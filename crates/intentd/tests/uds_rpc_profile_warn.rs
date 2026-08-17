@@ -255,6 +255,20 @@ async fn script_list_bootstrap_stays_within_statement_budget() {
         .expect("workspace id")
         .to_string();
 
+    // Regression test for intent-hq/monorepo#2672: `workspace.create` is a
+    // legitimately compound op (39-40 statements) and sits on the compound-op
+    // statement tier (budget 50), so at default thresholds it must not trip
+    // the statement budget.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &["exceeded SQL statement budget", "method=workspace.create"]
+        ),
+        0,
+        "workspace.create exceeded the compound statement budget, log:\n{log}"
+    );
+
     // First script.list triggers the repo-config bootstrap.
     let resp = rpc_with_params(
         &socket,

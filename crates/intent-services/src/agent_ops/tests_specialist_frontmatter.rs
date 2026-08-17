@@ -636,3 +636,266 @@ async fn delegate_override_keeps_derived_name_renameable() {
     assert_eq!(agent["name"], "Coordinator");
     assert_eq!(agent["nameExplicitlySet"], false);
 }
+
+/// Create a specialist file with an explicit name, roleReminder, and body.
+fn create_specialist_with_body(dir: &Path, id: &str, name: &str, reminder: &str, body: &str) {
+    let content = format!(
+        "---\nname: \"{name}\"\ndescription: \"Test specialist\"\nroleReminder: \"{reminder}\"\n---\n\n{body}"
+    );
+    std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
+}
+
+/// The resolved specialist injection is snapshotted into the session metadata
+/// at creation: body → `behaviorPrompt`, identity → `specialistName` /
+/// `specialistRoleReminder`.
+#[tokio::test]
+async fn specialist_snapshot_persisted_at_create() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let meta = session.metadata.expect("metadata snapshot written");
+    assert_eq!(
+        meta["behaviorPrompt"].as_str(),
+        Some("Original behavior prompt body.")
+    );
+    assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
+    assert_eq!(meta["specialistRoleReminder"].as_str(), Some("Stay frozen"));
+}
+
+/// An explicit caller `metadata.behaviorPrompt` override is left untouched —
+/// it IS the frozen body; the resolved identity is still snapshotted.
+#[tokio::test]
+async fn caller_behavior_prompt_override_preserved() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "behaviorPrompt": "CALLER OVERRIDE" })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("frozen".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let meta = session.metadata.expect("metadata");
+    assert_eq!(meta["behaviorPrompt"].as_str(), Some("CALLER OVERRIDE"));
+    assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
+    assert_eq!(meta["specialistRoleReminder"].as_str(), Some("Stay frozen"));
+}
+
+/// A non-object caller `metadata` is left untouched: the snapshot write is a
+/// no-op (`as_object_mut` fails), the create still succeeds, and the opaque
+/// value survives uncorrupted.
+#[tokio::test]
+async fn non_object_metadata_left_untouched() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!("opaque")),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("frozen".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create succeeds with non-object metadata");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.metadata, Some(json!("opaque")));
+}
+
+/// When the specialist resolves with NO role reminder, a caller-supplied
+/// free-form `metadata.specialistRoleReminder` is removed by the snapshot
+/// write — the reminder key always reflects the resolution outcome — so the
+/// frozen readers never consume it and the per-turn reminder stays silent.
+#[tokio::test]
+async fn caller_reminder_removed_when_resolution_has_none() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    // Specialist with a name but no roleReminder frontmatter AND no body, so
+    // the auto-generated fallback is empty and resolution yields no reminder.
+    let content = "---\nname: \"Frozen Name\"\ndescription: \"Test specialist\"\n---\n";
+    std::fs::write(specialists_dir.path().join("frozen.md"), content).expect("write specialist");
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "specialistRoleReminder": "BOGUS CALLER REMINDER" })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("frozen".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let meta = session.metadata.expect("metadata");
+    assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
+    assert!(
+        meta.get("specialistRoleReminder").is_none(),
+        "caller reminder must be removed: {meta:?}"
+    );
+    // Per-turn reminder stays silent (frozen name without frozen reminder).
+    assert!(svc.agent_role_reminder(&id).await.is_none());
+}
+
+/// An unknown specialist writes no snapshot and never fails the create
+/// (existing leniency), leaving caller metadata absent.
+#[tokio::test]
+async fn unknown_specialist_creates_without_snapshot() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+
+    let id = create_agent(
+        &svc,
+        &ws,
+        "TestAgent",
+        None,
+        Some("no-such-specialist".into()),
+    )
+    .await;
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.metadata.is_none(), "no snapshot for unknown id");
+}
+
+// ---- Regression: prompt frozen across specialist file edits (end-to-end) ----
+
+/// End-to-end freeze invariant: an agent created from a user-tier specialist
+/// file keeps its original behavior prompt, display name, and role reminder
+/// in the spawn assembly (`agent_specialist_injection`) after the file is
+/// edited — and after it is deleted.
+#[tokio::test]
+async fn injection_frozen_after_specialist_file_edit() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
+
+    // Edit the file after creation: new name, reminder, and body.
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Edited Name",
+        "Edited reminder",
+        "Edited body.",
+    );
+
+    let inj = svc
+        .agent_specialist_injection(&id, None)
+        .await
+        .expect("injection");
+    assert_eq!(
+        inj.behavior_prompt.as_deref(),
+        Some("Original behavior prompt body.")
+    );
+    assert_eq!(inj.specialist_name.as_deref(), Some("Frozen Name"));
+    assert_eq!(inj.role_reminder.as_deref(), Some("Stay frozen"));
+
+    // Delete the file: the frozen triple must still survive intact.
+    std::fs::remove_file(specialists_dir.path().join("frozen.md")).expect("delete specialist");
+    let inj = svc
+        .agent_specialist_injection(&id, None)
+        .await
+        .expect("injection after delete");
+    assert_eq!(
+        inj.behavior_prompt.as_deref(),
+        Some("Original behavior prompt body.")
+    );
+    assert_eq!(inj.specialist_name.as_deref(), Some("Frozen Name"));
+    assert_eq!(inj.role_reminder.as_deref(), Some("Stay frozen"));
+}
+
+/// Companion pin: a pre-change-style session (no frozen snapshot keys in its
+/// metadata) resolves live and DOES pick up the file edit — legacy behavior
+/// unchanged.
+#[tokio::test]
+async fn legacy_session_without_snapshot_picks_up_file_edit() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
+
+    // Simulate a pre-change row by stripping the creation-time snapshot.
+    svc.store()
+        .update_agent_session_metadata(&ws, &id, None, &intent_core::now_iso())
+        .await
+        .expect("strip snapshot");
+
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Edited Name",
+        "Edited reminder",
+        "Edited body.",
+    );
+
+    let inj = svc
+        .agent_specialist_injection(&id, None)
+        .await
+        .expect("injection");
+    assert_eq!(inj.behavior_prompt.as_deref(), Some("Edited body."));
+    assert_eq!(inj.specialist_name.as_deref(), Some("Edited Name"));
+    assert_eq!(inj.role_reminder.as_deref(), Some("Edited reminder"));
+}

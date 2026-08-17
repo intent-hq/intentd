@@ -7,7 +7,7 @@
 //!   kills the PTY, and flips `script.status` to `exited` (a reconnecting
 //!   client observes the teardown; `kill -0` on the recorded pid fails).
 //! - `script.run` while the script is already running warn-and-returns with
-//!   the PROTOCOL.md §5.8 envelope `{ exitCode?, output, timedOut?, warning? }`
+//!   the docs/protocol/methods/scripts.md §5.8 envelope `{ exitCode?, output, timedOut?, warning? }`
 //!   (only `output` + `warning`, no second PTY).
 
 #![cfg(unix)]
@@ -406,7 +406,7 @@ async fn script_run_client_disconnect_reaps_and_marks_exited() {
 
 /// Regression (monorepo#1155): `script.run` while the script is already
 /// running warn-and-returns instead of spawning a second PTY, and the
-/// envelope matches PROTOCOL.md §5.8 `{ exitCode?, output, timedOut?,
+/// envelope matches docs/protocol/methods/scripts.md §5.8 `{ exitCode?, output, timedOut?,
 /// warning? }` — only `output` (empty) + `warning`, no `exitCode`/`timedOut`.
 #[tokio::test]
 async fn script_run_while_running_returns_warning_envelope() {

@@ -6,8 +6,11 @@
 //! same-key arrivals so a slow consumer receives a bounded, superseding set of
 //! frames rather than the full firehose — without ever dropping content:
 //!
-//! - `chat:stream:delta` — latest-wins per block: each built block delta
-//!   carries the FULL accumulated text (CS-0 D2), so the newest supersedes.
+//! - `chat:stream:delta` — per block: a full-text delta (CS-0 D2 default
+//!   encoding) merges latest-wins — each carries the FULL accumulated text,
+//!   so the newest supersedes; an incremental delta (`textDelta`,
+//!   monorepo#2675) merges by fragment concat in arrival order (size-capped;
+//!   an oversized merge seals the entry), like `terminal:data`.
 //! - `agent:stream:activity` — latest-wins per agent: a content-free signal
 //!   carrying the newest live preview.
 //! - `terminal:data` — byte-concat per terminal: chunks are decoded, merged
@@ -41,6 +44,13 @@ use crate::subscriptions;
 /// newer chunk starts a fresh entry, so no merged frame ever approaches
 /// [`crate::MAX_OUTBOUND_MESSAGE_BYTES`].
 pub(crate) const TERMINAL_CONCAT_CAP_BYTES: usize = 256 * 1024;
+
+/// Cap on one conflated chat entity's merged `textDelta` byte length
+/// (incremental encoding, monorepo#2675). Same discipline as
+/// [`TERMINAL_CONCAT_CAP_BYTES`]: a merge that would exceed it is refused, the
+/// pending entry seals in place, and the newer fragment starts a fresh entry —
+/// fragments compose across frames, so nothing is lost.
+pub(crate) const CHAT_TEXT_CONCAT_CAP_BYTES: usize = 256 * 1024;
 
 /// Cap on the number of pending entries in one [`ConflationBuffer`]. Conflation
 /// bounds repeated keys, but a slow consumer observing unbounded *distinct*
@@ -378,10 +388,52 @@ impl Conflate for ChatItem {
     }
 
     fn merge(&mut self, newer: Self) -> Option<Self> {
-        // Latest entity wins (full accumulated text, CS-0 D2); the bucket of
-        // the first pending delta is preserved.
-        self.entity = newer.entity;
-        None
+        match (text_delta_of(&self.entity), text_delta_of(&newer.entity)) {
+            // Incremental encoding (monorepo#2675): fragments compose in
+            // arrival order, so append the newer fragment onto the pending
+            // entity's `textDelta` — capped like `terminal:data`; an
+            // oversized merge is refused (the entry seals, the newer
+            // fragment starts a fresh one). The pending entity's envelope
+            // (and the first delta's added/updated bucket) is preserved.
+            (Some(acc), Some(add)) => {
+                if acc.len() + add.len() > CHAT_TEXT_CONCAT_CAP_BYTES {
+                    return Some(newer);
+                }
+                let add = add.to_string();
+                if let Some(Value::String(slot)) = self
+                    .entity
+                    .get_mut("block")
+                    .and_then(|b| b.get_mut("textDelta"))
+                {
+                    slot.push_str(&add);
+                }
+                None
+            }
+            // Full-text encoding: latest entity wins (each carries the FULL
+            // accumulated text, CS-0 D2); the bucket of the first pending
+            // delta is preserved.
+            (None, None) => {
+                self.entity = newer.entity;
+                None
+            }
+            // Mixed shapes never occur within one subscription (the encoding
+            // is fixed at subscribe time); refuse defensively.
+            _ => Some(newer),
+        }
+    }
+}
+
+/// The `block.textDelta` string of a chat delta entity, or `None` for the
+/// full-text encoding's entities (which carry `block.text` instead). Gated on
+/// the mapper-owned `text`/`thinking` block types: non-text chunks pass
+/// provider content through verbatim, so a foreign block that happens to carry
+/// its own `textDelta` field must take the latest-entity-wins path, never the
+/// concatenate path.
+fn text_delta_of(entity: &Value) -> Option<&str> {
+    let block = entity.get("block")?;
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") | Some("thinking") => block.get("textDelta").and_then(Value::as_str),
+        _ => None,
     }
 }
 

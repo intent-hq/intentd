@@ -711,6 +711,19 @@ async function handlePrompt(id, params) {
   // An explicit `stopReason` on the active behavior/rule overrides the default
   // `end_turn`, letting e2e tests drive abnormal endings (`refusal`,
   // `max_tokens`, `max_turn_requests`) through the successful-turn path.
+  // Optional silent tail (monorepo#2669): park AFTER the last session/update
+  // and BEFORE resolving the prompt, emulating the incident's sustained
+  // stream-silence gap that terminates in a clean stopReason. Lets e2e tests
+  // drive the daemon's silent-tail capture + suspected-truncation annotation.
+  // Read off `active` only (a matched rule does NOT inherit the top-level
+  // tail), so one behavior can drive a stalled default and a quick rule.
+  const silentTailMs = Number.isFinite(active.silentTailBeforeResultMs)
+    ? active.silentTailBeforeResultMs
+    : 0;
+  if (silentTailMs > 0) {
+    log(`parking ${silentTailMs}ms of silence before resolving the prompt`);
+    await new Promise((r) => setTimeout(r, silentTailMs));
+  }
   const payload = {
     stopReason: typeof active.stopReason === 'string' ? active.stopReason : 'end_turn',
   };

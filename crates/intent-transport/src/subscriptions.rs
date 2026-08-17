@@ -84,12 +84,31 @@ pub(crate) struct CommentSubscribeParams {
 /// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
 /// scoped by `agentId` (like the comment channel's `noteId`, NOT `workspaceId`);
 /// `replaceGroup` is optional. `sinceMessageId` (optional) requests a resumed
-/// seq-0 snapshot: only messages AFTER that id (§7.1 resume).
+/// seq-0 snapshot: only messages AFTER that id (§7.1 resume). `deltaEncoding`
+/// (optional) selects the text-chunk delta encoding for the subscription's
+/// lifetime (D2): `"full"`/absent for full accumulated text per chunk,
+/// `"incremental"` for append-only `textDelta` fragments.
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
     pub since_message_id: Option<String>,
+    pub delta_encoding: DeltaEncoding,
     pub replace_group: Option<String>,
+}
+
+/// The text-chunk delta encoding for one chat subscription (CS-0 D2). Fixed at
+/// subscribe time; every snapshot the subscription emits echoes the active
+/// mode when it is not the default (`stamp_delta_encoding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DeltaEncoding {
+    /// Each text/thinking chunk delta carries the FULL accumulated `text`
+    /// (the pre-#2675 wire shape; the newest delta supersedes).
+    #[default]
+    Full,
+    /// Each text/thinking chunk delta carries only the new fragment as
+    /// `textDelta`; the client appends. Eliminates the quadratic wire
+    /// amplification of full-text re-sends (monorepo#2675).
+    Incremental,
 }
 
 /// Classify a parsed frame as a subscription fast-path request, or `None` to
@@ -217,6 +236,10 @@ pub(crate) fn parse_comment_subscribe_params(
 /// error (the chat channel is per-agent, CS-0). `sinceMessageId` is optional:
 /// absent / `null` / empty string all mean "no resume" (standard snapshot,
 /// no `resumed` key); a present non-string value is a `-32602` error.
+/// `deltaEncoding` is optional: absent / `null` / `"full"` select the default
+/// full-text encoding, `"incremental"` selects append-only text deltas; any
+/// other value is a `-32602` error (a silently ignored typo would leave the
+/// client appending fragments the daemon never sends as fragments).
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<ChatSubscribeParams, String> {
@@ -230,9 +253,16 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) => Some(s.clone()),
         Some(_) => return Err("sinceMessageId must be a string".to_string()),
     };
+    let delta_encoding = match params.get("deltaEncoding") {
+        None | Some(Value::Null) => DeltaEncoding::Full,
+        Some(Value::String(s)) if s == "full" => DeltaEncoding::Full,
+        Some(Value::String(s)) if s == "incremental" => DeltaEncoding::Incremental,
+        Some(_) => return Err("deltaEncoding must be \"full\" or \"incremental\"".to_string()),
+    };
     Ok(ChatSubscribeParams {
         agent_id,
         since_message_id,
+        delta_encoding,
         replace_group: replace_group(params),
     })
 }
@@ -243,6 +273,19 @@ fn replace_group(params: &Map<String, Value>) -> Option<String> {
         .get("replaceGroup")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Echo a non-default delta encoding on a chat snapshot (CS-0 D2): every
+/// snapshot an incremental subscription emits (seq-0 and lag recovery) carries
+/// `deltaEncoding: "incremental"`, so the client can assert the daemon honored
+/// the requested mode before appending fragments. Full mode stamps nothing —
+/// default subscriptions stay byte-identical to the pre-#2675 wire shape.
+pub(crate) fn stamp_delta_encoding(snapshot: &mut Value, encoding: DeltaEncoding) {
+    if encoding == DeltaEncoding::Incremental {
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert("deltaEncoding".to_string(), json!("incremental"));
+        }
+    }
 }
 
 /// Build a `subscription.push { kind: "snapshot", seq, snapshot }` notification
@@ -479,6 +522,36 @@ pub(crate) async fn chat_snapshot(
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
+    overlay_live_state(api, agent_id, &mut snapshot).await;
+    snapshot
+}
+
+/// [`chat_snapshot`] for the lag self-heal path — fallible instead of
+/// degrade-to-empty. A recovery snapshot is emitted at a LATER `seq` than
+/// content the client already rendered, so the seq-0 degrade contract is
+/// inverted here: serving `{ messages: [] }` would make the client rebuild an
+/// already-rendered transcript as EMPTY on a transient read failure, strictly
+/// worse than the lag it was healing. The read is retried once (same policy as
+/// the terminal reconcile's re-read); a persistent failure returns `None` and
+/// the caller keeps the recovery pending instead of emitting anything. Still
+/// bounded: at most two page reads per attempt, no resume filter (recovery
+/// always serves the full standard page).
+pub(crate) async fn chat_recovery_snapshot(
+    api: &dyn WorkspaceApi,
+    agent_id: &AgentId,
+) -> Option<Value> {
+    let read = || api.agent_get_conversation(agent_id.clone(), None, None, None, None);
+    let mut snapshot = match read().await {
+        Ok(v) => v,
+        Err(_) => read().await.ok()?,
+    };
+    overlay_live_state(api, agent_id, &mut snapshot).await;
+    Some(snapshot)
+}
+
+/// Overlay the live in-flight turn and activity flags onto a chat snapshot's
+/// persisted page (shared by [`chat_snapshot`] and [`chat_recovery_snapshot`]).
+async fn overlay_live_state(api: &dyn WorkspaceApi, agent_id: &AgentId, snapshot: &mut Value) {
     // Read busy BEFORE the slot, never after. The two reads are separate lock
     // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
     // stale slot under the busy lock before publishing the claim, which makes
@@ -490,7 +563,7 @@ pub(crate) async fn chat_snapshot(
     // content labelled settled, which the next delta or snapshot corrects.
     let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(&mut snapshot, agent_id, &live, is_streaming);
+        merge_live_turn(snapshot, agent_id, &live, is_streaming);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -503,7 +576,6 @@ pub(crate) async fn chat_snapshot(
             obj.insert(key.clone(), value.clone());
         }
     }
-    snapshot
 }
 
 /// Trim a chat seq-0 snapshot to the messages AFTER `since` (§7.1 resume).
@@ -613,7 +685,15 @@ fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value, is_st
 /// `agent.getConversation` snapshot (the CS-3 reconciliation invariant).
 pub(crate) struct ChatDeltaState {
     agent_id: String,
-    /// `blockId` → accumulated text for `text` blocks (deltas carry full text, D2).
+    /// The subscription's text-chunk encoding (D2): full accumulated text per
+    /// chunk, or append-only `textDelta` fragments (monorepo#2675).
+    encoding: DeltaEncoding,
+    /// `blockId` → accumulated text for `text` blocks. In full mode every
+    /// chunk delta re-materializes it (D2); in incremental mode it is kept
+    /// (O(chunk) appends, linear memory) but consulted only by the degraded
+    /// best-effort terminal frame, which must carry authoritative full text
+    /// in both modes — a fragment there would clobber the client's
+    /// accumulation.
     text_acc: HashMap<String, String>,
     /// `blockId`s emitted at least once this turn (added vs updated discriminator).
     seen_ids: HashSet<String>,
@@ -621,18 +701,29 @@ pub(crate) struct ChatDeltaState {
     emitted_ids: HashSet<String>,
     /// The in-flight assistant message id (block-id prefix), learned from events.
     message_id: Option<String>,
+    /// Last-known block per live block id, in first-sighting order — the
+    /// content of the best-effort terminal frame when the terminal reconcile's
+    /// re-read fails (the client must always receive a terminal frame).
+    /// Text/thinking entries are `{type, id}` markers rebuilt from
+    /// [`Self::text_acc`] at emit time; other blocks keep their full JSON.
+    live_blocks: Vec<(String, Value)>,
 }
 
 impl ChatDeltaState {
     /// A fresh mapper for one chat subscription (one agent). The same instance is
-    /// reused across turns; `finalize` resets the per-turn accumulation.
-    pub(crate) fn new(agent_id: &AgentId) -> Self {
+    /// reused across turns; `finalize` resets the per-turn accumulation. The
+    /// encoding is fixed for the subscription's lifetime (chosen at subscribe
+    /// time) — a lag-recovery replacement mapper must be built with the SAME
+    /// encoding.
+    pub(crate) fn new(agent_id: &AgentId, encoding: DeltaEncoding) -> Self {
         Self {
             agent_id: agent_id.as_str().to_string(),
+            encoding,
             text_acc: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
             message_id: None,
+            live_blocks: Vec::new(),
         }
     }
 
@@ -640,10 +731,14 @@ impl ChatDeltaState {
     /// in-flight assistant message (CS-0 D5): the message arriving mid-turn has
     /// already streamed some blocks, so prime `message_id`, mark each block id as
     /// already seen+emitted (subsequent chunks arrive as `updated`, not `added`),
-    /// and pre-load each `text` block's accumulated text so the NEXT chunk delta
-    /// carries the FULL text (D2), not just the new fragment. Without this, a
-    /// resuming subscriber's first chunk would restart the text from empty until
-    /// the terminal reconcile. No-op when the snapshot has no in-flight message.
+    /// and pre-load each `text` block's accumulated text. In full mode the NEXT
+    /// chunk delta then carries the FULL text (D2), not just the new fragment —
+    /// without this, a resuming subscriber's first chunk would restart the text
+    /// from empty until the terminal reconcile. In incremental mode
+    /// (monorepo#2675) deltas carry only the post-snapshot fragment, so the
+    /// pre-load doesn't shape the wire — but the accumulation still backs the
+    /// DEGRADED terminal frame's best-effort full text, so seeding is identical
+    /// in both modes. No-op when the snapshot has no in-flight message.
     pub(crate) fn seed_from_snapshot(&mut self, snapshot: &Value) {
         let Some(messages) = snapshot.get("messages").and_then(Value::as_array) else {
             return;
@@ -658,23 +753,37 @@ impl ChatDeltaState {
             return;
         };
         self.message_id = Some(message_id.to_string());
-        let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) else {
-            return;
-        };
-        for block in blocks {
-            let Some(bid) = block.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            self.seen_ids.insert(bid.to_string());
-            self.emitted_ids.insert(bid.to_string());
-            if matches!(
-                block.get("type").and_then(Value::as_str),
-                Some("text") | Some("thinking")
-            ) {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    self.text_acc.insert(bid.to_string(), text.to_string());
+        let mut seeded = false;
+        if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
+            for block in blocks {
+                let Some(bid) = block.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                self.seen_ids.insert(bid.to_string());
+                self.emitted_ids.insert(bid.to_string());
+                match block.get("type").and_then(Value::as_str) {
+                    Some(t) if t == "text" || t == "thinking" => {
+                        self.remember_text_marker(bid, t);
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            self.text_acc.insert(bid.to_string(), text.to_string());
+                        }
+                    }
+                    _ => self.remember_block(bid, block),
                 }
+                seeded = true;
             }
+        }
+        // A just-started streaming row with no blocks yet is still rendered
+        // as streaming by the snapshot consumer. Remember a placeholder empty
+        // text block under the id the first persisted block will take, so a
+        // DEGRADED terminal frame still carries one `streamingComplete`
+        // entity for the row — an empty frame would leave the blank row
+        // permanently streaming (the delta reducer flips `isStreaming` only
+        // while applying an entity). Inert on the authoritative path (which
+        // never reads `live_blocks`), and upserted over by the first real
+        // chunk, which takes the same `{messageId}:0` id.
+        if !seeded {
+            self.remember_text_marker(&format!("{message_id}:0"), "text");
         }
     }
 
@@ -803,9 +912,11 @@ impl ChatDeltaState {
         Some(json!({ "added": added, "updated": updated, "removedIds": [] }))
     }
 
-    /// Map a `chat:stream:delta`: accumulate the chunk and emit the full block
+    /// Map a `chat:stream:delta`: accumulate the chunk and emit the block
     /// (D2/D4). Text chunks — and the `thinking` chunks streamed reasoning
-    /// flushes into — coalesce onto one `blockId` (`updated` on growth);
+    /// flushes into — coalesce onto one `blockId` (`updated` on growth),
+    /// carrying the FULL accumulated `text` in full mode or only the new
+    /// fragment as `textDelta` in incremental mode (monorepo#2675);
     /// non-text chunks pass through as the full block (`added`), stamped with the
     /// same id the persisted block carries.
     fn chunk_delta(&mut self, event: &Event) -> Option<Value> {
@@ -819,11 +930,29 @@ impl ChatDeltaState {
             let chunk = content.as_str().unwrap_or_default();
             let acc = self.text_acc.entry(block_id.clone()).or_default();
             acc.push_str(chunk);
-            json!({ "type": block_type, "id": block_id, "text": acc.clone() })
+            let block = match self.encoding {
+                DeltaEncoding::Full => {
+                    json!({ "type": block_type, "id": block_id, "text": acc.clone() })
+                }
+                // Only the fragment travels — per-chunk wire cost is
+                // O(chunk), not O(accumulated text). The accumulation above
+                // still runs (O(chunk) append) so the degraded best-effort
+                // terminal frame can carry authoritative full text.
+                DeltaEncoding::Incremental => {
+                    json!({ "type": block_type, "id": block_id, "textDelta": chunk })
+                }
+            };
+            // A marker only — the full text lives once in `text_acc` and the
+            // best-effort frame rebuilds it at emit time, so per-chunk cost
+            // stays O(chunk), not O(accumulated text).
+            self.remember_text_marker(&block_id, block_type);
+            block
         } else {
             let mut obj = content.as_object()?.clone();
             obj.insert("id".to_string(), Value::String(block_id.clone()));
-            Value::Object(obj)
+            let block = Value::Object(obj);
+            self.remember_block(&block_id, &block);
+            block
         };
         let added = self.note_block(&block_id);
         let entity = self.entity(&message_id, block, None, None, false);
@@ -866,6 +995,7 @@ impl ChatDeltaState {
             status,
         );
         let use_added = self.note_block(&block_id);
+        self.remember_block(&block_id, &use_block);
         let mut added = Vec::new();
         let mut updated = Vec::new();
         push_entity(
@@ -889,6 +1019,7 @@ impl ChatDeltaState {
                     "is_error": status == "error",
                 });
                 let res_added = self.note_block(&result_id);
+                self.remember_block(&result_id, &result_block);
                 push_entity(
                     &mut added,
                     &mut updated,
@@ -927,6 +1058,7 @@ impl ChatDeltaState {
                                 attach_id, item,
                             );
                         let attach_added = self.note_block(attach_id);
+                        self.remember_block(attach_id, &attach_block);
                         push_entity(
                             &mut added,
                             &mut updated,
@@ -970,6 +1102,7 @@ impl ChatDeltaState {
         self.seen_ids.clear();
         self.emitted_ids.clear();
         self.message_id = None;
+        self.live_blocks.clear();
         delta
     }
 
@@ -979,10 +1112,23 @@ impl ChatDeltaState {
     /// the authoritative `messageSeq`/`timestamp` and `streamingComplete:true`,
     /// plus `removedIds` for any block emitted live that the persisted message
     /// does not contain (e.g. a mispredicted `tool_result` index).
+    ///
+    /// The re-read is retried once, and a persistent failure still emits a
+    /// terminal frame — the best-effort one built from the accumulated live
+    /// state — plus a WARN. Returning `None` here would suppress the terminal
+    /// frame entirely: the transcript then stays silently stale mid-turn while
+    /// the turn looks ended (the lifecycle flags clear via the separate agent
+    /// lifecycle lane), permanently, until the client resubscribes.
+    ///
+    /// Cost stays bounded regardless of transcript length: the re-read is the
+    /// server-clamped newest page (SQL-side pagination, monorepo#958) and the
+    /// retry re-issues that same bounded read — worst case two page reads per
+    /// turn end, never full-history hydration — while the fallback frame is
+    /// built purely from the already-accumulated [`Self::live_blocks`].
     async fn reconcile(&self, api: &dyn WorkspaceApi) -> Option<Value> {
         let message_id = self.message_id.clone()?;
-        let conv = api
-            .agent_get_conversation(
+        let read = || {
+            api.agent_get_conversation(
                 AgentId::from(self.agent_id.as_str()),
                 None,
                 None,
@@ -990,9 +1136,38 @@ impl ChatDeltaState {
                 None,
                 None,
             )
-            .await
-            .ok()?;
-        let messages = conv.get("messages").and_then(Value::as_array)?;
+        };
+        let conv = match read().await {
+            Ok(conv) => conv,
+            Err(first) => match read().await {
+                Ok(conv) => conv,
+                Err(retry) => {
+                    tracing::warn!(
+                        agent = %self.agent_id,
+                        message = %message_id,
+                        first_error = %first,
+                        retry_error = %retry,
+                        "terminal reconcile re-read failed twice; emitting best-effort \
+                         terminal frame from accumulated live state"
+                    );
+                    return Some(self.best_effort_terminal(&message_id));
+                }
+            },
+        };
+        let Some(messages) = conv.get("messages").and_then(Value::as_array) else {
+            // A successful read without a `messages` array should be
+            // impossible (`agent.getConversation` always serves one), but
+            // suppressing the frame here would reopen the exact silent-skip
+            // this path exists to close — degrade the same way a failed
+            // read does.
+            tracing::warn!(
+                agent = %self.agent_id,
+                message = %message_id,
+                "terminal reconcile re-read returned no messages array; emitting \
+                 best-effort terminal frame from accumulated live state"
+            );
+            return Some(self.best_effort_terminal(&message_id));
+        };
         let mut added = Vec::new();
         let mut updated = Vec::new();
         let mut persisted_ids: HashSet<String> = HashSet::new();
@@ -1022,6 +1197,60 @@ impl ChatDeltaState {
             .collect();
         removed.sort();
         Some(json!({ "added": added, "updated": updated, "removedIds": removed }))
+    }
+
+    /// The degraded terminal frame for a reconcile whose re-read failed twice:
+    /// every accumulated live block re-emitted as `updated` (each was already
+    /// delivered live or seeded from the seq-0 snapshot) stamped
+    /// `streamingComplete: true`, so the client still flips out of the
+    /// streaming state on the content it has. No authoritative
+    /// `messageSeq`/`timestamp` (the store read failed) and no `removedIds`
+    /// (without the persisted message no orphan is provable). Text/thinking
+    /// entries are markers — their FULL text is rebuilt from
+    /// [`Self::text_acc`] here, the one place the degraded frame needs it.
+    ///
+    /// When the id was learned only from the terminal event's `messageId`
+    /// fallback (monorepo#2105 — the subscription opened after the last
+    /// chunk), no live state was ever accumulated and this emits an empty
+    /// frame: net-equal to the pre-fix `None` for that path (nothing was
+    /// rendered as streaming, so nothing needs the flag).
+    fn best_effort_terminal(&self, message_id: &str) -> Value {
+        let updated: Vec<Value> = self
+            .live_blocks
+            .iter()
+            .map(|(id, block)| {
+                let block = match block.get("type").and_then(Value::as_str) {
+                    Some(t) if block.get("text").is_none() && (t == "text" || t == "thinking") => {
+                        let text = self.text_acc.get(id).map(String::as_str).unwrap_or("");
+                        json!({ "type": t, "id": id, "text": text })
+                    }
+                    _ => block.clone(),
+                };
+                self.entity(message_id, block, None, None, true)
+            })
+            .collect();
+        json!({ "added": [], "updated": updated, "removedIds": [] })
+    }
+
+    /// Upsert a live block's last-known full JSON into [`Self::live_blocks`]
+    /// (first-sighting order preserved) so a failed terminal reconcile can
+    /// still emit it in the best-effort frame. For text/thinking blocks use
+    /// [`Self::remember_text_marker`] instead — retaining their full JSON
+    /// would duplicate `text_acc` on every chunk (O(N·L) copying per turn).
+    fn remember_block(&mut self, block_id: &str, block: &Value) {
+        match self.live_blocks.iter_mut().find(|(id, _)| id == block_id) {
+            Some((_, existing)) => *existing = block.clone(),
+            None => self.live_blocks.push((block_id.to_string(), block.clone())),
+        }
+    }
+
+    /// Remember a text/thinking live block as a text-less `{type, id}` marker;
+    /// [`Self::best_effort_terminal`] rebuilds the full block from
+    /// [`Self::text_acc`] at emit time. Upserting keeps per-chunk cost
+    /// O(chunk) while preserving first-sighting order.
+    fn remember_text_marker(&mut self, block_id: &str, block_type: &str) {
+        let marker = json!({ "type": block_type, "id": block_id });
+        self.remember_block(block_id, &marker);
     }
 
     /// Wrap one upserted block as a delta entity: the message pointer plus the

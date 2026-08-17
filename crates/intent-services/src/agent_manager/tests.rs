@@ -7578,6 +7578,11 @@ async fn archive_workspace_parks_wake_deliveries() {
         .await
         .expect("wake delivery");
     assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert_eq!(
+        out["archivedParked"],
+        json!(true),
+        "archived park is distinguishable from a plain busy-queue fallback"
+    );
     assert!(!mgr.is_busy(&id), "no turn spawned while archived");
     assert_eq!(
         services.queue_snapshot(&id).len(),
@@ -7592,6 +7597,373 @@ async fn archive_workspace_parks_wake_deliveries() {
     assert!(
         services.queue_snapshot(&id).is_empty(),
         "unarchive's drain kick delivers the parked wake"
+    );
+}
+
+/// Regression (intent-hq/monorepo#2739): the archived-check → enqueue window
+/// in `deliver_wake_message` vs a concurrent `workspace.unarchive`. The
+/// unarchive's drain kick fires against the still-empty queue before the
+/// gate's enqueue lands, so without a post-enqueue re-check the parked wake
+/// strands until the next organic drain trigger. The re-check must self-heal
+/// by kicking the drain once it observes the workspace no longer archived
+/// (mirroring `AgentManager::send_message`'s archived-gate re-check).
+#[tokio::test]
+async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_wake_archived_park(park.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-wake-race");
+    let id = AgentId::from("a-archive-wake-race");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
+        .await
+        .expect("archive workspace");
+
+    // The wake enters the archived gate and parks in the seam window with
+    // the enqueue still pending.
+    let deliver = {
+        let services = services.clone();
+        let (ws, id) = (ws.clone(), id.clone());
+        tokio::spawn(async move {
+            services
+                .deliver_wake_message(&ws, &id, "[Agent Completed] raced wake", None)
+                .await
+        })
+    };
+    park.entered.notified().await;
+
+    // The unarchive lands inside the window: its drain kick sees no
+    // ready-to-send work (the enqueue has not happened yet) and does
+    // nothing — the strand this regression guards against.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick fired against a still-empty queue"
+    );
+
+    // Release the enqueue; the post-enqueue re-check observes the workspace
+    // no longer archived and kicks the drain itself.
+    park.release.notify_one();
+    let out = deliver
+        .await
+        .expect("join wake delivery")
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parked behind the gate");
+    assert_eq!(out["archivedParked"], json!(true), "archived park marker");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if services.queue_snapshot(&id).is_empty() && !services.has_ready_to_send(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-check drain delivers the raced wake without an organic kick");
+}
+
+/// Regression (intent-hq/monorepo#2732): an AUTOMATIC `send_message` into an
+/// archived workspace must park in the queue — NOT claim the slot (whose
+/// `try_begin` would auto-unarchive the workspace). The workspace stays
+/// Archived with no `autoUnarchive` delta, and unarchive's own drain kick
+/// delivers the parked message.
+#[tokio::test]
+async fn archived_workspace_parks_automatic_send_until_unarchive() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-auto-send");
+    let id = AgentId::from("a-archive-auto-send");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
+        .await
+        .expect("archive workspace");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "automatic delivery".to_string(),
+            None,
+            super::TurnOptions::default(), // origin defaults to Automatic
+        )
+        .await
+        .expect("automatic send parks");
+    assert_eq!(
+        result["queued"],
+        json!(true),
+        "parked, not driven: {result}"
+    );
+    assert_eq!(
+        result["archivedParked"],
+        json!(true),
+        "archived park is distinguishable from a plain busy-queue fallback"
+    );
+    assert!(!mgr.is_busy(&id), "no slot claim while archived");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "message parked behind the archived gate"
+    );
+
+    // The workspace row stays Archived — the send never auto-unarchived it.
+    let row = services.store.get_workspace(&ws).await.unwrap();
+    assert!(row.archived, "workspace stays archived");
+    assert_eq!(row.status, WorkspaceStatus::Archived);
+
+    // No workspace:updated unarchive delta was published.
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "workspace:updated"
+            && e.data["changes"]["archived"] == json!(false)),
+        "no auto-unarchive delta for an automatic delivery"
+    );
+
+    // Unarchive itself kicks the drain and delivers the parked message.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick delivers the parked message"
+    );
+}
+
+/// Regression (intent-hq/monorepo#2732) — the auto-unarchive loop: an
+/// internal parent wake (`deliver_parent_wake`, the completion-watch /
+/// event-subscription wake path) into an archived workspace parks in the
+/// parent's queue instead of starting a turn that flips the workspace
+/// straight back to Active.
+#[tokio::test]
+async fn archived_workspace_parks_internal_parent_wake() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-parent-wake");
+    let parent = AgentId::from("a-archive-parent");
+    seed_agent(&mgr, &ws, &parent).await;
+    let _agent = track_mock_agent(&mgr, &parent, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
+        .await
+        .expect("archive workspace");
+
+    let out = services
+        .deliver_parent_wake(
+            &ws,
+            parent.clone(),
+            "[Agent Completed] child settled".to_string(),
+            None,
+        )
+        .await
+        .expect("parent wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert_eq!(out["archivedParked"], json!(true), "archived park marker");
+    assert!(!mgr.is_busy(&parent), "no turn spawned while archived");
+    assert_eq!(
+        services.queue_snapshot(&parent).len(),
+        1,
+        "wake queued behind the archived gate"
+    );
+    let row = services.store.get_workspace(&ws).await.unwrap();
+    assert!(row.archived, "workspace stays archived after the wake");
+}
+
+/// Regression (intent-hq/monorepo#2732): an AUTOMATIC interrupt-priority
+/// delivery (`interrupt_send_message`) into an archived workspace parks
+/// front-of-queue instead of preempting/driving a turn; the workspace stays
+/// Archived.
+#[tokio::test]
+async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-int-send");
+    let id = AgentId::from("a-archive-int-send");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
+        .await
+        .expect("archive workspace");
+
+    // A normal automatic entry parked first, so the interrupt's
+    // front-of-queue ordering is observable.
+    let first = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "normal automatic".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("normal automatic send parks");
+    assert_eq!(first["queued"], json!(true));
+
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "automatic interrupt".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("automatic interrupt parks");
+    assert_eq!(result["queued"], json!(true), "parked: {result}");
+    assert_eq!(
+        result["archivedParked"],
+        json!(true),
+        "archived park marker"
+    );
+    assert!(!mgr.is_busy(&id), "no turn spawned while archived");
+
+    let queue = services.queue_snapshot(&id);
+    assert_eq!(queue.len(), 2, "both entries parked");
+    assert_eq!(
+        queue[0]["content"],
+        json!("automatic interrupt"),
+        "interrupt parks front-of-queue"
+    );
+    let row = services.store.get_workspace(&ws).await.unwrap();
+    assert!(row.archived, "workspace stays archived");
+}
+
+/// Guard the revive path (intent-hq/monorepo#2732 non-goal): a USER-origin
+/// `send_message` into an archived workspace still claims the slot and
+/// auto-unarchives — only automatic deliveries park.
+#[tokio::test]
+async fn archived_workspace_user_send_still_auto_unarchives() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-user-send");
+    let id = AgentId::from("a-archive-user-send");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
+        .await
+        .expect("archive workspace");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "user revive".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("user send drives a turn");
+    assert_eq!(result["queued"], json!(false), "direct send: {result}");
+
+    let row = services.store.get_workspace(&ws).await.unwrap();
+    assert!(!row.archived, "user send auto-unarchived the workspace");
+    assert_eq!(row.status, WorkspaceStatus::Active);
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        events.iter().any(|e| e.event_type == "workspace:updated"
+            && e.data["changes"]["autoUnarchive"]["reason"] == json!("agent_activity")),
+        "stamped auto-unarchive delta published"
+    );
+}
+
+/// Cross-workspace watchers are unaffected (intent-hq/monorepo#2732): the
+/// archived gate keys on the workspace the message is DELIVERED in (the
+/// target's home workspace), so a parent whose home workspace is Active
+/// receives its wake immediately even when the watched child's workspace is
+/// archived.
+#[tokio::test]
+async fn cross_workspace_parent_wake_unaffected_by_archived_child_workspace() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    // Parent home workspace (Active) and the child's workspace (Archived).
+    let parent_ws = WorkspaceId::from("ws-cross-parent");
+    let parent = AgentId::from("a-cross-parent");
+    seed_agent(&mgr, &parent_ws, &parent).await;
+    let _parent_agent = track_mock_agent(&mgr, &parent, false);
+
+    let child_ws = WorkspaceId::from("ws-cross-child");
+    let child = AgentId::from("a-cross-child");
+    seed_agent(&mgr, &child_ws, &child).await;
+    <Services as WorkspaceApi>::archive_workspace(&services, child_ws.clone(), None)
+        .await
+        .expect("archive the child's workspace");
+
+    // The wake is delivered in the PARENT's home workspace (Active): it
+    // drives a turn immediately instead of parking.
+    let out = services
+        .deliver_parent_wake(
+            &parent_ws,
+            parent.clone(),
+            "[Agent Completed] cross-workspace child settled".to_string(),
+            None,
+        )
+        .await
+        .expect("cross-workspace wake delivery");
+    assert_eq!(
+        out["queued"],
+        json!(false),
+        "wake delivered immediately in the Active home workspace: {out}"
+    );
+    assert!(
+        services.queue_snapshot(&parent).is_empty(),
+        "nothing parked for the cross-workspace watcher"
     );
 }
 

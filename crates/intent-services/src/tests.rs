@@ -29844,3 +29844,67 @@ mod harness_versioning {
         );
     }
 }
+
+/// Regression tests for the `agentSummary` soft-delete filter: sessions with
+/// `AgentStatus::Deleted` must be excluded from the card aggregate's
+/// `count`/`agents`/`agentIds` (all three consistent, §5.1) so clients never
+/// render soft-deleted rows — mirroring the `workspace_attention_signals`
+/// filter.
+#[cfg(test)]
+mod agent_summary_excludes_deleted {
+    use intent_core::{AgentId, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+
+    use super::turn_end_unread_gate::session;
+    use super::{workspace, TempDb};
+    use crate::Services;
+
+    /// A workspace with one active + one soft-deleted session yields an
+    /// `agentSummary` containing only the active one (count=1).
+    #[tokio::test]
+    async fn enriched_summary_skips_soft_deleted_sessions() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws_id = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws_id))
+            .await
+            .expect("seed workspace");
+        // Hermetic root: enrichment probes the workspaces root for
+        // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+        let root = tempfile::tempdir().expect("temp workspaces root");
+        let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+        let active_id = AgentId::new();
+        let mut active = session(&active_id, &ws_id);
+        active.status = AgentStatus::Active;
+        store
+            .insert_agent_session(&active)
+            .await
+            .expect("insert active session");
+
+        let deleted_id = AgentId::new();
+        let mut deleted = session(&deleted_id, &ws_id);
+        deleted.status = AgentStatus::Deleted;
+        store
+            .insert_agent_session(&deleted)
+            .await
+            .expect("insert deleted session");
+
+        let mut ws = store.get_workspace(&ws_id).await.expect("get ws");
+        services.enrich_workspace_aggregates(&mut ws).await;
+
+        let summary = ws.agent_summary.expect("agentSummary present");
+        assert_eq!(summary.count, 1, "deleted session excluded from count");
+        assert_eq!(
+            summary.agents.iter().map(|a| &a.id).collect::<Vec<_>>(),
+            vec![&active_id],
+            "agents lists only the active session"
+        );
+        assert_eq!(
+            summary.agent_ids,
+            vec![active_id],
+            "agentIds stays consistent with agents"
+        );
+    }
+}

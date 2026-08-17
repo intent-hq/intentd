@@ -1,7 +1,7 @@
 //! WSS end-to-end `workspace.create` worktree provisioning: drives the real
 //! pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via config) and
 //! asserts that creating a workspace off a local git repository provisions a
-//! linked worktree (PROTOCOL.md §5.1) — the returned `workspace.worktreePath`
+//! linked worktree (docs/protocol/methods/workspace.md §5.1) — the returned `workspace.worktreePath`
 //! exists on disk, is a git worktree checked out on the workspace branch, and
 //! `baseCommitSha` records the base tip. Regression for agents spawning in a
 //! temp dir because `workspace.create` persisted a row without a checkout.

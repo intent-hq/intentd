@@ -8239,6 +8239,92 @@ async fn diagnostics_reports_queue_snapshots() {
     assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
+/// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
+/// `conversationBytes` (total persisted conversation size, omitted at zero),
+/// and a conversation past `LARGE_CONVERSATION_WARN_BYTES` raises a
+/// `large-conversation` stuck-risk warning naming the agent and sizes.
+/// Diagnostics-only: the byte total never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
+    let (_t, svc, ws) = setup().await;
+    let small = create_agent(&svc, &ws, "Small").await;
+    let bloated = create_agent(&svc, &ws, "Bloated").await;
+    let empty = create_agent(&svc, &ws, "Empty").await;
+
+    svc.store()
+        .append_agent_message(
+            &small,
+            "assistant",
+            &json!([{ "type": "text", "text": "short reply" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append small");
+    // Push the bloated agent past the 4 MiB threshold with a few large rows.
+    let big_text = "x".repeat(1024 * 1024);
+    for _ in 0..5 {
+        svc.store()
+            .append_agent_message(
+                &bloated,
+                "assistant",
+                &json!([{ "type": "text", "text": big_text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append bloated");
+    }
+
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    let small_bytes = row_for(&small)["conversationBytes"]
+        .as_u64()
+        .expect("small conversationBytes");
+    assert!(small_bytes > 0 && small_bytes < super::LARGE_CONVERSATION_WARN_BYTES);
+    let bloated_bytes = row_for(&bloated)["conversationBytes"]
+        .as_u64()
+        .expect("bloated conversationBytes");
+    assert!(
+        bloated_bytes > super::LARGE_CONVERSATION_WARN_BYTES,
+        "bytes: {bloated_bytes}"
+    );
+    assert!(
+        row_for(&empty).get("conversationBytes").is_none(),
+        "zero-message agent omits the field"
+    );
+
+    let risks = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let large: Vec<&serde_json::Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("large-conversation"))
+        .collect();
+    assert_eq!(large.len(), 1, "risks: {risks:?}");
+    assert_eq!(large[0]["agentId"], json!(bloated.0));
+    assert_eq!(large[0]["severity"], json!("warning"));
+    assert_eq!(large[0]["conversationBytes"], json!(bloated_bytes));
+    assert_eq!(
+        large[0]["thresholdBytes"],
+        json!(super::LARGE_CONVERSATION_WARN_BYTES)
+    );
+    assert!(
+        large[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("rotating to a fresh agent"),
+        "message: {}",
+        large[0]["message"]
+    );
+}
+
 /// monorepo#2063 A2: `agent.diagnostics` agent rows carry `subtreeMemoryBytes`
 /// from the runtime manager's tree probe — present only for agents the probe
 /// attributed bytes to, omitted otherwise (no bucket, no probe, or no manager
@@ -8303,6 +8389,106 @@ async fn diagnostics_reports_subtree_memory_bytes() {
     assert!(
         row_for(&unsampled).get("subtreeMemoryBytes").is_none(),
         "no bucket for this agent, field omitted"
+    );
+}
+
+/// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
+/// `lastTurnSilentTailMs` (the last ended turn's stream-silence tail,
+/// recorded in-memory at turn end; omitted when no turn ended this daemon
+/// lifetime), and a tail at/past the suspect threshold raises a
+/// `long-silent-tail` stuck-risk warning naming the agent, the tail, and the
+/// threshold. Diagnostics-only: the field never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
+    let (_t, svc, ws) = setup().await;
+    let quick = create_agent(&svc, &ws, "Quick").await;
+    let stalled = create_agent(&svc, &ws, "Stalled").await;
+    let fresh = create_agent(&svc, &ws, "Fresh").await;
+
+    let threshold = crate::agent_session::silent_tail_suspect_ms();
+    svc.record_turn_silent_tail(&quick, 1_200);
+    svc.record_turn_silent_tail(&stalled, threshold + 60_000);
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(row_for(&quick)["lastTurnSilentTailMs"], json!(1_200));
+    assert_eq!(
+        row_for(&stalled)["lastTurnSilentTailMs"],
+        json!(threshold + 60_000)
+    );
+    assert!(
+        row_for(&fresh).get("lastTurnSilentTailMs").is_none(),
+        "no ended turn, field omitted"
+    );
+
+    let risks = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let long: Vec<&serde_json::Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("long-silent-tail"))
+        .collect();
+    assert_eq!(long.len(), 1, "risks: {risks:?}");
+    assert_eq!(long[0]["agentId"], json!(stalled.0));
+    assert_eq!(long[0]["severity"], json!("warning"));
+    assert_eq!(long[0]["silentTailMs"], json!(threshold + 60_000));
+    assert_eq!(long[0]["thresholdMs"], json!(threshold));
+    assert!(
+        long[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("silently truncated"),
+        "message: {}",
+        long[0]["message"]
+    );
+
+    // A later turn's record replaces the previous one — a healthy follow-up
+    // turn clears the risk.
+    svc.record_turn_silent_tail(&stalled, 800);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics after healthy turn");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let stalled_row = rows
+        .iter()
+        .find(|r| r["id"].as_str() == Some(stalled.0.as_str()))
+        .expect("agent row");
+    assert_eq!(stalled_row["lastTurnSilentTailMs"], json!(800));
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("long-silent-tail")),
+        "healthy turn clears the risk: {result}"
+    );
+
+    // Diagnostics-only: the hot list payloads never carry the field.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    let listed = serde_json::to_value(&agents).expect("serialize");
+    for row in listed.as_array().expect("agents array") {
+        assert!(
+            row.get("lastTurnSilentTailMs").is_none(),
+            "agent.list omits lastTurnSilentTailMs: {row}"
+        );
+    }
+
+    // Agent delete drops the in-memory record.
+    svc.agent_delete_op(quick.clone(), Some(ws.clone()))
+        .await
+        .expect("delete");
+    assert!(
+        svc.last_turn_silent_tail(&quick).is_none(),
+        "delete clears the silent-tail record"
     );
 }
 
@@ -25362,9 +25548,19 @@ async fn task_graph_off_suppresses_unblocked_section() {
 /// `session/load` resume whose provider checkpoint lags the daemon transcript
 /// by the interrupted turn.
 mod resume_tail_recap {
-    use crate::agent_ops::{build_resume_tail_recap, RESUME_CONTINUATION_TEXT};
+    use crate::agent_ops::{
+        build_resume_tail_recap, LEGACY_RESUME_CONTINUATION_TEXT,
+        RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_CONTINUATION_METADATA_TYPE,
+    };
     use intent_core::{AgentId, AgentMessage};
     use serde_json::{json, Value};
+
+    /// A duration-suffixed continuation as `resume_interrupted_agent`
+    /// delivers it — persisted rows embed a per-resume duration and carry
+    /// the [`RESUME_CONTINUATION_METADATA_TYPE`] tag the recap skip keys off.
+    const DURATION_CONTINUATION: &str = "You were interrupted for about 15 seconds due to a \
+         harness shutdown and restart. You can now continue your work and pick up where you \
+         left off.";
 
     fn message(role: &str, content: Value, metadata: Option<Value>) -> AgentMessage {
         AgentMessage {
@@ -25381,6 +25577,16 @@ mod resume_tail_recap {
 
     fn user(text: &str) -> AgentMessage {
         message("user", json!([{ "type": "text", "text": text }]), None)
+    }
+
+    /// A persisted continuation row as `resume_interrupted_agent` delivers
+    /// it: user role with the [`RESUME_CONTINUATION_METADATA_TYPE`] tag.
+    fn continuation_row(text: &str) -> AgentMessage {
+        message(
+            "user",
+            json!([{ "type": "text", "text": text }]),
+            Some(json!({ "type": RESUME_CONTINUATION_METADATA_TYPE, "source": "system" })),
+        )
     }
 
     fn assistant(text: &str) -> AgentMessage {
@@ -25509,7 +25715,7 @@ mod resume_tail_recap {
             user("original lost request"),
             interrupted_assistant("first partial..."),
             system_marker(),
-            user(RESUME_CONTINUATION_TEXT),
+            continuation_row(DURATION_CONTINUATION),
             interrupted_assistant("second partial..."),
             system_marker(),
         ];
@@ -25524,8 +25730,59 @@ mod resume_tail_recap {
         // The continuation wording is re-sent fresh each resume — the
         // persisted copy must not be replayed as a quoted user message.
         assert!(!recap.text.contains(&format!(
-            "<interrupted_user_message>\n{RESUME_CONTINUATION_TEXT}"
+            "<interrupted_user_message>\n{DURATION_CONTINUATION}"
         )));
+    }
+
+    /// The recap skips tagged continuation rows of every wording — the
+    /// duration-suffixed variant and the no-duration fallback — plus
+    /// untagged legacy rows matched by exact equality with
+    /// [`LEGACY_RESUME_CONTINUATION_TEXT`].
+    #[test]
+    fn recap_skips_all_continuation_variants() {
+        let variants = [
+            continuation_row(DURATION_CONTINUATION),
+            continuation_row(RESUME_CONTINUATION_FALLBACK_TEXT),
+            user(LEGACY_RESUME_CONTINUATION_TEXT),
+        ];
+        for row in variants {
+            let text = row.content[0]["text"].as_str().unwrap().to_string();
+            let messages = vec![
+                user("original lost request"),
+                interrupted_assistant("first partial..."),
+                system_marker(),
+                row,
+                interrupted_assistant("second partial..."),
+            ];
+            let recap = build_resume_tail_recap(&messages).expect("recap");
+            assert!(recap.text.contains("original lost request"));
+            assert!(
+                !recap
+                    .text
+                    .contains(&format!("<interrupted_user_message>\n{text}")),
+                "continuation variant must not be replayed: {text}"
+            );
+        }
+    }
+
+    /// The skip is keyed on the metadata tag, not the text: an ORDINARY
+    /// user request that happens to carry the exact continuation wording
+    /// (untagged, non-legacy) is still replayed — losing it would drop the
+    /// user's request from the provider-side context after a restart.
+    #[test]
+    fn recap_replays_untagged_message_with_continuation_wording() {
+        for text in [
+            DURATION_CONTINUATION,
+            RESUME_CONTINUATION_FALLBACK_TEXT,
+            "You were interrupted earlier — please investigate why",
+        ] {
+            let messages = vec![user(text), interrupted_assistant("partial...")];
+            let recap = build_resume_tail_recap(&messages).expect("recap");
+            assert!(
+                recap.text.contains(text),
+                "untagged user message must be replayed: {text}"
+            );
+        }
     }
 
     /// Replayed text is XML-escaped: a user message containing closing tags
@@ -25601,7 +25858,7 @@ mod resume_tail_recap {
         for i in 0..20 {
             messages.push(interrupted_assistant(&format!("partial-{i}")));
             messages.push(system_marker());
-            messages.push(user(RESUME_CONTINUATION_TEXT));
+            messages.push(continuation_row(DURATION_CONTINUATION));
         }
         messages.push(interrupted_assistant("partial-final"));
         let recap = build_resume_tail_recap(&messages).expect("recap");
@@ -25609,5 +25866,63 @@ mod resume_tail_recap {
         assert!(recap.text.contains("partial-final"));
         assert!(recap.text.contains("elided"));
         assert!(!recap.text.contains("partial-0"), "oldest partials elided");
+    }
+}
+
+/// Restart-resume continuation construction: the humanized outage duration
+/// and the never-fail fallback (`resume_continuation_text`).
+mod resume_continuation {
+    use crate::agent_ops::{
+        humanize_outage_duration, resume_continuation_text, RESUME_CONTINUATION_FALLBACK_TEXT,
+    };
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    fn parse(s: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(s, &Rfc3339).expect("parse test timestamp")
+    }
+
+    /// Coarse single-unit humanization: seconds under 2 minutes, minutes
+    /// under 2 hours, hours under 2 days, else days — with singular forms.
+    #[test]
+    fn humanizes_coarse_single_unit() {
+        assert_eq!(humanize_outage_duration(0), "0 seconds");
+        assert_eq!(humanize_outage_duration(1), "1 second");
+        assert_eq!(humanize_outage_duration(45), "45 seconds");
+        assert_eq!(humanize_outage_duration(119), "119 seconds");
+        assert_eq!(humanize_outage_duration(120), "2 minutes");
+        assert_eq!(humanize_outage_duration(15 * 60 + 29), "15 minutes");
+        assert_eq!(humanize_outage_duration(2 * 3_600 - 1), "119 minutes");
+        assert_eq!(humanize_outage_duration(2 * 3_600), "2 hours");
+        assert_eq!(humanize_outage_duration(2 * 86_400 - 1), "47 hours");
+        assert_eq!(humanize_outage_duration(2 * 86_400), "2 days");
+        assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
+    }
+
+    /// The delivered wording embeds the duration.
+    #[test]
+    fn continuation_carries_duration() {
+        let text = resume_continuation_text("2026-08-15T12:00:00Z", parse("2026-08-15T12:00:15Z"));
+        assert_eq!(
+            text,
+            "You were interrupted for about 15 seconds due to a harness shutdown and restart. \
+             You can now continue your work and pick up where you left off."
+        );
+    }
+
+    /// An unparseable `interrupted_at` never fails the resume: the base
+    /// text is sent unchanged.
+    #[test]
+    fn continuation_falls_back_on_unparseable_timestamp() {
+        let text = resume_continuation_text("not-a-timestamp", parse("2026-08-15T12:00:00Z"));
+        assert_eq!(text, RESUME_CONTINUATION_FALLBACK_TEXT);
+    }
+
+    /// A negative delta (clock skew: `interrupted_at` in the future) also
+    /// falls back to the base text.
+    #[test]
+    fn continuation_falls_back_on_negative_delta() {
+        let text = resume_continuation_text("2026-08-15T12:00:30Z", parse("2026-08-15T12:00:00Z"));
+        assert_eq!(text, RESUME_CONTINUATION_FALLBACK_TEXT);
     }
 }

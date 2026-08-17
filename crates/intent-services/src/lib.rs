@@ -170,7 +170,9 @@ pub use agent_session::SuspendOverlapQuery;
 // The individual watcher families are constructed only by `WatcherRegistry`
 // (they now take the crate-private shared-stream hub), so only the registry and
 // the bus/refresher surface leave the crate.
-pub use events::{EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry};
+pub use events::{
+    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
+};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::{
     fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
@@ -453,6 +455,13 @@ pub struct Services {
     /// interleave a concurrent row mutation. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
     attention_write_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/monorepo#2739) for the
+    /// `deliver_wake_message` archived-gate read → enqueue window: parks the
+    /// wake delivery after the gate observed the workspace archived and
+    /// before the enqueue, so a concurrent `workspace.unarchive` landing
+    /// inside that window is deterministic. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_wake_archived_park`.
+    wake_archived_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -494,6 +503,11 @@ pub struct Services {
     /// (monorepo#738): see [`agent_session::TurnBookkeeping`]. Shared across
     /// clones so consecutive turns of one agent chain onto the same handle.
     turn_bookkeeping: agent_session::TurnBookkeeping,
+    /// Per-agent silent tail of the most recently ended turn
+    /// (intent-hq/monorepo#2669): see [`agent_session::LastTurnSilentTails`].
+    /// Shared across clones so the turn writer and the `agent.diagnostics`
+    /// read door observe the same state.
+    last_turn_silent_tails: agent_session::LastTurnSilentTails,
     /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
     /// tests simulate an in-flight worker without spawning a real
     /// [`AgentManager`]. Production composition always attaches a manager and
@@ -849,6 +863,7 @@ impl Services {
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
             attention_write_park: None,
+            wake_archived_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -859,6 +874,7 @@ impl Services {
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
+            last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -1205,6 +1221,21 @@ impl Services {
         self.specialist_model_options(wp.as_deref())
     }
 
+    /// Non-empty trimmed string at `key` in a session's raw metadata JSON —
+    /// the read shape shared by the `behaviorPrompt` override slot and the
+    /// frozen specialist-identity snapshot keys (`specialistName` /
+    /// `specialistRoleReminder`) persisted at creation by `agent_create_op`.
+    fn session_metadata_str(session: &AgentSession, key: &str) -> Option<String> {
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
     /// prepend to a specialist agent's next turn, or `None` when the agent has no
     /// specialist or its specialist yields no reminder (port of acp-provider.ts
@@ -1213,6 +1244,16 @@ impl Services {
     pub(crate) async fn agent_role_reminder(&self, agent_id: &AgentId) -> Option<String> {
         let session = self.store.get_agent_session(agent_id).await.ok()?;
         let specialist_id = session.specialist.as_deref()?;
+        // Frozen identity snapshot (persisted at creation by `agent_create_op`):
+        // when present it wins over live 3-tier resolution, so later edits or
+        // deletes of specialist files never change this agent's reminder. A
+        // frozen name without a frozen reminder means creation resolved no
+        // usable reminder — stay silent rather than falling back live.
+        if let Some(name) = Self::session_metadata_str(&session, "specialistName") {
+            let reminder = Self::session_metadata_str(&session, "specialistRoleReminder")?;
+            return Some(crate::harness::latest().role_reminder_prefix(&name, &reminder));
+        }
+        // Legacy sessions (no frozen keys): live 3-tier resolution, unchanged.
         let workspace_path = self
             .store
             .get_workspace(&session.workspace_id)
@@ -1242,14 +1283,27 @@ impl Services {
         workspace_path: Option<&Path>,
     ) -> Option<crate::rules::SpecialistPromptInjection> {
         let session = self.store.get_agent_session(agent_id).await.ok()?;
-        let override_bp = session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("behaviorPrompt"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let override_bp = Self::session_metadata_str(&session, "behaviorPrompt");
+        // Frozen identity snapshot (persisted at creation by `agent_create_op`):
+        // on a specialist session, `specialistName` presence marks a snapshot
+        // and the whole triple is read frozen — the body from the
+        // `behaviorPrompt` override slot (absent when the specialist had no
+        // body at creation), skipping live resolution entirely so file
+        // edits/deletes never change the injection. Gated on
+        // `session.specialist` (mirroring `agent_role_reminder` and the
+        // write-side invariant that snapshots are only written for specialist
+        // sessions), so a caller-supplied `specialistName` on a
+        // non-specialist session stays inert. Legacy sessions fall through to
+        // live resolution below.
+        if session.specialist.is_some() {
+            if let Some(name) = Self::session_metadata_str(&session, "specialistName") {
+                return Some(crate::rules::SpecialistPromptInjection {
+                    behavior_prompt: override_bp,
+                    specialist_name: Some(name),
+                    role_reminder: Self::session_metadata_str(&session, "specialistRoleReminder"),
+                });
+            }
+        }
         // Embedded floor pinned to the session's stamped harness version
         // (H2) so respawns under a newer binary keep the pinned prompts.
         let entry = crate::harness::resolve_entry(&session.harness_version);
@@ -1379,6 +1433,16 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.attention_write_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
+    /// its archived-gate read → enqueue window so a concurrent
+    /// `workspace.unarchive` inside that window is deterministic. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_wake_archived_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+        self.wake_archived_park = Some(park);
         self
     }
 
@@ -6733,9 +6797,15 @@ fn note_to_workspace_task(
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
 /// `parentAgentId` (v2.9) carries the session's delegation parent (the value
 /// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
-/// root agents.
+/// root agents. Soft-deleted sessions (`AgentStatus::Deleted`) are excluded
+/// from `count`/`agents`/`agentIds` so clients never render deleted rows
+/// (mirrors the `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
-    let agents: Vec<WorkspaceAgentInfo> = sessions
+    let live: Vec<&AgentSession> = sessions
+        .iter()
+        .filter(|s| s.status != intent_core::AgentStatus::Deleted)
+        .collect();
+    let agents: Vec<WorkspaceAgentInfo> = live
         .iter()
         .map(|s| WorkspaceAgentInfo {
             id: s.id.clone(),
@@ -6748,7 +6818,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             parent_agent_id: s.parent_agent_id.clone(),
         })
         .collect();
-    let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+    let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();
     WorkspaceAgentSummary {
         count: agents.len(),
         agents,
@@ -14385,6 +14455,7 @@ impl WorkspaceApi for Services {
         let manager = self.agent_manager();
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
+        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         // Full handle for the direct completion delivery below (Services is
         // Clone — the same capture pattern the spawn helpers use).
@@ -14451,6 +14522,10 @@ impl WorkspaceApi for Services {
                 // last chance to unlink this state, so best-effort teardown
                 // outweighs propagating a mutex-poison panic.
                 live_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                last_turn_silent_tails
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);

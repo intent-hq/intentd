@@ -5,12 +5,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use intent_core::{ActorType, EventActor, WorkspaceId};
+use intent_core::{ActorType, Event, EventActor, WorkspaceId};
 use intent_store::{EventQuery, NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
-use super::bus::EventBus;
+use super::bus::{Delivery, EventBus, LagWarnThrottle, BROADCAST_CAPACITY, LAG_WARN_INTERVAL};
 use super::filter::SubscriptionFilter;
 
 struct TempDb {
@@ -724,5 +724,361 @@ async fn oneshot_receiver_drop_is_handled_gracefully() {
     assert!(
         result.is_ok(),
         "subsequent publish should succeed after oneshot receiver drop"
+    );
+}
+
+// --- Batch-insert retry on transient failure (monorepo#2673) ---------------
+//
+// `flush_prepared` is the insert-retry + resolve/broadcast core of the writer
+// task's `flush_batch`, generic over the insert operation so these tests can
+// inject failures without a real contended pool. `start_paused` auto-advances
+// the retry backoff sleeps.
+
+/// A stored `Event` as `insert_events` would return it for `ev`.
+fn stored_event(id: &str, ev: &NewEvent) -> Event {
+    Event {
+        id: id.to_string(),
+        workspace_id: ev.workspace_id.clone(),
+        timestamp: ev.timestamp.clone(),
+        event_type: ev.event_type.clone(),
+        actor: ev.actor.clone(),
+        session_id: ev.session_id.clone(),
+        correlation_id: ev.correlation_id.clone(),
+        parent_event_id: ev.parent_event_id.clone(),
+        metadata: ev.metadata.clone(),
+        data: ev.data.clone(),
+    }
+}
+
+/// The observed failure mode: `pool.acquire()` timing out under contention.
+fn transient_error() -> intent_core::Error {
+    intent_core::Error::Internal(
+        "acquire connection failed: pool timed out while waiting for an open connection"
+            .to_string(),
+    )
+}
+
+/// Drift guard: classify an error built through the SAME construction path as
+/// `insert_events` — `format!("acquire connection failed: {e}")` over a real
+/// `sqlx::Error::PoolTimedOut` — so a wording change on either side (the
+/// `event_repo.rs` prefix or sqlx's Display) breaks this test instead of
+/// silently disabling retries.
+#[test]
+fn transient_classification_matches_insert_events_wording() {
+    let sqlx_err = sqlx::Error::PoolTimedOut;
+    let as_insert_events_builds_it =
+        intent_core::Error::Internal(format!("acquire connection failed: {sqlx_err}"));
+    assert!(
+        super::bus::is_transient_insert_error(&as_insert_events_builds_it),
+        "acquire-timeout error must classify as transient: {as_insert_events_builds_it}"
+    );
+    // And a permanent failure through the same lens stays permanent.
+    let permanent =
+        intent_core::Error::Internal("insert failed: UNIQUE constraint failed: event.id".into());
+    assert!(!super::bus::is_transient_insert_error(&permanent));
+}
+
+/// Regression (monorepo#2673): a transient acquire failure must not drop the
+/// batch — the retry succeeds and the events are delivered both to the
+/// publisher (oneshot) and to live subscribers (broadcast).
+#[tokio::test(start_paused = true)]
+async fn transient_batch_insert_failure_retries_and_delivers() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let stored = stored_event("evt-1", &ev);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            let fail = attempts.get() == 1;
+            let stored = stored.clone();
+            async move {
+                if fail {
+                    Err(transient_error())
+                } else {
+                    Ok(vec![stored])
+                }
+            }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert_eq!(attempts.get(), 2, "one transient failure, one retry");
+    assert!(pending.is_empty());
+    let resolved = orx
+        .await
+        .expect("oneshot resolved")
+        .expect("publisher sees Ok after retry");
+    assert_eq!(resolved.id, "evt-1");
+    let broadcast = brx.recv().await.expect("broadcast delivered");
+    assert_eq!(broadcast.id, "evt-1");
+}
+
+/// Permanent failures (e.g. a constraint violation) must NOT retry: one
+/// attempt, publishers resolve with the error, nothing broadcast.
+#[tokio::test(start_paused = true)]
+async fn permanent_batch_insert_failure_does_not_retry() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            async {
+                Err(intent_core::Error::Internal(
+                    "insert events failed: UNIQUE constraint failed: event.id".to_string(),
+                ))
+            }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert_eq!(attempts.get(), 1, "permanent failures never retry");
+    assert!(pending.is_empty());
+    let err = orx
+        .await
+        .expect("oneshot resolved")
+        .expect_err("publisher sees the error");
+    assert!(
+        err.to_string().contains("batch insert failed"),
+        "existing error shape preserved: {err}"
+    );
+    assert!(
+        matches!(
+            brx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "nothing broadcast on durable failure"
+    );
+}
+
+/// A persistently transient failure exhausts the bounded retry budget, then
+/// resolves publishers with the error (existing behavior) without broadcast.
+#[tokio::test(start_paused = true)]
+async fn transient_batch_insert_failure_exhausts_retries() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            async { Err(transient_error()) }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert_eq!(
+        attempts.get(),
+        super::bus::INSERT_RETRY_MAX_ATTEMPTS,
+        "retry budget is bounded"
+    );
+    assert!(pending.is_empty());
+    let err = orx
+        .await
+        .expect("oneshot resolved")
+        .expect_err("publisher sees the error after exhausted retries");
+    assert!(err.to_string().contains("batch insert failed"));
+    assert!(
+        matches!(
+            brx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "nothing broadcast when retries are exhausted"
+    );
+}
+
+/// Test-only capturing `tracing` subscriber (mirrors the hand-rolled
+/// `test_capture` in `intent-transport/src/protocol.rs`; `tracing-subscriber`
+/// is not a dependency of this crate). Records `(level, rendered fields)` per
+/// event.
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl Capture {
+    fn warns(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for Capture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={:?} ", field.name(), value);
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), visitor.0));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Deterministic throttle semantics: the first lag warns immediately, reports
+/// inside [`LAG_WARN_INTERVAL`] are suppressed with their counts accumulated,
+/// and the next allowed WARN carries the accumulated total.
+#[test]
+fn lag_warn_throttle_rate_limits_and_accumulates() {
+    let t0 = std::time::Instant::now();
+    let mut throttle = LagWarnThrottle::default();
+    assert_eq!(
+        throttle.record(5, t0),
+        Some(5),
+        "first lag warns immediately"
+    );
+    assert_eq!(throttle.record(3, t0 + LAG_WARN_INTERVAL / 2), None);
+    assert_eq!(throttle.record(2, t0 + LAG_WARN_INTERVAL / 2), None);
+    assert_eq!(
+        throttle.record(1, t0 + LAG_WARN_INTERVAL),
+        Some(6),
+        "post-interval WARN carries the counts accumulated while throttled"
+    );
+}
+
+/// A subscriber driven past BROADCAST_CAPACITY must surface the loss: the
+/// delivery task's `Lagged` arm emits a WARN carrying the skipped count and
+/// the subscription's filter scope (event types + workspace).
+#[tokio::test]
+async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    filter.workspace_id = Some("ws-1".to_string());
+    let mut sub = bus.subscribe(filter);
+
+    let capture = Capture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    // Flood the broadcast ring in one non-yielding loop (`publish_transient`
+    // never awaits) so the delivery task cannot drain in between: its receiver
+    // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
+    const OVERFLOW: usize = 64;
+    for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
+        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+    }
+
+    // Delivery resumes after the lag report: the surviving events arrive.
+    let batch = timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert!(!batch.is_empty());
+
+    let warns = capture.warns();
+    let warn = warns
+        .iter()
+        .find(|l| l.contains("skipped="))
+        .unwrap_or_else(|| panic!("no broadcast-lag WARN captured; got: {warns:?}"));
+    assert!(
+        warn.contains(&format!("skipped={OVERFLOW}")),
+        "WARN must carry the exact skipped count, got: {warn}"
+    );
+    assert!(
+        warn.contains("note:*"),
+        "WARN must carry the filter's event types, got: {warn}"
+    );
+    assert!(
+        warn.contains("ws-1"),
+        "WARN must carry the workspace scope, got: {warn}"
+    );
+    assert!(
+        warn.contains("subscriber lagged"),
+        "WARN must describe the lag drop, got: {warn}"
+    );
+}
+
+/// A subscriber driven past BROADCAST_CAPACITY must ALSO see the loss in-band:
+/// `recv_delivery` yields a `Delivery::Lagged(n)` marker at the gap position
+/// (before the surviving post-drop events), carrying the ring's skipped count,
+/// so consumers like the chat forwarder can run a bounded recovery. Plain
+/// `recv` consumers keep seeing only event batches.
+#[tokio::test]
+async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    const OVERFLOW: usize = 64;
+    for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
+        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+    }
+
+    let first = timeout(Duration::from_secs(5), sub.recv_delivery())
+        .await
+        .expect("recv_delivery timed out")
+        .expect("subscription closed");
+    match first {
+        Delivery::Lagged(n) => assert_eq!(
+            n, OVERFLOW as u64,
+            "marker carries the ring's exact skipped count"
+        ),
+        Delivery::Batch(_) => panic!("expected the lag marker before any surviving event"),
+    }
+    let second = timeout(Duration::from_secs(5), sub.recv_delivery())
+        .await
+        .expect("recv_delivery timed out")
+        .expect("subscription closed");
+    assert!(
+        matches!(second, Delivery::Batch(ref b) if !b.is_empty()),
+        "surviving events follow the marker"
+    );
+}
+
+/// [`Subscription::recv`] must skip lag markers transparently: existing
+/// consumers (watchers, script/terminal streams) see only event batches.
+#[tokio::test]
+async fn recv_skips_lag_markers_transparently() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    for _ in 0..(BROADCAST_CAPACITY + 8) {
+        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+    }
+
+    let batch = timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert!(
+        !batch.is_empty(),
+        "recv yields the surviving events, never a marker"
     );
 }

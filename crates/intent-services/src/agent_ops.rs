@@ -32,6 +32,16 @@ const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 /// catching a wedged queue well before the incident's timescale.
 const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// Persisted-conversation size past which `agent.diagnostics` raises a
+/// `large-conversation` stuck-risk warning (intent-hq/monorepo#2669): in that
+/// incident, turns started silently dying (bare `end_turn` after an 11-13 min
+/// silent gap) once the conversation reached ~5.3-5.5 MB. 4 MiB is well past
+/// the transport's 1 MiB large-frame WARN while still comfortably before the
+/// observed failure sizes, so coordinators can rotate to a fresh agent BEFORE
+/// turns start dying. Diagnostics-only: the byte total never rides the hot
+/// `agent.list`/`agent.get` payloads.
+const LARGE_CONVERSATION_WARN_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -161,6 +171,9 @@ mod tests_delegate_provider_resolution;
 #[cfg(test)]
 mod tests_settings_default_effort;
 
+#[cfg(test)]
+mod tests_catalog_default_model;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -221,7 +234,12 @@ pub(crate) enum DefaultModelSource {
     Specialist,
     /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
     Settings,
-    /// Step 4 — nothing resolved; the provider CLI default applies.
+    /// Step 4 — the cached provider catalog's `isDefault` row
+    /// ([`crate::model_catalog::ModelCatalogCache::cached_default_model`]).
+    /// Not a settings default: the settings default reasoning effort does
+    /// NOT apply to it.
+    CatalogDefault,
+    /// Step 5 — nothing resolved; the provider CLI default applies.
     CliDefault,
 }
 
@@ -232,13 +250,17 @@ pub(crate) enum DefaultModelSource {
 /// by the caller. Also reusable standalone (e.g. `specialist.get/list`
 /// `resolvedModel`) so previews match what a no-model create actually pins.
 ///
-/// Precedence (steps 2–4; the former `modelTier` step is retired — the key
+/// Precedence (steps 2–5; the former `modelTier` step is retired — the key
 /// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
 /// 3. Settings chain ([`resolve_default_model_from_settings`]) —
 ///    provider-guarded.
-/// 4. `None` → provider CLI default (`session.model` stays unset).
+/// 4. The **cached** provider catalog's `isDefault` row (PROTOCOL §5.30) —
+///    cache-only, never a probe: pinning it freezes the model even if the
+///    provider later changes its default. Cold cache or no marked row falls
+///    through.
+/// 5. `None` → provider CLI default (`session.model` stays unset).
 ///
 /// The chain is background-agnostic (monorepo#1729): the quick-action model
 /// settings apply to single-shot quick actions only, so a delegated
@@ -299,21 +321,33 @@ pub(crate) fn resolve_agent_default_model_with_source(
     }
 
     // Step 3: settings chain, provider-guarded — a configured default owned
-    // by another provider must not be pinned (monorepo#607); drop to the CLI
-    // default instead of rejecting a model the caller never sent.
-    let Some(m) = resolve_default_model_from_settings(services, provider) else {
-        return (None, DefaultModelSource::CliDefault);
-    };
-    if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-        return (Some(m), DefaultModelSource::Settings);
+    // by another provider must not be pinned (monorepo#607); drop to the
+    // catalog/CLI default instead of rejecting a model the caller never sent.
+    if let Some(m) = resolve_default_model_from_settings(services, provider) {
+        if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+            return (Some(m), DefaultModelSource::Settings);
+        }
+        tracing::warn!(
+            model = m,
+            provider = effective_provider,
+            "configured default model belongs to another provider; \
+             falling back to the catalog/CLI default"
+        );
     }
-    tracing::warn!(
-        model = m,
-        provider = effective_provider,
-        "configured default model belongs to another provider; \
-         falling back to the CLI default"
-    );
-    // Step 4: None → provider CLI default.
+
+    // Step 4: the cached catalog's `isDefault` row for the resolved provider
+    // (PROTOCOL §5.5). Cache-only — never a probe on the creation path; the
+    // row is the provider's own by construction, so no ownership guard is
+    // needed. Pinning it to session.model freezes the model for the
+    // session's lifetime even if the provider later changes its default.
+    if let Some(m) = services
+        .models_catalog
+        .cached_default_model(effective_provider)
+    {
+        return (Some(m), DefaultModelSource::CatalogDefault);
+    }
+
+    // Step 5: None → provider CLI default.
     (None, DefaultModelSource::CliDefault)
 }
 
@@ -2470,7 +2504,7 @@ impl Services {
             provider,
             reasoning_effort,
             agent_type: _,
-            metadata,
+            mut metadata,
             workspace_path: _, // Ignored; derived from workspace record for security
             workspace_context: _,
             context_references,
@@ -2526,8 +2560,9 @@ impl Services {
         // workspacePath and read specialist files from other workspaces.
         // Use worktree_path if available, otherwise repository_path. Read once
         // and only when a specialist tier is actually consulted (model
-        // resolution and/or the specialist reasoning-effort rungs below).
-        let spec_wp = match model.is_none() || (specialist.is_some() && !reasoning_effort_decided) {
+        // resolution, the specialist reasoning-effort rungs, and/or the
+        // specialist prompt snapshot below).
+        let spec_wp = match model.is_none() || specialist.is_some() {
             true => self
                 .store
                 .get_workspace(&workspace_id)
@@ -2666,6 +2701,53 @@ impl Services {
                 resolved_model.as_deref(),
             ),
         };
+        // Specialist prompt snapshot: freeze the resolved specialist injection
+        // for the session's lifetime by persisting it into the metadata JSON,
+        // so later edits/deletes of user/project-tier specialist files never
+        // change this agent on respawn. The resolved body reuses the
+        // `behaviorPrompt` override slot — written only when the caller
+        // supplied no explicit override (a caller override is left untouched
+        // and is itself the frozen body); the resolved identity lands in
+        // `specialistName` / `specialistRoleReminder`. The bundled floor
+        // consulted here is the latest bundle — the same doctrine the
+        // `harnessVersion` stamp below pins — so no H2 interplay changes.
+        // Unknown specialist / resolution failure writes no snapshot and
+        // never fails the create; a non-object caller `metadata` is left
+        // untouched.
+        if let Some(spec_id) = specialist.as_deref() {
+            if let Some((body, spec_name, reminder)) = self
+                .specialists_service()
+                .resolve_prompt_injection(spec_id, spec_wp.as_deref())
+            {
+                let meta_value =
+                    metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(obj) = meta_value.as_object_mut() {
+                    let has_override = obj
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_override {
+                        if let Some(body) = body {
+                            obj.insert("behaviorPrompt".to_string(), json!(body));
+                        }
+                    }
+                    obj.insert("specialistName".to_string(), json!(spec_name));
+                    // The reminder key always reflects the resolution
+                    // outcome: a resolved reminder overwrites, a None
+                    // resolution REMOVES any caller-supplied key so the
+                    // frozen readers never consume free-form caller input
+                    // as a trusted reminder.
+                    match reminder {
+                        Some(reminder) => {
+                            obj.insert("specialistRoleReminder".to_string(), json!(reminder));
+                        }
+                        None => {
+                            obj.remove("specialistRoleReminder");
+                        }
+                    }
+                }
+            }
+        }
         // Harness stamp (intent-hq/monorepo#2459): every new session gets the
         // CURRENT harness version and a snapshot of the effective
         // agentFeatures values, captured once here and immutable for the
@@ -2981,6 +3063,10 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
+        // Silent-tail record (intent-hq/monorepo#2669): in-memory, keyed by
+        // agent — drop it with the session so the map never leaks entries
+        // for deleted agents.
+        self.clear_turn_silent_tail(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
@@ -7769,8 +7855,8 @@ impl Services {
                 .and_then(|s| agent_status_wire(s.status))
                 .unwrap_or("unknown");
             // Use lightweight message stats instead of full hydration
-            let (message_count_val, has_assistant) =
-                message_stats.get(id).copied().unwrap_or((0, false));
+            let (message_count_val, has_assistant, conversation_bytes) =
+                message_stats.get(id).copied().unwrap_or((0, false, 0));
             let message_count = if message_count_val > 0 {
                 Some(message_count_val)
             } else {
@@ -7807,6 +7893,13 @@ impl Services {
             if let Some(mc) = message_count {
                 row.insert("messageCount".into(), json!(mc));
             }
+            // Persisted-conversation size (intent-hq/monorepo#2669): session-
+            // size pressure signal so coordinators can rotate agents before
+            // turns start dying under context bloat. Omitted when zero (no
+            // messages), like `messageCount`.
+            if conversation_bytes > 0 {
+                row.insert("conversationBytes".into(), json!(conversation_bytes));
+            }
             row.insert("subscriptionCount".into(), json!(subscription_count));
             row.insert(
                 "eventSubscriptionCount".into(),
@@ -7835,6 +7928,15 @@ impl Services {
             }
             if let Some(bytes) = agent_memory.get(&AgentId(id.clone())) {
                 row.insert("subtreeMemoryBytes".into(), json!(bytes));
+            }
+            // Silent tail of the most recently ended turn
+            // (intent-hq/monorepo#2669): ms of stream silence before the
+            // prompt resolved, recorded in-memory at turn end. Omitted when
+            // no turn ended this daemon lifetime. Diagnostics-only by design
+            // (like `subtreeMemoryBytes`): never on the hot
+            // `agent.list`/`agent.get` payloads.
+            if let Some(tail_ms) = self.last_turn_silent_tail(&AgentId(id.clone())) {
+                row.insert("lastTurnSilentTailMs".into(), json!(tail_ms));
             }
             agent_rows.push(Value::Object(row));
         }
@@ -7893,6 +7995,49 @@ impl Services {
                     risk.insert("ageMs".into(), json!(a));
                 }
                 stuck_risks.push(Value::Object(risk));
+            }
+            // Large persisted conversation (intent-hq/monorepo#2669): past
+            // [`LARGE_CONVERSATION_WARN_BYTES`] the session is at risk of
+            // silently-truncated turns — surface it so coordinators rotate to
+            // a fresh agent before turns start dying.
+            if let Some(bytes) = row["conversationBytes"].as_u64() {
+                if bytes > LARGE_CONVERSATION_WARN_BYTES {
+                    stuck_risks.push(json!({
+                        "type": "large-conversation",
+                        "severity": "warning",
+                        "message": format!(
+                            "Agent {aid} has a large persisted conversation ({bytes} bytes > {LARGE_CONVERSATION_WARN_BYTES}); turns may start silently truncating under session bloat — consider rotating to a fresh agent"
+                        ),
+                        "agentId": aid,
+                        "conversationBytes": bytes,
+                        "thresholdBytes": LARGE_CONVERSATION_WARN_BYTES,
+                    }));
+                }
+            }
+            // Long silent tail on the last ended turn
+            // (intent-hq/monorepo#2669): the incident signature of a
+            // silently-truncated turn is a clean `end_turn` after 11-13 min
+            // of stream silence — surface a tail past the suspect threshold
+            // so coordinators see the turn likely died rather than finished.
+            // The tail is recorded for every resolution (completed,
+            // cancelled, or timed out — only invisible pre-output redrives
+            // are excluded), so the wording covers all of them: a deliberate
+            // interrupt aimed at a stalled agent legitimately lands here,
+            // and its follow-up turn overwrites the record anyway.
+            if let Some(tail_ms) = row["lastTurnSilentTailMs"].as_u64() {
+                let threshold_ms = crate::agent_session::silent_tail_suspect_ms();
+                if tail_ms >= threshold_ms {
+                    stuck_risks.push(json!({
+                        "type": "long-silent-tail",
+                        "severity": "warning",
+                        "message": format!(
+                            "Agent {aid}'s last turn ended (completed, cancelled, or timed out) after {tail_ms}ms of stream silence (>= {threshold_ms}ms); if it completed, it may have been silently truncated under session bloat rather than finishing"
+                        ),
+                        "agentId": aid,
+                        "silentTailMs": tail_ms,
+                        "thresholdMs": threshold_ms,
+                    }));
+                }
             }
         }
         // Stale undelivered queue entries (intent-hq/monorepo#1897): a
@@ -8882,6 +9027,14 @@ impl Services {
         if !workspace_id.is_chief() {
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {
+                    // Test seam (intent-hq/monorepo#2739): park in the
+                    // archived-check → enqueue window so a test can land a
+                    // concurrent `workspace.unarchive` between the gate's
+                    // read above and the enqueue below.
+                    if let Some(park) = &self.wake_archived_park {
+                        park.entered.notify_one();
+                        park.release.notified().await;
+                    }
                     let (queued, position) = self.enqueue_message(
                         agent_id,
                         content.to_string(),
@@ -8891,12 +9044,29 @@ impl Services {
                         None,
                         false,
                     );
-                    self.publish_queue_updated(agent_id).await;
-                    return Ok(json!({
+                    let result = json!({
                         "success": true,
                         "queued": true,
+                        "archivedParked": true,
                         "queuedMessage": queued.to_value(position),
-                    }));
+                    });
+                    self.publish_queue_updated(agent_id).await;
+                    // Race close (archived-check → enqueue vs a concurrent
+                    // `workspace.unarchive`): the unarchive's own drain kick
+                    // may have fired against a still-empty queue before this
+                    // enqueue landed, stranding the wake. Re-check and kick
+                    // the drain if the workspace is no longer archived; the
+                    // archived gate in `try_drain_queue` makes this a no-op
+                    // while still archived.
+                    if let Ok(current) = self.store.get_workspace(workspace_id).await {
+                        if !current.archived {
+                            manager
+                                .clone()
+                                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                                .await;
+                        }
+                    }
+                    return Ok(result);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -10141,14 +10311,73 @@ const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
 /// whole recap exists to preserve; the freshest partials matter most).
 const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
 
-/// The restart-resume continuation message (`resume_interrupted_agent`).
-/// Re-sent verbatim on every resume, so persisted copies of it in the
-/// transcript tail are never replayed by the recap — a second restart would
-/// otherwise stop the tail walk at the previous resume's continuation row
-/// and lose the original request again.
-pub(crate) const RESUME_CONTINUATION_TEXT: &str = "You were interrupted because the harness shut \
-     down. You now have a chance to continue the work — review your last steps and pick up where \
-     you left off.";
+/// `metadata.type` stamped on every restart-resume continuation message
+/// (`resume_interrupted_agent`), riding `messageMetadata` onto the persisted
+/// user row. A fresh continuation is re-sent on every resume, so persisted
+/// copies in the transcript tail are never replayed by the recap — the walk
+/// identifies them by THIS tag, never by their text: a text match (even a
+/// prefix one) would also swallow an ordinary user request that happens to
+/// start with the continuation wording, and if that request was interrupted
+/// the next restart's recap would omit it even though it is absent from the
+/// provider checkpoint. Rows persisted before the tag existed carry the
+/// legacy wording and are skipped by exact equality with
+/// [`LEGACY_RESUME_CONTINUATION_TEXT`].
+pub(crate) const RESUME_CONTINUATION_METADATA_TYPE: &str = "resume_continuation";
+
+/// The retired pre-duration continuation wording, kept ONLY as the
+/// exact-equality recap skip for legacy transcript rows persisted before
+/// [`RESUME_CONTINUATION_METADATA_TYPE`] tagging existed. Never sent.
+pub(crate) const LEGACY_RESUME_CONTINUATION_TEXT: &str = "You were interrupted because the \
+     harness shut down. You now have a chance to continue the work — review your last steps and \
+     pick up where you left off.";
+
+/// Fallback restart-resume continuation, sent unchanged when the claimed
+/// row's `interrupted_at` cannot be parsed or the delta is negative — the
+/// resume never fails on the timestamp.
+pub(crate) const RESUME_CONTINUATION_FALLBACK_TEXT: &str = "You were interrupted due to a \
+     harness shutdown and restart. You can now continue your work and pick up where you left \
+     off.";
+
+/// Humanize an outage duration coarsely for the resume continuation: a
+/// single unit — seconds under 2 minutes, minutes under 2 hours, hours under
+/// 2 days, else days — matching the wording's "for about {duration}" framing.
+fn humanize_outage_duration(seconds: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let (value, unit) = if seconds < 2 * MINUTE {
+        (seconds, "second")
+    } else if seconds < 2 * HOUR {
+        (seconds / MINUTE, "minute")
+    } else if seconds < 2 * DAY {
+        (seconds / HOUR, "hour")
+    } else {
+        (seconds / DAY, "day")
+    };
+    let plural = if value == 1 { "" } else { "s" };
+    format!("{value} {unit}{plural}")
+}
+
+/// Build the restart-resume continuation message: the approved wording with
+/// the humanized outage duration (`now` − `interrupted_at`), or
+/// [`RESUME_CONTINUATION_FALLBACK_TEXT`] when the timestamp is unparseable
+/// or in the future. Either variant is delivered under
+/// [`RESUME_CONTINUATION_METADATA_TYPE`] metadata, which the recap skip
+/// keys off.
+fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> String {
+    let Some(at) = parse_iso(interrupted_at) else {
+        return RESUME_CONTINUATION_FALLBACK_TEXT.to_string();
+    };
+    let seconds = (now - at).whole_seconds();
+    if seconds < 0 {
+        return RESUME_CONTINUATION_FALLBACK_TEXT.to_string();
+    }
+    format!(
+        "You were interrupted for about {} due to a harness shutdown and restart. You can now \
+         continue your work and pick up where you left off.",
+        humanize_outage_duration(seconds)
+    )
+}
 
 /// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
 /// recap text plus any attachment blocks the replayed user rows carried.
@@ -10191,7 +10420,11 @@ enum TailSegment {
 /// assistant rows (skipping system rows) until the completed-turn boundary.
 /// A single restart leaves `user + partial`; repeated restarts stack further
 /// partials, and the previous resumes' persisted continuation rows are
-/// skipped (each resume re-sends [`RESUME_CONTINUATION_TEXT`] verbatim).
+/// skipped by their [`RESUME_CONTINUATION_METADATA_TYPE`] metadata tag —
+/// legacy pre-tag rows by exact equality with
+/// [`LEGACY_RESUME_CONTINUATION_TEXT`] — never by a text prefix, so an
+/// ordinary user request that happens to open with the continuation
+/// wording is still replayed (each resume re-sends a fresh continuation).
 /// Replayed text is XML-escaped like `format_history_as_xml`, so a message
 /// containing closing tags cannot break out of its quoting element. Returns
 /// `None` when the tail has no incomplete rows (the provider checkpoint is
@@ -10224,11 +10457,18 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                 }
             }
             "user" => {
+                let tagged_continuation = m
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("type"))
+                    .and_then(Value::as_str)
+                    == Some(RESUME_CONTINUATION_METADATA_TYPE);
                 let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
                 let text = crate::agent_session::text_block_strings(blocks).join("\n");
-                if text == RESUME_CONTINUATION_TEXT {
-                    // A previous resume's continuation row — re-sent fresh by
-                    // every resume, never replayed.
+                if tagged_continuation || text == LEGACY_RESUME_CONTINUATION_TEXT {
+                    // A previous resume's continuation row (metadata-tagged,
+                    // or a legacy pre-tag row matched by its exact wording)
+                    // — re-sent fresh by every resume, never replayed.
                     continue;
                 }
                 let mut row_images: Vec<Value> = Vec::new();
@@ -10611,8 +10851,17 @@ impl Services {
             .await;
         }
 
-        // Deliver continuation message
-        let continuation = RESUME_CONTINUATION_TEXT;
+        // Deliver continuation message (with the humanized outage duration
+        // when the claimed row's `interrupted_at` yields one). The metadata
+        // tag persists on the user row so a later restart's recap can
+        // identify the continuation without matching its text (an ordinary
+        // user request opening with the same wording must still be replayed).
+        let continuation =
+            resume_continuation_text(&interrupted.interrupted_at, time::OffsetDateTime::now_utc());
+        let continuation_metadata = json!({
+            "type": RESUME_CONTINUATION_METADATA_TYPE,
+            "source": "system",
+        });
 
         // Mid-turn tail recap (monorepo#2539): a `session/load` resume replays
         // the PROVIDER's session checkpoint, which contains only completed
@@ -10649,10 +10898,12 @@ impl Services {
                         prepend_content: Some(recap.text),
                         prepend_image_blocks: recap.image_blocks,
                         prepend_file_blocks: recap.file_blocks,
+                        message_metadata: Some(continuation_metadata.clone()),
                         origin: intent_core::MessageOrigin::Automatic,
                         ..crate::agent_manager::TurnOptions::default()
                     },
                     None => crate::agent_manager::TurnOptions {
+                        message_metadata: Some(continuation_metadata.clone()),
                         origin: intent_core::MessageOrigin::Automatic,
                         ..crate::agent_manager::TurnOptions::default()
                     },
@@ -10661,7 +10912,7 @@ impl Services {
                     .send_message(
                         agent_id.clone(),
                         workspace_id.clone(),
-                        continuation.to_string(),
+                        continuation.clone(),
                         None,
                         options,
                     )
@@ -10671,7 +10922,7 @@ impl Services {
                 self.agent_send_message(
                     workspace_id.clone(),
                     agent_id.clone(),
-                    continuation.to_string(),
+                    continuation,
                     None,
                     None,
                     None,
@@ -10679,7 +10930,7 @@ impl Services {
                     None,
                     None,
                     None,
-                    None,
+                    Some(continuation_metadata),
                     intent_core::MessageOrigin::Automatic,
                 )
                 .await

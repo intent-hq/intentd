@@ -1,6 +1,6 @@
 //! Wire-facing domain structs (§9.1). Every struct uses
 //! `#[serde(rename_all = "camelCase")]` so JSON matches the existing TS types
-//! and PROTOCOL.md §5.1/§5.2. Enums serialize to their lowercase / snake_case
+//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / snake_case
 //! string forms, which are also their stored DB representations.
 
 use std::collections::BTreeMap;
@@ -3416,7 +3416,7 @@ pub struct Hook {
     /// each run; size-capped at the service layer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_state: Option<String>,
-    /// TTL deadline (`createdAt` + clamped `ttlMs`, ≤ 60 minutes): the hook
+    /// TTL deadline (`createdAt` + clamped `ttlMs`, ≤ 24 hours): the hook
     /// expires when this passes. `None` only on pre-TTL legacy rows, which
     /// never expire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
