@@ -4,7 +4,7 @@
 //! Every client-callable method, alias, notification, and reverse RPC is cataloged
 //! here. The golden test (`catalog/tests.rs`) enforces that any surface drift
 //! (added/removed/renamed methods) fails CI with a clear "update the catalog +
-//! PROTOCOL.md + bump protocol version" message.
+//! docs/protocol/ + bump protocol version" message.
 
 #[cfg(test)]
 mod tests;
@@ -316,7 +316,7 @@ pub const ROUTER_METHODS: &[&str] = &[
 ///
 /// The daemon accepts these 2 alias forms and dispatches them to their canonical
 /// counterparts. The wire accepts both, but the canonical name is the documented
-/// form in PROTOCOL.md.
+/// form in docs/protocol/05-method-catalog.md.
 pub const METHOD_ALIASES: &[(&str, &str)] =
     &[("git.diff", "git.diffs"), ("git.log", "git.commits")];
 

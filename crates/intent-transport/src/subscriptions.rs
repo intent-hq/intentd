@@ -479,6 +479,36 @@ pub(crate) async fn chat_snapshot(
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
+    overlay_live_state(api, agent_id, &mut snapshot).await;
+    snapshot
+}
+
+/// [`chat_snapshot`] for the lag self-heal path — fallible instead of
+/// degrade-to-empty. A recovery snapshot is emitted at a LATER `seq` than
+/// content the client already rendered, so the seq-0 degrade contract is
+/// inverted here: serving `{ messages: [] }` would make the client rebuild an
+/// already-rendered transcript as EMPTY on a transient read failure, strictly
+/// worse than the lag it was healing. The read is retried once (same policy as
+/// the terminal reconcile's re-read); a persistent failure returns `None` and
+/// the caller keeps the recovery pending instead of emitting anything. Still
+/// bounded: at most two page reads per attempt, no resume filter (recovery
+/// always serves the full standard page).
+pub(crate) async fn chat_recovery_snapshot(
+    api: &dyn WorkspaceApi,
+    agent_id: &AgentId,
+) -> Option<Value> {
+    let read = || api.agent_get_conversation(agent_id.clone(), None, None, None, None);
+    let mut snapshot = match read().await {
+        Ok(v) => v,
+        Err(_) => read().await.ok()?,
+    };
+    overlay_live_state(api, agent_id, &mut snapshot).await;
+    Some(snapshot)
+}
+
+/// Overlay the live in-flight turn and activity flags onto a chat snapshot's
+/// persisted page (shared by [`chat_snapshot`] and [`chat_recovery_snapshot`]).
+async fn overlay_live_state(api: &dyn WorkspaceApi, agent_id: &AgentId, snapshot: &mut Value) {
     // Read busy BEFORE the slot, never after. The two reads are separate lock
     // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
     // stale slot under the busy lock before publishing the claim, which makes
@@ -490,7 +520,7 @@ pub(crate) async fn chat_snapshot(
     // content labelled settled, which the next delta or snapshot corrects.
     let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(&mut snapshot, agent_id, &live, is_streaming);
+        merge_live_turn(snapshot, agent_id, &live, is_streaming);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -503,7 +533,6 @@ pub(crate) async fn chat_snapshot(
             obj.insert(key.clone(), value.clone());
         }
     }
-    snapshot
 }
 
 /// Trim a chat seq-0 snapshot to the messages AFTER `since` (§7.1 resume).

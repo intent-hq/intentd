@@ -2,7 +2,7 @@
 //! mutations (FIX 2 parity): drives a real pinned-TLS WebSocket against a
 //! live `intentd serve` (WSS listener enabled via config) and asserts that `workspace.update`
 //! and `workspace.delete` publish `workspace:updated` / `workspace:deleted`
-//! (PROTOCOL.md §6.5) so a subscribed client sees the mutation without a
+//! (docs/protocol/06-events.md §6.5) so a subscribed client sees the mutation without a
 //! follow-up read. The `git:commit` emission is exercised over UDS in
 //! `uds_events.rs` and via unit tests where a git worktree is cheaper to
 //! materialise; this file focuses on the pure-daemon lifecycle where no
@@ -739,7 +739,7 @@ async fn agent_delete_grace_window_schedule_cancel_commit_over_wss() {
 /// rewritten parent), `note.listTasks` surfaces the linked task, and
 /// `task.assignAgent` flips the `not_started` task to `in_progress` with a
 /// `note:updated` (assignment write) + `task:status-changed` +
-/// `task:ready-tasks-changed` fan-out (PROTOCOL.md §6.5) — author → list →
+/// `task:ready-tasks-changed` fan-out (docs/protocol/06-events.md §6.5) — author → list →
 /// delegate → in-progress, driven end-to-end over WSS with subscribers seeing
 /// every emission live and one confirming `task.get` at the end.
 #[tokio::test]
@@ -916,7 +916,7 @@ async fn task_block_author_list_assign_flow_over_wss() {
     assert_eq!(got["task"]["status"], json!("in_progress"), "task: {got}");
 }
 
-/// End-to-end `task:created` over WSS (PROTOCOL.md §6.5): every path where a
+/// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a
 /// note becomes a task publishes exactly one `task:created` carrying
 /// `{ noteId, noteTitle, status, createdAt }`. Drives all three paths on one
 /// subscription — `note.create` with an `@@@task` fence (auto-conversion),
@@ -2821,7 +2821,7 @@ async fn workspace_subscribe_snapshot_includes_archived_over_wss() {
     );
 }
 
-/// End-to-end `task.setRelations` over WSS (PROTOCOL.md §5.4): relation writes
+/// End-to-end `task.setRelations` over WSS (docs/protocol/methods/notes-tasks.md §5.4): relation writes
 /// round-trip `dependsOn`/`conflictsWith` (echoed normalized in the result and
 /// visible in `task.getMyTask` / `task.list` with the computed
 /// `unmetDependsOn`), emit `note:updated` for subscriber refetch, and reject
@@ -3237,7 +3237,8 @@ async fn task_subscribe_snapshot_and_deltas_carry_spec_linked_over_wss() {
     );
 }
 
-/// End-to-end readiness-over-dependsOn (PROTOCOL.md §5.4/§6.5; spec §2.2,
+/// End-to-end readiness-over-dependsOn (docs/protocol/methods/notes-tasks.md §5.4 /
+/// docs/protocol/06-events.md §6.5; spec §2.2,
 /// monorepo#1974) over WSS: a task with `dependsOn` edges onto two
 /// sibling-subtree tasks stays out of `task:ready-tasks-changed`'s
 /// `readyTaskIds` until BOTH deps are `complete` — the event shape itself is
@@ -3383,7 +3384,7 @@ async fn ready_tasks_gate_on_depends_on_over_wss() {
 }
 
 /// End-to-end ready-set recompute on relation writes and dep-note deletion
-/// (PROTOCOL.md §6.5, monorepo#1981) over WSS: a `task.setRelations` that
+/// (docs/protocol/06-events.md §6.5, monorepo#1981) over WSS: a `task.setRelations` that
 /// changes `dependsOn` emits `task:ready-tasks-changed` with the additive
 /// `triggeredBy: { noteId, reason: "relations-changed" }` variant (no status
 /// fields), and deleting a task note that other tasks dependOn emits the same
@@ -3482,7 +3483,7 @@ async fn ready_tasks_recompute_on_relations_write_and_deletion_over_wss() {
     assert_eq!(evt["data"]["readyTaskIds"], json!([]), "ready: {evt}");
 }
 
-/// End-to-end ready-set recompute on task-note deletion (PROTOCOL.md §6.5,
+/// End-to-end ready-set recompute on task-note deletion (docs/protocol/06-events.md §6.5,
 /// monorepo#2006) over WSS: deleting a task note that is itself in the ready
 /// set emits `task:ready-tasks-changed` with the deleted id gone from
 /// `readyTaskIds`, and deleting the last incomplete task child of a parent
@@ -3589,7 +3590,7 @@ async fn ready_tasks_recompute_on_task_note_delete_over_wss() {
     assert_eq!(evt["data"]["readyTaskIds"], json!([parent]), "ready: {evt}");
 }
 
-/// End-to-end tree-relative `dependsOn` rejection (PROTOCOL.md §5.4,
+/// End-to-end tree-relative `dependsOn` rejection (docs/protocol/methods/notes-tasks.md §5.4,
 /// monorepo#1982) over WSS: a `dependsOn` edge naming a tree ancestor or
 /// descendant of the task — the permanent mutual readiness block — is
 /// rejected by both `task.setRelations` and `task.markAsTask` with `-32603`
@@ -3745,7 +3746,7 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
     );
 }
 
-/// End-to-end `unmetDependsOn` on note-shaped payloads (PROTOCOL.md §5.3;
+/// End-to-end `unmetDependsOn` on note-shaped payloads (docs/protocol/methods/notes-tasks.md §5.3;
 /// monorepo#1979) over WSS: `note.get` / `note.list` project the computed
 /// field under `metadata.task` using the same rule as the `task.list`
 /// projection (dep unmet unless its task note is `complete`; cancelled =

@@ -40,7 +40,7 @@ pub fn attach_acp_title(input: Value, title: &str) -> Value {
     Value::Object(obj)
 }
 
-/// Build the full `tool_use` block matching PROTOCOL.md §7.1's persisted shape:
+/// Build the full `tool_use` block matching docs/protocol/07-agent-streaming.md §7.1's persisted shape:
 /// `{ type, id, name, input, toolCallId, metadata:{ toolKind, status } }`.
 /// `name` is the real tool name (already derived, §6.6 `toolName`); `title`
 /// is the raw ACP title echoed as `input._acpTitle`.

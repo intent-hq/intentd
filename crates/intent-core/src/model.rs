@@ -1,6 +1,6 @@
 //! Wire-facing domain structs (§9.1). Every struct uses
 //! `#[serde(rename_all = "camelCase")]` so JSON matches the existing TS types
-//! and PROTOCOL.md §5.1/§5.2. Enums serialize to their lowercase / snake_case
+//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / snake_case
 //! string forms, which are also their stored DB representations.
 
 use std::collections::BTreeMap;
