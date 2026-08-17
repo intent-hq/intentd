@@ -2011,22 +2011,29 @@ impl Services {
                 },
             }
         };
-        // Silent tail of the turn (intent-hq/monorepo#2669): ms of
-        // `session/update` silence between the turn's last streamed activity
-        // and the prompt resolving, captured the moment the prompt settles.
-        // In that incident bloated sessions resolved a clean `end_turn` after
-        // 11-13 min of total silence — the daemon held this exact signal
-        // (`activity.idle_ms()`) and discarded it; now it is recorded for
-        // `agent.diagnostics` and, past [`silent_tail_suspect_ms`], stamped
-        // on the terminal `agent:idle` payload below.
-        let silent_tail_ms = activity.idle_ms();
-        // Drain updates buffered before the prompt response resolved.
+        // Drain updates buffered before the prompt response resolved. Each
+        // drained note is streamed activity that arrived BEFORE the prompt
+        // settled (`prompt_fut` can win the `select!` while updates sit
+        // buffered — e.g. an agent sending its final update and response
+        // back-to-back), so `activity.touch()` here counts it against the
+        // silent tail captured below; without it such a turn would read as
+        // carrying a long tail it never had.
         while let Ok(note) = notifications.try_recv() {
+            activity.touch();
             any_update_received = true;
             updates_applied |= self
                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
                 .await;
         }
+        // Silent tail of the turn (intent-hq/monorepo#2669): ms of
+        // `session/update` silence between the turn's last streamed activity
+        // (buffered drain included) and the prompt resolving. In that
+        // incident bloated sessions resolved a clean `end_turn` after
+        // 11-13 min of total silence — the daemon held this exact signal
+        // (`activity.idle_ms()`) and discarded it; now it is recorded for
+        // `agent.diagnostics` and, past [`silent_tail_suspect_ms`], stamped
+        // on the terminal `agent:idle` payload below.
+        let silent_tail_ms = activity.idle_ms();
         // §7.1 deterministic attach — turn-end drain: append the registered
         // `AtTurnEnd` attachments as trailing resource blocks, and clear ALL
         // remaining registry entries for this agent (unclaimed `AtToolResult`
@@ -2134,8 +2141,16 @@ impl Services {
         // (intent-hq/monorepo#2669). A pre-output transport failure is
         // excluded: the attempt is invisible (the worker may silently
         // redrive it), so its tail must not overwrite the last VISIBLE
-        // turn's record.
-        if !pre_output_transport_failure {
+        // turn's record. Also skipped when the agent's session row is
+        // already gone: `agent.delete` does not stop a running turn, so a
+        // turn settling after the delete's `clear_turn_silent_tail` sweep
+        // would otherwise resurrect the entry for the daemon lifetime.
+        // Best-effort — a delete interleaving between this check and the
+        // insert leaves one stale u64, which the diagnostics read (it
+        // iterates live sessions) never serves.
+        if !pre_output_transport_failure
+            && self.store.get_agent_session_summary(agent_id).await.is_ok()
+        {
             self.record_turn_silent_tail(agent_id, silent_tail_ms);
         }
         // Suspicious bare normal ending (intent-hq/monorepo#2669): the turn
