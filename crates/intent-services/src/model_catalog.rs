@@ -365,22 +365,27 @@ impl ModelCatalogCache {
     /// [`Self::cached_catalog_claims`]: the creation path must never block on
     /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
     /// entry, or a catalog with no marked row all return `None` (the provider
-    /// CLI default applies).
+    /// CLI default applies). The registry version-key function runs only when
+    /// a cached entry with a marked row exists — for codex it resolves the
+    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
+    /// the login-shell PATH capture), a cost the cold-cache fall-through must
+    /// not pay; it also runs outside the cache lock so a slow first capture
+    /// never stalls other cache readers.
     pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
         let source = source_for(provider_id)?;
-        let version_key = (source.version_key)();
-        let entries = self.entries.lock().expect("model catalog cache poisoned");
-        let entry = entries.get(provider_id)?;
-        if entry.version_key != version_key {
-            return None;
-        }
-        entry
-            .models
-            .iter()
-            .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))
-            .and_then(|row| row.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        let (entry_version_key, default_id) = {
+            let entries = self.entries.lock().expect("model catalog cache poisoned");
+            let entry = entries.get(provider_id)?;
+            let default_id = entry
+                .models
+                .iter()
+                .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            (entry.version_key.clone(), default_id)
+        };
+        (entry_version_key == (source.version_key)()).then_some(default_id)
     }
 
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).

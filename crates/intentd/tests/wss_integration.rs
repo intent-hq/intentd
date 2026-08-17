@@ -2836,6 +2836,8 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Catalog default"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 2);
     assert_eq!(
         created["result"]["agent"]["model"],
         Value::from("sonnet5"),
@@ -2856,6 +2858,8 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings wins"}}}}"#
     );
     let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 3);
     assert_eq!(
         created["result"]["agent"]["model"],
         Value::from("auggie:fable-5"),
