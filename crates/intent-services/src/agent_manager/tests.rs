@@ -7578,6 +7578,11 @@ async fn archive_workspace_parks_wake_deliveries() {
         .await
         .expect("wake delivery");
     assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert_eq!(
+        out["archivedParked"],
+        json!(true),
+        "archived park is distinguishable from a plain busy-queue fallback"
+    );
     assert!(!mgr.is_busy(&id), "no turn spawned while archived");
     assert_eq!(
         services.queue_snapshot(&id).len(),
@@ -7634,6 +7639,11 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
         result["queued"],
         json!(true),
         "parked, not driven: {result}"
+    );
+    assert_eq!(
+        result["archivedParked"],
+        json!(true),
+        "archived park is distinguishable from a plain busy-queue fallback"
     );
     assert!(!mgr.is_busy(&id), "no slot claim while archived");
     assert_eq!(
@@ -7702,6 +7712,7 @@ async fn archived_workspace_parks_internal_parent_wake() {
         .await
         .expect("parent wake delivery");
     assert_eq!(out["queued"], json!(true), "wake parks while archived");
+    assert_eq!(out["archivedParked"], json!(true), "archived park marker");
     assert!(!mgr.is_busy(&parent), "no turn spawned while archived");
     assert_eq!(
         services.queue_snapshot(&parent).len(),
@@ -7760,6 +7771,11 @@ async fn archived_workspace_parks_automatic_interrupt_send_front_of_queue() {
         .await
         .expect("automatic interrupt parks");
     assert_eq!(result["queued"], json!(true), "parked: {result}");
+    assert_eq!(
+        result["archivedParked"],
+        json!(true),
+        "archived park marker"
+    );
     assert!(!mgr.is_busy(&id), "no turn spawned while archived");
 
     let queue = services.queue_snapshot(&id);

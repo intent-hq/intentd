@@ -4706,6 +4706,7 @@ impl AgentManager {
                     let result = json!({
                         "success": true,
                         "queued": true,
+                        "archivedParked": true,
                         "queuedMessage": queued.to_value(position),
                         "turnId": queued.turn_id,
                     });
