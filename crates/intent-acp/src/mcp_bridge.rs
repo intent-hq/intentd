@@ -31,10 +31,35 @@ use crate::mcp_server::WorkspaceMcpServer;
 /// Per-connection cap on concurrently dispatched requests. Small on purpose:
 /// enough that a long `tools/call` never blocks a liveness ping behind it
 /// (monorepo#871), bounded so a misbehaving client cannot spawn unboundedly.
-const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+pub(crate) const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 
 /// Capacity of the per-connection response channel feeding the writer task.
 const RESPONSE_CHANNEL_CAPACITY: usize = 32;
+
+/// Watchdog deadline for a single dispatched request (monorepo#2709). The
+/// dispatch future runs in its own task and the deadline is enforced from the
+/// per-request task via `select!`, so it fires even when the dispatch is
+/// wedged inside a single synchronous poll — the state an in-dispatch
+/// `tokio::time::timeout` (like the 30s `intent-js` eval budget) can never
+/// escape, because the wedged task never yields to let its timer fire.
+/// Generously above that 30s eval budget plus the post-eval awaits, so the
+/// watchdog only fires when the normal timeout machinery has already failed.
+///
+/// This is a floor, not the effective deadline: the eval budget can be raised
+/// via `INTENTD_WORKSPACE_API_TIMEOUT_MS`, so the production entry point
+/// derives the deadline with [`effective_dispatch_timeout`] to keep the two
+/// knobs from crossing.
+pub(crate) const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The effective watchdog deadline for a server whose eval budget may have
+/// been raised via `INTENTD_WORKSPACE_API_TIMEOUT_MS`: the
+/// [`DISPATCH_WATCHDOG_TIMEOUT`] floor, or twice the eval budget when the
+/// override exceeds half of it — so a raised budget can never cross the
+/// watchdog and get legitimate, still-in-budget calls aborted with a
+/// non-retryable error.
+pub(crate) fn effective_dispatch_timeout(eval_budget: Duration) -> Duration {
+    DISPATCH_WATCHDOG_TIMEOUT.max(eval_budget * 2)
+}
 
 /// Dispatch seam for the bridge listener: production is [`WorkspaceMcpServer`];
 /// tests inject controllable handlers to exercise concurrency semantics.
@@ -88,16 +113,30 @@ impl Drop for McpBridge {
 
 /// Bind a loopback TCP listener and serve `server` over newline-delimited
 /// JSON-RPC. Each accepted connection is handled concurrently; a request line
-/// yields one response line, a notification (no `id`) yields nothing.
+/// yields one response line, a notification (no `id`) yields nothing. The
+/// dispatch watchdog deadline is derived from the server's (possibly
+/// env-overridden) eval budget via [`effective_dispatch_timeout`].
 pub async fn serve_workspace_mcp_tcp(
     server: Arc<WorkspaceMcpServer>,
 ) -> std::io::Result<McpBridge> {
-    serve_mcp_tcp(server).await
+    let dispatch_timeout = effective_dispatch_timeout(server.workspace_api_timeout());
+    serve_mcp_tcp_with_timeout(server, dispatch_timeout).await
 }
 
 /// Generic body of [`serve_workspace_mcp_tcp`], parameterized over the dispatch
 /// seam so tests can serve a mock handler over a real loopback socket.
+#[cfg(test)]
 pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io::Result<McpBridge> {
+    serve_mcp_tcp_with_timeout(server, DISPATCH_WATCHDOG_TIMEOUT).await
+}
+
+/// [`serve_workspace_mcp_tcp`] body with an injectable dispatch watchdog
+/// deadline, so tests can shorten [`DISPATCH_WATCHDOG_TIMEOUT`] and exercise
+/// the timeout path without waiting minutes.
+pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
+    server: Arc<S>,
+    dispatch_timeout: Duration,
+) -> std::io::Result<McpBridge> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -106,7 +145,7 @@ pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io:
                 Ok((stream, _peer)) => {
                     let server = server.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = serve_connection(server, stream).await {
+                        if let Err(e) = serve_connection(server, stream, dispatch_timeout).await {
                             tracing::debug!(error = %e, "mcp bridge connection ended");
                         }
                     });
@@ -140,9 +179,19 @@ pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io:
 /// a TCP blip would re-run a call whose first attempt partially executed
 /// before the abort, double-applying the steps that completed before the
 /// drop.
+///
+/// Dispatch watchdog (monorepo#2709): each dispatch is spawned into its own
+/// task and the per-request task `select!`s its `JoinHandle` against
+/// `dispatch_timeout`. Because the watchdog polls in a different task than
+/// the dispatch, it fires even when the dispatch future is wedged inside a
+/// single synchronous poll. On deadline the dispatch task is aborted and, for
+/// requests carrying an `id`, a [`BRIDGE_DISPATCH_TIMEOUT_CODE`] error line
+/// is synthesized so the peer never waits out its own client timeout;
+/// notifications get only the abort.
 async fn serve_connection<S: BridgeDispatch>(
     server: Arc<S>,
     stream: TcpStream,
+    dispatch_timeout: Duration,
 ) -> std::io::Result<()> {
     let (read, mut write) = stream.into_split();
     let (response_tx, mut response_rx) = mpsc::channel::<String>(RESPONSE_CHANNEL_CAPACITY);
@@ -182,8 +231,56 @@ async fn serve_connection<S: BridgeDispatch>(
                     let response_tx = response_tx.clone();
                     in_flight.spawn(async move {
                         let _permit = permit;
-                        if let Some(response) = server.dispatch(message).await {
-                            let _ = response_tx.send(format!("{response}\n")).await;
+                        // A request is `method` + `id` — with any present
+                        // `id`, including `null`, counting — matching the
+                        // stdio proxy's `request_id`, so a wedged null-id
+                        // request still gets its synthesized error line.
+                        let id = if message.get("method").is_some() {
+                            message.get("id").cloned()
+                        } else {
+                            None
+                        };
+                        let method = message
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let started = Instant::now();
+                        // The dispatch runs in its own task so the watchdog
+                        // below still gets polled when the dispatch future
+                        // wedges inside a synchronous poll; the guard aborts
+                        // it if this request task is itself torn down.
+                        let mut dispatch = AbortOnDrop(tokio::spawn(server.dispatch(message)));
+                        tokio::select! {
+                            joined = &mut dispatch.0 => match joined {
+                                Ok(Some(response)) => {
+                                    let _ = response_tx.send(format!("{response}\n")).await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(%method, error = %e, "mcp bridge dispatch task failed");
+                                }
+                            },
+                            _ = tokio::time::sleep(dispatch_timeout) => {
+                                dispatch.0.abort();
+                                tracing::warn!(
+                                    %method,
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    "mcp bridge dispatch exceeded watchdog deadline; aborted and synthesized timeout error"
+                                );
+                                if let Some(id) = id {
+                                    let response = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": {
+                                            "code": BRIDGE_DISPATCH_TIMEOUT_CODE,
+                                            "message": BRIDGE_DISPATCH_TIMEOUT_MESSAGE,
+                                            "data": { "retryable": false },
+                                        },
+                                    });
+                                    let _ = response_tx.send(format!("{response}\n")).await;
+                                }
+                            }
                         }
                     });
                 }
@@ -198,6 +295,17 @@ async fn serve_connection<S: BridgeDispatch>(
     drop(response_tx);
     let _ = writer.await;
     result
+}
+
+/// Aborts the wrapped dispatch task on drop, so a per-request task torn down
+/// at connection teardown (or by the watchdog path exiting) never leaks a
+/// still-running dispatch: dropping a bare `JoinHandle` would detach it.
+struct AbortOnDrop(JoinHandle<Option<Value>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// JSON-RPC error code (implementation-defined `-32000`-range server error)
@@ -221,6 +329,17 @@ pub(crate) const BRIDGE_OUTCOME_UNKNOWN_CODE: i64 = -32002;
 /// Human-readable companion to [`BRIDGE_OUTCOME_UNKNOWN_CODE`].
 pub(crate) const BRIDGE_OUTCOME_UNKNOWN_MESSAGE: &str =
     "workspace-mcp call was delivered but its outcome is unknown after a disconnect; do not blindly retry";
+
+/// JSON-RPC error code (implementation-defined `-32000`-range server error)
+/// synthesized by the listener when a dispatch exceeds the watchdog deadline
+/// (monorepo#2709, see [`DISPATCH_WATCHDOG_TIMEOUT`]). The dispatch task is
+/// aborted mid-execution, so like [`BRIDGE_OUTCOME_UNKNOWN_CODE`] the call
+/// may have partially executed and the error is non-retryable.
+pub(crate) const BRIDGE_DISPATCH_TIMEOUT_CODE: i64 = -32003;
+
+/// Human-readable companion to [`BRIDGE_DISPATCH_TIMEOUT_CODE`].
+pub(crate) const BRIDGE_DISPATCH_TIMEOUT_MESSAGE: &str =
+    "workspace-mcp dispatch timed out daemon-side; the call may have partially executed — do not blindly retry";
 
 /// Max stdin lines buffered during the initial connect window (monorepo#908).
 /// The window is ~5s and a well-behaved client sends a handful of lines; the
