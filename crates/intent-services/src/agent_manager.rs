@@ -6512,6 +6512,34 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             }
         }
+        // auggie version gate (monorepo#1045): before a fresh child spawns,
+        // pick a version-compatible auggie by probing `--version` down the
+        // discovery-precedence candidate list and selecting the first new
+        // enough for the launch flags (`--acp/--allow-indexing/--model/
+        // --remove-tool`, which require auggie
+        // `AUGGIE_CLI_MIN_VERSION`+). A stale nvm auggie earlier on the
+        // daemon's minimal PATH is skipped rather than launched with flags it
+        // does not understand; if none qualify, fail fast with a clear,
+        // actionable error instead of a cryptic "Unknown arguments" spawn.
+        // Only for a fresh spawn (a reused live child already runs the binary
+        // it was spawned with) and never for the npx-fallback path. The probe
+        // is blocking (subprocess, ≤3s per candidate), so it runs off the
+        // runtime.
+        if resolved.provider.id == "auggie"
+            && resolved.provider_binary.is_some()
+            && !self.contains(agent_id)
+        {
+            let explicit = read_provider_path_setting(
+                &settings,
+                resolved.provider.primary_binary_provider_id(),
+            );
+            let selected = tokio::task::spawn_blocking(move || {
+                crate::auggie_cli::select_auggie_for_spawn(explicit.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
+            resolved.provider_binary = Some(selected);
+        }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
         // spawns, make sure the daemon-managed Unsloth server is running and
         // ready for the session's model, and thread the resulting endpoint

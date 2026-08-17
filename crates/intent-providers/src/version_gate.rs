@@ -1,17 +1,24 @@
-//! Pure version-gate decision for the pi provider's `pi` CLI.
+//! Pure version-gate decisions for provider CLIs (`pi`, `auggie`).
 //!
 //! The pinned pi-acp adapter ([`crate::config::PI_ACP_NPX_PACKAGE`]) requires
-//! the `pi` CLI at [`crate::config::PI_CLI_MIN_VERSION`] or newer. The gate
-//! decision here is pure and injectable — callers probe `pi --version`
-//! themselves (subprocess/PATH work stays at the call site) and feed the
-//! result in as a [`PiCliProbe`].
+//! the `pi` CLI at [`crate::config::PI_CLI_MIN_VERSION`] or newer, and the ACP
+//! agent-spawn path requires `auggie` at
+//! [`crate::config::AUGGIE_CLI_MIN_VERSION`] or newer (its launch flags landed
+//! in 0.7.0). The gate decisions here are pure and injectable — callers probe
+//! `<cli> --version` themselves (subprocess/PATH work stays at the call site)
+//! and feed the result in as a [`PiCliProbe`].
 //!
 //! Policy: only a confirmed-old or missing CLI gates the provider off.
 //! [`PiCliGate::Unknown`] (probe failed or output unparseable) is permissive
 //! so a changed `--version` format never false-negatives the provider;
-//! callers log a warning instead.
+//! callers log a warning instead. The auggie gate
+//! ([`auggie_cli_gate`]) reuses the same probe/gate shapes so the
+//! skip-and-continue spawn resolver treats an unparseable version as usable.
 
-use crate::config::{PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT};
+use crate::config::{
+    AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION,
+    PI_CLI_REQUIREMENT,
+};
 
 /// Result of probing the `pi` CLI, as fed to [`pi_cli_gate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +81,45 @@ pub fn pi_cli_gate(probe: &PiCliProbe) -> PiCliGate {
         PiCliProbe::Output(output) => match (
             parse_cli_version(output),
             parse_cli_version(PI_CLI_MIN_VERSION),
+        ) {
+            (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
+            (Some(_), Some(_)) => PiCliGate::Ok,
+            _ => PiCliGate::Unknown,
+        },
+    }
+}
+
+/// Human-readable, actionable reason the resolved `auggie` binary cannot be
+/// launched, or `None` when the gate is permissive ([`PiCliGate::Ok`] /
+/// [`PiCliGate::Unknown`]). Names the found version, the requirement, and the
+/// remedy (record the newer install in `~/.augment/auggie-path` or set
+/// `context.auggiePath`) so the spawn fail-fast and doctor share one message.
+pub fn auggie_gate_reason(gate: &PiCliGate) -> Option<String> {
+    match gate {
+        PiCliGate::TooOld(found) => Some(format!(
+            "auggie {found} is too old — {AUGGIE_CLI_REQUIREMENT} is required to launch an agent \
+             (the daemon passes --acp/--allow-indexing/--model/--remove-tool). Update auggie, or \
+             point the daemon at a newer install via ~/.augment/auggie-path or the \
+             context.auggiePath setting."
+        )),
+        PiCliGate::Missing => Some(format!(
+            "auggie not found — {AUGGIE_CLI_REQUIREMENT} is required to launch an agent"
+        )),
+        PiCliGate::Ok | PiCliGate::Unknown => None,
+    }
+}
+
+/// Decide the auggie version gate from a probe result. Pure — no filesystem,
+/// PATH, or subprocess access. Shares the [`PiCliProbe`]/[`PiCliGate`] shapes
+/// and tolerant parser with the pi gate; only the minimum version differs
+/// ([`AUGGIE_CLI_MIN_VERSION`]).
+pub fn auggie_cli_gate(probe: &PiCliProbe) -> PiCliGate {
+    match probe {
+        PiCliProbe::Missing => PiCliGate::Missing,
+        PiCliProbe::Failed => PiCliGate::Unknown,
+        PiCliProbe::Output(output) => match (
+            parse_cli_version(output),
+            parse_cli_version(AUGGIE_CLI_MIN_VERSION),
         ) {
             (Some(found), Some(min)) if found < min => PiCliGate::TooOld(format_version(found)),
             (Some(_), Some(_)) => PiCliGate::Ok,
@@ -189,5 +235,67 @@ mod tests {
         assert!(missing.contains(PI_ACP_NPX_PACKAGE));
         assert_eq!(pi_gate_reason(&PiCliGate::Ok), None);
         assert_eq!(pi_gate_reason(&PiCliGate::Unknown), None);
+    }
+
+    fn auggie_gate_output(output: &str) -> PiCliGate {
+        auggie_cli_gate(&PiCliProbe::Output(output.to_string()))
+    }
+
+    #[test]
+    fn auggie_min_version_constant_parses() {
+        assert_eq!(parse_cli_version(AUGGIE_CLI_MIN_VERSION), Some((0, 7, 0)));
+    }
+
+    #[test]
+    fn auggie_older_versions_gate_as_too_old() {
+        // The exact stale binaries from the incident (0.1.0 / 0.4.0) gate off.
+        assert_eq!(
+            auggie_gate_output("0.1.0"),
+            PiCliGate::TooOld("0.1.0".into())
+        );
+        assert_eq!(
+            auggie_gate_output("auggie 0.4.0 (commit abc)"),
+            PiCliGate::TooOld("0.4.0".into())
+        );
+        assert_eq!(
+            auggie_gate_output("0.6.9"),
+            PiCliGate::TooOld("0.6.9".into())
+        );
+    }
+
+    #[test]
+    fn auggie_minimum_and_newer_are_ok() {
+        assert_eq!(auggie_gate_output("0.7.0"), PiCliGate::Ok);
+        // The known-good binary from the incident.
+        assert_eq!(
+            auggie_gate_output("0.35.0 (commit 9a7f3836)"),
+            PiCliGate::Ok
+        );
+        assert_eq!(auggie_gate_output("v1.0.0"), PiCliGate::Ok);
+    }
+
+    #[test]
+    fn auggie_unparseable_and_failed_are_permissive() {
+        assert_eq!(auggie_gate_output("garbage"), PiCliGate::Unknown);
+        assert_eq!(auggie_gate_output(""), PiCliGate::Unknown);
+        assert_eq!(auggie_cli_gate(&PiCliProbe::Failed), PiCliGate::Unknown);
+    }
+
+    #[test]
+    fn auggie_missing_gates() {
+        assert_eq!(auggie_cli_gate(&PiCliProbe::Missing), PiCliGate::Missing);
+    }
+
+    #[test]
+    fn auggie_gate_reason_names_version_requirement_and_remedy() {
+        let too_old = auggie_gate_reason(&PiCliGate::TooOld("0.1.0".into())).unwrap();
+        assert!(too_old.contains("0.1.0"), "{too_old}");
+        assert!(too_old.contains(AUGGIE_CLI_REQUIREMENT), "{too_old}");
+        assert!(too_old.contains("auggie-path"), "{too_old}");
+        assert!(too_old.contains("context.auggiePath"), "{too_old}");
+        let missing = auggie_gate_reason(&PiCliGate::Missing).unwrap();
+        assert!(missing.contains(AUGGIE_CLI_REQUIREMENT), "{missing}");
+        assert_eq!(auggie_gate_reason(&PiCliGate::Ok), None);
+        assert_eq!(auggie_gate_reason(&PiCliGate::Unknown), None);
     }
 }

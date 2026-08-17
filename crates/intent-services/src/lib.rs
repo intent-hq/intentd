@@ -55,6 +55,7 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod attachment_upload;
+mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;

@@ -363,11 +363,17 @@ pub fn probe_npx() -> NpxStatus {
 ///    the `unsloth` key targets the unsloth CLI itself)
 /// 2. Native installer location (grok: `~/.grok/bin`, opencode: `~/.opencode/bin`)
 /// 3. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
-/// 4. Scan enhanced PATH directories (`intent_core::path_utils`: inherited
+/// 4. `~/.augment/auggie-path` marker (auggie-only, monorepo#939 parity) — the
+///    authoritative install record, so it beats an arbitrary PATH-scan hit
+/// 5. Scan enhanced PATH directories (`intent_core::path_utils`: inherited
 ///    PATH + enriched tool dirs + login-shell PATH capture)
 ///
-/// Returns `None` when the binary cannot be resolved. The `provider_id` is
-/// used for logging when an explicit path is invalid.
+/// Returns the first resolving tier, or `None` when the binary cannot be
+/// resolved. The `provider_id` is used for logging when an explicit path is
+/// invalid and to gate the auggie-only marker tier. Callers that need to
+/// version-gate the result (the auggie ACP spawn path) use
+/// [`find_auggie_candidates`] instead, which returns every tier in precedence
+/// order so an incompatible hit can be skipped.
 pub fn find_provider_binary(
     provider_id: &str,
     command: &str,
@@ -381,6 +387,72 @@ pub fn find_provider_binary(
         home.as_deref(),
         &intent_core::path_utils::enhanced_path_dirs(),
     )
+}
+
+/// Every resolved auggie binary candidate, in discovery-precedence order
+/// (explicit `providers.paths["auggie"]` → `~/.augment/bin/auggie` →
+/// `~/.augment/auggie-path` marker → each enhanced-PATH hit). Each entry is an
+/// existing executable; the list is de-duplicated preserving first-seen order.
+///
+/// This is the version-gate-aware companion to [`find_provider_binary`]: the
+/// auggie ACP spawn path probes `--version` on each candidate in order and
+/// launches the first one new enough, so a stale nvm auggie earlier on PATH is
+/// skipped rather than launched with flags it does not understand
+/// (monorepo#1045 regression). `find_provider_binary("auggie", …)` returns the
+/// first element of this list.
+pub fn find_auggie_candidates(explicit_path: Option<&str>) -> Vec<PathBuf> {
+    let home = home_dir();
+    find_auggie_candidates_with_home_and_dirs(
+        explicit_path,
+        home.as_deref(),
+        &intent_core::path_utils::enhanced_path_dirs(),
+    )
+}
+
+/// [`find_auggie_candidates`] with `home` and the enhanced dirs injected
+/// (test seam — avoids mutating process-global `HOME`/`PATH` in parallel
+/// tests). Builds the ordered, de-duplicated candidate list; the precedence
+/// mirrors [`find_provider_binary_with_home_and_dirs`] for auggie exactly, so
+/// the first element always equals what `find_provider_binary` would return.
+fn find_auggie_candidates_with_home_and_dirs(
+    explicit_path: Option<&str>,
+    home: Option<&std::path::Path>,
+    enhanced_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+
+    // 1. Explicit `providers.paths["auggie"]`.
+    if let Some(path) = explicit_path {
+        if let Some(pb) = resolve_explicit_path("auggie", path) {
+            push(pb, &mut out);
+        }
+    }
+    // 2. `~/.augment/bin/auggie` (auggie's own install location).
+    if let Some(managed) = managed_binary_path_with_home("auggie", home) {
+        if is_executable_file(&managed) {
+            push(managed, &mut out);
+        }
+    }
+    // 3. `~/.augment/auggie-path` marker (authoritative install record).
+    if let Some(marked) = auggie_marker_path_with_home(home) {
+        push(marked, &mut out);
+    }
+    // 4. Every enhanced-PATH hit, in order — so a too-old earlier hit can be
+    // skipped in favor of a newer later one.
+    for dir in enhanced_dirs {
+        for candidate in &name_candidates("auggie") {
+            let full = dir.join(candidate);
+            if is_executable_file(&full) {
+                push(full, &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// [`find_provider_binary`] with an explicit `home` for every user-local tier
@@ -432,7 +504,19 @@ fn find_provider_binary_with_home_and_dirs(
         }
     }
 
-    // 4. Scan enhanced PATH directories
+    // 4. ~/.augment/auggie-path marker (auggie-only): auggie's authoritative
+    // record of where it installed itself. A daemon-launched process inherits
+    // a minimal PATH that often misses that dir, so the marker must beat the
+    // PATH scan below — otherwise an arbitrary nvm auggie earlier on PATH
+    // wins over the install the user actually updated (monorepo#1045, and
+    // parity with `intent_context::discovery::find_auggie`).
+    if provider_id == "auggie" {
+        if let Some(marked) = auggie_marker_path_with_home(home) {
+            return Some(marked);
+        }
+    }
+
+    // 5. Scan enhanced PATH directories
     find_in_dirs(enhanced_dirs, command)
 }
 
@@ -526,6 +610,57 @@ fn managed_binary_path_with_home(command: &str, home: Option<&std::path::Path>) 
         command.to_string()
     };
     Some(home.join(".augment").join("bin").join(name))
+}
+
+/// Read the auggie binary path recorded by auggie's own installer in
+/// `~/.augment/auggie-path` (a single line holding an absolute path). The
+/// first non-blank line is used, so a marker that grows extra lines still
+/// resolves. This is the authoritative record of where auggie last installed
+/// itself — daemon-launched processes inherit a minimal PATH that often misses
+/// that directory, so the marker must win over an arbitrary PATH-scan hit
+/// (parity with `intent_context::discovery`, monorepo#939).
+///
+/// Returns `None` — silently — when the marker is missing, unreadable, empty,
+/// relative, or stale (points at something that is no longer an executable
+/// file), so a leftover marker never shadows a working install.
+fn auggie_marker_path_with_home(home: Option<&std::path::Path>) -> Option<PathBuf> {
+    auggie_marker_path_with_home_for(home, cfg!(windows))
+}
+
+/// [`auggie_marker_path_with_home`] parametrized on the platform (test seam —
+/// Windows CI is disabled, so the Windows arm is unit-tested on POSIX).
+fn auggie_marker_path_with_home_for(
+    home: Option<&std::path::Path>,
+    is_windows: bool,
+) -> Option<PathBuf> {
+    let marker = home?.join(".augment").join("auggie-path");
+    let contents = std::fs::read_to_string(&marker).ok()?;
+    let recorded = PathBuf::from(contents.lines().map(str::trim).find(|l| !l.is_empty())?);
+    if !recorded.is_absolute() {
+        return None;
+    }
+    resolve_marker_runnable(&recorded, is_windows)
+}
+
+/// Resolve a marker-recorded path to a runnable executable under the platform
+/// policy. An already-executable path is returned as-is. On Windows a bare
+/// extensionless record (auggie's installer writes `…\npm\auggie` even though
+/// only `auggie.cmd` is runnable) is resolved to its runnable sibling by
+/// probing `.exe`/`.cmd`/`.bat` in the same directory. Ported from
+/// `intent_context::discovery::resolve_runnable`.
+fn resolve_marker_runnable(recorded: &std::path::Path, is_windows: bool) -> Option<PathBuf> {
+    if is_executable_file_for(recorded, is_windows) {
+        return Some(recorded.to_path_buf());
+    }
+    if is_windows && !has_windows_exec_extension(recorded) {
+        for ext in WINDOWS_EXEC_EXTENSIONS {
+            let candidate = recorded.with_extension(ext);
+            if is_executable_file_for(&candidate, is_windows) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the user's home directory from environment, cross-platform.
@@ -694,6 +829,143 @@ mod find_provider_binary_tests {
         let unique_cmd = format!("intent-test-nocand-{}", nanos);
         let result = find_provider_binary("test", &unique_cmd, None);
         assert_eq!(result, None);
+    }
+
+    /// Write `~/.augment/auggie-path` under `home` with the given contents.
+    fn write_marker(home: &std::path::Path, contents: &str) {
+        let augment = home.join(".augment");
+        fs::create_dir_all(&augment).unwrap();
+        fs::write(augment.join("auggie-path"), contents).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auggie_marker_resolves_recorded_executable() {
+        let dir = unique_temp_dir("marker-ok");
+        let bin = dir.path().join("marked-auggie");
+        make_executable(&bin);
+        write_marker(dir.path(), bin.to_str().unwrap());
+        assert_eq!(auggie_marker_path_with_home(Some(dir.path())), Some(bin));
+    }
+
+    #[test]
+    fn auggie_marker_stale_or_relative_returns_none() {
+        let dir = unique_temp_dir("marker-stale");
+        // Stale: points at a nonexistent file.
+        write_marker(dir.path(), dir.path().join("gone").to_str().unwrap());
+        assert_eq!(auggie_marker_path_with_home(Some(dir.path())), None);
+        // Relative: rejected.
+        write_marker(dir.path(), "auggie");
+        assert_eq!(auggie_marker_path_with_home(Some(dir.path())), None);
+        // Missing marker / no home.
+        assert_eq!(auggie_marker_path_with_home(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auggie_marker_beats_path_scan_but_loses_to_managed_bin() {
+        // Marker wins over an arbitrary PATH hit (the monorepo#1045 fix)...
+        let dir = unique_temp_dir("marker-vs-path");
+        let marked = dir.path().join("marked-auggie");
+        make_executable(&marked);
+        write_marker(dir.path(), marked.to_str().unwrap());
+        let path_dir = unique_temp_dir("marker-vs-path-scan");
+        make_executable(&path_dir.path().join("auggie"));
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "auggie",
+                "auggie",
+                None,
+                Some(dir.path()),
+                &[path_dir.path().to_path_buf()],
+            ),
+            Some(marked),
+        );
+        // ...but ~/.augment/bin still outranks the marker.
+        let managed = dir.path().join(".augment").join("bin").join("auggie");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        make_executable(&managed);
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "auggie",
+                "auggie",
+                None,
+                Some(dir.path()),
+                &[path_dir.path().to_path_buf()],
+            ),
+            Some(managed),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_tier_is_auggie_only() {
+        // A non-auggie provider never consults the auggie marker, even if the
+        // recorded path happens to be executable.
+        let dir = unique_temp_dir("marker-other-provider");
+        let marked = dir.path().join("marked-auggie");
+        make_executable(&marked);
+        write_marker(dir.path(), marked.to_str().unwrap());
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs("grok", "grok", None, Some(dir.path()), &[],),
+            None,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auggie_candidates_ordered_and_deduped_across_all_tiers() {
+        let dir = unique_temp_dir("candidates");
+        // Managed bin.
+        let managed = dir.path().join(".augment").join("bin").join("auggie");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        make_executable(&managed);
+        // Marker.
+        let marked = dir.path().join("marked-auggie");
+        make_executable(&marked);
+        write_marker(dir.path(), marked.to_str().unwrap());
+        // Two PATH dirs, the second duplicating the managed bin dir so dedup
+        // is exercised.
+        let path1 = unique_temp_dir("candidates-p1");
+        let p1_bin = path1.path().join("auggie");
+        make_executable(&p1_bin);
+        let managed_dir = managed.parent().unwrap().to_path_buf();
+
+        let candidates = find_auggie_candidates_with_home_and_dirs(
+            None,
+            Some(dir.path()),
+            &[path1.path().to_path_buf(), managed_dir],
+        );
+        // Order: managed bin, marker, first PATH hit — managed bin appears once
+        // even though its dir is also in the enhanced dirs list.
+        assert_eq!(candidates, vec![managed.clone(), marked, p1_bin]);
+        // The first candidate always equals find_provider_binary's result.
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "auggie",
+                "auggie",
+                None,
+                Some(dir.path()),
+                &[path1.path().to_path_buf()],
+            ),
+            Some(managed),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auggie_candidates_explicit_path_leads() {
+        let dir = unique_temp_dir("candidates-explicit");
+        let explicit = dir.path().join("explicit-auggie");
+        make_executable(&explicit);
+        let path_dir = unique_temp_dir("candidates-explicit-path");
+        make_executable(&path_dir.path().join("auggie"));
+        let candidates = find_auggie_candidates_with_home_and_dirs(
+            Some(explicit.to_str().unwrap()),
+            Some(dir.path()),
+            &[path_dir.path().to_path_buf()],
+        );
+        assert_eq!(candidates.first(), Some(&explicit));
     }
 
     #[test]
