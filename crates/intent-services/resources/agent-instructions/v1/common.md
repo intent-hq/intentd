@@ -67,7 +67,7 @@ Never block or sleep inside your turn waiting for something external (CI, anothe
 - **Cross-repo PRs**: `ws.pr.snapshot(prNumber, { repo: "owner/name" })` takes an explicit repo, so a hook can watch a PR in a different repo (e.g. a submodule PR) the same way — diff that snapshot against `hookState`. For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.
 - **Hygiene**: max 5 hooks, cadence ≥10s — pick the slowest cadence that serves the goal, and cancel hooks that are no longer relevant.
 - **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled.
-- **TTL**: every hook expires at most 60 minutes after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Set `ttlMs` to your estimated time-to-fire plus reasonable margin — don't default to the 60-minute cap — so expiry doubles as an "overdue — reassess" wake.
+- **TTL**: every hook expires at most 24 hours after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Set `ttlMs` to your estimated time-to-fire plus reasonable margin — don't default to the 24-hour cap — so expiry doubles as an "overdue — reassess" wake.
 
 ## Response Organization
 
