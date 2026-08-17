@@ -7313,7 +7313,9 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
 /// `aroundMessageId` seek (centered page, `prevToken` walk newer, `-32602`
-/// on an unknown id), and the `chat.subscribe` seq-0 snapshot (standard,
+/// on an unknown id), the `aroundIndex` ordinal seek (same centered page,
+/// out-of-range clamp, `-32602` on a negative index or when combined with
+/// `aroundMessageId`), and the `chat.subscribe` seq-0 snapshot (standard,
 /// resumed via `sinceMessageId`, and the unknown-id fallback), all against
 /// one seeded 120-message session. Then the hydration regression at the wire
 /// level: with every row OLDER than the newest bounded page corrupted to
@@ -7632,6 +7634,145 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             .expect("error message")
             .contains("msg-nope"),
         "error names the unknown id: {bad_seek}"
+    );
+
+    // agent.getConversation ordinal seek (§5.5): `aroundIndex` returns the
+    // page containing that 0-based ordinal from the oldest message — the
+    // same centered split and dual cursors as `aroundMessageId`.
+    let idx_seek = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":25,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"aroundIndex":60}}}}"#
+        ),
+    )
+    .await;
+    let result = &idx_seek["result"];
+    let seqs: Vec<i64> = result["messages"]
+        .as_array()
+        .expect("ordinal seek messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        (55..=64).collect::<Vec<i64>>(),
+        "ordinal 60 yields the same page as seeking its message id: {result}"
+    );
+    let idx_prev = result["prevToken"].as_str().expect("newer cursor");
+    assert!(result["nextToken"].is_string(), "older cursor: {result}");
+
+    // The ordinal seek's prevToken walks newer exactly like a message-id
+    // seek's (seq 65..=74).
+    let idx_newer = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":26,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"nextToken":"{idx_prev}"}}}}"#
+        ),
+    )
+    .await;
+    let seqs: Vec<i64> = idx_newer["result"]["messages"]
+        .as_array()
+        .expect("ordinal newer messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (65..=74).collect::<Vec<i64>>());
+
+    // Out-of-range ordinal clamps to the newest window (never an error).
+    let idx_clamped = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":27,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"aroundIndex":999999}}}}"#
+        ),
+    )
+    .await;
+    let result = &idx_clamped["result"];
+    let seqs: Vec<i64> = result["messages"]
+        .as_array()
+        .expect("clamped messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (110..=119).collect::<Vec<i64>>());
+    assert!(
+        result["prevToken"].is_null(),
+        "clamped to the live tail: {result}"
+    );
+
+    // An integer beyond i64::MAX is still a valid overshoot — it clamps to
+    // the newest window like any other out-of-range estimate.
+    let idx_huge = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":37,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"aroundIndex":18446744073709551615}}}}"#
+        ),
+    )
+    .await;
+    let result = &idx_huge["result"];
+    let seqs: Vec<i64> = result["messages"]
+        .as_array()
+        .expect("u64-overshoot messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (110..=119).collect::<Vec<i64>>());
+
+    // Non-integer aroundIndex → -32602 naming the param.
+    let frac_idx = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":38,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","aroundIndex":60.5}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(frac_idx["error"]["code"], -32602);
+    assert!(
+        frac_idx["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("aroundIndex"),
+        "error names the param: {frac_idx}"
+    );
+
+    // Negative aroundIndex → -32602 (PROTOCOL §9).
+    let neg_idx = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":28,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","aroundIndex":-1}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(neg_idx["error"]["code"], -32602);
+    assert!(
+        neg_idx["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("aroundIndex"),
+        "error names the param: {neg_idx}"
+    );
+
+    // Both seek params together → -32602 naming the conflict.
+    let both_seek = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":29,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","aroundMessageId":"{target_id}","aroundIndex":60}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(both_seek["error"]["code"], -32602);
+    assert!(
+        both_seek["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("mutually exclusive"),
+        "error names the conflict: {both_seek}"
     );
 
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest

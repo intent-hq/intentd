@@ -692,6 +692,7 @@ async fn read_conversation(
             Some(ws.clone()),
             page_token,
             None,
+            None,
         )
         .await
         .map_err(map_err)?;

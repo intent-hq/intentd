@@ -1371,7 +1371,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// `agent.getConversation`: `{ agentId, messages, truncated, totalMessages }`
     /// capped to the most-recent `limit` (PROTOCOL §5.5). The optional
     /// `around_message_id` seeks to the page containing that message instead
-    /// of the newest window; absent, behavior is byte-identical to before.
+    /// of the newest window; `around_index` seeks to the page containing that
+    /// 0-based ordinal (from the oldest message), clamped into
+    /// `[0, totalMessages - 1]`. The two seek params are mutually exclusive
+    /// (enforced at the transport boundary); absent both, behavior is
+    /// byte-identical to before.
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
@@ -1379,8 +1383,16 @@ pub trait WorkspaceApi: Send + Sync {
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
         around_message_id: Option<String>,
+        around_index: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, limit, workspace_id, page_token, around_message_id);
+        let _ = (
+            agent_id,
+            limit,
+            workspace_id,
+            page_token,
+            around_message_id,
+            around_index,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
