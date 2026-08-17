@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.14] - 2026-08-17
+
+### 🚀 Features
+
+- *(acp)* Instrument workspace_api dispatch stages with tracing ([#1287](https://github.com/intent-hq/intentd/pull/1287))
+- *(services)* Silent-tail turn annotation + diagnostics exposure ([#1286](https://github.com/intent-hq/intentd/pull/1286))
+- *(transport)* Opt-in incremental chat delta encoding (deltaEncoding param) ([#1289](https://github.com/intent-hq/intentd/pull/1289))
+- *(services)* Raise hook TTL cap from 60 minutes to 24 hours ([#1290](https://github.com/intent-hq/intentd/pull/1290))
+- *(agent)* Include outage duration in restart-resume continuation ([#1291](https://github.com/intent-hq/intentd/pull/1291))
+- *(acp)* Default ws.agent.send / ws.agent.sendToTask to interrupt priority ([#1292](https://github.com/intent-hq/intentd/pull/1292))
+- *(services)* Park automatic wakes in archived workspaces ([#1293](https://github.com/intent-hq/intentd/pull/1293))
+
+### 🐛 Bug Fixes
+
+- Bounded retry for transient event-batch insert failures in the event bus ([#1284](https://github.com/intent-hq/intentd/pull/1284))
+- *(services)* Re-check drain after deliver_wake_message archived park ([#1294](https://github.com/intent-hq/intentd/pull/1294))
+- *(acp)* Bridge dispatch watchdog guarantees a timeout response ([#1285](https://github.com/intent-hq/intentd/pull/1285))
+
+
 ## [0.7.13] - 2026-08-17
 
 ### 🚀 Features
