@@ -88,6 +88,145 @@ pub(crate) fn clone_overall_percent(phase: &str, percent: u32) -> u32 {
 const HYDRATE_SUBMODULE_LO: u32 = 89;
 const HYDRATE_SUBMODULE_HI: u32 = 94;
 
+/// Band the warm-cache refresh's `git fetch --progress` stream maps into on
+/// the unified scale: from the `fetch` step milestone to the `reset` step
+/// milestone, so the fetch visibly advances between the two instead of
+/// freezing at the former.
+const CACHE_REFRESH_FETCH_LO: u32 = 5;
+const CACHE_REFRESH_FETCH_HI: u32 = 60;
+
+/// Normalize a refresh-fetch stderr phase + percent into the
+/// [`CACHE_REFRESH_FETCH_LO`]`..=`[`CACHE_REFRESH_FETCH_HI`] band: the same
+/// per-phase weighting a clone gets ([`clone_phase_segment`]), compressed
+/// into the fetch→reset slice of the cache segment.
+fn refresh_fetch_percent(phase: &str, percent: u32) -> u32 {
+    let (lo, hi) = clone_phase_segment(phase);
+    map_segment(
+        CACHE_REFRESH_FETCH_LO,
+        CACHE_REFRESH_FETCH_HI,
+        map_segment(lo, hi, percent),
+    )
+}
+
+/// One frame the cache-ensure pump wants reported: `Clone` frames carry the
+/// parser's raw (phase, percent) and go through
+/// [`CreateProgress::clone_progress`] (cache-miss full clone — mapping
+/// unchanged); `Milestone` frames carry an already-unified percent and go
+/// through [`CreateProgress::milestone`].
+enum CacheFrame {
+    Clone(&'static str, u32, String),
+    Milestone(&'static str, u32, String),
+}
+
+/// State machine translating raw [`intent_git::repo_cache::CacheEnsureEvent`]s
+/// into [`CacheFrame`]s. `CloneChunk`s arriving with no prior `Step` event
+/// belong to a cache-miss full clone (raw clone mapping); once `Step("fetch")`
+/// has been seen the ensure is a warm-cache refresh, and subsequent
+/// `CloneChunk`s (the refresh's `git fetch --progress` stderr) map into the
+/// fetch→reset band via [`refresh_fetch_percent`], labeled `cache` so the
+/// stream stays cache-phased. `Step("re-clone")` (the ensure escalated to a
+/// wipe + from-scratch clone) reverts to the raw clone mapping with a fresh
+/// clone parser, since the chunks that follow are a new clone's stderr.
+struct CacheEnsurePump {
+    // One parser per stream shape: the ensure clone/fetch is
+    // superproject-shaped; the refresh submodule update is
+    // submodule-scoped throughout.
+    clone_parser: crate::clone_ops::SubmoduleAwareParser,
+    sub_parser: crate::clone_ops::SubmoduleAwareParser,
+    refresh_fetch: bool,
+}
+
+impl CacheEnsurePump {
+    fn new() -> Self {
+        Self {
+            clone_parser: crate::clone_ops::SubmoduleAwareParser::for_clone(),
+            sub_parser: crate::clone_ops::SubmoduleAwareParser::for_submodule_update(),
+            refresh_fetch: false,
+        }
+    }
+
+    fn handle(&mut self, ev: intent_git::repo_cache::CacheEnsureEvent) -> Vec<CacheFrame> {
+        use intent_git::repo_cache::CacheEnsureEvent as Ev;
+        match ev {
+            Ev::CloneChunk(text) => {
+                let frames = self.clone_parser.parse(&text);
+                if self.refresh_fetch {
+                    frames
+                        .into_iter()
+                        .map(|(phase, pct, msg)| {
+                            CacheFrame::Milestone("cache", refresh_fetch_percent(phase, pct), msg)
+                        })
+                        .collect()
+                } else {
+                    frames
+                        .into_iter()
+                        .map(|(phase, pct, msg)| CacheFrame::Clone(phase, pct, msg))
+                        .collect()
+                }
+            }
+            Ev::SubmoduleChunk(text) => self
+                .sub_parser
+                .parse(&text)
+                .into_iter()
+                .map(|(phase, pct, msg)| CacheFrame::Clone(phase, pct, msg))
+                .collect(),
+            // Refresh step boundaries: coarse milestones so a warm-cache
+            // refresh moves even when its steps stream nothing. Percents
+            // sit on the unified scale (monotonic clamp orders them
+            // against any streamed frames).
+            Ev::Step(step) => {
+                if step == "fetch" {
+                    self.refresh_fetch = true;
+                }
+                if step == "re-clone" {
+                    // The cache was wiped: subsequent CloneChunks are a
+                    // from-scratch clone, so drop the refresh-fetch band
+                    // mapping and start a fresh parser for the new stream.
+                    // The milestone sits at the cache band floor — the
+                    // reporter's monotonic clamp keeps any higher percent
+                    // already reached (only the message changes).
+                    self.refresh_fetch = false;
+                    self.clone_parser = crate::clone_ops::SubmoduleAwareParser::for_clone();
+                }
+                let (phase, pct, msg) = match step {
+                    "fetch" => (
+                        "cache",
+                        CACHE_REFRESH_FETCH_LO,
+                        "Refreshing repository cache...",
+                    ),
+                    "re-clone" => (
+                        "cache",
+                        CACHE_REFRESH_FETCH_LO,
+                        "Rebuilding repository cache...",
+                    ),
+                    "reset" => ("cache", CACHE_REFRESH_FETCH_HI, "Updating cache branch..."),
+                    "submodule-sync" => (
+                        "submodules",
+                        SUBMODULE_SEGMENT_START,
+                        "Syncing submodules...",
+                    ),
+                    "submodule-update" => (
+                        "submodules",
+                        SUBMODULE_SEGMENT_START,
+                        "Updating submodules...",
+                    ),
+                    "clean" => (
+                        "cache",
+                        CLONE_SEGMENT_END - 1,
+                        "Cleaning repository cache...",
+                    ),
+                    // A fresh skip: a successful ensure landed within the
+                    // freshness TTL, so the whole refresh is skipped — jump
+                    // straight to the end of the cache phase.
+                    "fresh" => ("cache", CLONE_SEGMENT_END - 1, "Repository cache is fresh"),
+                    _ => return Vec::new(),
+                };
+                vec![CacheFrame::Milestone(phase, pct, msg.to_string())]
+            }
+        }
+    }
+}
+
 /// Bridge a repo-cache ensure to `reporter`: returns the callback to pass to
 /// `intent_git::repo_cache::ensure_cached_repo_with_progress` plus the pump
 /// task translating its raw events into unified-scale frames. The callback is
@@ -104,49 +243,16 @@ pub(crate) fn cache_ensure_reporter(
     use intent_git::repo_cache::CacheEnsureEvent as Ev;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
     let handle = tokio::spawn(async move {
-        // One parser per stream shape: the ensure clone/fetch is
-        // superproject-shaped; the refresh submodule update is
-        // submodule-scoped throughout.
-        let mut clone_parser = crate::clone_ops::SubmoduleAwareParser::for_clone();
-        let mut sub_parser = crate::clone_ops::SubmoduleAwareParser::for_submodule_update();
+        let mut pump = CacheEnsurePump::new();
         while let Some(ev) = rx.recv().await {
-            match ev {
-                Ev::CloneChunk(text) => {
-                    for (phase, pct, msg) in clone_parser.parse(&text) {
+            for frame in pump.handle(ev) {
+                match frame {
+                    CacheFrame::Clone(phase, pct, msg) => {
                         reporter.clone_progress(phase, pct, &msg).await;
                     }
-                }
-                Ev::SubmoduleChunk(text) => {
-                    for (phase, pct, msg) in sub_parser.parse(&text) {
-                        reporter.clone_progress(phase, pct, &msg).await;
+                    CacheFrame::Milestone(phase, pct, msg) => {
+                        reporter.milestone(phase, pct, &msg).await;
                     }
-                }
-                // Refresh step boundaries: coarse milestones so a warm-cache
-                // refresh moves even when its steps stream nothing. Percents
-                // sit on the unified scale (monotonic clamp orders them
-                // against any streamed frames).
-                Ev::Step(step) => {
-                    let (phase, pct, msg) = match step {
-                        "fetch" => ("cache", 5, "Refreshing repository cache..."),
-                        "reset" => ("cache", 60, "Updating cache branch..."),
-                        "submodule-sync" => (
-                            "submodules",
-                            SUBMODULE_SEGMENT_START,
-                            "Syncing submodules...",
-                        ),
-                        "submodule-update" => (
-                            "submodules",
-                            SUBMODULE_SEGMENT_START,
-                            "Updating submodules...",
-                        ),
-                        "clean" => (
-                            "cache",
-                            CLONE_SEGMENT_END - 1,
-                            "Cleaning repository cache...",
-                        ),
-                        _ => continue,
-                    };
-                    reporter.milestone(phase, pct, msg).await;
                 }
             }
         }
@@ -411,5 +517,150 @@ mod tests {
             "unknown phases span the superproject sub-segment"
         );
         assert_eq!(clone_overall_percent("mystery", 0), 0);
+    }
+
+    use intent_git::repo_cache::CacheEnsureEvent as Ev;
+
+    #[test]
+    fn cache_pump_chunks_before_any_step_keep_clone_mapping() {
+        // A cache-miss full clone streams CloneChunks with no prior Step:
+        // frames must pass through as raw Clone frames (the parser's own
+        // phase + percent, mapped later by `clone_progress` exactly as today).
+        let mut pump = CacheEnsurePump::new();
+        let frames = pump.handle(Ev::CloneChunk(
+            "Receiving objects:  42% (42/100)\r".to_string(),
+        ));
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            CacheFrame::Clone(phase, pct, msg) => {
+                assert_eq!(*phase, "receiving");
+                assert_eq!(*pct, 42);
+                assert_eq!(msg, "Receiving objects: 42%");
+            }
+            CacheFrame::Milestone(..) => panic!("cache-miss chunk must stay a Clone frame"),
+        }
+    }
+
+    #[test]
+    fn cache_pump_refresh_fetch_chunks_stream_into_band() {
+        // Chunks after Step("fetch") are the refresh fetch's stderr: they
+        // must become cache-phased Milestone frames strictly increasing
+        // within the fetch→reset band (5..=60).
+        let mut pump = CacheEnsurePump::new();
+        let fetch = pump.handle(Ev::Step("fetch"));
+        assert!(matches!(
+            fetch.as_slice(),
+            [CacheFrame::Milestone("cache", CACHE_REFRESH_FETCH_LO, _)]
+        ));
+        let chunks = [
+            "remote: Counting objects: 10, done.\n",
+            "remote: Compressing objects:  60% (6/10)\r",
+            "Receiving objects:  10% (10/100)\r",
+            "Receiving objects:  55% (55/100)\r",
+            "Receiving objects: 100% (100/100), done.\n",
+            "Resolving deltas: 100% (40/40), done.\n",
+        ];
+        let mut last = CACHE_REFRESH_FETCH_LO;
+        let mut advanced = false;
+        for chunk in chunks {
+            for frame in pump.handle(Ev::CloneChunk(chunk.to_string())) {
+                match frame {
+                    CacheFrame::Milestone(phase, pct, _) => {
+                        assert_eq!(phase, "cache");
+                        assert!((CACHE_REFRESH_FETCH_LO..=CACHE_REFRESH_FETCH_HI).contains(&pct));
+                        assert!(pct >= last, "band percent regressed: {pct} < {last}");
+                        if pct > last {
+                            advanced = true;
+                        }
+                        last = pct;
+                    }
+                    CacheFrame::Clone(phase, pct, _) => {
+                        panic!("refresh-fetch chunk leaked a Clone frame: {phase} {pct}%")
+                    }
+                }
+            }
+        }
+        assert!(advanced, "the fetch stream must advance past the 5% floor");
+    }
+
+    #[test]
+    fn cache_pump_reset_milestone_still_lands_at_60() {
+        let mut pump = CacheEnsurePump::new();
+        pump.handle(Ev::Step("fetch"));
+        pump.handle(Ev::CloneChunk(
+            "Receiving objects: 100% (100/100), done.\n".to_string(),
+        ));
+        let frames = pump.handle(Ev::Step("reset"));
+        match frames.as_slice() {
+            [CacheFrame::Milestone(phase, pct, msg)] => {
+                assert_eq!(*phase, "cache");
+                assert_eq!(*pct, 60);
+                assert_eq!(msg, "Updating cache branch...");
+            }
+            _ => panic!("Step(reset) must emit exactly one milestone frame"),
+        }
+    }
+
+    #[test]
+    fn cache_pump_reclone_resets_to_full_clone_mapping() {
+        // Step("fetch") → Step("re-clone"): the escalation must emit the
+        // rebuild milestone and revert subsequent CloneChunks to the raw
+        // full-clone mapping (fresh parser), not the refresh-fetch band.
+        let mut pump = CacheEnsurePump::new();
+        pump.handle(Ev::Step("fetch"));
+        pump.handle(Ev::CloneChunk(
+            "Receiving objects:  80% (80/100)\r".to_string(),
+        ));
+        let frames = pump.handle(Ev::Step("re-clone"));
+        match frames.as_slice() {
+            [CacheFrame::Milestone(phase, pct, msg)] => {
+                assert_eq!(*phase, "cache");
+                assert_eq!(*pct, CACHE_REFRESH_FETCH_LO);
+                assert_eq!(msg, "Rebuilding repository cache...");
+            }
+            _ => panic!("Step(re-clone) must emit exactly one milestone frame"),
+        }
+        let frames = pump.handle(Ev::CloneChunk(
+            "Receiving objects:  42% (42/100)\r".to_string(),
+        ));
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            CacheFrame::Clone(phase, pct, msg) => {
+                assert_eq!(*phase, "receiving");
+                assert_eq!(*pct, 42);
+                assert_eq!(msg, "Receiving objects: 42%");
+            }
+            CacheFrame::Milestone(..) => {
+                panic!("post-re-clone chunks must map as raw Clone frames")
+            }
+        }
+    }
+
+    #[test]
+    fn cache_pump_fresh_step_emits_end_of_cache_milestone() {
+        // Step("fresh") — the ensure skipped the refresh entirely — must emit
+        // one milestone at the end of the cache phase so the progress jumps
+        // straight past the refresh band.
+        let mut pump = CacheEnsurePump::new();
+        let frames = pump.handle(Ev::Step("fresh"));
+        match frames.as_slice() {
+            [CacheFrame::Milestone(phase, pct, msg)] => {
+                assert_eq!(*phase, "cache");
+                assert_eq!(*pct, CLONE_SEGMENT_END - 1);
+                assert_eq!(msg, "Repository cache is fresh");
+            }
+            _ => panic!("Step(fresh) must emit exactly one milestone frame"),
+        }
+    }
+
+    #[test]
+    fn refresh_fetch_percent_stays_within_band() {
+        assert_eq!(refresh_fetch_percent("starting", 0), CACHE_REFRESH_FETCH_LO);
+        assert_eq!(
+            refresh_fetch_percent("complete", 100),
+            CACHE_REFRESH_FETCH_HI
+        );
+        let mid = refresh_fetch_percent("receiving", 50);
+        assert!(mid > CACHE_REFRESH_FETCH_LO && mid < CACHE_REFRESH_FETCH_HI);
     }
 }
