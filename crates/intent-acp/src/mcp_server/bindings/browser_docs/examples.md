@@ -1,21 +1,44 @@
 # Browser API Examples
 
-## Opening Local HTML Files
+## Reusing a Tab Already at the Target URL
 
-You can open local files directly using file:// URLs:
+List tabs before opening one. If any agent- or user-opened tab already has the target
+URL or that target's rewritten/redirected `finalUrl`, focus it by `tabId` and continue
+working in that tab. For example, when targeting `http://daemon.localhost:8000`:
 
 ```json
-// Open a local HTML file
+{
+  "actions": [
+    { "action": "listTabs" }
+  ]
+}
+// A matching result may show the rewritten finalUrl instead of the requested alias:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ... }
+
+{
+  "actions": [
+    { "action": "focusTab", "tabId": "tab-abc123" },
+    { "action": "getAccessibilityTree", "tabId": "tab-abc123" }
+  ]
+}
+```
+
+Use `openTab` only after `listTabs` shows no tab with the target URL or its
+rewritten/redirected `finalUrl`, or when the user explicitly asks for another tab,
+side-by-side view, or second instance. A different URL may open in a new tab; do not
+navigate an existing tab away from its current URL merely to avoid opening a tab for a
+different URL. Leave user-opened extra tabs in place.
+
+## Opening Local HTML Files
+
+After confirming no tab already has the target URL, you can open local files directly
+using file:// URLs:
+
+```json
+// No existing tab has this URL, so open it
 {
   "actions": [
     { "action": "openTab", "url": "file:///Users/me/project/index.html" }
-  ]
-}
-
-// Navigate an existing tab to a different local file
-{
-  "actions": [
-    { "action": "navigate", "url": "file:///Users/me/project/other.html" }
   ]
 }
 ```
@@ -31,7 +54,7 @@ alias to target it explicitly — and bind `0.0.0.0` so a remote client can reac
 //    terminal for long-running processes — ws.host.exec is one-shot and would block:
 //    ws.script.create("http-server", "python3 -m http.server 8000 --bind 0.0.0.0", "service")
 
-// 2. Open it using the daemon.localhost alias
+// 2. After listTabs confirms no tab has this URL, open it using the daemon.localhost alias
 {
   "actions": [
     { "action": "openTab", "url": "http://daemon.localhost:8000" }
@@ -40,10 +63,11 @@ alias to target it explicitly — and bind `0.0.0.0` so a remote client can reac
 // The result echoes the rewrite, e.g.:
 // { requestedUrl: "http://daemon.localhost:8000", finalUrl: "http://10.0.0.5:8000/", rewritten: true, reason: "..." }
 
-// To target an app on the user's machine instead, use client.localhost
+// To target an app on the user's machine instead, use client.localhost. After the same
+// listTabs check, open a new tab if no tab already has this different URL.
 {
   "actions": [
-    { "action": "navigate", "url": "http://client.localhost:5173" }
+    { "action": "openTab", "url": "http://client.localhost:5173" }
   ]
 }
 ```
@@ -98,29 +122,39 @@ connections there, re-open with the same `remotePort`.
 
 ## Cleaning Up Tabs
 
-Close tabs you opened for testing/automation when you are done with them. `closeTab`
-requires an explicit `tabId` (discover it via `listTabs`) — it never falls back to the
-sequence-level default `tabId`.
+Start by listing tabs and reusing a matching one. Close a tab when you are done only if
+you opened it for testing or automation; do not close a user-opened tab that you reused.
+`closeTab` requires an explicit `tabId` — it never falls back to the sequence-level
+default `tabId`.
 
 ```json
-// Open a tab, find its id, work with it, then close it
+// First look for a tab already at the target URL
+{
+  "actions": [
+    { "action": "listTabs" }
+  ]
+}
+// If a matching tab exists, focus and reuse it. Leave it open if the user opened it.
+
+// If no matching tab exists, open one for this work
 {
   "actions": [
     { "action": "openTab", "url": "http://localhost:5173" }
   ]
 }
 
+// Discover the explicit id of the tab you opened
 {
   "actions": [
     { "action": "listTabs" }
   ]
 }
-// Returns tabs with their ids, e.g. { tabId: "tab-abc123", url: "http://localhost:5173", ... }
+// Returns tabs with their ids, e.g. { tabId: "tab-new456", url: "http://localhost:5173", ... }
 
 {
   "actions": [
-    { "action": "getAccessibilityTree", "tabId": "tab-abc123" },
-    { "action": "closeTab", "tabId": "tab-abc123" }
+    { "action": "getAccessibilityTree", "tabId": "tab-new456" },
+    { "action": "closeTab", "tabId": "tab-new456" }
   ]
 }
 ```
