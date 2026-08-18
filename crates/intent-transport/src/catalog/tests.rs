@@ -120,12 +120,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// removed methods without updating the catalog. The catalog freeze is
 /// intentional: any surface change requires a protocol version bump and a
 /// docs/protocol/ update.
-const EXPECTED_TOTAL_METHODS: usize = 336;
+const EXPECTED_TOTAL_METHODS: usize = 337;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 297;
+const EXPECTED_ROUTER_METHODS: usize = 298;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 37;

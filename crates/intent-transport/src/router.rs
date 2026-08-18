@@ -1284,6 +1284,20 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getMessageBlock" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let block_id = require_str_param(params, "blockId")?;
+            let ws = opt_workspace_id(params);
+            match api
+                .agent_get_message_block(agent_id, message_id, block_id, ws)
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "agent.getSessionStats" => {
             let session_id =
                 require_str_param(params, "sessionId").map(|s| AgentId::from(s.as_str()))?;
