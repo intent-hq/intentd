@@ -70,7 +70,9 @@ pub enum CacheEnsureEvent {
     /// warm-cache refresh shows movement even when the steps stream nothing.
     /// `re-clone` marks the escalation of an existing cache (refresh failure
     /// or origin mismatch) to a wipe + from-scratch clone — the `CloneChunk`s
-    /// that follow it belong to that clone, not the refresh fetch.
+    /// that follow it belong to that clone, not the refresh fetch. `fresh`
+    /// marks a skipped refresh: a successful ensure landed within the
+    /// freshness TTL, so the slot is served as-is with no git work at all.
     Step(&'static str),
 }
 
@@ -91,6 +93,66 @@ fn repo_locks() -> &'static Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>> {
 fn lock_for(cache_path: &Path) -> Arc<AsyncMutex<()>> {
     let mut map = repo_locks().lock().expect("repo cache lock map poisoned");
     map.entry(cache_path.to_path_buf()).or_default().clone()
+}
+
+/// Default freshness TTL: a successful ensure marks its slot fresh for this
+/// long, so a follow-up ensure (e.g. a `workspace.create` right after a
+/// `repo.warmCache` warmed the same repo) skips the refresh entirely.
+const CACHE_FRESH_TTL_DEFAULT: Duration = Duration::from_secs(60);
+
+/// Env var overriding the freshness TTL, in whole seconds. `0` disables the
+/// skip (every ensure refreshes); unset or unparseable falls back to
+/// [`CACHE_FRESH_TTL_DEFAULT`].
+const CACHE_FRESH_TTL_ENV: &str = "INTENTD_CACHE_FRESH_TTL_SECS";
+
+/// Parse a [`CACHE_FRESH_TTL_ENV`] value into the freshness TTL. Pure — the
+/// env read stays in [`fresh_ttl`] so tests never mutate process env.
+fn parse_fresh_ttl(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
+        Some(secs) => Duration::from_secs(secs),
+        None => CACHE_FRESH_TTL_DEFAULT,
+    }
+}
+
+/// The effective freshness TTL: [`CACHE_FRESH_TTL_ENV`] when set, else the
+/// default.
+fn fresh_ttl() -> Duration {
+    parse_fresh_ttl(std::env::var(CACHE_FRESH_TTL_ENV).ok().as_deref())
+}
+
+/// Process-global freshness registry (keyed like [`repo_locks`] by cache
+/// path): the `Instant` of the last SUCCESSFUL ensure of each slot. Failed
+/// ensures never record here.
+fn fresh_marks() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static MARKS: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    MARKS.get_or_init(Default::default)
+}
+
+/// Record a successful ensure of `cache_path`.
+fn mark_fresh(cache_path: &Path) {
+    let mut map = fresh_marks().lock().expect("repo cache fresh map poisoned");
+    map.insert(cache_path.to_path_buf(), Instant::now());
+}
+
+/// Whether the last successful ensure of `cache_path` is younger than `ttl`.
+/// A zero TTL disables freshness entirely.
+fn is_fresh(cache_path: &Path, ttl: Duration) -> bool {
+    if ttl.is_zero() {
+        return false;
+    }
+    fresh_marks()
+        .lock()
+        .expect("repo cache fresh map poisoned")
+        .get(cache_path)
+        .is_some_and(|at| at.elapsed() < ttl)
+}
+
+/// Drop the freshness record for `cache_path`, so the next ensure runs the
+/// real refresh (for tests exercising back-to-back refresh behavior).
+#[cfg(test)]
+fn forget_fresh(cache_path: &Path) {
+    let mut map = fresh_marks().lock().expect("repo cache fresh map poisoned");
+    map.remove(cache_path);
 }
 
 /// Ensure `<cache_root>/<owner>/<repo>` holds a fresh cached clone of
@@ -154,10 +216,34 @@ fn ensure_blocking(
     token: Option<&str>,
     progress: Option<&CacheEnsureProgress>,
 ) -> Result<()> {
+    ensure_blocking_with_ttl(cache_path, github_url, token, progress, fresh_ttl())
+}
+
+/// [`ensure_blocking`] with the freshness TTL passed explicitly, so tests
+/// control the TTL without touching process env.
+fn ensure_blocking_with_ttl(
+    cache_path: &Path,
+    github_url: &str,
+    token: Option<&str>,
+    progress: Option<&CacheEnsureProgress>,
+    fresh_ttl: Duration,
+) -> Result<()> {
     if cache_path.exists() {
         if origin_matches(cache_path, github_url) {
+            if is_fresh(cache_path, fresh_ttl) {
+                // A successful ensure of this slot landed within the TTL
+                // (e.g. an opportunistic warm right before this create): the
+                // slot is already pristine, so skip the refresh entirely. An
+                // origin mismatch never reaches here — it re-clones below
+                // regardless of freshness.
+                emit(progress, CacheEnsureEvent::Step("fresh"));
+                return Ok(());
+            }
             match refresh(cache_path, token, progress) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    mark_fresh(cache_path);
+                    return Ok(());
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -184,7 +270,9 @@ fn ensure_blocking(
         emit(progress, CacheEnsureEvent::Step("re-clone"));
     }
     remove_cache_path(cache_path)?;
-    clone(github_url, cache_path, token, progress)
+    clone(github_url, cache_path, token, progress)?;
+    mark_fresh(cache_path);
+    Ok(())
 }
 
 /// Whether the cache's `origin` remote points at exactly `github_url`. Any
@@ -1479,6 +1567,7 @@ mod tests {
         std::fs::write(&marker, "keep").unwrap();
 
         commit_file(origin.path(), "a.txt", "two\n");
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -1515,6 +1604,7 @@ mod tests {
         let marker = path.join(".git").join("intent-cache-marker");
         std::fs::write(&marker, "keep").unwrap();
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -1645,7 +1735,8 @@ mod tests {
         let marker = path.join(".git").join("intent-cache-marker");
         std::fs::write(&marker, "keep").unwrap();
 
-        // Same owner/repo pair, different source URL: must re-clone from B.
+        // Same owner/repo pair, different source URL: must re-clone from B —
+        // the fresh mark left by the first ensure never overrides a mismatch.
         let path2 = ensure_cached_repo(
             root.path(),
             &file_url(origin_b.path()),
@@ -1683,6 +1774,7 @@ mod tests {
         std::fs::create_dir_all(path.join("junk-dir")).unwrap();
         std::fs::write(path.join("junk-dir").join("x"), "y").unwrap();
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -1727,6 +1819,7 @@ mod tests {
         }
         commit_file(origin.path(), "dev.txt", "on develop\n");
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2140,6 +2233,7 @@ mod tests {
         let new_sha = head_sha(child.path());
         commit_gitlink_bump(origin.path(), "sub", &new_sha);
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2171,6 +2265,7 @@ mod tests {
             .unwrap();
         std::fs::write(path.join("sub").join("pollution.txt"), "leftover").unwrap();
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2206,6 +2301,7 @@ mod tests {
 
         commit_submodule_removal(origin.path(), "sub");
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2241,6 +2337,7 @@ mod tests {
         std::fs::remove_file(&gitfile).unwrap();
         std::fs::write(&gitfile, "not a gitfile").unwrap();
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2274,6 +2371,7 @@ mod tests {
         let gitfile = path.join("sub").join(".git");
         std::fs::remove_file(&gitfile).unwrap();
         std::fs::write(&gitfile, "not a gitfile").unwrap();
+        forget_fresh(&path);
 
         let (cb, events) = event_collector();
         ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
@@ -2588,6 +2686,7 @@ mod tests {
 
         commit_one_submodule_removal(origin.path(), "doomedsub");
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2608,6 +2707,7 @@ mod tests {
             "live submodule work tree still functional"
         );
         // A subsequent refresh with the pruned cache still succeeds in-place.
+        forget_fresh(&path);
         let path3 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2636,6 +2736,7 @@ mod tests {
         let marker = path.join(".git").join("intent-cache-marker");
         std::fs::write(&marker, "keep").unwrap();
 
+        forget_fresh(&path);
         let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2756,6 +2857,7 @@ mod tests {
         let saved = CacheRoot::new("nestedbase-saved");
         let saved_inner = saved.path().join("inner");
         copy_dir_recursive(&inner_gitdir, &saved_inner).unwrap();
+        forget_fresh(&cache);
         let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
@@ -2854,9 +2956,10 @@ mod tests {
         let (origin, _child) = submodule_fixture("repocache-progrefresh");
         let root = CacheRoot::new("progrefresh");
         let url = file_url(origin.path());
-        ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
+        forget_fresh(&path);
 
         let (cb, events) = event_collector();
         ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
@@ -2898,9 +3001,10 @@ mod tests {
         commit_file(origin.path(), "a.txt", "one\n");
         let root = CacheRoot::new("prognosub");
         let url = file_url(origin.path());
-        ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
+        forget_fresh(&path);
 
         let (cb, events) = event_collector();
         ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
@@ -2916,6 +3020,148 @@ mod tests {
             })
             .collect();
         assert_eq!(steps, vec!["fetch", "reset", "clean"]);
+    }
+
+    /// Back-to-back ensures within the freshness TTL: the second ensure
+    /// skips the refresh entirely — only `Step("fresh")` is emitted, no
+    /// fetch boundary and no streamed git output — and the slot is served
+    /// as-is (a new upstream commit is deliberately not picked up).
+    #[tokio::test]
+    async fn fresh_ensure_skips_refresh_and_emits_fresh_step() {
+        let origin = init_repo("repocache-fresh-skip");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("freshskip");
+        let url = file_url(origin.path());
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let sha = head_sha(&path);
+
+        // A real refresh would fetch this; the fresh skip must not.
+        commit_file(origin.path(), "a.txt", "two\n");
+
+        let (cb, events) = event_collector();
+        let path2 =
+            ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
+                .await
+                .unwrap();
+
+        assert_eq!(path, path2);
+        assert_eq!(head_sha(&path), sha, "a fresh skip runs no git work");
+        let events = events.lock().unwrap();
+        let steps: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::Step(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, vec!["fresh"], "only the fresh boundary is emitted");
+        assert!(
+            !events.iter().any(|ev| matches!(
+                ev,
+                CacheEnsureEvent::CloneChunk(_) | CacheEnsureEvent::SubmoduleChunk(_)
+            )),
+            "no git output streams during a fresh skip"
+        );
+    }
+
+    /// A zero TTL disables the skip: an ensure right after a successful one
+    /// still runs the full refresh, fetch included.
+    #[tokio::test]
+    async fn zero_ttl_disables_the_fresh_skip() {
+        let origin = init_repo("repocache-fresh-zero");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("freshzero");
+        let url = file_url(origin.path());
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        commit_file(origin.path(), "a.txt", "two\n");
+
+        let (cb, events) = event_collector();
+        ensure_blocking_with_ttl(&path, &url, None, Some(&cb), Duration::ZERO).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "two\n",
+            "the zero-TTL ensure ran the real refresh"
+        );
+        let events = events.lock().unwrap();
+        let steps: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::Step(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert!(steps.contains(&"fetch"), "refresh ran: {steps:?}");
+        assert!(!steps.contains(&"fresh"), "no fresh skip: {steps:?}");
+    }
+
+    /// A fresh mark older than the TTL no longer skips: the next ensure runs
+    /// the real refresh again and picks up new upstream commits.
+    #[tokio::test]
+    async fn elapsed_ttl_runs_the_refresh_again() {
+        let origin = init_repo("repocache-fresh-elapsed");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("freshelapsed");
+        let url = file_url(origin.path());
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        commit_file(origin.path(), "a.txt", "two\n");
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (cb, events) = event_collector();
+        ensure_blocking_with_ttl(&path, &url, None, Some(&cb), Duration::from_millis(10)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "two\n",
+            "the elapsed-TTL ensure fetched the new commit"
+        );
+        let events = events.lock().unwrap();
+        let steps: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::Step(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert!(steps.contains(&"fetch"), "refresh ran: {steps:?}");
+        assert!(!steps.contains(&"fresh"), "no fresh skip: {steps:?}");
+    }
+
+    /// A failed ensure (clone failure, nothing to fall back to) records no
+    /// freshness — the slot stays unmarked, so nothing ever fresh-skips onto
+    /// a failure.
+    #[tokio::test]
+    async fn failed_ensure_records_no_freshness() {
+        let root = CacheRoot::new("freshfail");
+        let missing = std::env::temp_dir().join("intent-git-repocache-fresh-missing");
+        ensure_cached_repo(root.path(), &file_url(&missing), "acme", "widget", None)
+            .await
+            .expect_err("clone from a missing path must fail");
+        let cache_path = root.path().join("acme").join("widget");
+        assert!(
+            !is_fresh(&cache_path, CACHE_FRESH_TTL_DEFAULT),
+            "a failed ensure must not mark the slot fresh"
+        );
+    }
+
+    /// [`parse_fresh_ttl`] handles the env shapes: unset/garbage fall back to
+    /// the default, `0` disables, whole seconds (whitespace-tolerant) parse.
+    #[test]
+    fn parse_fresh_ttl_handles_env_shapes() {
+        assert_eq!(parse_fresh_ttl(None), CACHE_FRESH_TTL_DEFAULT);
+        assert_eq!(parse_fresh_ttl(Some("0")), Duration::ZERO);
+        assert_eq!(parse_fresh_ttl(Some("120")), Duration::from_secs(120));
+        assert_eq!(parse_fresh_ttl(Some(" 30 ")), Duration::from_secs(30));
+        assert_eq!(parse_fresh_ttl(Some("")), CACHE_FRESH_TTL_DEFAULT);
+        assert_eq!(parse_fresh_ttl(Some("nope")), CACHE_FRESH_TTL_DEFAULT);
+        assert_eq!(parse_fresh_ttl(Some("-5")), CACHE_FRESH_TTL_DEFAULT);
+        assert_eq!(parse_fresh_ttl(Some("1.5")), CACHE_FRESH_TTL_DEFAULT);
     }
 
     /// Direct hydration with a chunk callback streams the submodule

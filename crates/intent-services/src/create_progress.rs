@@ -215,6 +215,10 @@ impl CacheEnsurePump {
                         CLONE_SEGMENT_END - 1,
                         "Cleaning repository cache...",
                     ),
+                    // A fresh skip: a successful ensure landed within the
+                    // freshness TTL, so the whole refresh is skipped — jump
+                    // straight to the end of the cache phase.
+                    "fresh" => ("cache", CLONE_SEGMENT_END - 1, "Repository cache is fresh"),
                     _ => return Vec::new(),
                 };
                 vec![CacheFrame::Milestone(phase, pct, msg.to_string())]
@@ -629,6 +633,23 @@ mod tests {
             CacheFrame::Milestone(..) => {
                 panic!("post-re-clone chunks must map as raw Clone frames")
             }
+        }
+    }
+
+    #[test]
+    fn cache_pump_fresh_step_emits_end_of_cache_milestone() {
+        // Step("fresh") — the ensure skipped the refresh entirely — must emit
+        // one milestone at the end of the cache phase so the progress jumps
+        // straight past the refresh band.
+        let mut pump = CacheEnsurePump::new();
+        let frames = pump.handle(Ev::Step("fresh"));
+        match frames.as_slice() {
+            [CacheFrame::Milestone(phase, pct, msg)] => {
+                assert_eq!(*phase, "cache");
+                assert_eq!(*pct, CLONE_SEGMENT_END - 1);
+                assert_eq!(msg, "Repository cache is fresh");
+            }
+            _ => panic!("Step(fresh) must emit exactly one milestone frame"),
         }
     }
 
