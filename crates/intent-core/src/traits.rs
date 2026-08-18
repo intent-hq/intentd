@@ -1405,6 +1405,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.getMessageBlock`: one full content block of one persisted
+    /// message, by block id — `{ block }` (PROTOCOL §5.5). The on-demand
+    /// counterpart of the `projection: "slim"` conversation read: a client
+    /// holding a truncated block fetches the full body here. Block ids are
+    /// the served identity — persisted assistant ids and the serve-time
+    /// synthetic `{messageId}:{index}` ids both resolve. Bounded cost: one
+    /// primary-key message row read, never a transcript hydration.
+    /// `NotFound` on an unknown agent or a workspace mismatch;
+    /// `InvalidParams` on an unknown message or block id.
+    fn agent_get_message_block(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, message_id, block_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_message_block not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getSession`: full [`AgentSession`] projection including
     /// `systemPrompt`, `specialist`, and the persisted metadata block —
     /// the superset that `agent.get`/`AgentLite` strips (PROTOCOL §5.5).
