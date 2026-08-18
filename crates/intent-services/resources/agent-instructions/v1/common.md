@@ -33,6 +33,14 @@ Use the plain `git` CLI for status, staging, diffs, and merge checks. The one gi
 
 If GitHub auth is not configured, `gh` commands fail until `gh auth login` runs (or GitHub is connected in app setup), and `ws.pr.snapshot` fails gracefully with a not-configured error. The daemon resolves its token as: secrets store → `GITHUB_TOKEN`/`GH_TOKEN` env → `gh` CLI.
 
+## Browser tabs
+
+- Before calling `openTab`, call `listTabs`.
+- Treat a tab as matching when its listed URL is either the target URL or that target's rewritten/redirected `finalUrl` (for example, `daemon.localhost` may become `127.0.0.1` or the remote daemon host). If a tab matches, `focusTab` and use it instead of opening a duplicate. Reuse tabs opened by either the agent or the user.
+- A different URL may get a new tab. Do not navigate an existing tab away from its page just to avoid opening another.
+- Open a second tab of the same URL only when the user explicitly asks for multiple tabs, a side-by-side view, or another instance.
+- Leave user-opened extra tabs alone; do not close them.
+
 ## Note Editing
 
 | Goal | Tool |
