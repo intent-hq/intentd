@@ -1374,8 +1374,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// of the newest window; `around_index` seeks to the page containing that
     /// 0-based ordinal (from the oldest message), clamped into
     /// `[0, totalMessages - 1]`. The two seek params are mutually exclusive
-    /// (enforced at the transport boundary); absent both, behavior is
-    /// byte-identical to before.
+    /// (enforced at the transport boundary). The optional `projection`
+    /// requests bounded tool/image block bodies
+    /// ([`crate::ConversationProjection`]); absent all optional params,
+    /// behavior is byte-identical to before.
+    #[allow(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
@@ -1384,6 +1387,7 @@ pub trait WorkspaceApi: Send + Sync {
         page_token: Option<String>,
         around_message_id: Option<String>,
         around_index: Option<i64>,
+        projection: Option<crate::ConversationProjection>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             agent_id,
@@ -1392,6 +1396,7 @@ pub trait WorkspaceApi: Send + Sync {
             page_token,
             around_message_id,
             around_index,
+            projection,
         );
         Box::pin(async {
             Err(Error::Internal(

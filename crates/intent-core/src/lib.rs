@@ -97,6 +97,7 @@ pub use model::{
     WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
     WorkspaceUpdate,
 };
+pub use model::{ConversationProjection, SLIM_PROJECTION_BUDGET_BYTES};
 pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;

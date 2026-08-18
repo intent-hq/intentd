@@ -206,7 +206,15 @@ async fn agent_conversation_and_summary() {
 
     // Read conversation
     let conversation = services
-        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None, None, None)
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            Some(ws.clone()),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("get conversation");
     assert!(conversation["messages"].is_array());

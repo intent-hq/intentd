@@ -15,9 +15,9 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
-    EventActor, NoteId, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
-    MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -1801,6 +1801,19 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
+/// `projection: "slim"`) to one served message. The block bounding itself
+/// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
+/// `chat.subscribe` stream so deltas and snapshots agree byte-for-byte. Runs
+/// AFTER [`stamp_synthetic_block_ids`] so the flags land on the final served
+/// block identity.
+fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) -> AgentMessage {
+    if let Some(blocks) = message.content.as_array_mut() {
+        crate::tool_block::slim_message_blocks(blocks, thumbnails);
+    }
+    message
+}
+
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
     /// the runtime manager's busy set. Only the small busy set reaches SQLite,
@@ -2239,6 +2252,7 @@ impl Services {
     /// cursor, so older continuation is ordinary paging. Absent both params
     /// (and any seek-minted forward token), the response is byte-identical
     /// to before — no `prevToken` key is added.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -2247,6 +2261,7 @@ impl Services {
         page_token: Option<String>,
         around_message_id: Option<String>,
         around_index: Option<i64>,
+        projection: Option<ConversationProjection>,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -2301,7 +2316,7 @@ impl Services {
                 (w.start, w.end, w.next_token, None)
             }
         };
-        let page: Vec<AgentMessage> = self
+        let mut page: Vec<AgentMessage> = self
             .store
             .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
             .await?
@@ -2309,6 +2324,24 @@ impl Services {
             .map(strip_anonymous_tool_blocks)
             .map(stamp_synthetic_block_ids)
             .collect();
+        if projection == Some(ConversationProjection::Slim) {
+            // One bounded thumbnails read sized by the page (RPC cost
+            // contract: O(rows returned); the common all-text page selects
+            // nothing). Absent-projection reads never reach here, keeping
+            // them byte-identical to before.
+            let ids: Vec<String> = page.iter().map(|m| m.id.clone()).collect();
+            let thumbnails = self
+                .store
+                .get_agent_message_thumbnails(&agent_id, &ids)
+                .await?;
+            page = page
+                .into_iter()
+                .map(|m| {
+                    let thumbs = thumbnails.get(&m.id);
+                    apply_slim_projection(m, thumbs)
+                })
+                .collect();
+        }
         let mut result = json!({
             "agentId": agent_id,
             "messages": page,

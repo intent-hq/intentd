@@ -2278,6 +2278,31 @@ pub struct AgentMessage {
     pub created_at: String,
 }
 
+/// The additive `projection` param on conversation reads (PROTOCOL §5.5):
+/// `agent.getConversation` and `chat.subscribe` accept `projection: "slim"`,
+/// which serves bounded `tool_use`/`tool_result`/`image` blocks so large
+/// transcripts never produce multi-MB RPC frames. Oversized `tool_use.input`
+/// / `tool_result.output` bodies are replaced by a
+/// [`SLIM_PROJECTION_BUDGET_BYTES`] preview with additive
+/// `*Truncated`/`*Bytes` flags; oversized `image.data` is replaced by the
+/// thumbnail persisted at message-write time (`dataIsThumbnail: true`), or
+/// omitted for pre-thumbnail rows. Absent param (`None` at every plumbing
+/// layer) keeps responses byte-identical to before — old clients are
+/// unaffected. Serve-time only; stored rows are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationProjection {
+    /// Bounded tool/image block bodies (previews + additive flags).
+    Slim,
+}
+
+/// Per-body byte budget for the slim conversation projection: a
+/// `tool_use.input` / `tool_result.output` / `image.data` body at or under
+/// this size is served whole with no flags; a larger one is replaced by a
+/// bounded preview (or persisted thumbnail). Shared by the serve-time
+/// transform (intent-services) and the write-time thumbnail trigger
+/// (intent-store) so the two sides agree on what "oversized" means.
+pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
+
 /// Metadata key under which the client-supplied `userAppMessageId` is
 /// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
 /// the router (which folds the top-level param into `messageMetadata`) and

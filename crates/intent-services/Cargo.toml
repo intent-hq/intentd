@@ -51,6 +51,7 @@ async-trait = "0.1"
 git2.workspace = true
 sqlx.workspace = true
 ctor = "1.0.10"
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

@@ -289,7 +289,15 @@ async fn agent_read_conversation_returns_messages() {
 
     // Call agent.readConversation
     let result = services
-        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None, None, None)
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            Some(ws.clone()),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("get conversation");
 

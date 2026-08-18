@@ -212,6 +212,7 @@ async fn chief_agent_ws_app_workspaces_list() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("get conversation");
@@ -385,6 +386,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("read conversation");
@@ -552,6 +554,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
             agent_id.clone(),
             None,
             Some(chief_ws.clone()),
+            None,
             None,
             None,
             None,
@@ -724,6 +727,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
             agent_id.clone(),
             None,
             Some(chief_ws.clone()),
+            None,
             None,
             None,
             None,
@@ -903,6 +907,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("read conversation");
@@ -1075,7 +1080,15 @@ async fn non_chief_agent_ws_app_gating_error() {
 
     // Assert the persisted tool output contains success: false and the gating error string
     let transcript = services
-        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None, None, None)
+        .agent_get_conversation(
+            agent_id.clone(),
+            None,
+            Some(ws.clone()),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("get conversation");
     let messages = transcript["messages"].as_array().expect("messages array");
