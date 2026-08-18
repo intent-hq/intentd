@@ -8313,6 +8313,171 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     srv.ws.stop().await;
 }
 
+/// `agent.getMessageBlock` over the real WSS wire (§5.5): one FULL content
+/// block by id — the on-demand counterpart of the slim projection. A
+/// persisted assistant block id and a serve-time synthetic
+/// `{messageId}:{index}` id both resolve; the returned block is the full,
+/// unprojected body (no slim flags) even when a slim read truncated it;
+/// unknown message/block ids are `-32602` naming the id; a workspace
+/// mismatch and an unknown agent are not-found; missing required params are
+/// `-32602`.
+#[tokio::test]
+async fn wss_agent_get_message_block_serves_full_block() {
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Block"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Block"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // One row: an id-less text block (synthetic id at serve time) plus an
+    // oversized tool_result with a persisted id (slim would truncate it).
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let content = json!([
+        { "type": "text", "text": "hello" },
+        { "type": "tool_result", "id": "blk-full", "tool_use_id": "tc-1",
+          "output": big, "is_error": false },
+    ]);
+    let row_id = srv
+        .store
+        .append_agent_message(&agent, "user", &content, &now_iso())
+        .await
+        .expect("append message")
+        .id;
+
+    // Persisted block id: the full, unprojected body — no slim flags.
+    let by_persisted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"blk-full","workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(by_persisted["jsonrpc"], "2.0");
+    assert_eq!(by_persisted["id"], 3);
+    let block = &by_persisted["result"]["block"];
+    assert_eq!(block["output"].as_str().expect("full output"), big);
+    assert!(
+        block.get("outputTruncated").is_none(),
+        "no slim flags on the full block: {block}"
+    );
+    assert_eq!(block, &content[1], "byte-identical to the stored block");
+
+    // Synthetic block id: `{messageId}:0` resolves the id-less text block,
+    // served with the synthetic id stamped (matching agent.getConversation).
+    let by_synthetic = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{row_id}:0"}}}}"#
+        ),
+    )
+    .await;
+    let block = &by_synthetic["result"]["block"];
+    assert_eq!(block["text"], "hello");
+    assert_eq!(block["id"].as_str(), Some(format!("{row_id}:0").as_str()));
+
+    // Unknown message id / unknown block id: -32602 naming the id.
+    let bad_msg = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"m-missing","blockId":"b"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_msg["error"]["code"], -32602);
+    assert!(
+        bad_msg["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("m-missing"),
+        "names the message id: {bad_msg}"
+    );
+    let bad_block = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{row_id}:9"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_block["error"]["code"], -32602);
+    assert!(
+        bad_block["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(":9"),
+        "names the block id: {bad_block}"
+    );
+
+    // Cross-workspace mismatch and unknown agent: not-found, fail closed.
+    let other_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.create","params":{"title":"Other"}}"#,
+    )
+    .await;
+    let other_ws_id = other_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("other workspace id");
+    let mismatch = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{row_id}:0","workspaceId":"{other_ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], -32602);
+    assert_eq!(mismatch["error"]["data"]["code"], "not-found");
+    let unknown_agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getMessageBlock","params":{{"agentId":"agent-00000000-0000-0000-0000-000000000000","messageId":"{row_id}","blockId":"{row_id}:0"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(unknown_agent["error"]["code"], -32602);
+    assert_eq!(unknown_agent["error"]["data"]["code"], "not-found");
+
+    // Missing required params: -32602.
+    let missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
 /// `search.messages` over the real WSS wire (§5.15): FTS5-backed search over
 /// persisted user/assistant messages. Covers the reworked contract — global
 /// scope when `workspaceId` is absent, `workspaceId` as a hard scope filter,

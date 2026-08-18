@@ -20900,6 +20900,19 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_get_message_block(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_get_message_block_op(agent_id, message_id, block_id, workspace_id)
+                .await
+        })
+    }
+
     fn agent_get_session(
         &self,
         agent_id: AgentId,

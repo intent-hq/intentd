@@ -3666,6 +3666,130 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     assert_eq!(legacy["mimeType"], "image/png", "mimeType intact");
 }
 
+/// `agent.getMessageBlock` (§5.5): the full, unprojected block is served by
+/// id — a persisted assistant id and a serve-time synthetic
+/// `{messageId}:{index}` id both resolve, and an oversized tool body that
+/// the slim projection would truncate comes back complete, byte-identical
+/// to the stored block (plus the synthetic id stamp where applicable).
+#[tokio::test]
+async fn get_message_block_returns_full_block_by_persisted_and_synthetic_id() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "BlockFetch").await;
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let content = json!([
+        { "type": "text", "text": "hello" },
+        { "type": "tool_result", "id": "blk-persisted", "tool_use_id": "tc-1",
+          "output": big, "is_error": false },
+    ]);
+    let row = svc
+        .store()
+        .append_agent_message(&id, "user", &content, &now_iso())
+        .await
+        .expect("append");
+
+    // Synthetic id: the id-less text block resolves at `{messageId}:0`.
+    let by_synthetic = svc
+        .agent_get_message_block_op(
+            id.clone(),
+            row.id.clone(),
+            format!("{}:0", row.id),
+            Some(ws.clone()),
+        )
+        .await
+        .expect("synthetic id resolves");
+    assert_eq!(by_synthetic["block"]["type"], "text");
+    assert_eq!(by_synthetic["block"]["text"], "hello");
+    assert_eq!(
+        by_synthetic["block"]["id"],
+        format!("{}:0", row.id),
+        "served block carries the synthetic id stamp"
+    );
+
+    // Persisted id: the oversized tool_result comes back FULL — never the
+    // slim preview.
+    let by_persisted = svc
+        .agent_get_message_block_op(id, row.id, "blk-persisted".to_string(), None)
+        .await
+        .expect("persisted id resolves");
+    let block = &by_persisted["block"];
+    assert_eq!(
+        block["output"].as_str().unwrap(),
+        big,
+        "full unprojected body"
+    );
+    assert!(
+        block.get("outputTruncated").is_none(),
+        "no slim flags on the full block: {block}"
+    );
+    assert_eq!(block, &content[1], "byte-identical to the stored block");
+}
+
+/// `agent.getMessageBlock` error contract: an unknown message id and an
+/// unknown block id are both `InvalidParams` naming the id (matching the
+/// `agent.getConversation` seek), a cross-workspace mismatch is `NotFound`
+/// (fail closed, indistinguishable from an unknown agent), and an unknown
+/// agent is `NotFound`.
+#[tokio::test]
+async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "BlockErrs").await;
+    let row = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+
+    let err = svc
+        .agent_get_message_block_op(id.clone(), "m-missing".into(), "b".into(), None)
+        .await
+        .expect_err("unknown message id");
+    match err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.contains("m-missing"), "names the message id: {msg}")
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    let err = svc
+        .agent_get_message_block_op(id.clone(), row.id.clone(), format!("{}:9", row.id), None)
+        .await
+        .expect_err("out-of-range synthetic block id");
+    match err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.contains(":9"), "names the block id: {msg}")
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    let err = svc
+        .agent_get_message_block_op(
+            id,
+            row.id.clone(),
+            format!("{}:0", row.id),
+            Some(WorkspaceId::new()),
+        )
+        .await
+        .expect_err("workspace mismatch");
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+
+    let err = svc
+        .agent_get_message_block_op(
+            AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
+            row.id.clone(),
+            format!("{}:0", row.id),
+            None,
+        )
+        .await
+        .expect_err("unknown agent");
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
 /// monorepo#1114 helper: only id-less object blocks are stamped with the
 /// stable synthetic `{messageId}:{index}`; existing ids are never overwritten,
 /// non-object blocks pass through, and the index counts ALL blocks so it

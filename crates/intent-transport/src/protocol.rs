@@ -184,6 +184,12 @@
 //! is `-32602` naming the conflict), carrying the same `nextToken` /
 //! `prevToken` seek cursors as `aroundMessageId` pages — no method-catalog
 //! change, 293 router methods, 332 total. Version 7.2 adds the
+//! `agent.getMessageBlock` router method (additive; §5.5): one FULL content
+//! block of one persisted message by block id — the on-demand counterpart
+//! of the `projection: "slim"` conversation read — `{ block }`, resolving
+//! persisted assistant ids and serve-time synthetic `{messageId}:{index}`
+//! ids alike (unknown message/block id is `-32602` naming the id; unknown
+//! agent or workspace mismatch is not-found); the
 //! `agent:last-message` event (additive; §6.5): the content-bearing
 //! companion emitted alongside EVERY `agent:message` — the id-only echo
 //! enriched with the persisted preview projections the write just computed
@@ -193,8 +199,7 @@
 //! user/assistant message's LAST `tool_use` block preview
 //! (`{ name, input?, inputTruncated?, inputBytes? }`, input bounded by the
 //! §5.5 slim budget), denormalized at message-write time
-//! (migration 0098) — no method-catalog change, 293 router methods,
-//! 332 total.
+//! (migration 0098) — 294 router methods, 333 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
