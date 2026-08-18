@@ -3711,6 +3711,75 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
     assert_eq!(passthrough.content, json!("raw"));
 }
 
+/// `agent_last_message_event_payload` (PROTOCOL §6.5): the id-only echo
+/// enriched with the preview projections derived from the appended row —
+/// assistant rows carry `lastAgentResponse` (+ `lastToolUse` when the row
+/// has a tool_use block), user rows carry `lastUserMessage`, system rows
+/// keep the base echo shape (no preview fields), and every optional field
+/// is omitted rather than `null`.
+#[test]
+fn agent_last_message_payload_shapes() {
+    use crate::agent_ops::agent_last_message_event_payload;
+    let agent_id = AgentId::from("agent-lm");
+    let msg = |role: &str, content: serde_json::Value| intent_core::AgentMessage {
+        id: format!("m-{role}"),
+        agent_id: agent_id.clone(),
+        seq: 0,
+        role: role.to_string(),
+        content,
+        metadata: None,
+        app_message_id: None,
+        created_at: now_iso(),
+    };
+
+    // Assistant row with text + tool_use: response preview + tool preview.
+    let assistant = msg(
+        "assistant",
+        json!([
+            { "type": "text", "text": "first line\nfinal answer" },
+            { "type": "tool_use", "id": "m:1", "name": "view", "input": {"path": "/x"}, "toolCallId": "tc-1" },
+        ]),
+    );
+    let p = agent_last_message_event_payload(&agent_id, &assistant, Some("turn-1"));
+    assert_eq!(p["agentId"], "agent-lm");
+    assert_eq!(p["messageId"], "m-assistant");
+    assert_eq!(p["role"], "assistant");
+    assert_eq!(p["turnId"], "turn-1");
+    assert_eq!(p["lastMessageRole"], "assistant");
+    assert_eq!(p["lastMessageId"], "m-assistant");
+    assert_eq!(p["lastAgentResponse"], "final answer");
+    assert_eq!(
+        p["lastToolUse"],
+        json!({"name": "view", "input": {"path": "/x"}})
+    );
+    assert!(p.get("lastUserMessage").is_none(), "omitted, never null");
+
+    // Assistant row without a tool_use: lastToolUse is ABSENT (the cleared
+    // state), the response preview still rides along.
+    let plain = msg("assistant", json!([{ "type": "text", "text": "done" }]));
+    let p = agent_last_message_event_payload(&agent_id, &plain, None);
+    assert_eq!(p["lastAgentResponse"], "done");
+    assert!(p.get("lastToolUse").is_none());
+    assert!(p.get("turnId").is_none());
+
+    // User row: lastUserMessage, no assistant preview.
+    let user = msg("user", json!([{ "type": "text", "text": "a question" }]));
+    let p = agent_last_message_event_payload(&agent_id, &user, None);
+    assert_eq!(p["lastMessageRole"], "user");
+    assert_eq!(p["lastMessageId"], "m-user");
+    assert_eq!(p["lastUserMessage"], "a question");
+    assert!(p.get("lastAgentResponse").is_none());
+
+    // System row: base echo only — the preview columns were not touched.
+    let system = msg("system", json!([{ "type": "text", "text": "notice" }]));
+    let p = agent_last_message_event_payload(&agent_id, &system, None);
+    assert_eq!(p["role"], "system");
+    assert!(p.get("lastMessageRole").is_none());
+    assert!(p.get("lastMessageId").is_none());
+    assert!(p.get("lastUserMessage").is_none());
+    assert!(p.get("lastToolUse").is_none());
+}
+
 /// monorepo#1114 strip→stamp composition: when `strip_anonymous_tool_blocks`
 /// removes leading blocks, a surviving id-less block is stamped with its
 /// POST-strip index — the invariant that makes the served array's ids match

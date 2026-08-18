@@ -2240,6 +2240,195 @@ async fn wss_agent_mark_seen_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `agent:last-message` + `AgentLite.lastToolUse` (PROTOCOL §6.5/§5.5): a
+/// transcript persist emits BOTH the lean `agent:message` echo (unchanged
+/// shape) and the content-bearing `agent:last-message` companion carrying
+/// the preview projections — including `lastToolUse` (`{ name, input }`)
+/// when the appended row bears a `tool_use` block — and `agent.get` serves
+/// the same preview from the persisted 0098 column. A follow-up tool-less
+/// assistant persist emits a companion WITHOUT `lastToolUse` (the cleared
+/// state) and `agent.get` drops the field.
+#[tokio::test]
+async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS LastToolUse"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"ToolUse Agent"}}}}"#
+        )],
+    )
+    .await;
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // One persistent connection: subscribe BEFORE the persists so both
+    // event notifications are delivered to this client.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    async fn next_event(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        event_type: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == event_type
+                        {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => continue,
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+    }
+    let sub = send_and_wait(
+        &mut ws,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{{"eventTypes":["agent:message","agent:last-message"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        3,
+    )
+    .await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // Persist an assistant row bearing a tool_use block. Issued over a
+    // SEPARATE connection so the subscriber socket above receives only the
+    // event notifications (send_and_wait would otherwise discard an event
+    // frame interleaved before the RPC response).
+    let appended = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"running a tool"}},{{"type":"tool_use","id":"m:1","name":"view","input":{{"path":"/tmp/f"}},"toolCallId":"tc-1"}}]}}}}"#
+        ),
+    )
+    .await;
+    let message_id = appended["result"]["message"]["id"]
+        .as_str()
+        .expect("appended message id")
+        .to_string();
+
+    // The lean echo keeps its pre-existing shape (no preview fields).
+    let echo = next_event(&mut ws, "agent:message").await;
+    assert_eq!(echo["data"]["agentId"], agent_id.as_str());
+    assert_eq!(echo["data"]["messageId"], message_id.as_str());
+    assert_eq!(echo["data"]["role"], "assistant");
+    assert!(
+        echo["data"].get("lastToolUse").is_none(),
+        "agent:message stays the id-only echo: {echo}"
+    );
+
+    // The companion carries the preview projections (§6.5).
+    let last = next_event(&mut ws, "agent:last-message").await;
+    assert_eq!(last["data"]["agentId"], agent_id.as_str());
+    assert_eq!(last["data"]["messageId"], message_id.as_str());
+    assert_eq!(last["data"]["role"], "assistant");
+    assert_eq!(last["data"]["lastMessageRole"], "assistant");
+    assert_eq!(last["data"]["lastMessageId"], message_id.as_str());
+    assert_eq!(last["data"]["lastAgentResponse"], "running a tool");
+    assert_eq!(
+        last["data"]["lastToolUse"],
+        serde_json::json!({"name": "view", "input": {"path": "/tmp/f"}}),
+        "companion carries the bounded tool preview: {last}"
+    );
+    assert!(
+        last["data"].get("lastUserMessage").is_none(),
+        "assistant echo omits lastUserMessage: {last}"
+    );
+
+    // Served on the AgentLite projection from the persisted column.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["lastToolUse"],
+        serde_json::json!({"name": "view", "input": {"path": "/tmp/f"}}),
+        "agent.get serves lastToolUse from the persisted column: {got}"
+    );
+
+    // A newer tool-less assistant persist clears: the companion omits
+    // `lastToolUse` and `agent.get` drops the field. Separate connection,
+    // same reasoning as the first persist.
+    let cleared = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"all done"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(cleared["result"]["success"], true, "append: {cleared}");
+    let last2 = next_event(&mut ws, "agent:last-message").await;
+    assert_eq!(last2["data"]["lastAgentResponse"], "all done");
+    assert!(
+        last2["data"].get("lastToolUse").is_none(),
+        "tool-less persist omits lastToolUse (cleared state): {last2}"
+    );
+    let got2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        got2["result"]["agent"].get("lastToolUse").is_none(),
+        "agent.get drops lastToolUse after a tool-less persist: {got2}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// A8: the four session-shape RPCs unblocking the FE agent-backend-handler
 /// retirement (C1d/C1e) — `agent.getSession`, `agent.update`,
 /// `agent.appendMessage`, `agent.replaceMessages` — over the real WSS

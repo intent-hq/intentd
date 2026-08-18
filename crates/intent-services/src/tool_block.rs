@@ -26,7 +26,7 @@
 //! subscriber's accumulated state stays byte-identical to a fresh slim
 //! snapshot — the same invariant the factory above upholds for block shape.
 
-use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+use intent_core::{cap_json_value, slim_body_size, SLIM_PROJECTION_BUDGET_BYTES};
 use serde_json::{json, Map, Value};
 
 /// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
@@ -122,88 +122,6 @@ fn slim_image(block: &mut Value, ordinal: usize, thumbnails: Option<&Value>) {
     }
     obj.insert("dataTruncated".to_string(), json!(true));
     obj.insert("dataBytes".to_string(), json!(data_len));
-}
-
-/// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
-/// budget check: string bodies by length, everything else by serialized JSON
-/// length counted through a discarding writer — no multi-MB string is
-/// allocated just to be measured (a body that fails to serialize measures 0
-/// and passes through).
-fn slim_body_size(body: &Value) -> usize {
-    struct CountingSink(usize);
-    impl std::io::Write for CountingSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    match body {
-        Value::String(s) => s.len(),
-        other => {
-            let mut sink = CountingSink(0);
-            serde_json::to_writer(&mut sink, other)
-                .map(|()| sink.0)
-                .unwrap_or(0)
-        }
-    }
-}
-
-/// Bounded, structure-preserving preview of a JSON body (slim projection):
-/// object entries are admitted smallest-value-first while the shared `budget`
-/// lasts (each charges its key length plus a punctuation allowance), so the
-/// small scalar keys the FE's tool classification reads —
-/// `classifyTool(name, input)` — survive giant blob siblings; entries beyond
-/// the budget are dropped, keeping the preview bounded regardless of key
-/// count. String leaves are truncated (char-boundary safe) against the
-/// budget, array tails beyond it are dropped, and non-string scalars pass
-/// through with a nominal charge. With the budget exhausted, strings collapse
-/// to `""` and containers to their already-emitted prefix, so the preview's
-/// serialized size stays within a small constant factor of the budget
-/// regardless of input shape.
-fn cap_json_value(value: &Value, budget: &mut usize) -> Value {
-    match value {
-        Value::String(s) => {
-            let mut end = (*budget).min(s.len());
-            while end > 0 && !s.is_char_boundary(end) {
-                end -= 1;
-            }
-            *budget = budget.saturating_sub(end);
-            Value::String(s[..end].to_string())
-        }
-        Value::Array(items) => {
-            let mut out = Vec::new();
-            for item in items {
-                if *budget == 0 {
-                    break;
-                }
-                out.push(cap_json_value(item, budget));
-            }
-            Value::Array(out)
-        }
-        Value::Object(map) => {
-            // Smallest values first: serialization order is key-sorted
-            // regardless of insertion order, so processing order only decides
-            // WHICH entries fit, never how the preview is laid out.
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            entries.sort_by_key(|(_, val)| slim_body_size(val));
-            let mut out = Map::new();
-            for (key, val) in entries {
-                if *budget == 0 {
-                    break;
-                }
-                *budget = budget.saturating_sub(key.len() + 4);
-                out.insert(key.clone(), cap_json_value(val, budget));
-            }
-            Value::Object(out)
-        }
-        other => {
-            *budget = budget.saturating_sub(8);
-            other.clone()
-        }
-    }
 }
 
 /// Return `input` augmented with `_acpTitle = title` when `title` is non-empty.

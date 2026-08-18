@@ -183,13 +183,24 @@
 //! non-integer is `-32602`; supplying it together with `aroundMessageId`
 //! is `-32602` naming the conflict), carrying the same `nextToken` /
 //! `prevToken` seek cursors as `aroundMessageId` pages — no method-catalog
-//! change, 293 router methods, 332 total.
+//! change, 293 router methods, 332 total. Version 7.2 adds the
+//! `agent:last-message` event (additive; §6.5): the content-bearing
+//! companion emitted alongside EVERY `agent:message` — the id-only echo
+//! enriched with the persisted preview projections the write just computed
+//! (`lastMessageRole`/`lastMessageId` plus `lastAgentResponse` /
+//! `lastUserMessage` / `lastToolUse` on user/assistant rows) — and the
+//! additive `AgentLite.lastToolUse` field (§5.5): the newest
+//! user/assistant message's LAST `tool_use` block preview
+//! (`{ name, input?, inputTruncated?, inputBytes? }`, input bounded by the
+//! §5.5 slim budget), denormalized at message-write time
+//! (migration 0098) — no method-catalog change, 293 router methods,
+//! 332 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.1";
+pub const PROTOCOL_VERSION: &str = "7.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

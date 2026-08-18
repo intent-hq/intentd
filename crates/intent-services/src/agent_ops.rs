@@ -1379,6 +1379,44 @@ pub(crate) fn agent_message_event_payload(
     payload
 }
 
+/// The `agent:last-message` event payload (PROTOCOL §6.5): the id-only
+/// `agent:message` echo enriched with the persisted preview projections the
+/// write just computed — derived from the appended row itself, no extra
+/// queries. A `user`/`assistant` row (by construction the session's newest
+/// such message) carries `lastMessageRole`/`lastMessageId` plus its
+/// role-specific preview: `lastAgentResponse` (assistant) or
+/// `lastUserMessage` (user), and `lastToolUse` (the
+/// [`intent_core::last_tool_use_preview`] of the row's content — present
+/// only when the row carries a `tool_use` block; its ABSENCE on a
+/// user/assistant echo means the session's `lastToolUse` is now cleared,
+/// matching the overwritten 0098 column). System (and other) rows keep the
+/// base echo shape — the preview columns were not touched, so no preview
+/// fields ride along. Every optional field is omitted (never `null`).
+pub(crate) fn agent_last_message_event_payload(
+    agent_id: &AgentId,
+    message: &AgentMessage,
+    turn_id: Option<&str>,
+) -> Value {
+    let mut payload = agent_message_event_payload(agent_id, message, turn_id);
+    if message.role != "user" && message.role != "assistant" {
+        return payload;
+    }
+    payload["lastMessageRole"] = json!(message.role);
+    payload["lastMessageId"] = json!(message.id);
+    let blocks = text_blocks(&message.content);
+    if message.role == "assistant" {
+        if let (Some(last_response), _) = last_response_and_digest_from_blocks(&blocks) {
+            payload["lastAgentResponse"] = json!(last_response);
+        }
+    } else if let Some(last_user) = user_text_from_blocks(&blocks) {
+        payload["lastUserMessage"] = json!(last_user);
+    }
+    if let Some(preview) = intent_core::last_tool_use_preview(&message.content) {
+        payload["lastToolUse"] = preview;
+    }
+    payload
+}
+
 /// Whether a wire `priority` requests interrupt delivery (PROTOCOL §5.5):
 /// `"interrupt"` preempts the in-flight turn keep-alive; anything else (or
 /// absent) is normal queue-vs-stream delivery.
@@ -1648,8 +1686,9 @@ fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
     let last_user = last_user_message(&session.messages);
     let (last_role, last_id) = last_message_role_and_id(&session.messages);
+    let last_tool_use = last_tool_use_from_messages(&session.messages);
     let count = session.messages.len() as u64;
-    AgentLite::from_session(
+    let mut lite = AgentLite::from_session(
         session,
         count,
         last_response,
@@ -1657,7 +1696,23 @@ fn project_lite(session: AgentSession) -> AgentLite {
         digest,
         last_role,
         last_id,
-    )
+    );
+    lite.last_tool_use = last_tool_use;
+    lite
+}
+
+/// Derive `lastToolUse` from a loaded transcript: the newest
+/// `user`/`assistant` message's last `tool_use` block preview — the same
+/// [`intent_core::last_tool_use_preview`] the write path persists into the
+/// 0098 column, so this loaded-transcript path and the projection paths
+/// (which serve the persisted column) agree. `None` when that message
+/// carries no `tool_use` block or no user/assistant message exists.
+fn last_tool_use_from_messages(messages: &[AgentMessage]) -> Option<Value> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" || m.role == "assistant")
+        .and_then(|m| intent_core::last_tool_use_preview(&m.content))
 }
 
 /// Derive `lastMessageRole`/`lastMessageId` from a loaded transcript: the
@@ -1696,7 +1751,7 @@ fn project_lite_from_projection(
         .last_user_text_blocks
         .as_deref()
         .and_then(user_text_from_blocks);
-    AgentLite::from_session(
+    let mut lite = AgentLite::from_session(
         session,
         projection.message_count,
         last_response,
@@ -1704,7 +1759,9 @@ fn project_lite_from_projection(
         digest,
         projection.last_message_role.clone(),
         projection.last_message_id.clone(),
-    )
+    );
+    lite.last_tool_use = projection.last_tool_use.clone();
+    lite
 }
 
 /// Whether `blocks` contains a `tool_use` block with no matching `tool_result`
@@ -2383,6 +2440,36 @@ impl Services {
                 metadata: None,
                 data,
             },
+        )
+        .await;
+    }
+
+    /// Publish the persisted-row event pair (PROTOCOL §6.5): the lean
+    /// `agent:message` echo followed by the content-bearing
+    /// `agent:last-message` companion — every transcript persist emits both,
+    /// so clients that only know the old echo are untouched while preview
+    /// consumers converge with zero follow-up RPCs. Payloads derive from the
+    /// appended row itself ([`agent_message_event_payload`] /
+    /// [`agent_last_message_event_payload`]); no extra queries.
+    pub(crate) async fn publish_agent_message_events(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message: &AgentMessage,
+        turn_id: Option<&str>,
+    ) {
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            agent_message_event_payload(agent_id, message, turn_id),
+        )
+        .await;
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            intent_core::events::AGENT_LAST_MESSAGE,
+            agent_last_message_event_payload(agent_id, message, turn_id),
         )
         .await;
     }
@@ -3544,13 +3631,8 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
-        self.publish_agent_mutation_event(
-            &session.workspace_id,
-            &agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(&agent_id, &message, None),
-        )
-        .await;
+        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+            .await;
         // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
         // as the turn-end and user-send persists: an appended assistant row
         // bearing question blocks arms the pending marker, an appended user
@@ -4227,14 +4309,9 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                // Publish agent:message event using the store-returned message id.
-                self.publish_agent_mutation_event(
-                    &session.workspace_id,
-                    &agent_id,
-                    AGENT_MESSAGE,
-                    agent_message_event_payload(&agent_id, &message, None),
-                )
-                .await;
+                // Publish agent:message events using the store-returned message id.
+                self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+                    .await;
                 // Answer intake (PROTOCOL §5.5, question hold): parity with
                 // the runtime `AgentManager::send_message` persist — a
                 // `question_answers` tag naming the marked assistant message
@@ -4385,14 +4462,9 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
-        // Publish agent:message event using the store-returned message id.
-        self.publish_agent_mutation_event(
-            &session.workspace_id,
-            &agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(&agent_id, &message, None),
-        )
-        .await;
+        // Publish agent:message events using the store-returned message id.
+        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+            .await;
         // Answer intake (PROTOCOL §5.5, question hold): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
         // tag clears the marker, and only that clear can retire the
@@ -5495,13 +5567,8 @@ impl Services {
         {
             Ok(message) => {
                 self.invalidate_agent_list_cache(&workspace_id);
-                self.publish_agent_mutation_event(
-                    &workspace_id,
-                    &caller,
-                    intent_core::events::AGENT_MESSAGE,
-                    json!({ "agentId": caller.0, "messageId": message.id, "role": "system" }),
-                )
-                .await;
+                self.publish_agent_message_events(&workspace_id, &caller, &message, None)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -9275,16 +9342,11 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(workspace_id.clone());
         }
-        // Publish agent:message event using the store-returned message id.
+        // Publish agent:message events using the store-returned message id.
         // Wake deliveries carry no user retry record, so no turnId (spec
         // non-goal — the worker still mints one internally at spawn).
-        self.publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(agent_id, &message, None),
-        )
-        .await;
+        self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+            .await;
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
@@ -9372,14 +9434,9 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                // Publish agent:message event using the store-returned message id.
-                self.publish_agent_mutation_event(
-                    workspace_id,
-                    agent_id,
-                    AGENT_MESSAGE,
-                    agent_message_event_payload(agent_id, &message, None),
-                )
-                .await;
+                // Publish agent:message events using the store-returned message id.
+                self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -10940,13 +10997,8 @@ impl Services {
             self.invalidate_agent_list_cache(&workspace_id);
 
             // Emit agent:message + agent:updated so live UIs render the marker.
-            self.publish_agent_mutation_event(
-                &workspace_id,
-                agent_id,
-                AGENT_MESSAGE,
-                json!({ "agentId": agent_id.0, "messageId": marker.id, "role": "system" }),
-            )
-            .await;
+            self.publish_agent_message_events(&workspace_id, agent_id, &marker, None)
+                .await;
             self.publish_agent_mutation_event(
                 &workspace_id,
                 agent_id,
@@ -11144,14 +11196,9 @@ impl Services {
             )));
         }
 
-        // Emit agent:message event so live UIs see the new message
-        self.publish_agent_mutation_event(
-            &workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
-        )
-        .await;
+        // Emit agent:message events so live UIs see the new message
+        self.publish_agent_message_events(&workspace_id, agent_id, &message, None)
+            .await;
 
         Ok(())
     }
