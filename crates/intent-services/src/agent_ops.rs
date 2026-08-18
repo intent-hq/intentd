@@ -2370,6 +2370,17 @@ impl Services {
     /// the returned block is always the full, unprojected body. Bounded cost
     /// (RPC cost contract): a metadata-only session read plus ONE primary-key
     /// message row read; the transcript is never hydrated.
+    ///
+    /// Frame-size note: a block whose serialized response exceeds the
+    /// transport's 40 MiB outbound frame cap (`MAX_OUTBOUND_MESSAGE_BYTES`)
+    /// surfaces as the standard `-32010` oversized-response error naming
+    /// `responseBytes` and the limit — explicit, not a hang. Such a block is
+    /// rare by construction (the matching inbound cap bounds what clients can
+    /// persist; base64 attachments top out ~33.4 MiB) and is equally
+    /// unservable via unprojected `agent.getConversation`, where it takes the
+    /// whole page down rather than just itself. The slim flags
+    /// (`inputBytes`/`outputBytes`/`dataBytes`) carry the full body size, so
+    /// a client can predict the fetch size before calling.
     pub(crate) async fn agent_get_message_block_op(
         &self,
         agent_id: AgentId,
