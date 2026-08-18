@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.20] - 2026-08-18
+
+### 📚 Documentation
+
+- Teach agents to reuse existing browser tabs ([#1310](https://github.com/intent-hq/intentd/pull/1310))
+
+
 ## [0.7.19] - 2026-08-18
 
 ### 🚀 Features
