@@ -1994,11 +1994,13 @@ mod chat_message_delta {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Minimal `WorkspaceApi` serving a pre-canned `agent.getConversation`
-    /// page and counting reads, standing in for the persisted transcript the
-    /// `agent:message` re-read path consults.
+    /// page, counting reads and recording each read's `projection`, standing
+    /// in for the persisted transcript the `agent:message` re-read path
+    /// consults.
     struct ConvApi {
         calls: AtomicUsize,
         conversation: Value,
+        projections: std::sync::Mutex<Vec<Option<intent_core::ConversationProjection>>>,
     }
 
     impl ConvApi {
@@ -2006,6 +2008,7 @@ mod chat_message_delta {
             Self {
                 calls: AtomicUsize::new(0),
                 conversation,
+                projections: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -2019,9 +2022,10 @@ mod chat_message_delta {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
-            _projection: Option<intent_core::ConversationProjection>,
+            projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.projections.lock().unwrap().push(projection);
             let conv = self.conversation.clone();
             Box::pin(async move { Ok(conv) })
         }
@@ -2098,6 +2102,55 @@ mod chat_message_delta {
         assert_eq!(added[1]["block"]["id"], "user-msg-1:1");
         assert!(d["updated"].as_array().unwrap().is_empty());
         assert!(d["removedIds"].as_array().unwrap().is_empty());
+    }
+
+    /// The two delta re-read paths — the `agent:message` user-row re-read and
+    /// the terminal reconcile — forward the subscription's projection to
+    /// `agent.getConversation`, so a slim subscriber's deltas are built from
+    /// the SAME bounded page a fresh slim snapshot would serve (and absent
+    /// stays absent — back-compat).
+    #[tokio::test]
+    async fn delta_re_reads_forward_subscription_projection() {
+        use intent_core::ConversationProjection;
+        let end_event = |agent_id: &str, message_id: &str| Event {
+            id: "evt-end".into(),
+            event_type: intent_core::events::AGENT_STREAM_END.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: Some(agent_id.to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "agentId": agent_id, "messageId": message_id }),
+        };
+
+        let api = ConvApi::new(user_row_conversation());
+        let mut slim = ChatDeltaState::new(
+            &agent(),
+            DeltaEncoding::Full,
+            Some(ConversationProjection::Slim),
+        );
+        slim.delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row delta");
+        slim.delta(&api, &end_event("agent-1", "user-msg-1")).await;
+        let mut full = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+        full.delta(&api, &message_event("agent-1", "user-msg-1", "user"))
+            .await
+            .expect("user-row delta");
+        assert_eq!(
+            *api.projections.lock().unwrap(),
+            vec![
+                Some(ConversationProjection::Slim),
+                Some(ConversationProjection::Slim),
+                None
+            ],
+            "message re-read, terminal reconcile, then default-subscription read"
+        );
     }
 
     #[tokio::test]
