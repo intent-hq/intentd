@@ -2253,6 +2253,144 @@ pub enum ConversationProjection {
 /// (intent-store) so the two sides agree on what "oversized" means.
 pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 
+/// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
+/// budget check: string bodies by length, everything else by serialized JSON
+/// length counted through a discarding writer — no multi-MB string is
+/// allocated just to be measured (a body that fails to serialize measures 0
+/// and passes through). Shared by the serve-time slim projection
+/// (intent-services `tool_block`) and the write-time `lastToolUse` preview
+/// (intent-store, [`last_tool_use_preview`]).
+pub fn slim_body_size(body: &serde_json::Value) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    match body {
+        serde_json::Value::String(s) => s.len(),
+        other => {
+            let mut sink = CountingSink(0);
+            serde_json::to_writer(&mut sink, other)
+                .map(|()| sink.0)
+                .unwrap_or(0)
+        }
+    }
+}
+
+/// Bounded, structure-preserving preview of a JSON body (slim projection):
+/// object entries are admitted smallest-value-first while the shared `budget`
+/// lasts (each charges its key length plus a punctuation allowance; an entry
+/// whose key charge alone exceeds the remaining budget is skipped outright —
+/// the key would be copied verbatim and bypass the bound), so the small
+/// scalar keys the FE's tool classification reads —
+/// `classifyTool(name, input)` — survive giant blob siblings; entries beyond
+/// the budget are dropped, keeping the preview bounded regardless of key
+/// count. String leaves are truncated (char-boundary safe) against the
+/// budget and charge a quote allowance on top of their content, array
+/// elements charge a punctuation allowance each (so a flood of `""` / `[]` /
+/// `{}` elements still exhausts the budget), array tails beyond it are
+/// dropped, and non-string scalars pass through with a nominal charge. With
+/// the budget exhausted, strings collapse to `""` and containers to their
+/// already-emitted prefix, so the preview's serialized size stays within a
+/// small constant factor of the budget regardless of input shape. Shared
+/// like [`slim_body_size`].
+pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => {
+            let mut end = (*budget).min(s.len());
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            // The quote allowance keeps empty/short strings from being
+            // budget-free: unbounded repetition must exhaust the budget.
+            *budget = budget.saturating_sub(end + 2);
+            Value::String(s[..end].to_string())
+        }
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if *budget == 0 {
+                    break;
+                }
+                // Per-element punctuation charge: empty containers and empty
+                // strings must consume budget, or a flood of them would keep
+                // the preview unbounded.
+                *budget = budget.saturating_sub(2);
+                out.push(cap_json_value(item, budget));
+            }
+            Value::Array(out)
+        }
+        Value::Object(map) => {
+            // Smallest values first: serialization order is key-sorted
+            // regardless of insertion order, so processing order only decides
+            // WHICH entries fit, never how the preview is laid out.
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(_, val)| slim_body_size(val));
+            let mut out = serde_json::Map::new();
+            for (key, val) in entries {
+                if *budget == 0 {
+                    break;
+                }
+                let charge = key.len() + 4;
+                if charge > *budget {
+                    // The key is copied verbatim (never truncated), so an
+                    // over-budget key must be dropped — admitting it would
+                    // bypass the advertised bound. Later (smaller-keyed)
+                    // entries still get a chance at the remaining budget.
+                    continue;
+                }
+                *budget -= charge;
+                out.insert(key.clone(), cap_json_value(val, budget));
+            }
+            Value::Object(out)
+        }
+        other => {
+            *budget = budget.saturating_sub(8);
+            other.clone()
+        }
+    }
+}
+
+/// The `lastToolUse` preview of one message's content blocks (PROTOCOL §5.5 /
+/// §6.5): the LAST `tool_use` block's `name` plus its `input` bounded by
+/// [`SLIM_PROJECTION_BUDGET_BYTES`] — an over-budget input is replaced by
+/// [`cap_json_value`]'s structure-preserving preview with additive
+/// `inputTruncated` / `inputBytes` flags (the same treatment as the slim
+/// conversation projection), an absent input is omitted. `None` when the
+/// content is not a block array or carries no `tool_use` block. Shared by
+/// the write-time `agent_session.last_tool_use_preview` column maintenance
+/// (intent-store, 0098) and the `agent:last-message` event payload
+/// (intent-services), so the persisted column and the event always agree.
+pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    let blocks = content.as_array()?;
+    let block = blocks
+        .iter()
+        .rev()
+        .find(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))?;
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+    let mut preview = serde_json::Map::new();
+    preview.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(input) = block.get("input") {
+        let size = slim_body_size(input);
+        if size <= SLIM_PROJECTION_BUDGET_BYTES {
+            preview.insert("input".to_string(), input.clone());
+        } else {
+            let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+            preview.insert("input".to_string(), cap_json_value(input, &mut budget));
+            preview.insert("inputTruncated".to_string(), Value::Bool(true));
+            preview.insert("inputBytes".to_string(), serde_json::json!(size));
+        }
+    }
+    Some(Value::Object(preview))
+}
+
 /// Metadata key under which the client-supplied `userAppMessageId` is
 /// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
 /// the router (which folds the top-level param into `messageMetadata`) and
@@ -2830,6 +2968,15 @@ pub struct AgentLite {
     /// the last persisted message until the assistant row persists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_id: Option<String>,
+    /// Preview of the newest user/assistant message's LAST `tool_use` block —
+    /// `{ name, input?, inputTruncated?, inputBytes? }` with `input` bounded
+    /// by [`SLIM_PROJECTION_BUDGET_BYTES`] (see [`last_tool_use_preview`]) —
+    /// served from the persisted `agent_session.last_tool_use_preview` column
+    /// (0098) maintained at message-write time. Additive wire field; omitted
+    /// when the newest user/assistant message carries no `tool_use` block (or
+    /// the session has no such message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_use: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
@@ -2944,6 +3091,9 @@ impl AgentLite {
             last_user_message,
             last_message_role,
             last_message_id,
+            // Overlaid by the service projections from the persisted 0098
+            // column ([`Self::last_tool_use`]); no session-level source here.
+            last_tool_use: None,
             digest,
             context_references: session.context_references,
             file_blocks: session.file_blocks,
@@ -3636,6 +3786,106 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    /// [`last_tool_use_preview`] derivation: the LAST tool_use block wins,
+    /// an under-budget input passes through whole (no flags), an over-budget
+    /// input is capped with the additive `inputTruncated`/`inputBytes`
+    /// flags, a tool-less / non-array content yields `None`, and a missing
+    /// `input` omits the field.
+    #[test]
+    fn last_tool_use_preview_shapes() {
+        // Last block wins; small input passes through whole.
+        let content = json!([
+            { "type": "tool_use", "id": "m:0", "name": "old", "input": {"a": 1}, "toolCallId": "t0" },
+            { "type": "text", "text": "between" },
+            { "type": "tool_use", "id": "m:2", "name": "view", "input": {"path": "/x"}, "toolCallId": "t2" },
+        ]);
+        assert_eq!(
+            last_tool_use_preview(&content),
+            Some(json!({"name": "view", "input": {"path": "/x"}}))
+        );
+
+        // Over-budget input: capped preview + flags; small scalar keys
+        // survive the giant sibling (smallest-value-first admission).
+        let big = json!([{
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": {
+                "path": "/tmp/a.txt",
+                "content": "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 8),
+            },
+            "toolCallId": "tb",
+        }]);
+        let preview = last_tool_use_preview(&big).unwrap();
+        assert_eq!(preview["name"], "write_file");
+        assert_eq!(preview["inputTruncated"], true);
+        assert!(preview["inputBytes"].as_u64().unwrap() as usize > SLIM_PROJECTION_BUDGET_BYTES);
+        assert_eq!(preview["input"]["path"], "/tmp/a.txt");
+        let served = serde_json::to_string(&preview["input"]).unwrap();
+        assert!(
+            served.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2,
+            "capped input stays near the budget, got {} bytes",
+            served.len()
+        );
+
+        // Missing input omits the field; missing name degrades to "".
+        let no_input = json!([{ "type": "tool_use", "id": "m:0", "toolCallId": "t" }]);
+        assert_eq!(last_tool_use_preview(&no_input), Some(json!({"name": ""})));
+
+        // Tool-less and non-array contents yield None.
+        assert_eq!(
+            last_tool_use_preview(&json!([{ "type": "text", "text": "hi" }])),
+            None
+        );
+        assert_eq!(last_tool_use_preview(&json!("raw")), None);
+    }
+
+    /// [`cap_json_value`] adversarial-shape bounding: elements that
+    /// serialize to almost nothing (empty strings / empty containers) and
+    /// oversized object keys must not bypass the budget — the capped
+    /// preview's serialized size stays within a small constant factor of the
+    /// budget for every input shape.
+    #[test]
+    fn cap_json_value_bounds_adversarial_shapes() {
+        let bound = SLIM_PROJECTION_BUDGET_BYTES * 2;
+        let capped_len = |v: &serde_json::Value| {
+            let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+            serde_json::to_string(&cap_json_value(v, &mut budget))
+                .unwrap()
+                .len()
+        };
+
+        // A flood of empty strings: each charges a quote allowance, so the
+        // array is cut long before it is copied whole.
+        let empty_strings = json!(vec![""; 100_000]);
+        let len = capped_len(&empty_strings);
+        assert!(len <= bound, "empty-string flood stays bounded, got {len}");
+
+        // A flood of empty containers: the per-element punctuation charge
+        // exhausts the budget the same way.
+        let empty_arrays = json!(vec![serde_json::json!([]); 100_000]);
+        let len = capped_len(&empty_arrays);
+        assert!(len <= bound, "empty-array flood stays bounded, got {len}");
+
+        // One object key larger than the whole budget: the entry is dropped
+        // (a key is copied verbatim, so admitting it would bypass the bound),
+        // while a small sibling that fits is kept.
+        let huge_key = "k".repeat(SLIM_PROJECTION_BUDGET_BYTES * 8);
+        let one_huge_key = json!({ huge_key.clone(): 1, "path": "/x" });
+        let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+        let capped = cap_json_value(&one_huge_key, &mut budget);
+        assert!(capped.get(&huge_key).is_none(), "over-budget key dropped");
+        assert_eq!(capped["path"], "/x", "small sibling entry survives");
+        let len = serde_json::to_string(&capped).unwrap().len();
+        assert!(len <= bound, "huge-key object stays bounded, got {len}");
+
+        // Nested repetition of the above shapes stays bounded too.
+        let nested = json!({
+            "a": vec![""; 50_000],
+            "b": { huge_key: vec![serde_json::json!({}); 50_000] },
+        });
+        let len = capped_len(&nested);
+        assert!(len <= bound, "nested adversarial shape bounded, got {len}");
+    }
 
     #[test]
     fn event_wire_shape_matches_ts() {
