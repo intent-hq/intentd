@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.18] - 2026-08-18
+
+### 🚀 Features
+
+- Slim tool/image projection for conversation reads ([#1304](https://github.com/intent-hq/intentd/pull/1304))
+
+
 ## [0.7.17] - 2026-08-18
 
 ### 🐛 Bug Fixes
