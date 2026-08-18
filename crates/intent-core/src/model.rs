@@ -2284,16 +2284,21 @@ pub fn slim_body_size(body: &serde_json::Value) -> usize {
 
 /// Bounded, structure-preserving preview of a JSON body (slim projection):
 /// object entries are admitted smallest-value-first while the shared `budget`
-/// lasts (each charges its key length plus a punctuation allowance), so the
-/// small scalar keys the FE's tool classification reads —
+/// lasts (each charges its key length plus a punctuation allowance; an entry
+/// whose key charge alone exceeds the remaining budget is skipped outright —
+/// the key would be copied verbatim and bypass the bound), so the small
+/// scalar keys the FE's tool classification reads —
 /// `classifyTool(name, input)` — survive giant blob siblings; entries beyond
 /// the budget are dropped, keeping the preview bounded regardless of key
 /// count. String leaves are truncated (char-boundary safe) against the
-/// budget, array tails beyond it are dropped, and non-string scalars pass
-/// through with a nominal charge. With the budget exhausted, strings collapse
-/// to `""` and containers to their already-emitted prefix, so the preview's
-/// serialized size stays within a small constant factor of the budget
-/// regardless of input shape. Shared like [`slim_body_size`].
+/// budget and charge a quote allowance on top of their content, array
+/// elements charge a punctuation allowance each (so a flood of `""` / `[]` /
+/// `{}` elements still exhausts the budget), array tails beyond it are
+/// dropped, and non-string scalars pass through with a nominal charge. With
+/// the budget exhausted, strings collapse to `""` and containers to their
+/// already-emitted prefix, so the preview's serialized size stays within a
+/// small constant factor of the budget regardless of input shape. Shared
+/// like [`slim_body_size`].
 pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_json::Value {
     use serde_json::Value;
     match value {
@@ -2302,7 +2307,9 @@ pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_js
             while end > 0 && !s.is_char_boundary(end) {
                 end -= 1;
             }
-            *budget = budget.saturating_sub(end);
+            // The quote allowance keeps empty/short strings from being
+            // budget-free: unbounded repetition must exhaust the budget.
+            *budget = budget.saturating_sub(end + 2);
             Value::String(s[..end].to_string())
         }
         Value::Array(items) => {
@@ -2311,6 +2318,10 @@ pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_js
                 if *budget == 0 {
                     break;
                 }
+                // Per-element punctuation charge: empty containers and empty
+                // strings must consume budget, or a flood of them would keep
+                // the preview unbounded.
+                *budget = budget.saturating_sub(2);
                 out.push(cap_json_value(item, budget));
             }
             Value::Array(out)
@@ -2326,7 +2337,15 @@ pub fn cap_json_value(value: &serde_json::Value, budget: &mut usize) -> serde_js
                 if *budget == 0 {
                     break;
                 }
-                *budget = budget.saturating_sub(key.len() + 4);
+                let charge = key.len() + 4;
+                if charge > *budget {
+                    // The key is copied verbatim (never truncated), so an
+                    // over-budget key must be dropped — admitting it would
+                    // bypass the advertised bound. Later (smaller-keyed)
+                    // entries still get a chance at the remaining budget.
+                    continue;
+                }
+                *budget -= charge;
                 out.insert(key.clone(), cap_json_value(val, budget));
             }
             Value::Object(out)
@@ -3818,6 +3837,54 @@ mod tests {
             None
         );
         assert_eq!(last_tool_use_preview(&json!("raw")), None);
+    }
+
+    /// [`cap_json_value`] adversarial-shape bounding: elements that
+    /// serialize to almost nothing (empty strings / empty containers) and
+    /// oversized object keys must not bypass the budget — the capped
+    /// preview's serialized size stays within a small constant factor of the
+    /// budget for every input shape.
+    #[test]
+    fn cap_json_value_bounds_adversarial_shapes() {
+        let bound = SLIM_PROJECTION_BUDGET_BYTES * 2;
+        let capped_len = |v: &serde_json::Value| {
+            let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+            serde_json::to_string(&cap_json_value(v, &mut budget))
+                .unwrap()
+                .len()
+        };
+
+        // A flood of empty strings: each charges a quote allowance, so the
+        // array is cut long before it is copied whole.
+        let empty_strings = json!(vec![""; 100_000]);
+        let len = capped_len(&empty_strings);
+        assert!(len <= bound, "empty-string flood stays bounded, got {len}");
+
+        // A flood of empty containers: the per-element punctuation charge
+        // exhausts the budget the same way.
+        let empty_arrays = json!(vec![serde_json::json!([]); 100_000]);
+        let len = capped_len(&empty_arrays);
+        assert!(len <= bound, "empty-array flood stays bounded, got {len}");
+
+        // One object key larger than the whole budget: the entry is dropped
+        // (a key is copied verbatim, so admitting it would bypass the bound),
+        // while a small sibling that fits is kept.
+        let huge_key = "k".repeat(SLIM_PROJECTION_BUDGET_BYTES * 8);
+        let one_huge_key = json!({ huge_key.clone(): 1, "path": "/x" });
+        let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+        let capped = cap_json_value(&one_huge_key, &mut budget);
+        assert!(capped.get(&huge_key).is_none(), "over-budget key dropped");
+        assert_eq!(capped["path"], "/x", "small sibling entry survives");
+        let len = serde_json::to_string(&capped).unwrap().len();
+        assert!(len <= bound, "huge-key object stays bounded, got {len}");
+
+        // Nested repetition of the above shapes stays bounded too.
+        let nested = json!({
+            "a": vec![""; 50_000],
+            "b": { huge_key: vec![serde_json::json!({}); 50_000] },
+        });
+        let len = capped_len(&nested);
+        assert!(len <= bound, "nested adversarial shape bounded, got {len}");
     }
 
     #[test]

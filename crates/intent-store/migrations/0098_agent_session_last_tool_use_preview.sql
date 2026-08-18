@@ -18,18 +18,29 @@
 
 ALTER TABLE agent_session ADD COLUMN last_tool_use_preview TEXT;
 
+-- Size accounting mirrors the Rust `slim_body_size`: a STRING input is
+-- measured by its raw UTF-8 byte length (`->>` extracts the decoded text;
+-- the BLOB cast counts bytes, not characters — `length()` on TEXT counts
+-- code points), everything else by its serialized JSON byte length (`->`).
+-- Measuring a string's `->` form would count the surrounding quotes and
+-- escapes and disagree with new writes near the boundary.
 UPDATE agent_session SET last_tool_use_preview = (
   SELECT CASE WHEN json_valid(m.content) AND json_type(m.content) = 'array' THEN
     (SELECT CASE
         WHEN b.value -> '$.input' IS NULL THEN
           json_object('name', COALESCE(b.value ->> '$.name', ''))
-        WHEN length(b.value -> '$.input') <= 2048 THEN
+        WHEN (CASE WHEN json_type(b.value, '$.input') = 'text'
+                   THEN length(CAST(b.value ->> '$.input' AS BLOB))
+                   ELSE length(CAST((b.value -> '$.input') AS BLOB)) END) <= 2048 THEN
           json_object('name', COALESCE(b.value ->> '$.name', ''),
                       'input', json(b.value -> '$.input'))
         ELSE
           json_object('name', COALESCE(b.value ->> '$.name', ''),
                       'inputTruncated', json('true'),
-                      'inputBytes', length(b.value -> '$.input'))
+                      'inputBytes',
+                      (CASE WHEN json_type(b.value, '$.input') = 'text'
+                            THEN length(CAST(b.value ->> '$.input' AS BLOB))
+                            ELSE length(CAST((b.value -> '$.input') AS BLOB)) END))
       END
      FROM json_each(m.content) b
      WHERE b.value ->> '$.type' = 'tool_use'

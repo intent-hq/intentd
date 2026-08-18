@@ -7805,9 +7805,10 @@ mod tests {
 
         let with_tool = AgentId("agent-bf-tool".to_string());
         let big_tool = AgentId("agent-bf-big".to_string());
+        let boundary = AgentId("agent-bf-boundary".to_string());
         let no_tool = AgentId("agent-bf-plain".to_string());
         let empty = AgentId("agent-bf-empty".to_string());
-        for id in [&with_tool, &big_tool, &no_tool, &empty] {
+        for id in [&with_tool, &big_tool, &boundary, &no_tool, &empty] {
             store
                 .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
                 .await
@@ -7843,6 +7844,24 @@ mod tests {
             )
             .await
             .expect("append big tool row");
+        // Exactly-at-budget STRING input: the Rust write path measures a
+        // string body by its raw byte length (`slim_body_size`), so this row
+        // must backfill whole — measuring the JSON form (`->`) would count
+        // the surrounding quotes and flag it truncated (off-by-two).
+        let boundary_str = "y".repeat(intent_core::SLIM_PROJECTION_BUDGET_BYTES);
+        store
+            .append_agent_message(
+                &boundary,
+                "assistant",
+                &serde_json::json!([{
+                    "type": "tool_use", "id": "m:0", "name": "bash",
+                    "input": boundary_str,
+                    "toolCallId": "ty",
+                }]),
+                &ts,
+            )
+            .await
+            .expect("append boundary tool row");
         store
             .append_agent_message(&no_tool, "assistant", &text("plain"), &ts)
             .await
@@ -7874,6 +7893,12 @@ mod tests {
         assert!(
             big.get("input").is_none(),
             "SQL backfill stores flags only for over-budget inputs"
+        );
+        assert_eq!(
+            read_tool_use_column(&store, &boundary).await,
+            Some(serde_json::json!({"name": "bash", "input": boundary_str})),
+            "an exactly-at-budget string input backfills whole — the SQL size \
+             accounting matches slim_body_size (raw bytes, not quoted JSON)"
         );
         assert_eq!(read_tool_use_column(&store, &no_tool).await, None);
         assert_eq!(read_tool_use_column(&store, &empty).await, None);
