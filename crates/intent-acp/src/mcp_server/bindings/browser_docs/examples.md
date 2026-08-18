@@ -3,7 +3,8 @@
 ## Reusing a Tab Already at the Target URL
 
 List tabs before opening one. If any agent- or user-opened tab already has the target
-URL, focus it by `tabId` and continue working in that tab:
+URL or that target's rewritten/redirected `finalUrl`, focus it by `tabId` and continue
+working in that tab. For example, when targeting `http://daemon.localhost:8000`:
 
 ```json
 {
@@ -11,8 +12,8 @@ URL, focus it by `tabId` and continue working in that tab:
     { "action": "listTabs" }
   ]
 }
-// A matching result might be:
-// { tabId: "tab-abc123", url: "http://daemon.localhost:8000", ... }
+// A matching result may show the rewritten finalUrl instead of the requested alias:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ... }
 
 {
   "actions": [
@@ -22,10 +23,11 @@ URL, focus it by `tabId` and continue working in that tab:
 }
 ```
 
-Use `openTab` only after `listTabs` shows no tab with the target URL, or when the user
-explicitly asks for another tab, side-by-side view, or second instance. A different URL
-may open in a new tab; do not navigate an existing tab away from its current URL merely
-to avoid opening a tab for a different URL. Leave user-opened extra tabs in place.
+Use `openTab` only after `listTabs` shows no tab with the target URL or its
+rewritten/redirected `finalUrl`, or when the user explicitly asks for another tab,
+side-by-side view, or second instance. A different URL may open in a new tab; do not
+navigate an existing tab away from its current URL merely to avoid opening a tab for a
+different URL. Leave user-opened extra tabs in place.
 
 ## Opening Local HTML Files
 
