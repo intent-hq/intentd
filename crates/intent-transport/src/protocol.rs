@@ -183,13 +183,20 @@
 //! non-integer is `-32602`; supplying it together with `aroundMessageId`
 //! is `-32602` naming the conflict), carrying the same `nextToken` /
 //! `prevToken` seek cursors as `aroundMessageId` pages — no method-catalog
-//! change, 293 router methods, 332 total.
+//! change, 293 router methods, 332 total. Version 7.2 adds the
+//! `agent.getMessageBlock` router method (additive; §5.5): one FULL content
+//! block of one persisted message by block id — the on-demand counterpart
+//! of the `projection: "slim"` conversation read — `{ block }`, resolving
+//! persisted assistant ids and serve-time synthetic `{messageId}:{index}`
+//! ids alike (unknown message/block id is `-32602` naming the id; unknown
+//! agent or workspace mismatch is not-found) — 294 router methods, 333
+//! total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.1";
+pub const PROTOCOL_VERSION: &str = "7.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -2360,6 +2360,51 @@ impl Services {
         Ok(result)
     }
 
+    /// `agent.getMessageBlock` (PROTOCOL §5.5): one FULL content block of one
+    /// persisted message, by block id — the on-demand counterpart of the slim
+    /// conversation projection. The row is served through the same
+    /// [`strip_anonymous_tool_blocks`] + [`stamp_synthetic_block_ids`] passes
+    /// as `agent.getConversation` (NEVER the slim bounding), so block identity
+    /// matches the served conversation byte-for-byte — persisted assistant ids
+    /// and serve-time synthetic `{messageId}:{index}` ids both resolve — and
+    /// the returned block is always the full, unprojected body. Bounded cost
+    /// (RPC cost contract): a metadata-only session read plus ONE primary-key
+    /// message row read; the transcript is never hydrated.
+    pub(crate) async fn agent_get_message_block_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        // Metadata-only scope check — same fail-closed contract as
+        // `agent_get_conversation_op`: a cross-workspace mismatch is
+        // `NotFound`, indistinguishable from an unknown agent.
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let message = self
+            .store
+            .get_agent_message_by_id(&agent_id, &message_id)
+            .await?
+            .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {message_id}")))?;
+        let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
+        let block = message
+            .content
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b.get("id").and_then(Value::as_str) == Some(block_id.as_str()))
+            })
+            .cloned()
+            .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
+        Ok(json!({ "block": block }))
+    }
+
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
     /// session mutation emits an invalidation event so subscribed clients
     /// re-read the projection instead of relying on a local cache.
