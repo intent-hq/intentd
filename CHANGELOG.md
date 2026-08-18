@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.17] - 2026-08-18
+
+### 🐛 Bug Fixes
+
+- Repo-cache create progress visibility, re-clone signal, freshness TTL, env-overridable timeouts ([#1301](https://github.com/intent-hq/intentd/pull/1301))
+
+
 ## [0.7.16] - 2026-08-17
 
 ### 🚀 Features
