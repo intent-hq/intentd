@@ -544,7 +544,7 @@ fn tool_event_with_ids(
 
 #[test]
 fn chat_chunk_delta_accumulates_text_and_flips_added_to_updated() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     // First text chunk for blk-0 → `added`, with the full text so far.
     let d1 = s
         .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
@@ -564,7 +564,7 @@ fn chat_chunk_delta_accumulates_text_and_flips_added_to_updated() {
 
 #[test]
 fn chat_chunk_delta_handles_non_text_block() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .chunk_delta(&chunk_event(
             "msg-2",
@@ -584,7 +584,7 @@ fn chat_chunk_delta_handles_non_text_block() {
 
 #[test]
 fn chat_chunk_delta_returns_none_for_missing_required_fields() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     // Missing blockId.
     let mut e = chunk_event("msg-3", "ignored", "text", json!("x"));
     e.data.as_object_mut().unwrap().remove("blockId");
@@ -601,7 +601,7 @@ fn chat_chunk_delta_returns_none_for_missing_required_fields() {
 
 #[test]
 fn chat_tool_delta_started_emits_only_use_block() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event("msg-4", "msg-4:0", "tc-1", "started", None))
         .expect("tool started delta");
@@ -616,7 +616,7 @@ fn chat_tool_delta_started_emits_only_use_block() {
 
 #[test]
 fn chat_tool_delta_completed_emits_use_and_result_blocks() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event(
             "msg-5",
@@ -641,7 +641,7 @@ fn chat_tool_delta_completed_emits_use_and_result_blocks() {
 
 #[test]
 fn chat_tool_delta_error_status_marks_is_error_true() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event(
             "msg-6",
@@ -665,7 +665,7 @@ fn chat_tool_delta_synthesizes_name_and_acp_title_from_event() {
     // tool name on the wire and the raw ACP title travels separately as
     // `title`; the block's `name` is the toolName verbatim and the title is
     // echoed as `input._acpTitle`.
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event("msg-9", "msg-9:0", "tc-1", "started", None))
         .expect("tool started delta");
@@ -695,7 +695,7 @@ fn chat_tool_delta_proposal_output_emits_standalone_resource_block() {
     // A completed tool whose output carries a proposal-MIME resource item emits
     // the standalone proposal block right after the tool_result (§7.1), with
     // the resource left in `tool_result.output` untouched.
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let output = json!([{ "type": "text", "text": "shown" }, proposal_output_item()]);
     let d = s
         .tool_delta(&tool_event(
@@ -725,7 +725,7 @@ fn chat_tool_delta_collapsed_proposal_output_emits_standalone_resource_block() {
     // Provider-collapsed output (auggie flattens the MCP content items into
     // `{ "output": "<stringified {ok, proposal}>" }`, dropping the resource
     // item): the fallback lift still emits the standalone proposal block.
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let proposal = json!({
         "kind": "settings-change",
         "preview": { "title": "Update" },
@@ -763,7 +763,7 @@ fn chat_tool_delta_collapsed_proposal_output_emits_standalone_resource_block() {
 fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
     // An errored tool must not surface an actionable ProposalCard, even when
     // its output still carries a proposal-MIME resource item.
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event(
             "msg-e",
@@ -778,7 +778,7 @@ fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
 
 #[test]
 fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event(
             "msg-q",
@@ -794,7 +794,7 @@ fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
 #[test]
 fn chat_tool_delta_malformed_proposal_resource_emits_no_extra_block() {
     // Wrong MIME / missing text → not a proposal resource; no standalone block.
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let mut wrong_mime = proposal_output_item();
     wrong_mime["resource"]["mimeType"] = json!("text/plain");
     let mut no_text = proposal_output_item();
@@ -813,7 +813,7 @@ fn chat_tool_delta_malformed_proposal_resource_emits_no_extra_block() {
 
 #[test]
 fn chat_tool_delta_completed_without_output_only_emits_use_block() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event("msg-7", "msg-7:0", "tc-x", "completed", None))
         .expect("completed-no-output delta");
@@ -824,7 +824,7 @@ fn chat_tool_delta_completed_without_output_only_emits_use_block() {
 
 #[test]
 fn chat_tool_delta_returns_none_for_missing_required_fields() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let base = || tool_event("msg-8", "msg-8:0", "tc-1", "started", None);
     for key in ["blockId", "messageId", "toolCallId"] {
         let mut e = base();
@@ -838,7 +838,7 @@ fn chat_tool_delta_use_then_completed_marks_use_as_updated() {
     // Tool started, then completes: the second event re-emits the `tool_use` block
     // which is now a known id → goes into `updated`, while the `tool_result` block
     // is brand new → goes into `added`.
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let _ = s.tool_delta(&tool_event("msg-9", "msg-9:0", "tc-1", "started", None));
     let d = s
         .tool_delta(&tool_event(
@@ -887,7 +887,7 @@ fn reduce_deltas(deltas: &[Value]) -> Vec<(String, String)> {
 /// overwritten. Predicting `tool_use + 1` clobbered it for the rest of the turn.
 #[test]
 fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let deltas = vec![
         s.chunk_delta(&chunk_event(
             "msg-i",
@@ -943,7 +943,7 @@ fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
 /// `stream:end`. With the real ids on the event both rows survive.
 #[test]
 fn chat_tool_delta_uses_the_event_result_id_for_parallel_completions() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let started = |block_id: &str, tc: &str| {
         tool_event_with_ids("msg-p2", block_id, tc, "started", None, None, Vec::new())
     };
@@ -987,7 +987,7 @@ fn chat_tool_delta_uses_the_event_result_id_for_parallel_completions() {
 /// chained from the `tool_result` id, which is wrong for the same reasons.
 #[test]
 fn chat_tool_delta_proposal_ids_come_from_the_event() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let output = json!([proposal_output_item()]);
     let d = s
         .tool_delta(&tool_event_with_ids(
@@ -1015,7 +1015,7 @@ fn chat_tool_delta_proposal_ids_come_from_the_event() {
 /// id — the terminal reconcile delivers whatever the turn actually persisted.
 #[test]
 fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
         .tool_delta(&tool_event_with_ids(
             "msg-nr",
@@ -1034,7 +1034,7 @@ fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
 
 #[test]
 fn chat_seed_from_snapshot_primes_in_flight_message_state() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let snapshot = json!({
         "agentId": "agent-1",
         "messages": [
@@ -1071,7 +1071,7 @@ fn chat_seed_from_snapshot_primes_in_flight_message_state() {
 /// `thinking` type.
 #[test]
 fn chat_chunk_delta_accumulates_thinking_blocks() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d1 = s
         .chunk_delta(&chunk_event(
             "msg-6",
@@ -1105,7 +1105,7 @@ fn chat_chunk_delta_accumulates_thinking_blocks() {
 /// too, so the resumed reasoning stream is not truncated to its tail.
 #[test]
 fn chat_seed_from_snapshot_primes_thinking_blocks() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     s.seed_from_snapshot(&json!({
         "agentId": "agent-1",
         "messages": [{
@@ -1132,7 +1132,7 @@ fn chat_seed_from_snapshot_primes_thinking_blocks() {
 
 #[test]
 fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     // No `messages` at all.
     s.seed_from_snapshot(&json!({ "agentId": "agent-1" }));
     // `messages` present but no streaming entry.
@@ -1156,7 +1156,7 @@ fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
 /// `text`), with the same added→updated bucket flip as full mode.
 #[test]
 fn incremental_chunk_delta_carries_only_the_fragment() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
     let d1 = s
         .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
         .expect("first chunk");
@@ -1187,7 +1187,7 @@ fn incremental_chunk_delta_carries_only_the_fragment() {
 /// block in incremental mode exactly as in full mode.
 #[test]
 fn incremental_chunk_delta_passes_non_text_blocks_through() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
     let d = s
         .chunk_delta(&chunk_event(
             "msg-2",
@@ -1207,7 +1207,7 @@ fn incremental_chunk_delta_passes_non_text_blocks_through() {
 /// client appends — the daemon must NOT replay the seeded prefix.
 #[test]
 fn incremental_seed_from_snapshot_appends_fragments_after_the_snapshot_text() {
-    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
     s.seed_from_snapshot(&json!({
         "agentId": "agent-1",
         "messages": [{
@@ -1688,6 +1688,7 @@ mod chat_snapshot_bounded {
             page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // The snapshot must ask for the newest page (no cursor) and must
@@ -1732,7 +1733,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_reads_exactly_one_bounded_page_for_large_transcript() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), None).await;
+        let snap = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(
             api.calls.load(Ordering::SeqCst),
             1,
@@ -1757,7 +1758,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_merges_live_turn_on_truncated_page() {
         let api = BoundedPageApi::new(true);
-        let snap = chat_snapshot(&api, &agent(), None).await;
+        let snap = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         // The in-flight message is appended after the bounded page with the
         // next monotonic seq (CS-0 D5) — truncation does not disable the merge.
@@ -1774,7 +1775,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_serves_only_messages_after_since_id() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), Some("m-118")).await;
+        let snap = chat_snapshot(&api, &agent(), Some("m-118"), None).await;
         // Resume is a post-filter, never a second fetch.
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         let messages = snap["messages"].as_array().unwrap();
@@ -1791,7 +1792,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_at_newest_id_yields_empty_page() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), Some("m-119")).await;
+        let snap = chat_snapshot(&api, &agent(), Some("m-119"), None).await;
         assert_eq!(snap["messages"].as_array().unwrap().len(), 0);
         assert_eq!(snap["resumed"], true);
         assert_eq!(snap["truncated"], false);
@@ -1801,7 +1802,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_unknown_id_falls_back_to_full_page() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), Some("msg-nope")).await;
+        let snap = chat_snapshot(&api, &agent(), Some("msg-nope"), None).await;
         // Still exactly one bounded read — no lookup follow-up.
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         // The standard page is served intact; `resumed: false` tells the
@@ -1817,7 +1818,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_keeps_live_turn_merge() {
         let api = BoundedPageApi::new(true);
-        let snap = chat_snapshot(&api, &agent(), Some("m-119")).await;
+        let snap = chat_snapshot(&api, &agent(), Some("m-119"), None).await;
         // The filter trims the persisted page to empty, then the in-flight
         // message is merged AFTER the filter, so it is never trimmed away.
         let messages = snap["messages"].as_array().unwrap();
@@ -1825,6 +1826,65 @@ mod chat_snapshot_bounded {
         assert_eq!(messages[0]["id"], "msg-live");
         assert_eq!(messages[0]["isStreaming"], true);
         assert_eq!(snap["resumed"], true);
+    }
+
+    /// A `WorkspaceApi` that records the `projection` each conversation read
+    /// was asked for — the snapshot paths must forward the subscription's
+    /// projection so slim subscribers never receive a full-fidelity page.
+    struct ProjectionRecordingApi {
+        seen: std::sync::Mutex<Vec<Option<intent_core::ConversationProjection>>>,
+    }
+
+    impl ProjectionRecordingApi {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorkspaceApi for ProjectionRecordingApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            projection: Option<intent_core::ConversationProjection>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.seen.lock().unwrap().push(projection);
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+    }
+
+    /// Both the seq-0 snapshot and the lag-recovery snapshot forward the
+    /// subscription's projection to the conversation read (and absent stays
+    /// absent — back-compat).
+    #[tokio::test]
+    async fn snapshots_forward_subscription_projection() {
+        use intent_core::ConversationProjection;
+        let api = ProjectionRecordingApi::new();
+        chat_snapshot(&api, &agent(), None, Some(ConversationProjection::Slim)).await;
+        chat_snapshot(&api, &agent(), None, None).await;
+        chat_recovery_snapshot(&api, &agent(), Some(ConversationProjection::Slim)).await;
+        assert_eq!(
+            *api.seen.lock().unwrap(),
+            vec![
+                Some(ConversationProjection::Slim),
+                None,
+                Some(ConversationProjection::Slim)
+            ],
+        );
     }
 }
 
@@ -1862,6 +1922,7 @@ mod chat_message_delta {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
@@ -1917,7 +1978,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn user_row_message_emits_added_entities_with_real_role() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1971,7 +2032,7 @@ mod chat_message_delta {
             "nextToken": Value::Null,
         });
         let api = ConvApi::new(conv);
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1987,7 +2048,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn user_row_message_without_metadata_omits_the_field() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -2027,7 +2088,7 @@ mod chat_message_delta {
             "nextToken": Value::Null,
         });
         let api = ConvApi::new(conv);
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -2047,7 +2108,7 @@ mod chat_message_delta {
         // Rows without a client id keep the lean entity shape — the field is
         // omitted entirely, never serialized as null.
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -2066,7 +2127,7 @@ mod chat_message_delta {
         // `agent:message` echo for one must NOT emit (double-emission guard)
         // and must not even cost a conversation read.
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "asst-msg-1", "assistant"))
             .await;
@@ -2077,7 +2138,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn unknown_message_id_maps_to_none() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-GONE", "user"))
             .await;
@@ -2087,7 +2148,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn redelivery_upserts_known_blocks_as_updated() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         let e = message_event("agent-1", "user-msg-1", "user");
         let first = s.delta(&api, &e).await.expect("first delivery");
         assert_eq!(first["added"].as_array().unwrap().len(), 2);
@@ -2130,7 +2191,7 @@ mod chat_message_delta {
             "nextToken": Value::Null,
         });
         let api = ConvApi::new(conv);
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         // Turn in flight: first assistant chunk accumulated.
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("chunk 1");
@@ -2221,6 +2282,7 @@ mod chat_snapshot_interrupt_window {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             let flushed = self.phase() == Phase::Flushed;
             Box::pin(async move {
@@ -2291,6 +2353,7 @@ mod chat_snapshot_interrupt_window {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2345,6 +2408,7 @@ mod chat_snapshot_interrupt_window {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2402,6 +2466,7 @@ mod chat_snapshot_interrupt_window {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2465,7 +2530,7 @@ mod chat_snapshot_interrupt_window {
         let api = InterruptWindowApi::new();
 
         // Phase 1 — mid-turn: the partial turn is served from the live slot.
-        let mid = chat_snapshot(&api, &agent(), None).await;
+        let mid = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(assistant_ids(&mid), vec!["msg-live".to_string()]);
         assert_eq!(mid["messages"][1]["isStreaming"], true);
 
@@ -2473,7 +2538,7 @@ mod chat_snapshot_interrupt_window {
         // yet written, but the pinned slot is still published, so the snapshot
         // carries the same in-flight message.
         api.set(Phase::PinnedRowNotYetPersisted);
-        let gap = chat_snapshot(&api, &agent(), None).await;
+        let gap = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(
             assistant_ids(&gap),
             vec!["msg-live".to_string()],
@@ -2497,7 +2562,7 @@ mod chat_snapshot_interrupt_window {
         // the slot, so the content is served ONCE, as a persisted,
         // NON-streaming row.
         api.set(Phase::Flushed);
-        let after = chat_snapshot(&api, &agent(), None).await;
+        let after = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(assistant_ids(&after), vec!["msg-live".to_string()]);
         assert_eq!(
             after["totalMessages"], 2,
@@ -2519,7 +2584,7 @@ mod chat_snapshot_interrupt_window {
     /// orphaned slot never claims to be streaming.
     #[tokio::test]
     async fn chat_snapshot_serves_an_orphaned_slot_as_a_non_streaming_message() {
-        let snap = chat_snapshot(&OrphanSlotApi { populated: true }, &agent(), None).await;
+        let snap = chat_snapshot(&OrphanSlotApi { populated: true }, &agent(), None, None).await;
         assert_eq!(
             assistant_ids(&snap),
             vec!["msg-orphan".to_string()],
@@ -2545,7 +2610,7 @@ mod chat_snapshot_interrupt_window {
     /// bubble is strictly worse than nothing).
     #[tokio::test]
     async fn chat_snapshot_skips_an_empty_orphaned_slot() {
-        let snap = chat_snapshot(&OrphanSlotApi { populated: false }, &agent(), None).await;
+        let snap = chat_snapshot(&OrphanSlotApi { populated: false }, &agent(), None, None).await;
         assert!(
             assistant_ids(&snap).is_empty(),
             "an empty orphan slot must not surface at all: {snap}"
@@ -2570,7 +2635,7 @@ mod chat_snapshot_interrupt_window {
             busy: std::sync::atomic::AtomicBool::new(false),
         };
 
-        let snap = chat_snapshot(&api, &agent(), None).await;
+        let snap = chat_snapshot(&api, &agent(), None, None).await;
 
         assert_eq!(
             assistant_ids(&snap),
@@ -2596,7 +2661,7 @@ mod chat_snapshot_interrupt_window {
         };
 
         // Mid-turn: served from the slot as usual, flagged in-flight.
-        let mid = chat_snapshot(&api, &agent(), None).await;
+        let mid = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(assistant_ids(&mid), vec!["msg-live".to_string()]);
         assert_eq!(mid["messages"][1]["isStreaming"], true);
 
@@ -2604,7 +2669,7 @@ mod chat_snapshot_interrupt_window {
         // not in the page and never will be; the slot is the only copy.
         api.flush_failed
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let after = chat_snapshot(&api, &agent(), None).await;
+        let after = chat_snapshot(&api, &agent(), None, None).await;
         assert_eq!(
             assistant_ids(&after),
             vec!["msg-live".to_string()],
@@ -2658,6 +2723,7 @@ mod chat_terminal_message_id_fallback {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
@@ -2727,7 +2793,7 @@ mod chat_terminal_message_id_fallback {
         // Pre-fix the terminal event mapped to `None` and the partial turn stayed
         // missing for the rest of the subscription's life.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.seed_from_snapshot(&conversation()); // no `isStreaming` row → no id learned
         let d = s
             .delta(&api, &end_event(Some("msg-1")))
@@ -2763,7 +2829,7 @@ mod chat_terminal_message_id_fallback {
         // used (not the event's), the blocks the client already saw come back as
         // `updated` — one terminal frame, no re-added duplicates.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Working")))
             .expect("first chunk");
         let d = s
@@ -2792,7 +2858,7 @@ mod chat_terminal_message_id_fallback {
         // A turn that persisted no assistant row (e.g. an empty interrupted
         // turn) omits `messageId` — there is nothing to reconcile against.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         assert!(s.delta(&api, &end_event(None)).await.is_none());
         assert_eq!(
             api.calls.load(Ordering::SeqCst),
@@ -2806,7 +2872,7 @@ mod chat_terminal_message_id_fallback {
         // `finalize` resets the per-turn accumulation whichever way the id was
         // resolved, so the recovered id cannot reconcile a later turn.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.delta(&api, &end_event(Some("msg-1")))
             .await
             .expect("first turn recovered");
@@ -2866,6 +2932,7 @@ mod chat_terminal_reconcile_failure {
             _page_token: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
@@ -2922,7 +2989,7 @@ mod chat_terminal_reconcile_failure {
     #[tokio::test]
     async fn a_failed_re_read_retries_once_then_emits_the_best_effort_frame() {
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
@@ -2986,7 +3053,7 @@ mod chat_terminal_reconcile_failure {
     #[tokio::test]
     async fn the_per_turn_state_resets_after_the_best_effort_frame() {
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         s.delta(&api, &end_event("msg-1"))
@@ -3022,7 +3089,7 @@ mod chat_terminal_reconcile_failure {
     async fn incremental_terminal_reconcile_emits_full_authoritative_blocks() {
         let api = FailingConvApi::failing_once_then(conversation());
         api.calls.store(1, Ordering::SeqCst); // consume the failing call
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
@@ -3051,7 +3118,7 @@ mod chat_terminal_reconcile_failure {
     #[tokio::test]
     async fn incremental_best_effort_terminal_carries_the_full_accumulated_text() {
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
@@ -3075,7 +3142,7 @@ mod chat_terminal_reconcile_failure {
         // First read fails, the retry succeeds → the AUTHORITATIVE terminal
         // frame is emitted (persisted seq/timestamp), not the degraded one.
         let api = FailingConvApi::failing_once_then(conversation());
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         let d = s
@@ -3107,7 +3174,7 @@ mod chat_terminal_reconcile_failure {
         // entity for that row — an empty frame would leave the blank row
         // permanently streaming.
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         s.seed_from_snapshot(&json!({
             "agentId": "agent-1",
             "messages": [{
@@ -3143,7 +3210,7 @@ mod chat_terminal_reconcile_failure {
         #[tokio::test]
         async fn a_persistent_read_failure_returns_none_after_one_retry() {
             let api = FailingConvApi::new();
-            let snapshot = chat_recovery_snapshot(&api, &agent()).await;
+            let snapshot = chat_recovery_snapshot(&api, &agent(), None).await;
             assert!(
                 snapshot.is_none(),
                 "a persistent failure must NOT degrade to an empty page"
@@ -3158,7 +3225,7 @@ mod chat_terminal_reconcile_failure {
         #[tokio::test]
         async fn a_transient_failure_recovers_on_the_retry() {
             let api = FailingConvApi::failing_once_then(conversation());
-            let snapshot = chat_recovery_snapshot(&api, &agent())
+            let snapshot = chat_recovery_snapshot(&api, &agent(), None)
                 .await
                 .expect("the retry served the page");
             assert_eq!(api.calls.load(Ordering::SeqCst), 2);
@@ -3173,7 +3240,7 @@ mod chat_terminal_reconcile_failure {
             let api = FailingConvApi::failing_once_then(conversation());
             api.calls.store(1, Ordering::SeqCst); // consume the failing call
             let before = api.calls.load(Ordering::SeqCst);
-            let snapshot = chat_recovery_snapshot(&api, &agent())
+            let snapshot = chat_recovery_snapshot(&api, &agent(), None)
                 .await
                 .expect("healthy read");
             assert_eq!(

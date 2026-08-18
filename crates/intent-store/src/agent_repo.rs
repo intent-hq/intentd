@@ -500,8 +500,9 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
-            let insert_sql =
-                format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+            let insert_sql = format!(
+                "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
+            );
             let mut last_message_id: Option<String> = None;
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
                 let content_json = serde_json::to_string(content)
@@ -512,6 +513,7 @@ impl Store {
                     })?),
                     None => None,
                 };
+                let thumbnails_json = thumbnails_col_value(content);
                 let id = Uuid::now_v7().to_string();
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
@@ -524,6 +526,7 @@ impl Store {
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
+                    .bind(thumbnails_json.as_deref())
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
@@ -2013,6 +2016,30 @@ fn encode_metadata(value: Option<&serde_json::Value>) -> Result<Option<String>> 
 
 const MESSAGE_COLUMNS: &str = "id, agent_id, seq, role, content, metadata, created_at";
 
+/// Insert-side superset of [`MESSAGE_COLUMNS`]: message writes also persist
+/// the write-time image `thumbnails` map (0097, slim projection). Reads keep
+/// selecting [`MESSAGE_COLUMNS`] only — the full-fidelity read path never
+/// pays for the column; slim reads fetch it separately via
+/// [`Store::get_agent_message_thumbnails_page`].
+const MESSAGE_INSERT_COLUMNS: &str =
+    "id, agent_id, seq, role, content, metadata, created_at, thumbnails";
+
+/// Serialize the write-time thumbnail map for `content` (0097), or `None`
+/// when the message needs none. Generation failure inside is non-fatal
+/// (logged per block); a serialization failure of the map itself is also
+/// non-fatal — thumbnails are an optimization, never worth failing the
+/// message write.
+fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
+    let map = crate::message_thumbnails::generate_message_thumbnails(content)?;
+    match serde_json::to_string(&map) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "encode message thumbnails failed; persisting none");
+            None
+        }
+    }
+}
+
 /// SQL scalar expression extracting the searchable plain text of an
 /// `agent_message` row (aliased `m`) for the `agent_message_fts` index
 /// (0074). Mirrors the search-side `message_text` extraction
@@ -2272,7 +2299,10 @@ impl Store {
             "user" => Some(("last_user_preview", preview_col_value(role, content)?)),
             _ => None,
         };
-        let sql = format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+        let thumbnails_json = thumbnails_col_value(content);
+        let sql = format!(
+            "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
+        );
         match &preview_update {
             None => {
                 sqlx::query(&sql)
@@ -2283,6 +2313,7 @@ impl Store {
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
+                    .bind(thumbnails_json.as_deref())
                     .execute(self.write_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
@@ -2309,6 +2340,7 @@ impl Store {
                         .bind(&content_json)
                         .bind(metadata_json.as_deref())
                         .bind(created_at)
+                        .bind(thumbnails_json.as_deref())
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| {
@@ -2513,6 +2545,55 @@ impl Store {
         rows.iter().map(map_message_row).collect()
     }
 
+    /// Read the persisted image-thumbnail maps (0097) for the message ids in
+    /// `message_ids`, keyed by message id. Only rows with a non-NULL
+    /// `thumbnails` column appear in the result — the common all-text page
+    /// returns an empty map. One bounded SELECT sized by the page (slim reads
+    /// only; the full-fidelity read path never calls this). Each value is the
+    /// stored JSON map `{"<image ordinal>": {"data", "mimeType"}}`; a row
+    /// whose stored JSON fails to decode is skipped with a WARN (slim reads
+    /// then degrade to data-omitted flags, same as a legacy row).
+    pub async fn get_agent_message_thumbnails(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+        if message_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = vec!["?"; message_ids.len()].join(",");
+        let sql = format!(
+            "SELECT id, thumbnails FROM agent_message \
+             WHERE agent_id = ? AND thumbnails IS NOT NULL AND id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(&agent_id.0);
+        for id in message_ids {
+            query = query.bind(id);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent message thumbnails failed: {e}")))?;
+        let mut map = std::collections::HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = col(row, "id")?;
+            let raw: String = col(row, "thumbnails")?;
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(v) => {
+                    map.insert(id, v);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        message = %id,
+                        error = %e,
+                        "decode message thumbnails failed; serving block with data omitted"
+                    );
+                }
+            }
+        }
+        Ok(map)
+    }
+
     /// Atomically clear the agent's message log and reinsert `messages` under
     /// fresh 0-based monotonic `seq` values. Row ids are minted here (UUIDv7)
     /// so callers cannot smuggle stale ids across the swap; the returned
@@ -2563,8 +2644,9 @@ impl Store {
                 })?;
             let mut inserted = Vec::with_capacity(owned_messages.len());
             let mut last_message_id: Option<String> = None;
-            let insert_sql =
-                format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+            let insert_sql = format!(
+                "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
+            );
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
                 let seq = idx as i64;
                 let id = Uuid::now_v7().to_string();
@@ -2580,6 +2662,7 @@ impl Store {
                     })?),
                     None => None,
                 };
+                let thumbnails_json = thumbnails_col_value(content);
                 sqlx::query(&insert_sql)
                     .bind(&id)
                     .bind(&agent_id.0)
@@ -2588,6 +2671,7 @@ impl Store {
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
+                    .bind(thumbnails_json.as_deref())
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| {
@@ -3242,6 +3326,91 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
         }
+    }
+
+    /// Write-time thumbnails (0097): appending a message with an oversized
+    /// image block persists a thumbnail map on the row, the page-scoped
+    /// getter returns it keyed by message id, and text-only / under-budget
+    /// rows persist NULL (absent from the getter's map). Legacy rows
+    /// (thumbnails column NULL) are simply absent — the slim read then
+    /// serves the block with data omitted.
+    #[tokio::test]
+    async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-thumbnails");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-thumbs".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-thumbs".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        // A 512x384 noise PNG comfortably exceeds the slim budget.
+        let img = image::RgbImage::from_fn(512, 384, |x, y| {
+            let v = (x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)) % 251) as u8;
+            image::Rgb([v, v.wrapping_add(97), v.wrapping_add(193)])
+        });
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode test png");
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+        let with_image = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([
+                    { "type": "text", "text": "see screenshot" },
+                    { "type": "image", "data": data, "mimeType": "image/png" },
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append image message");
+        let text_only = store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "looks good" }]),
+                &ts,
+            )
+            .await
+            .expect("append text message");
+
+        let ids = vec![with_image.id.clone(), text_only.id.clone()];
+        let thumbs = store
+            .get_agent_message_thumbnails(&agent_id, &ids)
+            .await
+            .expect("read thumbnails");
+        let entry = thumbs
+            .get(&with_image.id)
+            .expect("image row has a persisted thumbnail map");
+        let thumb = entry.get("0").expect("keyed by image ordinal");
+        assert!(thumb
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+        assert!(
+            !thumbs.contains_key(&text_only.id),
+            "text-only row persists NULL and is absent from the map"
+        );
+        assert!(
+            store
+                .get_agent_message_thumbnails(&agent_id, &[])
+                .await
+                .expect("empty read")
+                .is_empty(),
+            "empty id list short-circuits"
+        );
     }
 
     /// The CAS-swap branch of `replace_acp_session_id` folds the current

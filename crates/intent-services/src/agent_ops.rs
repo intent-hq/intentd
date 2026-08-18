@@ -15,9 +15,9 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
-    EventActor, NoteId, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
-    MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, SLIM_PROJECTION_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -1801,6 +1801,150 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
+/// `projection: "slim"`) to one served message: oversized `tool_use.input` /
+/// `tool_result.output` bodies are replaced by a structure-preserving preview
+/// bounded by [`SLIM_PROJECTION_BUDGET_BYTES`] with additive
+/// `inputTruncated`/`inputBytes` (resp. `outputTruncated`/`outputBytes`)
+/// flags; oversized `image.data` is replaced by the write-time thumbnail from
+/// `thumbnails` (keyed by the block's image ordinal) with
+/// `dataTruncated`/`dataBytes`/`dataIsThumbnail`, or omitted entirely when no
+/// thumbnail was persisted (legacy rows, failed generation). Blocks at or
+/// under budget pass through byte-identical with no flags. `name`, block ids,
+/// `tool_use_id` pairing, and `is_error` are never touched. Serve-time only —
+/// stored rows are untouched. Runs AFTER [`stamp_synthetic_block_ids`] so the
+/// flags land on the final served block identity.
+fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) -> AgentMessage {
+    let Some(blocks) = message.content.as_array_mut() else {
+        return message;
+    };
+    let mut image_ordinal: usize = 0;
+    for block in blocks.iter_mut() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => slim_body(block, "input", "inputTruncated", "inputBytes"),
+            Some("tool_result") => slim_body(block, "output", "outputTruncated", "outputBytes"),
+            Some("image") => {
+                let ordinal = image_ordinal;
+                image_ordinal += 1;
+                slim_image(block, ordinal, thumbnails);
+            }
+            _ => {}
+        }
+    }
+    message
+}
+
+/// Slim one `tool_use.input` / `tool_result.output` body in place: measured
+/// against [`SLIM_PROJECTION_BUDGET_BYTES`] (string bodies by length, JSON
+/// bodies by serialized length), an over-budget body is replaced by
+/// [`cap_json_value`]'s bounded preview plus the additive truncation flags.
+fn slim_body(block: &mut Value, field: &str, truncated_flag: &str, bytes_flag: &str) {
+    let Some(body) = block.get(field) else {
+        return;
+    };
+    let size = slim_body_size(body);
+    if size <= SLIM_PROJECTION_BUDGET_BYTES {
+        return;
+    }
+    let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+    let capped = cap_json_value(body, &mut budget);
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert(field.to_string(), capped);
+        obj.insert(truncated_flag.to_string(), json!(true));
+        obj.insert(bytes_flag.to_string(), json!(size));
+    }
+}
+
+/// Slim one `image` block in place: an over-budget base64 `data` is replaced
+/// by the persisted write-time thumbnail (`dataIsThumbnail: true`, `mimeType`
+/// switched to the thumbnail's encoding) when one exists for this image
+/// ordinal, otherwise `data` is omitted entirely (a truncated base64 fragment
+/// is unrenderable). `dataTruncated`/`dataBytes` are stamped in both cases.
+fn slim_image(block: &mut Value, ordinal: usize, thumbnails: Option<&Value>) {
+    let Some(data_len) = block.get("data").and_then(Value::as_str).map(str::len) else {
+        return;
+    };
+    if data_len <= SLIM_PROJECTION_BUDGET_BYTES {
+        return;
+    }
+    let thumb = thumbnails
+        .and_then(|t| t.get(ordinal.to_string()))
+        .and_then(|t| {
+            let data = t.get("data").and_then(Value::as_str)?;
+            let mime = t.get("mimeType").and_then(Value::as_str)?;
+            Some((data.to_string(), mime.to_string()))
+        });
+    let Some(obj) = block.as_object_mut() else {
+        return;
+    };
+    match thumb {
+        Some((data, mime)) => {
+            obj.insert("data".to_string(), Value::String(data));
+            obj.insert("mimeType".to_string(), Value::String(mime));
+            obj.insert("dataIsThumbnail".to_string(), json!(true));
+        }
+        None => {
+            obj.remove("data");
+        }
+    }
+    obj.insert("dataTruncated".to_string(), json!(true));
+    obj.insert("dataBytes".to_string(), json!(data_len));
+}
+
+/// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
+/// budget check: string bodies by length, everything else by serialized JSON
+/// length (a body that fails to serialize measures 0 and passes through).
+fn slim_body_size(body: &Value) -> usize {
+    match body {
+        Value::String(s) => s.len(),
+        other => serde_json::to_string(other).map(|s| s.len()).unwrap_or(0),
+    }
+}
+
+/// Bounded, structure-preserving preview of a JSON body (slim projection):
+/// object KEYS are always kept — the FE's tool classification reads
+/// `classifyTool(name, input)` over the input's shape — while string leaves
+/// are truncated (char-boundary safe) against the shared `budget` and array
+/// tails beyond the budget are dropped. Non-string scalars pass through with
+/// a nominal budget charge. With the budget exhausted, strings collapse to
+/// `""` and arrays to their already-emitted prefix, so the preview's
+/// serialized size stays within a small constant factor of the budget
+/// regardless of input shape.
+fn cap_json_value(value: &Value, budget: &mut usize) -> Value {
+    match value {
+        Value::String(s) => {
+            let mut end = (*budget).min(s.len());
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            *budget = budget.saturating_sub(end);
+            Value::String(s[..end].to_string())
+        }
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if *budget == 0 {
+                    break;
+                }
+                out.push(cap_json_value(item, budget));
+            }
+            Value::Array(out)
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, val) in map {
+                *budget = budget.saturating_sub(key.len());
+                out.insert(key.clone(), cap_json_value(val, budget));
+            }
+            Value::Object(out)
+        }
+        other => {
+            *budget = budget.saturating_sub(8);
+            other.clone()
+        }
+    }
+}
+
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
     /// the runtime manager's busy set. Only the small busy set reaches SQLite,
@@ -2239,6 +2383,7 @@ impl Services {
     /// cursor, so older continuation is ordinary paging. Absent both params
     /// (and any seek-minted forward token), the response is byte-identical
     /// to before — no `prevToken` key is added.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -2247,6 +2392,7 @@ impl Services {
         page_token: Option<String>,
         around_message_id: Option<String>,
         around_index: Option<i64>,
+        projection: Option<ConversationProjection>,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -2301,7 +2447,7 @@ impl Services {
                 (w.start, w.end, w.next_token, None)
             }
         };
-        let page: Vec<AgentMessage> = self
+        let mut page: Vec<AgentMessage> = self
             .store
             .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
             .await?
@@ -2309,6 +2455,24 @@ impl Services {
             .map(strip_anonymous_tool_blocks)
             .map(stamp_synthetic_block_ids)
             .collect();
+        if projection == Some(ConversationProjection::Slim) {
+            // One bounded thumbnails read sized by the page (RPC cost
+            // contract: O(rows returned); the common all-text page selects
+            // nothing). Absent-projection reads never reach here, keeping
+            // them byte-identical to before.
+            let ids: Vec<String> = page.iter().map(|m| m.id.clone()).collect();
+            let thumbnails = self
+                .store
+                .get_agent_message_thumbnails(&agent_id, &ids)
+                .await?;
+            page = page
+                .into_iter()
+                .map(|m| {
+                    let thumbs = thumbnails.get(&m.id);
+                    apply_slim_projection(m, thumbs)
+                })
+                .collect();
+        }
         let mut result = json!({
             "agentId": agent_id,
             "messages": page,

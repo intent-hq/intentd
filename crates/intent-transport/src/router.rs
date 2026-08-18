@@ -1239,6 +1239,11 @@ async fn dispatch(
                     "aroundMessageId and aroundIndex are mutually exclusive",
                 ));
             }
+            // Additive `projection` param (§5.5): absent / null keeps the
+            // response byte-identical to before; `"slim"` bounds tool/image
+            // block bodies; any other value is `-32602` (a silently ignored
+            // typo would hand the client full-size frames it opted out of).
+            let projection = parse_projection(params)?;
             match api
                 .agent_get_conversation(
                     agent_id,
@@ -1247,6 +1252,7 @@ async fn dispatch(
                     page_token,
                     around_message_id,
                     around_index,
+                    projection,
                 )
                 .await
             {
@@ -3971,6 +3977,21 @@ fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
         _ => None,
+    }
+}
+
+/// Parse the optional `projection` param on conversation reads (§5.5):
+/// absent / `null` mean full fidelity (`None`), `"slim"` selects the bounded
+/// tool/image projection, anything else is `-32602`.
+fn parse_projection(
+    params: &Map<String, Value>,
+) -> Result<Option<intent_core::ConversationProjection>, RpcErr> {
+    match params.get("projection") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "slim" => {
+            Ok(Some(intent_core::ConversationProjection::Slim))
+        }
+        Some(_) => Err(invalid_params("projection must be \"slim\"")),
     }
 }
 

@@ -19,7 +19,8 @@ use intent_core::events::{
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, now_iso, AgentId, Event, Note, NoteId, WorkspaceApi, WorkspaceId,
+    extract_spec_task_ids, now_iso, AgentId, ConversationProjection, Event, Note, NoteId,
+    WorkspaceApi, WorkspaceId,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -87,12 +88,16 @@ pub(crate) struct CommentSubscribeParams {
 /// seq-0 snapshot: only messages AFTER that id (§7.1 resume). `deltaEncoding`
 /// (optional) selects the text-chunk delta encoding for the subscription's
 /// lifetime (D2): `"full"`/absent for full accumulated text per chunk,
-/// `"incremental"` for append-only `textDelta` fragments.
+/// `"incremental"` for append-only `textDelta` fragments. `projection`
+/// (optional) selects the slim conversation projection for the
+/// subscription's lifetime: the seq-0 snapshot, lag-recovery snapshots, and
+/// every delta re-read serve bounded tool/image block bodies (§5.5).
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
     pub since_message_id: Option<String>,
     pub delta_encoding: DeltaEncoding,
+    pub projection: Option<ConversationProjection>,
     pub replace_group: Option<String>,
 }
 
@@ -259,10 +264,20 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) if s == "incremental" => DeltaEncoding::Incremental,
         Some(_) => return Err("deltaEncoding must be \"full\" or \"incremental\"".to_string()),
     };
+    // `projection` is optional: absent / `null` serve full fidelity, `"slim"`
+    // bounds tool/image block bodies (§5.5); any other value is `-32602` (a
+    // silently ignored typo would hand the client the full-size frames it
+    // opted out of).
+    let projection = match params.get("projection") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "slim" => Some(ConversationProjection::Slim),
+        Some(_) => return Err("projection must be \"slim\"".to_string()),
+    };
     Ok(ChatSubscribeParams {
         agent_id,
         since_message_id,
         delta_encoding,
+        projection,
         replace_group: replace_group(params),
     })
 }
@@ -505,9 +520,10 @@ pub(crate) async fn chat_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
     since_message_id: Option<&str>,
+    projection: Option<ConversationProjection>,
 ) -> Value {
     let mut snapshot = match api
-        .agent_get_conversation(agent_id.clone(), None, None, None, None, None)
+        .agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection)
         .await
     {
         Ok(v) => v,
@@ -539,8 +555,10 @@ pub(crate) async fn chat_snapshot(
 pub(crate) async fn chat_recovery_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
+    projection: Option<ConversationProjection>,
 ) -> Option<Value> {
-    let read = || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None);
+    let read =
+        || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection);
     let mut snapshot = match read().await {
         Ok(v) => v,
         Err(_) => read().await.ok()?,
@@ -688,6 +706,12 @@ pub(crate) struct ChatDeltaState {
     /// The subscription's text-chunk encoding (D2): full accumulated text per
     /// chunk, or append-only `textDelta` fragments (monorepo#2675).
     encoding: DeltaEncoding,
+    /// The subscription's conversation projection (§5.5), fixed at subscribe
+    /// time like the encoding. Every delta re-read (`agent:message` rows,
+    /// terminal reconcile) passes it through so the accumulated client state
+    /// stays byte-identical to a fresh snapshot under the SAME projection
+    /// (the CS-3 reconciliation invariant).
+    projection: Option<ConversationProjection>,
     /// `blockId` → accumulated text for `text` blocks. In full mode every
     /// chunk delta re-materializes it (D2); in incremental mode it is kept
     /// (O(chunk) appends, linear memory) but consulted only by the degraded
@@ -715,10 +739,15 @@ impl ChatDeltaState {
     /// encoding is fixed for the subscription's lifetime (chosen at subscribe
     /// time) — a lag-recovery replacement mapper must be built with the SAME
     /// encoding.
-    pub(crate) fn new(agent_id: &AgentId, encoding: DeltaEncoding) -> Self {
+    pub(crate) fn new(
+        agent_id: &AgentId,
+        encoding: DeltaEncoding,
+        projection: Option<ConversationProjection>,
+    ) -> Self {
         Self {
             agent_id: agent_id.as_str().to_string(),
             encoding,
+            projection,
             text_acc: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
@@ -830,6 +859,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 None,
+                self.projection,
             )
             .await
             .ok()?;
@@ -1135,6 +1165,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 None,
+                self.projection,
             )
         };
         let conv = match read().await {
