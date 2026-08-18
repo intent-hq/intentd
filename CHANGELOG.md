@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.19] - 2026-08-18
+
+### 🚀 Features
+
+- Agent.getMessageBlock — one full content block on demand (protocol v7.2) ([#1306](https://github.com/intent-hq/intentd/pull/1306))
+- LastToolUse preview column + agent:last-message event ([#1307](https://github.com/intent-hq/intentd/pull/1307))
+
+
 ## [0.7.18] - 2026-08-18
 
 ### 🚀 Features
