@@ -36,13 +36,56 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::map_git_err;
 
-/// Wall-clock bound for the cache clone, matching the service-layer clone
-/// budget (`intent-services` CLONE_TIMEOUT).
-const CACHE_CLONE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default wall-clock bound for the cache clone, matching the service-layer
+/// clone budget (`intent-services` CLONE_TIMEOUT).
+const CACHE_CLONE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 
-/// Wall-clock bound for the refresh fetch, matching [`crate::fetch`]'s
-/// SHELL_FETCH_TIMEOUT.
-const CACHE_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
+/// Env var overriding the clone bound, in whole seconds. Unset, unparseable,
+/// or zero falls back to [`CACHE_CLONE_TIMEOUT_DEFAULT`].
+const CACHE_CLONE_TIMEOUT_ENV: &str = "INTENTD_CACHE_CLONE_TIMEOUT_SECS";
+
+/// Default wall-clock bound for the refresh fetch, matching
+/// [`crate::fetch`]'s SHELL_FETCH_TIMEOUT.
+const CACHE_FETCH_TIMEOUT_DEFAULT: Duration = Duration::from_secs(100);
+
+/// Env var overriding the fetch bound, in whole seconds. Unset, unparseable,
+/// or zero falls back to [`CACHE_FETCH_TIMEOUT_DEFAULT`].
+const CACHE_FETCH_TIMEOUT_ENV: &str = "INTENTD_CACHE_FETCH_TIMEOUT_SECS";
+
+/// Parse a timeout env value into a wall-clock bound. Pure — the env reads
+/// stay in [`cache_clone_timeout`] / [`cache_fetch_timeout`] so tests never
+/// mutate process env. Unlike the freshness TTL, zero is rejected (it would
+/// kill every git child instantly), keeping the default.
+fn parse_timeout_secs(raw: Option<&str>, default: Duration) -> Duration {
+    match raw.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
+        Some(0) | None => default,
+        Some(secs) => Duration::from_secs(secs),
+    }
+}
+
+/// The effective clone bound: [`CACHE_CLONE_TIMEOUT_ENV`] when set to a
+/// positive whole-second value, else the default. Resolved once per process.
+fn cache_clone_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_timeout_secs(
+            std::env::var(CACHE_CLONE_TIMEOUT_ENV).ok().as_deref(),
+            CACHE_CLONE_TIMEOUT_DEFAULT,
+        )
+    })
+}
+
+/// The effective fetch bound: [`CACHE_FETCH_TIMEOUT_ENV`] when set to a
+/// positive whole-second value, else the default. Resolved once per process.
+fn cache_fetch_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_timeout_secs(
+            std::env::var(CACHE_FETCH_TIMEOUT_ENV).ok().as_deref(),
+            CACHE_FETCH_TIMEOUT_DEFAULT,
+        )
+    })
+}
 
 /// Poll interval while waiting for a shelled-out git child to exit.
 pub(crate) const GIT_POLL: Duration = Duration::from_millis(50);
@@ -363,14 +406,14 @@ fn refresh(
         cache_path,
         fetch_args,
         token,
-        CACHE_FETCH_TIMEOUT,
+        cache_fetch_timeout(),
         chunk_fn(progress, CacheEnsureEvent::CloneChunk),
     )?;
     run_git(
         cache_path,
         &["remote", "set-head", "origin", "--auto"],
         token,
-        CACHE_FETCH_TIMEOUT,
+        cache_fetch_timeout(),
     )?;
     let repo = Repository::open(cache_path).map_err(map_git_err)?;
     let default = default_branch(&repo)?;
@@ -404,7 +447,7 @@ fn refresh(
             cache_path,
             &["submodule", "sync", "--recursive"],
             token,
-            CACHE_FETCH_TIMEOUT,
+            cache_fetch_timeout(),
         )?;
         emit(progress, CacheEnsureEvent::Step("submodule-update"));
         let update_args: &[&str] = if progress.is_some() {
@@ -423,7 +466,7 @@ fn refresh(
             cache_path,
             update_args,
             token,
-            CACHE_FETCH_TIMEOUT,
+            cache_fetch_timeout(),
             chunk_fn(progress, CacheEnsureEvent::SubmoduleChunk),
         )?;
     }
@@ -433,7 +476,7 @@ fn refresh(
     // Double `-f` so an orphaned submodule checkout — a nested repo left
     // behind when upstream removed the submodule — is removable too.
     emit(progress, CacheEnsureEvent::Step("clean"));
-    run_git(cache_path, &["clean", "-ffdx"], None, CACHE_FETCH_TIMEOUT)?;
+    run_git(cache_path, &["clean", "-ffdx"], None, cache_fetch_timeout())?;
     if has_submodules {
         // Untracked pollution inside live submodule work trees is invisible
         // to the superproject clean; drop it per submodule.
@@ -448,7 +491,7 @@ fn refresh(
                 "-fdx",
             ],
             None,
-            CACHE_FETCH_TIMEOUT,
+            cache_fetch_timeout(),
         )?;
     }
     // Stale module git dirs: when upstream removes (or renames) a submodule,
@@ -483,7 +526,7 @@ fn default_branch(repo: &Repository) -> Result<String> {
 /// A plain clone with `--recurse-submodules` — the remote's default branch
 /// ends up checked out, `origin/HEAD` recorded, and every submodule work tree
 /// populated at its recorded gitlink, exactly the state [`refresh`] relies
-/// on. [`CACHE_CLONE_TIMEOUT`] bounds the whole clone, submodules included.
+/// on. [`cache_clone_timeout`] bounds the whole clone, submodules included.
 fn clone(
     github_url: &str,
     cache_path: &Path,
@@ -514,7 +557,7 @@ fn clone(
         parent,
         &args,
         token,
-        CACHE_CLONE_TIMEOUT,
+        cache_clone_timeout(),
         chunk_fn(progress, CacheEnsureEvent::CloneChunk),
     )
     .inspect_err(|_| {
@@ -803,7 +846,7 @@ pub(crate) fn sync_submodule_urls(checkout_path: &Path) -> Result<()> {
         checkout_path,
         &["submodule", "sync", "--recursive"],
         None,
-        CACHE_FETCH_TIMEOUT,
+        cache_fetch_timeout(),
     )
 }
 
@@ -844,7 +887,7 @@ fn update_checkout_submodules_streamed(
     if on_chunk.is_some() {
         args.push("--progress");
     }
-    run_git_streamed(checkout_path, &args, None, CACHE_FETCH_TIMEOUT, on_chunk)
+    run_git_streamed(checkout_path, &args, None, cache_fetch_timeout(), on_chunk)
 }
 
 /// Plain recursive directory copy (dirs, files, symlinks recreated). The
@@ -1115,7 +1158,7 @@ pub(crate) fn provision_plain_clone_checkout(
         source_path.as_os_str(),
         dir_name,
     ];
-    run_git_os(parent, &args, None, CACHE_CLONE_TIMEOUT)?;
+    run_git_os(parent, &args, None, cache_clone_timeout())?;
     (|| {
         // The local clone only maps the source's refs/heads/* into
         // refs/remotes/origin/*; overlay the source's own remote-tracking refs
@@ -1128,7 +1171,7 @@ pub(crate) fn provision_plain_clone_checkout(
                 "+refs/remotes/origin/*:refs/remotes/origin/*",
             ],
             None,
-            CACHE_FETCH_TIMEOUT,
+            cache_fetch_timeout(),
         )?;
         let sha =
             crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")?;
@@ -3162,6 +3205,31 @@ mod tests {
         assert_eq!(parse_fresh_ttl(Some("nope")), CACHE_FRESH_TTL_DEFAULT);
         assert_eq!(parse_fresh_ttl(Some("-5")), CACHE_FRESH_TTL_DEFAULT);
         assert_eq!(parse_fresh_ttl(Some("1.5")), CACHE_FRESH_TTL_DEFAULT);
+    }
+
+    /// [`parse_timeout_secs`] handles the env shapes: unset/garbage/zero fall
+    /// back to the default (a zero bound would kill every git child
+    /// instantly), whole seconds (whitespace-tolerant) parse.
+    #[test]
+    fn parse_timeout_secs_handles_env_shapes() {
+        let fetch = CACHE_FETCH_TIMEOUT_DEFAULT;
+        let clone = CACHE_CLONE_TIMEOUT_DEFAULT;
+        assert_eq!(parse_timeout_secs(None, fetch), Duration::from_secs(100));
+        assert_eq!(parse_timeout_secs(None, clone), Duration::from_secs(300));
+        assert_eq!(
+            parse_timeout_secs(Some("240"), fetch),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            parse_timeout_secs(Some(" 600 "), clone),
+            Duration::from_secs(600)
+        );
+        assert_eq!(parse_timeout_secs(Some("0"), fetch), fetch);
+        assert_eq!(parse_timeout_secs(Some(" 0 "), clone), clone);
+        assert_eq!(parse_timeout_secs(Some(""), fetch), fetch);
+        assert_eq!(parse_timeout_secs(Some("nope"), fetch), fetch);
+        assert_eq!(parse_timeout_secs(Some("-5"), fetch), fetch);
+        assert_eq!(parse_timeout_secs(Some("1.5"), clone), clone);
     }
 
     /// Direct hydration with a chunk callback streams the submodule
