@@ -26,6 +26,22 @@ const THUMBNAIL_TARGET_BASE64_BYTES: usize = 16 * 1024;
 /// JPEG quality for the PNG-overflow fallback encode.
 const THUMBNAIL_JPEG_QUALITY: u8 = 60;
 
+/// Cheap predicate for the write path: does `content` carry an `image` block
+/// whose base64 `data` exceeds the slim budget — i.e. would
+/// [`generate_message_thumbnails`] do real (decode/resize/encode) work? Lets
+/// callers skip the content clone and blocking-pool hop for the common
+/// no-oversized-image message.
+pub(crate) fn needs_thumbnails(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b.get("type").and_then(Value::as_str) == Some("image")
+                && b.get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| d.len() > SLIM_PROJECTION_BUDGET_BYTES)
+        })
+    })
+}
+
 /// Build the `thumbnails` column value for a message's content blocks:
 /// `{"<image ordinal>": {"data": "<base64>", "mimeType": "image/..."}}` for
 /// every `image` block whose base64 `data` exceeds the slim-projection

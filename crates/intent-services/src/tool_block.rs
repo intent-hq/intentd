@@ -18,8 +18,193 @@
 //! electron behavior at `acp-provider-streaming.ts:917` / `:1821`.
 //!
 //! The ACP title is always echoed under `input._acpTitle` when non-empty.
+//!
+//! This module is also home to the slim-projection block bounding (§5.5):
+//! [`slim_message_blocks`] / [`slim_tool_block`] are shared by the persisted
+//! read path (`agent_ops`) and the live `chat.subscribe` stream
+//! (`intent-transport`'s tool deltas and live-turn snapshot merge), so a slim
+//! subscriber's accumulated state stays byte-identical to a fresh slim
+//! snapshot — the same invariant the factory above upholds for block shape.
 
+use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
 use serde_json::{json, Map, Value};
+
+/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
+/// `projection: "slim"`) to one served message's content blocks: oversized
+/// `tool_use.input` / `tool_result.output` bodies are replaced by a
+/// structure-preserving preview bounded by [`SLIM_PROJECTION_BUDGET_BYTES`]
+/// with additive `inputTruncated`/`inputBytes` (resp.
+/// `outputTruncated`/`outputBytes`) flags; oversized `image.data` is replaced
+/// by the write-time thumbnail from `thumbnails` (keyed by the block's image
+/// ordinal) with `dataTruncated`/`dataBytes`/`dataIsThumbnail`, or omitted
+/// entirely when no thumbnail was persisted (legacy rows, failed generation,
+/// or an in-flight turn — pass `None`). Blocks at or under budget pass
+/// through byte-identical with no flags. `name`, block ids, `tool_use_id`
+/// pairing, and `is_error` are never touched. Serve-time only — stored rows
+/// are untouched.
+pub fn slim_message_blocks(blocks: &mut [Value], thumbnails: Option<&Value>) {
+    let mut image_ordinal: usize = 0;
+    for block in blocks.iter_mut() {
+        if block.get("type").and_then(Value::as_str) == Some("image") {
+            let ordinal = image_ordinal;
+            image_ordinal += 1;
+            slim_image(block, ordinal, thumbnails);
+        } else {
+            slim_tool_block(block);
+        }
+    }
+}
+
+/// Slim one `tool_use` / `tool_result` block in place (no-op for any other
+/// block type). Split out of [`slim_message_blocks`] for the live delta
+/// stream, which synthesizes tool blocks one at a time from `agent:tool:call`
+/// payloads and must bound them identically to the persisted read path.
+pub fn slim_tool_block(block: &mut Value) {
+    match block.get("type").and_then(Value::as_str) {
+        Some("tool_use") => slim_body(block, "input", "inputTruncated", "inputBytes"),
+        Some("tool_result") => slim_body(block, "output", "outputTruncated", "outputBytes"),
+        _ => {}
+    }
+}
+
+/// Slim one `tool_use.input` / `tool_result.output` body in place: measured
+/// against [`SLIM_PROJECTION_BUDGET_BYTES`] (string bodies by length, JSON
+/// bodies by serialized length), an over-budget body is replaced by
+/// [`cap_json_value`]'s bounded preview plus the additive truncation flags.
+fn slim_body(block: &mut Value, field: &str, truncated_flag: &str, bytes_flag: &str) {
+    let Some(body) = block.get(field) else {
+        return;
+    };
+    let size = slim_body_size(body);
+    if size <= SLIM_PROJECTION_BUDGET_BYTES {
+        return;
+    }
+    let mut budget = SLIM_PROJECTION_BUDGET_BYTES;
+    let capped = cap_json_value(body, &mut budget);
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert(field.to_string(), capped);
+        obj.insert(truncated_flag.to_string(), json!(true));
+        obj.insert(bytes_flag.to_string(), json!(size));
+    }
+}
+
+/// Slim one `image` block in place: an over-budget base64 `data` is replaced
+/// by the persisted write-time thumbnail (`dataIsThumbnail: true`, `mimeType`
+/// switched to the thumbnail's encoding) when one exists for this image
+/// ordinal, otherwise `data` is omitted entirely (a truncated base64 fragment
+/// is unrenderable). `dataTruncated`/`dataBytes` are stamped in both cases.
+fn slim_image(block: &mut Value, ordinal: usize, thumbnails: Option<&Value>) {
+    let Some(data_len) = block.get("data").and_then(Value::as_str).map(str::len) else {
+        return;
+    };
+    if data_len <= SLIM_PROJECTION_BUDGET_BYTES {
+        return;
+    }
+    let thumb = thumbnails
+        .and_then(|t| t.get(ordinal.to_string()))
+        .and_then(|t| {
+            let data = t.get("data").and_then(Value::as_str)?;
+            let mime = t.get("mimeType").and_then(Value::as_str)?;
+            Some((data.to_string(), mime.to_string()))
+        });
+    let Some(obj) = block.as_object_mut() else {
+        return;
+    };
+    match thumb {
+        Some((data, mime)) => {
+            obj.insert("data".to_string(), Value::String(data));
+            obj.insert("mimeType".to_string(), Value::String(mime));
+            obj.insert("dataIsThumbnail".to_string(), json!(true));
+        }
+        None => {
+            obj.remove("data");
+        }
+    }
+    obj.insert("dataTruncated".to_string(), json!(true));
+    obj.insert("dataBytes".to_string(), json!(data_len));
+}
+
+/// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
+/// budget check: string bodies by length, everything else by serialized JSON
+/// length counted through a discarding writer — no multi-MB string is
+/// allocated just to be measured (a body that fails to serialize measures 0
+/// and passes through).
+fn slim_body_size(body: &Value) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    match body {
+        Value::String(s) => s.len(),
+        other => {
+            let mut sink = CountingSink(0);
+            serde_json::to_writer(&mut sink, other)
+                .map(|()| sink.0)
+                .unwrap_or(0)
+        }
+    }
+}
+
+/// Bounded, structure-preserving preview of a JSON body (slim projection):
+/// object entries are admitted smallest-value-first while the shared `budget`
+/// lasts (each charges its key length plus a punctuation allowance), so the
+/// small scalar keys the FE's tool classification reads —
+/// `classifyTool(name, input)` — survive giant blob siblings; entries beyond
+/// the budget are dropped, keeping the preview bounded regardless of key
+/// count. String leaves are truncated (char-boundary safe) against the
+/// budget, array tails beyond it are dropped, and non-string scalars pass
+/// through with a nominal charge. With the budget exhausted, strings collapse
+/// to `""` and containers to their already-emitted prefix, so the preview's
+/// serialized size stays within a small constant factor of the budget
+/// regardless of input shape.
+fn cap_json_value(value: &Value, budget: &mut usize) -> Value {
+    match value {
+        Value::String(s) => {
+            let mut end = (*budget).min(s.len());
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            *budget = budget.saturating_sub(end);
+            Value::String(s[..end].to_string())
+        }
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                if *budget == 0 {
+                    break;
+                }
+                out.push(cap_json_value(item, budget));
+            }
+            Value::Array(out)
+        }
+        Value::Object(map) => {
+            // Smallest values first: serialization order is key-sorted
+            // regardless of insertion order, so processing order only decides
+            // WHICH entries fit, never how the preview is laid out.
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(_, val)| slim_body_size(val));
+            let mut out = Map::new();
+            for (key, val) in entries {
+                if *budget == 0 {
+                    break;
+                }
+                *budget = budget.saturating_sub(key.len() + 4);
+                out.insert(key.clone(), cap_json_value(val, budget));
+            }
+            Value::Object(out)
+        }
+        other => {
+            *budget = budget.saturating_sub(8);
+            other.clone()
+        }
+    }
+}
 
 /// Return `input` augmented with `_acpTitle = title` when `title` is non-empty.
 /// A `Null` input is coerced to `{}` so the marker can attach; non-object,
@@ -221,6 +406,78 @@ fn build_proposal_resource_item(proposal: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unbounded-keys regression (PR #1304 review): a `tool_use.input`
+    /// with thousands of keys must still serialize within a small constant
+    /// factor of the budget — entry admission stops when the budget runs out,
+    /// it never emits every key.
+    #[test]
+    fn slim_tool_block_bounds_key_heavy_inputs() {
+        let mut input = Map::new();
+        for i in 0..10_000 {
+            input.insert(format!("key_number_{i:05}"), json!(i));
+        }
+        let mut block = json!({
+            "type": "tool_use",
+            "id": "m:1",
+            "name": "big",
+            "input": Value::Object(input),
+            "toolCallId": "tc-1",
+        });
+        slim_tool_block(&mut block);
+        assert_eq!(block["inputTruncated"], true);
+        let served = serde_json::to_string(&block["input"]).unwrap();
+        assert!(
+            served.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2,
+            "served input must stay near the budget, got {} bytes",
+            served.len()
+        );
+    }
+
+    /// Small scalar entries (the fields `classifyTool` reads) survive a giant
+    /// blob sibling: entries are admitted smallest-value-first, so the blob
+    /// burns the budget LAST instead of starving the small keys.
+    #[test]
+    fn slim_tool_block_keeps_small_keys_over_giant_sibling() {
+        let mut block = json!({
+            "type": "tool_use",
+            "id": "m:1",
+            "name": "write_file",
+            "input": {
+                "path": "/tmp/a.txt",
+                "mode": "overwrite",
+                "content": "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 8),
+            },
+            "toolCallId": "tc-1",
+        });
+        slim_tool_block(&mut block);
+        assert_eq!(block["inputTruncated"], true);
+        assert_eq!(block["input"]["path"], "/tmp/a.txt");
+        assert_eq!(block["input"]["mode"], "overwrite");
+        let content = block["input"]["content"].as_str().unwrap();
+        assert!(content.len() < SLIM_PROJECTION_BUDGET_BYTES * 8);
+    }
+
+    /// Under-budget tool blocks and non-tool blocks pass through untouched —
+    /// no flags, byte-identical.
+    #[test]
+    fn slim_tool_block_passes_small_and_foreign_blocks_through() {
+        let mut small = json!({
+            "type": "tool_result",
+            "id": "m:2",
+            "tool_use_id": "tc-1",
+            "output": "12 tests passed",
+            "is_error": false,
+        });
+        let before = small.clone();
+        slim_tool_block(&mut small);
+        assert_eq!(small, before);
+
+        let mut text = json!({ "type": "text", "id": "m:0", "text": "hi" });
+        let before = text.clone();
+        slim_tool_block(&mut text);
+        assert_eq!(text, before);
+    }
 
     #[test]
     fn name_and_title_land_in_block_and_marker() {

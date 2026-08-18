@@ -639,6 +639,50 @@ fn chat_tool_delta_completed_emits_use_and_result_blocks() {
     assert_eq!(added[1]["block"]["is_error"], false);
 }
 
+/// Live tool deltas are bounded under the slim projection (PR #1304 review):
+/// the `agent:tool:call` payload carries the FULL input/output, and a slim
+/// subscription must never forward them unslimmed — otherwise the live stream
+/// reintroduces the oversized frames the projection opted out of, and the
+/// accumulated client state diverges from the slim terminal-reconcile re-read.
+#[test]
+fn chat_tool_delta_slims_live_blocks_under_slim_projection() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let mut event = tool_event("msg-5", "msg-5:0", "tc-9", "completed", Some(json!(big)));
+    event.data["input"] = json!({ "path": "/tmp/a.txt", "content": big });
+
+    // Full fidelity: blocks pass through unslimmed, no flags.
+    let mut full = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+    let d = full.tool_delta(&event).expect("full tool delta");
+    let added = d["added"].as_array().unwrap();
+    assert!(added[0]["block"].get("inputTruncated").is_none());
+    assert_eq!(
+        added[1]["block"]["output"].as_str().unwrap().len(),
+        big.len()
+    );
+
+    // Slim: both live blocks bounded with the same flags the read path stamps.
+    let mut slim = ChatDeltaState::new(
+        &agent(),
+        DeltaEncoding::Full,
+        Some(ConversationProjection::Slim),
+    );
+    let d = slim.tool_delta(&event).expect("slim tool delta");
+    let added = d["added"].as_array().unwrap();
+    let tu = &added[0]["block"];
+    assert_eq!(tu["inputTruncated"], true);
+    assert_eq!(tu["input"]["path"], "/tmp/a.txt", "small keys survive");
+    assert_eq!(tu["toolCallId"], "tc-9", "pairing id intact");
+    let served_input = serde_json::to_string(&tu["input"]).unwrap();
+    assert!(served_input.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2);
+    let tr = &added[1]["block"];
+    assert_eq!(tr["outputTruncated"], true);
+    assert_eq!(tr["outputBytes"].as_u64().unwrap() as usize, big.len());
+    assert!(tr["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES);
+    assert_eq!(tr["tool_use_id"], "tc-9");
+    assert_eq!(tr["is_error"], false);
+}
+
 #[test]
 fn chat_tool_delta_error_status_marks_is_error_true() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
@@ -1245,7 +1289,7 @@ fn merge_live_turn_appends_in_flight_message_idempotently() {
         "messageId": "msg-live",
         "contentBlocks": [{ "id": "msg-live:0", "type": "text", "text": "partial" }],
     });
-    merge_live_turn(&mut snapshot, &agent(), &live, true);
+    merge_live_turn(&mut snapshot, &agent(), &live, true, None);
     let messages = snapshot["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["id"], "msg-live");
@@ -1254,7 +1298,7 @@ fn merge_live_turn_appends_in_flight_message_idempotently() {
     assert_eq!(messages[0]["role"], "assistant");
     assert_eq!(snapshot["totalMessages"], 1);
     // Idempotent re-merge: same message id already present → no duplicate, no seq bump.
-    merge_live_turn(&mut snapshot, &agent(), &live, true);
+    merge_live_turn(&mut snapshot, &agent(), &live, true, None);
     assert_eq!(snapshot["messages"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["totalMessages"], 1);
 }
@@ -1272,7 +1316,7 @@ fn merge_live_turn_merges_an_orphan_slot_as_not_streaming() {
         "messageId": "msg-orphan",
         "contentBlocks": [{ "id": "msg-orphan:0", "type": "text", "text": "partial" }],
     });
-    merge_live_turn(&mut snapshot, &agent(), &live, false);
+    merge_live_turn(&mut snapshot, &agent(), &live, false, None);
     let messages = snapshot["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["id"], "msg-orphan");
@@ -1291,7 +1335,7 @@ fn merge_live_turn_skips_an_empty_orphan_but_not_an_empty_live_turn() {
     let empty = json!({ "messageId": "msg-live", "contentBlocks": [] });
 
     let mut orphan = json!({ "messages": [], "totalMessages": 0 });
-    merge_live_turn(&mut orphan, &agent(), &empty, false);
+    merge_live_turn(&mut orphan, &agent(), &empty, false, None);
     assert!(
         orphan["messages"].as_array().unwrap().is_empty(),
         "an empty orphan slot adds no row: {orphan}"
@@ -1299,7 +1343,7 @@ fn merge_live_turn_skips_an_empty_orphan_but_not_an_empty_live_turn() {
     assert_eq!(orphan["totalMessages"], 0);
 
     let mut streaming = json!({ "messages": [], "totalMessages": 0 });
-    merge_live_turn(&mut streaming, &agent(), &empty, true);
+    merge_live_turn(&mut streaming, &agent(), &empty, true, None);
     assert_eq!(streaming["messages"].as_array().unwrap().len(), 1);
     assert_eq!(streaming["messages"][0]["isStreaming"], true);
 }
@@ -1312,6 +1356,7 @@ fn merge_live_turn_noop_when_message_id_missing() {
         &agent(),
         &json!({ "contentBlocks": [] }),
         true,
+        None,
     );
     assert!(snapshot["messages"].as_array().unwrap().is_empty());
     assert_eq!(snapshot["totalMessages"], 0);
@@ -1325,8 +1370,60 @@ fn merge_live_turn_noop_when_snapshot_is_not_object() {
         &agent(),
         &json!({ "messageId": "m", "contentBlocks": [] }),
         true,
+        None,
     );
     assert_eq!(snapshot, json!([]));
+}
+
+/// A slim subscription's live-turn merge bounds the in-flight blocks (§5.5):
+/// an oversized live `tool_result` is truncated with flags, and an oversized
+/// live image (no write-time thumbnail exists mid-turn) has `data` omitted.
+/// A full-fidelity merge of the same slot stays untouched.
+#[test]
+fn merge_live_turn_slims_in_flight_blocks_under_slim_projection() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let live = json!({
+        "messageId": "msg-live",
+        "contentBlocks": [
+            { "id": "msg-live:0", "type": "text", "text": "partial" },
+            { "id": "msg-live:1", "type": "tool_result", "tool_use_id": "tc-1",
+              "output": big, "is_error": false },
+            { "id": "msg-live:2", "type": "image", "mimeType": "image/png", "data": big },
+        ],
+    });
+
+    let mut slim = json!({ "messages": [], "totalMessages": 0 });
+    merge_live_turn(
+        &mut slim,
+        &agent(),
+        &live,
+        true,
+        Some(ConversationProjection::Slim),
+    );
+    let blocks = slim["messages"][0]["contentBlocks"].as_array().unwrap();
+    assert_eq!(blocks[0]["text"], "partial", "text untouched");
+    assert_eq!(blocks[1]["outputTruncated"], true);
+    assert!(
+        blocks[1]["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES,
+        "live tool_result bounded"
+    );
+    assert_eq!(blocks[2]["dataTruncated"], true);
+    assert!(
+        blocks[2].get("data").is_none(),
+        "no mid-turn thumbnail → data omitted: {}",
+        blocks[2]
+    );
+
+    let mut full = json!({ "messages": [], "totalMessages": 0 });
+    merge_live_turn(&mut full, &agent(), &live, true, None);
+    let blocks = full["messages"][0]["contentBlocks"].as_array().unwrap();
+    assert_eq!(
+        blocks[1]["output"].as_str().unwrap().len(),
+        big.len(),
+        "full-fidelity merge untouched"
+    );
+    assert!(blocks[1].get("outputTruncated").is_none());
 }
 
 // --- task_delta re-read arm (channel-mapping regression) ------------------

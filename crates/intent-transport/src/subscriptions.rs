@@ -90,8 +90,10 @@ pub(crate) struct CommentSubscribeParams {
 /// lifetime (D2): `"full"`/absent for full accumulated text per chunk,
 /// `"incremental"` for append-only `textDelta` fragments. `projection`
 /// (optional) selects the slim conversation projection for the
-/// subscription's lifetime: the seq-0 snapshot, lag-recovery snapshots, and
-/// every delta re-read serve bounded tool/image block bodies (§5.5).
+/// subscription's lifetime: the seq-0 snapshot (including its live-turn
+/// merge), lag-recovery snapshots, every delta re-read, AND the live
+/// `tool_use`/`tool_result` deltas serve bounded tool/image block bodies
+/// (§5.5) — no frame class is exempt.
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
@@ -538,7 +540,7 @@ pub(crate) async fn chat_snapshot(
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
-    overlay_live_state(api, agent_id, &mut snapshot).await;
+    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
     snapshot
 }
 
@@ -563,13 +565,23 @@ pub(crate) async fn chat_recovery_snapshot(
         Ok(v) => v,
         Err(_) => read().await.ok()?,
     };
-    overlay_live_state(api, agent_id, &mut snapshot).await;
+    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
     Some(snapshot)
 }
 
 /// Overlay the live in-flight turn and activity flags onto a chat snapshot's
 /// persisted page (shared by [`chat_snapshot`] and [`chat_recovery_snapshot`]).
-async fn overlay_live_state(api: &dyn WorkspaceApi, agent_id: &AgentId, snapshot: &mut Value) {
+/// The in-flight message's blocks are bounded under the subscription's
+/// `projection` (the persisted page already arrived bounded from the read) —
+/// without this, a slim subscriber connecting mid-turn could receive a seq-0
+/// snapshot carrying a multi-MB live `tool_result`/`image` block, the exact
+/// frame class the projection exists to prevent.
+async fn overlay_live_state(
+    api: &dyn WorkspaceApi,
+    agent_id: &AgentId,
+    snapshot: &mut Value,
+    projection: Option<ConversationProjection>,
+) {
     // Read busy BEFORE the slot, never after. The two reads are separate lock
     // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
     // stale slot under the busy lock before publishing the claim, which makes
@@ -581,7 +593,7 @@ async fn overlay_live_state(api: &dyn WorkspaceApi, agent_id: &AgentId, snapshot
     // content labelled settled, which the next delta or snapshot corrects.
     let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(snapshot, agent_id, &live, is_streaming);
+        merge_live_turn(snapshot, agent_id, &live, is_streaming, projection);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -649,14 +661,29 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// still-streaming turn keeps merging empty — a turn that has only just begun
 /// legitimately has no blocks yet, and the client needs the id to reconcile
 /// against.
-fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value, is_streaming: bool) {
+fn merge_live_turn(
+    snapshot: &mut Value,
+    agent_id: &AgentId,
+    live: &Value,
+    is_streaming: bool,
+    projection: Option<ConversationProjection>,
+) {
     let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
         return;
     };
-    let blocks = live
+    let mut blocks = live
         .get("contentBlocks")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    // Bound the in-flight blocks under the slim projection (§5.5). No
+    // write-time thumbnail exists mid-turn, so an oversized live image
+    // degrades to data-omitted + flags; the terminal reconcile re-reads the
+    // persisted row and serves the real thumbnail.
+    if projection == Some(ConversationProjection::Slim) {
+        if let Some(arr) = blocks.as_array_mut() {
+            intent_services::tool_block::slim_message_blocks(arr, None);
+        }
+    }
     let populated = blocks.as_array().is_some_and(|b| !b.is_empty());
     if !is_streaming && !populated {
         return;
@@ -1015,7 +1042,7 @@ impl ChatDeltaState {
         // delta stays byte-identical to the persisted block that `record_tool`
         // writes on `agent:stream:end` — the invariant chat.subscribe relies
         // on for its terminal reconcile.
-        let use_block = intent_services::tool_block::build_tool_use_block(
+        let mut use_block = intent_services::tool_block::build_tool_use_block(
             &block_id,
             d.get("toolName").and_then(Value::as_str).unwrap_or(""),
             d.get("title").and_then(Value::as_str).unwrap_or(""),
@@ -1024,6 +1051,13 @@ impl ChatDeltaState {
             d.get("toolKind").and_then(Value::as_str).unwrap_or(""),
             status,
         );
+        // A slim subscription bounds the live blocks too (§5.5) — the event
+        // payload carries the FULL tool input/output, and forwarding it
+        // unslimmed would hand the subscriber the very oversized frame the
+        // projection opted out of, mid-turn. Same shared bounding as the
+        // persisted read path, so the terminal reconcile (which re-reads
+        // under the same projection) upserts byte-identical blocks.
+        self.slim_block(&mut use_block);
         let use_added = self.note_block(&block_id);
         self.remember_block(&block_id, &use_block);
         let mut added = Vec::new();
@@ -1041,13 +1075,14 @@ impl ChatDeltaState {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             if let (Some(output), Some(result_id)) = (d.get("output"), result_id) {
-                let result_block = json!({
+                let mut result_block = json!({
                     "type": "tool_result",
                     "id": result_id,
                     "tool_use_id": tool_call_id,
                     "output": output,
                     "is_error": status == "error",
                 });
+                self.slim_block(&mut result_block);
                 let res_added = self.note_block(&result_id);
                 self.remember_block(&result_id, &result_block);
                 push_entity(
@@ -1342,6 +1377,16 @@ impl ChatDeltaState {
     fn note_block(&mut self, block_id: &str) -> bool {
         self.emitted_ids.insert(block_id.to_string());
         self.seen_ids.insert(block_id.to_string())
+    }
+
+    /// Bound a live-synthesized `tool_use`/`tool_result` block under the
+    /// subscription's projection (§5.5) — a no-op for full-fidelity
+    /// subscriptions. Applied BEFORE `remember_block`, so the degraded
+    /// best-effort terminal frame replays the slimmed block, never the raw one.
+    fn slim_block(&self, block: &mut Value) {
+        if self.projection == Some(ConversationProjection::Slim) {
+            intent_services::tool_block::slim_tool_block(block);
+        }
     }
 }
 

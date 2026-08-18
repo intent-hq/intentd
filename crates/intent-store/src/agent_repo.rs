@@ -487,6 +487,9 @@ impl Store {
                 )
             })
             .collect();
+        // Thumbnail generation (CPU-bound image work) runs BEFORE the write
+        // transaction opens — never inside it or the retry closure.
+        let thumbnails = batch_thumbnails_col_values(&owned_messages).await;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -513,7 +516,7 @@ impl Store {
                     })?),
                     None => None,
                 };
-                let thumbnails_json = thumbnails_col_value(content);
+                let thumbnails_json = thumbnails[idx].as_deref();
                 let id = Uuid::now_v7().to_string();
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
@@ -526,7 +529,7 @@ impl Store {
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
-                    .bind(thumbnails_json.as_deref())
+                    .bind(thumbnails_json)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
@@ -2029,8 +2032,29 @@ const MESSAGE_INSERT_COLUMNS: &str =
 /// (logged per block); a serialization failure of the map itself is also
 /// non-fatal — thumbnails are an optimization, never worth failing the
 /// message write.
-fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
-    let map = crate::message_thumbnails::generate_message_thumbnails(content)?;
+///
+/// Generation decodes + downscales + re-encodes the image (hundreds of ms of
+/// CPU for a multi-MB screenshot), so callers MUST await this BEFORE opening
+/// the write transaction / entering the `with_write_txn_retry` closure — never
+/// inside — and the work itself runs on a blocking thread, off the tokio
+/// worker. The cheap `needs_thumbnails` pre-check keeps the common
+/// no-oversized-image message free of the clone + thread hop.
+async fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
+    if !crate::message_thumbnails::needs_thumbnails(content) {
+        return None;
+    }
+    let owned = content.clone();
+    let map = match tokio::task::spawn_blocking(move || {
+        crate::message_thumbnails::generate_message_thumbnails(&owned)
+    })
+    .await
+    {
+        Ok(map) => map?,
+        Err(e) => {
+            tracing::warn!(error = %e, "thumbnail generation task failed; persisting none");
+            return None;
+        }
+    };
     match serde_json::to_string(&map) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -2038,6 +2062,17 @@ fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
             None
         }
     }
+}
+
+/// [`thumbnails_col_value`] for a whole batch, positionally aligned with
+/// `messages`. Awaited before the batch write transaction opens, so a
+/// SQLITE_BUSY retry re-runs only the SQL, never the image work.
+async fn batch_thumbnails_col_values(messages: &[OwnedBatchMessage]) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(messages.len());
+    for (_, content, _, _) in messages {
+        out.push(thumbnails_col_value(content).await);
+    }
+    out
 }
 
 /// SQL scalar expression extracting the searchable plain text of an
@@ -2299,7 +2334,9 @@ impl Store {
             "user" => Some(("last_user_preview", preview_col_value(role, content)?)),
             _ => None,
         };
-        let thumbnails_json = thumbnails_col_value(content);
+        // Awaited before any write transaction below opens: thumbnail
+        // generation is CPU-bound image work and runs on a blocking thread.
+        let thumbnails_json = thumbnails_col_value(content).await;
         let sql = format!(
             "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
         );
@@ -2630,6 +2667,9 @@ impl Store {
                 .collect();
         let (assistant_preview, user_preview, last_message_role) =
             batch_preview_col_values(&owned_messages)?;
+        // Thumbnail generation (CPU-bound image work) runs BEFORE the write
+        // transaction opens — never inside it or the retry closure.
+        let thumbnails = batch_thumbnails_col_values(&owned_messages).await;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -2662,7 +2702,7 @@ impl Store {
                     })?),
                     None => None,
                 };
-                let thumbnails_json = thumbnails_col_value(content);
+                let thumbnails_json = thumbnails[idx].as_deref();
                 sqlx::query(&insert_sql)
                     .bind(&id)
                     .bind(&agent_id.0)
@@ -2671,7 +2711,7 @@ impl Store {
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
                     .bind(created_at)
-                    .bind(thumbnails_json.as_deref())
+                    .bind(thumbnails_json)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| {
