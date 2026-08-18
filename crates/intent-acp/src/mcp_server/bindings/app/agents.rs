@@ -176,6 +176,7 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
             None,
             None,
             None,
+            None,
         )
         .await
         .map_err(map_err)?;
@@ -413,6 +414,7 @@ mod tests {
             _include_tool_calls: Option<String>,
             _around_message_id: Option<String>,
             _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
         ) -> BoxFuture<'_, Result<Value>> {
             let messages = self.conversation_messages.lock().unwrap().clone();
             Box::pin(async move { Ok(json!({ "messages": messages })) })

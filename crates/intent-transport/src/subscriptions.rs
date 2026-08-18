@@ -19,7 +19,8 @@ use intent_core::events::{
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
-    extract_spec_task_ids, now_iso, AgentId, Event, Note, NoteId, WorkspaceApi, WorkspaceId,
+    extract_spec_task_ids, now_iso, AgentId, ConversationProjection, Event, Note, NoteId,
+    WorkspaceApi, WorkspaceId,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -87,12 +88,18 @@ pub(crate) struct CommentSubscribeParams {
 /// seq-0 snapshot: only messages AFTER that id (§7.1 resume). `deltaEncoding`
 /// (optional) selects the text-chunk delta encoding for the subscription's
 /// lifetime (D2): `"full"`/absent for full accumulated text per chunk,
-/// `"incremental"` for append-only `textDelta` fragments.
+/// `"incremental"` for append-only `textDelta` fragments. `projection`
+/// (optional) selects the slim conversation projection for the
+/// subscription's lifetime: the seq-0 snapshot (including its live-turn
+/// merge), lag-recovery snapshots, every delta re-read, AND the live
+/// `tool_use`/`tool_result` deltas serve bounded tool/image block bodies
+/// (§5.5) — no frame class is exempt.
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
     pub since_message_id: Option<String>,
     pub delta_encoding: DeltaEncoding,
+    pub projection: Option<ConversationProjection>,
     pub replace_group: Option<String>,
 }
 
@@ -259,10 +266,20 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) if s == "incremental" => DeltaEncoding::Incremental,
         Some(_) => return Err("deltaEncoding must be \"full\" or \"incremental\"".to_string()),
     };
+    // `projection` is optional: absent / `null` serve full fidelity, `"slim"`
+    // bounds tool/image block bodies (§5.5); any other value is `-32602` (a
+    // silently ignored typo would hand the client the full-size frames it
+    // opted out of).
+    let projection = match params.get("projection") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "slim" => Some(ConversationProjection::Slim),
+        Some(_) => return Err("projection must be \"slim\"".to_string()),
+    };
     Ok(ChatSubscribeParams {
         agent_id,
         since_message_id,
         delta_encoding,
+        projection,
         replace_group: replace_group(params),
     })
 }
@@ -505,9 +522,10 @@ pub(crate) async fn chat_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
     since_message_id: Option<&str>,
+    projection: Option<ConversationProjection>,
 ) -> Value {
     let mut snapshot = match api
-        .agent_get_conversation(agent_id.clone(), None, None, None, None, None)
+        .agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection)
         .await
     {
         Ok(v) => v,
@@ -522,7 +540,7 @@ pub(crate) async fn chat_snapshot(
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
-    overlay_live_state(api, agent_id, &mut snapshot).await;
+    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
     snapshot
 }
 
@@ -539,19 +557,31 @@ pub(crate) async fn chat_snapshot(
 pub(crate) async fn chat_recovery_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
+    projection: Option<ConversationProjection>,
 ) -> Option<Value> {
-    let read = || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None);
+    let read =
+        || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None, projection);
     let mut snapshot = match read().await {
         Ok(v) => v,
         Err(_) => read().await.ok()?,
     };
-    overlay_live_state(api, agent_id, &mut snapshot).await;
+    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
     Some(snapshot)
 }
 
 /// Overlay the live in-flight turn and activity flags onto a chat snapshot's
 /// persisted page (shared by [`chat_snapshot`] and [`chat_recovery_snapshot`]).
-async fn overlay_live_state(api: &dyn WorkspaceApi, agent_id: &AgentId, snapshot: &mut Value) {
+/// The in-flight message's blocks are bounded under the subscription's
+/// `projection` (the persisted page already arrived bounded from the read) —
+/// without this, a slim subscriber connecting mid-turn could receive a seq-0
+/// snapshot carrying a multi-MB live `tool_result`/`image` block, the exact
+/// frame class the projection exists to prevent.
+async fn overlay_live_state(
+    api: &dyn WorkspaceApi,
+    agent_id: &AgentId,
+    snapshot: &mut Value,
+    projection: Option<ConversationProjection>,
+) {
     // Read busy BEFORE the slot, never after. The two reads are separate lock
     // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
     // stale slot under the busy lock before publishing the claim, which makes
@@ -563,7 +593,7 @@ async fn overlay_live_state(api: &dyn WorkspaceApi, agent_id: &AgentId, snapshot
     // content labelled settled, which the next delta or snapshot corrects.
     let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(snapshot, agent_id, &live, is_streaming);
+        merge_live_turn(snapshot, agent_id, &live, is_streaming, projection);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -631,14 +661,29 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// still-streaming turn keeps merging empty — a turn that has only just begun
 /// legitimately has no blocks yet, and the client needs the id to reconcile
 /// against.
-fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value, is_streaming: bool) {
+fn merge_live_turn(
+    snapshot: &mut Value,
+    agent_id: &AgentId,
+    live: &Value,
+    is_streaming: bool,
+    projection: Option<ConversationProjection>,
+) {
     let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
         return;
     };
-    let blocks = live
+    let mut blocks = live
         .get("contentBlocks")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    // Bound the in-flight blocks under the slim projection (§5.5). No
+    // write-time thumbnail exists mid-turn, so an oversized live image
+    // degrades to data-omitted + flags; the terminal reconcile re-reads the
+    // persisted row and serves the real thumbnail.
+    if projection == Some(ConversationProjection::Slim) {
+        if let Some(arr) = blocks.as_array_mut() {
+            intent_services::tool_block::slim_message_blocks(arr, None);
+        }
+    }
     let populated = blocks.as_array().is_some_and(|b| !b.is_empty());
     if !is_streaming && !populated {
         return;
@@ -688,6 +733,12 @@ pub(crate) struct ChatDeltaState {
     /// The subscription's text-chunk encoding (D2): full accumulated text per
     /// chunk, or append-only `textDelta` fragments (monorepo#2675).
     encoding: DeltaEncoding,
+    /// The subscription's conversation projection (§5.5), fixed at subscribe
+    /// time like the encoding. Every delta re-read (`agent:message` rows,
+    /// terminal reconcile) passes it through so the accumulated client state
+    /// stays byte-identical to a fresh snapshot under the SAME projection
+    /// (the CS-3 reconciliation invariant).
+    projection: Option<ConversationProjection>,
     /// `blockId` → accumulated text for `text` blocks. In full mode every
     /// chunk delta re-materializes it (D2); in incremental mode it is kept
     /// (O(chunk) appends, linear memory) but consulted only by the degraded
@@ -715,10 +766,15 @@ impl ChatDeltaState {
     /// encoding is fixed for the subscription's lifetime (chosen at subscribe
     /// time) — a lag-recovery replacement mapper must be built with the SAME
     /// encoding.
-    pub(crate) fn new(agent_id: &AgentId, encoding: DeltaEncoding) -> Self {
+    pub(crate) fn new(
+        agent_id: &AgentId,
+        encoding: DeltaEncoding,
+        projection: Option<ConversationProjection>,
+    ) -> Self {
         Self {
             agent_id: agent_id.as_str().to_string(),
             encoding,
+            projection,
             text_acc: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
@@ -830,6 +886,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 None,
+                self.projection,
             )
             .await
             .ok()?;
@@ -985,7 +1042,7 @@ impl ChatDeltaState {
         // delta stays byte-identical to the persisted block that `record_tool`
         // writes on `agent:stream:end` — the invariant chat.subscribe relies
         // on for its terminal reconcile.
-        let use_block = intent_services::tool_block::build_tool_use_block(
+        let mut use_block = intent_services::tool_block::build_tool_use_block(
             &block_id,
             d.get("toolName").and_then(Value::as_str).unwrap_or(""),
             d.get("title").and_then(Value::as_str).unwrap_or(""),
@@ -994,6 +1051,13 @@ impl ChatDeltaState {
             d.get("toolKind").and_then(Value::as_str).unwrap_or(""),
             status,
         );
+        // A slim subscription bounds the live blocks too (§5.5) — the event
+        // payload carries the FULL tool input/output, and forwarding it
+        // unslimmed would hand the subscriber the very oversized frame the
+        // projection opted out of, mid-turn. Same shared bounding as the
+        // persisted read path, so the terminal reconcile (which re-reads
+        // under the same projection) upserts byte-identical blocks.
+        self.slim_block(&mut use_block);
         let use_added = self.note_block(&block_id);
         self.remember_block(&block_id, &use_block);
         let mut added = Vec::new();
@@ -1011,13 +1075,14 @@ impl ChatDeltaState {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             if let (Some(output), Some(result_id)) = (d.get("output"), result_id) {
-                let result_block = json!({
+                let mut result_block = json!({
                     "type": "tool_result",
                     "id": result_id,
                     "tool_use_id": tool_call_id,
                     "output": output,
                     "is_error": status == "error",
                 });
+                self.slim_block(&mut result_block);
                 let res_added = self.note_block(&result_id);
                 self.remember_block(&result_id, &result_block);
                 push_entity(
@@ -1135,6 +1200,7 @@ impl ChatDeltaState {
                 None,
                 None,
                 None,
+                self.projection,
             )
         };
         let conv = match read().await {
@@ -1311,6 +1377,16 @@ impl ChatDeltaState {
     fn note_block(&mut self, block_id: &str) -> bool {
         self.emitted_ids.insert(block_id.to_string());
         self.seen_ids.insert(block_id.to_string())
+    }
+
+    /// Bound a live-synthesized `tool_use`/`tool_result` block under the
+    /// subscription's projection (§5.5) — a no-op for full-fidelity
+    /// subscriptions. Applied BEFORE `remember_block`, so the degraded
+    /// best-effort terminal frame replays the slimmed block, never the raw one.
+    fn slim_block(&self, block: &mut Value) {
+        if self.projection == Some(ConversationProjection::Slim) {
+            intent_services::tool_block::slim_tool_block(block);
+        }
     }
 }
 

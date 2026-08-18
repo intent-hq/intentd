@@ -7959,6 +7959,171 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `agent.getConversation` / `chat.subscribe` slim projection over the real
+/// WSS wire (§5.5, §7.1): `projection: "slim"` bounds oversized
+/// tool_use/tool_result bodies (additive `inputTruncated`/`outputTruncated`
+/// flags, pairing ids intact) and swaps oversized image data for the
+/// write-time thumbnail (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the
+/// seq-0 snapshot of a slim subscription serves the same bounded blocks;
+/// absent param stays byte-identical full fidelity; a bad value is `-32602`.
+#[tokio::test]
+async fn wss_conversation_slim_projection_bounds_blocks() {
+    use base64::Engine as _;
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Slim"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Slim"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // One message with an oversized tool pair, an under-budget tool pair,
+    // and an oversized image (noise PNG defeats compression, so the write
+    // path persists a real thumbnail for it).
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let img = image::RgbImage::from_fn(512, 384, |x, y| {
+        let v = (x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)) % 251) as u8;
+        image::Rgb([v, v.wrapping_add(97), v.wrapping_add(193)])
+    });
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .expect("encode test png");
+    let img_b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+    assert!(img_b64.len() > SLIM_PROJECTION_BUDGET_BYTES);
+    let content = json!([
+        { "type": "tool_use", "id": "m:0", "name": "view", "toolCallId": "tc-1",
+          "input": { "path": "big.rs", "blob": big } },
+        { "type": "tool_result", "id": "m:1", "tool_use_id": "tc-1",
+          "output": big, "is_error": false },
+        { "type": "tool_use", "id": "m:2", "name": "ls", "toolCallId": "tc-2",
+          "input": { "path": "." } },
+        { "type": "tool_result", "id": "m:3", "tool_use_id": "tc-2",
+          "output": "ok", "is_error": false },
+        { "type": "image", "id": "m:4", "data": img_b64, "mimeType": "image/png" },
+    ]);
+    srv.store
+        .append_agent_message(&agent, "assistant", &content, &now_iso())
+        .await
+        .expect("append message");
+
+    // Absent param: byte-identical full fidelity.
+    let full = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        full["result"]["messages"][0]["contentBlocks"], content,
+        "absent projection stays byte-identical"
+    );
+
+    // Slim read: bounded bodies, additive flags, pairing intact.
+    let slim = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+        ),
+    )
+    .await;
+    let blocks = slim["result"]["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("slim blocks");
+    let assert_slim_blocks = |blocks: &[Value], label: &str| {
+        let tu = &blocks[0];
+        assert_eq!(tu["inputTruncated"], true, "{label}: {tu}");
+        assert_eq!(tu["name"], "view", "{label}");
+        assert_eq!(tu["toolCallId"], "tc-1", "{label}");
+        assert!(
+            serde_json::to_string(&tu["input"]).unwrap().len()
+                <= SLIM_PROJECTION_BUDGET_BYTES + 256,
+            "{label}: input bounded"
+        );
+        let tr = &blocks[1];
+        assert_eq!(tr["outputTruncated"], true, "{label}");
+        assert_eq!(tr["tool_use_id"], "tc-1", "{label}");
+        assert!(
+            tr["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES,
+            "{label}: output bounded"
+        );
+        assert_eq!(blocks[2], content[2], "{label}: under-budget untouched");
+        assert_eq!(blocks[3], content[3], "{label}: under-budget untouched");
+        let img_block = &blocks[4];
+        assert_eq!(img_block["dataTruncated"], true, "{label}");
+        assert_eq!(img_block["dataIsThumbnail"], true, "{label}");
+        assert_eq!(
+            img_block["dataBytes"].as_u64().unwrap() as usize,
+            img_b64.len(),
+            "{label}"
+        );
+        let served = img_block["data"].as_str().expect("thumbnail data");
+        assert!(served.len() < img_b64.len(), "{label}: thumbnail smaller");
+    };
+    assert_slim_blocks(blocks, "slim read");
+
+    // chat.subscribe with the slim projection: the seq-0 snapshot serves the
+    // same bounded blocks.
+    let snap = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+        ),
+        5,
+    )
+    .await;
+    let snap_blocks = snap["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("snapshot blocks");
+    assert_slim_blocks(snap_blocks, "slim snapshot");
+
+    // A bad projection value is -32602 on both methods.
+    let bad = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","projection":"tiny"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602);
+    let bad_sub = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"tiny"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_sub["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
 /// `search.messages` over the real WSS wire (§5.15): FTS5-backed search over
 /// persisted user/assistant messages. Covers the reworked contract — global
 /// scope when `workspaceId` is absent, `workspaceId` as a hard scope filter,
