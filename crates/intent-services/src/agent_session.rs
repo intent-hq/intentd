@@ -1491,12 +1491,22 @@ impl Services {
             )
             .await
         {
-            Ok(_) => {
+            Ok(message) => {
                 // Best-effort: resolve workspace from the session so the
                 // projection cache drops without requiring the caller to pass
-                // workspace_id on this interrupt flush path.
+                // workspace_id on this interrupt flush path. The same lookup
+                // scopes the persisted-row event pair (§6.5) — the flushed
+                // partial row is a transcript persist like any other, so
+                // preview subscribers converge on its `lastToolUse` too.
                 if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                     self.invalidate_agent_list_cache(&session.workspace_id);
+                    self.publish_agent_message_events(
+                        &session.workspace_id,
+                        agent_id,
+                        &message,
+                        None,
+                    )
+                    .await;
                 }
                 if owns_slot {
                     self.clear_live_turn(agent_id);
@@ -2197,7 +2207,8 @@ impl Services {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
-            self.store
+            let message = self
+                .store
                 .append_agent_message_with_id(
                     agent_id,
                     &message_id,
@@ -2208,6 +2219,13 @@ impl Services {
                 )
                 .await?;
             self.invalidate_agent_list_cache(workspace_id);
+            // Persisted-row event pair (PROTOCOL §6.5): the assistant turn
+            // flush emits `agent:message` + `agent:last-message` like every
+            // other transcript persist, so preview subscribers learn the
+            // final persisted `lastToolUse` with zero follow-up RPCs (the
+            // streaming activity preview carries no tool input).
+            self.publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
+                .await;
             message_persisted = true;
         }
         // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
@@ -2755,8 +2773,12 @@ impl Services {
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(message) => {
                     self.invalidate_agent_list_cache(workspace_id);
+                    // Same persisted-row event pair as the prompt-turn flush
+                    // (§6.5); wake turns carry no turn correlation id.
+                    self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                        .await;
                     message_persisted = true;
                 }
                 Err(e) => {

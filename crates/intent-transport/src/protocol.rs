@@ -189,8 +189,17 @@
 //! of the `projection: "slim"` conversation read — `{ block }`, resolving
 //! persisted assistant ids and serve-time synthetic `{messageId}:{index}`
 //! ids alike (unknown message/block id is `-32602` naming the id; unknown
-//! agent or workspace mismatch is not-found) — 294 router methods, 333
-//! total. Version 7.3 adds
+//! agent or workspace mismatch is not-found); the
+//! `agent:last-message` event (additive; §6.5): the content-bearing
+//! companion emitted alongside EVERY `agent:message` — the id-only echo
+//! enriched with the persisted preview projections the write just computed
+//! (`lastMessageRole`/`lastMessageId` plus `lastAgentResponse` /
+//! `lastUserMessage` / `lastToolUse` on user/assistant rows) — and the
+//! additive `AgentLite.lastToolUse` field (§5.5): the newest
+//! user/assistant message's LAST `tool_use` block preview
+//! (`{ name, input?, inputTruncated?, inputBytes? }`, input bounded by the
+//! §5.5 slim budget), denormalized at message-write time
+//! (migration 0098) — 294 router methods, 333 total. Version 7.3 adds
 //! the execution-environment surface (additive; §5.35, §5.1, §5.5b): the
 //! `sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
 //! `sandbox.image.check` router methods, the

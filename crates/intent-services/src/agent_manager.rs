@@ -5422,12 +5422,7 @@ impl AgentManager {
         // agent:message / agent:stream:* events follow"). Mirrors the
         // queue-drain (`persist_user`) and wake-delivery emits.
         self.services
-            .publish_agent_mutation_event(
-                &workspace_id,
-                &agent_id,
-                intent_core::events::AGENT_MESSAGE,
-                crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
-            )
+            .publish_agent_message_events(&workspace_id, &agent_id, &message, Some(&turn_id))
             .await;
         // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
         // `question_answers` naming the marked assistant message resolves the
@@ -5894,15 +5889,11 @@ impl AgentManager {
             // Emit `agent:message` (role=user) with the persisted row id,
             // mirroring the `send_message` direct-send branch (§5.5).
             self.services
-                .publish_agent_mutation_event(
+                .publish_agent_message_events(
                     &workspace_id,
                     &agent_id,
-                    intent_core::events::AGENT_MESSAGE,
-                    crate::agent_ops::agent_message_event_payload(
-                        &agent_id,
-                        &message,
-                        Some(entry.turn_id.as_str()),
-                    ),
+                    &message,
+                    Some(entry.turn_id.as_str()),
                 )
                 .await;
             // Answer intake (PROTOCOL §5.5, question hold): an answer that was
@@ -6825,12 +6816,7 @@ impl AgentManager {
                 Ok(message) => {
                     self.services.invalidate_agent_list_cache(workspace_id);
                     self.services
-                        .publish_agent_mutation_event(
-                            workspace_id,
-                            agent_id,
-                            intent_core::events::AGENT_MESSAGE,
-                            crate::agent_ops::agent_message_event_payload(agent_id, &message, None),
-                        )
+                        .publish_agent_message_events(workspace_id, agent_id, &message, None)
                         .await;
                 }
                 Err(e) => {
@@ -9676,12 +9662,7 @@ async fn persist_user(
             .schedule_last_activity_event(workspace_id.clone());
     }
     mgr.services
-        .publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            intent_core::events::AGENT_MESSAGE,
-            crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
-        )
+        .publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
         .await;
     // Answer intake (PROTOCOL §5.5, question hold): same contract as the
     // direct-send persist — a `question_answers` tag naming the marked
@@ -10214,12 +10195,7 @@ async fn publish_error_status_and_requeue(
             Ok(message) => {
                 mgr.services.invalidate_agent_list_cache(workspace_id);
                 mgr.services
-                    .publish_agent_mutation_event(
-                        workspace_id,
-                        agent_id,
-                        intent_core::events::AGENT_MESSAGE,
-                        json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
-                    )
+                    .publish_agent_message_events(workspace_id, agent_id, &message, None)
                     .await;
             }
             Err(e) => {

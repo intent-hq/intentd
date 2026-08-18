@@ -27,6 +27,14 @@ pub const AGENT_COMPLETED: &str = "agent:completed";
 pub const AGENT_FAILED: &str = "agent:failed";
 pub const AGENT_TOOL_CALL: &str = "agent:tool:call";
 pub const AGENT_MESSAGE: &str = "agent:message";
+// Content-bearing companion to the id-only `agent:message` echo (§6.5):
+// emitted alongside EVERY `agent:message`, carrying the persisted preview
+// projections the write just computed — `{ agentId, messageId, role,
+// appMessageId?, turnId?, lastMessageRole?, lastMessageId?,
+// lastAgentResponse?, lastUserMessage?, lastToolUse? }` — so clients update
+// agent-card previews with zero follow-up RPCs. `agent:message` stays the
+// lean back-compat echo.
+pub const AGENT_LAST_MESSAGE: &str = "agent:last-message";
 
 // Agent interaction events (agent-to-agent communication).
 pub const AGENT_CREATED: &str = "agent:created";
@@ -481,6 +489,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_FAILED,
     AGENT_TOOL_CALL,
     AGENT_MESSAGE,
+    AGENT_LAST_MESSAGE,
     AGENT_CREATED,
     AGENT_DELETED,
     AGENT_DELETE_SCHEDULED,

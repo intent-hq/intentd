@@ -8080,6 +8080,7 @@ mod wsapi4_bindings_tests {
             last_user_message: None,
             last_message_role: None,
             last_message_id: None,
+            last_tool_use: None,
             context_references: None,
             file_blocks: None,
             stop_reason: None,

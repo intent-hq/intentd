@@ -211,6 +211,15 @@ pub struct SessionMessageProjection {
     /// Other roles (system/tool) are transparent. `None` when the session
     /// has no user/assistant message — the wire field is omitted.
     pub last_message_id: Option<String>,
+    /// Preview of the newest user/assistant message's LAST `tool_use` block
+    /// (`{ name, input?, inputTruncated?, inputBytes? }`, the
+    /// [`intent_core::last_tool_use_preview`] shape), served from the
+    /// persisted `agent_session.last_tool_use_preview` column (0098)
+    /// maintained at message-write time. `None` when that message carries no
+    /// `tool_use` block, the session has no user/assistant message, or the
+    /// column is corrupt (degrade-only, like the 0066 previews) — the wire
+    /// field is omitted.
+    pub last_tool_use: Option<serde_json::Value>,
 }
 
 /// Per-block character cap applied inside SQLite when extracting projection
@@ -265,6 +274,38 @@ fn preview_col_value(role: &str, content: &serde_json::Value) -> Result<String> 
         .map_err(|e| Error::Internal(format!("encode message preview failed: {e}")))
 }
 
+/// TEXT column value for the `last_tool_use_preview` column (0098): the
+/// JSON-encoded [`intent_core::last_tool_use_preview`] of the message
+/// content, `None` (NULL) when the content carries no `tool_use` block —
+/// a user/assistant append always overwrites the column (it IS the newest
+/// user/assistant message), so NULL actively clears a stale preview.
+fn last_tool_use_col_value(content: &serde_json::Value) -> Result<Option<String>> {
+    intent_core::last_tool_use_preview(content)
+        .map(|preview| {
+            serde_json::to_string(&preview)
+                .map_err(|e| Error::Internal(format!("encode last tool use preview failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the persisted `last_tool_use_preview` column (0098): NULL stays
+/// `None`; a corrupt value degrades to `None` (with a warning) like
+/// [`decode_preview_col`] — no repair is attempted; the column converges the
+/// next time a user/assistant message is appended.
+fn decode_last_tool_use_col(raw: Option<String>) -> Option<serde_json::Value> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(preview) => Some(preview),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "corrupt agent_session last_tool_use_preview column; degrading to None"
+            );
+            None
+        }
+    }
+}
+
 /// Decode a persisted preview column back into the projection's block vec:
 /// NULL stays `None`, non-NULL is the JSON string array written by
 /// [`preview_col_value`] or the 0066 backfill. A corrupt value degrades to
@@ -286,36 +327,51 @@ fn decode_preview_col(raw: Option<String>) -> Option<Vec<String>> {
 }
 
 /// Preview column values `(last_assistant_preview, last_user_preview,
-/// last_message_role)` for a whole message batch written in seq order: the
+/// last_message_role, last_tool_use_preview)` for a whole message batch
+/// written in seq order: the
 /// projection of the LAST message of each role wins (a non-array winner
 /// stores `"[]"`, the projection form), `None` when the batch has no message
 /// of that role — matching the newest-row window query.
 /// `last_message_role` is the role of the batch's LAST user/assistant
-/// message (0070); other roles are transparent. The batch insert loops track
+/// message (0070); other roles are transparent, as they are for
+/// `last_tool_use_preview` (0098, derived from that same newest
+/// user/assistant message's content). The batch insert loops track
 /// `last_message_id` (0088) inline with the same newest-user/assistant
 /// definition (ids are minted in-loop) — keep the two in sync if the
 /// transparent-role set ever changes.
 type OwnedBatchMessage = (String, serde_json::Value, Option<serde_json::Value>, String);
-fn batch_preview_col_values(
-    messages: &[OwnedBatchMessage],
-) -> Result<(Option<String>, Option<String>, Option<String>)> {
+type BatchPreviewColValues = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+fn batch_preview_col_values(messages: &[OwnedBatchMessage]) -> Result<BatchPreviewColValues> {
     let mut assistant_preview = None;
     let mut user_preview = None;
     let mut last_message_role = None;
+    let mut last_tool_use = None;
     for (role, content, _, _) in messages {
         match role.as_str() {
             "assistant" => {
                 assistant_preview = Some(preview_col_value(role, content)?);
                 last_message_role = Some(role.clone());
+                last_tool_use = last_tool_use_col_value(content)?;
             }
             "user" => {
                 user_preview = Some(preview_col_value(role, content)?);
                 last_message_role = Some(role.clone());
+                last_tool_use = last_tool_use_col_value(content)?;
             }
             _ => {}
         }
     }
-    Ok((assistant_preview, user_preview, last_message_role))
+    Ok((
+        assistant_preview,
+        user_preview,
+        last_message_role,
+        last_tool_use,
+    ))
 }
 
 /// Encode an optional JSON payload column (`context_references` /
@@ -534,16 +590,18 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
             }
-            let (assistant_preview, user_preview, last_message_role) =
+            let (assistant_preview, user_preview, last_message_role, last_tool_use) =
                 batch_preview_col_values(&owned_messages)?;
             sqlx::query(
                 "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, \
-                 last_message_role = ?, last_message_id = ? WHERE id = ?",
+                 last_message_role = ?, last_message_id = ?, last_tool_use_preview = ? \
+                 WHERE id = ?",
             )
             .bind(assistant_preview.as_deref())
             .bind(user_preview.as_deref())
             .bind(last_message_role.as_deref())
             .bind(last_message_id.as_deref())
+            .bind(last_tool_use.as_deref())
             .bind(&s.id.0)
             .execute(&mut *tx)
             .await
@@ -796,7 +854,7 @@ impl Store {
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
         let sql = "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
             s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
-            s.last_message_id \
+            s.last_message_id, s.last_tool_use_preview \
             FROM agent_session s \
             LEFT JOIN agent_message m ON m.agent_id = s.id \
             WHERE s.workspace_id = ? \
@@ -820,6 +878,7 @@ impl Store {
                     last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
                     last_message_role: row.get("last_message_role"),
                     last_message_id: row.get("last_message_id"),
+                    last_tool_use: decode_last_tool_use_col(row.get("last_tool_use_preview")),
                 },
             );
         }
@@ -837,7 +896,7 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<SessionMessageProjection> {
         let sql = "SELECT s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
-            s.last_message_id, \
+            s.last_message_id, s.last_tool_use_preview, \
             (SELECT COUNT(*) FROM agent_message m WHERE m.agent_id = s.id) AS message_count \
             FROM agent_session s WHERE s.id = ?";
         let Some(row) = sqlx::query(sql)
@@ -855,6 +914,7 @@ impl Store {
             last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
             last_message_role: row.get("last_message_role"),
             last_message_id: row.get("last_message_id"),
+            last_tool_use: decode_last_tool_use_col(row.get("last_tool_use_preview")),
         })
     }
 
@@ -2357,6 +2417,14 @@ impl Store {
             "user" => Some(("last_user_preview", preview_col_value(role, content)?)),
             _ => None,
         };
+        // 0098: the newest user/assistant message's lastToolUse preview —
+        // NULL actively clears a stale preview when this newest message
+        // carries no tool_use block. Only computed alongside a preview
+        // update (system/tool rows are transparent).
+        let last_tool_use = match &preview_update {
+            Some(_) => last_tool_use_col_value(content)?,
+            None => None,
+        };
         // Awaited before any write transaction below opens: thumbnail
         // generation is CPU-bound image work and runs on a blocking thread.
         let thumbnails_json = thumbnails_col_value(content).await;
@@ -2381,12 +2449,13 @@ impl Store {
             Some((column, value)) => {
                 let pool = self.write_pool();
                 // A user/assistant append is by construction the session's
-                // newest message of any role, so `last_message_role` (0070)
-                // and `last_message_id` (0088) are overwritten unconditionally
-                // alongside the preview.
+                // newest message of any role, so `last_message_role` (0070),
+                // `last_message_id` (0088), and `last_tool_use_preview`
+                // (0098) are overwritten unconditionally alongside the
+                // preview.
                 let update_sql = format!(
                     "UPDATE agent_session SET {column} = ?, last_message_role = ?, \
-                     last_message_id = ? WHERE id = ?"
+                     last_message_id = ?, last_tool_use_preview = ? WHERE id = ?"
                 );
                 crate::with_write_txn_retry(|| async {
                     let mut tx = pool.begin().await.map_err(|e| {
@@ -2410,6 +2479,7 @@ impl Store {
                         .bind(value.as_str())
                         .bind(role)
                         .bind(id)
+                        .bind(last_tool_use.as_deref())
                         .bind(&agent_id.0)
                         .execute(&mut *tx)
                         .await
@@ -2688,7 +2758,7 @@ impl Store {
                     )
                 })
                 .collect();
-        let (assistant_preview, user_preview, last_message_role) =
+        let (assistant_preview, user_preview, last_message_role, last_tool_use) =
             batch_preview_col_values(&owned_messages)?;
         // Thumbnail generation (CPU-bound image work) runs BEFORE the write
         // transaction opens — never inside it or the retry closure.
@@ -2753,12 +2823,14 @@ impl Store {
             }
             sqlx::query(
                 "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, \
-                 last_message_role = ?, last_message_id = ? WHERE id = ?",
+                 last_message_role = ?, last_message_id = ?, last_tool_use_preview = ? \
+                 WHERE id = ?",
             )
             .bind(assistant_preview.as_deref())
             .bind(user_preview.as_deref())
             .bind(last_message_role.as_deref())
             .bind(last_message_id.as_deref())
+            .bind(last_tool_use.as_deref())
             .bind(&agent_id.0)
             .execute(&mut *tx)
             .await
@@ -7545,6 +7617,322 @@ mod tests {
             Some(converge.id),
             "column converges on next append"
         );
+    }
+
+    /// Raw `last_tool_use_preview` column value for a session (0098),
+    /// decoded as JSON.
+    async fn read_tool_use_column(store: &Store, agent_id: &AgentId) -> Option<serde_json::Value> {
+        let raw: Option<String> =
+            sqlx::query("SELECT last_tool_use_preview FROM agent_session WHERE id = ?")
+                .bind(&agent_id.0)
+                .fetch_one(store.read_pool())
+                .await
+                .expect("read tool use column")
+                .get("last_tool_use_preview");
+        raw.map(|s| serde_json::from_str(&s).expect("column is valid JSON"))
+    }
+
+    /// `last_tool_use_preview` (0098) is maintained at message-write time:
+    /// a user/assistant append stamps the row's last tool_use block preview
+    /// (NULL actively clears when the row carries no tool_use), system/tool
+    /// appends are transparent, an over-budget input is capped with the
+    /// additive truncation flags, and `replace_agent_messages` recomputes
+    /// from the batch. Both projection read paths serve the column.
+    #[tokio::test]
+    async fn last_tool_use_preview_maintained_on_writes() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-tooluse-writes".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-tooluse-writes".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        assert_eq!(
+            read_tool_use_column(&store, &agent_id).await,
+            None,
+            "fresh session has NULL preview"
+        );
+
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+        store
+            .append_agent_message(&agent_id, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        assert_eq!(
+            read_tool_use_column(&store, &agent_id).await,
+            None,
+            "text-only row keeps NULL"
+        );
+
+        // Assistant row with two tool_use blocks: the LAST one wins, small
+        // input passes through whole (no flags).
+        let with_tools = serde_json::json!([
+            {"type": "tool_use", "id": "m:0", "name": "first", "input": {"a": 1}, "toolCallId": "tc-0"},
+            {"type": "text", "text": "between"},
+            {"type": "tool_use", "id": "m:2", "name": "view", "input": {"path": "/tmp/f"}, "toolCallId": "tc-2"},
+        ]);
+        store
+            .append_agent_message(&agent_id, "assistant", &with_tools, &ts)
+            .await
+            .expect("append assistant with tools");
+        assert_eq!(
+            read_tool_use_column(&store, &agent_id).await,
+            Some(serde_json::json!({"name": "view", "input": {"path": "/tmp/f"}})),
+            "last tool_use block wins, small input whole, no flags"
+        );
+
+        // System/tool appends are transparent.
+        for role in ["system", "tool"] {
+            store
+                .append_agent_message(&agent_id, role, &text("noise"), &ts)
+                .await
+                .expect("append transparent role");
+        }
+        assert!(
+            read_tool_use_column(&store, &agent_id).await.is_some(),
+            "system/tool appends leave the preview untouched"
+        );
+
+        // A newer user/assistant row WITHOUT a tool_use actively clears.
+        store
+            .append_agent_message(&agent_id, "assistant", &text("plain"), &ts)
+            .await
+            .expect("append plain assistant");
+        assert_eq!(
+            read_tool_use_column(&store, &agent_id).await,
+            None,
+            "tool-less user/assistant row clears the preview"
+        );
+
+        // Over-budget input is capped with the additive flags; the small
+        // scalar keys classifyTool reads survive the giant sibling.
+        let big = serde_json::json!([{
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": {
+                "path": "/tmp/big.txt",
+                "content": "x".repeat(intent_core::SLIM_PROJECTION_BUDGET_BYTES * 4),
+            },
+            "toolCallId": "tc-big",
+        }]);
+        store
+            .append_agent_message(&agent_id, "assistant", &big, &ts)
+            .await
+            .expect("append oversized tool input");
+        let preview = read_tool_use_column(&store, &agent_id)
+            .await
+            .expect("preview present");
+        assert_eq!(preview["name"], "write_file");
+        assert_eq!(preview["inputTruncated"], true);
+        assert!(preview["inputBytes"].as_u64().unwrap() > 0);
+        assert_eq!(preview["input"]["path"], "/tmp/big.txt");
+        let capped = preview["input"]["content"].as_str().unwrap();
+        assert!(capped.len() < intent_core::SLIM_PROJECTION_BUDGET_BYTES * 4);
+
+        // Replace recomputes from the batch (newest user/assistant wins,
+        // trailing system rows transparent), and an empty batch clears.
+        let tool_row = serde_json::json!([
+            {"type": "tool_use", "id": "m:0", "name": "grep", "input": {"q": "x"}, "toolCallId": "tc-r"},
+        ]);
+        let batch = vec![
+            ReplaceMessage {
+                role: "assistant",
+                content: &tool_row,
+                metadata: None,
+                created_at: &ts,
+            },
+            ReplaceMessage {
+                role: "user",
+                content: &tool_row,
+                metadata: None,
+                created_at: &ts,
+            },
+            ReplaceMessage {
+                role: "system",
+                content: &tool_row,
+                metadata: None,
+                created_at: &ts,
+            },
+        ];
+        store
+            .replace_agent_messages(&agent_id, &batch)
+            .await
+            .expect("replace");
+        assert_eq!(
+            read_tool_use_column(&store, &agent_id).await,
+            Some(serde_json::json!({"name": "grep", "input": {"q": "x"}})),
+            "replace stamps the batch's newest user/assistant row's preview"
+        );
+        store
+            .replace_agent_messages(&agent_id, &[])
+            .await
+            .expect("replace empty");
+        assert_eq!(read_tool_use_column(&store, &agent_id).await, None);
+
+        // Both projection read paths serve the column; a corrupt value
+        // degrades to None without repair.
+        store
+            .append_agent_message(&agent_id, "assistant", &tool_row, &ts)
+            .await
+            .expect("re-append tool row");
+        let per_session = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("per-session projection");
+        assert_eq!(
+            per_session.last_tool_use,
+            Some(serde_json::json!({"name": "grep", "input": {"q": "x"}}))
+        );
+        let workspace = store
+            .get_agent_session_message_projections(&ws_id)
+            .await
+            .expect("workspace projections");
+        assert_eq!(
+            workspace
+                .get(&agent_id.0)
+                .and_then(|p| p.last_tool_use.clone()),
+            Some(serde_json::json!({"name": "grep", "input": {"q": "x"}}))
+        );
+        sqlx::query("UPDATE agent_session SET last_tool_use_preview = '{corrupt' WHERE id = ?")
+            .bind(&agent_id.0)
+            .execute(store.write_pool())
+            .await
+            .expect("corrupt column");
+        let degraded = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("read survives corrupt column");
+        assert_eq!(
+            degraded.last_tool_use, None,
+            "corrupt column degrades to None without repair"
+        );
+    }
+
+    /// The 0098 migration backfill stamps `last_tool_use_preview` from the
+    /// newest user/assistant row's LAST tool_use block: a small input is
+    /// stored whole, an over-budget input stores only the truncation flags
+    /// (the SQL backfill's one bounded divergence from the Rust write path),
+    /// and tool-less / empty transcripts stay NULL.
+    #[tokio::test]
+    async fn last_tool_use_preview_backfill() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-tooluse-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        let with_tool = AgentId("agent-bf-tool".to_string());
+        let big_tool = AgentId("agent-bf-big".to_string());
+        let boundary = AgentId("agent-bf-boundary".to_string());
+        let no_tool = AgentId("agent-bf-plain".to_string());
+        let empty = AgentId("agent-bf-empty".to_string());
+        for id in [&with_tool, &big_tool, &boundary, &no_tool, &empty] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+        store
+            .append_agent_message(
+                &with_tool,
+                "assistant",
+                &serde_json::json!([
+                    {"type": "tool_use", "id": "m:0", "name": "old", "input": {}, "toolCallId": "t0"},
+                    {"type": "tool_use", "id": "m:1", "name": "view", "input": {"path": "/x"}, "toolCallId": "t1"},
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append tool row");
+        store
+            .append_agent_message(&with_tool, "system", &text("tail"), &ts)
+            .await
+            .expect("append system tail");
+        store
+            .append_agent_message(
+                &big_tool,
+                "assistant",
+                &serde_json::json!([{
+                    "type": "tool_use", "id": "m:0", "name": "write_file",
+                    "input": {"content": "x".repeat(intent_core::SLIM_PROJECTION_BUDGET_BYTES * 4)},
+                    "toolCallId": "tb",
+                }]),
+                &ts,
+            )
+            .await
+            .expect("append big tool row");
+        // Exactly-at-budget STRING input: the Rust write path measures a
+        // string body by its raw byte length (`slim_body_size`), so this row
+        // must backfill whole — measuring the JSON form (`->`) would count
+        // the surrounding quotes and flag it truncated (off-by-two).
+        let boundary_str = "y".repeat(intent_core::SLIM_PROJECTION_BUDGET_BYTES);
+        store
+            .append_agent_message(
+                &boundary,
+                "assistant",
+                &serde_json::json!([{
+                    "type": "tool_use", "id": "m:0", "name": "bash",
+                    "input": boundary_str,
+                    "toolCallId": "ty",
+                }]),
+                &ts,
+            )
+            .await
+            .expect("append boundary tool row");
+        store
+            .append_agent_message(&no_tool, "assistant", &text("plain"), &ts)
+            .await
+            .expect("append plain row");
+
+        // Recreate the pre-0098 shape and re-run the migration verbatim.
+        sqlx::query("ALTER TABLE agent_session DROP COLUMN last_tool_use_preview")
+            .execute(store.write_pool())
+            .await
+            .expect("drop column");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0098_agent_session_last_tool_use_preview.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0098 migration");
+
+        assert_eq!(
+            read_tool_use_column(&store, &with_tool).await,
+            Some(serde_json::json!({"name": "view", "input": {"path": "/x"}})),
+            "backfill stamps the last tool_use of the newest user/assistant row (system tail transparent)"
+        );
+        let big = read_tool_use_column(&store, &big_tool)
+            .await
+            .expect("big preview present");
+        assert_eq!(big["name"], "write_file");
+        assert_eq!(big["inputTruncated"], true);
+        assert!(big["inputBytes"].as_u64().unwrap() > 0);
+        assert!(
+            big.get("input").is_none(),
+            "SQL backfill stores flags only for over-budget inputs"
+        );
+        assert_eq!(
+            read_tool_use_column(&store, &boundary).await,
+            Some(serde_json::json!({"name": "bash", "input": boundary_str})),
+            "an exactly-at-budget string input backfills whole — the SQL size \
+             accounting matches slim_body_size (raw bytes, not quoted JSON)"
+        );
+        assert_eq!(read_tool_use_column(&store, &no_tool).await, None);
+        assert_eq!(read_tool_use_column(&store, &empty).await, None);
     }
 
     /// A corrupt (non-JSON) preview column value never fails the projection

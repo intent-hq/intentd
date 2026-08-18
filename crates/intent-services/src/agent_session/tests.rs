@@ -792,10 +792,12 @@ async fn prompt_turn_streams_events_and_accumulates() {
             "agent:stream:activity",
             "chat:stream:delta",
             "agent:tool:call",
+            "agent:message",
+            "agent:last-message",
             "agent:stream:end",
             "agent:idle",
         ],
-        "a normal turn emits the `prompt` status hint before the first chunk, the leading-edge activity signal on the first chunk, and exactly one agent:idle after the terminal stream:end"
+        "a normal turn emits the `prompt` status hint before the first chunk, the leading-edge activity signal on the first chunk, the persisted-row event pair after the flush, and exactly one agent:idle after the terminal stream:end"
     );
 
     // The activity signal carries identifiers plus the server-derived live
@@ -1344,7 +1346,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let mut events = Vec::new();
-    while events.len() < 7 {
+    while events.len() < 9 {
         let batch = timeout(Duration::from_secs(2), sub.recv())
             .await
             .expect("recv timed out")
@@ -1360,6 +1362,8 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
             "agent:stream:activity",
             "chat:stream:delta",
             "agent:tool:call",
+            "agent:message",
+            "agent:last-message",
             "agent:stream:end",
             "agent:idle",
         ],
@@ -2857,10 +2861,12 @@ async fn post_output_transport_death_keeps_terminal_events() {
             "agent:stream:status",
             "chat:stream:delta",
             "agent:stream:activity",
+            "agent:message",
+            "agent:last-message",
             "agent:stream:end",
             "agent:failed",
         ],
-        "post-output transport death keeps the terminal pair and ordering"
+        "post-output transport death keeps the terminal pair and ordering (the flushed partial row emits the persisted-row event pair)"
     );
     // The streamed partial persists as the turn's assistant row.
     let messages = bus
@@ -3627,9 +3633,11 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
             "agent:stream:status",
             "chat:stream:delta",
             "agent:stream:activity",
+            "agent:message",
+            "agent:last-message",
             "agent:stream:end"
         ],
-        "partial streams, normal stream:end, no agent:failed / agent:idle"
+        "partial streams, persisted-row event pair on the flush, normal stream:end, no agent:failed / agent:idle"
     );
     // The partial persists as the turn's assistant row (interrupt-flush
     // semantics) and the stream:end advertises it.
