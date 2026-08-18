@@ -124,7 +124,9 @@ enum CacheFrame {
 /// has been seen the ensure is a warm-cache refresh, and subsequent
 /// `CloneChunk`s (the refresh's `git fetch --progress` stderr) map into the
 /// fetch→reset band via [`refresh_fetch_percent`], labeled `cache` so the
-/// stream stays cache-phased.
+/// stream stays cache-phased. `Step("re-clone")` (the ensure escalated to a
+/// wipe + from-scratch clone) reverts to the raw clone mapping with a fresh
+/// clone parser, since the chunks that follow are a new clone's stderr.
 struct CacheEnsurePump {
     // One parser per stream shape: the ensure clone/fetch is
     // superproject-shaped; the refresh submodule update is
@@ -176,11 +178,26 @@ impl CacheEnsurePump {
                 if step == "fetch" {
                     self.refresh_fetch = true;
                 }
+                if step == "re-clone" {
+                    // The cache was wiped: subsequent CloneChunks are a
+                    // from-scratch clone, so drop the refresh-fetch band
+                    // mapping and start a fresh parser for the new stream.
+                    // The milestone sits at the cache band floor — the
+                    // reporter's monotonic clamp keeps any higher percent
+                    // already reached (only the message changes).
+                    self.refresh_fetch = false;
+                    self.clone_parser = crate::clone_ops::SubmoduleAwareParser::for_clone();
+                }
                 let (phase, pct, msg) = match step {
                     "fetch" => (
                         "cache",
                         CACHE_REFRESH_FETCH_LO,
                         "Refreshing repository cache...",
+                    ),
+                    "re-clone" => (
+                        "cache",
+                        CACHE_REFRESH_FETCH_LO,
+                        "Rebuilding repository cache...",
                     ),
                     "reset" => ("cache", CACHE_REFRESH_FETCH_HI, "Updating cache branch..."),
                     "submodule-sync" => (
@@ -577,6 +594,41 @@ mod tests {
                 assert_eq!(msg, "Updating cache branch...");
             }
             _ => panic!("Step(reset) must emit exactly one milestone frame"),
+        }
+    }
+
+    #[test]
+    fn cache_pump_reclone_resets_to_full_clone_mapping() {
+        // Step("fetch") → Step("re-clone"): the escalation must emit the
+        // rebuild milestone and revert subsequent CloneChunks to the raw
+        // full-clone mapping (fresh parser), not the refresh-fetch band.
+        let mut pump = CacheEnsurePump::new();
+        pump.handle(Ev::Step("fetch"));
+        pump.handle(Ev::CloneChunk(
+            "Receiving objects:  80% (80/100)\r".to_string(),
+        ));
+        let frames = pump.handle(Ev::Step("re-clone"));
+        match frames.as_slice() {
+            [CacheFrame::Milestone(phase, pct, msg)] => {
+                assert_eq!(*phase, "cache");
+                assert_eq!(*pct, CACHE_REFRESH_FETCH_LO);
+                assert_eq!(msg, "Rebuilding repository cache...");
+            }
+            _ => panic!("Step(re-clone) must emit exactly one milestone frame"),
+        }
+        let frames = pump.handle(Ev::CloneChunk(
+            "Receiving objects:  42% (42/100)\r".to_string(),
+        ));
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            CacheFrame::Clone(phase, pct, msg) => {
+                assert_eq!(*phase, "receiving");
+                assert_eq!(*pct, 42);
+                assert_eq!(msg, "Receiving objects: 42%");
+            }
+            CacheFrame::Milestone(..) => {
+                panic!("post-re-clone chunks must map as raw Clone frames")
+            }
         }
     }
 

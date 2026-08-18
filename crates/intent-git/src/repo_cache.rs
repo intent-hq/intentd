@@ -68,6 +68,9 @@ pub enum CacheEnsureEvent {
     /// A named refresh step boundary: `fetch`, `reset`, `submodule-sync`,
     /// `submodule-update`, or `clean`. Emitted before the step runs so a
     /// warm-cache refresh shows movement even when the steps stream nothing.
+    /// `re-clone` marks the escalation of an existing cache (refresh failure
+    /// or origin mismatch) to a wipe + from-scratch clone — the `CloneChunk`s
+    /// that follow it belong to that clone, not the refresh fetch.
     Step(&'static str),
 }
 
@@ -174,6 +177,11 @@ fn ensure_blocking(
                 "repo cache origin does not match the requested URL; re-cloning"
             );
         }
+        // A cache existed but cannot be reused (refresh failure or origin
+        // mismatch): signal the escalation before the wipe + clone so a
+        // progress listener can relabel the stream. Not emitted on the plain
+        // cache-miss path below.
+        emit(progress, CacheEnsureEvent::Step("re-clone"));
     }
     remove_cache_path(cache_path)?;
     clone(github_url, cache_path, token, progress)
@@ -2244,6 +2252,104 @@ mod tests {
             "sub one\n"
         );
         assert_eq!(head_sha(&path.join("sub")), head_sha(child.path()));
+    }
+
+    /// A failed refresh that escalates to wipe + re-clone emits
+    /// `Step("re-clone")` after the refresh's step boundaries and before the
+    /// re-clone's own `CloneChunk`s, so a progress listener can relabel the
+    /// stream.
+    #[tokio::test]
+    async fn escalated_refresh_emits_reclone_step_before_clone_chunks() {
+        allow_file_submodules();
+        let (origin, _child) = submodule_fixture("repocache-reclone-step");
+        let root = CacheRoot::new("reclonestep");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+        // Break the submodule so the refresh fails and escalates to re-clone.
+        let gitfile = path.join("sub").join(".git");
+        std::fs::remove_file(&gitfile).unwrap();
+        std::fs::write(&gitfile, "not a gitfile").unwrap();
+
+        let (cb, events) = event_collector();
+        ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
+            .await
+            .unwrap();
+        assert!(!marker.exists(), "the escalation must have re-cloned");
+
+        let events = events.lock().unwrap();
+        let reclone_idx = events
+            .iter()
+            .position(|ev| matches!(ev, CacheEnsureEvent::Step("re-clone")))
+            .expect("escalation must emit Step(\"re-clone\")");
+        let steps_before: Vec<&str> = events[..reclone_idx]
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::Step(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            steps_before.contains(&"fetch"),
+            "the failed refresh ran before the escalation: {steps_before:?}"
+        );
+        let clone_boundary = events
+            .iter()
+            .position(|ev| {
+                matches!(ev, CacheEnsureEvent::CloneChunk(text) if text.contains("Cloning into"))
+            })
+            .expect("the re-clone streams CloneChunks");
+        assert!(
+            reclone_idx < clone_boundary,
+            "Step(\"re-clone\") at {reclone_idx} must precede the clone's chunks at {clone_boundary}"
+        );
+    }
+
+    /// The `re-clone` escalation with no reporter attached behaves exactly as
+    /// before — the event is additive and its emission is a no-op when no one
+    /// is listening.
+    #[tokio::test]
+    async fn escalated_refresh_without_reporter_still_self_heals() {
+        let origin_a = init_repo("repocache-reclone-noop-a");
+        commit_file(origin_a.path(), "a.txt", "host A\n");
+        let origin_b = init_repo("repocache-reclone-noop-b");
+        commit_file(origin_b.path(), "b.txt", "host B\n");
+        let root = CacheRoot::new("reclonenoop");
+
+        let path = ensure_cached_repo(
+            root.path(),
+            &file_url(origin_a.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        // Origin mismatch escalates to re-clone; progress stays None.
+        let path2 = ensure_cached_repo_with_progress(
+            root.path(),
+            &file_url(origin_b.path()),
+            "acme",
+            "widget",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(!marker.exists(), "the escalation must have re-cloned");
+        assert_eq!(
+            std::fs::read_to_string(path.join("b.txt")).unwrap(),
+            "host B\n"
+        );
     }
 
     /// Every value in the given repo config file, so a test can assert no
