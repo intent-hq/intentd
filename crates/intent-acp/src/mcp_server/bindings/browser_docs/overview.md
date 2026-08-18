@@ -3,6 +3,18 @@
 The browser API gives you programmatic access to embedded browser tabs via Chrome DevTools Protocol.
 Actions are executed as a sequence of declarative operations.
 
+## Reuse Tabs by URL
+
+Use one tab per URL by default. Before `openTab`, call `listTabs`. If an agent- or
+user-opened tab already has the target URL, call `focusTab` with its `tabId` and operate
+on that tab instead of opening another. Use `openTab` only when no tab has the target
+URL, or when the user explicitly asks for another tab, side-by-side view, or second
+instance of the page.
+
+A different URL may open in a new tab. Do not navigate an existing tab away from its
+current URL merely to avoid opening a tab for a different URL. Do not close user-opened
+tabs; leave extra tabs the user created in place.
+
 ## Basic Actions
 - `{ action: "listTabs" }` - List all browser tabs
 - `{ action: "getAccessibilityTree", tabId? }` - Get page structure as YAML
