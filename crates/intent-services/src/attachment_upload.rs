@@ -643,7 +643,11 @@ fn assemble_and_verify(
              still be being written; wait for the chunk call to return, then retry the commit"
         )));
     }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if actual != declared_sha256 {
         return Err(Error::InvalidParams(format!(
             "attachment checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
@@ -682,7 +686,10 @@ mod tests {
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", sha2::Sha256::digest(bytes))
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// One in-process service stack with a seeded workspace whose checkout

@@ -1057,7 +1057,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519",
  "serde",
- "sha2",
+ "sha2 0.10.9",
  "subtle",
  "zeroize",
 ]
@@ -2107,7 +2107,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "agent-client-protocol",
  "ctor",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2165,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "git2",
  "intent-core",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "intent-providers"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "ctor",
  "intent-core",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "globset",
  "grep",
@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2282,7 +2282,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
+ "sha2 0.11.0",
  "similar",
  "sqlx",
  "sysinfo",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "intent-store"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "base64 0.23.1",
  "image",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "intent-transport"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "base64 0.23.1",
  "ctor",
@@ -2350,7 +2350,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
  "time",
@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.7.21"
+version = "0.7.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2413,7 +2413,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
+ "sha2 0.11.0",
  "sqlx",
  "sysinfo",
  "tempfile",
@@ -2439,7 +2439,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.0",
  "tar",
  "tempfile",
  "thiserror 2.0.20",
@@ -2507,7 +2507,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "signature",
  "simple_asn1",
  "zeroize",
@@ -3080,7 +3080,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "primeorder",
- "sha2",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -3092,7 +3092,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "primeorder",
- "sha2",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -4140,6 +4140,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4337,7 +4348,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "thiserror 2.0.20",
  "tokio",
@@ -4375,7 +4386,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "sqlx-core",
  "sqlx-mysql",
  "sqlx-postgres",
@@ -4419,7 +4430,7 @@ dependencies = [
  "rsa",
  "serde",
  "sha1 0.10.6",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "sqlx-core",
  "stringprep",
@@ -4457,7 +4468,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "sqlx-core",
  "stringprep",
