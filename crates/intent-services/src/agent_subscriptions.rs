@@ -1402,7 +1402,7 @@ impl Services {
         call_site: WatchReconcileCallSite,
     ) {
         use intent_core::AgentStatus;
-        let (event_type, event_ws, status_value, completion_report, stop_reason) =
+        let (event_type, event_ws, status_value, completion_report, stop_reason, agent_name) =
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
@@ -1486,12 +1486,14 @@ impl Services {
                         status,
                         session.completion_report,
                         session.stop_reason,
+                        Some(session.name),
                     )
                 }
                 Err(intent_store::Error::NotFound(_)) => (
                     intent_core::events::AGENT_DELETED,
                     fallback_ws.clone(),
                     serde_json::json!("deleted"),
+                    None,
                     None,
                     None,
                 ),
@@ -1518,6 +1520,13 @@ impl Services {
             if let Some(reason) = &stop_reason {
                 data["error"] = serde_json::Value::String(reason.clone());
             }
+        }
+        // `agentName` enrichment (intent-hq/monorepo#2869): a synthesized
+        // completion carries the same name stamp as the live emits, so wake
+        // subscribers never render the raw agent id. Omitted (never null)
+        // when the session row is gone (NotFound fallback).
+        if let Some(name) = agent_name {
+            data["agentName"] = serde_json::Value::String(name);
         }
         // Idle-visibility: a synthesized idle carries the same
         // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
@@ -1712,6 +1721,7 @@ impl Services {
                         };
                         let mut data = serde_json::json!({
                             "agentId": child_id.0,
+                            "agentName": session.name,
                             "status": serde_json::to_value(session.status).unwrap_or_default(),
                         });
                         if let Some(s) = &stall {
