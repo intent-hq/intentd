@@ -2609,6 +2609,107 @@ async fn sender_auto_subscribe_rearm_suppresses_same_cycle_completion_wake() {
     );
 }
 
+/// Regression (intent-hq/monorepo#2889, PR #1326 review): NO watch exists at
+/// report time — the report wake still delivers unconditionally and must
+/// still record the cycle's identity, so a watch armed only AFTER the report
+/// (fresh interest, `report_delivered` never set) cannot re-deliver the same
+/// cycle's report at settlement. The armed watch stays waiting for a future
+/// completion, which still delivers exactly once.
+#[tokio::test]
+async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // A parented child with NO completion watch (agent_create_op arms none —
+    // unlike delegate, which registers the auto parent→child watch).
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "no watch at report time"
+    );
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // Report with no watch: the wake delivers unconditionally and the marker
+    // records the cycle even though nothing was flipped.
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+
+    // Watch armed only AFTER the report — fresh interest, so the
+    // `report_delivered` flag was never set on it; only the report-time
+    // marker stands between the parent and the duplicate.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("arm");
+    let watches = svc.find_watches_for_child(&child);
+    assert_eq!(watches.len(), 1, "watch armed after the report");
+    assert!(
+        !watches[0].report_delivered,
+        "post-report watch starts with report_delivered unset"
+    );
+
+    // Same-cycle settlement with the identical report: suppressed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "shipped it" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "same-cycle completion wake must not repeat the delivered report"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "suppressed watch stays armed for a future completion"
+    );
+
+    // A FUTURE report cycle (new timestamp) delivers normally, exactly once.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.completion_report = Some("second".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("re-report");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "second" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "a distinct NEW report cycle still delivers"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired at the future completion"
+    );
+}
+
 /// monorepo#2889 guard: a GROUPED child's reportToParent delivers no
 /// immediate wake and must record NO delivery marker — the aggregated
 /// after_all wake is the one report carrier there and keeps today's
