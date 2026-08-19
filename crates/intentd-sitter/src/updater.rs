@@ -389,7 +389,12 @@ impl Updater {
         resp.copy_to(&mut tee).map_err(network)?;
         tee.file.flush()?;
 
-        let actual = format!("{:x}", tee.hasher.finalize());
+        let actual: String = tee
+            .hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let expected = entry.sha256.to_ascii_lowercase();
         if actual != expected {
             let _ = fs::remove_file(dest);

@@ -877,7 +877,12 @@ fn write_archive(
         hasher.update(&buf[..n]);
         size_bytes += n as u64;
     }
-    Ok((archive_path, size_bytes, format!("{:x}", hasher.finalize())))
+    let sha256: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((archive_path, size_bytes, sha256))
 }
 
 #[cfg(test)]
@@ -1084,7 +1089,12 @@ mod tests {
         assert_eq!(archive.len() as u64, size);
         let mut hasher = sha2::Sha256::new();
         hasher.update(&archive);
-        assert_eq!(format!("{:x}", hasher.finalize()), sha);
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(actual, sha);
 
         // Idempotent re-read: same seq, same bytes.
         let again = svc
