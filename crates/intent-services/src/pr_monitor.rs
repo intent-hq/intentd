@@ -228,41 +228,52 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
 /// Fold a workspace's monitor rows into the displayStatus PR signals
 /// (§6.5): an ACTIVE row whose persisted `last_snapshot` shows the PR
 /// open/draft raises `open` — and `ready` when the snapshot says mergeable
-/// and not draft (the same mapping as a linked open PR) — while a COMPLETED
-/// row whose final snapshot shows `merged` raises `merged`. A row with no
-/// snapshot or an unparseable blob contributes nothing (never fails the
-/// derivation), and cancelled rows are excluded by the caller's SQL filter.
-/// An ACTIVE row already showing a terminal snapshot (a poll observed the
-/// merge but lost its guarded terminalize write) contributes nothing —
-/// the next tick re-detects and completes it.
+/// and not draft (the same mapping as a linked open PR) — while the LATEST
+/// (most recently updated) COMPLETED row raises `merged` when its final
+/// snapshot shows `merged` — matching linked-PR step-6 "latest" semantics,
+/// so an older merged monitor never shadows a newer closed-unmerged one.
+/// A row with no snapshot or an unparseable blob contributes nothing
+/// (never fails the derivation), and cancelled rows are excluded by the
+/// caller's SQL filter (which also bounds completed rows to the latest
+/// one). An ACTIVE row already showing a terminal snapshot (a poll
+/// observed the merge but lost its guarded terminalize write) contributes
+/// nothing — the next tick re-detects and completes it.
 pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignals {
     let mut signals = MonitorPrSignals::default();
+    let mut latest_completed: Option<&PrMonitor> = None;
     for m in monitors {
-        let Some(snapshot) = m
-            .last_snapshot
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
-        else {
-            continue;
-        };
-        let req = &snapshot.requirements;
         match m.state {
-            PrMonitorState::Active => match req.state.as_str() {
-                "open" | "draft" => {
+            PrMonitorState::Active => {
+                let Some(snapshot) = m
+                    .last_snapshot
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+                else {
+                    continue;
+                };
+                let req = &snapshot.requirements;
+                if matches!(req.state.as_str(), "open" | "draft") {
                     signals.open = true;
                     if req.mergeable == Some(true) && !req.is_draft {
                         signals.ready = true;
                     }
                 }
-                _ => {}
-            },
+            }
             PrMonitorState::Completed => {
-                if req.state == "merged" {
-                    signals.merged = true;
+                if latest_completed.is_none_or(|prev| m.updated_at > prev.updated_at) {
+                    latest_completed = Some(m);
                 }
             }
             PrMonitorState::Cancelled => {}
         }
+    }
+    if let Some(m) = latest_completed {
+        let merged = m
+            .last_snapshot
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+            .is_some_and(|s| s.requirements.state == "merged");
+        signals.merged = merged;
     }
     signals
 }
@@ -640,11 +651,13 @@ impl Services {
     /// Probe the workspace's agent-monitored PRs for the displayStatus PR
     /// rungs (§6.5, [`MonitorPrSignals`]): ACTIVE monitors whose persisted
     /// `last_snapshot` shows the PR open/draft raise `open` (and `ready`
-    /// when the snapshot says mergeable and not draft); COMPLETED monitors
-    /// whose final snapshot shows the PR merged raise `merged`. Purely
-    /// snapshot-derived — no forge calls — and SQL-filtered to non-cancelled
-    /// rows so the cost stays O(live monitor rows). Best-effort: a store
-    /// read failure is logged and reads as no signals (mirrors
+    /// when the snapshot says mergeable and not draft); the LATEST COMPLETED
+    /// monitor raises `merged` when its final snapshot shows the PR merged.
+    /// Purely snapshot-derived — no forge calls — and SQL-bounded to active
+    /// rows plus the single most recently updated completed row, so the cost
+    /// stays O(active monitors) even though completed rows are retained
+    /// indefinitely. Best-effort: a store read failure is logged and reads
+    /// as no signals (mirrors
     /// [`Services::workspace_has_active_pr_monitors`]) so list/get emission
     /// is never wedged and PR stages are never fabricated.
     pub(crate) async fn workspace_monitor_pr_signals(
@@ -653,7 +666,7 @@ impl Services {
     ) -> MonitorPrSignals {
         match self
             .store
-            .list_non_cancelled_pr_monitors_by_workspace(workspace_id)
+            .list_display_status_pr_monitors_by_workspace(workspace_id)
             .await
         {
             Ok(monitors) => fold_monitor_pr_signals(&monitors),
@@ -4220,10 +4233,47 @@ mod tests {
         );
         // Signals aggregate across rows.
         assert_eq!(
-            fold_monitor_pr_signals(&[ready, merged]),
+            fold_monitor_pr_signals(&[ready, merged.clone()]),
             MonitorPrSignals {
                 open: true,
                 ready: true,
+                merged: true
+            }
+        );
+        // Latest-completed semantics (linked-PR step 6): an older merged
+        // monitor never shadows a newer closed-unmerged one — only the most
+        // recently updated completed row decides `merged`.
+        let mut newer_closed = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "closed".into()),
+        );
+        newer_closed.updated_at = "2026-01-02T00:00:00Z".into();
+        assert_eq!(
+            fold_monitor_pr_signals(&[merged.clone(), newer_closed.clone()]),
+            MonitorPrSignals::default(),
+            "newer closed-unmerged monitor wins over an older merged one"
+        );
+        // Order-independent: the fold picks the latest by updated_at, not
+        // by slice position.
+        assert_eq!(
+            fold_monitor_pr_signals(&[newer_closed, merged.clone()]),
+            MonitorPrSignals::default()
+        );
+        // And the reverse: a newer merged monitor after an older closed one.
+        let mut newer_merged = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "merged".into()),
+        );
+        newer_merged.updated_at = "2026-01-03T00:00:00Z".into();
+        let older_closed = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "closed".into()),
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(&[older_closed, newer_merged]),
+            MonitorPrSignals {
+                open: false,
+                ready: false,
                 merged: true
             }
         );
