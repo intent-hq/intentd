@@ -39,6 +39,14 @@ use tokio_tungstenite::tungstenite::Message;
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
+/// Lowercase hex sha256 digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -9552,7 +9560,7 @@ async fn wss_file_attachment_upload_round_trip() {
     srv.store.insert_workspace(&w).await.expect("insert ws");
 
     let payload: Vec<u8> = (0u32..50_000).flat_map(|i| i.to_le_bytes()).collect();
-    let sha = format!("{:x}", Sha256::digest(&payload));
+    let sha = sha256_hex(&payload);
     let mid = payload.len() / 2;
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
 
@@ -9783,7 +9791,7 @@ async fn wss_workspace_import_lifecycle() {
     .expect("session row");
     zip.finish().expect("zip");
     let archive = buf.into_inner();
-    let sha = format!("{:x}", Sha256::digest(&archive));
+    let sha = sha256_hex(&archive);
 
     // begin → { importId, maxChunkBytes }.
     let begin = wss_call(
@@ -10154,7 +10162,7 @@ async fn wss_workspace_export_lifecycle() {
         );
     }
     assert_eq!(archive.len() as u64, size);
-    assert_eq!(format!("{:x}", Sha256::digest(&archive)), sha);
+    assert_eq!(sha256_hex(&archive), sha);
     let reread = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -10415,7 +10423,7 @@ async fn wss_workspace_import_commit_materializes_git() {
         .expect("refs write");
     zip.finish().expect("zip");
     let archive = buf.into_inner();
-    let sha = format!("{:x}", Sha256::digest(&archive));
+    let sha = sha256_hex(&archive);
 
     // begin → chunk → commit over the wire.
     let begin = wss_call(

@@ -791,7 +791,11 @@ fn assemble_and_extract(
             "assembled archive is {total} bytes, expected {declared_size}"
         )));
     }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if actual != declared_sha256 {
         return Err(Error::InvalidParams(format!(
             "archive checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
@@ -1832,7 +1836,11 @@ mod tests {
     fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
-        format!("{:x}", hasher.finalize())
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     fn b64(bytes: &[u8]) -> String {

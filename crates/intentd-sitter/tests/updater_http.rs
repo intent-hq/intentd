@@ -69,7 +69,10 @@ fn make_tar_xz(bin_contents: &[u8]) -> Vec<u8> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Schema-v1 manifest with a single platform entry for this build's triple.

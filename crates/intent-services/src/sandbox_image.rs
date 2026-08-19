@@ -603,7 +603,11 @@ async fn download_hashed(
     file.flush()
         .await
         .map_err(|e| format!("flush {}: {e}", dest.display()))?;
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Hex sha256 of a fetched manifest document — the pin value clients save
@@ -616,7 +620,11 @@ pub fn manifest_sha256(bytes: &[u8]) -> String {
 fn hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Publish a `sandbox:image:*` event when a bus is wired; failures are logged
