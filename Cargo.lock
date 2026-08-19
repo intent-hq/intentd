@@ -2138,10 +2138,8 @@ dependencies = [
  "directories",
  "intent-core",
  "nix 0.31.3",
- "serde_json",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2170,7 +2168,6 @@ dependencies = [
  "git2",
  "intent-core",
  "libc",
- "serde",
  "tokio",
  "tracing",
 ]
@@ -2229,9 +2226,7 @@ dependencies = [
  "grep",
  "ignore",
  "intent-core",
- "intent-store",
  "serde",
- "serde_json",
  "uuid",
 ]
 
@@ -2397,8 +2392,6 @@ dependencies = [
  "intent-js",
  "intent-linear",
  "intent-providers",
- "intent-pty",
- "intent-search",
  "intent-sentry",
  "intent-services",
  "intent-sourcecontrol",
