@@ -238,6 +238,7 @@ if ($serviceMode -eq 'yes') {
         }
     }
     Write-Host "install.ps1: manage the service with: Get-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask/Unregister-ScheduledTask -TaskName $taskName"
+    Write-Host 'install.ps1: connecting from another machine (desktop/mobile app)? Run: intentd pair'
 } else {
     if ($serviceMode -eq 'skip') {
         Write-Host 'install.ps1: skipping service setup (non-interactive session). To set it up, re-run with $env:INTENTD_INSTALL_SERVICE = ''1'''
@@ -245,4 +246,5 @@ if ($serviceMode -eq 'yes') {
     Write-Host ''
     Write-Host 'Next steps:'
     Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
+    Write-Host '  intentd pair    # connecting from another machine (desktop/mobile app)? prints pairing info'
 }

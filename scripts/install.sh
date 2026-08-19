@@ -179,6 +179,7 @@ EOF
   verify_daemon
   apply_auto_resume
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
+  info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
 setup_service_macos() {
@@ -252,6 +253,7 @@ EOF
   verify_daemon
   apply_auto_resume
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
+  info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
 main() {
@@ -454,6 +456,7 @@ main() {
   printf '%s\n' "
 Next steps:
   intentd serve   # start the daemon in the foreground (downloads the real daemon on first run)
+  intentd pair    # connecting from another machine (desktop/mobile app)? prints pairing info
 
 To run intentd at login as a background service, re-run this installer with
 INTENTD_INSTALL_SERVICE=1, or use a package-manager install:
