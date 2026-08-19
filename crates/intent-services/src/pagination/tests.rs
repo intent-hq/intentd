@@ -261,3 +261,64 @@ fn forward_page_window_clamps_stale_cursor_past_end() {
     assert_eq!((fwd.start, fwd.end), (5, 5));
     assert!(fwd.prev_token.is_none());
 }
+
+#[test]
+fn budget_page_newest_keeps_newest_suffix() {
+    // Anchor Newest: admit newest-first until the budget stops an older row.
+    let sizes = [100, 100, 100, 100];
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Newest, 250), (2, 4));
+    // Everything fits: whole page kept.
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Newest, 400), (0, 4));
+    // The anchor (newest) row always serves, even alone over budget.
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Newest, 50), (3, 4));
+    assert_eq!(budget_page(&[], BudgetAnchor::Newest, 50), (0, 0));
+}
+
+#[test]
+fn budget_page_oldest_keeps_oldest_prefix() {
+    let sizes = [100, 100, 100, 100];
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Oldest, 250), (0, 2));
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Oldest, 400), (0, 4));
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Oldest, 50), (0, 1));
+}
+
+#[test]
+fn budget_page_target_grows_outward_and_always_keeps_target() {
+    let sizes = [100, 100, 100, 100, 100];
+    // Target in the middle, room for two neighbors (older admitted first).
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Target(2), 320), (1, 4));
+    // Only the target fits.
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Target(2), 100), (2, 3));
+    // A lone over-budget target still serves (never an empty page).
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Target(2), 10), (2, 3));
+    // Each direction stops independently: a huge older neighbor doesn't
+    // block newer admission.
+    let uneven = [1000, 10, 10, 10];
+    assert_eq!(budget_page(&uneven, BudgetAnchor::Target(1), 40), (1, 4));
+    // Position clamps into the slice.
+    assert_eq!(budget_page(&sizes, BudgetAnchor::Target(99), 100), (4, 5));
+}
+
+#[test]
+fn budget_page_reminted_tokens_resume_at_first_excluded_row() {
+    // A budget trim on a backward page re-mints `{"b": start+lo}`; following
+    // it through page_window resumes exactly at the first excluded (older)
+    // row — no gaps, no duplicates.
+    let sizes = [100, 100, 100, 100];
+    let (lo, _hi) = budget_page(&sizes, BudgetAnchor::Newest, 250);
+    let token = remint_backward_token(lo).expect("older rows remain");
+    let next = page_window(4, Some(4), Some(&token));
+    assert_eq!((next.start, next.end), (0, 2), "resumes at first excluded");
+    assert!(
+        remint_backward_token(0).is_none(),
+        "no token at oldest edge"
+    );
+    // Forward re-mint: `{"f": end}` resumes at the first excluded newer row.
+    let fwd_token = remint_forward_token(2, 4).expect("newer rows remain");
+    let fwd = forward_page_window(4, Some(4), &fwd_token).expect("forward");
+    assert_eq!((fwd.start, fwd.end), (2, 4));
+    assert!(
+        remint_forward_token(4, 4).is_none(),
+        "no token at newest edge"
+    );
+}
