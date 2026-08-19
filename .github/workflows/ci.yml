@@ -240,12 +240,14 @@ jobs:
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       # Blocking unused-dependency gate: fails when any crate declares a
-      # dependency its code never uses. True false positives (e.g. link-time
-      # only deps like intentd's vendored openssl-sys) are suppressed via
+      # dependency its code never uses. --deny-warnings promotes warnings
+      # (e.g. unused optional dependencies) to errors so they cannot land
+      # either. True false positives (e.g. link-time only deps like intentd's
+      # vendored openssl-sys) are suppressed via
       # [package.metadata.cargo-shear] ignored = [...] next to the dependency,
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
-        run: cargo shear
+        run: cargo shear --deny-warnings
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate for PRs. Running it
       # plainly here as well would double the critical path. The exception is
