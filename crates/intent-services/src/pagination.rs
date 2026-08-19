@@ -140,6 +140,114 @@ pub fn forward_page_window(len: usize, limit: Option<i64>, token: &str) -> Optio
     Some(seek_window(len, start, end))
 }
 
+/// Admission anchor for [`budget_page`] — which end of a page the byte
+/// budget grows from, mirroring the direction its consumer walks:
+///
+/// - `Newest`: legacy backward pages (client walks newest→oldest), so the
+///   newest suffix is kept and the oldest rows are dropped.
+/// - `Oldest`: forward (`prevToken`-minted) continuations (client walks
+///   oldest→newest toward the live tail), so the oldest prefix is kept.
+/// - `Target(pos)`: seek pages (`aroundMessageId` / `aroundIndex`) — `pos`
+///   is the target's position WITHIN the page slice; the target is always
+///   kept (even alone over budget) and the page grows outward from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetAnchor {
+    Newest,
+    Oldest,
+    Target(usize),
+}
+
+/// Trim a page to a byte budget (the §5.5 slim page budget): given each
+/// row's serialized size, return the kept contiguous `lo..hi` subrange of
+/// the page slice. The anchor row is always admitted — a single row over
+/// budget still serves alone (never an empty page, no infinite loop) — and
+/// further rows are admitted only while the cumulative size stays within
+/// `budget`, stopping at the first row that would exceed it (pages stay
+/// contiguous; rows are never skipped over). `Target` grows outward
+/// alternating older-first (mirroring the unbudgeted half-older split);
+/// each direction stops independently at its first non-fitting row.
+pub fn budget_page(sizes: &[usize], anchor: BudgetAnchor, budget: usize) -> (usize, usize) {
+    let n = sizes.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    match anchor {
+        BudgetAnchor::Newest => {
+            let mut lo = n;
+            let mut total = 0usize;
+            while lo > 0 {
+                let s = sizes[lo - 1];
+                if lo != n && total.saturating_add(s) > budget {
+                    break;
+                }
+                total = total.saturating_add(s);
+                lo -= 1;
+            }
+            (lo, n)
+        }
+        BudgetAnchor::Oldest => {
+            let mut hi = 0;
+            let mut total = 0usize;
+            while hi < n {
+                let s = sizes[hi];
+                if hi != 0 && total.saturating_add(s) > budget {
+                    break;
+                }
+                total = total.saturating_add(s);
+                hi += 1;
+            }
+            (0, hi)
+        }
+        BudgetAnchor::Target(pos) => {
+            let pos = pos.min(n - 1);
+            let mut lo = pos;
+            let mut hi = pos + 1;
+            let mut total = sizes[pos];
+            let mut can_older = lo > 0;
+            let mut can_newer = hi < n;
+            while can_older || can_newer {
+                if can_older {
+                    let s = sizes[lo - 1];
+                    if total.saturating_add(s) <= budget {
+                        total = total.saturating_add(s);
+                        lo -= 1;
+                        can_older = lo > 0;
+                    } else {
+                        can_older = false;
+                    }
+                }
+                if can_newer {
+                    let s = sizes[hi];
+                    if total.saturating_add(s) <= budget {
+                        total = total.saturating_add(s);
+                        hi += 1;
+                        can_newer = hi < n;
+                    } else {
+                        can_newer = false;
+                    }
+                }
+            }
+            (lo, hi)
+        }
+    }
+}
+
+/// Re-mint the backward continuation token after a budget trim moved a
+/// page's effective start: `{"b": start}` while older rows remain. Same
+/// cursor shape as [`page_window`], so the resumed page picks up exactly at
+/// the first excluded (older) row.
+pub fn remint_backward_token(start: usize) -> Option<String> {
+    (start > 0).then(|| encode_token(&json!({ "b": start })))
+}
+
+/// Re-mint the forward continuation token after a budget trim moved a
+/// page's effective end: `{"f": end}` while newer rows remain. Same cursor
+/// shape as [`seek_window`], so the resumed page picks up exactly at the
+/// first excluded (newer) row.
+pub fn remint_forward_token(end: usize, len: usize) -> Option<String> {
+    (end < len).then(|| encode_token(&json!({ "f": end })))
+}
+
 /// A page of items plus the opaque token for the next (older) page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
