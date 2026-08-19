@@ -140,6 +140,15 @@ interrupted agents at startup (see [Auto-resume on start](#auto-resume-on-start)
 answering `auto` — the default — writes nothing). `INTENTD_AUTO_RESUME=auto|on|off`
 (or `--auto-resume=<value>` on a direct run) answers non-interactively.
 
+```sh
+intentd pair   # pairing info for remote clients (URL/token/fingerprint) — skip if only the local desktop app uses this daemon
+```
+
+To connect the desktop or iOS app from another machine, run `intentd pair` once the
+daemon is running (the service starts it; if you declined service setup, start it
+with `intentd serve` first) — see
+[Pairing a remote client](#pairing-a-remote-client-wss).
+
 ### One-line script (Windows)
 
 ```powershell
@@ -157,12 +166,24 @@ startup (see [Auto-resume on start](#auto-resume-on-start));
 `$env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off'` (or `-AutoResume auto|on|off` on a
 direct run) answers non-interactively.
 
+```powershell
+intentd pair   # pairing info for remote clients (URL/token/fingerprint) — skip if only the local desktop app uses this daemon
+```
+
+To connect the desktop or iOS app from another machine, run `intentd pair` once the
+daemon is running (the scheduled task starts it; if you declined task setup, start it
+with `intentd serve` first) — see
+[Pairing a remote client](#pairing-a-remote-client-wss).
+
 ### Homebrew (macOS / Linux)
 
 ```sh
 brew install intent-hq/tap/intentd
 # Run as a login service (launchd/systemd) — executes `intentd serve`:
 brew services start intentd
+# Pairing info for remote clients (URL/token/fingerprint) — skip if only the
+# local desktop app uses this daemon; see "Pairing a remote client" below:
+intentd pair
 ```
 
 The formula lives in [intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap),
@@ -184,6 +205,9 @@ curl -fLO https://github.com/intent-hq/intentd-releases/releases/download/sitter
 sudo apt install ./intentd_amd64.deb
 # The package does not auto-enable the unit (it is per-user); start it at login with:
 systemctl --user enable --now intentd
+# Pairing info for remote clients (URL/token/fingerprint) — skip if only the
+# local desktop app uses this daemon; see "Pairing a remote client" below:
+intentd pair
 ```
 
 ### Direct download
@@ -199,6 +223,10 @@ curl -fLO https://github.com/intent-hq/intentd-releases/releases/download/sitter
 tar -xJf intentd-aarch64-apple-darwin.tar.xz
 # → intentd-aarch64-apple-darwin/intentd
 ```
+
+Once the daemon runs, `intentd pair` prints the pairing info remote clients need
+(URL/token/fingerprint) — skip it if only the local desktop app uses this daemon;
+see [Pairing a remote client](#pairing-a-remote-client-wss).
 
 ### Auto-resume on start
 
