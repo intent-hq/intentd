@@ -299,12 +299,14 @@ pub(crate) struct HarnessEntry {
     /// what a NULL-snapshot gate would have resolved to when the version was
     /// current. Not consumed at runtime yet: legacy NULL-features rows keep
     /// the read-live behavior (`session_agent_features`); exercised by
-    /// registry tests meanwhile.
+    /// registry tests meanwhile (hence the allow — the lib build has no
+    /// reader).
     #[allow(dead_code)]
     pub default_features: fn() -> AgentFeaturesSettings,
     /// `(camelCase key, human-readable label)` for every `agentFeatures`
     /// toggle this version knows about. For diagnostics/UI surfaces;
-    /// exercised by registry tests meanwhile.
+    /// exercised by registry tests meanwhile (hence the allow — the lib
+    /// build has no reader).
     #[allow(dead_code)]
     pub feature_labels: &'static [(&'static str, &'static str)],
 }
@@ -366,13 +368,6 @@ pub(crate) fn resolve_entry(version: &str) -> &'static HarnessEntry {
     }
 }
 
-/// Resolve a `harnessVersion` string to its implementation
-/// ([`resolve_entry`]'s harness projection).
-#[allow(dead_code)]
-pub(crate) fn resolve(version: &str) -> &'static dyn Harness {
-    resolve_entry(version).harness
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,17 +384,19 @@ mod tests {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
         assert!(std::ptr::eq(
-            data_ptr(resolve(intent_core::CURRENT_HARNESS_VERSION)),
+            data_ptr(resolve_entry(intent_core::CURRENT_HARNESS_VERSION).harness),
             data_ptr(&v1::V1)
         ));
     }
 
     #[test]
     fn registry_unknown_version_falls_back_to_latest() {
-        assert!(std::ptr::eq(data_ptr(resolve("v999")), data_ptr(latest())));
-        assert!(std::ptr::eq(data_ptr(resolve("")), data_ptr(latest())));
         assert!(std::ptr::eq(
             data_ptr(resolve_entry("v999").harness),
+            data_ptr(latest())
+        ));
+        assert!(std::ptr::eq(
+            data_ptr(resolve_entry("").harness),
             data_ptr(latest())
         ));
     }

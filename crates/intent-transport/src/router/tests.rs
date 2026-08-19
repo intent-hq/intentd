@@ -5487,6 +5487,7 @@ mod send_message_payload_forwarding {
     /// are asserted; the rest are captured so the tests document the full
     /// observed shape.
     #[derive(Default, Debug, Clone)]
+    // Unasserted fields are written but never read; kept to document the shape.
     #[allow(dead_code)]
     struct Capture {
         workspace_id: Option<WorkspaceId>,

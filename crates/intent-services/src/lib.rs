@@ -6213,7 +6213,12 @@ async fn reanchor_note_comments(
                     note_ops::RecoveryOutcome::Recovered(new_md) => {
                         current = new_md;
                     }
-                    note_ops::RecoveryOutcome::Failed(_) => {
+                    note_ops::RecoveryOutcome::Failed(reason) => {
+                        tracing::debug!(
+                            comment_id = %comment.id,
+                            reason,
+                            "partial-anchor recovery failed; orphaning comment"
+                        );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
                         let mut updated = comment.clone();
