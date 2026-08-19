@@ -508,6 +508,17 @@ pub struct Services {
     /// Shared across clones so the turn writer and the `agent.diagnostics`
     /// read door observe the same state.
     last_turn_silent_tails: agent_session::LastTurnSilentTails,
+    /// Per-agent consecutive suspected-truncation auto-redrive counter
+    /// (intent-hq/monorepo#2863): see [`agent_session::TruncationRedrives`].
+    /// Shared across clones so consecutive turns of one agent accumulate the
+    /// same stall-episode streak.
+    truncation_redrives: agent_session::TruncationRedrives,
+    /// One-shot truncation auto-redrive handoff flags
+    /// (intent-hq/monorepo#2863): see
+    /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
+    /// the `run_prompt_turn` arm and the turn worker's take observe the same
+    /// state.
+    pending_truncation_redrive: agent_session::PendingTruncationRedrives,
     /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
     /// tests simulate an in-flight worker without spawning a real
     /// [`AgentManager`]. Production composition always attaches a manager and
@@ -875,6 +886,8 @@ impl Services {
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
+            truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -4678,17 +4691,70 @@ impl Services {
         } else {
             (Vec::new(), None, None)
         };
+        // Failure identity (intent-hq/monorepo#2862): an `agent:failed` is
+        // identified by the session's persisted `stop_reason_timestamp`
+        // (stamped with the Error status BEFORE the event reaches the bus —
+        // durable-before-observable, monorepo#2050 — and cleared on
+        // `agent.retry` / turn start, so one failure cycle keeps one
+        // identity and a post-retry failure always gets a new one). Same
+        // guard shape as the completion identity above: derived only when
+        // the event carries a NON-EMPTY `error` matching the session's
+        // persisted `stop_reason` — a mismatch (stale event, or an emit
+        // path that never persisted the reason) fails open: identity None,
+        // delivered as before, nothing recorded. The `failed:` prefix keeps
+        // failure identities from ever cross-matching a completion identity
+        // in the shared per-pair marker row.
+        //
+        // The match also accepts the ONE known wrap relationship (PR #1316
+        // review): the streaming prompt-failure path persists the wrapped
+        // `internal error: session/prompt failed: {e}` as `stop_reason` but
+        // emits the RAW `{e}` as the live event's `error` — reconstructing
+        // the wrapper from the event text lets that (most common) failure
+        // mode record its marker on live delivery too, instead of failing
+        // open and leaving the first restart/re-arm replay deliverable.
+        // Replays synthesized from the persisted state carry the wrapped
+        // text verbatim and take the exact-match arm.
+        let failure_identity: Option<String> =
+            if !watches.is_empty() && event.event_type == AGENT_FAILED {
+                match failure_error_text.as_deref() {
+                    Some(err) if !err.is_empty() => {
+                        match self.store.get_agent_session(child_id).await {
+                            Ok(s) => {
+                                let wrapped = Error::Internal(format!(
+                                    "{} {err}",
+                                    crate::agent_manager::PROMPT_FAILED_PREFIX
+                                ))
+                                .to_string();
+                                let persisted = s.stop_reason.as_deref();
+                                if persisted == Some(err) || persisted == Some(wrapped.as_str()) {
+                                    s.stop_reason_timestamp.map(|ts| format!("failed:{ts}"))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
         // The identity the delivery-path marker write records. The skip
         // check stays on the stricter event-carried `completion_identity`;
         // the record additionally covers the report-less Gap B settlement
-        // (see the identity guards above).
-        let record_identity: Option<&str> = completion_identity.as_deref().or_else(|| {
-            if event_report_raw.is_none() {
-                session_report_ts.as_deref()
-            } else {
-                None
-            }
-        });
+        // (see the identity guards above). A failure identity (monorepo#2862)
+        // participates in both.
+        let record_identity: Option<&str> = completion_identity
+            .as_deref()
+            .or_else(|| {
+                if event_report_raw.is_none() {
+                    session_report_ts.as_deref()
+                } else {
+                    None
+                }
+            })
+            .or(failure_identity.as_deref());
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4934,7 +5000,16 @@ impl Services {
             // so the suppressed replay never consumes the one-shot watch. A
             // marker read failure fails open (deliver as before): dedup is a
             // guard, a missed suppression only restores the pre-fix wake.
-            if let Some(identity) = completion_identity.as_deref() {
+            // monorepo#2862: `agent:failed` replays are suppressed the same
+            // way, keyed on the failure identity (the session's
+            // `stop_reason_timestamp`) — a restart or re-arm on a child
+            // parked in Error must not re-deliver the failure the parent
+            // already heard; a post-retry failure carries a fresh timestamp
+            // and delivers normally.
+            if let Some(identity) = completion_identity
+                .as_deref()
+                .or(failure_identity.as_deref())
+            {
                 let delivered = self
                     .store
                     .get_completion_wake_delivery(&watch.parent_agent_id, child_id)
@@ -4988,7 +5063,12 @@ impl Services {
             // for this completion (the pre-fix behavior). If the send below
             // fails, the parent misses the wake either way (the watch is
             // already removed — the STAB-18 stance: a missed wake beats a
-            // duplicate), so recording first costs nothing.
+            // duplicate), so recording first costs nothing. NB this stance
+            // consciously applies to FAILURE identities too (monorepo#2862),
+            // inverting the #840 in-memory record's after-send ordering: a
+            // failed send now also suppresses the boot/re-arm replay that
+            // could previously have healed the missed failure wake — same
+            // missed-beats-duplicate tradeoff as completions.
             if let Some(identity) = record_identity {
                 if let Err(e) = self
                     .store
@@ -6133,7 +6213,12 @@ async fn reanchor_note_comments(
                     note_ops::RecoveryOutcome::Recovered(new_md) => {
                         current = new_md;
                     }
-                    note_ops::RecoveryOutcome::Failed(_) => {
+                    note_ops::RecoveryOutcome::Failed(reason) => {
+                        tracing::debug!(
+                            comment_id = %comment.id,
+                            reason,
+                            "partial-anchor recovery failed; orphaning comment"
+                        );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
                         let mut updated = comment.clone();
@@ -14630,6 +14715,8 @@ impl WorkspaceApi for Services {
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
         let last_turn_silent_tails = self.last_turn_silent_tails.clone();
+        let truncation_redrives = self.truncation_redrives.clone();
+        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         // Full handle for the direct completion delivery below (Services is
         // Clone — the same capture pattern the spawn helpers use).
@@ -14703,6 +14790,14 @@ impl WorkspaceApi for Services {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);
+                truncation_redrives
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                pending_truncation_redrive
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
                 agent_queues
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -14740,7 +14835,10 @@ impl WorkspaceApi for Services {
                         correlation_id: None,
                         parent_event_id: None,
                         metadata: None,
-                        data: serde_json::json!({ "agentId": session.id.0 }),
+                        data: serde_json::json!({
+                            "agentId": session.id.0,
+                            "agentName": session.name,
+                        }),
                     },
                 )
                 .await;
@@ -14768,7 +14866,10 @@ impl WorkspaceApi for Services {
                     correlation_id: None,
                     parent_event_id: None,
                     metadata: None,
-                    data: serde_json::json!({ "agentId": session.id.0 }),
+                    data: serde_json::json!({
+                        "agentId": session.id.0,
+                        "agentName": session.name,
+                    }),
                 };
                 services
                     .deliver_completion_to_watches(&session.id, &event)

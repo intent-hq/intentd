@@ -1169,9 +1169,9 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     assert_eq!(sent["success"], true, "target die turn accepted: {sent}");
     // The failure path includes a full silent-redrive cycle (kill + respawn +
     // re-prompt), so the window is generous. `format_completion_wake` renders
-    // an AGENT_FAILED completion as "Child agent <label> failed." — the label
-    // falls back to the bare agent id (the `agent:failed` payload carries no
-    // agentName).
+    // an AGENT_FAILED completion as "Child agent <label> failed." — the
+    // `agent:failed` payload carries `agentName` (intent-hq/monorepo#2869), so
+    // the label is the session name, not the bare agent id.
     let text = await_conversation_contains(
         &mut fx.setup.rpc,
         &mut fx.req_id,
@@ -1182,8 +1182,8 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     )
     .await;
     assert!(
-        text.contains(&format!("Child agent {}", fx.target)),
-        "failure wake names the target: {text}"
+        text.contains("Child agent WatchTarget"),
+        "failure wake names the target by its session name: {text}"
     );
     // monorepo#2051: the terminal failure wake retired the watch and says so.
     assert!(

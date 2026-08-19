@@ -42,9 +42,6 @@ use crate::Services;
 
 /// One parent→child completion-watch record. An ungrouped watch is removed
 /// once the child's completion has been delivered to the parent (AS-3).
-// Fields are read by the AS-3 delivery worker and by tests; AS-2 only populates
-// the registry, so the lib-only build sees them as unread.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionWatch {
     pub id: String,
@@ -91,15 +88,10 @@ pub(crate) struct DelegationGroup {
     /// `__chief__`.
     pub workspace_id: WorkspaceId,
     pub parent_agent_id: AgentId,
-    // Retained for parity with the TS group shape; not read by the fan-in.
-    #[allow(dead_code)]
     pub await_mode: String,
     pub expected_agent_ids: Vec<AgentId>,
     pub completed_agent_ids: Vec<AgentId>,
     pub deleted_agent_ids: Vec<AgentId>,
-    // Retained for parity with the TS group shape; not read by the fan-in.
-    #[allow(dead_code)]
-    pub subscription_id: Option<String>,
     pub sealed: bool,
     pub delivered: bool,
     pub event_summaries: Vec<String>,
@@ -698,7 +690,6 @@ impl Services {
             expected_agent_ids: Vec::new(),
             completed_agent_ids: Vec::new(),
             deleted_agent_ids: Vec::new(),
-            subscription_id: None,
             sealed: false,
             delivered: false,
             event_summaries: Vec::new(),
@@ -1402,7 +1393,7 @@ impl Services {
         call_site: WatchReconcileCallSite,
     ) {
         use intent_core::AgentStatus;
-        let (event_type, event_ws, status_value, completion_report) =
+        let (event_type, event_ws, status_value, completion_report, stop_reason, agent_name) =
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
@@ -1485,12 +1476,16 @@ impl Services {
                         session.workspace_id,
                         status,
                         session.completion_report,
+                        session.stop_reason,
+                        Some(session.name),
                     )
                 }
                 Err(intent_store::Error::NotFound(_)) => (
                     intent_core::events::AGENT_DELETED,
                     fallback_ws.clone(),
                     serde_json::json!("deleted"),
+                    None,
+                    None,
                     None,
                 ),
                 Err(e) => {
@@ -1505,6 +1500,25 @@ impl Services {
             "agentId": child_id.0,
             "status": status_value,
         });
+        // A synthesized `agent:failed` carries the persisted `stop_reason` as
+        // `data.error` — like a live terminal-failure emit — so the wake text
+        // names the failure and, critically, the delivery pass can derive the
+        // failure's persistent dedup identity (monorepo#2862: the identity
+        // guard requires the event-carried error to match the session's
+        // persisted stop_reason). Without it a boot/registration replay of a
+        // historical failure would fail open and re-deliver.
+        if event_type == intent_core::events::AGENT_FAILED {
+            if let Some(reason) = &stop_reason {
+                data["error"] = serde_json::Value::String(reason.clone());
+            }
+        }
+        // `agentName` enrichment (intent-hq/monorepo#2869): a synthesized
+        // completion carries the same name stamp as the live emits, so wake
+        // subscribers never render the raw agent id. Omitted (never null)
+        // when the session row is gone (NotFound fallback).
+        if let Some(name) = agent_name {
+            data["agentName"] = serde_json::Value::String(name);
+        }
         // Idle-visibility: a synthesized idle carries the same
         // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
         // `agent:idle` emit (each omitted when the child owns none), the
@@ -1698,6 +1712,7 @@ impl Services {
                         };
                         let mut data = serde_json::json!({
                             "agentId": child_id.0,
+                            "agentName": session.name,
                             "status": serde_json::to_value(session.status).unwrap_or_default(),
                         });
                         if let Some(s) = &stall {
@@ -2139,7 +2154,6 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
         expected_agent_ids: p.expected_agent_ids.clone(),
         completed_agent_ids: p.completed_agent_ids.clone(),
         deleted_agent_ids: p.deleted_agent_ids.clone(),
-        subscription_id: None,
         sealed: p.sealed,
         delivered: p.delivered,
         event_summaries: p.event_summaries.clone(),

@@ -125,7 +125,10 @@ fn dead_url() -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `.tar.xz` with `intentd-<triple>/intentd` (mode 0755) — the cargo-dist
