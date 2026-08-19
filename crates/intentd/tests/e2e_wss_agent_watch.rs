@@ -1826,6 +1826,208 @@ async fn agent_watch_rearm_adoption_after_report_fires_next_completion_over_wss(
     assert_eq!(wakes, 1, "exactly one completion wake after the re-arm");
 }
 
+/// monorepo#2889: same-cycle suppression over the real WSS transport. The
+/// child reports (immediate parent wake, report body included) and then
+/// lingers in the SAME turn (mock silent tail); the parent re-arms mid-cycle
+/// (adoption clears `report_delivered` — Gap A fresh interest). When the
+/// child's turn resolves and it goes GENUINELY idle, the settlement must NOT
+/// re-embed the already-delivered report: the report-time delivery marker
+/// suppresses the completion wake and leaves the watch armed, and the
+/// child's NEXT cycle still fires exactly one completion wake. Pre-fix, the
+/// parent transcript carried the identical report twice in one cycle.
+#[tokio::test]
+async fn report_wake_then_rearm_suppresses_same_cycle_completion_over_wss() {
+    let Some(script) = gate("WSS same-cycle report dedup E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+
+    const SPAWN_GO: &str = "WATCH7_SPAWN_GO";
+    const CHILD_GO: &str = "WATCH7_CHILD_GO";
+    const REARM_GO: &str = "WATCH7_REARM_GO";
+    const CHILD2_GO: &str = "WATCH7_CHILD2_GO";
+    const REPORT: &str = "WATCH7_REPORT shipped the thing";
+
+    let spawn_js = format!(
+        "const r = await ws.agent.create('DedupChild', '{CHILD_GO} do your work', \
+         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+    );
+    let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let rearm_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'DedupChild');
+        const r = await ws.agent.watch(t.id);
+        return 'rearmed=' + r.ok;
+    "#;
+    // Wake-ack rule FIRST: the report wake and any completion wake ack,
+    // never re-run a marker rule off replayed history. The child's reporting
+    // rule parks a silent tail AFTER the report tool call and BEFORE the
+    // prompt resolves — the in-turn window where the parent's re-arm lands,
+    // keeping the child's eventual idle in the SAME report cycle.
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            {
+                "ifPromptContains": SPAWN_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the reporting child" }
+                },
+                "emitToolBlocks": true,
+                "response": "child spawned",
+            },
+            {
+                "ifPromptContains": CHILD_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": child_report_js, "summary": "child reports" }
+                },
+                "emitToolBlocks": true,
+                "silentTailBeforeResultMs": 5000,
+                "response": "child lingered then finished",
+            },
+            {
+                "ifPromptContains": REARM_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": rearm_js, "summary": "re-arm the reported-on child" }
+                },
+                "emitToolBlocks": true,
+                "response": "rearm done",
+            },
+            { "ifPromptContains": CHILD2_GO, "response": "second turn done" },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
+    let ws_id = setup.ws_id.clone();
+
+    // Parent spawns the child through the bridge: parent linkage makes
+    // reportToParent legal and arms the auto parent→child watch.
+    let parent = create_agent(&mut setup.rpc, 10, &ws_id, "DedupParent").await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": SPAWN_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "spawn send ok: {sent}");
+    let mut req_id = 20i64;
+    let child = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "DedupChild",
+        budget.step(60),
+    )
+    .await;
+
+    // Report-time wake: delivered immediately, report body included, the
+    // auto watch flipped to report_delivered. The child is still mid-turn
+    // (silent tail running).
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "reported. Report:",
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        text.contains("consumed your one-shot watch"),
+        "report wake disclosed the disarm: {text}"
+    );
+
+    // Mid-cycle re-arm: adoption clears report_delivered (Gap A fresh
+    // interest) — pre-fix, this reopened the settlement to the duplicate.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        30,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": REARM_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "rearm send ok: {sent}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "rearmed=true",
+        budget.step(60),
+    )
+    .await;
+
+    // The child's silent tail expires and it goes GENUINELY idle — the
+    // same-cycle settlement. The marker recorded at report delivery must
+    // suppress the completion wake.
+    let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert_ne!(
+        child_idle["data"]["isWaitingForOtherAgents"],
+        json!(true),
+        "child idle is genuine (no interim deferral): {child_idle}"
+    );
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        !text.contains("completed."),
+        "same-cycle settlement must not re-deliver the heard report: {text}"
+    );
+    let reports =
+        wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "reported. Report:").await;
+    req_id += 1;
+    assert_eq!(reports, 1, "exactly one report wake in the cycle");
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "suppressed watch stays armed for a future completion");
+
+    // FUTURE cycle: a new child turn (turn start clears the persisted
+    // report) idles genuinely — the re-armed watch fires exactly one
+    // completion wake and retires.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        40,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child, "content": CHILD2_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "second child send ok: {sent}");
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "completed.",
+        budget.step(90),
+    )
+    .await;
+    assert!(
+        text.contains(&format!("Child agent DedupChild ({child})")),
+        "future-cycle completion wake names the child: {text}"
+    );
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    let wakes = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "completed.").await;
+    req_id += 1;
+    assert_eq!(wakes, 1, "exactly one completion wake on the future cycle");
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    assert_eq!(n, 0, "watch retired at the future completion");
+}
+
 /// monorepo#2532 Gap B: arming a watch on a child that REPORTED and idled
 /// while holding an ACTIVE background hook must not fire instantly with the
 /// stale report — the registration-time reconcile defers, the watch stays
