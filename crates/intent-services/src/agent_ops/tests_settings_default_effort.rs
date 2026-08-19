@@ -70,9 +70,12 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
 /// ACP provider binary being installed on the test host (CI has none).
 fn seed_catalog(svc: &Services) {
     for provider in ["auggie", "mock"] {
+        let version_key = crate::model_catalog::source_for(provider)
+            .map(|source| (source.version_key)())
+            .unwrap_or_default();
         svc.models_catalog.store_for_test(
             provider,
-            "",
+            &version_key,
             vec![
                 json!({ "id": "fable-5", "name": "Fable 5", "provider": provider,
                         "effortLevels": ["low", "high"] }),

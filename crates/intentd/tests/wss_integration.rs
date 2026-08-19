@@ -3739,6 +3739,67 @@ async fn wss_models_list_returns_catalog_with_source() {
     srv.ws.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_preserves_legacy_metadata_through_cache() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = test_tempdir("intentd-wss-models-legacy-");
+    let calls = dir.path().join("calls");
+    let bin = dir.path().join("auggie");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$*" != "model list --json" ]; then
+  exit 1
+fi
+cat <<'JSON'
+{{"models":[{{"shortName":"current","displayName":"Current","modelGroupPriority":1,"priority":1,"isLegacyModel":false}},{{"shortName":"legacy","displayName":"Legacy","modelGroupPriority":2,"priority":1,"isLegacyModel":true}}]}}
+JSON
+"#,
+        calls.display()
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let request =
+        r#"{"jsonrpc":"2.0","id":47,"method":"models.list","params":{"providerId":"auggie"}}"#;
+    let response = wss_call(srv.port, srv.cfg.clone(), request).await;
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 47,
+            "result": {
+                "providerId": "auggie",
+                "models": [
+                    { "id": "current", "name": "Current", "provider": "auggie",
+                      "modelGroupPriority": 1, "priority": 1 },
+                    { "id": "legacy", "name": "Legacy", "provider": "auggie",
+                      "modelGroupPriority": 2, "priority": 1, "isLegacyModel": true }
+                ],
+                "source": "auggie"
+            }
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "model list --json\n"
+    );
+
+    let cached_request = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
+    let cached = wss_call(srv.port, srv.cfg.clone(), cached_request).await;
+    assert_eq!(cached["result"]["models"], response["result"]["models"]);
+    assert_eq!(cached["result"]["source"], response["result"]["source"]);
+    assert!(cached["result"].get("providerId").is_none());
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "model list --json\n"
+    );
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     // The current hour bucket is inside both the current month and the

@@ -308,7 +308,7 @@ async fn agent_create_mismatched_settings_default_falls_back_to_cli_default() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![serde_json::json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );

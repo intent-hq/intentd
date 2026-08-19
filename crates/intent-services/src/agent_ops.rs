@@ -1144,10 +1144,10 @@ pub(crate) async fn fetch_auggie_models(
 /// `{ models: [...] }`, maps `id` ← `shortName` and `name` ← `displayName`,
 /// and skips rows missing either string. Optional picker metadata
 /// (`description`, `modelGroupPriority`, `costTier`, `badges`, `effortLevels`,
-/// `isDefault`, `priority`) is copied only when present/non-empty. The
-/// transient `isLegacyModel` flag is kept so [`finalize_model_rows`] can
-/// filter it, then stripped from the wire. Returns `None` when the payload is
-/// not the expected JSON shape, so the caller falls back to plain text.
+/// `isDefault`, `priority`, `isLegacyModel`) is copied only when
+/// present/non-empty; boolean flags are emitted only when true. Returns `None`
+/// when the payload is not the expected JSON shape, so the caller falls back
+/// to plain text.
 pub(crate) fn parse_model_list_json(stdout: &str) -> Option<Vec<Value>> {
     let parsed: Value = serde_json::from_str(stdout.trim()).ok()?;
     let models = parsed.get("models")?.as_array()?;
@@ -1188,10 +1188,9 @@ pub(crate) fn parse_model_list_json(stdout: &str) -> Option<Vec<Value>> {
     Some(out)
 }
 
-/// Post-process parsed `models.list` rows (PROTOCOL §5.30), porting the
-/// reference `fetchAuggieModels` tail: drop rows flagged `isLegacyModel`
-/// (stripping the flag from survivors) and sort by `modelGroupPriority`, then
-/// `priority`, then `name` — missing priorities sort last (`999`).
+/// Post-process parsed `models.list` rows (PROTOCOL §5.30): preserve every row
+/// and its metadata, then sort by `modelGroupPriority`, `priority`, and `name`
+/// — missing priorities sort last (`999`).
 pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
     fn priority(row: &Value, key: &str) -> f64 {
         row.get(key).and_then(Value::as_f64).unwrap_or(999.0)
@@ -1199,23 +1198,14 @@ pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
     fn name(row: &Value) -> &str {
         row.get("name").and_then(Value::as_str).unwrap_or("")
     }
-    let mut kept: Vec<Value> = rows
-        .into_iter()
-        .filter(|r| r.get("isLegacyModel").and_then(Value::as_bool) != Some(true))
-        .map(|mut r| {
-            if let Some(obj) = r.as_object_mut() {
-                obj.remove("isLegacyModel");
-            }
-            r
-        })
-        .collect();
-    kept.sort_by(|a, b| {
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
         priority(a, "modelGroupPriority")
             .total_cmp(&priority(b, "modelGroupPriority"))
             .then_with(|| priority(a, "priority").total_cmp(&priority(b, "priority")))
             .then_with(|| name(a).cmp(name(b)))
     });
-    kept
+    rows
 }
 
 /// Upper bound on one auggie CLI invocation (model list / session stats).
@@ -1250,7 +1240,7 @@ async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::p
 /// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
 /// reference `fetchAuggieModels`: try `auggie model list --json` for the rich
 /// rows, fall back to the plain-text parser ([`parse_model_list_output`]),
-/// then filter legacy models and sort ([`finalize_model_rows`]). Returns
+/// then preserve all rows and sort ([`finalize_model_rows`]). Returns
 /// `None` when the CLI is unavailable, hangs past
 /// [`AUGGIE_MODELS_TIMEOUT`], or yields nothing parseable, so the caller can
 /// degrade to an empty model list. `auggie_bin` overrides discovery
@@ -4043,6 +4033,11 @@ impl Services {
         let Some(provider_id) = provider_id else {
             return self.models_list_auggie_op(force_refresh).await;
         };
+        if provider_id == "auggie" {
+            let mut response = self.models_list_auggie_op(force_refresh).await?;
+            response["providerId"] = Value::String(provider_id);
+            return Ok(response);
+        }
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,

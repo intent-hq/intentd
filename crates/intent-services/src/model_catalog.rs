@@ -71,6 +71,15 @@ fn no_version() -> String {
     String::new()
 }
 
+/// Auggie catalog wire-shape version. Bump when daemon-side filtering or
+/// metadata projection changes so persisted rows from the old shape cannot be
+/// served indefinitely by the last-good cache.
+pub(crate) const AUGGIE_CATALOG_VERSION: &str = "preserve-legacy-v1";
+
+fn auggie_catalog_version() -> String {
+    AUGGIE_CATALOG_VERSION.to_string()
+}
+
 /// auggie source: the rich CLI fetch already backing `models.list`
 /// (discovery via `resolve_auggie_bin` — registry sources are plain fns with
 /// no `Services` handle, so the `auggie_bin` test seam is unavailable here).
@@ -202,7 +211,7 @@ fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
 static SOURCES: &[ModelSource] = &[
     ModelSource {
         provider_id: "auggie",
-        version_key: no_version,
+        version_key: auggie_catalog_version,
         fetch: auggie_fetch,
     },
     ModelSource {
