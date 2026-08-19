@@ -16416,10 +16416,17 @@ async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
         Some(parent.0.as_str()),
         "delegated child's agent:failed carries the parent id: {data}"
     );
-    // intent-hq/monorepo#2869: the same central enrichment stamps agentName.
-    assert!(
-        data["agentName"].as_str().is_some_and(|n| !n.is_empty()),
-        "agent:failed carries the child's agentName: {data}"
+    // intent-hq/monorepo#2869: the same central enrichment stamps agentName —
+    // exactly the child's session name from the store.
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(
+        data["agentName"].as_str(),
+        Some(child_session.name.as_str()),
+        "agent:failed carries the child's exact agentName: {data}"
     );
 }
 
