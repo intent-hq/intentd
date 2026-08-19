@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.21] - 2026-08-19
+
+### 🚀 Features
+
+- Byte-budget slim conversation pages at ~512KB ([#1314](https://github.com/intent-hq/intentd/pull/1314))
+
+### 🐛 Bug Fixes
+
+- Dedup completion wakes per (watcher, completion) so restarts and re-arms never re-deliver ([#1313](https://github.com/intent-hq/intentd/pull/1313))
+
+
 ## [0.7.20] - 2026-08-18
 
 ### 📚 Documentation
