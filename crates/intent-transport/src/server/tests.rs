@@ -239,6 +239,33 @@ fn pairing_hosts_unspecified_or_unknown_bind_enumerates_local_ips() {
 }
 
 #[test]
+fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
+    // `::` accepts native IPv6 plus v4-mapped IPv4: the advertised set starts
+    // with the v4 enumeration (v6 additions vary by machine, so assert the
+    // prefix). A SPECIFIC v6 bind still advertises exactly that address.
+    let v6_unspecified = PairingSnapshot {
+        port: Some(5181),
+        bind_address: Some("::".parse().unwrap()),
+    };
+    let hosts = pairing_hosts(&v6_unspecified);
+    let v4 = collect_local_ips();
+    assert_eq!(&hosts[..v4.len()], &v4[..]);
+    for extra in &hosts[v4.len()..] {
+        let ip: std::net::IpAddr = extra.parse().expect("v6 host entries parse");
+        assert!(
+            ip.is_ipv6(),
+            "extra hosts beyond the v4 set are v6: {extra}"
+        );
+    }
+
+    let v6_specific = PairingSnapshot {
+        port: Some(5181),
+        bind_address: Some("2001:db8::7".parse().unwrap()),
+    };
+    assert_eq!(pairing_hosts(&v6_specific), vec!["2001:db8::7".to_string()]);
+}
+
+#[test]
 fn collect_bind_interfaces_loopback_first_no_duplicates() {
     let ifaces = collect_bind_interfaces();
     // Machines without any interface (rare CI sandboxes) yield an empty list;

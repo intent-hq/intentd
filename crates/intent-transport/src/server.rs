@@ -154,11 +154,50 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 /// bound to a specific address (loopback included) is reachable only there,
 /// so advertise exactly that address; an unspecified bind (`0.0.0.0` / `::`)
 /// or an unknown one falls back to enumerating the machine's local IPs.
+/// An IPv6-unspecified bind (`::`) also accepts native IPv6 connections
+/// (v4-mapped sockets cover the IPv4 side), so its enumeration additionally
+/// carries the machine's global IPv6 addresses.
 pub fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
     match snapshot.bind_address {
         Some(addr) if !addr.is_unspecified() => vec![addr.to_string()],
+        Some(std::net::IpAddr::V6(_)) => {
+            let mut hosts = collect_local_ips();
+            hosts.extend(collect_local_ipv6s());
+            hosts
+        }
         _ => collect_local_ips(),
     }
+}
+
+/// Collect local non-loopback, non-link-local IPv6 addresses. Companion to
+/// [`collect_local_ips`] for advertising hosts of an IPv6-unspecified (`::`)
+/// bind; link-local (`fe80::/10`) addresses are skipped because they are not
+/// usable without a zone index.
+fn collect_local_ipv6s() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if ["docker", "veth", "br-", "bridge", "vboxnet", "vmnet"]
+                .iter()
+                .any(|p| iface.name.starts_with(p))
+            {
+                continue;
+            }
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V6(v6) = iface.ip() {
+                if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                    continue;
+                }
+                let addr = v6.to_string();
+                if !ips.contains(&addr) {
+                    ips.push(addr);
+                }
+            }
+        }
+    }
+    ips
 }
 
 /// Enumerate `(interface name, IPv4)` candidates for the `intentd pair`

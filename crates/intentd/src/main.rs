@@ -427,6 +427,8 @@ struct BindChoice {
 /// Build the picker entries from the enumerated `(interface, IPv4)` pairs
 /// (loopback first, per [`intent_transport::collect_bind_interfaces`]), then
 /// an explicit all-interfaces `0.0.0.0` entry carrying its exposure warning.
+/// A loopback entry is always present (synthesized when enumeration found
+/// none) so the first — and thus default — choice is never the wide bind.
 /// Pure over its input so the list shape is unit-testable.
 fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindChoice> {
     let mut choices: Vec<BindChoice> = interfaces
@@ -440,6 +442,15 @@ fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindCh
             addr: std::net::IpAddr::V4(*ip),
         })
         .collect();
+    if !choices.iter().any(|c| c.addr.is_loopback()) {
+        choices.insert(
+            0,
+            BindChoice {
+                label: "127.0.0.1 — this machine only (loopback)".to_string(),
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            },
+        );
+    }
     choices.push(BindChoice {
         label: "0.0.0.0 — ALL interfaces; exposed to every network this machine is on, \
                 including the internet"
@@ -1541,13 +1552,30 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     ws_options.locality_override = locality_override;
     // Apply the effective server.bindAddress (default 127.0.0.1 — loopback;
     // monorepo#2900). An unparseable persisted value falls back to loopback
-    // with a warning rather than silently widening the bind.
+    // with a warning rather than silently widening the bind (defense in
+    // depth — SettingsFile::validate rejects non-IP values at load time).
     match boot_settings.effective.server.bind_address.parse() {
         Ok(addr) => ws_options.bind_address = addr,
         Err(_) => tracing::warn!(
             value = %boot_settings.effective.server.bind_address,
             "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
         ),
+    }
+    // Loud upgrade-path warning (monorepo#2900): the old config template wrote
+    // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
+    // file-origin wide bind that predates the loopback default. When that wide
+    // bind will actually be served (listener enabled), say so prominently.
+    if ws_options.bind_address.is_unspecified()
+        && boot_settings.effective.server.ws_api.enabled
+        && !insecure
+    {
+        tracing::warn!(
+            "server.bindAddress = \"{}\" exposes the WSS listener on EVERY interface, \
+             including untrusted networks and possibly the internet. If this is not \
+             intentional, set bindAddress = \"127.0.0.1\" under [server] in config.toml \
+             (or re-run `intentd pair` and pick an interface)",
+            boot_settings.effective.server.bind_address
+        );
     }
     // ONE daemon-wide outstanding-slow-path-RPC cap (`server.maxOutstandingRpcs`,
     // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
@@ -5209,11 +5237,41 @@ mod tests {
     }
 
     #[test]
-    fn bind_choices_no_interfaces_still_offer_all_interfaces() {
+    fn bind_choices_no_interfaces_synthesize_loopback_default() {
+        // Empty enumeration must NOT leave 0.0.0.0 as the first (default)
+        // entry: a loopback choice is synthesized ahead of it.
         let choices = build_bind_choices(&[]);
-        assert_eq!(choices.len(), 1);
+        assert_eq!(choices.len(), 2);
         assert_eq!(
             choices[0].addr,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(
+            choices[0].label.contains("loopback"),
+            "{}",
+            choices[0].label
+        );
+        assert_eq!(
+            choices[1].addr,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn bind_choices_non_loopback_only_enumeration_synthesizes_loopback_first() {
+        let ifaces = vec![("eth0".to_string(), std::net::Ipv4Addr::new(10, 0, 0, 7))];
+        let choices = build_bind_choices(&ifaces);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(
+            choices[0].addr,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            choices[1].addr,
+            "10.0.0.7".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            choices[2].addr,
             "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
         );
     }

@@ -962,6 +962,23 @@ impl SettingsFile {
                 ),
             ));
         }
+        // Reject non-IP bind addresses at write time (settings.update
+        // re-validates through here) instead of deferring the failure to the
+        // next listener start (monorepo#2900 review).
+        if self
+            .server
+            .bind_address
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        {
+            return Err(bad(
+                "server.bindAddress",
+                format!(
+                    "must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {:?}",
+                    self.server.bind_address
+                ),
+            ));
+        }
         // Mirrors the catalog bound so a hand-edited config.toml cannot boot a
         // cap the `settings.update` RPC would have rejected (`0` = unlimited).
         if self.server.max_outstanding_rpcs > 100_000 {
@@ -1685,6 +1702,29 @@ mod tests {
                 err.to_string().contains(key),
                 "{body:?} should fail naming `{key}`: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn bind_address_must_be_an_ip_address() {
+        // Rejected at write/parse time so a typo or hostname never defers the
+        // failure to the next listener start (monorepo#2900 review).
+        for body in [
+            "[server]\nbindAddress = \"not-an-ip\"\n",
+            "[server]\nbindAddress = \"localhost\"\n",
+            "[server]\nbindAddress = \"\"\n",
+        ] {
+            let err = SettingsFile::parse_str(body).unwrap_err();
+            assert!(
+                err.to_string().contains("server.bindAddress"),
+                "{body:?} should fail naming `server.bindAddress`: {err}"
+            );
+        }
+        // Valid v4 / v6 forms (specific and unspecified) all parse.
+        for addr in ["127.0.0.1", "0.0.0.0", "192.168.1.7", "::", "::1"] {
+            let body = format!("[server]\nbindAddress = \"{addr}\"\n");
+            let parsed = SettingsFile::parse_str(&body).unwrap();
+            assert_eq!(parsed.server.bind_address, addr);
         }
     }
 
