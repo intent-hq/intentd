@@ -1,6 +1,6 @@
 //! WSS end-to-end for the write-side `git.*` methods added in
 //! docs/protocol/methods/git.md §5.6: `git.createBranch`, `git.checkoutBranch`,
-//! `git.renameBranch`, `git.stageHunk`, `git.unstageHunk`,
+//! `git.renameBranch`, `git.stage`, `git.stageHunk`, `git.unstageHunk`,
 //! `git.removeLockFile`, `git.push`, and `git.fetch`. Drives a real
 //! pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via config) and
 //! asserts the response envelope shape from docs/protocol/methods/git.md §5.6 (`{ ok, ... }`)
@@ -453,6 +453,199 @@ async fn git_branch_ops_round_trip_over_wss() {
     )
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// A stale or ignored untracked path does not block a valid path in the same
+/// `git.stage` request. Prohibited and unsafe entries reject the whole batch,
+/// while fully unmatched and ignored-only requests keep a pathspec error.
+#[tokio::test]
+async fn git_stage_tolerates_stale_path_in_valid_batch_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-stage-stale");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — stale stage").await;
+    std::fs::write(wt.join("tracked.txt"), "changed\n").unwrap();
+
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "git.stage",
+        json!({
+            "workspaceId": ws_id,
+            "paths": ["vanished.txt", "tracked.txt"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "ok": true,
+                "paths": ["vanished.txt", "tracked.txt"],
+            },
+        })
+    );
+
+    let status = wss_rpc(&mut ws, 4, "git.status", json!({ "workspaceId": ws_id })).await;
+    let files = status["result"]["files"].as_array().expect("files array");
+    let tracked = files
+        .iter()
+        .find(|file| file["path"] == json!("tracked.txt"))
+        .expect("tracked.txt in status after stage");
+    assert_eq!(tracked["staged"], json!(true));
+    assert!(files
+        .iter()
+        .all(|file| file["path"] != json!("vanished.txt")));
+
+    let resp = wss_rpc(
+        &mut ws,
+        5,
+        "git.unstage",
+        json!({ "workspaceId": ws_id, "paths": ["tracked.txt"] }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true), "unstage: {resp}");
+
+    std::fs::write(wt.join("tracked.log"), "one\n").unwrap();
+    run_git(&["add", "tracked.log"], &wt);
+    run_git(&["commit", "-q", "-m", "tracked ignored fixture"], &wt);
+    std::fs::write(wt.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(wt.join("tracked.log"), "two\n").unwrap();
+    std::fs::write(wt.join("ignored.log"), "ignored\n").unwrap();
+
+    let resp = wss_rpc(
+        &mut ws,
+        6,
+        "git.stage",
+        json!({
+            "workspaceId": ws_id,
+            "paths": ["ignored.log", "tracked.log"],
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true), "mixed ignored: {resp}");
+    assert_eq!(
+        run_git(&["diff", "--cached", "--name-only"], &wt),
+        "tracked.log"
+    );
+
+    let resp = wss_rpc(
+        &mut ws,
+        7,
+        "git.unstage",
+        json!({ "workspaceId": ws_id, "paths": ["tracked.log"] }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true), "unstage: {resp}");
+
+    let resp = wss_rpc(
+        &mut ws,
+        8,
+        "git.stage",
+        json!({ "workspaceId": ws_id, "paths": ["ignored.log"] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603), "ignored-only: {resp}");
+    assert!(run_git(&["diff", "--cached", "--name-only"], &wt).is_empty());
+
+    let resp = wss_rpc(
+        &mut ws,
+        9,
+        "git.stage",
+        json!({ "workspaceId": ws_id, "paths": ["tracked.txt", "*"] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603), "stage-all: {resp}");
+    assert!(run_git(&["diff", "--cached", "--name-only"], &wt).is_empty());
+
+    let resp = wss_rpc(
+        &mut ws,
+        10,
+        "git.stage",
+        json!({ "workspaceId": ws_id, "paths": ["tracked.txt", "../outside"] }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602), "traversal: {resp}");
+    assert!(run_git(&["diff", "--cached", "--name-only"], &wt).is_empty());
+
+    let resp = wss_rpc(
+        &mut ws,
+        11,
+        "git.stage",
+        json!({ "workspaceId": ws_id, "paths": ["still-missing.txt"] }),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], json!("2.0"));
+    assert_eq!(resp["id"], json!(11));
+    assert!(resp.get("result").is_none(), "unmatched stage: {resp}");
+    assert_eq!(resp["error"]["code"], json!(-32603));
+    let message = resp["error"]["data"]
+        .as_str()
+        .or_else(|| resp["error"]["message"].as_str())
+        .unwrap_or_default();
+    assert!(message.contains("pathspec 'still-missing.txt' did not match any files"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+#[tokio::test]
+async fn git_status_force_refresh_bypasses_cached_status_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-status-force-refresh");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — forced status").await;
+
+    std::fs::write(wt.join("transient.txt"), "present\n").unwrap();
+    let present = wss_rpc(
+        &mut ws,
+        3,
+        "git.status",
+        json!({ "workspaceId": ws_id, "forceRefresh": true }),
+    )
+    .await;
+    assert_eq!(present["jsonrpc"], json!("2.0"));
+    assert_eq!(present["id"], json!(3));
+    assert!(present.get("error").is_none(), "forced status: {present}");
+    assert!(present["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == json!("transient.txt")));
+
+    std::fs::remove_file(wt.join("transient.txt")).unwrap();
+    let refreshed = wss_rpc(
+        &mut ws,
+        4,
+        "git.status",
+        json!({ "workspaceId": ws_id, "forceRefresh": true }),
+    )
+    .await;
+    assert_eq!(refreshed["jsonrpc"], json!("2.0"));
+    assert_eq!(refreshed["id"], json!(4));
+    assert!(
+        refreshed.get("error").is_none(),
+        "forced status refresh: {refreshed}"
+    );
+    assert!(refreshed["result"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|file| file["path"] != json!("transient.txt")));
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

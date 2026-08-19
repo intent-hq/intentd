@@ -847,6 +847,15 @@ impl WorkspaceApi for FakeApi {
         workspace_id: WorkspaceId,
         git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<GitStatus>> {
+        self.git_status_with_options(workspace_id, git_root_id, false)
+    }
+
+    fn git_status_with_options(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+        force_refresh: bool,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
         Box::pin(async move {
             if let Some(id) = &git_root_id {
                 if id.as_str() != "root-1" {
@@ -854,6 +863,17 @@ impl WorkspaceApi for FakeApi {
                 }
                 return Ok(GitStatus {
                     branch: "root-branch".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                    diverged: false,
+                    files: vec![],
+                    has_uncommitted_changes: false,
+                    has_untracked_files: false,
+                });
+            }
+            if force_refresh {
+                return Ok(GitStatus {
+                    branch: "forced".to_string(),
                     ahead: 0,
                     behind: 0,
                     diverged: false,
@@ -3862,6 +3882,16 @@ async fn git_status_returns_status_object() {
     );
     assert_eq!(v["result"]["files"][0]["status"], serde_json::json!("M"));
     assert_eq!(v["result"]["files"][0]["staged"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn git_status_force_refresh_is_forwarded() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","forceRefresh":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("forced"));
 }
 
 #[tokio::test]

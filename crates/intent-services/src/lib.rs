@@ -1500,6 +1500,24 @@ impl Services {
         self.git_status_cache.waiters(worktree)
     }
 
+    /// Test seam: number of forced status callers waiting for a published,
+    /// pre-invalidation flight to retire before they can join again.
+    #[cfg(test)]
+    pub(crate) fn git_status_retirement_waiters(&self, worktree: &Path) -> usize {
+        self.git_status_cache.retirement_waiters(worktree)
+    }
+
+    /// Test seam: park a status leader after result publication but before its
+    /// flight is removed, making the handoff race deterministic.
+    #[cfg(test)]
+    pub(crate) fn with_git_status_after_publish_probe(
+        self,
+        probe: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.git_status_cache.set_after_publish_probe(probe);
+        self
+    }
+
     /// Test seam: number of followers currently awaiting the in-flight full
     /// `accept-changes.getStatus` build for `workspace_id`.
     #[cfg(test)]
@@ -1527,10 +1545,20 @@ impl Services {
     /// from the per-worktree cache when live, otherwise one single-flighted
     /// blocking-pool scan whose result every concurrent caller shares and
     /// which repopulates the cache.
-    async fn scan_git_status(&self, worktree: &Path) -> Result<Arc<intent_core::GitStatus>> {
-        self.git_status_cache
-            .get(worktree, self.git_status_scan_probe.clone())
-            .await
+    async fn scan_git_status(
+        &self,
+        worktree: &Path,
+        force_refresh: bool,
+    ) -> Result<Arc<intent_core::GitStatus>> {
+        if force_refresh {
+            self.git_status_cache
+                .get_fresh(worktree, self.git_status_scan_probe.clone())
+                .await
+        } else {
+            self.git_status_cache
+                .get(worktree, self.git_status_scan_probe.clone())
+                .await
+        }
     }
 
     /// Handle on the status cache for a daemon-owned git mutation to
@@ -19298,6 +19326,15 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
+        self.git_status_with_options(workspace_id, git_root_id, false)
+    }
+
+    fn git_status_with_options(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+        force_refresh: bool,
+    ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
         let svc = self.clone();
         Box::pin(async move {
             // Unknown workspace / remote / non-repo all return the empty status
@@ -19326,7 +19363,7 @@ impl WorkspaceApi for Services {
             // `git_fetch_bounded` closes for `git.fetch`) nor gets re-walked
             // once per concurrent caller (monorepo#1648).
             let started = std::time::Instant::now();
-            let status = svc.scan_git_status(&path).await;
+            let status = svc.scan_git_status(&path, force_refresh).await;
             if let Ok(s) = &status {
                 tracing::debug!(
                     workspace_id = %workspace_id.as_str(),
@@ -20710,7 +20747,7 @@ impl WorkspaceApi for Services {
             // The same working-tree scan `git.status` pays, so it goes through
             // the shared per-worktree single-flight (monorepo#1648): a burst
             // mixing `git.changes` with `git.status` walks the tree once.
-            let status = svc.scan_git_status(&path).await?;
+            let status = svc.scan_git_status(&path, false).await?;
             Ok(serde_json::to_value(&status.files).unwrap_or(empty))
         })
     }
@@ -24582,7 +24619,7 @@ impl Services {
             match inflight.join(&workspace_id) {
                 ac_status_singleflight::Join::Leader(guard) => {
                     let scanned = if worktree.join(".git").exists() {
-                        match self.scan_git_status(&worktree).await {
+                        match self.scan_git_status(&worktree, false).await {
                             Ok(scanned) => Some(scanned),
                             Err(e) => {
                                 guard.finish(Err(match &e {
@@ -25951,7 +25988,7 @@ impl Services {
             // accept-changes step land on a warm, current entry.
             self.git_status_cache.invalidate(worktree);
             let scanned = if worktree.join(".git").exists() {
-                self.scan_git_status(worktree).await.ok()
+                self.scan_git_status(worktree, false).await.ok()
             } else {
                 None
             };

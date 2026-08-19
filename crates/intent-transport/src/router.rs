@@ -2011,8 +2011,9 @@ async fn dispatch(
             // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
             // scan to a registered git root; an unknown/foreign id is -32602.
             let git_root_id = opt_git_root_id(params);
+            let force_refresh = opt_bool(params, "forceRefresh").unwrap_or(false);
             let status = api
-                .git_status(ws, git_root_id)
+                .git_status_with_options(ws, git_root_id, force_refresh)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&status)

@@ -128,15 +128,33 @@ impl GitStatusCache {
                 slot.cached = None;
             }
         }
-        self.scan(&key, worktree, probe).await
+        self.scan(&key, worktree, probe, None).await
     }
 
-    /// Discard the cached status for `worktree` and repopulate it with a fresh
-    /// scan. The refresher's post-change recompute goes through here so its
-    /// scan feeds the cache instead of racing a separate one.
+    /// Discard the cached status and require a scan that starts after this
+    /// invalidation. If an older scan is already in flight, await and discard
+    /// its result before joining or leading the next flight.
+    pub(crate) async fn get_fresh(
+        &self,
+        worktree: &Path,
+        probe: ScanProbe,
+    ) -> Result<Arc<GitStatus>> {
+        let key = git_status_singleflight::status_key(worktree);
+        let minimum_generation = {
+            let mut slots = self.slots.lock().unwrap();
+            let slot = slots.entry(key.clone()).or_default();
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.cached = None;
+            slot.generation
+        };
+        self.scan(&key, worktree, probe, Some(minimum_generation))
+            .await
+    }
+
+    /// Refresh for watcher-driven recomputes, using the same authoritative
+    /// semantics as a forced `git.status` read.
     pub async fn refresh(&self, worktree: &Path) -> Result<Arc<GitStatus>> {
-        self.invalidate(worktree);
-        self.get(worktree, None).await
+        self.get_fresh(worktree, None).await
     }
 
     /// The entry's current generation, snapshotted before a scan starts.
@@ -151,11 +169,14 @@ impl GitStatusCache {
 
     /// Store `status` only if the entry has not been invalidated since the
     /// scan started (see the module note on invalidation racing a scan).
-    fn store(&self, key: &StatusKey, generation: u64, status: &Arc<GitStatus>) {
+    fn store(&self, key: &StatusKey, generation: u64, status: &Arc<GitStatus>) -> bool {
         let mut slots = self.slots.lock().unwrap();
         let slot = slots.entry(key.clone()).or_default();
         if slot.generation == generation {
             slot.cached = Some((Arc::clone(status), Instant::now()));
+            true
+        } else {
+            false
         }
     }
 
@@ -166,22 +187,22 @@ impl GitStatusCache {
     /// that vanishes without publishing frees the flight, so the result of a
     /// failed or cancelled scan is never reused.
     ///
-    /// Only the leader caches its result, and only against the generation it
-    /// snapshotted *after* being elected: a follower's own generation says
-    /// nothing about when the leader's scan started, so a follower that joined
-    /// after an invalidation must not publish the leader's older snapshot.
+    /// Only the leader caches its result, and only against the generation
+    /// registered on that exact flight. Forced followers compare that flight
+    /// generation with their invalidation generation and wait for an older
+    /// published flight to retire before joining again.
     async fn scan(
         &self,
         key: &StatusKey,
         worktree: &Path,
         probe: ScanProbe,
+        minimum_generation: Option<u64>,
     ) -> Result<Arc<GitStatus>> {
         loop {
-            match self.flights.join(key) {
+            let candidate_generation = self.generation(key);
+            match self.flights.join(key, candidate_generation) {
                 Join::Leader(flight) => {
-                    // Snapshot after election, so anything that invalidated
-                    // before this scan started is already reflected.
-                    let generation = self.generation(key);
+                    let generation = flight.generation();
                     // A libgit2 working-tree scan is unbounded CPU on a big
                     // repo; never run it on a Tokio worker.
                     let scan_path = worktree.to_path_buf();
@@ -197,8 +218,13 @@ impl GitStatusCache {
                     return match scanned {
                         Ok(status) => {
                             let shared = Arc::new(status);
-                            self.store(key, generation, &shared);
+                            let stored = self.store(key, generation, &shared);
                             flight.finish(Ok(Arc::clone(&shared)));
+                            if minimum_generation
+                                .is_some_and(|minimum| generation < minimum || !stored)
+                            {
+                                continue;
+                            }
                             Ok(shared)
                         }
                         Err(e) => {
@@ -215,22 +241,30 @@ impl GitStatusCache {
                         }
                     };
                 }
-                Join::Follower(mut rx) => {
+                Join::Follower(mut follower) => {
                     tracing::debug!(
                         worktree = %key.display(),
                         "git status: coalesced into in-flight worktree scan"
                     );
-                    match rx.wait_for(|slot| slot.is_some()).await {
-                        Ok(slot) => {
-                            return match slot.clone().expect("wait_for guarantees Some") {
+                    match follower.result().await {
+                        Some(published) => {
+                            let result = match published {
                                 Ok(shared) => Ok(shared),
                                 Err(msg) => Err(Error::Internal(msg)),
                             };
+                            let generation = follower.generation();
+                            if minimum_generation.is_some_and(|minimum| {
+                                generation < minimum || self.generation(key) != generation
+                            }) {
+                                follower.wait_for_retirement().await;
+                                continue;
+                            }
+                            return result;
                         }
                         // The leader vanished without publishing (cancelled
                         // RPC / panicked scan): retry — the next join elects a
                         // new leader.
-                        Err(_) => continue,
+                        None => continue,
                     }
                 }
             }
@@ -243,6 +277,17 @@ impl GitStatusCache {
     pub(crate) fn waiters(&self, worktree: &Path) -> usize {
         self.flights
             .waiters(&git_status_singleflight::status_key(worktree))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement_waiters(&self, worktree: &Path) -> usize {
+        self.flights
+            .retirement_waiters(&git_status_singleflight::status_key(worktree))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_publish_probe(&self, probe: Arc<dyn Fn() + Send + Sync>) {
+        self.flights.set_after_publish_probe(probe);
     }
 
     /// Test seam: number of slots currently held.

@@ -13844,6 +13844,132 @@ mod file_tracking {
         );
     }
 
+    #[tokio::test]
+    async fn git_status_force_refresh_bypasses_cached_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(svc
+            .git_status(ws_id.clone(), None)
+            .await
+            .unwrap()
+            .files
+            .is_empty());
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        assert!(
+            svc.git_status(ws_id.clone(), None)
+                .await
+                .unwrap()
+                .files
+                .is_empty(),
+            "the default read keeps existing cached behavior"
+        );
+
+        let fresh = svc
+            .git_status_with_options(ws_id, None, true)
+            .await
+            .unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert!(fresh.files.iter().any(|file| file.path == "seed.txt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn git_status_force_refresh_waits_for_published_old_flight_to_retire() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release_scan = Arc::new(AtomicBool::new(false));
+        let publications = Arc::new(AtomicUsize::new(0));
+        let first_published = Arc::new(AtomicBool::new(false));
+        let release_retirement = Arc::new(AtomicBool::new(false));
+        let changed_path = repo.dir.join("seed.txt");
+        let svc = svc
+            .with_git_status_scan_probe({
+                let scans = Arc::clone(&scans);
+                let release_scan = Arc::clone(&release_scan);
+                Arc::new(move || {
+                    if scans.fetch_add(1, Ordering::SeqCst) == 0 {
+                        while !release_scan.load(Ordering::SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    }
+                })
+            })
+            .with_git_status_after_publish_probe({
+                let publications = Arc::clone(&publications);
+                let first_published = Arc::clone(&first_published);
+                let release_retirement = Arc::clone(&release_retirement);
+                Arc::new(move || {
+                    if publications.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::fs::write(&changed_path, "seed\nadded\n").unwrap();
+                        first_published.store(true, Ordering::SeqCst);
+                        tokio::task::block_in_place(|| {
+                            while !release_retirement.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                            }
+                        });
+                    }
+                })
+            });
+
+        let old = tokio::spawn({
+            let svc = svc.clone();
+            let ws_id = ws_id.clone();
+            async move { svc.git_status(ws_id, None).await }
+        });
+        wait_until("older status scan to start", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let forced = tokio::spawn({
+            let svc = svc.clone();
+            let ws_id = ws_id.clone();
+            async move { svc.git_status_with_options(ws_id, None, true).await }
+        });
+        wait_until("forced status to join the older flight", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+        release_scan.store(true, Ordering::SeqCst);
+        wait_until("older flight to publish before removal", || {
+            first_published.load(Ordering::SeqCst)
+        })
+        .await;
+        wait_until("forced status to wait for old-flight retirement", || {
+            svc.git_status_retirement_waiters(&repo.dir) == 1
+        })
+        .await;
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        assert!(
+            !forced.is_finished(),
+            "forced status must not accept the published pre-invalidation result"
+        );
+        release_retirement.store(true, Ordering::SeqCst);
+
+        let old = old.await.unwrap().unwrap();
+        let fresh = forced.await.unwrap().unwrap();
+        assert!(
+            old.files.is_empty(),
+            "the old flight scanned before the edit"
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert!(fresh.files.iter().any(|file| file.path == "seed.txt"));
+    }
+
     /// A daemon-owned git mutation invalidates the cache inline, so the next
     /// read reflects it rather than serving the pre-mutation snapshot.
     #[tokio::test]
