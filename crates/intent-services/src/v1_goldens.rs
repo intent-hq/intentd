@@ -368,7 +368,6 @@ fn golden_group_wake_header() {
         expected_agent_ids: vec![child_a.clone(), child_b.clone()],
         completed_agent_ids: vec![child_a.clone(), child_b.clone()],
         deleted_agent_ids: vec![],
-        subscription_id: None,
         sealed: true,
         delivered: false,
         event_summaries: vec![

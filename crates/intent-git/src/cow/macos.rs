@@ -13,15 +13,6 @@ use super::{CowCloneStats, CowSupport};
 // physical byte copy, preserving the module contract (monorepo#1124).
 const COPYFILE_CLONE_FORCE: u32 = 1 << 25;
 
-// getattrlist volume capability constants
-// TODO: Re-enable fast path once f_fsid comparison is fixed for APFS
-#[allow(dead_code)]
-const ATTR_VOL_INFO: u32 = 0x80000000;
-#[allow(dead_code)]
-const ATTR_VOL_CAPABILITIES: u32 = 1 << 17;
-#[allow(dead_code)]
-const VOL_CAP_INT_CLONE: u64 = 1 << 25;
-
 extern "C" {
     fn copyfile(
         from: *const libc::c_char,
@@ -32,42 +23,7 @@ extern "C" {
 
     fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
 
-    #[allow(dead_code)]
-    fn getattrlist(
-        path: *const libc::c_char,
-        attrlist: *const AttrList,
-        attrbuf: *mut libc::c_void,
-        attrBufSize: libc::size_t,
-        options: libc::c_ulong,
-    ) -> libc::c_int;
-
     fn statfs(path: *const libc::c_char, buf: *mut StatFs) -> libc::c_int;
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct AttrList {
-    bitmapcount: libc::c_ushort,
-    reserved: libc::c_ushort,
-    commonattr: u32,
-    volattr: u32,
-    dirattr: u32,
-    fileattr: u32,
-    forkattr: u32,
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct VolCapabilities {
-    capabilities: [u32; 4],
-    valid: [u32; 4],
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct AttrBuf {
-    length: u32,
-    caps: VolCapabilities,
 }
 
 #[repr(C)]
@@ -91,81 +47,6 @@ struct StatFs {
     f_reserved: [u32; 7],
 }
 
-/// Fast path: check volume capability flags. Returns `Some(Supported/Unsupported)`
-/// if conclusive, `None` if the live probe is needed.
-/// TODO: Re-enable once f_fsid comparison is fixed for APFS
-#[allow(dead_code)]
-fn check_volume_caps(src_dir: &Path, dst_dir: &Path) -> Option<CowSupport> {
-    let src_caps = has_clone_capability(src_dir)?;
-    let dst_caps = has_clone_capability(dst_dir)?;
-
-    if !src_caps || !dst_caps {
-        return Some(CowSupport::Unsupported);
-    }
-
-    // Check same volume (f_fsid must match)
-    if !same_volume(src_dir, dst_dir) {
-        return Some(CowSupport::Unsupported);
-    }
-
-    None // Live probe needed
-}
-
-#[allow(dead_code)]
-fn has_clone_capability(path: &Path) -> Option<bool> {
-    let path_cstr = CString::new(path.as_os_str().as_bytes()).ok()?;
-
-    let attrlist = AttrList {
-        bitmapcount: 5,
-        reserved: 0,
-        commonattr: 0,
-        volattr: ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES,
-        dirattr: 0,
-        fileattr: 0,
-        forkattr: 0,
-    };
-
-    let mut attrbuf: AttrBuf = unsafe { std::mem::zeroed() };
-
-    let ret = unsafe {
-        getattrlist(
-            path_cstr.as_ptr(),
-            &attrlist,
-            &mut attrbuf as *mut _ as *mut libc::c_void,
-            std::mem::size_of::<AttrBuf>(),
-            0,
-        )
-    };
-
-    if ret != 0 {
-        return None;
-    }
-
-    Some((attrbuf.caps.capabilities[3] & (VOL_CAP_INT_CLONE as u32)) != 0)
-}
-
-#[allow(dead_code)]
-fn same_volume(src: &Path, dst: &Path) -> bool {
-    let src_cstr = CString::new(src.as_os_str().as_bytes()).ok();
-    let dst_cstr = CString::new(dst.as_os_str().as_bytes()).ok();
-
-    let (Some(src_cstr), Some(dst_cstr)) = (src_cstr, dst_cstr) else {
-        return false;
-    };
-
-    let mut src_stat: StatFs = unsafe { std::mem::zeroed() };
-    let mut dst_stat: StatFs = unsafe { std::mem::zeroed() };
-
-    let src_ret = unsafe { statfs(src_cstr.as_ptr(), &mut src_stat) };
-    let dst_ret = unsafe { statfs(dst_cstr.as_ptr(), &mut dst_stat) };
-
-    if src_ret != 0 || dst_ret != 0 {
-        return false;
-    }
-
-    src_stat.f_fsid == dst_stat.f_fsid
-}
-
 /// Get volume IDs (f_fsid) for both paths as a cache key.
 pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
     let src_id = get_volume_id(src)?;
@@ -185,12 +66,9 @@ fn get_volume_id(path: &Path) -> Option<u64> {
 }
 
 pub fn probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
-    // SKIP fast path for now - it has false negatives with f_fsid comparison on APFS
-    // if let Some(result) = check_volume_caps(src_dir, dst_dir) {
-    //     return Ok(result);
-    // }
-
-    // Live probe: create a temp file and try to clone it
+    // Live probe: create a temp file and try to clone it. (A getattrlist
+    // volume-capability fast path existed but had false negatives with the
+    // f_fsid comparison on APFS; see git history if it's ever revisited.)
     let temp_src = src_dir.join(".cow_probe_temp");
     let temp_dst = dst_dir.join(".cow_probe_temp");
 
