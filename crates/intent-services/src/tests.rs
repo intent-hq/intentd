@@ -25619,6 +25619,17 @@ mod clone_orchestration {
             "hydration persists cow or direct: {:?}",
             ws.checkout_mode
         );
+        // The derived executionEnvironment (§5.1 v4.2) follows the checkout
+        // mode: CoW copy → `cow`, plain local clone → `direct`.
+        let expected_env = match ws.checkout_mode {
+            Some(intent_core::CheckoutMode::Cow) => intent_core::SandboxType::Cow,
+            _ => intent_core::SandboxType::Direct,
+        };
+        assert_eq!(
+            ws.execution_environment,
+            Some(expected_env),
+            "hydration derives executionEnvironment from the checkout mode"
+        );
         assert_eq!(
             repo.head().unwrap().shorthand().expect("branch name"),
             ws.branch.as_str(),
@@ -25645,7 +25656,7 @@ mod clone_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
+        let svc = Services::new(store.clone())
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
@@ -25670,6 +25681,12 @@ mod clone_orchestration {
             "base commit SHA recorded from the checkout"
         );
         drop(repo);
+        // The derived environment round-trips through the store.
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment, ws.execution_environment,
+            "derived executionEnvironment round-trips through the store"
+        );
         // Owner/name derived from the URL (file:// → last two segments).
         assert!(ws.repository_owner.is_some(), "owner derived from URL");
         assert_eq!(
