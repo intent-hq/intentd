@@ -1426,6 +1426,139 @@ fn merge_live_turn_slims_in_flight_blocks_under_slim_projection() {
     assert!(blocks[1].get("outputTruncated").is_none());
 }
 
+/// The §5.5 slim page budget survives the live-turn merge: a streaming turn
+/// with many individually-capped blocks weighs more than the whole page
+/// budget, so appending it beside an at-budget persisted page must evict the
+/// oldest persisted rows (never the live turn — the newest row anchors) and
+/// re-mint `truncated`/`nextToken` at the first evicted row so the client
+/// pages the evicted history back via `agent.getConversation`.
+#[test]
+fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
+    use intent_core::{SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
+    // Persisted page: 8 rows of ~128KB each (~1MB total mimics a page that
+    // arrived at/near budget from the budgeted read).
+    let row_text = "p".repeat(128 * 1024);
+    let messages: Vec<Value> = (0..8)
+        .map(|i| {
+            json!({
+                "id": format!("m-{i}"),
+                "seq": 100 + i,
+                "role": "user",
+                "contentBlocks": [{ "type": "text", "text": row_text }],
+            })
+        })
+        .collect();
+    // Live turn: 400 capped tool_result blocks ≈ 800KB after slimming —
+    // alone over the 512KB budget.
+    let capped = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES);
+    let live_blocks: Vec<Value> = (0..400)
+        .map(|i| {
+            json!({ "id": format!("msg-live:{i}"), "type": "tool_result",
+                    "tool_use_id": format!("tc-{i}"), "output": capped, "is_error": false })
+        })
+        .collect();
+    let live = json!({ "messageId": "msg-live", "contentBlocks": live_blocks });
+
+    let mut snapshot = json!({
+        "messages": messages,
+        "totalMessages": 108,
+        "truncated": true,
+        "nextToken": "tok-old",
+    });
+    merge_live_turn(
+        &mut snapshot,
+        &agent(),
+        &live,
+        true,
+        Some(ConversationProjection::Slim),
+    );
+    let arr = snapshot["messages"].as_array().unwrap();
+    // The live turn survives as the newest row (the budget anchor)…
+    assert_eq!(arr.last().unwrap()["id"], "msg-live");
+    assert_eq!(snapshot["totalMessages"], 109);
+    // …and oldest persisted rows were evicted to make room.
+    assert!(
+        arr.len() < 9,
+        "over-budget merge must evict oldest rows, kept {}",
+        arr.len()
+    );
+    let page_bytes = serde_json::to_string(arr).unwrap().len();
+    // One-row floor aside, the kept page hugs the budget: the live turn
+    // (~0.9MB slim) anchors, so allow budget + one row's slack.
+    assert!(
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES * 2,
+        "merged page must be re-budgeted, got {page_bytes} bytes"
+    );
+    // The continuation cursor was re-minted at the oldest KEPT row's seq, so
+    // `agent.getConversation {{ nextToken }}` resumes at the first evicted row.
+    assert_eq!(snapshot["truncated"], true);
+    let token = snapshot["nextToken"].as_str().expect("re-minted token");
+    assert_ne!(
+        token, "tok-old",
+        "cursor must move to the eviction boundary"
+    );
+    use base64::Engine as _;
+    let cursor: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(token)
+            .unwrap(),
+    )
+    .unwrap();
+    let oldest_kept_seq = arr[0]["seq"].as_u64().unwrap();
+    assert_eq!(cursor["b"].as_u64().unwrap(), oldest_kept_seq);
+}
+
+/// The merge-time re-budget is slim-only and fit-tolerant: a full-fidelity
+/// merge never evicts (mirroring the unbudgeted full read), and a slim merge
+/// whose page already fits keeps every row and the original cursor.
+#[test]
+fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
+    let heavy_text = "p".repeat(700 * 1024);
+    let heavy_page = json!({
+        "messages": [
+            { "id": "m-0", "seq": 0, "role": "user",
+              "contentBlocks": [{ "type": "text", "text": heavy_text }] },
+        ],
+        "totalMessages": 1,
+        "truncated": false,
+        "nextToken": Value::Null,
+    });
+    let live = json!({
+        "messageId": "msg-live",
+        "contentBlocks": [{ "id": "msg-live:0", "type": "text", "text": "partial" }],
+    });
+
+    // Full projection: the (over-budget) persisted row is untouched.
+    let mut full = heavy_page.clone();
+    merge_live_turn(&mut full, &agent(), &live, true, None);
+    assert_eq!(full["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(full["truncated"], false);
+
+    // Slim projection, small page: everything fits, nothing evicted, the
+    // original cursor is preserved.
+    let mut slim = json!({
+        "messages": [
+            { "id": "m-0", "seq": 5, "role": "user",
+              "contentBlocks": [{ "type": "text", "text": "small" }] },
+        ],
+        "totalMessages": 6,
+        "truncated": true,
+        "nextToken": "tok-old",
+    });
+    merge_live_turn(
+        &mut slim,
+        &agent(),
+        &live,
+        true,
+        Some(ConversationProjection::Slim),
+    );
+    assert_eq!(slim["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        slim["nextToken"], "tok-old",
+        "fitting page keeps its cursor"
+    );
+}
+
 // --- task_delta re-read arm (channel-mapping regression) ------------------
 
 mod task_delta_re_read {

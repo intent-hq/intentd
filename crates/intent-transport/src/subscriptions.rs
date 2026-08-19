@@ -20,7 +20,7 @@ use intent_core::events::{
 };
 use intent_core::{
     extract_spec_task_ids, now_iso, AgentId, ConversationProjection, Event, Note, NoteId,
-    WorkspaceApi, WorkspaceId,
+    WorkspaceApi, WorkspaceId, SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -661,6 +661,20 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// still-streaming turn keeps merging empty — a turn that has only just begun
 /// legitimately has no blocks yet, and the client needs the id to reconcile
 /// against.
+///
+/// **Slim page budget (§5.5).** Under `projection: "slim"` the merged page is
+/// re-budgeted after the append: the persisted page arrived within
+/// [`SLIM_PAGE_BUDGET_BYTES`], but `slim_message_blocks` caps block *bodies*,
+/// not block *count*, so a streaming turn with hundreds of capped blocks can
+/// weigh MBs on its own — added beside an at-budget persisted page, the seq-0
+/// frame would blow the budget the read path just enforced. The live turn is
+/// the newest row and the page's anchor (always kept, even alone over
+/// budget); oldest persisted rows are evicted until the page fits, with
+/// `truncated`/`nextToken` re-minted at the first evicted row (row `seq` is
+/// contiguous from 0, so a row's seq IS its global oldest-indexed position)
+/// so the client pulls the evicted rows via `agent.getConversation` exactly
+/// like any budget-trimmed page. Full (absent-projection) merges are never
+/// budgeted, mirroring the read path.
 fn merge_live_turn(
     snapshot: &mut Value,
     agent_id: &AgentId,
@@ -715,6 +729,48 @@ fn merge_live_turn(
         "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
+    if projection == Some(ConversationProjection::Slim) {
+        rebudget_merged_page(obj);
+    }
+}
+
+/// Re-apply the §5.5 slim page budget to a chat snapshot's `messages` page
+/// after the live-turn append (see [`merge_live_turn`]'s budget note). The
+/// newest row — the just-appended live turn — is the anchor and always
+/// serves; oldest rows are evicted until the page fits
+/// [`SLIM_PAGE_BUDGET_BYTES`], with `truncated`/`nextToken` re-minted at the
+/// oldest kept row's global position (its `seq`, contiguous from 0) so the
+/// evicted rows stay reachable via `agent.getConversation { nextToken }`
+/// with no gaps or duplicates. Sizes are counted through the same discarding
+/// writer as the read path ([`intent_services::pagination::serialized_size`]),
+/// so both sides of the budget agree on what a row weighs. No-op when the
+/// merged page already fits — the common case, since the persisted page
+/// arrived within budget and a typical live turn is small.
+fn rebudget_merged_page(obj: &mut Map<String, Value>) {
+    let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let sizes: Vec<usize> = arr
+        .iter()
+        .map(intent_services::pagination::serialized_size)
+        .collect();
+    let (lo, _hi) = intent_services::pagination::budget_page(
+        &sizes,
+        intent_services::pagination::BudgetAnchor::Newest,
+        SLIM_PAGE_BUDGET_BYTES,
+    );
+    if lo == 0 {
+        return;
+    }
+    let boundary = arr[lo].get("seq").and_then(Value::as_u64);
+    arr.drain(..lo);
+    if let Some(b) = boundary {
+        obj.insert("truncated".to_string(), Value::Bool(true));
+        let token = intent_services::pagination::remint_backward_token(b as usize)
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        obj.insert("nextToken".to_string(), token);
+    }
 }
 
 /// Stateful, event-payload-driven delta mapper for the per-agent chat channel

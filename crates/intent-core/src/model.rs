@@ -2260,9 +2260,14 @@ pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 /// `agent.getConversation` page (and the seq-0 chat snapshot that reuses it)
 /// stops early once its cumulative serialized size would exceed this budget,
 /// re-minting the continuation token at the first excluded message — so the
-/// worst-case slim frame is this budget plus one message's slim size, well
-/// under the transport's 1 MiB large-frame warn. Serve-time only; the full
-/// (absent-projection) read is never budgeted.
+/// worst-case slim frame is this budget plus one message's slim size. That
+/// stays under the transport's 1 MiB large-frame warn for typical messages,
+/// but is NOT a hard bound: per-message slim size is unbounded (blocks are
+/// capped individually, block count is not), so a single block-heavy message
+/// can exceed the warn alone — which the at-least-one-message floor accepts
+/// by design, degrading to one whole message per page rather than an
+/// unpageable transcript. Serve-time only; the full (absent-projection) read
+/// is never budgeted.
 pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
 
 /// Byte size of a `tool_use.input` / `tool_result.output` body for the slim

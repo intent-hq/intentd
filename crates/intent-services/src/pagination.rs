@@ -248,6 +248,30 @@ pub fn remint_forward_token(end: usize, len: usize) -> Option<String> {
     (end < len).then(|| encode_token(&json!({ "f": end })))
 }
 
+/// Serialized JSON byte size of one served row, for the §5.5 slim page
+/// budget. Counted through a discarding writer so no page-sized string is
+/// allocated just to be measured; a row that fails to serialize measures 0
+/// and is admitted (fail-open, matching [`intent_core::slim_body_size`]).
+/// Shared by the paginated read (`agent_ops`) and the seq-0 chat snapshot's
+/// live-turn merge (`intent-transport`), so both sides of the budget agree
+/// on what a row weighs.
+pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = CountingSink(0);
+    serde_json::to_writer(&mut sink, row)
+        .map(|()| sink.0)
+        .unwrap_or(0)
+}
+
 /// A page of items plus the opaque token for the next (older) page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {

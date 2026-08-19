@@ -1871,27 +1871,6 @@ fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) 
     message
 }
 
-/// Serialized JSON byte size of one served message, for the §5.5 slim page
-/// budget. Counted through a discarding writer so no page-sized string is
-/// allocated just to be measured; a message that fails to serialize measures
-/// 0 and is admitted (fail-open, matching [`intent_core::slim_body_size`]).
-fn serialized_message_size(message: &AgentMessage) -> usize {
-    struct CountingSink(usize);
-    impl std::io::Write for CountingSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut sink = CountingSink(0);
-    serde_json::to_writer(&mut sink, message)
-        .map(|()| sink.0)
-        .unwrap_or(0)
-}
-
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
     /// the runtime manager's busy set. Only the small busy set reaches SQLite,
@@ -2457,7 +2436,10 @@ impl Services {
                 }
                 other => other,
             };
-            let sizes: Vec<usize> = page.iter().map(serialized_message_size).collect();
+            let sizes: Vec<usize> = page
+                .iter()
+                .map(crate::pagination::serialized_size)
+                .collect();
             let (lo, hi) = crate::pagination::budget_page(&sizes, anchor, SLIM_PAGE_BUDGET_BYTES);
             if (lo, hi) != (0, page.len()) {
                 page.truncate(hi);
