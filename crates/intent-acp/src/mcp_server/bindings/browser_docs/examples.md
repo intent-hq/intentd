@@ -2,9 +2,11 @@
 
 ## Reusing a Tab Already at the Target URL
 
-List tabs before opening one. If any agent- or user-opened tab already has the target
-URL or that target's rewritten/redirected `finalUrl`, focus it by `tabId` and continue
-working in that tab. For example, when targeting `http://daemon.localhost:8000`:
+List tabs before opening one. If a tab you own already has the target URL or that
+target's rewritten/redirected `finalUrl`, focus it by `tabId` and continue working in
+that tab. An unowned (user) tab at the target URL must be claimed first (see "Claiming
+and Resizing Tabs" below); tabs owned by other agents are never reused. For example,
+when targeting `http://daemon.localhost:8000`:
 
 ```json
 {
@@ -12,8 +14,9 @@ working in that tab. For example, when targeting `http://daemon.localhost:8000`:
     { "action": "listTabs" }
   ]
 }
-// A matching result may show the rewritten finalUrl instead of the requested alias:
-// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ... }
+// A matching result may show the rewritten finalUrl instead of the requested alias.
+// Each tab carries its owner and sizing info:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, ... }
 
 {
   "actions": [
@@ -23,11 +26,65 @@ working in that tab. For example, when targeting `http://daemon.localhost:8000`:
 }
 ```
 
-Use `openTab` only after `listTabs` shows no tab with the target URL or its
+Use `openTab` only after `listTabs` shows no reusable tab with the target URL or its
 rewritten/redirected `finalUrl`, or when the user explicitly asks for another tab,
 side-by-side view, or second instance. A different URL may open in a new tab; do not
 navigate an existing tab away from its current URL merely to avoid opening a tab for a
 different URL. Leave user-opened extra tabs in place.
+
+## Claiming and Resizing Tabs
+
+Tabs are agent-owned: you can only manipulate tabs you own. To work in an unowned
+(user) tab, claim it first — `width` is required, omitted `height` defaults to 800:
+
+```json
+// Find unowned tabs
+{
+  "actions": [
+    { "action": "listTabs", "scope": "unclaimed" }
+  ]
+}
+// → tabs with ownerAgentId: null and native sizing:
+// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", ... }
+
+// Claim it — atomic, first-claim-wins; ownership transfer and viewport emulation
+// at the given size happen in one step
+{
+  "actions": [
+    { "action": "claimTab", "tabId": "tab-user1", "width": 1280, "height": 800 }
+  ]
+}
+
+// Later, change the owned tab's emulated size (omitted height keeps the current one)
+{
+  "actions": [
+    { "action": "resizeTab", "tabId": "tab-user1", "width": 375, "height": 667 }
+  ]
+}
+```
+
+Ownership failures come back as structured action-result errors (inside the
+per-action `{ action, success: false, error }` envelope, never a top-level failure):
+
+```json
+// Claim lost to an earlier claim — no stealing; the error names the owner
+// { action: "claimTab", success: false, errorCode: "already-claimed", ownerAgentId: "<other-agent-id>", error: "Tab ... is owned by agent ..." }
+
+// Op on a tab you do not own — a not-owner on an unowned tab carries no owner
+// to name (ownerAgentId: null); the remedy is claimTab
+// { action: "resizeTab", success: false, errorCode: "not-owner", ownerAgentId: null, error: "Tab ... is not owned by you ..." }
+```
+
+Agent-issued `openTab` also accepts optional `width` / `height` (emulated from
+creation; defaults 1280×800 when omitted):
+
+```json
+{
+  "actions": [
+    { "action": "openTab", "url": "http://localhost:5173", "width": 1440, "height": 900 }
+  ]
+}
+```
 
 ## Opening Local HTML Files
 
