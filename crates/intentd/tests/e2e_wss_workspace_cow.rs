@@ -1502,7 +1502,8 @@ where
 /// `direct` provisions nothing and persists the selection; a disabled type
 /// (`cow` is disabled by default) fails `-32602` with the structured
 /// `execution-environment-unavailable` payload; `microvm` disabled fails the
-/// same way. Runs on any filesystem (no CoW dependency in these arms).
+/// same way; the flow rules reject `worktree` for `githubUrl` and `isNewRepo`
+/// creates. Runs on any filesystem (no CoW dependency in these arms).
 #[tokio::test]
 async fn workspace_create_execution_environment_selection_over_wss() {
     const TEST: &str = "workspace.create executionEnvironment WSS e2e";
@@ -1642,6 +1643,57 @@ async fn workspace_create_execution_environment_selection_over_wss() {
     )
     .await;
     assert_eq!(err["code"], json!(-32602), "conflicting params: {err}");
+
+    // Flow rule: worktree + githubUrl ("pick a repo") is rejected up front
+    // with the structured payload — validation fires before any clone, so no
+    // network is touched.
+    let err = wss_rpc_err(
+        &mut ws,
+        8,
+        "workspace.create",
+        json!({
+            "title": "EE Worktree GitHub E2E",
+            "githubUrl": "https://github.com/intent-hq/example",
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "worktree + githubUrl: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable"),
+        "structured payload: {err}"
+    );
+    assert_eq!(err["data"]["environment"], json!("worktree"));
+    assert!(
+        err["data"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("local repository copy")),
+        "reason names the flow rule: {err}"
+    );
+
+    // Flow rule: worktree + isNewRepo ("new repo") — same structured
+    // rejection.
+    let err = wss_rpc_err(
+        &mut ws,
+        9,
+        "workspace.create",
+        json!({
+            "title": "EE Worktree NewRepo E2E",
+            "repositoryPath": daemon.scratch.join("fresh-repo").to_string_lossy(),
+            "isNewRepo": true,
+            "executionEnvironment": "worktree",
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "worktree + isNewRepo: {err}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("execution-environment-unavailable")
+    );
+    assert_eq!(err["data"]["environment"], json!("worktree"));
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

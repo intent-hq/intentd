@@ -21448,6 +21448,116 @@ mod worktree_provisioning {
         assert!(matches!(&err, Error::InvalidParams(_)), "got: {err}");
     }
 
+    /// Flow rule (§5.1): `executionEnvironment: "worktree"` requires a local
+    /// repository copy — a `githubUrl` create is rejected structured
+    /// (`-32602`, `execution-environment-unavailable`) before any
+    /// provisioning.
+    #[tokio::test]
+    async fn create_with_worktree_environment_and_github_url_is_rejected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eewtgh-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some("https://github.com/intent-hq/example".to_string()),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("worktree + githubUrl rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, reason }
+                if environment == "worktree" && reason.contains("local repository copy")),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32602);
+    }
+
+    /// Flow rule (§5.1): `executionEnvironment: "worktree"` with
+    /// `isNewRepo: true` is rejected structured — the new-repo flow works
+    /// directly in the initialized repository.
+    #[tokio::test]
+    async fn create_with_worktree_environment_and_is_new_repo_is_rejected() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eewtnew-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let repo_parent = unique_dir("intentd-eewtnew-repo");
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(
+                        repo_parent.0.join("fresh").to_string_lossy().to_string(),
+                    ),
+                    is_new_repo: Some(true),
+                    execution_environment: Some(intent_core::SandboxType::Worktree),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("worktree + isNewRepo rejected");
+        assert!(
+            matches!(&err, Error::ExecutionEnvironmentUnavailable { environment, reason }
+                if environment == "worktree" && reason.contains("local repository copy")),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32602);
+    }
+
+    /// `isNewRepo` + omitted `executionEnvironment` (§5.1): the initialized
+    /// repository is worked in directly, and the derived `direct` environment
+    /// persists on the row.
+    #[tokio::test]
+    async fn create_new_repo_derives_direct_execution_environment() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-eenewderive-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let repo_parent = unique_dir("intentd-eenewderive-repo");
+        let repo_path = repo_parent.0.join("fresh");
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_path.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+        assert_eq!(
+            ws.execution_environment,
+            Some(intent_core::SandboxType::Direct),
+            "isNewRepo derives and persists direct"
+        );
+        assert!(
+            !ws.skip_worktree,
+            "direct here still provisions the checkout"
+        );
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(repo_path.to_string_lossy().as_ref()),
+            "the initialized repository is the checkout"
+        );
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.execution_environment,
+            Some(intent_core::SandboxType::Direct)
+        );
+    }
+
     /// `executionEnvironment: "microvm"` (§5.1 v4.2 + EE-5): disabled by
     /// default → structured unavailable; enabled on a capable host → the
     /// workspace provisions a CoW checkout and persists the microvm

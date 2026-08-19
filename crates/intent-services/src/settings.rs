@@ -947,7 +947,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         boolean(
             "sandbox.direct.enabled",
             "Direct enabled",
-            "Offer the direct (in-repo, no isolation) execution environment",
+            "The direct (in-repo, no isolation) execution environment is always enabled; disabling it is rejected",
             "sandbox",
             true,
         ),

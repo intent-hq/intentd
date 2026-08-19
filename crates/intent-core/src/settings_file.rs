@@ -210,7 +210,10 @@ impl SandboxType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SandboxDirectSettings {
-    /// `sandbox.direct.enabled` — offer the direct environment.
+    /// `sandbox.direct.enabled` — offer the direct environment. Direct is
+    /// **always on**: it is the universal fallback every creation flow can
+    /// use, so `validate()` rejects `false` (the toggle exists only for
+    /// schema symmetry with the other types).
     pub enabled: bool,
 }
 
@@ -1140,6 +1143,16 @@ impl SettingsFile {
                 format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
+        // Direct is always on — it is the universal fallback every creation
+        // flow can use, so a config that disables it cannot boot and a
+        // `settings.update` batch that disables it is rejected.
+        if !self.sandbox.direct.enabled {
+            return Err(bad(
+                "sandbox.direct.enabled",
+                "the direct execution environment is always enabled and cannot be disabled"
+                    .to_string(),
+            ));
+        }
         let default_type_enabled = match self.sandbox.default_type {
             SandboxType::Direct => self.sandbox.direct.enabled,
             SandboxType::Worktree => self.sandbox.worktree.enabled,
@@ -1306,7 +1319,8 @@ autoCommit = true
 defaultType = "worktree"
 
 [sandbox.direct]
-# Direct enabled -- offer the direct (in-repo, no isolation) environment.
+# Direct enabled -- the direct (in-repo, no isolation) environment is always
+# enabled; setting this to false is a startup error.
 enabled = true
 
 [sandbox.worktree]
@@ -1928,6 +1942,22 @@ mod tests {
         // A disabled built-in default is equally rejected.
         let err = SettingsFile::parse_str("[sandbox.worktree]\nenabled = false\n").unwrap_err();
         assert!(err.to_string().contains("sandbox.defaultType"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_direct_cannot_be_disabled() {
+        // Direct is always on: disabling it is a validation error even when
+        // the default type is some other (enabled) type.
+        let err = SettingsFile::parse_str("[sandbox.direct]\nenabled = false\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sandbox.direct.enabled"),
+            "names the key: {msg}"
+        );
+        assert!(
+            msg.contains("cannot be disabled"),
+            "states the invariant: {msg}"
+        );
     }
 
     #[test]

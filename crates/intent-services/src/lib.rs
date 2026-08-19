@@ -8102,10 +8102,14 @@ fn workspace_dir_candidates(
 /// / `sandbox.options` row order, PROTOCOL §5.5b).
 const SANDBOX_TYPES: &[&str] = &["direct", "worktree", "cow", "microvm"];
 
-/// Whether `ty` is enabled in the sandbox settings group.
+/// Whether `ty` is enabled in the sandbox settings group. `direct` is always
+/// enabled — the schema clamps `sandbox.direct.enabled = false` at
+/// validation, and this belt-and-braces arm keeps `sandbox.options` /
+/// `sandbox.profiles.list` reporting it enabled even if a legacy persisted
+/// value slipped past.
 fn sandbox_type_enabled(sandbox: &intent_core::settings_file::SandboxSettings, ty: &str) -> bool {
     match ty {
-        "direct" => sandbox.direct.enabled,
+        "direct" => true,
         "worktree" => sandbox.worktree.enabled,
         "cow" => sandbox.cow.enabled,
         "microvm" => sandbox.microvm.enabled,
@@ -13882,6 +13886,37 @@ impl WorkspaceApi for Services {
                         env.as_str()
                     )));
                 }
+                // Flow rule (§5.1): `worktree` is only offerable for local
+                // repository copies — a linked worktree needs an existing
+                // local checkout to link against. "Pick a repo" (`githubUrl`)
+                // and "New repo" (`isNewRepo`) creates provision a standalone
+                // checkout (or none), so they take `direct`, `cow`, or
+                // `microvm` — never `worktree`.
+                if env == intent_core::SandboxType::Worktree {
+                    let has_github_url = input
+                        .github_url
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|s| !s.is_empty());
+                    if has_github_url {
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason: "worktree checkouts require a local repository copy; \
+                                     GitHub-URL creates provision a standalone checkout — \
+                                     use direct, cow, or microvm"
+                                .to_string(),
+                        });
+                    }
+                    if input.is_new_repo == Some(true) {
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason: "worktree checkouts require a local repository copy; \
+                                     new-repo creates work directly in the initialized \
+                                     repository — use direct, cow, or microvm"
+                                .to_string(),
+                        });
+                    }
+                }
                 let sandbox = services.effective_settings().sandbox;
                 if !sandbox_type_enabled(&sandbox, env.as_str()) {
                     return Err(Error::ExecutionEnvironmentUnavailable {
@@ -14610,9 +14645,17 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         // `executionEnvironment: direct` is the explicit
-                        // spelling of the `skipIsolation` opt-out (§5.1).
+                        // spelling of the `skipIsolation` opt-out (§5.1) —
+                        // but only for local-repo creates. In the
+                        // "pick a repo" (cache hydration) and "new repo"
+                        // flows there is no pre-existing local checkout to
+                        // work in, so `direct` still provisions the
+                        // standalone checkout below (CoW is just the copy
+                        // mechanism there) and must not skip provisioning.
                         skip_worktree: input.skip_isolation.unwrap_or(false)
-                            || requested_env == Some(intent_core::SandboxType::Direct),
+                            || (requested_env == Some(intent_core::SandboxType::Direct)
+                                && cache_hydration.is_none()
+                                && !new_repo_direct),
                         setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
@@ -14716,9 +14759,29 @@ impl WorkspaceApi for Services {
                                     intent_core::CheckoutMode::Cow
                                 }
                                 Ok(intent_git::CowSupport::Unsupported) => {
+                                    // Explicit `cow`/`microvm` never silently
+                                    // degrades to a plain clone — surface the
+                                    // structured unavailability (the local-arm
+                                    // no-silent-fallback rule, §5.1).
+                                    if explicit_cow {
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason: "the workspaces root filesystem does \
+                                                     not support copy-on-write clones"
+                                                .to_string(),
+                                        });
+                                    }
                                     intent_core::CheckoutMode::Direct
                                 }
                                 Err(e) => {
+                                    if explicit_cow {
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        return Err(Error::ExecutionEnvironmentUnavailable {
+                                            environment: explicit_env_label.clone(),
+                                            reason: format!("CoW probe failed: {e}"),
+                                        });
+                                    }
                                     tracing::warn!(
                                         cache = %cache_path.display(),
                                         error = %e,
@@ -14849,6 +14912,19 @@ impl WorkspaceApi for Services {
                             let sha = match provision(mode).await {
                                 Ok(sha) => sha,
                                 Err(Error::Unsupported(reason))
+                                    if mode == intent_core::CheckoutMode::Cow
+                                        && explicit_cow =>
+                                {
+                                    // Explicit `cow`/`microvm` never silently
+                                    // degrades — surface the structured
+                                    // unavailability (§5.1).
+                                    remove_workspace_dir_if_empty(&ws_dir);
+                                    return Err(Error::ExecutionEnvironmentUnavailable {
+                                        environment: explicit_env_label.clone(),
+                                        reason,
+                                    });
+                                }
+                                Err(Error::Unsupported(reason))
                                     if mode == intent_core::CheckoutMode::Cow =>
                                 {
                                     // Safety net: the probe passed but the
@@ -14882,6 +14958,19 @@ impl WorkspaceApi for Services {
                             ws.worktree_path =
                                 Some(checkout_path.to_string_lossy().to_string());
                             ws.checkout_mode = Some(mode);
+                            // Persist the environment the hydration actually
+                            // provisioned when the param was omitted (§5.1):
+                            // a CoW copy is `cow`, a plain local clone is
+                            // `direct`. Explicit selections were validated
+                            // against the outcome above and persist as-is.
+                            if ws.execution_environment.is_none() {
+                                ws.execution_environment = Some(match mode {
+                                    intent_core::CheckoutMode::Cow => {
+                                        intent_core::SandboxType::Cow
+                                    }
+                                    _ => intent_core::SandboxType::Direct,
+                                });
+                            }
                             if ws.base_commit_sha.is_none() {
                                 ws.base_commit_sha = Some(sha);
                             }
@@ -14967,6 +15056,18 @@ impl WorkspaceApi for Services {
                                 // user-chosen folder never matches.
                                 ws.worktree_path =
                                     Some(repo_dir.to_string_lossy().into_owned());
+                                // Persist the environment this arm actually
+                                // provisions when the param was omitted: the
+                                // initialized repository is worked in
+                                // directly. (`worktree` was rejected up
+                                // front for `isNewRepo`; explicit
+                                // `cow`/`microvm` persist as-is — their
+                                // per-agent isolation keys off the persisted
+                                // field, sourced from this direct checkout.)
+                                if ws.execution_environment.is_none() {
+                                    ws.execution_environment =
+                                        Some(intent_core::SandboxType::Direct);
+                                }
                                 if ws.base_commit_sha.is_none() {
                                     ws.base_commit_sha = Some(sha);
                                 }
