@@ -1883,17 +1883,32 @@ impl Services {
     /// across repos — first-wins in source-priority order: workspace's own
     /// PRs, then git-root PRs, then monitor-derived entries. A row with
     /// nothing to merge is left untouched (a `None` stays omitted on the
-    /// wire); a store read failure degrades to serving the base rows.
-    pub(crate) async fn merge_external_pull_requests(&self, list: &mut [Workspace]) {
+    /// wire, and an empty git-root list contributes nothing rather than
+    /// materializing `[]`); a store read failure degrades to serving the
+    /// base rows. `include_archived` mirrors the list call's flag so the
+    /// bulk reads never pay for archived workspaces the list won't return.
+    pub(crate) async fn merge_external_pull_requests(
+        &self,
+        list: &mut [Workspace],
+        include_archived: bool,
+    ) {
         use std::collections::HashMap;
-        let roots = match self.store.list_workspace_git_roots_with_prs().await {
+        let roots = match self
+            .store
+            .list_workspace_git_roots_with_prs(include_archived)
+            .await
+        {
             Ok(roots) => roots,
             Err(e) => {
                 tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
                 Vec::new()
             }
         };
-        let monitors = match self.store.load_non_cancelled_pr_monitors().await {
+        let monitors = match self
+            .store
+            .load_non_cancelled_pr_monitors(include_archived)
+            .await
+        {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(error = %e, "workspace.list: pr monitor read failed; skipping");
@@ -1905,10 +1920,14 @@ impl Services {
         }
         // Group externally sourced PRs per workspace, git-root entries before
         // monitor-derived ones so the first-wins dedup below encodes the
-        // source priority.
+        // source priority. Empty lists are skipped so they can't flip an
+        // omitted workspace `pullRequests` into `[]`.
         let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
         for root in &roots {
             if let Some(prs) = &root.pull_requests {
+                if prs.is_empty() {
+                    continue;
+                }
                 extras
                     .entry(root.workspace_id.0.clone())
                     .or_default()
@@ -12548,7 +12567,8 @@ impl WorkspaceApi for Services {
             // Emit-path PR merge: fold git-root + monitor PRs into each
             // row's `pullRequests` (after enrichment so displayStatus
             // derivation still sees only the persisted workspace PRs).
-            this.merge_external_pull_requests(&mut list).await;
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             // Background backfill: active workspaces with repository_path but missing
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
@@ -12596,7 +12616,8 @@ impl WorkspaceApi for Services {
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
             // `workspace.list` would.
-            this.merge_external_pull_requests(&mut list).await;
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             Ok(list)
         })
     }

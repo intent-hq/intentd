@@ -817,6 +817,35 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     let ws3 = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws3)).await.expect("ws3");
 
+    // ws4: a git root with an EMPTY pull_requests list contributes nothing —
+    // the stored NULL must not become `[]` on the wire.
+    let ws4 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws4)).await.expect("ws4");
+    store
+        .upsert_workspace_git_root(&git_root(&ws4, "/tmp/root-c", vec![]))
+        .await
+        .expect("ws4 root");
+
+    // ws5: archived, with a git-root PR and a monitor — merged only when the
+    // list call includes archived workspaces.
+    let ws5 = WorkspaceId::new();
+    let mut w5 = workspace(&ws5);
+    w5.archived = true;
+    w5.status = intent_core::WorkspaceStatus::Archived;
+    store.insert_workspace(&w5).await.expect("ws5");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &ws5,
+            "/tmp/root-d",
+            vec![pr_info(
+                8,
+                "https://github.com/o/r/pull/8",
+                "Archived root PR",
+            )],
+        ))
+        .await
+        .expect("ws5 root");
+
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
     let assert_merged = |list: &[Workspace], path: &str| {
@@ -867,12 +896,41 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
             r3.pull_requests.is_none(),
             "{path}: no external sources leaves the stored value untouched"
         );
+
+        // Empty git-root list: stored NULL stays omitted on the wire.
+        let r4 = list.iter().find(|w| w.id == ws4).expect("ws4 row");
+        assert!(
+            r4.pull_requests.is_none(),
+            "{path}: empty git-root list must not materialize []"
+        );
+        let v4 = serde_json::to_value(r4).unwrap();
+        assert!(
+            v4.get("pullRequests").is_none(),
+            "{path}: pullRequests omitted, not []"
+        );
     };
 
     let full = svc.list_workspaces(false).await.expect("full list");
     assert_merged(&full, "workspace.list");
     let lite = svc.list_workspaces_lite(false).await.expect("lite list");
     assert_merged(&lite, "lite list");
+
+    // Archived-inclusive list: the archived row's git-root PR merges in.
+    let all = svc.list_workspaces_lite(true).await.expect("archived list");
+    let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
+    let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
+    assert_eq!(prs5.len(), 1);
+    assert_eq!(prs5[0].title, "Archived root PR");
+
+    // Archived-excluding bulk reads filter archived-workspace rows in SQL.
+    let roots = store
+        .list_workspace_git_roots_with_prs(false)
+        .await
+        .expect("roots");
+    assert!(
+        roots.iter().all(|r| r.workspace_id != ws5),
+        "archived workspace's roots excluded from the non-archived read"
+    );
 
     // Emit-path only: nothing was persisted back to workspace.pull_requests.
     let stored = store.get_workspace(&ws1).await.expect("ws1 stored");

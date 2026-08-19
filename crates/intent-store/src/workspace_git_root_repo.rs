@@ -252,11 +252,21 @@ impl Store {
     /// `pull_requests` list, oldest first — the single bulk read backing the
     /// `workspace.list` / `workspace.subscribe` seq-0 PR merge (one query per
     /// list call instead of one per workspace). SQL-filtered on
-    /// `pull_requests IS NOT NULL` so cost is O(PR-bearing roots).
-    pub async fn list_workspace_git_roots_with_prs(&self) -> Result<Vec<WorkspaceGitRoot>> {
+    /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
+    /// owning workspace being live, so cost is O(PR-bearing roots of returned
+    /// workspaces) and a large archive never inflates the hot list paths.
+    pub async fn list_workspace_git_roots_with_prs(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<WorkspaceGitRoot>> {
+        let archived_filter = if include_archived {
+            ""
+        } else {
+            " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
+        };
         let sql = format!(
-            "SELECT {COLUMNS} FROM workspace_git_root WHERE pull_requests IS NOT NULL \
-             ORDER BY created_at"
+            "SELECT {COLUMNS} FROM workspace_git_root WHERE pull_requests IS NOT NULL\
+             {archived_filter} ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())

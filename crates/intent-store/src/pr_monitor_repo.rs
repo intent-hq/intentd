@@ -277,10 +277,21 @@ impl Store {
     /// `workspace.list` / `workspace.subscribe` seq-0 PR merge. Completed
     /// rows are retained so merged PRs stay visible; cancelled rows are
     /// excluded (they are removed from the UI), matching the services-level
-    /// per-workspace view ([`Services::pr_monitors_for_workspace`]).
-    pub async fn load_non_cancelled_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
+    /// per-workspace view ([`Services::pr_monitors_for_workspace`]). Unless
+    /// `include_archived`, rows owned by archived workspaces are filtered in
+    /// SQL so cost tracks the workspaces the list call actually returns.
+    pub async fn load_non_cancelled_pr_monitors(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<PrMonitor>> {
+        let archived_filter = if include_archived {
+            ""
+        } else {
+            " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
+        };
         let sql = format!(
-            "SELECT {COLUMNS} FROM pr_monitor WHERE state != 'cancelled' ORDER BY created_at"
+            "SELECT {COLUMNS} FROM pr_monitor WHERE state != 'cancelled'\
+             {archived_filter} ORDER BY created_at"
         );
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())
