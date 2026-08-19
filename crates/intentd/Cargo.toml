@@ -69,7 +69,7 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # `e2e_wss_agent_lifecycle.rs::terminal_create_env_over_wss` decodes base64
 # `terminal:data` chunks to prove the env overlay reached the child (§5.13).
 base64 = { workspace = true }
