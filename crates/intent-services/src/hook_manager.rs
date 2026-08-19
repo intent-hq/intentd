@@ -162,6 +162,36 @@ fn next_run_at_iso(delay_ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Resumed countdown for a rehydrated hook: the EARLIER of the persisted
+/// `next_run_at` and a fresh `now + delay_ms` countdown, so a restart never
+/// pushes a run further out than it was already scheduled
+/// (intent-hq/monorepo#2856). Returns the timestamp to persist (the original
+/// string verbatim when the persisted deadline wins) and the time remaining
+/// until it — zero when overdue, so the run starts promptly, still gated by
+/// the scheduler task's pre-run expiry check. An absent or unparseable
+/// persisted deadline falls back to the fresh countdown.
+fn resumed_next_run(hook: &Hook) -> (String, Duration) {
+    let now = OffsetDateTime::now_utc();
+    let fresh = now + time::Duration::milliseconds(hook.delay_ms.max(0));
+    match hook
+        .next_run_at
+        .as_deref()
+        .and_then(|raw| Some((raw, OffsetDateTime::parse(raw, &Rfc3339).ok()?)))
+    {
+        Some((raw, persisted)) if persisted < fresh => {
+            let remaining = persisted - now;
+            (
+                raw.to_string(),
+                Duration::from_millis(remaining.whole_milliseconds().max(0) as u64),
+            )
+        }
+        _ => (
+            next_run_at_iso(hook.delay_ms),
+            Duration::from_millis(hook.delay_ms.max(0) as u64),
+        ),
+    }
+}
+
 /// Clamp a schedulable `ttlMs` into `[MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS]`;
 /// `None` (omitted) takes the default (= the 24-hour cap).
 fn clamp_ttl_ms(ttl_ms: Option<i64>) -> i64 {
@@ -942,9 +972,13 @@ impl Services {
     /// and respawn its scheduler task. Rows whose owning agent is gone are
     /// cancelled instead of resumed; rows whose `expiresAt` passed while the
     /// daemon was down are expired (owner woken). `running` rows (daemon died
-    /// mid-run) are reset to `scheduled`; every resumed hook starts a fresh
-    /// `delayMs` countdown but keeps its ORIGINAL `expiresAt` (the TTL does
-    /// not reset on restart). `agentFeatures.backgroundHooks = false` does
+    /// mid-run) are reset to `scheduled`; every resumed hook resumes the
+    /// EARLIER of its persisted `nextRunAt` and a fresh `now + delayMs`
+    /// countdown ([`resumed_next_run`] — a restart never pushes a run
+    /// further out, and an overdue row runs promptly, still gated by the
+    /// pre-run expiry check; intent-hq/monorepo#2856) and keeps its ORIGINAL
+    /// `expiresAt` (the TTL does not reset on restart).
+    /// `agentFeatures.backgroundHooks = false` does
     /// NOT cancel or skip active rows (decided semantics: the toggle only
     /// rejects NEW schedules; existing hooks run to their terminal
     /// state/TTL). Returns the number of resumed hooks.
@@ -983,7 +1017,7 @@ impl Services {
                 self.expire_hook(&mut hook).await;
                 continue;
             }
-            let next_run_at = next_run_at_iso(hook.delay_ms);
+            let (next_run_at, initial_delay) = resumed_next_run(&hook);
             if hook.state == HookState::Running {
                 self.store
                     .update_hook_state(&hook.hook_id, HookState::Scheduled)
@@ -996,7 +1030,7 @@ impl Services {
             hook.next_run_at = Some(next_run_at.clone());
             self.emit_hook_event(HOOK_SCHEDULED, &hook, Some(next_run_at))
                 .await;
-            self.spawn_hook_task(hook);
+            self.spawn_hook_task_with_initial_delay(hook, Some(initial_delay));
             resumed += 1;
         }
         Ok(resumed)
@@ -1020,13 +1054,25 @@ impl Services {
     /// run already in flight at expiry completes normally). The task
     /// deregisters itself from [`Services::hook_tasks`] on every exit path.
     fn spawn_hook_task(&self, hook: Hook) {
+        self.spawn_hook_task_with_initial_delay(hook, None)
+    }
+
+    /// [`Services::spawn_hook_task`] with an explicit first-iteration sleep:
+    /// rehydration passes the resumed countdown (which may be shorter than
+    /// `delayMs`, or zero for an overdue row) so the persisted `nextRunAt`
+    /// is honored across restarts; every later iteration sleeps the plain
+    /// `delayMs` cadence.
+    fn spawn_hook_task_with_initial_delay(&self, hook: Hook, initial_delay: Option<Duration>) {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
         let hook_id = hook.hook_id.clone();
         let join = tokio::spawn(async move {
             let mut hook = hook;
+            let mut initial_delay = initial_delay;
             loop {
-                let delay = Duration::from_millis(hook.delay_ms.max(0) as u64);
+                let delay = initial_delay
+                    .take()
+                    .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0) as u64));
                 // Race the inter-run sleep against the time to `expiresAt`
                 // (deadline-free legacy rows never take the expiry arm).
                 let to_expiry =
@@ -3112,6 +3158,133 @@ mod tests {
         assert_eq!(orphaned.state, HookState::Cancelled);
         // Idempotent: a second pass resumes nothing new.
         assert_eq!(svc.rehydrate_hooks().await.expect("second pass"), 0);
+    }
+
+    /// Row template for the rehydration-countdown tests below: a 10-minute
+    /// cadence hook whose persisted `next_run_at`/`expires_at` the caller
+    /// controls (intent-hq/monorepo#2856).
+    fn countdown_row(
+        ws: &WorkspaceId,
+        owner: &AgentId,
+        name: &str,
+        next_run_at: Option<String>,
+        expires_at: String,
+    ) -> Hook {
+        Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: name.to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 600_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at,
+            run_count: 1,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(expires_at),
+            perpetual: false,
+            dispatch_count: 0,
+        }
+    }
+
+    /// A restart must not push a hook's countdown back: rehydration resumes
+    /// with the EARLIER of the persisted `nextRunAt` and a fresh
+    /// `now + delayMs` countdown (intent-hq/monorepo#2856), so a
+    /// long-cadence hook nearing its run keeps that near deadline — and the
+    /// run actually fires on it — instead of restarting a full period out.
+    #[tokio::test]
+    async fn rehydration_preserves_earlier_persisted_next_run_at() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // 10-minute cadence, but the persisted countdown is nearly done:
+        // the run is due 1s out.
+        let due_at = next_run_at_iso(1_000);
+        let hook = countdown_row(
+            &ws,
+            &owner,
+            "long-cadence",
+            Some(due_at.clone()),
+            next_run_at_iso(MAX_HOOK_TTL_MS),
+        );
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        // The persisted countdown survives the restart verbatim...
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        // ...and the run fires on it, nowhere near the 10-minute cadence a
+        // reset countdown would impose (the poll deadline is 10s).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
+        assert_eq!(ran.state, HookState::Scheduled);
+        assert!(ran.next_run_at.is_some(), "rescheduled after the run");
+    }
+
+    /// A hook whose persisted `nextRunAt` passed while the daemon was down
+    /// is overdue: it runs promptly after rehydration — not dropped, not
+    /// pushed a full `delayMs` period out (intent-hq/monorepo#2856).
+    #[tokio::test]
+    async fn rehydration_runs_overdue_hook_promptly() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = countdown_row(
+            &ws,
+            &owner,
+            "overdue",
+            Some(next_run_at_iso(-60_000)),
+            next_run_at_iso(MAX_HOOK_TTL_MS),
+        );
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
+        assert_eq!(ran.state, HookState::Scheduled);
+        assert!(ran.next_run_at.is_some(), "rescheduled after the run");
+    }
+
+    /// Rows with no persisted `nextRunAt` fall back to the fresh
+    /// `now + delayMs` countdown, and a persisted deadline LATER than the
+    /// fresh countdown is tightened to it (min semantics: a restart never
+    /// schedules a hook later than `now + delayMs` either).
+    #[tokio::test]
+    async fn rehydration_fresh_countdown_when_absent_or_later() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let far_out = next_run_at_iso(MAX_HOOK_TTL_MS);
+        let absent = countdown_row(&ws, &owner, "absent", None, far_out.clone());
+        let later = countdown_row(&ws, &owner, "later", Some(far_out.clone()), far_out);
+        svc.store().insert_hook(&absent).await.unwrap();
+        svc.store().insert_hook(&later).await.unwrap();
+        let before = OffsetDateTime::now_utc();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 2);
+        let after = OffsetDateTime::now_utc();
+        for hook in [&absent, &later] {
+            let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+            let next = OffsetDateTime::parse(stored.next_run_at.as_deref().unwrap(), &Rfc3339)
+                .expect("parse resumed nextRunAt");
+            let delay = time::Duration::milliseconds(600_000);
+            assert!(next >= before + delay, "{}: full countdown", hook.name);
+            assert!(next <= after + delay, "{}: no later than fresh", hook.name);
+        }
+    }
+
+    /// The expiry guard outranks an overdue countdown: a hook whose
+    /// persisted `nextRunAt` AND `expiresAt` both passed while the daemon
+    /// was down expires at boot without ever running.
+    #[tokio::test]
+    async fn rehydration_expires_overdue_hook_past_deadline() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = countdown_row(
+            &ws,
+            &owner,
+            "overdue-expired",
+            Some(next_run_at_iso(-120_000)),
+            next_run_at_iso(-60_000),
+        );
+        svc.store().insert_hook(&hook).await.unwrap();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 0);
+        let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        assert_eq!(expired.run_count, 1, "no run at/after expiry");
+        assert!(expired.next_run_at.is_none());
+        assert!(!svc.hook_task_alive(&hook.hook_id));
     }
 
     #[tokio::test]
