@@ -720,7 +720,11 @@ async fn agent_delete_grace_window_schedule_cancel_commit_over_wss() {
     .await;
     assert_eq!(scheduled["scheduled"], json!(true), "{scheduled}");
     let evt = next_event(&mut sub, &["agent:deleted"], 15).await;
-    assert_eq!(evt["data"], json!({ "agentId": agent_id }));
+    // intent-hq/monorepo#2869: the delete emit carries agentName.
+    assert_eq!(
+        evt["data"],
+        json!({ "agentId": agent_id, "agentName": "Grace Agent" })
+    );
 
     // Cancel after commit: the race-safe non-error `{ cancelled: false }`.
     let late = wss_rpc(

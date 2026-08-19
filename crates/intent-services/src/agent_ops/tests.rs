@@ -194,6 +194,9 @@ async fn delete_emits_agent_deleted_scoped_to_workspace() {
     assert_eq!(batch[0].event_type, AGENT_DELETED);
     assert_eq!(batch[0].workspace_id, ws);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    // intent-hq/monorepo#2869: the delete emit carries the session's name so
+    // wake subscribers never fall back to rendering the raw agent id.
+    assert_eq!(batch[0].data["agentName"].as_str(), Some("Doomed"));
 }
 
 #[tokio::test]
@@ -1912,6 +1915,17 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
         session.messages.len(),
         1,
         "reconciliation delivered the wake"
+    );
+    // intent-hq/monorepo#2869: the synthesized completion event carries the
+    // child's agentName so the FE wake banner never renders the raw agent id.
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("wake message carries event_notification metadata");
+    assert_eq!(
+        metadata["events"][0]["data"]["agentName"],
+        json!("Child"),
+        "synthesized wake event data carries agentName: {metadata}"
     );
     assert!(
         restarted.find_watches_for_child(&child).is_empty(),
@@ -16637,6 +16651,18 @@ async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
         data["parentAgentId"].as_str(),
         Some(parent.0.as_str()),
         "delegated child's agent:failed carries the parent id: {data}"
+    );
+    // intent-hq/monorepo#2869: the same central enrichment stamps agentName —
+    // exactly the child's session name from the store.
+    let child_session = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    assert_eq!(
+        data["agentName"].as_str(),
+        Some(child_session.name.as_str()),
+        "agent:failed carries the child's exact agentName: {data}"
     );
 }
 
