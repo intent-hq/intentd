@@ -5464,16 +5464,50 @@ impl Services {
                 metadata["watchStillArmed"] = json!(false);
             }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
-            if let Err(e) = self
+            match self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
                 .await
             {
-                tracing::warn!(
-                    error = %e,
-                    parent = %parent.0,
-                    child = %caller.0,
-                    "failed to deliver reportToParent wake to parent"
-                );
+                Ok(_) => {
+                    // monorepo#2889: the parent just heard THIS report cycle —
+                    // record its identity (the report timestamp, the same
+                    // #2842 identity) in the per-pair delivery marker so the
+                    // same cycle's completion wake cannot re-embed the report
+                    // body. The `report_delivered` watch flag alone does not
+                    // survive the cycle: every re-arm path (agent.watch
+                    // adoption, SUB-1 sender auto-subscribe, watch reuse)
+                    // clears it as fresh interest (monorepo#2532), and a
+                    // parent with NO watch at report time still receives this
+                    // wake. The marker skip in
+                    // `deliver_completion_to_watches` leaves the watch ARMED,
+                    // so a re-armed watch still fires on a FUTURE cycle (new
+                    // timestamp). Grouped children never reach here (their
+                    // report defers to the aggregated wake), and a failed
+                    // send records nothing (the parent never heard the
+                    // report, so the completion wake must still carry it).
+                    // Best-effort: a write failure only restores the pre-fix
+                    // duplicate for this cycle.
+                    if let Err(e) = self
+                        .store
+                        .record_completion_wake_delivery(&parent, &caller, &saved_at, &now_iso())
+                        .await
+                    {
+                        tracing::warn!(
+                            parent = %parent.0,
+                            child = %caller.0,
+                            error = %e,
+                            "completion wake dedup record failed at reportToParent delivery"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        parent = %parent.0,
+                        child = %caller.0,
+                        "failed to deliver reportToParent wake to parent"
+                    );
+                }
             }
             // Marking flips the parent's waiting projection (report_delivered
             // watches are excluded), so publish the refreshed flags in the
