@@ -157,6 +157,9 @@ pub(crate) trait Harness: Send + Sync {
     /// `[SYSTEM WARNING]` injected after a prompt idle-timeout interrupt;
     /// `window` is the pre-rendered seconds value (e.g. `1800` / `1.5`).
     fn idle_timeout_warning(&self, window: &str) -> String;
+    /// `[SYSTEM NOTE]` auto-redrive nudge injected after a suspected-truncated
+    /// turn on a delegated in-task agent (intent-hq/monorepo#2863).
+    fn truncation_redrive_nudge(&self) -> String;
 
     // --- Prompt notices (`agent_manager.rs`) ---
 

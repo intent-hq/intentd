@@ -3309,8 +3309,11 @@ impl Services {
             .remove(&agent_id);
         // Silent-tail record (intent-hq/monorepo#2669): in-memory, keyed by
         // agent — drop it with the session so the map never leaks entries
-        // for deleted agents.
+        // for deleted agents. The truncation-redrive counter and handoff
+        // flag (monorepo#2863) are dropped on the same terms.
         self.clear_turn_silent_tail(&agent_id);
+        self.clear_truncation_redrives(&agent_id);
+        self.take_truncation_redrive(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
