@@ -14740,7 +14740,10 @@ impl WorkspaceApi for Services {
                         correlation_id: None,
                         parent_event_id: None,
                         metadata: None,
-                        data: serde_json::json!({ "agentId": session.id.0 }),
+                        data: serde_json::json!({
+                            "agentId": session.id.0,
+                            "agentName": session.name,
+                        }),
                     },
                 )
                 .await;
@@ -14768,7 +14771,10 @@ impl WorkspaceApi for Services {
                     correlation_id: None,
                     parent_event_id: None,
                     metadata: None,
-                    data: serde_json::json!({ "agentId": session.id.0 }),
+                    data: serde_json::json!({
+                        "agentId": session.id.0,
+                        "agentName": session.name,
+                    }),
                 };
                 services
                     .deliver_completion_to_watches(&session.id, &event)
