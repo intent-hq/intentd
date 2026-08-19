@@ -25,7 +25,6 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{WorkspaceApi, WorkspaceId};
@@ -522,12 +521,6 @@ fn domain_err(e: HostExecError) -> intent_core::Error {
         INVALID_PARAMS => intent_core::Error::InvalidParams(e.message),
         _ => intent_core::Error::Internal(e.message),
     }
-}
-
-/// Small helper so callers can share an `Arc<dyn ExecPolicy>` seam later.
-#[allow(dead_code)]
-pub fn allow_all_policy() -> Arc<dyn ExecPolicy> {
-    Arc::new(AllowAllPolicy)
 }
 
 #[cfg(test)]

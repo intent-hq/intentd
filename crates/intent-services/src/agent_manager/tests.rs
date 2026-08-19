@@ -11705,7 +11705,7 @@ mod merge_user_mcp_servers_tests {
     use intent_acp::{NormalizedMcpServer, NormalizedMcpServers};
     use serde_json::json;
 
-    use super::{manager, TempDb};
+    use super::TempDb;
     use crate::agent_manager::AgentManager;
     use crate::agent_manager::BusEventSink;
     use crate::events::EventBus;
@@ -12051,12 +12051,6 @@ mod merge_user_mcp_servers_tests {
             Some(inherited.as_str()),
             "baseline PATH only — no injected override"
         );
-    }
-
-    // Prevent dead-code warnings for `manager` when this module compiles alone.
-    #[allow(dead_code)]
-    async fn _use_manager() {
-        let _ = manager().await;
     }
 }
 

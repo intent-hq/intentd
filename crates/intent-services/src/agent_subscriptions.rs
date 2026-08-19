@@ -42,9 +42,6 @@ use crate::Services;
 
 /// One parent→child completion-watch record. An ungrouped watch is removed
 /// once the child's completion has been delivered to the parent (AS-3).
-// Fields are read by the AS-3 delivery worker and by tests; AS-2 only populates
-// the registry, so the lib-only build sees them as unread.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionWatch {
     pub id: String,
@@ -91,15 +88,10 @@ pub(crate) struct DelegationGroup {
     /// `__chief__`.
     pub workspace_id: WorkspaceId,
     pub parent_agent_id: AgentId,
-    // Retained for parity with the TS group shape; not read by the fan-in.
-    #[allow(dead_code)]
     pub await_mode: String,
     pub expected_agent_ids: Vec<AgentId>,
     pub completed_agent_ids: Vec<AgentId>,
     pub deleted_agent_ids: Vec<AgentId>,
-    // Retained for parity with the TS group shape; not read by the fan-in.
-    #[allow(dead_code)]
-    pub subscription_id: Option<String>,
     pub sealed: bool,
     pub delivered: bool,
     pub event_summaries: Vec<String>,
@@ -698,7 +690,6 @@ impl Services {
             expected_agent_ids: Vec::new(),
             completed_agent_ids: Vec::new(),
             deleted_agent_ids: Vec::new(),
-            subscription_id: None,
             sealed: false,
             delivered: false,
             event_summaries: Vec::new(),
@@ -2163,7 +2154,6 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
         expected_agent_ids: p.expected_agent_ids.clone(),
         completed_agent_ids: p.completed_agent_ids.clone(),
         deleted_agent_ids: p.deleted_agent_ids.clone(),
-        subscription_id: None,
         sealed: p.sealed,
         delivered: p.delivered,
         event_summaries: p.event_summaries.clone(),

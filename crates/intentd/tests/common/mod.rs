@@ -84,7 +84,6 @@ pub fn test_tempdir(prefix: &str) -> tempfile::TempDir {
 /// root. Use with `"/tmp"` when the dir must stay short enough for a UDS
 /// socket path (macOS caps them at ~104 bytes; `temp_dir()` resolves to a
 /// long `/var/folders/...` path).
-#[allow(dead_code)]
 pub fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
     let mut dir = tempfile::Builder::new()
         .prefix(prefix)
@@ -390,7 +389,6 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
 /// this on every daemon boot). Panics if an `[agents]` table exists WITHOUT
 /// the pin — silently skipping would only surface as a flake on headless
 /// runners.
-#[allow(dead_code)]
 pub fn disable_resume_on_start(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
