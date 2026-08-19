@@ -226,6 +226,26 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Per-slot HOME for install-action — see the coverage-e2e job's comment
+      # for the full rationale (shared ~/.install-action tmp/bin race across
+      # the 8 tinybox slots; monorepo#1239).
+      - name: Key install-action dirs per runner slot
+        run: |
+          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
+          else
+            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+          fi
+      - uses: taiki-e/install-action@cargo-shear
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
+      # Blocking unused-dependency gate: fails when any crate declares a
+      # dependency its code never uses. True false positives (e.g. link-time
+      # only deps like intentd's vendored openssl-sys) are suppressed via
+      # [package.metadata.cargo-shear] ignored = [...] next to the dependency,
+      # each with a comment explaining why.
+      - name: Unused dependencies (cargo-shear)
+        run: cargo shear
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate for PRs. Running it
       # plainly here as well would double the critical path. The exception is
