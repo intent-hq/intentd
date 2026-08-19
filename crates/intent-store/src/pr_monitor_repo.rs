@@ -272,6 +272,25 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
+    /// Every non-cancelled (active or completed) monitor across all
+    /// workspaces, oldest first — the single bulk read backing the
+    /// `workspace.list` / `workspace.subscribe` seq-0 PR merge. Completed
+    /// rows are retained so merged PRs stay visible; cancelled rows are
+    /// excluded (they are removed from the UI), matching the services-level
+    /// per-workspace view ([`Services::pr_monitors_for_workspace`]).
+    pub async fn load_non_cancelled_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM pr_monitor WHERE state != 'cancelled' ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("load non-cancelled pr monitors failed: {e}"))
+            })?;
+        rows.iter().map(monitor_from_row).collect()
+    }
+
     /// Set a monitor's lifecycle state. Every legal transition starts from
     /// `active`, so the update is guarded on it; returns `false` when the row
     /// is absent or already terminal (a concurrent cancel/complete won) so
