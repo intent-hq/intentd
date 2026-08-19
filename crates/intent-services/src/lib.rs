@@ -4615,18 +4615,46 @@ impl Services {
         // delivery/render time against CURRENT task state (never here), so a
         // wake that sits queued behind a busy parent cannot carry a stale
         // snapshot.
-        let trigger_tasks: Vec<(String, String)> =
-            if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
-                match self.store.get_agent_session(child_id).await {
-                    Ok(s) => match s.task_note_id {
+        //
+        // Completion identity (intent-hq/monorepo#2842): a genuine reported
+        // `agent:idle` is identified by the session's persisted
+        // `completion_report_timestamp` (set with the report by
+        // `agent.reportToParent`, cleared at each turn's start — so a given
+        // completion keeps one identity across replays and a FUTURE
+        // completion always gets a new one). The ungrouped loop below skips
+        // a watcher whose recorded delivered identity matches — a boot
+        // reconcile replaying the child's historical completion, or a watch
+        // re-armed on an already-completed child, delivers at most once per
+        // completion. Only report-carrying idles dedup: an unreported idle
+        // (or a Gap B settlement idle whose stale report keys were dropped —
+        // completion_reported is false for it) has nothing to dedup against
+        // and delivers as before. `session_report_ts` is kept separately for
+        // the report_delivered retirement branch, whose completion cycle is
+        // identified by the session's report even when the event payload
+        // does not carry it.
+        let (trigger_tasks, completion_identity, session_report_ts): (
+            Vec<(String, String)>,
+            Option<String>,
+            Option<String>,
+        ) = if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
+            match self.store.get_agent_session(child_id).await {
+                Ok(s) => {
+                    let identity = if completion_reported {
+                        s.completion_report_timestamp.clone()
+                    } else {
+                        None
+                    };
+                    let trigger = match s.task_note_id {
                         Some(n) => vec![(s.workspace_id.0, n.0)],
                         None => Vec::new(),
-                    },
-                    Err(_) => Vec::new(),
+                    };
+                    (trigger, identity, s.completion_report_timestamp)
                 }
-            } else {
-                Vec::new()
-            };
+                Err(_) => (Vec::new(), None, None),
+            }
+        } else {
+            (Vec::new(), None, None)
+        };
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4784,6 +4812,36 @@ impl Services {
                     parent = %watch.parent_agent_id.0,
                     "skipping agent:idle wake — report already delivered at reportToParent time"
                 );
+                // monorepo#2842: the completion cycle ends here for this
+                // parent — the report-time wake already delivered this
+                // completion, so persist its identity for the pair. A watch
+                // re-armed later (or a boot reconcile replaying the child's
+                // historical completion after a restart) matches the marker
+                // and is skipped instead of re-delivering. Keyed on the
+                // SESSION's report timestamp (not the event's): this branch
+                // is reached by unreported idle payloads too, and the cycle
+                // being retired is the session's persisted report. A
+                // best-effort write: a failure only loses the dedup for this
+                // completion.
+                if let Some(identity) = session_report_ts.as_deref() {
+                    if let Err(e) = self
+                        .store
+                        .record_completion_wake_delivery(
+                            &watch.parent_agent_id,
+                            child_id,
+                            identity,
+                            &now_iso(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            child = %child_id.0,
+                            parent = %watch.parent_agent_id.0,
+                            error = %e,
+                            "completion wake dedup record failed at report-delivered retirement"
+                        );
+                    }
+                }
                 // Remove the watch now that the completion cycle is done.
                 if self.remove_watch(&watch.id) {
                     self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
@@ -4815,6 +4873,41 @@ impl Services {
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
                         "skipping duplicate agent:failed wake — same error already delivered"
+                    );
+                    continue;
+                }
+            }
+            // monorepo#2842: suppress a replayed identical completion wake to
+            // the same parent. The persisted per-pair marker records the
+            // identity (the child's completion_report_timestamp) of the last
+            // completion wake delivered — a boot reconcile re-synthesizing
+            // the child's HISTORICAL completion after a restart, or a watch
+            // re-armed on an already-completed child, matches the marker and
+            // is skipped, leaving the watch armed for a FUTURE completion
+            // (which carries a fresh report timestamp and delivers normally).
+            // Checked BEFORE the watch removal, like the failure dedup above,
+            // so the suppressed replay never consumes the one-shot watch. A
+            // marker read failure fails open (deliver as before): dedup is a
+            // guard, a missed suppression only restores the pre-fix wake.
+            if let Some(identity) = completion_identity.as_deref() {
+                let delivered = self
+                    .store
+                    .get_completion_wake_delivery(&watch.parent_agent_id, child_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            child = %child_id.0,
+                            parent = %watch.parent_agent_id.0,
+                            error = %e,
+                            "completion wake dedup read failed; delivering"
+                        );
+                        None
+                    });
+                if delivered.as_deref() == Some(identity) {
+                    tracing::info!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        "skipping replayed completion wake — same completion already delivered; watch stays armed"
                     );
                     continue;
                 }
@@ -4866,6 +4959,30 @@ impl Services {
             // identical failure the parent has yet to hear about.
             if let Some(err) = failure_error_text.as_deref() {
                 self.record_failure_wake(&watch.parent_agent_id, child_id, err);
+            }
+            // monorepo#2842: persist the delivered completion's identity for
+            // this pair — AFTER the wake succeeded (mirroring the failure
+            // record above), so a failed delivery never suppresses the retry.
+            // Best-effort: a write failure only loses the dedup for this
+            // completion (the pre-fix behavior).
+            if let Some(identity) = completion_identity.as_deref() {
+                if let Err(e) = self
+                    .store
+                    .record_completion_wake_delivery(
+                        &watch.parent_agent_id,
+                        child_id,
+                        identity,
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        error = %e,
+                        "completion wake dedup record failed"
+                    );
+                }
             }
             self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                 .await;

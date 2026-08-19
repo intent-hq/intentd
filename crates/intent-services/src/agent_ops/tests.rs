@@ -2038,6 +2038,194 @@ async fn fired_completion_watch_does_not_rehydrate() {
     assert_eq!(session.messages.len(), 1, "only the pre-restart wake");
 }
 
+/// Regression (intent-hq/monorepo#2842, restart replay): restart recovery
+/// must not re-deliver an already-delivered terminal completion. A child that
+/// reported (immediate parent wake) and completed retires its watch; when the
+/// parent re-arms a watch on the settled child and the daemon restarts, the
+/// boot reconciliation synthesizes the child's HISTORICAL completion — which
+/// must NOT wake the parent again (the re-armed watch stays armed for a
+/// FUTURE completion), across any number of restarts.
+#[tokio::test]
+async fn restart_reconcile_skips_already_delivered_completion() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child, baseline) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let resp = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    agent_instructions: Some("do the thing".into()),
+                    ..Default::default()
+                },
+                Some(parent.clone()),
+            )
+            .await
+            .expect("delegate");
+        let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        let baseline = parent_message_count(&svc, &parent).await;
+        // Immediate report-time wake (marks the delegate watch
+        // report_delivered).
+        svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child.clone()))
+            .await
+            .expect("report");
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        // Real completion: the report_delivered watch retires silently.
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({ "agentId": child.0 }),
+        ))
+        .await;
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        assert!(svc.find_watches_for_child(&child).is_empty());
+        wait_for_persisted_watches(&svc, 0).await;
+        // The parent re-arms a fresh watch on the settled child.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("re-arm watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child, baseline)
+    }; // old Services dropped — simulated daemon shutdown
+
+    // The child's terminal state as boot reconciliation sees it (the
+    // completion report + timestamp persisted by reportToParent survive: a
+    // settled child never starts the turn that would clear them).
+    {
+        let store = Store::open(&tmp.path).await.expect("reopen to mark");
+        let mut s = store
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        s.status = intent_core::AgentStatus::Completed;
+        store
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark child");
+    }
+
+    // Two consecutive restarts: the reconcile pass must not re-deliver the
+    // historical completion on either, and the re-armed watch stays armed.
+    for restart in 1..=2 {
+        let store = Store::open(&tmp.path).await.expect("reopen store");
+        let restarted = Services::new(store);
+        restarted
+            .heal_completion_watches_on_startup()
+            .await
+            .expect("heal watches");
+        assert_eq!(
+            parent_message_count(&restarted, &parent).await,
+            baseline + 1,
+            "restart {restart}: no duplicate completion wake"
+        );
+        assert_eq!(
+            restarted.find_watches_for_child(&child).len(),
+            1,
+            "restart {restart}: re-armed watch stays armed for a future completion"
+        );
+    }
+}
+
+/// Regression (intent-hq/monorepo#2842, re-arm semantics): re-arming a watch
+/// on an already-completed child must not fire on the historical completion
+/// the parent already received — only on a subsequent one.
+#[tokio::test]
+async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+    svc.agent_report_to_parent_op(ws.clone(), json!("first"), Some(child.clone()))
+        .await
+        .expect("report");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Park the child in its terminal state (report retained), then re-watch:
+    // the registration-time reconcile must NOT fire the historical completion.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "re-arm must not fire on the historical completion"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed for a future completion"
+    );
+
+    // A subsequent completion (new report → new identity) fires normally,
+    // exactly once — the normal single-delivery path is unchanged.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.completion_report = Some("second".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("re-report");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "second" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "future completion delivers exactly one wake"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired at the future completion"
+    );
+}
+
 /// Scope gate: a non-chief caller may not wait on a target outside its own
 /// workspace — rejected for BOTH modes and side-effect free (no watches, no
 /// group), even when a same-workspace target precedes the offending one.

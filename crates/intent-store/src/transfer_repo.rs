@@ -138,6 +138,14 @@ pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          captured in `interrupted_agent`",
     ),
     (
+        "completion_wake_delivery",
+        "per-daemon delivered-completion dedup bookkeeping (monorepo#2842); its \
+         (parent, child) rows can span workspaces (chief parents) so a \
+         workspace-scoped export could violate the agent_session FKs on import, \
+         and losing a marker fails open — at worst one already-delivered \
+         completion wake repeats once on the target",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",
