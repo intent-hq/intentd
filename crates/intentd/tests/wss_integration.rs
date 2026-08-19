@@ -39,6 +39,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+/// Persisted cache key for the current Auggie catalog wire shape.
+const AUGGIE_CATALOG_VERSION: &str = "preserve-legacy-v1";
 
 /// Lowercase hex sha256 digest of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1842,12 +1844,13 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
 async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     let dir = test_tempdir("intentd-wss-bare-mismatch-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
-    // version key must match each provider's current one ("" — no pin).
+    // version key must match each provider's current one (Auggie is shape-versioned;
+    // Grok has no pin).
     let cache = serde_json::json!({
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
             },
@@ -1992,12 +1995,13 @@ async fn wss_agent_set_model_provider_id_param() {
     }
     let dir = test_tempdir("intentd-wss-setmodel-pid-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
-    // version key must match each provider's current one ("" — no pin).
+    // version key must match each provider's current one (Auggie is shape-versioned;
+    // Grok has no pin).
     let cache = serde_json::json!({
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
             },
@@ -2174,12 +2178,13 @@ async fn wss_agent_set_model_provider_id_param() {
 async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
     let dir = test_tempdir("intentd-wss-bare-cache-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
-    // version key must match each provider's current one ("" — no pin).
+    // version key must match each provider's current one (Auggie is shape-versioned;
+    // Grok has no pin).
     let cache = serde_json::json!({
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "fable-5", "name": "Fable 5", "provider": "auggie" } ]
             },
@@ -3087,7 +3092,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [
                     { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
@@ -3186,7 +3191,7 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [
                     { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
@@ -3299,7 +3304,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [
                     { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
@@ -4318,7 +4323,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "lg", "name": "LG", "provider": "auggie" } ]
             }
