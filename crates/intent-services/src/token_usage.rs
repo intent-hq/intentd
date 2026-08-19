@@ -17,17 +17,17 @@
 use std::collections::BTreeMap;
 
 use intent_acp::session::Usage;
-use intent_core::{token_usage_reported, AgentSession, TokenUsage, TokenUsageTotals, UsageCost};
+use intent_core::{token_usage_reported, TokenUsage, TokenUsageTotals, UsageCost};
 use serde_json::Value;
 
 /// Model key used when an agent session has no recorded model (§5.23 fallback).
-pub const UNKNOWN_MODEL: &str = "unknown";
+pub(crate) const UNKNOWN_MODEL: &str = "unknown";
 
 /// Provider key used when a session's provider is unknowable (§5.36 fallback).
 /// Same `"unknown"` sentinel as [`UNKNOWN_MODEL`] — the two usage-stats
 /// dimensions share the value, but the alias keeps provider-side call sites
 /// readable.
-pub const UNKNOWN_PROVIDER: &str = UNKNOWN_MODEL;
+pub(crate) const UNKNOWN_PROVIDER: &str = UNKNOWN_MODEL;
 
 /// One agent's contribution to the workspace tally: its `agent-{uuid}` id, the
 /// effective model name, and the summed per-turn counters.
@@ -88,7 +88,7 @@ impl CostBucket {
 /// is stamped by the caller (the scan job records the RFC-3339 scan time).
 /// Provider-reported costs (§5.23) accumulate per bucket via [`CostBucket`];
 /// buckets no contributing session reported a cost for stay cost-less.
-pub fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
+pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
     let mut usage = TokenUsage::default();
     let mut totals_cost = CostBucket::default();
     let mut agent_costs: BTreeMap<String, CostBucket> = BTreeMap::new();
@@ -132,26 +132,6 @@ pub fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
     usage
 }
 
-/// Sum the per-turn token counters recorded on one agent session's transcript.
-/// Each message MAY carry a `usage` object — checked at the content block's
-/// top level and under `_meta` — whose `inputTokens`/`outputTokens`/
-/// `cacheReadTokens`/`cacheCreationTokens` fields are summed; absent fields and
-/// messages without usage contribute zero. The model key is the session's
-/// `model` (empty → `"unknown"` is applied by [`aggregate_token_usage`]).
-pub fn session_token_tally(session: &AgentSession) -> AgentTokenTally {
-    let mut totals = TokenUsageTotals::default();
-    for message in &session.messages {
-        if let Some(usage) = extract_message_usage(&message.content) {
-            add_totals(&mut totals, &usage);
-        }
-    }
-    AgentTokenTally {
-        agent_id: session.id.0.clone(),
-        model: session.model.clone().unwrap_or_default(),
-        totals,
-    }
-}
-
 /// Interpret one end-of-turn ACP `Usage` report as the session's cumulative
 /// [`TokenUsageTotals`] snapshot.
 ///
@@ -174,7 +154,7 @@ pub fn session_token_tally(session: &AgentSession) -> AgentTokenTally {
 /// (`Store::replace_acp_session_id`); the agent's effective total is then
 /// `baseline + snapshot` (see [`agent_token_tally`]). The snapshot itself
 /// stays replace-only — the baseline lives outside it.
-pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
+pub(crate) fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
     TokenUsageTotals {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -236,9 +216,8 @@ pub fn agent_token_tally(
 
 /// Lightweight token tally from extracted usage data (finding F2: avoid full
 /// AgentSession hydration). Takes an agent_id, model, and the message content
-/// JSON list (usage metadata is embedded in each content block). This is the
-/// incremental-scan counterpart to [`session_token_tally`].
-pub fn agent_token_tally_from_contents(
+/// JSON list (usage metadata is embedded in each content block).
+pub(crate) fn agent_token_tally_from_contents(
     agent_id: &str,
     model: Option<&str>,
     contents: &[serde_json::Value],

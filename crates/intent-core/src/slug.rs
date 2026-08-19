@@ -35,7 +35,7 @@ pub fn append_slug_suffix(base: &str, number: u32) -> String {
 
 /// Strip a trailing numeric collision suffix from a `word-word(-N)` slug (TS
 /// `extractBaseSlug`); anything else is returned unchanged.
-pub fn extract_base_slug(slug: &str) -> &str {
+pub(crate) fn extract_base_slug(slug: &str) -> &str {
     let Some((base, tail)) = slug.rsplit_once('-') else {
         return slug;
     };

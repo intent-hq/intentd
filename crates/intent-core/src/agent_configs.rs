@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 /// Directory under the data dir that holds per-agent generated config files.
-pub const AGENT_CONFIGS_DIR_NAME: &str = "agent-configs";
+pub(crate) const AGENT_CONFIGS_DIR_NAME: &str = "agent-configs";
 
 /// The agent-configs root for a data dir: `<data_dir>/agent-configs`.
 pub fn agent_configs_root(data_dir: &Path) -> PathBuf {

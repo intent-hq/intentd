@@ -133,7 +133,7 @@ fn transport_closed_error(err: &AcpError) -> bool {
 /// only from `availableModes` rather than blindly asking for a mode the agent
 /// never offered.
 #[derive(Debug, Clone)]
-pub struct AcpSessionOpened {
+pub(crate) struct AcpSessionOpened {
     /// The canonical `acpSessionId` to drive future turns.
     pub session_id: String,
     /// The modes the provider advertised in `session/new` / `session/load`, if
@@ -156,7 +156,7 @@ pub struct AcpSessionOpened {
 /// `reasoning_effort` for codex-acp), so discovery keys on the CATEGORY and
 /// carries the adapter's own id for the `session/set_config_option` call.
 #[derive(Debug, Clone)]
-pub struct ThoughtLevelOption {
+pub(crate) struct ThoughtLevelOption {
     /// The adapter's config id, sent as `configId`.
     pub config_id: String,
     /// The value the adapter reported as current at session open — the
@@ -177,7 +177,7 @@ impl ThoughtLevelOption {
     /// sentinel (claude-agent-acp lists it alongside the real levels; it is a
     /// clear-selection affordance, not a level). `None` when nothing remains —
     /// the persisted column stays NULL rather than `Some(empty)`.
-    pub fn surfaced_levels(&self) -> Option<Vec<String>> {
+    pub(crate) fn surfaced_levels(&self) -> Option<Vec<String>> {
         let levels: Vec<String> = self
             .values
             .iter()
@@ -1146,7 +1146,8 @@ impl Services {
     /// Test seam: [`set_live_turn`](Self::set_live_turn) with the final text
     /// block marked CLOSED (e.g. flushed by a tool call, no new text since) —
     /// the live preview derivation must not clip it.
-    pub fn set_live_turn_closed_final_block(
+    #[cfg(test)]
+    pub(crate) fn set_live_turn_closed_final_block(
         &self,
         agent_id: &AgentId,
         message_id: &str,
@@ -1806,7 +1807,7 @@ impl Services {
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to
     /// pick a permissive `session/set_mode` target from `availableModes`).
-    pub async fn open_acp_session(
+    pub(crate) async fn open_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
@@ -1870,7 +1871,7 @@ impl Services {
     /// reused instead of being clobbered. Returns the canonical `acpSessionId`
     /// with modes only when the freshly-opened session won the CAS — otherwise
     /// the modes belong to some other session and callers must not act on them.
-    pub async fn recreate_acp_session(
+    pub(crate) async fn recreate_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
@@ -1940,7 +1941,7 @@ impl Services {
     /// when one was stored and the agent advertised the `loadSession` capability.
     /// Returns the resumed id plus the modes the provider advertised in
     /// `session/load`, or `None` when resume is not possible (§6.5).
-    pub async fn resume_acp_session(
+    pub(crate) async fn resume_acp_session(
         &self,
         conn: &Connection,
         init: &InitializeResponse,

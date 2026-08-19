@@ -61,7 +61,8 @@ pub fn ensure_tls_certificate(data_dir: &Path) -> Result<TlsCertificate> {
 
 /// SHA-256 fingerprint of the cached certificate, or `None` before one has been
 /// loaded or generated.
-pub fn cert_fingerprint() -> Option<String> {
+#[cfg(test)]
+pub(crate) fn cert_fingerprint() -> Option<String> {
     CACHE
         .lock()
         .expect("tls cache poisoned")
@@ -71,7 +72,7 @@ pub fn cert_fingerprint() -> Option<String> {
 
 /// Clear the in-memory cache. Used in tests to ensure hermetic test isolation.
 #[cfg(test)]
-pub fn clear_cert_cache() {
+pub(crate) fn clear_cert_cache() {
     *CACHE.lock().expect("tls cache poisoned") = None;
 }
 

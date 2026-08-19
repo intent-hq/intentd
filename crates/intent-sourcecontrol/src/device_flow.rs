@@ -26,7 +26,8 @@ use tokio::time::timeout;
 use crate::error::{Error, Result};
 use crate::token::SECRET_ACCOUNT;
 
-pub use intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID as DEFAULT_OAUTH_CLIENT_ID;
+#[cfg(test)]
+use intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID as DEFAULT_OAUTH_CLIENT_ID;
 
 /// Extra seconds GitHub mandates after a `slow_down` response when the reply
 /// carries no explicit `interval` hint.
@@ -146,13 +147,6 @@ pub async fn start_at(
 }
 
 impl DeviceFlow {
-    /// Override the backing secret store (tests use a temp-dir store so they
-    /// never touch the real `~/intent/secrets.json`).
-    pub fn with_store(mut self, store: FileSecretStore) -> Self {
-        self.store = store;
-        self
-    }
-
     /// Minimum seconds callers must wait before the next [`Self::poll_once`]
     /// (grows when GitHub answers `slow_down`).
     pub fn interval_secs(&self) -> u64 {
@@ -280,7 +274,8 @@ async fn persist_token(store: FileSecretStore, token: SecretString) -> Result<()
 /// disconnect). Absence is an idempotent success, mirroring
 /// [`FileSecretStore::delete`], and the blocking delete is bounded by
 /// [`SECRET_WRITE_TIMEOUT`]. Env / `gh` fallbacks are untouched.
-pub async fn revoke_token(store: FileSecretStore) -> Result<()> {
+#[cfg(test)]
+pub(crate) async fn revoke_token(store: FileSecretStore) -> Result<()> {
     let handle = tokio::task::spawn_blocking(move || store.delete(SECRET_ACCOUNT));
     match timeout(SECRET_WRITE_TIMEOUT, handle).await {
         Ok(Ok(Ok(()))) => Ok(()),

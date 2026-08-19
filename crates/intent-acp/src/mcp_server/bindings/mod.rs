@@ -45,6 +45,7 @@ pub(crate) mod workspace;
 /// `pub` (re-exported as `intent_acp::bindings_prelude`) so callers that
 /// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
 /// scheduler in `intent-services` — install the exact same environment.
+#[cfg(test)]
 pub fn prelude() -> String {
     prelude_for(&AgentFeaturesSettings::default())
 }
@@ -57,7 +58,7 @@ pub fn prelude() -> String {
 /// `pub` (re-exported as `intent_acp::bindings_prelude_for`) so the
 /// background hook scheduler in `intent-services` installs the same gated
 /// environment its owning session's `workspace_api` bridge would.
-pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
+pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     prelude_for_bridge(features, false)
 }
 

@@ -418,7 +418,7 @@ impl Store {
     }
 
     /// List the comments in one thread, ordered by creation time.
-    pub async fn list_thread_comments(&self, thread_id: &str) -> Result<Vec<Comment>> {
+    pub(crate) async fn list_thread_comments(&self, thread_id: &str) -> Result<Vec<Comment>> {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM comment WHERE thread_id = ? ORDER BY created_at, id"
         );

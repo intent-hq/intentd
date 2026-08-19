@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 /// writer (§17.4) to populate `tracked_changes`. Content stays lazy via the blob
 /// SHAs rather than being inlined.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiffSummary {
+pub(crate) struct DiffSummary {
     pub additions: i64,
     pub deletions: i64,
     pub old_blob_sha: Option<String>,
@@ -36,7 +36,7 @@ pub struct DiffSummary {
 ///
 /// Full file content is **not** inlined (`old_content`/`new_content` stay NULL);
 /// content is recoverable lazily via the blob SHAs in the returned summary.
-pub async fn compute_and_store(
+pub(crate) async fn compute_and_store(
     store: &Store,
     worktree_path: &Path,
     workspace_id: &WorkspaceId,

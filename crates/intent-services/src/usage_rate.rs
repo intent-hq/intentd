@@ -15,16 +15,16 @@ use time::{Duration, OffsetDateTime, UtcOffset};
 
 /// Default number of trailing minute samples returned by
 /// `stats.getRateHistory` when the caller omits `limit`.
-pub const DEFAULT_RATE_HISTORY_LIMIT: u32 = 60;
+pub(crate) const DEFAULT_RATE_HISTORY_LIMIT: u32 = 60;
 
 /// Upper bound on `limit`: the 24h retention window holds at most 1440
 /// minute buckets, so larger windows could never be served.
-pub const MAX_RATE_HISTORY_LIMIT: u32 = 1440;
+pub(crate) const MAX_RATE_HISTORY_LIMIT: u32 = 1440;
 
 /// Floor `t` to its UTC minute and render the bucket key used by
 /// `usage_rate_minutely.bucket_utc`: `"YYYY-MM-DDTHH:MM:00Z"`. Keys sort
 /// lexicographically in chronological order.
-pub fn minute_bucket_utc(t: OffsetDateTime) -> String {
+pub(crate) fn minute_bucket_utc(t: OffsetDateTime) -> String {
     let t = t.to_offset(UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:00Z",
@@ -53,7 +53,7 @@ pub fn minute_bucket_utc(t: OffsetDateTime) -> String {
 ///
 /// Pure: callers skip all-zero parts, and the store accumulates additively when
 /// two turns overlap the same minute.
-pub fn split_delta_across_minutes(
+pub(crate) fn split_delta_across_minutes(
     turn_end: OffsetDateTime,
     turn_duration: std::time::Duration,
     delta: &UsageRateDelta,
@@ -101,7 +101,7 @@ pub fn split_delta_across_minutes(
 /// Validate the wire `limit` param: absent → [`DEFAULT_RATE_HISTORY_LIMIT`];
 /// out of range (< 1 or > [`MAX_RATE_HISTORY_LIMIT`]) is `InvalidParams`
 /// (router surfaces `-32602`).
-pub fn parse_limit(limit: Option<i64>) -> Result<u32> {
+pub(crate) fn parse_limit(limit: Option<i64>) -> Result<u32> {
     match limit {
         None => Ok(DEFAULT_RATE_HISTORY_LIMIT),
         Some(n) if (1..=i64::from(MAX_RATE_HISTORY_LIMIT)).contains(&n) => Ok(n as u32),
@@ -123,7 +123,11 @@ pub fn window_start(now_utc: OffsetDateTime, limit: u32) -> String {
 /// minute floor. Minutes without a persisted row are zero-filled; `rows`
 /// outside the window are ignored (defensive — the store query already
 /// filters). Empty stores return all-zero samples, never an error.
-pub fn rate_history_json(rows: &[UsageRateRow], limit: u32, now_utc: OffsetDateTime) -> Value {
+pub(crate) fn rate_history_json(
+    rows: &[UsageRateRow],
+    limit: u32,
+    now_utc: OffsetDateTime,
+) -> Value {
     let by_bucket: std::collections::BTreeMap<&str, &UsageRateRow> =
         rows.iter().map(|r| (r.bucket_utc.as_str(), r)).collect();
     let zero = UsageRateRow::default();
