@@ -258,6 +258,31 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
+    /// List a workspace's non-cancelled (active + completed) monitors, oldest
+    /// first — the displayStatus derivation read (active rows feed the open-PR
+    /// signals, completed rows the merged signal). Cancelled rows are excluded
+    /// in SQL so cost stays O(live monitor rows), never O(all monitor history
+    /// in the workspace).
+    pub async fn list_non_cancelled_pr_monitors_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitor>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? \
+             AND state IN ('active', 'completed') ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "list non-cancelled pr monitors by workspace failed: {e}"
+                ))
+            })?;
+        rows.iter().map(monitor_from_row).collect()
+    }
+
     /// Every `active` monitor across all workspaces, oldest first — the poll
     /// loop's per-tick read and the boot rehydration read.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
