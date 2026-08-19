@@ -10102,6 +10102,16 @@ async fn handle_terminal_turn_failure(
     // from within the worker: only kills child/handle, no worker/busy touch.
     mgr.kill_child_only(agent_id).await;
 
+    // A stale truncation auto-redrive arm (monorepo#2863) must not survive a
+    // terminal failure: `run_prompt_turn` arms BEFORE the assistant-row
+    // flush, so a `?`-propagated store error after the arm lands here with
+    // the flag still set — a later plain `sendMessage` turn would consume it
+    // and inject a spurious nudge. The streak clears with it: the failed
+    // turn ends the stall episode, same terms as the stop/interrupt/retry/
+    // delete teardown sites.
+    mgr.services.take_truncation_redrive(agent_id);
+    mgr.services.clear_truncation_redrives(agent_id);
+
     let error_text = error.to_string();
     if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
         return;
