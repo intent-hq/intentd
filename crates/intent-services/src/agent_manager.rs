@@ -9831,7 +9831,9 @@ async fn handle_drain_persist_failure(
 
 /// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
 /// `agent_session.rs`): `Error::Internal(format!("session/prompt failed: {e}"))`.
-const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
+/// `pub(crate)` so the failure-wake identity guard (`lib.rs`, monorepo#2862)
+/// can reconstruct the persisted wrapper from a raw-text `agent:failed` emit.
+pub(crate) const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 
 /// The ACP cancellation surface inside the [`PROMPT_FAILED_PREFIX`] wrapper,
 /// if any. The structured `AcpError` is flattened to a string at the wrap
