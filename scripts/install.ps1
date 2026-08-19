@@ -246,5 +246,5 @@ if ($serviceMode -eq 'yes') {
     Write-Host ''
     Write-Host 'Next steps:'
     Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
-    Write-Host '  intentd pair    # connecting from another machine (desktop/mobile app)? prints pairing info'
+    Write-Host '  intentd pair    # once the daemon is running (another terminal): pairing info for remote clients (desktop/mobile app)'
 }

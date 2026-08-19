@@ -144,8 +144,10 @@ answering `auto` — the default — writes nothing). `INTENTD_AUTO_RESUME=auto|
 intentd pair   # pairing info for remote clients (URL/token/fingerprint) — skip if only the local desktop app uses this daemon
 ```
 
-To connect the desktop or iOS app from another machine, run `intentd pair` after
-installing — see [Pairing a remote client](#pairing-a-remote-client-wss).
+To connect the desktop or iOS app from another machine, run `intentd pair` once the
+daemon is running (the service starts it; if you declined service setup, start it
+with `intentd serve` first) — see
+[Pairing a remote client](#pairing-a-remote-client-wss).
 
 ### One-line script (Windows)
 
@@ -168,8 +170,10 @@ direct run) answers non-interactively.
 intentd pair   # pairing info for remote clients (URL/token/fingerprint) — skip if only the local desktop app uses this daemon
 ```
 
-To connect the desktop or iOS app from another machine, run `intentd pair` after
-installing — see [Pairing a remote client](#pairing-a-remote-client-wss).
+To connect the desktop or iOS app from another machine, run `intentd pair` once the
+daemon is running (the scheduled task starts it; if you declined task setup, start it
+with `intentd serve` first) — see
+[Pairing a remote client](#pairing-a-remote-client-wss).
 
 ### Homebrew (macOS / Linux)
 
