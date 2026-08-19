@@ -113,6 +113,7 @@ apply_auto_resume() {
 setup_service_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
+    info "connecting from another machine (desktop/mobile app)? Once the daemon is running: intentd pair"
     return 0
   fi
 
@@ -155,6 +156,7 @@ EOF
   if ! systemctl --user show-environment >/dev/null 2>&1; then
     warn "unit written to $unit_dir/$unit_name.service, but cannot talk to the systemd user manager for this session — enable it later from a login session with:
   systemctl --user enable --now $unit_name"
+    info "connecting from another machine (desktop/mobile app)? Once the daemon is running: intentd pair"
     return 0
   fi
 
@@ -179,6 +181,7 @@ EOF
   verify_daemon
   apply_auto_resume
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
+  info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
 setup_service_macos() {
@@ -252,6 +255,7 @@ EOF
   verify_daemon
   apply_auto_resume
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
+  info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
 main() {
@@ -454,6 +458,7 @@ main() {
   printf '%s\n' "
 Next steps:
   intentd serve   # start the daemon in the foreground (downloads the real daemon on first run)
+  intentd pair    # once the daemon is running (another terminal): pairing info for remote clients (desktop/mobile app)
 
 To run intentd at login as a background service, re-run this installer with
 INTENTD_INSTALL_SERVICE=1, or use a package-manager install:
