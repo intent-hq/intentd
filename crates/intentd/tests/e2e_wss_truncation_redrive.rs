@@ -473,6 +473,10 @@ async fn truncated_turn_redriven_and_no_premature_wake_over_wss() {
     // again after the wake turn. Meanwhile count every OTHER agent's (the
     // child's) `agent:idle` — the truncated first turn must NOT produce one,
     // so exactly ONE child idle (the clean post-redrive one) is expected.
+    // The break requires BOTH two parent idles and a child idle: a stray
+    // parent wake (e.g. an unrelated `[WORKSPACE EVENTS]` batch) can produce
+    // the second parent idle before the child's clean idle arrives, and
+    // breaking on the parent count alone would miss the child idle.
     let mut parent_idles = 0u32;
     let mut child_idles: Vec<Value> = Vec::new();
     for _ in 0..400 {
@@ -481,11 +485,11 @@ async fn truncated_turn_redriven_and_no_premature_wake_over_wss() {
         if ev["type"] == json!("agent:idle") {
             if ev["data"]["agentId"] == json!(parent_id) {
                 parent_idles += 1;
-                if parent_idles >= 2 {
-                    break;
-                }
             } else {
                 child_idles.push(ev.clone());
+            }
+            if parent_idles >= 2 && !child_idles.is_empty() {
+                break;
             }
         }
     }

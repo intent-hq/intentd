@@ -3651,8 +3651,12 @@ impl AgentManager {
         // failure.
         self.services.discard_pending_terminal_error(agent_id);
         // A stale truncation auto-redrive arm (monorepo#2863) is dropped on
-        // the same terms: it belongs to the aborted turn.
+        // the same terms: it belongs to the aborted turn. The consecutive
+        // streak clears with it — a manual stop ends the stall episode, so a
+        // later unrelated truncation must start a fresh episode rather than
+        // inherit the old count and hit the cap early.
         self.services.take_truncation_redrive(agent_id);
+        self.services.clear_truncation_redrives(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -3768,8 +3772,12 @@ impl AgentManager {
         // later failure's settle.
         self.services.discard_pending_terminal_error(agent_id);
         // A stale truncation auto-redrive arm (monorepo#2863) is dropped on
-        // the same terms: it belongs to the aborted turn.
+        // the same terms: it belongs to the aborted turn. The consecutive
+        // streak clears with it — an interrupt ends the stall episode, so a
+        // later unrelated truncation must start a fresh episode rather than
+        // inherit the old count and hit the cap early.
         self.services.take_truncation_redrive(agent_id);
+        self.services.clear_truncation_redrives(agent_id);
         // Persist the streamed-so-far assistant content as an interrupted
         // assistant row, stamped with the interruption reason (+ sender
         // attribution on preemption). Runs AFTER the abort (a worker append
