@@ -277,8 +277,9 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors.
+    Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
@@ -505,8 +506,9 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors.
+    Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
