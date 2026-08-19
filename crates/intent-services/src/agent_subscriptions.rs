@@ -1402,7 +1402,7 @@ impl Services {
         call_site: WatchReconcileCallSite,
     ) {
         use intent_core::AgentStatus;
-        let (event_type, event_ws, status_value, completion_report, agent_name) =
+        let (event_type, event_ws, status_value, completion_report, stop_reason, agent_name) =
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
@@ -1485,6 +1485,7 @@ impl Services {
                         session.workspace_id,
                         status,
                         session.completion_report,
+                        session.stop_reason,
                         Some(session.name),
                     )
                 }
@@ -1492,6 +1493,7 @@ impl Services {
                     intent_core::events::AGENT_DELETED,
                     fallback_ws.clone(),
                     serde_json::json!("deleted"),
+                    None,
                     None,
                     None,
                 ),
@@ -1507,6 +1509,18 @@ impl Services {
             "agentId": child_id.0,
             "status": status_value,
         });
+        // A synthesized `agent:failed` carries the persisted `stop_reason` as
+        // `data.error` — like a live terminal-failure emit — so the wake text
+        // names the failure and, critically, the delivery pass can derive the
+        // failure's persistent dedup identity (monorepo#2862: the identity
+        // guard requires the event-carried error to match the session's
+        // persisted stop_reason). Without it a boot/registration replay of a
+        // historical failure would fail open and re-deliver.
+        if event_type == intent_core::events::AGENT_FAILED {
+            if let Some(reason) = &stop_reason {
+                data["error"] = serde_json::Value::String(reason.clone());
+            }
+        }
         // `agentName` enrichment (intent-hq/monorepo#2869): a synthesized
         // completion carries the same name stamp as the live emits, so wake
         // subscribers never render the raw agent id. Omitted (never null)
