@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.22] - 2026-08-19
+
+### 🐛 Bug Fixes
+
+- Persist agent:failed wake dedup so restarts and re-arms never re-deliver historical failures ([#1316](https://github.com/intent-hq/intentd/pull/1316))
+- Enrich agent:failed and agent:deleted wake events with agentName ([#1318](https://github.com/intent-hq/intentd/pull/1318))
+- Auto-redrive suspected-truncated turns on delegated in-task agents ([#1317](https://github.com/intent-hq/intentd/pull/1317))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump sha2 to 0.11 ([#1321](https://github.com/intent-hq/intentd/pull/1321))
+
+
 ## [0.7.21] - 2026-08-19
 
 ### 🚀 Features
