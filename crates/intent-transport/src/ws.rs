@@ -1,7 +1,7 @@
 //! HTTPS + WebSocket listener (§5.2).
 //!
 //! Ports `src/main/websocket-api-server.ts`: a TLS listener on
-//! `<bindAddress>:<port>` (default `0.0.0.0:5181`) serving a WebSocket endpoint
+//! `<bindAddress>:<port>` (default `127.0.0.1:5181`) serving a WebSocket endpoint
 //! at `/ws` and a plain `GET /health` → `{ "status":"ok", "clients":<n> }`.
 //! Bearer auth + the origin allow-list are enforced during the HTTP upgrade
 //! (401 bad token / 403 disabled or bad origin, socket destroyed). The accepted
@@ -49,7 +49,8 @@ use crate::tls::TlsCertificate;
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 /// Tuning for a [`WsApiServer`]. [`Default`] mirrors the production posture:
-/// bind `0.0.0.0:5181`, WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
+/// bind `127.0.0.1:5181` (loopback; `server.bindAddress` widens it
+/// deliberately), WS API enabled, bearer auth on (TCP), 30s/60s heartbeat.
 ///
 /// The TLS + auth posture is picked by the constructor: [`WsApiServer::new`]
 /// uses TLS + bearer auth; [`WsApiServer::new_insecure`] disables both.
@@ -78,7 +79,7 @@ pub struct WsOptions {
 impl Default for WsOptions {
     fn default() -> Self {
         Self {
-            bind_address: IpAddr::from([0, 0, 0, 0]),
+            bind_address: IpAddr::from([127, 0, 0, 1]),
             base_port: DEFAULT_PORT,
             enabled: true,
             auth_enabled: true,

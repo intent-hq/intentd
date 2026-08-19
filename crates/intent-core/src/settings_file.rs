@@ -223,7 +223,9 @@ pub struct RtkSettings {
 pub struct ServerSettings {
     /// `server.socketPath` — Unix socket path for the UDS listener.
     pub socket_path: Option<String>,
-    /// `server.bindAddress` — address the TCP listener binds.
+    /// `server.bindAddress` — address the TCP listener binds. Defaults to
+    /// loopback (`127.0.0.1`); set `0.0.0.0` to expose the listener on every
+    /// interface, including untrusted networks.
     pub bind_address: String,
     /// `server.port` — TCP port for the WSS listener (1024–65535).
     pub port: u16,
@@ -244,7 +246,7 @@ impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             socket_path: None,
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "127.0.0.1".to_string(),
             port: 5181,
             origin_allow_list: None,
             max_outstanding_rpcs: DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
@@ -1159,8 +1161,9 @@ enabled = false
 [server]
 # Socket path -- Unix socket path for the UDS listener.
 # socketPath = "/path/to/intentd.sock"
-# Bind address -- address the TCP listener binds.
-bindAddress = "0.0.0.0"
+# Bind address -- address the TCP listener binds; 0.0.0.0 exposes it on every
+# interface, including untrusted networks.
+bindAddress = "127.0.0.1"
 # WS port -- TCP port for the WSS listener (1024-65535).
 port = 5181
 # Origin allow-list -- permitted WS origins.
@@ -1420,7 +1423,7 @@ mod tests {
         assert!(d.notifications.sound_only_when_unfocused);
         assert_eq!(d.notifications.volume, 0.5);
         assert!(!d.rtk.enabled);
-        assert_eq!(d.server.bind_address, "0.0.0.0");
+        assert_eq!(d.server.bind_address, "127.0.0.1");
         assert_eq!(d.server.port, 5181);
         assert_eq!(d.server.origin_allow_list, None);
         assert!(!d.server.ws_api.enabled);

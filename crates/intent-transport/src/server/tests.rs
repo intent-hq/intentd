@@ -45,7 +45,12 @@ struct MockPairingInfo {
 impl ServerPairingInfo for MockPairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let port = self.port;
-        Box::pin(async move { PairingSnapshot { port } })
+        Box::pin(async move {
+            PairingSnapshot {
+                port,
+                bind_address: None,
+            }
+        })
     }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
@@ -200,4 +205,51 @@ async fn handle_rotate_token_local_success() {
 
     let _ = std::fs::remove_dir_all(&tmpdir);
     // _guard drops here, restoring the original env var value
+}
+
+#[test]
+fn pairing_hosts_specific_bind_advertises_only_that_address() {
+    // A listener bound to one address (loopback or a single interface) is
+    // reachable only there (monorepo#2900).
+    for addr in ["127.0.0.1", "192.168.1.23"] {
+        let snapshot = PairingSnapshot {
+            port: Some(5181),
+            bind_address: Some(addr.parse().unwrap()),
+        };
+        assert_eq!(pairing_hosts(&snapshot), vec![addr.to_string()]);
+    }
+}
+
+#[test]
+fn pairing_hosts_unspecified_or_unknown_bind_enumerates_local_ips() {
+    // 0.0.0.0 listens everywhere; an unknown bind (older snapshot source)
+    // keeps the historical enumeration behavior. Both fall back to
+    // collect_local_ips — assert equality rather than contents, since the
+    // machine's interfaces vary.
+    let unspecified = PairingSnapshot {
+        port: Some(5181),
+        bind_address: Some("0.0.0.0".parse().unwrap()),
+    };
+    let unknown = PairingSnapshot {
+        port: Some(5181),
+        bind_address: None,
+    };
+    assert_eq!(pairing_hosts(&unspecified), collect_local_ips());
+    assert_eq!(pairing_hosts(&unknown), collect_local_ips());
+}
+
+#[test]
+fn collect_bind_interfaces_loopback_first_no_duplicates() {
+    let ifaces = collect_bind_interfaces();
+    // Machines without any interface (rare CI sandboxes) yield an empty list;
+    // everything else must lead with loopback and never repeat an address.
+    if let Some((_, first)) = ifaces.first() {
+        if ifaces.iter().any(|(_, ip)| ip.is_loopback()) {
+            assert!(first.is_loopback(), "loopback sorts first: {ifaces:?}");
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (_, ip) in &ifaces {
+        assert!(seen.insert(*ip), "duplicate address in {ifaces:?}");
+    }
 }

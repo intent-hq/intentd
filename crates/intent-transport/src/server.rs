@@ -33,6 +33,10 @@ pub trait ServerPairingInfo: Send + Sync {
 pub struct PairingSnapshot {
     /// The bound WSS port, when the TCP listener is running.
     pub port: Option<u16>,
+    /// The address the running listener is bound to (`server.bindAddress`),
+    /// when known — drives which hosts the pairing payload advertises
+    /// ([`pairing_hosts`]).
+    pub bind_address: Option<std::net::IpAddr>,
 }
 
 /// The two server methods, once classified.
@@ -117,7 +121,7 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    let local_ips = collect_local_ips();
+    let local_ips = pairing_hosts(&snapshot);
     let hostname = crate::host_env::local_hostname();
 
     Ok(json!({
@@ -144,6 +148,42 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 
     crate::generate_token(provider.token_store()).await?;
     pairing_info_json(provider).await
+}
+
+/// Hosts the pairing payload should advertise for `snapshot`: a listener
+/// bound to a specific address (loopback included) is reachable only there,
+/// so advertise exactly that address; an unspecified bind (`0.0.0.0` / `::`)
+/// or an unknown one falls back to enumerating the machine's local IPs.
+pub fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
+    match snapshot.bind_address {
+        Some(addr) if !addr.is_unspecified() => vec![addr.to_string()],
+        _ => collect_local_ips(),
+    }
+}
+
+/// Enumerate `(interface name, IPv4)` candidates for the `intentd pair`
+/// bind-address picker: loopback included (listed first), virtual/container
+/// interfaces skipped (same prefixes as [`collect_local_ips`]), one entry per
+/// distinct address.
+pub fn collect_bind_interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
+    let mut out: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if ["docker", "veth", "br-", "bridge", "vboxnet", "vmnet"]
+                .iter()
+                .any(|p| iface.name.starts_with(p))
+            {
+                continue;
+            }
+            if let std::net::IpAddr::V4(v4) = iface.ip() {
+                if !out.iter().any(|(_, ip)| *ip == v4) {
+                    out.push((iface.name.clone(), v4));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|(_, ip)| !ip.is_loopback());
+    out
 }
 
 /// Collect local IP addresses (non-loopback IPv4) for pairing. Mirrors the logic

@@ -10629,7 +10629,8 @@ impl Services {
 
     /// Apply server runtime control hooks after `settings.update` persists
     /// `server.wsApi.*` changes (§5.12): `server.wsApi.enabled` starts/stops the
-    /// WSS listener; `server.wsApi.port` restarts it when running.
+    /// WSS listener; `server.wsApi.port` / `server.bindAddress` restart it when
+    /// running (the start path re-reads both persisted values).
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
     ///
@@ -10701,6 +10702,42 @@ impl Services {
                                     port = port,
                                     "server.wsApi.port → {}: persisted (listener not running)",
                                     port
+                                );
+                            }
+                        }
+                    }
+                    "server.bindAddress" => {
+                        if let Some(addr) = change.get("value").and_then(|v| v.as_str()) {
+                            // Check if listener is running
+                            if control.ws_listener_port().await.is_some() {
+                                // Listener is running: restart it on the new
+                                // bind address (start re-reads the persisted
+                                // value)
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarting WSS listener",
+                                    addr
+                                );
+                                control.stop_ws_listener().await;
+                                control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        bind_address = addr,
+                                        "server.bindAddress → {}: failed to restart WSS listener", addr
+                                    );
+                                    Error::Internal(format!("failed to restart WSS listener on {}: {}", addr, e))
+                                })?;
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarted WSS listener",
+                                    addr
+                                );
+                            } else {
+                                // Listener is not running: persisting the value is enough
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: persisted (listener not running)",
+                                    addr
                                 );
                             }
                         }
