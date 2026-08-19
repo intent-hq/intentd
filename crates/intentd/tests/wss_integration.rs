@@ -8505,6 +8505,136 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     srv.ws.stop().await;
 }
 
+/// Slim page byte budget over the real WSS wire (§5.5): a block-heavy
+/// transcript (the observed 2.87MB-frame class: many messages × ~80 capped
+/// tool blocks each) served with `projection: "slim"` stops early at the
+/// ~512KB page budget — every frame stays bounded by budget + one message —
+/// the `nextToken` walk reconstructs the full transcript with no gaps or
+/// duplicates, and the `chat.subscribe` seq-0 snapshot (which reuses the
+/// read) stays under the bound too. The full (absent-projection) read is
+/// unbudgeted.
+#[tokio::test]
+async fn wss_slim_conversation_pages_are_byte_budgeted() {
+    use intent_core::{AgentId, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Budget"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Budget"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // 46 messages × 40 tool pairs (80 blocks) with oversized bodies: each
+    // block caps at the ~2KB block budget, but 80 capped blocks × 46
+    // messages ≈ 7MB+ of slim page weight — the exact class the page budget
+    // exists to bound.
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 2);
+    for m in 0..46 {
+        let mut blocks = Vec::new();
+        for p in 0..40 {
+            blocks.push(json!({
+                "type": "tool_use", "id": format!("m{m}:{}", p * 2), "name": "view",
+                "toolCallId": format!("tc-{m}-{p}"),
+                "input": { "path": "big.rs", "blob": big },
+            }));
+            blocks.push(json!({
+                "type": "tool_result", "id": format!("m{m}:{}", p * 2 + 1),
+                "tool_use_id": format!("tc-{m}-{p}"), "output": big, "is_error": false,
+            }));
+        }
+        srv.store
+            .append_agent_message(&agent, "assistant", &json!(blocks), &now_iso())
+            .await
+            .expect("append block-heavy message");
+    }
+
+    // Slim nextToken walk: every frame bounded, sequence exact.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let token_field = match &token {
+            Some(t) => format!(r#","nextToken":"{t}""#),
+            None => String::new(),
+        };
+        let page = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","projection":"slim"{token_field}}}}}"#
+            ),
+        )
+        .await;
+        let frame_bytes = serde_json::to_string(&page["result"]).unwrap().len();
+        // One slim message here is ~80 blocks × ~2KB caps ≈ 170KB; allow
+        // budget + one message of headroom, still far under the old
+        // multi-MB frames and the transport's 1 MiB warn threshold.
+        assert!(
+            frame_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
+            "slim frame bounded by budget + one message: {frame_bytes}"
+        );
+        let msgs = page["result"]["messages"].as_array().expect("messages");
+        assert!(!msgs.is_empty(), "budgeted pages are never empty");
+        assert_eq!(page["result"]["totalMessages"], 46);
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        pages += 1;
+        assert!(pages <= 46, "walk terminates");
+        match page["result"]["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert!(pages > 1, "budget forced multiple pages: {pages}");
+    assert_eq!(walked.len(), 46, "no gaps or duplicates in the walk");
+    let unique: std::collections::HashSet<&String> = walked.iter().collect();
+    assert_eq!(unique.len(), 46, "no duplicates in the walk");
+
+    // The slim seq-0 chat snapshot reuses the budgeted read: bounded too.
+    let snap = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+        ),
+        4,
+    )
+    .await;
+    let snap_bytes = serde_json::to_string(&snap).unwrap().len();
+    assert!(
+        snap_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
+        "slim seq-0 snapshot bounded: {snap_bytes}"
+    );
+    assert!(
+        !snap["messages"].as_array().expect("messages").is_empty(),
+        "snapshot serves the newest bounded page"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `agent.getMessageBlock` over the real WSS wire (§5.5): one FULL content
 /// block by id — the on-demand counterpart of the slim projection. A
 /// persisted assistant block id and a serve-time synthetic

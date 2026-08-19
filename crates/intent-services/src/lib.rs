@@ -96,7 +96,7 @@ mod model_catalog;
 mod nested_repos;
 mod note_ops;
 mod one_shot_acp;
-mod pagination;
+pub mod pagination;
 pub mod pi_cli;
 mod pr_monitor;
 mod pr_ops;

@@ -2303,6 +2303,23 @@ pub enum ConversationProjection {
 /// (intent-store) so the two sides agree on what "oversized" means.
 pub const SLIM_PROJECTION_BUDGET_BYTES: usize = 2048;
 
+/// Whole-page byte budget for slim conversation reads (PROTOCOL §5.5): the
+/// per-block budget above bounds each body, but `limit` counts messages and a
+/// message can carry hundreds of blocks, so a slim page could still serialize
+/// to multiple MB (observed: 3,672 capped blocks → 2.87MB frame). A slim
+/// `agent.getConversation` page (and the seq-0 chat snapshot that reuses it)
+/// stops early once its cumulative serialized size would exceed this budget,
+/// re-minting the continuation token at the first excluded message — so the
+/// worst-case slim frame is this budget plus one message's slim size. That
+/// stays under the transport's 1 MiB large-frame warn for typical messages,
+/// but is NOT a hard bound: per-message slim size is unbounded (blocks are
+/// capped individually, block count is not), so a single block-heavy message
+/// can exceed the warn alone — which the at-least-one-message floor accepts
+/// by design, degrading to one whole message per page rather than an
+/// unpageable transcript. Serve-time only; the full (absent-projection) read
+/// is never budgeted.
+pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
+
 /// Byte size of a `tool_use.input` / `tool_result.output` body for the slim
 /// budget check: string bodies by length, everything else by serialized JSON
 /// length counted through a discarding writer — no multi-MB string is

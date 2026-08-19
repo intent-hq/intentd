@@ -17,7 +17,7 @@ use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
     AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
-    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, SLIM_PAGE_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -2309,6 +2309,18 @@ impl Services {
     /// cursor, so older continuation is ordinary paging. Absent both params
     /// (and any seek-minted forward token), the response is byte-identical
     /// to before — no `prevToken` key is added.
+    ///
+    /// Slim page budget (§5.5): under `projection: "slim"` the served page is
+    /// additionally bounded by [`SLIM_PAGE_BUDGET_BYTES`] total serialized
+    /// bytes — `limit` counts messages, but a message can carry hundreds of
+    /// (individually capped) blocks, so a message-counted slim page could
+    /// still serialize to multiple MB. The trim keeps the page's anchor end
+    /// (newest for legacy backward pages, oldest for forward continuations,
+    /// the target for seek pages — always at least one message) and re-mints
+    /// the continuation cursor(s) at the first excluded row, so existing
+    /// token loops resume seamlessly with more round-trips. `totalMessages`
+    /// / `truncated` semantics are unchanged (transcript-wide, not
+    /// page-length). Full (absent-projection) reads are never budgeted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
@@ -2344,29 +2356,39 @@ impl Services {
         // the legacy backward contract applies unchanged. `prev_token` is
         // `Some(..)` only on seek/forward pages — the legacy path never adds
         // the `prevToken` key, keeping absent-param responses byte-identical.
+        // The slim page budget's admission anchor mirrors the direction the
+        // page's consumer walks (see `budget_page`): legacy backward pages
+        // keep the newest suffix, forward continuations keep the oldest
+        // prefix, seek pages keep the target and grow outward. Tracked here
+        // (as a global target index for seeks) so a budget trim below can
+        // re-mint the right cursor(s).
+        let mut slim_anchor = crate::pagination::BudgetAnchor::Newest;
         let seek_win = if let Some(mid) = around_message_id {
             let index = self
                 .store
                 .get_agent_message_index(&agent_id, &mid)
                 .await?
                 .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {mid}")))?;
-            Some(crate::pagination::page_window_around(
-                total,
-                limit,
-                index.max(0) as usize,
-            ))
+            let index = index.max(0) as usize;
+            slim_anchor = crate::pagination::BudgetAnchor::Target(index);
+            Some(crate::pagination::page_window_around(total, limit, index))
         } else if let Some(idx) = around_index {
             // Ordinal seek: clamp into [0, total - 1] — client estimates are
             // approximate, so an overshooting index lands on the newest page
             // instead of erroring (negatives were rejected at the boundary).
             let clamped = (idx.max(0) as usize).min(total.saturating_sub(1));
+            slim_anchor = crate::pagination::BudgetAnchor::Target(clamped);
             Some(crate::pagination::page_window_around(total, limit, clamped))
         } else {
-            page_token
+            let w = page_token
                 .as_deref()
-                .and_then(|t| crate::pagination::forward_page_window(total, limit, t))
+                .and_then(|t| crate::pagination::forward_page_window(total, limit, t));
+            if w.is_some() {
+                slim_anchor = crate::pagination::BudgetAnchor::Oldest;
+            }
+            w
         };
-        let (start, end, next_token, prev_token) = match seek_win {
+        let (start, end, mut next_token, mut prev_token) = match seek_win {
             Some(w) => (w.start, w.end, w.next_token, Some(w.prev_token)),
             None => {
                 let w = crate::pagination::page_window(total, limit, page_token.as_deref());
@@ -2398,6 +2420,35 @@ impl Services {
                     apply_slim_projection(m, thumbs)
                 })
                 .collect();
+            // Page byte budget (§5.5): the per-block bound above caps each
+            // body, but `limit` counts messages and a message can carry
+            // hundreds of blocks, so a slim page could still serialize to
+            // multiple MB. Trim the page to `SLIM_PAGE_BUDGET_BYTES` from
+            // its anchor (the anchor row always serves, so a single
+            // over-budget message still pages through) and re-mint the
+            // continuation cursor(s) at the first excluded row, so existing
+            // `nextToken`/`prevToken` loops resume with no gaps or
+            // duplicates — they just make more round-trips. The full
+            // (absent-projection) read never reaches here.
+            let anchor = match slim_anchor {
+                crate::pagination::BudgetAnchor::Target(global) => {
+                    crate::pagination::BudgetAnchor::Target(global.saturating_sub(start))
+                }
+                other => other,
+            };
+            let sizes: Vec<usize> = page
+                .iter()
+                .map(crate::pagination::serialized_size)
+                .collect();
+            let (lo, hi) = crate::pagination::budget_page(&sizes, anchor, SLIM_PAGE_BUDGET_BYTES);
+            if (lo, hi) != (0, page.len()) {
+                page.truncate(hi);
+                page.drain(..lo);
+                next_token = crate::pagination::remint_backward_token(start + lo);
+                if prev_token.is_some() {
+                    prev_token = Some(crate::pagination::remint_forward_token(start + hi, total));
+                }
+            }
         }
         let mut result = json!({
             "agentId": agent_id,
