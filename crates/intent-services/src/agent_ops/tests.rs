@@ -4311,6 +4311,242 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     assert_eq!(legacy["mimeType"], "image/png", "mimeType intact");
 }
 
+/// Slim page byte budget (§5.5): the per-block bound caps each body, but
+/// `limit` counts messages and a message can carry hundreds of blocks, so a
+/// slim page could still serialize to multiple MB. The slim read stops early
+/// once the page would exceed [`SLIM_PAGE_BUDGET_BYTES`], re-minting
+/// `nextToken` at the first excluded message — a token walk yields the
+/// identical sequence as unbudgeted paging (no gaps, no duplicates), and the
+/// full (absent-projection) read is never budgeted.
+#[tokio::test]
+async fn get_conversation_slim_pages_are_byte_budgeted() {
+    use intent_core::{ConversationProjection, SLIM_PAGE_BUDGET_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Budget").await;
+    // 12 messages of ~100KB each. Text passes through the slim block bound
+    // untouched, so page weight is driven purely by message size × count —
+    // the same class as the observed block-count frames, with exact sizes.
+    let chunk = "y".repeat(100 * 1024);
+    for i in 0..12 {
+        let c = json!([{ "type": "text", "id": format!("b{i}"), "text": format!("{i}:{chunk}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    // Full projection: never budgeted — all 12 in one default page.
+    let full = svc
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None, None)
+        .await
+        .expect("full conv");
+    let all: Vec<String> = full["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(all.len(), 12);
+    assert!(full["nextToken"].is_null());
+
+    // Slim walk: every page bounded by budget + one message, and the
+    // reconstructed sequence equals the full transcript exactly.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let page = svc
+            .agent_get_conversation_op(
+                id.clone(),
+                None,
+                None,
+                token.clone(),
+                None,
+                None,
+                Some(ConversationProjection::Slim),
+            )
+            .await
+            .expect("slim page");
+        let msgs = page["messages"].as_array().unwrap();
+        assert!(!msgs.is_empty(), "budgeted pages are never empty");
+        let page_bytes = serde_json::to_string(&page["messages"]).unwrap().len();
+        assert!(
+            page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
+            "page bounded by budget + one message: {page_bytes}"
+        );
+        // Transcript-wide semantics are untouched by the trim: totals count
+        // the whole transcript and `truncated` still means "older history
+        // remains" (paired with a non-null token).
+        assert_eq!(page["totalMessages"], 12);
+        assert_eq!(page["truncated"], !page["nextToken"].is_null());
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        pages += 1;
+        match page["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert!(pages >= 2, "budget forced multiple pages: {pages}");
+    assert_eq!(walked, all, "token walk has no gaps or duplicates");
+}
+
+/// Slim page budget edge: a single message over the whole page budget still
+/// serves alone (never an empty page, no infinite token loop), and the walk
+/// continues past it into older history.
+#[tokio::test]
+async fn get_conversation_slim_single_overbudget_message_still_serves() {
+    use intent_core::{ConversationProjection, SLIM_PAGE_BUDGET_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "BigOne").await;
+    let small = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "id": "s", "text": "small" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append small");
+    let huge_text = "z".repeat(SLIM_PAGE_BUDGET_BYTES + 64 * 1024);
+    let huge = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "id": "h", "text": huge_text }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append huge");
+
+    let p1 = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+        )
+        .await
+        .expect("page 1");
+    let m1 = p1["messages"].as_array().unwrap();
+    assert_eq!(m1.len(), 1, "over-budget message serves alone");
+    assert_eq!(m1[0]["id"], huge.id.as_str());
+    let t = p1["nextToken"].as_str().expect("older rows remain");
+    let p2 = svc
+        .agent_get_conversation_op(
+            id,
+            None,
+            None,
+            Some(t.to_string()),
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+        )
+        .await
+        .expect("page 2");
+    let m2 = p2["messages"].as_array().unwrap();
+    assert_eq!(m2.len(), 1);
+    assert_eq!(m2[0]["id"], small.id.as_str());
+    assert!(p2["nextToken"].is_null());
+}
+
+/// Slim page budget on the seek path (§5.5): an `aroundMessageId` page keeps
+/// the target message (grown outward within the budget) and re-mints BOTH
+/// cursors, so walking `nextToken` older and `prevToken` newer from the
+/// trimmed seek page reconstructs the full transcript with no gaps or
+/// duplicates.
+#[tokio::test]
+async fn get_conversation_slim_seek_budget_keeps_target_and_reminted_cursors() {
+    use intent_core::ConversationProjection;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "SeekBudget").await;
+    let chunk = "w".repeat(100 * 1024);
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        let c = json!([{ "type": "text", "id": format!("k{i}"), "text": format!("{i}:{chunk}") }]);
+        let row = svc
+            .store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+        ids.push(row.id.as_str().to_string());
+    }
+    let target = ids[5].clone();
+
+    let slim = Some(ConversationProjection::Slim);
+    let seek = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            None,
+            None,
+            None,
+            Some(target.clone()),
+            None,
+            slim,
+        )
+        .await
+        .expect("seek page");
+    let seek_ids: Vec<String> = seek["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        seek_ids.contains(&target),
+        "target always kept: {seek_ids:?}"
+    );
+    assert!(
+        seek_ids.len() < 10,
+        "budget trimmed the seek page: {seek_ids:?}"
+    );
+
+    // Walk older via nextToken, prepending; then newer via prevToken,
+    // appending. The union must be the exact transcript.
+    let mut walked = seek_ids.clone();
+    let mut token = seek["nextToken"].as_str().map(str::to_string);
+    while let Some(t) = token {
+        let page = svc
+            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim)
+            .await
+            .expect("older page");
+        let ids: Vec<String> = page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!ids.is_empty());
+        walked.splice(0..0, ids);
+        token = page["nextToken"].as_str().map(str::to_string);
+    }
+    let mut fwd = seek["prevToken"].as_str().map(str::to_string);
+    while let Some(t) = fwd {
+        let page = svc
+            .agent_get_conversation_op(id.clone(), None, None, Some(t), None, None, slim)
+            .await
+            .expect("newer page");
+        let ids: Vec<String> = page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!ids.is_empty());
+        walked.extend(ids);
+        fwd = page["prevToken"].as_str().map(str::to_string);
+    }
+    assert_eq!(walked, ids, "seek walk has no gaps or duplicates");
+}
+
 /// `agent.getMessageBlock` (§5.5): the full, unprojected block is served by
 /// id — a persisted assistant id and a serve-time synthetic
 /// `{messageId}:{index}` id both resolve, and an oversized tool body that
