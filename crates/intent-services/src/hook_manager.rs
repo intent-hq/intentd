@@ -1029,6 +1029,8 @@ impl Services {
                 self.expire_hook(&mut hook).await;
                 continue;
             }
+            // Must run before the state heal below: `resumed_next_run`
+            // branches on `Running` (interrupted mid-run ⇒ fresh countdown).
             let (next_run_at, initial_delay) = resumed_next_run(&hook);
             if hook.state == HookState::Running {
                 self.store
@@ -3292,13 +3294,21 @@ mod tests {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         let far_out = next_run_at_iso(MAX_HOOK_TTL_MS);
         let absent = countdown_row(&ws, &owner, "absent", None, far_out.clone());
-        let later = countdown_row(&ws, &owner, "later", Some(far_out.clone()), far_out);
+        let later = countdown_row(&ws, &owner, "later", Some(far_out.clone()), far_out.clone());
+        let garbled = countdown_row(
+            &ws,
+            &owner,
+            "garbled",
+            Some("not-a-timestamp".into()),
+            far_out,
+        );
         svc.store().insert_hook(&absent).await.unwrap();
         svc.store().insert_hook(&later).await.unwrap();
+        svc.store().insert_hook(&garbled).await.unwrap();
         let before = OffsetDateTime::now_utc();
-        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 2);
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 3);
         let after = OffsetDateTime::now_utc();
-        for hook in [&absent, &later] {
+        for hook in [&absent, &later, &garbled] {
             let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
             let next = OffsetDateTime::parse(stored.next_run_at.as_deref().unwrap(), &Rfc3339)
                 .expect("parse resumed nextRunAt");
