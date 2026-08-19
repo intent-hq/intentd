@@ -4691,13 +4691,33 @@ impl Services {
         // delivered as before, nothing recorded. The `failed:` prefix keeps
         // failure identities from ever cross-matching a completion identity
         // in the shared per-pair marker row.
+        //
+        // The match also accepts the ONE known wrap relationship (PR #1316
+        // review): the streaming prompt-failure path persists the wrapped
+        // `internal error: session/prompt failed: {e}` as `stop_reason` but
+        // emits the RAW `{e}` as the live event's `error` — reconstructing
+        // the wrapper from the event text lets that (most common) failure
+        // mode record its marker on live delivery too, instead of failing
+        // open and leaving the first restart/re-arm replay deliverable.
+        // Replays synthesized from the persisted state carry the wrapped
+        // text verbatim and take the exact-match arm.
         let failure_identity: Option<String> =
             if !watches.is_empty() && event.event_type == AGENT_FAILED {
                 match failure_error_text.as_deref() {
                     Some(err) if !err.is_empty() => {
                         match self.store.get_agent_session(child_id).await {
-                            Ok(s) if s.stop_reason.as_deref() == Some(err) => {
-                                s.stop_reason_timestamp.map(|ts| format!("failed:{ts}"))
+                            Ok(s) => {
+                                let wrapped = Error::Internal(format!(
+                                    "{} {err}",
+                                    crate::agent_manager::PROMPT_FAILED_PREFIX
+                                ))
+                                .to_string();
+                                let persisted = s.stop_reason.as_deref();
+                                if persisted == Some(err) || persisted == Some(wrapped.as_str()) {
+                                    s.stop_reason_timestamp.map(|ts| format!("failed:{ts}"))
+                                } else {
+                                    None
+                                }
                             }
                             _ => None,
                         }
@@ -5030,7 +5050,12 @@ impl Services {
             // for this completion (the pre-fix behavior). If the send below
             // fails, the parent misses the wake either way (the watch is
             // already removed — the STAB-18 stance: a missed wake beats a
-            // duplicate), so recording first costs nothing.
+            // duplicate), so recording first costs nothing. NB this stance
+            // consciously applies to FAILURE identities too (monorepo#2862),
+            // inverting the #840 in-memory record's after-send ordering: a
+            // failed send now also suppresses the boot/re-arm replay that
+            // could previously have healed the missed failure wake — same
+            // missed-beats-duplicate tradeoff as completions.
             if let Some(identity) = record_identity {
                 if let Err(e) = self
                     .store

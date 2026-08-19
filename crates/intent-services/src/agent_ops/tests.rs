@@ -2683,6 +2683,70 @@ async fn fresh_watch_on_failed_child_delivers_historical_failure_once() {
     assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
+/// intent-hq/monorepo#2862 (PR #1316 review): the streaming prompt-failure
+/// path — the most common `agent:failed` producer — persists the WRAPPED
+/// `internal error: session/prompt failed: {e}` as `stop_reason` but emits
+/// the RAW `{e}` as the live event's error. The identity guard must accept
+/// that wrap relationship so the LIVE delivery records the marker — without
+/// it, the first re-arm/restart replay (synthesized with the wrapped text)
+/// still re-delivered the historical failure once.
+#[tokio::test]
+async fn prompt_failure_raw_emit_records_marker_against_wrapped_stop_reason() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("watch");
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // Streaming prompt failure: persist the WRAPPED text (as run_prompt_turn
+    // does via persist_terminal_error_status_via_services), emit the RAW one.
+    svc.store()
+        .set_agent_session_status(
+            &ws,
+            &child,
+            intent_core::AgentStatus::Error,
+            false,
+            "2026-01-01T00:00:01Z",
+            Some(Some(
+                "internal error: session/prompt failed: agent stdout closed".into(),
+            )),
+        )
+        .await
+        .expect("park child in Error with wrapped stop_reason");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "agent stdout closed" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "live raw-text failure wake delivers"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Re-arm: the registration reconcile synthesizes the failure with the
+    // WRAPPED persisted text. The marker recorded at live delivery (via the
+    // wrapper reconstruction) must suppress this first replay.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "wrapped-text replay suppressed — live raw emit recorded the marker"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed for a future signal"
+    );
+}
+
 /// Scope gate: a non-chief caller may not wait on a target outside its own
 /// workspace — rejected for BOTH modes and side-effect free (no watches, no
 /// group), even when a same-workspace target precedes the offending one.
