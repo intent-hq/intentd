@@ -4678,17 +4678,50 @@ impl Services {
         } else {
             (Vec::new(), None, None)
         };
+        // Failure identity (intent-hq/monorepo#2862): an `agent:failed` is
+        // identified by the session's persisted `stop_reason_timestamp`
+        // (stamped with the Error status BEFORE the event reaches the bus —
+        // durable-before-observable, monorepo#2050 — and cleared on
+        // `agent.retry` / turn start, so one failure cycle keeps one
+        // identity and a post-retry failure always gets a new one). Same
+        // guard shape as the completion identity above: derived only when
+        // the event carries a NON-EMPTY `error` matching the session's
+        // persisted `stop_reason` — a mismatch (stale event, or an emit
+        // path that never persisted the reason) fails open: identity None,
+        // delivered as before, nothing recorded. The `failed:` prefix keeps
+        // failure identities from ever cross-matching a completion identity
+        // in the shared per-pair marker row.
+        let failure_identity: Option<String> =
+            if !watches.is_empty() && event.event_type == AGENT_FAILED {
+                match failure_error_text.as_deref() {
+                    Some(err) if !err.is_empty() => {
+                        match self.store.get_agent_session(child_id).await {
+                            Ok(s) if s.stop_reason.as_deref() == Some(err) => {
+                                s.stop_reason_timestamp.map(|ts| format!("failed:{ts}"))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
         // The identity the delivery-path marker write records. The skip
         // check stays on the stricter event-carried `completion_identity`;
         // the record additionally covers the report-less Gap B settlement
-        // (see the identity guards above).
-        let record_identity: Option<&str> = completion_identity.as_deref().or_else(|| {
-            if event_report_raw.is_none() {
-                session_report_ts.as_deref()
-            } else {
-                None
-            }
-        });
+        // (see the identity guards above). A failure identity (monorepo#2862)
+        // participates in both.
+        let record_identity: Option<&str> = completion_identity
+            .as_deref()
+            .or_else(|| {
+                if event_report_raw.is_none() {
+                    session_report_ts.as_deref()
+                } else {
+                    None
+                }
+            })
+            .or(failure_identity.as_deref());
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4934,7 +4967,16 @@ impl Services {
             // so the suppressed replay never consumes the one-shot watch. A
             // marker read failure fails open (deliver as before): dedup is a
             // guard, a missed suppression only restores the pre-fix wake.
-            if let Some(identity) = completion_identity.as_deref() {
+            // monorepo#2862: `agent:failed` replays are suppressed the same
+            // way, keyed on the failure identity (the session's
+            // `stop_reason_timestamp`) — a restart or re-arm on a child
+            // parked in Error must not re-deliver the failure the parent
+            // already heard; a post-retry failure carries a fresh timestamp
+            // and delivers normally.
+            if let Some(identity) = completion_identity
+                .as_deref()
+                .or(failure_identity.as_deref())
+            {
                 let delivered = self
                     .store
                     .get_completion_wake_delivery(&watch.parent_agent_id, child_id)

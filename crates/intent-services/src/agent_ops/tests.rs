@@ -2442,6 +2442,247 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
     );
 }
 
+/// Regression (intent-hq/monorepo#2862, restart replay): the `agent:failed`
+/// dedup must survive a restart. A child parked in Error whose failure wake
+/// was already delivered retires its watch; when the parent re-arms a watch
+/// on the failed child and the daemon restarts, the boot reconciliation
+/// synthesizes the child's HISTORICAL failure — which must NOT wake the
+/// parent again (the re-armed watch stays armed for a future signal), across
+/// any number of restarts.
+#[tokio::test]
+async fn restart_reconcile_skips_already_delivered_failure() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child, baseline) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let baseline = parent_message_count(&svc, &parent).await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        // The child fails terminally: Error + stop_reason persist FIRST
+        // (durable-before-observable), then the live `agent:failed` delivers
+        // the wake and retires the watch.
+        svc.store()
+            .set_agent_session_status(
+                &ws,
+                &child,
+                intent_core::AgentStatus::Error,
+                false,
+                "2026-01-01T00:00:01Z",
+                Some(Some("boom".into())),
+            )
+            .await
+            .expect("park child in Error");
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_FAILED,
+            &child,
+            json!({ "agentId": child.0, "error": "boom" }),
+        ))
+        .await;
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        assert!(svc.find_watches_for_child(&child).is_empty());
+        wait_for_persisted_watches(&svc, 0).await;
+        // The parent re-arms a fresh watch on the failed child.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("re-arm watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child, baseline)
+    }; // old Services dropped — simulated daemon shutdown
+
+    // Two consecutive restarts: the reconcile pass synthesizes the child's
+    // historical `agent:failed` from the persisted Error status — it must
+    // not re-deliver on either, and the re-armed watch stays armed.
+    for restart in 1..=2 {
+        let store = Store::open(&tmp.path).await.expect("reopen store");
+        let restarted = Services::new(store);
+        restarted
+            .heal_completion_watches_on_startup()
+            .await
+            .expect("heal watches");
+        assert_eq!(
+            parent_message_count(&restarted, &parent).await,
+            baseline + 1,
+            "restart {restart}: no duplicate failure wake"
+        );
+        assert_eq!(
+            restarted.find_watches_for_child(&child).len(),
+            1,
+            "restart {restart}: re-armed watch stays armed"
+        );
+    }
+}
+
+/// Regression (intent-hq/monorepo#2862, re-arm semantics): re-arming a watch
+/// on a child parked in Error must not fire on the historical failure the
+/// parent already received — the persistent identity (the session's
+/// `stop_reason_timestamp`) suppresses the registration-reconcile replay
+/// even though registration clears the in-memory text dedup. A FUTURE
+/// failure cycle (post-retry re-failure, fresh timestamp — even with the
+/// SAME error text) delivers normally.
+#[tokio::test]
+async fn rearmed_watch_on_failed_child_waits_for_future_failure() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("watch");
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // First failure cycle: Error + stop_reason persist, live event delivers.
+    svc.store()
+        .set_agent_session_status(
+            &ws,
+            &child,
+            intent_core::AgentStatus::Error,
+            false,
+            "2026-01-01T00:00:01Z",
+            Some(Some("boom".into())),
+        )
+        .await
+        .expect("park child in Error");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Re-arm on the failed child: the registration reconcile synthesizes the
+    // historical failure (error stamped from the persisted stop_reason) —
+    // the marker must suppress it and leave the watch armed.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "re-arm must not replay the historical failure"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed for a future signal"
+    );
+
+    // Post-retry re-failure with the SAME text: a new cycle stamps a new
+    // stop_reason_timestamp, so the new identity delivers exactly once.
+    svc.store()
+        .set_agent_session_status(
+            &ws,
+            &child,
+            intent_core::AgentStatus::Error,
+            false,
+            "2026-01-01T00:00:02Z",
+            Some(Some("boom".into())),
+        )
+        .await
+        .expect("re-fail child");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "a fresh failure cycle delivers despite unchanged text"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // And a re-arm after the second cycle is suppressed the same way.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch after second cycle");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "second cycle's marker suppresses its replay"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+}
+
+/// intent-hq/monorepo#2862: a FIRST-EVER watch on a child already parked in
+/// Error still receives the failure — the registration reconcile finds no
+/// marker for the pair, delivers the synthesized `agent:failed` (now
+/// carrying the persisted stop_reason as its error text), and records the
+/// marker so only replays are suppressed.
+#[tokio::test]
+async fn fresh_watch_on_failed_child_delivers_historical_failure_once() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let baseline = parent_message_count(&svc, &parent).await;
+    svc.store()
+        .set_agent_session_status(
+            &ws,
+            &child,
+            intent_core::AgentStatus::Error,
+            false,
+            "2026-01-01T00:00:01Z",
+            Some(Some("boom".into())),
+        )
+        .await
+        .expect("park child in Error");
+
+    // First watch: the historical failure is new information — delivered.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "first watch delivers the historical failure"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let wake = session.messages.last().expect("wake message");
+    let wake_text = serde_json::to_string(&wake.content).expect("serialize content");
+    assert!(
+        wake_text.contains("boom"),
+        "synthesized failure wake names the persisted stop_reason: {wake_text}"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Second watch: the marker recorded at delivery suppresses the replay.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "replay suppressed for the re-armed watch"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+}
+
 /// Scope gate: a non-chief caller may not wait on a target outside its own
 /// workspace — rejected for BOTH modes and side-effect free (no watches, no
 /// group), even when a same-workspace target precedes the offending one.
