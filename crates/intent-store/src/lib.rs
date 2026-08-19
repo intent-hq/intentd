@@ -17,6 +17,7 @@ mod agent_repo;
 mod attachment_repo;
 mod client_repo;
 mod comment_repo;
+mod completion_wake_delivery_repo;
 mod completion_watch_repo;
 mod delegation_group_repo;
 mod diffs_repo;
