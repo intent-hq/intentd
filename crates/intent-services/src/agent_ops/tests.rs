@@ -20653,7 +20653,6 @@ fn settled_group(
             .map(|(id, _)| (*id).clone())
             .collect::<Vec<_>>(),
         deleted_agent_ids: deleted.to_vec(),
-        subscription_id: None,
         sealed: true,
         delivered: false,
         event_summaries: children

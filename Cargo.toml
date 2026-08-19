@@ -11,7 +11,6 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["ws"] }
 # Consumed from the intent-hq fork's `deflate` branch (RFC 7692 permessage-deflate,
 # enabled via the fork's default features). The fork's tokio-tungstenite pulls the
 # intent-hq tungstenite fork transitively, so the whole graph resolves to the forks.

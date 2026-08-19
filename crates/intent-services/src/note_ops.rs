@@ -1086,8 +1086,8 @@ pub enum RecoveryOutcome {
     Recovered(String),
     /// Recovery failed — caller should scrub any stray markers and mark the
     /// comment orphaned. The reason mirrors the reference log messages and is
-    /// carried for diagnostics / test assertions.
-    Failed(#[allow(dead_code)] &'static str),
+    /// logged by the re-anchor pass for diagnostics.
+    Failed(&'static str),
 }
 
 /// Attempt to relocate a partially-anchored comment inside `markdown`, using
