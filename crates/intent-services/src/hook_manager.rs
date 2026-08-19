@@ -169,10 +169,20 @@ fn next_run_at_iso(delay_ms: i64) -> String {
 /// string verbatim when the persisted deadline wins) and the time remaining
 /// until it — zero when overdue, so the run starts promptly, still gated by
 /// the scheduler task's pre-run expiry check. An absent or unparseable
-/// persisted deadline falls back to the fresh countdown.
+/// persisted deadline falls back to the fresh countdown. A row persisted as
+/// `Running` (daemon died mid-run) also gets the fresh countdown: its
+/// `next_run_at` is the deadline of the run that already STARTED
+/// ([`Services::execute_hook_run`] leaves it in place), so honoring it would
+/// immediately re-execute a potentially non-idempotent interrupted run.
 fn resumed_next_run(hook: &Hook) -> (String, Duration) {
     let now = OffsetDateTime::now_utc();
     let fresh = now + time::Duration::milliseconds(hook.delay_ms.max(0));
+    if hook.state == HookState::Running {
+        return (
+            next_run_at_iso(hook.delay_ms),
+            Duration::from_millis(hook.delay_ms.max(0) as u64),
+        );
+    }
     match hook
         .next_run_at
         .as_deref()
@@ -972,7 +982,9 @@ impl Services {
     /// and respawn its scheduler task. Rows whose owning agent is gone are
     /// cancelled instead of resumed; rows whose `expiresAt` passed while the
     /// daemon was down are expired (owner woken). `running` rows (daemon died
-    /// mid-run) are reset to `scheduled`; every resumed hook resumes the
+    /// mid-run) are reset to `scheduled` and start a fresh `delayMs`
+    /// countdown (their persisted `nextRunAt` is the started-run's deadline,
+    /// not a future schedule); every other resumed hook resumes the
     /// EARLIER of its persisted `nextRunAt` and a fresh `now + delayMs`
     /// countdown ([`resumed_next_run`] — a restart never pushes a run
     /// further out, and an overdue row runs promptly, still gated by the
@@ -3239,6 +3251,36 @@ mod tests {
         let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
         assert_eq!(ran.state, HookState::Scheduled);
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
+    }
+
+    /// A row persisted mid-run (`Running`) keeps the fresh-cadence recovery:
+    /// its `nextRunAt` is the deadline of the run that already started, so
+    /// min semantics would immediately re-execute a potentially
+    /// non-idempotent interrupted run. It resumes `Scheduled` with a full
+    /// `delayMs` countdown instead.
+    #[tokio::test]
+    async fn rehydration_gives_interrupted_running_row_fresh_countdown() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let mut hook = countdown_row(
+            &ws,
+            &owner,
+            "mid-run",
+            Some(next_run_at_iso(-60_000)),
+            next_run_at_iso(MAX_HOOK_TTL_MS),
+        );
+        hook.state = HookState::Running;
+        svc.store().insert_hook(&hook).await.unwrap();
+        let before = OffsetDateTime::now_utc();
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Scheduled);
+        let next = OffsetDateTime::parse(stored.next_run_at.as_deref().unwrap(), &Rfc3339)
+            .expect("parse resumed nextRunAt");
+        assert!(
+            next >= before + time::Duration::milliseconds(600_000),
+            "full countdown, not the interrupted run's overdue deadline"
+        );
+        assert_eq!(stored.run_count, 1, "no immediate re-execution");
     }
 
     /// Rows with no persisted `nextRunAt` fall back to the fresh
