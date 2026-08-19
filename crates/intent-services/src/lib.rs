@@ -508,6 +508,17 @@ pub struct Services {
     /// Shared across clones so the turn writer and the `agent.diagnostics`
     /// read door observe the same state.
     last_turn_silent_tails: agent_session::LastTurnSilentTails,
+    /// Per-agent consecutive suspected-truncation auto-redrive counter
+    /// (intent-hq/monorepo#2863): see [`agent_session::TruncationRedrives`].
+    /// Shared across clones so consecutive turns of one agent accumulate the
+    /// same stall-episode streak.
+    truncation_redrives: agent_session::TruncationRedrives,
+    /// One-shot truncation auto-redrive handoff flags
+    /// (intent-hq/monorepo#2863): see
+    /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
+    /// the `run_prompt_turn` arm and the turn worker's take observe the same
+    /// state.
+    pending_truncation_redrive: agent_session::PendingTruncationRedrives,
     /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
     /// tests simulate an in-flight worker without spawning a real
     /// [`AgentManager`]. Production composition always attaches a manager and
@@ -875,6 +886,8 @@ impl Services {
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
+            truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -14630,6 +14643,8 @@ impl WorkspaceApi for Services {
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
         let last_turn_silent_tails = self.last_turn_silent_tails.clone();
+        let truncation_redrives = self.truncation_redrives.clone();
+        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         // Full handle for the direct completion delivery below (Services is
         // Clone — the same capture pattern the spawn helpers use).
@@ -14700,6 +14715,14 @@ impl WorkspaceApi for Services {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);
                 last_turn_silent_tails
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                truncation_redrives
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                pending_truncation_redrive
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);

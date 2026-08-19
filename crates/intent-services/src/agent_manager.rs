@@ -3650,6 +3650,9 @@ impl AgentManager {
         // and the orphaned context describes the aborted turn, not a future
         // failure.
         self.services.discard_pending_terminal_error(agent_id);
+        // A stale truncation auto-redrive arm (monorepo#2863) is dropped on
+        // the same terms: it belongs to the aborted turn.
+        self.services.take_truncation_redrive(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -3764,6 +3767,9 @@ impl AgentManager {
         // context describes the aborted turn, so it must not survive into a
         // later failure's settle.
         self.services.discard_pending_terminal_error(agent_id);
+        // A stale truncation auto-redrive arm (monorepo#2863) is dropped on
+        // the same terms: it belongs to the aborted turn.
+        self.services.take_truncation_redrive(agent_id);
         // Persist the streamed-so-far assistant content as an interrupted
         // assistant row, stamped with the interruption reason (+ sender
         // attribution on preemption). Runs AFTER the abort (a worker append
@@ -6166,6 +6172,10 @@ impl AgentManager {
             worker.abort();
         }
         self.services.discard_pending_terminal_error(&agent_id);
+        // Retry is the clean-slate escape hatch for the truncation-redrive
+        // episode too (monorepo#2863): drop the streak and any stale arm.
+        self.services.clear_truncation_redrives(&agent_id);
+        self.services.take_truncation_redrive(&agent_id);
         self.release_in_flight_slot(&agent_id).await;
 
         // Tear down any stale child handle (use kill_child_only to avoid
@@ -7972,6 +7982,62 @@ async fn run_message_worker(
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;
+                        // Truncation auto-redrive (intent-hq/monorepo#2863):
+                        // `run_prompt_turn` classified this turn as suspected-
+                        // truncated on a delegated in-task agent, suppressed
+                        // its terminal `agent:idle`, and armed the one-shot
+                        // handoff flag — inject the system nudge as a NEW
+                        // persisted, user-visible turn on the same session,
+                        // mirroring the idle-timeout warning turn: the busy
+                        // slot stays held and the `continue` bypasses the
+                        // queue drain below, so queued messages cannot jump
+                        // ahead of the nudge. The nudge is a user-role row
+                        // tagged `{"type": "auto_redrive"}` so the transcript
+                        // stays attributable.
+                        if mgr.services.take_truncation_redrive(&agent_id) {
+                            tracing::warn!(
+                                agent = %agent_id,
+                                "suspected-truncated turn — injecting the auto-redrive nudge (monorepo#2863)"
+                            );
+                            let nudge = crate::harness::latest().truncation_redrive_nudge();
+                            let nudge_turn_id = new_message_id();
+                            let nudge_metadata = json!({ "type": "auto_redrive" });
+                            user_persisted = persist_user(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &nudge,
+                                None,
+                                None,
+                                Some(&nudge_metadata),
+                                Some(&nudge_turn_id),
+                            )
+                            .await;
+                            content = nudge;
+                            options = TurnOptions {
+                                turn_id: Some(nudge_turn_id),
+                                message_metadata: Some(nudge_metadata),
+                                ..TurnOptions::default()
+                            };
+                            // New message → fresh silent-redrive budget
+                            // (monorepo#764).
+                            silent_redrive_used = false;
+                            // Fail closed (#547): a nudge row that never
+                            // reached the transcript must not drive a turn.
+                            if !user_persisted {
+                                handle_drain_persist_failure(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &content,
+                                    &options,
+                                )
+                                .await;
+                                mgr.release_in_flight_slot(&agent_id).await;
+                                break 'outer;
+                            }
+                            continue 'outer;
+                        }
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
@@ -9738,6 +9804,8 @@ async fn discard_failure_for_vanished_session(
     mgr.services.clear_failure_streak(agent_id);
     mgr.services.discard_pending_terminal_error(agent_id);
     mgr.services.clear_turn_silent_tail(agent_id);
+    mgr.services.clear_truncation_redrives(agent_id);
+    mgr.services.take_truncation_redrive(agent_id);
     true
 }
 

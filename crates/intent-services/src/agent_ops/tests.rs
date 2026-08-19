@@ -22903,6 +22903,130 @@ async fn stall_tail_never_contradicts_rendered_report() {
 }
 
 // ---------------------------------------------------------------------------
+// Truncation auto-redrive (intent-hq/monorepo#2863): eligibility + counter
+// ---------------------------------------------------------------------------
+
+/// A delegated agent (parent set) with an `in_progress` task note and no
+/// persisted completion report is redrive-eligible; each of the exclusions —
+/// no parent, no task note, non-in-progress task, persisted report — makes
+/// it ineligible (today's WARN + advisory behavior).
+#[tokio::test]
+async fn truncation_redrive_eligibility_gates() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // Fully eligible: parent + in_progress task + no report.
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
+    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    s.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("link parent");
+    assert!(
+        svc.truncation_redrive_eligible(&child).await,
+        "delegated in-task agent without a report is eligible"
+    );
+
+    // Root agent (no parent) with the same task shape → ineligible.
+    let root = create_agent(&svc, &ws, "Root").await;
+    link_task_note(&svc, &ws, &root, "Root task", "in_progress").await;
+    assert!(
+        !svc.truncation_redrive_eligible(&root).await,
+        "root/user-facing agents keep WARN-only behavior"
+    );
+
+    // Delegated but taskless → ineligible.
+    let taskless = create_agent(&svc, &ws, "Taskless").await;
+    let mut s = svc.store().get_agent_session(&taskless).await.expect("s");
+    s.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("link parent");
+    assert!(
+        !svc.truncation_redrive_eligible(&taskless).await,
+        "no assigned task → no redrive"
+    );
+
+    // Delegated + task, but the task is not in_progress → ineligible.
+    let waiting = create_agent(&svc, &ws, "Waiting").await;
+    link_task_note(&svc, &ws, &waiting, "Parked task", "waiting").await;
+    let mut s = svc.store().get_agent_session(&waiting).await.expect("s");
+    s.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("link parent");
+    assert!(
+        !svc.truncation_redrive_eligible(&waiting).await,
+        "only in_progress tasks qualify"
+    );
+
+    // Persisted completion report → ineligible (the parent must get that
+    // wake, not a redrive).
+    let reported = create_agent(&svc, &ws, "Reported").await;
+    link_task_note(&svc, &ws, &reported, "Reported task", "in_progress").await;
+    let mut s = svc.store().get_agent_session(&reported).await.expect("s");
+    s.parent_agent_id = Some(parent.clone());
+    s.completion_report = Some("all done".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("persist");
+    assert!(
+        !svc.truncation_redrive_eligible(&reported).await,
+        "a persisted report suppresses the redrive"
+    );
+
+    // Dangling task_note_id (note gone) → fail closed.
+    let dangling = create_agent(&svc, &ws, "Dangling").await;
+    let mut s = svc.store().get_agent_session(&dangling).await.expect("s");
+    s.parent_agent_id = Some(parent.clone());
+    s.task_note_id = Some(intent_core::NoteId::from("gone-note"));
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("persist");
+    assert!(
+        !svc.truncation_redrive_eligible(&dangling).await,
+        "store lookup failure fails closed"
+    );
+}
+
+/// The consecutive-redrive counter accumulates per agent, one-shot handoff
+/// flags arm/take exactly once, and `clear_truncation_redrives` resets the
+/// episode (the reset the worker applies on any clean turn resolution).
+#[tokio::test]
+async fn truncation_redrive_counter_and_handoff_semantics() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Staller").await;
+
+    assert_eq!(svc.bump_truncation_redrives(&agent), 1);
+    assert_eq!(svc.bump_truncation_redrives(&agent), 2);
+    assert_eq!(svc.bump_truncation_redrives(&agent), 3);
+    assert_eq!(
+        svc.bump_truncation_redrives(&agent),
+        4,
+        "past MAX_CONSECUTIVE_TRUNCATION_REDRIVES the caller falls through to idle"
+    );
+
+    // Progress clears the episode: the next truncated turn starts at 1.
+    svc.clear_truncation_redrives(&agent);
+    assert_eq!(svc.bump_truncation_redrives(&agent), 1);
+
+    // The handoff flag is one-shot: armed once, taken once.
+    assert!(!svc.take_truncation_redrive(&agent), "nothing armed yet");
+    svc.arm_truncation_redrive(&agent);
+    assert!(svc.take_truncation_redrive(&agent), "armed flag is taken");
+    assert!(
+        !svc.take_truncation_redrive(&agent),
+        "the take consumed the flag"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Question hold: `question_hold_active` derivation + `agent.dismissQuestions`
 // ---------------------------------------------------------------------------
 
