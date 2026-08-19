@@ -2039,6 +2039,410 @@ async fn fired_completion_watch_does_not_rehydrate() {
     assert_eq!(session.messages.len(), 1, "only the pre-restart wake");
 }
 
+/// Regression (intent-hq/monorepo#2842, restart replay): restart recovery
+/// must not re-deliver an already-delivered terminal completion. A child that
+/// reported (immediate parent wake) and completed retires its watch; when the
+/// parent re-arms a watch on the settled child and the daemon restarts, the
+/// boot reconciliation synthesizes the child's HISTORICAL completion — which
+/// must NOT wake the parent again (the re-armed watch stays armed for a
+/// FUTURE completion), across any number of restarts.
+#[tokio::test]
+async fn restart_reconcile_skips_already_delivered_completion() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child, baseline) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let resp = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    agent_instructions: Some("do the thing".into()),
+                    ..Default::default()
+                },
+                Some(parent.clone()),
+            )
+            .await
+            .expect("delegate");
+        let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        let baseline = parent_message_count(&svc, &parent).await;
+        // Immediate report-time wake (marks the delegate watch
+        // report_delivered).
+        svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child.clone()))
+            .await
+            .expect("report");
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        // Real completion: the report_delivered watch retires silently.
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({ "agentId": child.0 }),
+        ))
+        .await;
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        assert!(svc.find_watches_for_child(&child).is_empty());
+        wait_for_persisted_watches(&svc, 0).await;
+        // The parent re-arms a fresh watch on the settled child.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("re-arm watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child, baseline)
+    }; // old Services dropped — simulated daemon shutdown
+
+    // The child's terminal state as boot reconciliation sees it (the
+    // completion report + timestamp persisted by reportToParent survive: a
+    // settled child never starts the turn that would clear them).
+    {
+        let store = Store::open(&tmp.path).await.expect("reopen to mark");
+        let mut s = store
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        s.status = intent_core::AgentStatus::Completed;
+        store
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark child");
+    }
+
+    // Two consecutive restarts: the reconcile pass must not re-deliver the
+    // historical completion on either, and the re-armed watch stays armed.
+    for restart in 1..=2 {
+        let store = Store::open(&tmp.path).await.expect("reopen store");
+        let restarted = Services::new(store);
+        restarted
+            .heal_completion_watches_on_startup()
+            .await
+            .expect("heal watches");
+        assert_eq!(
+            parent_message_count(&restarted, &parent).await,
+            baseline + 1,
+            "restart {restart}: no duplicate completion wake"
+        );
+        assert_eq!(
+            restarted.find_watches_for_child(&child).len(),
+            1,
+            "restart {restart}: re-armed watch stays armed for a future completion"
+        );
+    }
+}
+
+/// Regression (intent-hq/monorepo#2842, re-arm semantics): re-arming a watch
+/// on an already-completed child must not fire on the historical completion
+/// the parent already received — only on a subsequent one.
+#[tokio::test]
+async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+    svc.agent_report_to_parent_op(ws.clone(), json!("first"), Some(child.clone()))
+        .await
+        .expect("report");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Park the child in its terminal state (report retained), then re-watch:
+    // the registration-time reconcile must NOT fire the historical completion.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "re-arm must not fire on the historical completion"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed for a future completion"
+    );
+
+    // A subsequent completion (new report → new identity) fires normally,
+    // exactly once — the normal single-delivery path is unchanged.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.completion_report = Some("second".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("re-report");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "second" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "future completion delivers exactly one wake"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retired at the future completion"
+    );
+
+    // PR #1313 review: the second completion's marker was written by the
+    // DELIVERY path (no report-time wake preceded it, so the retirement
+    // branch never ran for it). Re-watching the still-completed child pins
+    // that write: the registration reconcile replays the second completion,
+    // which must now be suppressed with the watch left armed.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch after delivery-path wake");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "delivery-path marker suppresses the replayed second completion"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed after the suppressed replay"
+    );
+}
+
+/// PR #1313 review (empty-report dedup): `agent.reportToParent("")` persists
+/// an empty report WITH a completion_report_timestamp, but the #1945
+/// non-empty filter classifies the stamped event value as unreported — the
+/// dedup identity must still be derived (raw key presence, not the #1945
+/// filter), or a re-arm on the settled child replays the historical
+/// completion the retirement branch already recorded.
+#[tokio::test]
+async fn rearmed_watch_dedups_empty_report_completion() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+    // Empty report: still persists the report + timestamp and delivers the
+    // immediate report-time wake (marks the delegate watch report_delivered).
+    svc.agent_report_to_parent_op(ws.clone(), json!(""), Some(child.clone()))
+        .await
+        .expect("empty report");
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    // Real completion: the report_delivered watch retires silently and the
+    // retirement branch records the marker (keyed on the session timestamp).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Park the child terminal (empty report + timestamp retained), re-watch:
+    // the registration reconcile synthesizes the historical completion with
+    // `completionReport: ""` — the marker must match and suppress it.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Completed;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "re-arm must not fire on the historical empty-report completion"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed for a future completion"
+    );
+}
+
+/// PR #1313 review (Gap B residual hole): a monorepo#2532 Gap B settlement —
+/// the report keys deliberately dropped from the synthesized idle
+/// (`had_stale_report`) — must still RECORD the settled cycle's marker (keyed
+/// on the session's retained report timestamp), so a later re-arm on the
+/// settled child does not replay the historical stale report.
+#[tokio::test]
+async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+    // Child reported (report + timestamp persisted) and sits RuntimeIdle
+    // with the hook still active.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("PR ready; hook armed".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+
+    // NEW watch on the reported idle child: registration reconcile defers
+    // with the stale-report marker (monorepo#2532 Gap B).
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("watch");
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // Last hook terminal transition → the settlement wake (report keys
+    // dropped) delivers and must record the settled cycle's marker.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
+        .await
+        .expect("dispatch hook");
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "Gap B settlement wake delivers"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // Re-arm on the settled child: the reconcile now synthesizes the
+    // REPORTED historical idle (hook gone, report + timestamp retained) —
+    // the marker recorded by the settlement wake must suppress it.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "re-arm must not replay the historical stale report"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "re-armed watch stays armed for a future completion"
+    );
+}
+
+/// PR #1313 review (stale-event identity adoption): a reported idle consumed
+/// only AFTER the child already reported again must not adopt the NEWER
+/// cycle's identity — the event-carried report is matched against the
+/// session's before the timestamp is used, so the stale wake records nothing
+/// and the newer completion still delivers to a re-armed watch.
+#[tokio::test]
+async fn stale_reported_idle_does_not_suppress_newer_completion() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("watch");
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // The session has already moved on to the SECOND report when the FIRST
+    // report's idle event is finally processed.
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("second".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("second report");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "first" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "stale reported idle delivers (fail-open)"
+    );
+    assert!(svc.find_watches_for_child(&child).is_empty());
+
+    // The stale wake must NOT have recorded the second cycle's identity: a
+    // re-armed watch still receives the second completion.
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "second" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "the newer completion still delivers after the stale wake"
+    );
+}
+
 /// Scope gate: a non-chief caller may not wait on a target outside its own
 /// workspace — rejected for BOTH modes and side-effect free (no watches, no
 /// group), even when a same-workspace target precedes the offending one.
