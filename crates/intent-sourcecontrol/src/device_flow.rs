@@ -105,7 +105,8 @@ fn login_client(base_uri: &str) -> Result<octocrab::Octocrab> {
 }
 
 /// Start a device flow: request codes for `client_id` (a *public* OAuth App
-/// client id, e.g. [`DEFAULT_OAUTH_CLIENT_ID`]) and the given `scopes`.
+/// client id, e.g. [`intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID`])
+/// and the given `scopes`.
 /// Returns the user-facing codes plus the opaque poll handle.
 pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorization, DeviceFlow)> {
     start_at(DEFAULT_LOGIN_BASE_URI, client_id, scopes).await
