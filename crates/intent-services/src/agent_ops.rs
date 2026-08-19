@@ -3203,17 +3203,20 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
-        // Capture the workspace before deleting so the post-delete agent:deleted
-        // emit can be workspace-scoped. If the session is already gone, skip the
-        // emit gracefully rather than failing the idempotent delete. When the
-        // caller declares a workspace, reject a cross-workspace bare-id probe
-        // by mapping to `NotFound` before touching the store.
-        let session_workspace_id = self
+        // Capture the workspace (and name, for the event's `agentName`
+        // enrichment — intent-hq/monorepo#2869) before deleting so the
+        // post-delete agent:deleted emit can be workspace-scoped. If the
+        // session is already gone, skip the emit gracefully rather than
+        // failing the idempotent delete. When the caller declares a
+        // workspace, reject a cross-workspace bare-id probe by mapping to
+        // `NotFound` before touching the store.
+        let session_meta = self
             .store
             .get_agent_session(&agent_id)
             .await
             .ok()
-            .map(|s| s.workspace_id);
+            .map(|s| (s.workspace_id, s.name));
+        let session_workspace_id = session_meta.as_ref().map(|(ws, _)| ws.clone());
         if let (Some(ws), Some(session_ws)) = (workspace_id.as_ref(), session_workspace_id.as_ref())
         {
             if session_ws != ws {
@@ -3255,7 +3258,7 @@ impl Services {
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;
-        if let Some(workspace_id) = session_workspace_id {
+        if let Some((workspace_id, agent_name)) = session_meta {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
@@ -3267,7 +3270,7 @@ impl Services {
                     correlation_id: None,
                     parent_event_id: None,
                     metadata: None,
-                    data: json!({ "agentId": agent_id.0 }),
+                    data: json!({ "agentId": agent_id.0, "agentName": agent_name }),
                 },
             )
             .await;
@@ -11211,7 +11214,10 @@ impl Services {
                             correlation_id: None,
                             parent_event_id: None,
                             metadata: None,
-                            data: json!({ "agentId": agent_id.0 }),
+                            data: json!({
+                                "agentId": agent_id.0,
+                                "agentName": session.name.clone(),
+                            }),
                         };
                         self.record_group_child_completion(
                             &group.group_id,
