@@ -98,7 +98,10 @@ fn agent_stats_value(additions: i64, deletions: i64, files_changed: i64) -> Valu
 
 /// Build the workspace-level `Metrics` value (§5.20):
 /// `{ additions, deletions, filesChanged, byAgent: { [agentId]: Metrics } }`.
-pub fn workspace_metrics_value(ws: &WorkspaceMetricsRow, agents: &[AgentMetricsRow]) -> Value {
+pub(crate) fn workspace_metrics_value(
+    ws: &WorkspaceMetricsRow,
+    agents: &[AgentMetricsRow],
+) -> Value {
     let mut by_agent = Map::new();
     for a in agents {
         by_agent.insert(
@@ -116,7 +119,7 @@ pub fn workspace_metrics_value(ws: &WorkspaceMetricsRow, agents: &[AgentMetricsR
 
 /// Sum one agent's rows across workspaces into a per-agent `Metrics` value (no
 /// `byAgent`, per §5.20). Returns `null` when the agent has no recorded metrics.
-pub fn agent_metrics_value(rows: &[AgentMetricsRow]) -> Value {
+pub(crate) fn agent_metrics_value(rows: &[AgentMetricsRow]) -> Value {
     if rows.is_empty() {
         return Value::Null;
     }

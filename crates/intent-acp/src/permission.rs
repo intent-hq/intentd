@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 
 /// Unanswered permission prompts resolve as `cancelled` after this long
 /// (parity: TS 5-minute auto-cancel).
-pub const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Heuristic risk class derived from the tool-call title (PROTOCOL §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,7 +41,7 @@ pub enum RiskLevel {
 
 /// Derive a [`RiskLevel`] from a tool-call title (parity: TS `assessRiskLevel`):
 /// high-risk patterns win over low-risk; everything else is medium.
-pub fn assess_risk_level(title: &str) -> RiskLevel {
+pub(crate) fn assess_risk_level(title: &str) -> RiskLevel {
     let lower = title.to_lowercase();
     const HIGH: [&str; 7] = [
         "delete", "remove", "execute", "write", "modify", "create", "launch",
@@ -116,7 +116,7 @@ impl PermissionOutcome {
 
     /// The `outcome` object carried on `agent:permission:resolved` and embedded
     /// in the ACP response (PROTOCOL §8 outcome shape).
-    pub fn to_event_value(&self) -> Value {
+    pub(crate) fn to_event_value(&self) -> Value {
         match self {
             PermissionOutcome::Selected { option_id } => {
                 json!({ "outcome": "selected", "optionId": option_id })
@@ -163,7 +163,7 @@ pub enum PermissionPolicy {
 impl PermissionPolicy {
     /// The auto-decision for `risk`, or `None` when the prompt must be surfaced
     /// to a client. `true` selects an allow option, `false` a deny option.
-    pub fn auto_allow(self, risk: RiskLevel) -> Option<bool> {
+    pub(crate) fn auto_allow(self, risk: RiskLevel) -> Option<bool> {
         match self {
             PermissionPolicy::Interactive => None,
             PermissionPolicy::AllowAll => Some(true),
@@ -201,7 +201,7 @@ impl PermissionRegistry {
 
     /// A registry with an explicit timeout (used by tests to exercise the
     /// timeout path without waiting five minutes).
-    pub fn with_timeout(timeout: Duration) -> Self {
+    pub(crate) fn with_timeout(timeout: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
@@ -215,7 +215,7 @@ impl PermissionRegistry {
     }
 
     /// Mint the next `perm_<millis>_<n>` request id.
-    pub fn next_request_id(&self) -> String {
+    pub(crate) fn next_request_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         format!("perm_{}_{}", now_millis(), n)
     }
@@ -257,7 +257,7 @@ impl PermissionRegistry {
 }
 
 /// The default options when a provider offers none (PROTOCOL §8).
-pub fn default_options() -> Vec<PermissionOptionView> {
+pub(crate) fn default_options() -> Vec<PermissionOptionView> {
     vec![
         PermissionOptionView {
             id: "allow_once".to_string(),
@@ -276,7 +276,7 @@ pub fn default_options() -> Vec<PermissionOptionView> {
 
 /// Normalize ACP [`PermissionOption`]s to the §8 client shape; an empty list
 /// falls back to [`default_options`]. `reject_*` kinds are marked destructive.
-pub fn normalize_options(options: &[PermissionOption]) -> Vec<PermissionOptionView> {
+pub(crate) fn normalize_options(options: &[PermissionOption]) -> Vec<PermissionOptionView> {
     if options.is_empty() {
         return default_options();
     }
@@ -298,7 +298,7 @@ pub fn normalize_options(options: &[PermissionOption]) -> Vec<PermissionOptionVi
 /// `session/request_permission`. `session_id` is the intentd agent id (so a
 /// client routes the prompt to the agent view); `request_id` is minted by the
 /// registry. Title/description are derived from the tool-call fields.
-pub fn normalize_request(
+pub(crate) fn normalize_request(
     request_id: String,
     session_id: String,
     agent_name: String,
@@ -332,7 +332,7 @@ pub fn normalize_request(
 /// Pick the option id to auto-select for a policy decision: the first
 /// non-destructive option when allowing, otherwise the first destructive one.
 /// Falls back to the first option so a decision can always be made.
-pub fn select_option(options: &[PermissionOptionView], allow: bool) -> Option<String> {
+pub(crate) fn select_option(options: &[PermissionOptionView], allow: bool) -> Option<String> {
     options
         .iter()
         .find(|o| o.destructive != allow)

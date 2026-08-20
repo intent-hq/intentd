@@ -2,8 +2,12 @@
 //! that survives reconnects, persisted by the `client.hello` handshake. The
 //! ephemeral per-connection id is transport-only and never stored here.
 
-use intent_core::{now_iso, Client, ClientId, Error, Result};
+#[cfg(test)]
+use intent_core::Client;
+use intent_core::{now_iso, ClientId, Error, Result};
+#[cfg(test)]
 use sqlx::sqlite::SqliteRow;
+#[cfg(test)]
 use sqlx::Row;
 
 use crate::Store;
@@ -44,7 +48,8 @@ impl Store {
     }
 
     /// Fetch a logical client by id (used by tests + diagnostics).
-    pub async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
+    #[cfg(test)]
+    pub(crate) async fn get_client(&self, id: &ClientId) -> Result<Option<Client>> {
         let row = sqlx::query(
             "SELECT id, name, capabilities, first_seen, last_seen FROM client WHERE id = ?",
         )
@@ -56,6 +61,7 @@ impl Store {
     }
 }
 
+#[cfg(test)]
 fn map_client_row(r: &SqliteRow) -> Result<Client> {
     let caps_text: String = r.get("capabilities");
     let capabilities = serde_json::from_str(&caps_text)

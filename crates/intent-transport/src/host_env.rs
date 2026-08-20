@@ -34,7 +34,7 @@ fn has_display(display: bool, wayland: bool, over_ssh: bool, gui_platform: bool)
 /// (§5.14). Reports `wayland`/`x11` when their env is present; `None`
 /// otherwise. Cross-platform clean — returns `None` on hosts without those
 /// Unix display-server env vars.
-pub fn detect_display_server() -> Option<String> {
+pub(crate) fn detect_display_server() -> Option<String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         return Some("wayland".to_string());
     }

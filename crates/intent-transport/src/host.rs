@@ -24,7 +24,7 @@ use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 /// default (`true`/local for UDS, `false`/remote for TCP/WSS) unless forced by
 /// `--mode local|remote` / the `server.locality` setting. Pure so the
 /// per-transport + override matrix is unit-testable.
-pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> bool {
+pub(crate) fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> bool {
     override_local.unwrap_or(transport_local)
 }
 
@@ -643,50 +643,19 @@ async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<Strin
 
 /// Opens a URL/file on the daemon host's GUI. Injected so the local path is
 /// unit-testable without launching a real browser.
-pub trait ExternalOpener: Send + Sync {
+#[cfg(test)]
+pub(crate) trait ExternalOpener: Send + Sync {
     /// Open `url` with the host's default handler. Returns a descriptive error
     /// when the platform opener cannot be spawned.
     fn open(&self, url: &str) -> Result<(), String>;
 }
 
-/// Default opener: the platform handler (`open` on macOS, `cmd /C start` on
-/// Windows, `xdg-open` elsewhere), detached from this process's stdio.
-pub struct OsOpener;
-
-impl ExternalOpener for OsOpener {
-    fn open(&self, url: &str) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        let mut cmd = {
-            let mut c = std::process::Command::new("open");
-            c.arg(url);
-            c
-        };
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "start", "", url]);
-            c
-        };
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        let mut cmd = {
-            let mut c = std::process::Command::new("xdg-open");
-            c.arg(url);
-            c
-        };
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        cmd.spawn()
-            .map(|_| ())
-            .map_err(|e| format!("open external failed: {e}"))
-    }
-}
-
 /// Why a [`open_external`] call could not be satisfied. `code()` maps each to a
 /// standard JSON-RPC error code (PROTOCOL §9: no custom codes — server-side
 /// conditions are `-32602`/`-32603` with a descriptive message).
+#[cfg(test)]
 #[derive(Debug)]
-pub enum OpenExternalError {
+pub(crate) enum OpenExternalError {
     /// `hasDisplay=false` on the daemon host and the op needs a display (§12.4).
     Headless(String),
     /// The host OS opener failed (the local path).
@@ -697,6 +666,7 @@ pub enum OpenExternalError {
     InvalidUrl(String),
 }
 
+#[cfg(test)]
 impl OpenExternalError {
     /// JSON-RPC 2.0 numeric error code for this condition (PROTOCOL §9).
     pub fn code(&self) -> i32 {
@@ -709,6 +679,7 @@ impl OpenExternalError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Display for OpenExternalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -720,6 +691,7 @@ impl fmt::Display for OpenExternalError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for OpenExternalError {}
 
 /// Open `url` on the *user's* machine (§5.14; the daemon→client reverse RPC
@@ -730,7 +702,8 @@ impl std::error::Error for OpenExternalError {}
 /// intent is dispatched to the connected frontend as an FE-served reverse RPC
 /// (`host.openExternal`) so it opens on the user's machine (mirroring the
 /// ACP client-served pattern, §6.7).
-pub async fn open_external(
+#[cfg(test)]
+pub(crate) async fn open_external(
     url: &str,
     is_local: bool,
     has_display: bool,
@@ -764,7 +737,7 @@ pub async fn open_external(
 /// Where the editor should open. Line/column are 1-based hints (best-effort in
 /// the local launch path; forwarded verbatim on the reverse RPC).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EditorTarget {
+pub(crate) struct EditorTarget {
     pub path: String,
     pub line: Option<u32>,
     pub column: Option<u32>,
@@ -776,7 +749,7 @@ pub struct EditorTarget {
 /// (native binary vs macOS `.app` bundle vs flatpak) without re-doing the
 /// resolution work.
 #[derive(Debug, Clone)]
-pub struct ResolvedEditor {
+pub(crate) struct ResolvedEditor {
     pub id: String,
     pub installed: bool,
     pub path: Option<String>,
@@ -787,7 +760,7 @@ pub struct ResolvedEditor {
 impl ResolvedEditor {
     /// Locate `editor_id` in the `host.listInstalledEditors` payload. Returns
     /// `None` when the id is unknown to the current platform's catalog.
-    pub fn from_editors_payload(editor_id: &str, payload: &Value) -> Option<Self> {
+    pub(crate) fn from_editors_payload(editor_id: &str, payload: &Value) -> Option<Self> {
         let entries = payload.get("editors")?.as_array()?;
         entries
             .iter()
@@ -807,7 +780,7 @@ impl ResolvedEditor {
 
 /// Launch a resolved editor on the daemon host with the requested target.
 /// Injected so the local path is unit-testable without spawning a real editor.
-pub trait EditorLauncher: Send + Sync {
+pub(crate) trait EditorLauncher: Send + Sync {
     /// Launch `editor` on `target`. Returns a descriptive error when the
     /// platform launch cannot be spawned.
     fn launch(&self, editor: &ResolvedEditor, target: &EditorTarget) -> Result<(), String>;
@@ -819,7 +792,7 @@ pub trait EditorLauncher: Send + Sync {
 /// a flatpak application id via `flatpak run`. Line/column are best-effort and
 /// only honored for editors that accept a `--goto <file>:<line>[:<col>]` arg;
 /// unknown editors receive just the target path.
-pub struct OsEditorLauncher;
+pub(crate) struct OsEditorLauncher;
 
 impl EditorLauncher for OsEditorLauncher {
     fn launch(&self, editor: &ResolvedEditor, target: &EditorTarget) -> Result<(), String> {
@@ -879,7 +852,7 @@ fn append_editor_args(cmd: &mut std::process::Command, goto: bool, target: &Edit
 /// a standard JSON-RPC error code (PROTOCOL §9: no custom codes — server-side
 /// conditions are `-32602`/`-32603` with a descriptive message).
 #[derive(Debug)]
-pub enum OpenInEditorError {
+pub(crate) enum OpenInEditorError {
     /// `editorId` / `path` was missing or empty, or the editor id is unknown to
     /// the current platform's `host.listInstalledEditors` catalog.
     InvalidParams(String),
@@ -929,7 +902,7 @@ impl std::error::Error for OpenInEditorError {}
 /// connected frontend as an FE-served reverse RPC (`host.openInEditor`) so the
 /// editor opens on the user's laptop (mirroring `host.openExternal`).
 #[allow(clippy::too_many_arguments)]
-pub async fn open_in_editor(
+pub(crate) async fn open_in_editor(
     editor_id: &str,
     path: &str,
     line: Option<u32>,
@@ -997,7 +970,8 @@ pub async fn open_in_editor(
 /// Present an "open with…" application chooser for `path` to the user.
 /// Injected so the local path is unit-testable without launching a real OS
 /// chooser dialog.
-pub trait AppPicker: Send + Sync {
+#[cfg(test)]
+pub(crate) trait AppPicker: Send + Sync {
     /// Prompt the user for the application to open `path` with. Returns
     /// `Ok(Some(applicationId))` on selection, `Ok(None)` when the user
     /// cancelled / the daemon host has no local chooser, or `Err(message)`
@@ -1010,8 +984,10 @@ pub trait AppPicker: Send + Sync {
 /// with a display, callers can inject a native picker; otherwise clients
 /// gate the UI on `host.status.hasDisplay` and let the FE-served reverse RPC
 /// (`host.pickApplication`) present the chooser on the user's machine.
-pub struct NoopAppPicker;
+#[cfg(test)]
+pub(crate) struct NoopAppPicker;
 
+#[cfg(test)]
 impl AppPicker for NoopAppPicker {
     fn pick(&self, _path: &str) -> Result<Option<String>, String> {
         Ok(None)
@@ -1020,8 +996,9 @@ impl AppPicker for NoopAppPicker {
 
 /// Why a [`pick_application`] call could not be satisfied. `code()` maps each
 /// to a standard JSON-RPC error code (PROTOCOL §9).
+#[cfg(test)]
 #[derive(Debug)]
-pub enum PickApplicationError {
+pub(crate) enum PickApplicationError {
     /// `path` was missing or empty.
     InvalidPath(String),
     /// The host picker failed (the local path).
@@ -1030,6 +1007,7 @@ pub enum PickApplicationError {
     Proxy(String),
 }
 
+#[cfg(test)]
 impl PickApplicationError {
     /// JSON-RPC 2.0 numeric error code for this condition (PROTOCOL §9).
     pub fn code(&self) -> i32 {
@@ -1040,6 +1018,7 @@ impl PickApplicationError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Display for PickApplicationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1050,6 +1029,7 @@ impl fmt::Display for PickApplicationError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for PickApplicationError {}
 
 /// Present the "open with…" chooser for `path` on the *user's* machine
@@ -1059,7 +1039,8 @@ impl std::error::Error for PickApplicationError {}
 /// dispatched to the connected frontend as an FE-served reverse RPC
 /// (`host.pickApplication`) so the chooser appears on the user's laptop; the
 /// client's `{ applicationId? }` reply is echoed back verbatim.
-pub async fn pick_application(
+#[cfg(test)]
+pub(crate) async fn pick_application(
     path: &str,
     is_local: bool,
     picker: &dyn AppPicker,

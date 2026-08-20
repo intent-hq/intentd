@@ -6,7 +6,7 @@ use intent_core::{Error, Result};
 /// Build a [`GlobSet`] from `opts.globs`, or `None` when no globs are given.
 /// `*` crosses path separators (`literal_separator(false)`), so `*.rs` matches
 /// nested files. An unparsable glob → `-32602 "Invalid glob pattern"`.
-pub fn build_glob_set(globs: &[String]) -> Result<Option<GlobSet>> {
+pub(crate) fn build_glob_set(globs: &[String]) -> Result<Option<GlobSet>> {
     if globs.is_empty() {
         return Ok(None);
     }
@@ -26,12 +26,12 @@ pub fn build_glob_set(globs: &[String]) -> Result<Option<GlobSet>> {
 
 /// Whether `pattern` contains glob metacharacters (so it is matched as a glob
 /// rather than a case-insensitive substring).
-pub fn is_glob(pattern: &str) -> bool {
+pub(crate) fn is_glob(pattern: &str) -> bool {
     pattern.contains(['*', '?', '[', ']', '{', '}'])
 }
 
 /// Build a single case-insensitive [`GlobSet`] from one filename pattern.
-pub fn build_name_glob(pattern: &str) -> Result<GlobSet> {
+pub(crate) fn build_name_glob(pattern: &str) -> Result<GlobSet> {
     let glob = GlobBuilder::new(pattern)
         .literal_separator(false)
         .case_insensitive(true)

@@ -19,7 +19,7 @@ use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
 /// First line of every transfer WIP snapshot commit message. The import side
 /// identifies snapshot commits by this sentinel and unwinds them via
 /// [`unwind_wip`]; keep it stable across versions.
-pub const TRANSFER_WIP_SENTINEL: &str = "intent-transfer: WIP snapshot";
+pub(crate) const TRANSFER_WIP_SENTINEL: &str = "intent-transfer: WIP snapshot";
 
 /// Commit-message trailer carrying the pre-snapshot index tree OID, so
 /// [`unwind_wip`] can restore the exact staged/unstaged split (a plain soft
@@ -35,13 +35,13 @@ const TRANSFER_REF_NS: &str = "refs/intent/transfer";
 /// Bundle ref name recording the workspace base commit. Namespaced by
 /// workspace id: worktree-based workspaces share the repository's common
 /// refs dir, so concurrent transfers must not collide on temp-ref names.
-pub fn base_bundle_ref(workspace_id: &str) -> String {
+pub(crate) fn base_bundle_ref(workspace_id: &str) -> String {
     format!("{TRANSFER_REF_NS}/{workspace_id}/base")
 }
 
 /// Bundle ref name recording one sandbox's `sb/<agentId>` branch tip
 /// (workspace-namespaced like [`base_bundle_ref`]).
-pub fn sandbox_bundle_ref(workspace_id: &str, agent_id: &str) -> String {
+pub(crate) fn sandbox_bundle_ref(workspace_id: &str, agent_id: &str) -> String {
     format!("{TRANSFER_REF_NS}/{workspace_id}/sandbox/{agent_id}")
 }
 
@@ -105,7 +105,7 @@ pub struct SandboxBundleRef {
 /// recorded as a commit-message trailer so [`unwind_wip`] restores the exact
 /// staged/unstaged split, and anchored via an auxiliary second parent so it
 /// stays reachable inside a transfer bundle.
-pub fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
+pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
     let repo = git2::Repository::open(repo_path)
         .map_err(|e| Error::Internal(format!("open repo for WIP snapshot failed: {e}")))?;
     if !is_dirty(&repo)? {
@@ -210,7 +210,7 @@ pub fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
 /// [`INDEX_TREE_TRAILER`], leaving the worktree exactly as found (staged
 /// stays staged, unstaged stays unstaged, untracked stays untracked).
 /// Returns `false` (no-op) when HEAD is not a transfer WIP commit.
-pub fn unwind_wip(repo_path: &Path) -> Result<bool> {
+pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
     let repo = git2::Repository::open(repo_path)
         .map_err(|e| Error::Internal(format!("open repo for WIP unwind failed: {e}")))?;
     let head_commit = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {

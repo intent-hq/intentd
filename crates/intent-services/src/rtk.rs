@@ -41,7 +41,7 @@ fn is_excluded(cmd: &str) -> bool {
 
 /// RTK detection result, cached per daemon run.
 #[derive(Debug, Clone)]
-pub struct RtkStatus {
+pub(crate) struct RtkStatus {
     pub available: bool,
     pub subcommands: Vec<String>,
 }

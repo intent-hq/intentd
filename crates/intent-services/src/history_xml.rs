@@ -14,7 +14,7 @@ use intent_core::AgentMessage;
 use serde_json::{json, Value};
 
 /// Max characters of history to include (TS `MAX_HISTORY_CHARS`).
-pub const MAX_HISTORY_CHARS: usize = 200_000;
+pub(crate) const MAX_HISTORY_CHARS: usize = 200_000;
 /// Max characters per tool input/output block (TS `MAX_TOOL_CONTENT_CHARS`).
 const MAX_TOOL_CONTENT_CHARS: usize = 4_000;
 /// Max characters for a tool name (TS `MAX_TOOL_NAME_CHARS`).
@@ -292,7 +292,7 @@ struct Exchange {
 /// session recovery (TS `formatHistoryAsXml`). Groups user→assistant pairs,
 /// renders newest-first within a `max_chars` budget, and emits an omission
 /// comment for older exchanges that did not fit. Returns `""` for empty input.
-pub fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize) -> String {
+pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize) -> String {
     if messages.is_empty() {
         return String::new();
     }

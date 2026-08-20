@@ -69,7 +69,7 @@ pub trait SentryEngine: Send + Sync {
 
 /// REST-backed [`SentryEngine`] over [`SentryClient`].
 #[derive(Debug)]
-pub struct SentryEngineImpl {
+pub(crate) struct SentryEngineImpl {
     client: SentryClient,
 }
 

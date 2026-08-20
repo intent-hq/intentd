@@ -550,7 +550,8 @@ impl PtyHost {
 
     /// Kill every PTY under `scope` (session/workspace teardown). Returns the
     /// number reaped. No process-group orphans are left behind.
-    pub async fn kill_scope(&self, scope: &str) -> usize {
+    #[cfg(test)]
+    pub(crate) async fn kill_scope(&self, scope: &str) -> usize {
         let victims: Vec<Arc<PtySession>> = {
             let mut sessions = self.sessions.lock().unwrap();
             let ids: Vec<PtyId> = sessions

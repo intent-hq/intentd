@@ -74,7 +74,7 @@ const UNSLOTH_HF_API_URL: &str =
 /// (adapter missing, npx missing, probe timeout, auth required, empty
 /// response) `models` is `None` and `warning` carries the reason.
 #[derive(Debug)]
-pub struct ProviderModelsFetch {
+pub(crate) struct ProviderModelsFetch {
     /// Wire-shaped model rows, or `None` when the catalog is unavailable.
     pub models: Option<Vec<Value>>,
     /// Machine-readable reason when `models` is `None`.
@@ -109,7 +109,7 @@ fn finish(provider_id: &str, outcome: Result<Vec<Value>, ProbeError>) -> Provide
 /// Dispatch a model-catalog fetch by provider id. Providers without a
 /// daemon-side source here (auggie's CLI path and cortex's open-gate empty
 /// list are wired elsewhere) return `None` with a warning.
-pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
+pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
     match provider_id {
         "claude-code" => fetch_claude_code_models().await,
         "codex" => fetch_codex_models().await,
@@ -128,7 +128,7 @@ pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
 /// `session/update` notification. The adapter's `default` pseudo-row is
 /// resolved to the real model it stands for (marked `isDefault: true`) and
 /// dropped; an unresolvable pseudo-row is kept as-is.
-pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
     let Some(npx) = find_npx() else {
         return ProviderModelsFetch::unavailable(
             "claude-code",
@@ -152,7 +152,7 @@ pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// logged-in codex stays logged in, plus a minimal `config.toml` carrying
 /// only the user's configured `model` / `model_reasoning_effort` so that
 /// model appears in the reported catalog.
-pub async fn fetch_codex_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     let Some(cmd) =
         codex_probe_launch(find_provider_binary("codex", "codex-acp", None), find_npx())
     else {
@@ -296,7 +296,7 @@ fn minimal_codex_config_seed(path: &Path) -> Option<String> {
 /// pi: ACP probe via the pinned npx adapter. Models may arrive under
 /// `models.availableModels`, `availableModels`, `models.available`, or
 /// `configOptions[id="model"].options`.
-pub async fn fetch_pi_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_pi_models() -> ProviderModelsFetch {
     let Some(npx) = find_npx() else {
         return ProviderModelsFetch::unavailable(
             "pi",
@@ -313,7 +313,7 @@ pub async fn fetch_pi_models() -> ProviderModelsFetch {
 /// droid: ACP probe via a resolved `droid` binary
 /// (`droid exec --output-format acp`). An explicit ACP auth-required error is
 /// surfaced as a distinct warning (parity with the FE `droid-acp-probe.ts`).
-pub async fn fetch_droid_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_droid_models() -> ProviderModelsFetch {
     let Some(bin) = find_provider_binary("droid", "droid", None) else {
         return ProviderModelsFetch::unavailable("droid", "droid binary not found");
     };
@@ -384,7 +384,7 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// opencode: native CLI — run `opencode models` and parse one
 /// `provider/model` per line (parity with the FE `opencode.ipc.ts`, which
 /// routes the same command through `host.exec`).
-pub async fn fetch_opencode_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_opencode_models() -> ProviderModelsFetch {
     let Some(bin) = find_provider_binary("opencode", "opencode", None) else {
         return ProviderModelsFetch::unavailable("opencode", "opencode binary not found");
     };
@@ -445,7 +445,7 @@ fn stderr_tail(stderr: &str) -> String {
 /// grok: native CLI — run `grok models` and parse stdout via
 /// [`intent_providers::parse_grok_models_command_output`] (auth markers, then
 /// a JSON payload, then text rows — parity with the FE grok probe).
-pub async fn fetch_grok_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_grok_models() -> ProviderModelsFetch {
     let Some(bin) = find_provider_binary("grok", "grok", None) else {
         return ProviderModelsFetch::unavailable("grok", "grok binary not found");
     };
@@ -516,7 +516,7 @@ async fn run_grok_models_cli(
 /// total system RAM. On a platform where RAM detection is unsupported
 /// ([`crate::agent_manager::total_memory_bytes`] returns `None`), the fit
 /// filter is skipped and every repo is returned — never mis-filtered.
-pub async fn fetch_unsloth_models() -> ProviderModelsFetch {
+pub(crate) async fn fetch_unsloth_models() -> ProviderModelsFetch {
     let body = match fetch_unsloth_hf_catalog(UNSLOTH_HF_TIMEOUT).await {
         Ok(body) => body,
         Err(reason) => return ProviderModelsFetch::unavailable("unsloth", reason),
