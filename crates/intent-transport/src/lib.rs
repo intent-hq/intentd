@@ -34,7 +34,9 @@ pub use reverse::{
 };
 pub use router::handle_message;
 pub use rpc_limit::{RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
-pub use server::{collect_local_ips, PairingSnapshot, ServerPairingInfo};
+pub use server::{
+    collect_bind_interfaces, collect_local_ips, pairing_hosts, PairingSnapshot, ServerPairingInfo,
+};
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 

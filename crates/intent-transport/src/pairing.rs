@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::events::{error_frame, error_frame_with_data, success_frame};
-use crate::server::{collect_local_ips, ServerPairingInfo};
+use crate::server::{pairing_hosts, ServerPairingInfo};
 use intent_core::{Error, Result};
 
 /// Version of the `intent://pair` payload format (the `v` query parameter and
@@ -132,7 +132,9 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    let hosts = collect_local_ips();
+    // Bind-aware hosts: a specific bind (loopback included) advertises exactly
+    // that address; only an unspecified/unknown bind enumerates local IPs.
+    let hosts = pairing_hosts(&snapshot);
     if hosts.is_empty() {
         return Err(Error::Unsupported(
             "no non-loopback IPv4 address found — connect this machine to a network before pairing"
