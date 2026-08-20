@@ -35,7 +35,8 @@ pub mod transport;
 #[cfg(unix)]
 pub use descendant_sweep::{descendant_pids, descendant_pids_many, sweep_escaped_descendants};
 pub use error::{
-    is_transient_upstream_disconnect, AcpError, AcpResult, JsonRpcError, PROMPT_IDLE_TIMEOUT_PREFIX,
+    is_transient_provider_fetch_failure, is_transient_upstream_disconnect, AcpError, AcpResult,
+    JsonRpcError, PROMPT_IDLE_TIMEOUT_PREFIX,
 };
 pub use fs::FileService;
 pub use handler::{ClientRequestHandler, EventSink, SinkEvent};

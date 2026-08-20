@@ -3,6 +3,8 @@
 //! `stream:end`, persists `acpSessionId`, and gates resume on the capability.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_acp::session::{ContentBlock, InitializeResponse};
@@ -3172,6 +3174,420 @@ async fn streaming_benign_cancel_does_not_persist_error() {
     assert!(
         services.take_pending_terminal_error(&agent_id).is_none(),
         "nothing stashed for a benign cancel"
+    );
+}
+
+/// Mock agent whose `session/prompt` fails the first `failures` calls with a
+/// JSON-RPC `-32603` carrying `error_data` (the provider-fetch failure shape,
+/// monorepo#3007), then serves the NEXT call normally: streams `updates` and
+/// resolves `end_turn`. Returns the shared prompt-call counter so the test
+/// can assert how many attempts the driver made.
+fn spawn_mock_agent_failing_prompts_then_success<R, W>(
+    read: R,
+    write: W,
+    failures: usize,
+    error_data: String,
+    updates: Vec<String>,
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                let call = counter.fetch_add(1, Ordering::SeqCst);
+                if call < failures {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32603, "message": "Internal error", "data": error_data },
+                    });
+                    write
+                        .write_all(format!("{resp}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                    continue;
+                }
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    });
+    (handle, prompt_calls)
+}
+
+/// [`connect`] against the failing-then-succeeding mock above.
+fn connect_with_failing_prompts_then_success(
+    failures: usize,
+    error_data: &str,
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    Arc<AtomicUsize>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (agent, prompt_calls) = spawn_mock_agent_failing_prompts_then_success(
+        c2a_agent,
+        a2c_agent,
+        failures,
+        error_data.to_string(),
+        updates,
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, prompt_calls)
+}
+
+/// The observed monorepo#3007 `data` payload: a Node fetch EPIPE with the
+/// provider's `apiStatus: unavailable` JSON.
+const FETCH_EPIPE_UNAVAILABLE: &str = "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
+    {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}";
+
+/// Regression for monorepo#3007: a transient provider-fetch failure (`-32603`
+/// wrapping an EPIPE connect + `apiStatus: unavailable`) on an output-free
+/// attempt is retried in place — the turn completes normally instead of
+/// failing terminally, and no Error status is persisted.
+#[tokio::test]
+async fn transient_provider_fetch_failure_retries_and_turn_completes() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_failing_prompts_then_success(2, FETCH_EPIPE_UNAVAILABLE, prompt_updates());
+
+    let stop = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect("transient fetch failures are retried, not terminal (monorepo#3007)");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        3,
+        "two failed attempts + the succeeding retry"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(
+        stored.status,
+        AgentStatus::Error,
+        "a recovered transient fetch failure must not park the session in Error"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_none(),
+        "nothing stashed for a recovered turn"
+    );
+    // The retried attempt's streamed output persisted as the turn's message.
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the successful attempt's output persisted"
+    );
+}
+
+/// The retry budget is bounded (monorepo#3007): a provider that keeps failing
+/// transiently exhausts the attempts and the turn fails through the existing
+/// terminal path (Error persisted, context stashed for the worker).
+#[tokio::test]
+async fn transient_provider_fetch_failure_exhausts_bounded_retries() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    // More consecutive failures than 1 initial attempt + 2 retries.
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_failing_prompts_then_success(10, FETCH_EPIPE_UNAVAILABLE, Vec::new());
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("exhausted retries surface the terminal error");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "exhausted retries keep the ordinary terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        3,
+        "1 initial attempt + 2 bounded retries, then terminal"
+    );
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "the exhausted turn still persists the terminal Error status"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker as before"
+    );
+}
+
+/// Fail-fast guard (monorepo#3007): a genuinely terminal provider error (an
+/// auth rejection) is NOT retried — exactly one `session/prompt` attempt is
+/// made and the turn fails terminally as today.
+#[tokio::test]
+async fn terminal_provider_error_fails_fast_without_retry() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, prompt_calls) = connect_with_failing_prompts_then_success(
+        10,
+        "fetch failed: 401 Unauthorized: invalid api key",
+        Vec::new(),
+    );
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a terminal provider error still fails the turn");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "terminal error keeps the wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "a terminal error is never retried"
+    );
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error, "fails fast as today");
+}
+
+/// Once the attempt streamed ANY output the retry is off the table
+/// (monorepo#3007 idempotency guard): a transient-shaped failure after
+/// streamed updates fails through the existing terminal path on the first
+/// attempt — re-dispatching would duplicate the streamed output.
+#[tokio::test]
+async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    // The mock streams updates only on the SUCCESS path, so reuse the plain
+    // rpc-error mock that streams updates BEFORE failing.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(prompt_updates(), FETCH_EPIPE_UNAVAILABLE);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-output failure is not retried in place");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-output failure keeps the terminal wrapper: {err}"
+    );
+    // The streamed partial persisted as the turn's assistant row (unchanged
+    // from today's post-output failure handling).
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "streamed partial persisted, not duplicated"
+    );
+}
+
+/// Mock agent that issues one side-effecting agent→client request
+/// (`fs/write_text_file`) and then fails `session/prompt` with a
+/// transient-shaped `-32603` — the request line is written BEFORE the error
+/// response on the same pipe, so the reader is guaranteed to bump the
+/// client-request watermark before the prompt future resolves.
+fn spawn_mock_agent_with_client_request_then_transient_failure<R, W>(
+    read: R,
+    write: W,
+    error_data: String,
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let req = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1000,
+                    "method": "fs/write_text_file",
+                    "params": { "sessionId": ACP_SID, "path": "/tmp/x", "content": "x" },
+                });
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": "Internal error", "data": error_data },
+                });
+                write
+                    .write_all(format!("{req}\n{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    });
+    (handle, prompt_calls)
+}
+
+/// Side-effect guard (monorepo#3007): a transient-shaped failure on an
+/// attempt that already issued an agent→client request (`fs/write_text_file`)
+/// is NOT retried — the handler may have side-effected (file written,
+/// terminal command run), so re-dispatching is no longer provably idempotent
+/// even though no `session/update` streamed.
+#[tokio::test]
+async fn transient_fetch_failure_after_client_request_is_not_retried() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (_agent, prompt_calls) = spawn_mock_agent_with_client_request_then_transient_failure(
+        c2a_agent,
+        a2c_agent,
+        FETCH_EPIPE_UNAVAILABLE.to_string(),
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-request failure is not retried in place");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-request failure keeps the terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "no retry after a side-effecting client request"
     );
 }
 

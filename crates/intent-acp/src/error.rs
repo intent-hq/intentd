@@ -162,6 +162,10 @@ const TERMINAL_MESSAGE_MARKERS: &[&str] = &[
     "status 4",
     "status: 4",
     "status code 4",
+    // JSON renderings (no space after the colon), e.g. a bridge error
+    // embedding `{"status":404,...}` verbatim.
+    "\"status\":4",
+    "\"status\": 4",
     "400 bad request",
     "401 unauthorized",
     "403 forbidden",
@@ -172,6 +176,36 @@ const TERMINAL_MESSAGE_MARKERS: &[&str] = &[
     "unauthorized",
     "forbidden",
     "too many requests",
+    // Provider request-level rejections (Anthropic/OpenAI-style error types
+    // and their common phrasings) — retrying cannot fix these either.
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "model not found",
+    "invalid api key",
+];
+
+/// Provider-fetch failure markers (matched case-insensitively) beyond the
+/// connection-class [`TRANSIENT_DISCONNECT_MARKERS`]: the shapes a provider
+/// bridge (e.g. codex-acp / auggie wrapping a Node `fetch`) renders into its
+/// `-32603 Internal error` when the upstream model endpoint is transiently
+/// unreachable (intent-hq/monorepo#3007). The observed instance:
+/// `fetch failed (EPIPE: connect EPIPE 34.36.229.120:443):
+/// {"apiStatus":"unavailable",…}`.
+const TRANSIENT_PROVIDER_FETCH_MARKERS: &[&str] = &[
+    // The provider itself reported a transient availability problem.
+    "\"apistatus\":\"unavailable\"",
+    "\"apistatus\": \"unavailable\"",
+    "apistatus: unavailable",
+    "\"apistatus\":\"overloaded\"",
+    "\"apistatus\": \"overloaded\"",
+    "apistatus: overloaded",
+    // Node/undici connect-level fetch failures.
+    "fetch failed",
+    "econnrefused",
+    "etimedout",
+    "socket hang up",
 ];
 
 /// Classify a rendered error message: does it describe a transient upstream
@@ -214,6 +248,48 @@ pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
         | AcpError::PromptIdleTimeout(_) => false,
         other => message_is_transient_upstream_disconnect(&other.to_string()),
     }
+}
+
+/// Decide whether `err` is a transient provider-fetch failure that an
+/// in-place `session/prompt` retry can recover from
+/// (intent-hq/monorepo#3007): the provider bridge answered the prompt with a
+/// JSON-RPC error whose rendered text describes a transient upstream fault —
+/// a connect-level fetch failure (EPIPE/ECONNRESET/ECONNREFUSED/timeout) or
+/// an explicit provider `apiStatus: unavailable`/`overloaded` payload.
+///
+/// Deliberately narrower than [`is_transient_upstream_disconnect`]:
+/// only [`AcpError::Rpc`] qualifies. A provider bridge that answered with an
+/// error is alive and can serve a retried prompt on the same connection;
+/// transport-shaped failures (closed pipe, dead child — including the
+/// synthesized code-0 "agent stdout closed") are excluded because retrying on
+/// a dead transport cannot succeed — those keep their existing recovery paths
+/// (silent redrive on a fresh child, sleep-resume enrollment). The terminal
+/// denylist wins as usual: auth failures, invalid requests, and
+/// model-not-found rejections are never retried.
+pub fn is_transient_provider_fetch_failure(err: &AcpError) -> bool {
+    match err {
+        AcpError::Rpc(e) => {
+            !(e.code == 0 && e.message == "agent stdout closed")
+                && message_is_transient_provider_fetch_failure(&err.to_string())
+        }
+        _ => false,
+    }
+}
+
+/// Message-level classification backing [`is_transient_provider_fetch_failure`]:
+/// the rendered text (message + bounded `data`) matches a transient
+/// provider-fetch or connection-class marker, and no terminal marker.
+/// Denylist wins over allowlist, same contract as
+/// [`message_is_transient_upstream_disconnect`].
+pub(crate) fn message_is_transient_provider_fetch_failure(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    if TERMINAL_MESSAGE_MARKERS.iter().any(|m| msg.contains(m)) {
+        return false;
+    }
+    TRANSIENT_PROVIDER_FETCH_MARKERS
+        .iter()
+        .any(|m| msg.contains(m))
+        || TRANSIENT_DISCONNECT_MARKERS.iter().any(|m| msg.contains(m))
 }
 
 #[cfg(test)]
@@ -309,5 +385,76 @@ mod classifier_tests {
                 "expected terminal: {msg:?}"
             );
         }
+    }
+
+    /// The observed monorepo#3007 shape: `-32603` wrapping a Node fetch EPIPE
+    /// with an `apiStatus: unavailable` payload in `data` classifies as a
+    /// transient provider-fetch failure.
+    #[test]
+    fn classifies_provider_fetch_epipe_unavailable_as_transient() {
+        let err = AcpError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(serde_json::Value::String(
+                "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
+                 {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}"
+                    .to_string(),
+            )),
+        });
+        assert!(is_transient_provider_fetch_failure(&err));
+    }
+
+    #[test]
+    fn classifies_provider_fetch_failure_messages_as_transient() {
+        for msg in [
+            "JSON-RPC error -32603: Internal error: fetch failed (ECONNREFUSED)",
+            "JSON-RPC error -32603: Internal error: {\"apiStatus\":\"unavailable\"}",
+            "JSON-RPC error -32603: Internal error: {\"apiStatus\": \"overloaded\"}",
+            "JSON-RPC error -32603: Internal error: socket hang up",
+            "JSON-RPC error -32603: Internal error: connect ETIMEDOUT 1.2.3.4:443",
+        ] {
+            assert!(
+                message_is_transient_provider_fetch_failure(msg),
+                "expected transient: {msg:?}"
+            );
+        }
+    }
+
+    /// Genuinely terminal provider rejections never classify as retryable
+    /// fetch failures — the denylist wins even when the text also carries a
+    /// fetch-failure phrase.
+    #[test]
+    fn provider_fetch_classifier_keeps_terminal_errors_terminal() {
+        for msg in [
+            "JSON-RPC error -32603: Internal error: 401 Unauthorized",
+            "JSON-RPC error -32603: Internal error: invalid_request_error",
+            "JSON-RPC error -32603: Internal error: model not found: claude-nope",
+            "JSON-RPC error -32603: Internal error: fetch failed: 403 Forbidden",
+            // JSON status rendering (no space after the colon).
+            "JSON-RPC error -32603: Internal error: fetch failed: {\"status\":404,\"error\":\"not found\"}",
+            "JSON-RPC error -32603: Internal error: invalid api key",
+            "some unrelated failure",
+        ] {
+            assert!(
+                !message_is_transient_provider_fetch_failure(msg),
+                "expected terminal: {msg:?}"
+            );
+        }
+    }
+
+    /// Only `Rpc`-variant errors qualify: transport-shaped failures keep
+    /// their existing recovery paths (silent redrive, sleep-resume).
+    #[test]
+    fn provider_fetch_classifier_rejects_non_rpc_variants() {
+        let transport = AcpError::Transport("broken pipe (EPIPE)".to_string());
+        assert!(!is_transient_provider_fetch_failure(&transport));
+        let stdout_closed = AcpError::Rpc(JsonRpcError {
+            code: 0,
+            message: "agent stdout closed".to_string(),
+            data: None,
+        });
+        assert!(!is_transient_provider_fetch_failure(&stdout_closed));
+        let auth = AcpError::Auth("login required".to_string());
+        assert!(!is_transient_provider_fetch_failure(&auth));
     }
 }
