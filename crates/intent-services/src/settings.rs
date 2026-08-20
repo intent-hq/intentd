@@ -1071,9 +1071,9 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "server.bindAddress",
             "Bind address",
-            "Address the TCP listener binds",
+            "Address the TCP listener binds; 0.0.0.0 exposes it on every interface, including untrusted networks",
             "server",
-            Some("0.0.0.0"),
+            Some("127.0.0.1"),
         ),
         number(
             "server.port",

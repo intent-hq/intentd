@@ -163,8 +163,10 @@ enum Command {
     /// sources the daemon serves. When external connections (the WSS listener)
     /// are disabled, offers to enable them on the spot (persisting
     /// `server.wsApi.enabled = true` via `settings.update`, which also starts
-    /// the listener) — interactively via a [Y/n] prompt, or unattended with
-    /// `--yes`; non-interactive runs without `--yes` refuse instead.
+    /// the listener) — interactively via a [Y/n] prompt followed by a
+    /// bind-address picker (persisted to `server.bindAddress`), or unattended
+    /// with `--yes` (keeps the persisted bind address; default loopback);
+    /// non-interactive runs without `--yes` refuse instead.
     Pair {
         /// Also write the QR code as a PNG image to this path.
         #[arg(long, value_name = "PATH")]
@@ -364,24 +366,141 @@ fn confirm_enable_wss() -> anyhow::Result<bool> {
 /// Enable external connections via `settings.update` over UDS: persists
 /// `server.wsApi.enabled = true` to config.toml and starts the WSS listener
 /// through the server-control hooks — the same path the FE settings UI uses.
-async fn enable_wss_listener(socket: &Path) -> anyhow::Result<()> {
-    let response = rpc_call(
-        socket,
-        "settings.update",
-        json!({ "changes": [{ "path": "server.wsApi.enabled", "value": true }] }),
-    )
-    .await?;
+/// When `bind_address` is `Some` (the interactive picker's choice), it is
+/// persisted to `server.bindAddress` in the SAME batch; the hook ordering
+/// applies value keys before the enable, so the listener starts on the chosen
+/// address. `None` (unattended `--yes` / already-set config) leaves the
+/// persisted value untouched.
+async fn enable_wss_listener(
+    socket: &Path,
+    bind_address: Option<std::net::IpAddr>,
+) -> anyhow::Result<()> {
+    let mut changes = Vec::new();
+    if let Some(addr) = bind_address {
+        changes.push(json!({ "path": "server.bindAddress", "value": addr.to_string() }));
+    }
+    changes.push(json!({ "path": "server.wsApi.enabled", "value": true }));
+    let response = rpc_call(socket, "settings.update", json!({ "changes": changes })).await?;
     if let Some(error) = response.get("error") {
         anyhow::bail!(
             "cannot enable external connections: {}",
             rpc_error_text(error)
         );
     }
+    // Name the address the listener now binds so an unattended run still
+    // reports the effective posture (default: loopback) and how to widen it.
+    let effective = match bind_address {
+        Some(addr) => addr.to_string(),
+        None => current_bind_address(socket)
+            .await
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+    };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
-         machine (server.wsApi.enabled = true persisted to config.toml)."
+         machine (server.wsApi.enabled = true persisted to config.toml; listening \
+         on {effective} — change it via server.bindAddress in config.toml or the \
+         settings UI)."
     );
     Ok(())
+}
+
+/// Read the effective `server.bindAddress` over UDS; `None` when the RPC
+/// fails or the value is not a parseable IP (callers fall back to loopback).
+async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
+    let response = rpc_call(
+        socket,
+        "settings.get",
+        json!({ "path": "server.bindAddress" }),
+    )
+    .await
+    .ok()?;
+    response["result"]["value"].as_str()?.parse().ok()
+}
+
+/// One selectable entry in the `intentd pair` bind-address picker.
+struct BindChoice {
+    label: String,
+    addr: std::net::IpAddr,
+}
+
+/// Build the picker entries from the enumerated `(interface, IPv4)` pairs
+/// (loopback first, per [`intent_transport::collect_bind_interfaces`]), then
+/// an explicit all-interfaces `0.0.0.0` entry carrying its exposure warning.
+/// A loopback entry is always present (synthesized when enumeration found
+/// none) so the first — and thus default — choice is never the wide bind.
+/// Pure over its input so the list shape is unit-testable.
+fn build_bind_choices(interfaces: &[(String, std::net::Ipv4Addr)]) -> Vec<BindChoice> {
+    let mut choices: Vec<BindChoice> = interfaces
+        .iter()
+        .map(|(name, ip)| BindChoice {
+            label: if ip.is_loopback() {
+                format!("{ip} ({name}) — this machine only (loopback)")
+            } else {
+                format!("{ip} ({name})")
+            },
+            addr: std::net::IpAddr::V4(*ip),
+        })
+        .collect();
+    if !choices.iter().any(|c| c.addr.is_loopback()) {
+        choices.insert(
+            0,
+            BindChoice {
+                label: "127.0.0.1 — this machine only (loopback)".to_string(),
+                addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            },
+        );
+    }
+    choices.push(BindChoice {
+        label: "0.0.0.0 — ALL interfaces; exposed to every network this machine is on, \
+                including the internet"
+            .to_string(),
+        addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    });
+    choices
+}
+
+/// Parse one line of picker input into a 0-based choice index: empty (plain
+/// Enter) selects `default_index`, otherwise a 1-based number within range;
+/// anything else is `None` (re-prompt).
+fn parse_bind_choice(input: &str, count: usize, default_index: usize) -> Option<usize> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Some(default_index);
+    }
+    match t.parse::<usize>() {
+        Ok(n) if (1..=count).contains(&n) => Some(n - 1),
+        _ => None,
+    }
+}
+
+/// Interactive bind-address picker shown right after the user consents to
+/// enabling external connections: lists this machine's interfaces plus the
+/// explicit all-interfaces option and returns the chosen address. `current`
+/// (the effective `server.bindAddress`) selects the default entry; when it
+/// matches no entry the default is the first (loopback).
+fn prompt_bind_address(current: Option<std::net::IpAddr>) -> anyhow::Result<std::net::IpAddr> {
+    use std::io::{BufRead, Write};
+    let choices = build_bind_choices(&intent_transport::collect_bind_interfaces());
+    let default_index = current
+        .and_then(|cur| choices.iter().position(|c| c.addr == cur))
+        .unwrap_or(0);
+    eprintln!("Which address should the daemon accept connections on?");
+    for (i, choice) in choices.iter().enumerate() {
+        eprintln!("  {}) {}", i + 1, choice.label);
+    }
+    loop {
+        eprint!("Choice [{}]: ", default_index + 1);
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line)? == 0 {
+            anyhow::bail!("no bind address selected (EOF before a choice was made)");
+        }
+        match parse_bind_choice(&line, choices.len(), default_index) {
+            Some(i) => return Ok(choices[i].addr),
+            None => eprintln!("enter a number between 1 and {}", choices.len()),
+        }
+    }
 }
 
 /// Rotate the pairing bearer token via `server.rotateToken` over UDS — the
@@ -415,7 +534,11 @@ async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
 /// `server.pairingInfo` — and renders the `intent://pair?…` payload URI as a
 /// QR code in half-height unicode blocks. When external connections (the WSS
 /// listener) are disabled, offers to enable them (prompt, or unattended via
-/// `yes`) through `settings.update` and retries the query. `rotate` mints a
+/// `yes`) through `settings.update` and retries the query — the interactive
+/// path also asks WHICH address to bind ([`prompt_bind_address`]: interfaces
+/// plus an explicit all-interfaces 0.0.0.0 entry, persisted to
+/// `server.bindAddress` in the same batch), while `--yes`/unattended keeps
+/// the persisted value (default: loopback). `rotate` mints a
 /// new token via [`rotate_pairing_token`] — only AFTER the listener is
 /// confirmed up (pairing info is obtainable), so a declined enable prompt (or
 /// a non-TTY run without `--yes`) never invalidates existing clients' tokens
@@ -430,14 +553,23 @@ async fn cmd_pair(
     let config = resolve_config()?;
     let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
     if response.get("error").is_some_and(is_listener_down_error) {
-        if !yes && !confirm_enable_wss()? {
-            anyhow::bail!(
-                "pairing requires external connections to be enabled — enable them \
-                 later with `intentd pair --yes` or via server.wsApi.enabled in \
-                 config.toml"
-            );
-        }
-        enable_wss_listener(&config.socket_path).await?;
+        // Interactive path: consent prompt, then the bind-address picker.
+        // `--yes` (or an unattended run) skips both and keeps the persisted
+        // server.bindAddress (default: loopback).
+        let bind_address = if yes {
+            None
+        } else {
+            if !confirm_enable_wss()? {
+                anyhow::bail!(
+                    "pairing requires external connections to be enabled — enable them \
+                     later with `intentd pair --yes` or via server.wsApi.enabled in \
+                     config.toml"
+                );
+            }
+            let current = current_bind_address(&config.socket_path).await;
+            Some(prompt_bind_address(current)?)
+        };
+        enable_wss_listener(&config.socket_path, bind_address).await?;
         response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
     }
     if let Some(error) = response.get("error") {
@@ -1430,6 +1562,33 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // over persisted settings for the port.
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
+    // Apply the effective server.bindAddress (default 127.0.0.1 — loopback;
+    // monorepo#2900). An unparseable persisted value falls back to loopback
+    // with a warning rather than silently widening the bind (defense in
+    // depth — SettingsFile::validate rejects non-IP values at load time).
+    match boot_settings.effective.server.bind_address.parse() {
+        Ok(addr) => ws_options.bind_address = addr,
+        Err(_) => tracing::warn!(
+            value = %boot_settings.effective.server.bind_address,
+            "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
+        ),
+    }
+    // Loud upgrade-path warning (monorepo#2900): the old config template wrote
+    // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
+    // file-origin wide bind that predates the loopback default. When that wide
+    // bind will actually be served (listener enabled), say so prominently.
+    if ws_options.bind_address.is_unspecified()
+        && boot_settings.effective.server.ws_api.enabled
+        && !insecure
+    {
+        tracing::warn!(
+            "server.bindAddress = \"{}\" exposes the WSS listener on EVERY interface, \
+             including untrusted networks and possibly the internet. If this is not \
+             intentional, set bindAddress = \"127.0.0.1\" under [server] in config.toml \
+             (or re-run `intentd pair` and pick an interface)",
+            boot_settings.effective.server.bind_address
+        );
+    }
     // ONE daemon-wide outstanding-slow-path-RPC cap (`server.maxOutstandingRpcs`,
     // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
     // not per-connection or per-transport.
@@ -1475,6 +1634,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         state: tokio::sync::Mutex::new(WsRuntimeState {
             ws_server: None,
             port: None,
+            bind_address: None,
         }),
         control: std::sync::OnceLock::new(),
     });
@@ -1586,6 +1746,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             let mut state = runtime.state.lock().await;
             state.ws_server = Some(server);
             state.port = Some(port);
+            state.bind_address = Some(ws_options.bind_address);
         }
     }
 
@@ -2439,6 +2600,9 @@ struct WsRuntimeState {
     ws_server: Option<WsApiServer>,
     /// Cached port for sync system.status access
     port: Option<u16>,
+    /// Address the running listener is bound to (`server.bindAddress`) so
+    /// pairing surfaces advertise the reachable host(s), not all local IPs.
+    bind_address: Option<std::net::IpAddr>,
 }
 
 /// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
@@ -2461,7 +2625,10 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
     > {
         Box::pin(async move {
             let state = self.ws_runtime.state.lock().await;
-            intent_transport::PairingSnapshot { port: state.port }
+            intent_transport::PairingSnapshot {
+                port: state.port,
+                bind_address: state.bind_address,
+            }
         })
     }
 
@@ -2680,9 +2847,33 @@ impl intent_core::ServerControl for DaemonControl {
                 runtime.ws_options.base_port,
             );
 
-            // Clone ws_options and override the port
+            // Read the persisted bind address (server.bindAddress) so a value
+            // changed since boot applies on the next listener start. An invalid
+            // value is a hard error naming the setting — never silently bind a
+            // different address than the user configured.
+            let bind_address = match runtime
+                .api
+                .settings_get("server.bindAddress".to_string())
+                .await
+            {
+                Ok(result) => match result.get("value").and_then(|v| v.as_str()) {
+                    Some(raw) => Some(raw.parse::<std::net::IpAddr>().map_err(|_| {
+                        intent_core::Error::InvalidParams(format!(
+                            "server.bindAddress {:?} is not a valid IP address — fix it in \
+                             config.toml ([server] bindAddress) or via settings",
+                            raw
+                        ))
+                    })?),
+                    None => None,
+                },
+                Err(_) => None,
+            }
+            .unwrap_or(runtime.ws_options.bind_address);
+
+            // Clone ws_options and override the port + bind address
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
+            ws_options.bind_address = bind_address;
 
             // Build a fresh WsApiServer and start it. The control is populated via
             // OnceLock after DaemonControl construction (breaking the circular Arc).
@@ -2739,8 +2930,12 @@ impl intent_core::ServerControl for DaemonControl {
                         desired_port
                     )
                 } else {
-                    // Other bind errors: include the port and OS error text
-                    format!("failed to bind port {}: {}", desired_port, e)
+                    // Other bind errors: name the address (server.bindAddress)
+                    // + port and include the OS error text
+                    format!(
+                        "failed to bind {}:{} (server.bindAddress): {}",
+                        bind_address, desired_port, e
+                    )
                 };
                 intent_core::Error::Internal(error_msg)
             })?;
@@ -2750,6 +2945,7 @@ impl intent_core::ServerControl for DaemonControl {
                 let mut state = runtime.state.lock().await;
                 state.ws_server = Some(server);
                 state.port = Some(port);
+                state.bind_address = Some(bind_address);
             }
 
             Ok(port)
@@ -2765,6 +2961,7 @@ impl intent_core::ServerControl for DaemonControl {
             let server = {
                 let mut state = runtime.state.lock().await;
                 state.port = None;
+                state.bind_address = None;
                 state.ws_server.take()
             };
 
@@ -5027,6 +5224,99 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_choices_list_interfaces_then_all_interfaces_option() {
+        let ifaces = vec![
+            ("lo".to_string(), std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
+        ];
+        let choices = build_bind_choices(&ifaces);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(
+            choices[0].addr,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(
+            choices[0].label.contains("loopback"),
+            "{}",
+            choices[0].label
+        );
+        assert_eq!(
+            choices[1].addr,
+            "192.168.1.5".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(choices[1].label.contains("eth0"), "{}", choices[1].label);
+        // The all-interfaces entry is explicit and carries the exposure warning.
+        assert_eq!(
+            choices[2].addr,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(
+            choices[2].label.contains("ALL interfaces"),
+            "{}",
+            choices[2].label
+        );
+        assert!(
+            choices[2].label.contains("internet"),
+            "{}",
+            choices[2].label
+        );
+    }
+
+    #[test]
+    fn bind_choices_no_interfaces_synthesize_loopback_default() {
+        // Empty enumeration must NOT leave 0.0.0.0 as the first (default)
+        // entry: a loopback choice is synthesized ahead of it.
+        let choices = build_bind_choices(&[]);
+        assert_eq!(choices.len(), 2);
+        assert_eq!(
+            choices[0].addr,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(
+            choices[0].label.contains("loopback"),
+            "{}",
+            choices[0].label
+        );
+        assert_eq!(
+            choices[1].addr,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn bind_choices_non_loopback_only_enumeration_synthesizes_loopback_first() {
+        let ifaces = vec![("eth0".to_string(), std::net::Ipv4Addr::new(10, 0, 0, 7))];
+        let choices = build_bind_choices(&ifaces);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(
+            choices[0].addr,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            choices[1].addr,
+            "10.0.0.7".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            choices[2].addr,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_bind_choice_matrix() {
+        // Empty (plain Enter) → the default entry.
+        assert_eq!(parse_bind_choice("", 3, 0), Some(0));
+        assert_eq!(parse_bind_choice("  \n", 3, 2), Some(2));
+        // 1-based in-range numbers map to 0-based indices.
+        assert_eq!(parse_bind_choice("1", 3, 0), Some(0));
+        assert_eq!(parse_bind_choice("3\n", 3, 0), Some(2));
+        // Out-of-range / non-numeric → None (re-prompt).
+        assert_eq!(parse_bind_choice("0", 3, 0), None);
+        assert_eq!(parse_bind_choice("4", 3, 0), None);
+        assert_eq!(parse_bind_choice("eth0", 3, 0), None);
+    }
 
     #[test]
     fn coerce_boolean_accepts_true_false_only() {
