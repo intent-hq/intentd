@@ -5444,15 +5444,22 @@ impl Services {
                 }]
             });
             // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
-            // the reporting child's linked task-note id so the delivery path
-            // can compute the "tasks now unblocked" section fresh at render
-            // time. Only the triggering fact is stored here.
+            // the reporting child's linked task-note id plus its recorded
+            // flipped completions (consumed here — this report wake is the
+            // completion cycle's one wake, since it disarms the idle-time
+            // delivery) so the delivery path can compute the "tasks now
+            // unblocked" section fresh at render time. Only the triggering
+            // facts are stored here.
+            let mut trigger_tasks: Vec<(String, String)> = Vec::new();
             if let Some(note_id) = &task_note_id {
-                ready_delta::stamp_trigger_tasks(
-                    &mut metadata,
-                    &[(workspace_id.0.clone(), note_id.0.clone())],
-                );
+                trigger_tasks.push((workspace_id.0.clone(), note_id.0.clone()));
             }
+            for pair in self.take_flipped_completion_triggers(&caller).await {
+                if !trigger_tasks.contains(&pair) {
+                    trigger_tasks.push(pair);
+                }
+            }
+            ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             // Machine-readable disarm flag (monorepo#2060 parity, the
             // `hookStillActive` twin): present iff this call flipped a watch;
             // omitted entirely when nothing was disarmed.

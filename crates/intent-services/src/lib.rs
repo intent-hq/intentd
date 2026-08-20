@@ -4467,6 +4467,29 @@ impl Services {
         }
     }
 
+    /// Take (consume) the agent's recorded flipped completions as trigger
+    /// `(workspace_id, task_note_id)` pairs for wake stamping. Consuming at
+    /// the stamp point guarantees a flip is attributed as an
+    /// `unblockedTriggerTasks` trigger at most once — a later completion
+    /// cycle can never re-attribute a stale flip. Best-effort: a store
+    /// failure is logged and the wake proceeds without flip triggers.
+    pub(crate) async fn take_flipped_completion_triggers(
+        &self,
+        agent_id: &AgentId,
+    ) -> Vec<(String, String)> {
+        match self.store.take_agent_flipped_completions(agent_id).await {
+            Ok(pairs) => pairs.into_iter().map(|(ws, n)| (ws.0, n.0)).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "take agent flipped completions failed; wake proceeds without flip triggers"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Wake every parent whose watch matches child_id, then drop that watch:
     /// every ungrouped watch is deliver-once-and-retire. group_id = Some
     /// watches defer to the AS-4 delegation-group fan-in and are left
@@ -4845,6 +4868,14 @@ impl Services {
                 }
             })
             .or(failure_identity.as_deref());
+        // Flipped-completion triggers (consumed on stamp): the child's
+        // recorded flips of OTHER task notes join the trigger set alongside
+        // its own linked task. Taken LAZILY at the first stamp point that
+        // needs them — never up front — so a pass that skips every delivery
+        // (deferral, report_delivered retirement, replay dedup) leaves the
+        // rows for the wake that actually stamps them; one take is shared by
+        // every watch in this pass so multiple watchers stamp the same set.
+        let mut taken_flip_triggers: Option<Vec<(String, String)>> = None;
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4893,23 +4924,36 @@ impl Services {
                         .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
                 });
                 // Record-time trigger capture (intent-hq/monorepo#2044): a
-                // task-linked child's `agent:idle` stamps its linked task
-                // onto the RECORDED event, so the aggregated wake keeps the
-                // trigger even if the child session is deleted before the
-                // group settles (`try_fire_group` reads the stamp first and
-                // only falls back to a live session lookup).
-                let trigger = child_session.as_ref().and_then(|s| {
-                    (event.event_type == AGENT_IDLE)
-                        .then(|| {
-                            s.task_note_id
-                                .clone()
-                                .map(|n| (s.workspace_id.0.clone(), n.0))
-                        })
-                        .flatten()
-                });
+                // settled child's `agent:idle` stamps its linked task plus
+                // its recorded flipped completions (consumed here) onto the
+                // RECORDED event, so the aggregated wake keeps the triggers
+                // even if the child session is deleted before the group
+                // settles (`try_fire_group` reads the stamp first and only
+                // falls back to a live session lookup).
+                let mut triggers: Vec<(String, String)> = Vec::new();
+                if event.event_type == AGENT_IDLE {
+                    if let Some(s) = child_session.as_ref() {
+                        if let Some(n) = &s.task_note_id {
+                            triggers.push((s.workspace_id.0.clone(), n.0.clone()));
+                        }
+                    }
+                    let flips = match &taken_flip_triggers {
+                        Some(f) => f.clone(),
+                        None => {
+                            let f = self.take_flipped_completion_triggers(child_id).await;
+                            taken_flip_triggers = Some(f.clone());
+                            f
+                        }
+                    };
+                    for pair in flips {
+                        if !triggers.contains(&pair) {
+                            triggers.push(pair);
+                        }
+                    }
+                }
                 let report = child_session.and_then(|s| s.completion_report);
                 let group_annotated;
-                let event = if attention.is_some() || trigger.is_some() {
+                let event = if attention.is_some() || !triggers.is_empty() {
                     let mut e = event.clone();
                     if let Some((kind, reason)) = &attention {
                         agent_subscriptions::annotate_attention_request(
@@ -4918,13 +4962,10 @@ impl Services {
                             Some(reason),
                         );
                     }
-                    if let Some((ws, task)) = &trigger {
-                        crate::agent_ops::ready_delta::stamp_event_trigger_task(
-                            &mut e.data,
-                            ws,
-                            task,
-                        );
-                    }
+                    crate::agent_ops::ready_delta::stamp_event_trigger_tasks(
+                        &mut e.data,
+                        &triggers,
+                    );
                     group_annotated = e;
                     &group_annotated
                 } else {
@@ -5186,7 +5227,27 @@ impl Services {
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
-            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
+            // Join the child's recorded flipped completions (consumed at
+            // this first stamp) into the trigger set alongside its own
+            // linked task — a genuine `agent:idle` completion only; failure
+            // and deletion wakes never attribute triggers.
+            let mut stamped_triggers = trigger_tasks.clone();
+            if event.event_type == AGENT_IDLE && !interim_idle {
+                let flips = match &taken_flip_triggers {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = self.take_flipped_completion_triggers(child_id).await;
+                        taken_flip_triggers = Some(f.clone());
+                        f
+                    }
+                };
+                for pair in flips {
+                    if !stamped_triggers.contains(&pair) {
+                        stamped_triggers.push(pair);
+                    }
+                }
+            }
+            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &stamped_triggers);
             if let Err(e) = self
                 .deliver_parent_wake(
                     &parent_ws,
@@ -5302,9 +5363,10 @@ impl Services {
         let mut metadata = build_event_notification_metadata(&event_refs);
         // Enqueue-time trigger record (intent-hq/monorepo#2044), aggregated
         // form: every group member that settled via a genuine `agent:idle`
-        // completion and has a linked task note contributes its task id.
-        // Only the triggering facts are stamped — the unblocked enumeration
-        // is computed fresh at delivery/render time. Prefer the record-time
+        // completion contributes its record-time trigger stamp — its linked
+        // task plus any flipped completions consumed when it settled. Only
+        // the triggering facts are stamped — the unblocked enumeration is
+        // computed fresh at delivery/render time. Prefer the record-time
         // stamp on the raw event (captured when the child settled, so it
         // survives the child's deletion before group settlement); the live
         // session lookup is a fallback for events recorded before the stamp
@@ -5314,8 +5376,9 @@ impl Services {
             if event.event_type != AGENT_IDLE {
                 continue;
             }
-            if let Some(pair) = crate::agent_ops::ready_delta::event_trigger_task(&event.data) {
-                trigger_tasks.push(pair);
+            let stamped = crate::agent_ops::ready_delta::event_trigger_tasks(&event.data);
+            if !stamped.is_empty() {
+                trigger_tasks.extend(stamped);
                 continue;
             }
             let Some(child) = completion_event_child_id(event) else {
@@ -7252,6 +7315,52 @@ fn apply_status_transition(task: &mut TaskMetadata, status: TaskStatus, now: &st
     }
     if status != TaskStatus::Complete && task.completed_at.is_some() {
         task.completed_at = None;
+    }
+}
+
+/// Record/remove the caller agent's flipped-completion pairs when a task-note
+/// status write crosses the `complete` boundary. Recording requires an agent
+/// caller and skips the agent's own linked task note (its completion is
+/// already stamped as a wake trigger separately); a transition back out of
+/// `complete` removes the pair for every recording agent — the flip is stale
+/// regardless of who reverted it. Best-effort: failures are logged, never
+/// surfaced to the status write.
+async fn track_flipped_completion_boundary(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    was_complete: bool,
+    is_complete: bool,
+    now: &str,
+) {
+    if !was_complete && is_complete {
+        let Some(agent_id) = caller_agent_id else {
+            return;
+        };
+        match store.get_agent_session(agent_id).await {
+            // The agent's own linked task note is excluded.
+            Ok(session) if session.task_note_id.as_ref() == Some(note_id) => {}
+            Ok(_) => {
+                if let Err(e) = store
+                    .record_agent_flipped_completion(agent_id, workspace_id, note_id, now)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id.0, note = %note_id.0, error = %e, "record agent flipped completion failed");
+                }
+            }
+            // No session (e.g. deleted) → nothing to record against.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id.0, error = %e, "flipped-completion caller session lookup failed");
+            }
+        }
+    } else if was_complete && !is_complete {
+        if let Err(e) = store
+            .remove_agent_flipped_completions_for_task(workspace_id, note_id)
+            .await
+        {
+            tracing::warn!(note = %note_id.0, error = %e, "remove agent flipped completions failed");
+        }
     }
 }
 
@@ -17807,16 +17916,24 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
+                // A complete-boundary crossing records/removes the caller's
+                // flipped-completion pair (later stamped as a wake trigger).
+                track_flipped_completion_boundary(
+                    &store,
+                    caller_agent_id.as_ref(),
+                    &note.workspace_id,
+                    &note.id,
+                    previous_status == TaskStatus::Complete,
+                    new_status == TaskStatus::Complete,
+                    &now,
+                )
+                .await;
                 // LC-1: agent-attributed changes carry provenance — resolve the
                 // caller's display name best-effort for the agent actor.
-                let agent = match caller_agent_id {
+                let agent = match &caller_agent_id {
                     Some(agent_id) => Some((
                         agent_id.0.clone(),
-                        store
-                            .get_agent_session(&agent_id)
-                            .await
-                            .ok()
-                            .map(|s| s.name),
+                        store.get_agent_session(agent_id).await.ok().map(|s| s.name),
                     )),
                     None => None,
                 };
@@ -18151,6 +18268,19 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now.clone();
             store.update_note(&note).await?;
+            // A markAsTask that crosses the complete boundary records/removes
+            // the caller's flipped-completion pair, exactly like
+            // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
+            track_flipped_completion_boundary(
+                &store,
+                caller_agent_id.as_ref(),
+                &note.workspace_id,
+                &note.id,
+                previous_status == Some(TaskStatus::Complete),
+                new_status == TaskStatus::Complete,
+                &now,
+            )
+            .await;
             let agent = resolve_event_agent(&store, caller_agent_id.as_ref()).await;
             // The note's metadata changed, so subscribers need to refetch it
             // (§6.5) — without this a task-ness flip is invisible until the
