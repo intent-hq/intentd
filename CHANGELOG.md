@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.25] - 2026-08-20
+
+### 🐛 Bug Fixes
+
+- Retry transient provider fetch failures instead of failing the turn terminally ([#1347](https://github.com/intent-hq/intentd/pull/1347))
+
+
 ## [0.7.24] - 2026-08-20
 
 ### 🚀 Features
