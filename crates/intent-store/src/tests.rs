@@ -6285,4 +6285,34 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         .await
         .expect("second take")
         .is_empty());
+
+    // Deleting the recording agent's session cascades its flip rows via the
+    // FK; other agents' rows are untouched.
+    for (agent, note) in [(&agent_a, "task-keep"), (&agent_b, "task-doomed")] {
+        reopened
+            .record_agent_flipped_completion(
+                agent,
+                &ws,
+                &NoteId::from(note),
+                "2026-01-01T00:03:00Z",
+            )
+            .await
+            .expect("record for cascade");
+    }
+    assert!(reopened
+        .delete_agent_session(&ws, &agent_b)
+        .await
+        .expect("delete session"));
+    assert!(reopened
+        .list_agent_flipped_completions(&agent_b)
+        .await
+        .expect("list b after cascade")
+        .is_empty());
+    assert_eq!(
+        reopened
+            .list_agent_flipped_completions(&agent_a)
+            .await
+            .expect("list a after cascade"),
+        vec![(ws.clone(), NoteId::from("task-keep"))]
+    );
 }
