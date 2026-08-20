@@ -2401,17 +2401,19 @@ impl Services {
         // — single-slot). A question-FREE turn end deliberately does NOT
         // clear the marker: pendingness survives the agent's later turns
         // until the user answers or dismisses.
-        if message_persisted && questions_persisted {
+        let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
-                .await;
-        }
+                .await
+        } else {
+            false
+        };
         // A question-bearing tail arms the marker above and so RAISES the
         // workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare. A question-FREE tail no longer moves the
         // derivation at all — pendingness now survives the agent's later
         // turns — so those turn ends skip the workspace-wide probe entirely
         // instead of relying on the dedup cache to stay silent.
-        if message_persisted && questions_persisted {
+        if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
@@ -2972,13 +2974,15 @@ impl Services {
         // Same stored-on-write pending-questions marker as the prompt-turn
         // persist: a question-bearing wake tail arms the hold (question-free
         // tails leave the marker untouched).
-        if message_persisted && questions_persisted {
+        let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
-                .await;
-        }
+                .await
+        } else {
+            false
+        };
         // Same §6.5 step-0 recompute as the prompt-turn persist: only a
         // question-bearing tail moves the question-hold derivation.
-        if message_persisted && questions_persisted {
+        if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).

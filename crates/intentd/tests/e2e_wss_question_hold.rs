@@ -346,6 +346,23 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
+async fn await_pending_marker_event<S>(sub: &mut WebSocketStream<S>, agent_id: &str, expected: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:updated"
+            && event["data"]["agentId"].as_str() == Some(agent_id)
+            && event["data"]["pendingQuestionsMessageId"].as_str() == Some(expected)
+        {
+            return;
+        }
+    }
+    panic!("no pendingQuestionsMessageId={expected:?} event for {agent_id}");
+}
+
 /// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
@@ -517,7 +534,21 @@ where
     )
     .await;
     assert_eq!(sent["success"], true, "ask kickoff ok: {sent}");
-    await_stream_end(sub, asker_id).await;
+    let mut marker_event = None;
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:updated" && event["data"]["agentId"].as_str() == Some(asker_id) {
+            if let Some(marker) = event["data"]["pendingQuestionsMessageId"].as_str() {
+                marker_event = Some(marker.to_string());
+            }
+        }
+        if event["type"] == "agent:stream:end"
+            && event["data"]["agentId"].as_str() == Some(asker_id)
+        {
+            break;
+        }
+    }
 
     let conv = wss_rpc(
         rpc,
@@ -538,10 +569,21 @@ where
         trailing["resource"]["mimeType"], QUESTION_MIME,
         "trailing block is the question resource: {trailing}"
     );
-    last["id"]
+    let message_id = last["id"]
         .as_str()
         .expect("question message id")
-        .to_string()
+        .to_string();
+    assert_eq!(
+        marker_event.as_deref(),
+        Some(message_id.as_str()),
+        "question completion emits the set marker"
+    );
+    let got = wss_rpc(rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], message_id,
+        "AgentLite projects the additive set marker: {got}"
+    );
+    message_id
 }
 
 /// Read a sender-captured results note by title and return its parsed JSON.
@@ -976,6 +1018,12 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     assert!(
         answered.get("heldForQuestions").is_none(),
         "user answer is never held: {answered}"
+    );
+    await_pending_marker_event(&mut sub, &asker_id, "").await;
+    let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], "",
+        "AgentLite preserves the written-empty clear marker: {got}"
     );
 
     // The answer lands, the marker clears, and the queue fully drains.

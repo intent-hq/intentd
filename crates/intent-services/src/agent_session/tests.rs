@@ -3,6 +3,7 @@
 //! `stream:end`, persists `acpSessionId`, and gates resume on the capability.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_acp::session::{ContentBlock, InitializeResponse};
@@ -2149,6 +2150,144 @@ fn question_blocks() -> Value {
             "text": "{\"questions\":[]}"
         }
     }])
+}
+
+fn marker_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["agent:updated".to_string()],
+        ..Default::default()
+    })
+}
+
+async fn assert_only_marker_event(sub: &mut crate::events::Subscription, expected: &str) {
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("marker event delivered")
+        .expect("subscription open");
+    let markers: Vec<&str> = batch
+        .iter()
+        .filter_map(|event| event.data["pendingQuestionsMessageId"].as_str())
+        .collect();
+    assert_eq!(markers, vec![expected]);
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "stale marker mutation must not emit a later event"
+    );
+}
+
+/// A tagged answer can observe question A and then pause before its clear.
+/// Question B commits in that window; the answer's exact-value CAS must lose,
+/// leave B pending, and emit no stale clear event.
+#[tokio::test]
+async fn old_answer_cannot_clear_newer_pending_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let asked = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append question A");
+    let asked_id = asked["message"]["id"].as_str().unwrap().to_string();
+
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("clear"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let answering = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let asked_id = asked_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(
+                    agent_id,
+                    "user".to_string(),
+                    json!([{ "type": "text", "text": "late answer" }]),
+                    Some(json!({
+                        "type": "question_answers",
+                        "answeredQuestionsMessageId": asked_id,
+                    })),
+                )
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("old answer reached clear window");
+
+    let newer = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append question B");
+    let newer_id = newer["message"]["id"].as_str().unwrap().to_string();
+    park.release.notify_waiters();
+    answering
+        .await
+        .unwrap()
+        .expect("old answer append succeeds");
+
+    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(newer_id.as_str())
+    );
+    assert_only_marker_event(&mut sub, &newer_id).await;
+}
+
+/// Question A persists first, then pauses before its marker write. Question B
+/// persists and commits its marker. When A resumes, transcript `seq` ordering
+/// must reject it and suppress its stale event.
+#[tokio::test]
+async fn older_question_completion_cannot_overwrite_newer_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("set"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let older = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(agent_id, "assistant".to_string(), question_blocks(), None)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("older question reached marker window");
+
+    let newer = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append newer question");
+    let newer_id = newer["message"]["id"].as_str().unwrap().to_string();
+    park.release.notify_waiters();
+    older
+        .await
+        .unwrap()
+        .expect("older question append succeeds");
+
+    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(newer_id.as_str())
+    );
+    assert_only_marker_event(&mut sub, &newer_id).await;
 }
 
 /// The `workspace:displayStatus-changed`-only subscription the monorepo#1266
