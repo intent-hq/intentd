@@ -21,7 +21,7 @@ pub(crate) const PRELUDE: &str = r#"
 pub const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+json";
 
 /// Valid proposal kinds (parity with TS `PROPOSAL_KINDS`).
-pub const PROPOSAL_KINDS: &[&str] = &[
+pub(crate) const PROPOSAL_KINDS: &[&str] = &[
     "workspace-create",
     "settings-change",
     "specialist-edit",

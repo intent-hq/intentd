@@ -42,7 +42,7 @@ const GH_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Terminal outcome of one sync attempt (log/test surface only — never wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhSyncOutcome {
+pub(crate) enum GhSyncOutcome {
     /// `gh auth login --with-token` succeeded.
     Synced,
     /// No stored token to sync (nothing in `sourceControl.github.token`).
@@ -58,7 +58,7 @@ pub enum GhSyncOutcome {
 /// Terminal outcome of one revoke-side logout attempt (log/test surface only
 /// — never wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhLogoutOutcome {
+pub(crate) enum GhLogoutOutcome {
     /// `gh auth logout` succeeded — gh held exactly the revoked token.
     LoggedOut,
     /// No revoked token was captured (nothing was stored) — nothing to match.

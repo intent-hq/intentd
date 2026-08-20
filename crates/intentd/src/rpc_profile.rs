@@ -15,7 +15,7 @@
 //!
 //! Duration budgets are tiered: methods that fan out to a network-bound
 //! upstream ([`is_network_tier_method`] — `github.*`, `linear.*`, `sentry.*`,
-//! `pr.refresh`, `pr.state`) get a higher default budget
+//! `pr.refresh`, `pr.state`, `workspace.create`) get a higher default budget
 //! ([`DEFAULT_NETWORK_DURATION_WARN_MS`]) so normal upstream latency doesn't
 //! drown out the local-regression signal; every other method keeps the
 //! default budget ([`DEFAULT_DURATION_WARN_MS`]; catches fs walks / git scans
@@ -76,8 +76,11 @@ pub const NETWORK_DURATION_THRESHOLD_ENV: &str = "INTENTD_RPC_NETWORK_DURATION_W
 /// [`is_network_tier_method`]).
 const NETWORK_TIER_PREFIXES: &[&str] = &["github.", "linear.", "sentry."];
 /// Exact method names (outside the prefix list) that identify a network-bound
-/// RPC (see [`is_network_tier_method`]).
-const NETWORK_TIER_METHODS: &[&str] = &["pr.refresh", "pr.state"];
+/// RPC (see [`is_network_tier_method`]). `workspace.create` belongs here
+/// because its dominant cost is git provisioning — clone/fetch from the
+/// remote plus worktree checkout — so its normal duration tracks upstream
+/// and disk latency, not local SQL work (intent-hq/monorepo#2994).
+const NETWORK_TIER_METHODS: &[&str] = &["pr.refresh", "pr.state", "workspace.create"];
 
 /// Whether `method` fans out to a network-bound upstream and should use the
 /// network-tier duration budget ([`DEFAULT_NETWORK_DURATION_WARN_MS`] /
@@ -578,6 +581,7 @@ mod tests {
         assert!(is_network_tier_method("sentry.listIssues"));
         assert!(is_network_tier_method("pr.refresh"));
         assert!(is_network_tier_method("pr.state"));
+        assert!(is_network_tier_method("workspace.create"));
         assert!(!is_network_tier_method("workspace.list"));
         assert!(!is_network_tier_method("pr.list"));
         assert!(!is_network_tier_method("github"));

@@ -58,12 +58,12 @@ const NO_AUTH_METHOD_ID: &str = "none";
 /// when the provider actually advertises that mode; the backend then locally
 /// auto-approves anything the provider still surfaces). Only requested when it
 /// appears in the session's `availableModes` — see [`select_preferred_mode`].
-pub const BYPASS_PERMISSIONS_MODE: &str = "bypassPermissions";
+pub(crate) const BYPASS_PERMISSIONS_MODE: &str = "bypassPermissions";
 /// Logical key looked up in [`ProviderConfig::mode_map`] to obtain a
 /// provider-specific override for the bypass-permissions preference (used by
 /// agents that name their permissive mode something other than
 /// `bypassPermissions`).
-pub const BYPASS_LOGICAL_KEY: &str = "bypass";
+pub(crate) const BYPASS_LOGICAL_KEY: &str = "bypass";
 
 /// Outcome of a completed handshake.
 #[derive(Debug)]
@@ -138,7 +138,11 @@ pub async fn authenticate(conn: &Connection, provider: &ProviderConfig) -> AcpRe
 
 /// Set the agent's mode for a session (§6.4.3). Session-scoped; call after a
 /// session exists (M3.4).
-pub async fn set_session_mode(conn: &Connection, session_id: &str, mode_id: &str) -> AcpResult<()> {
+pub(crate) async fn set_session_mode(
+    conn: &Connection,
+    session_id: &str,
+    mode_id: &str,
+) -> AcpResult<()> {
     let request = SetSessionModeRequest::new(session_id.to_string(), mode_id.to_string());
     let params = serde_json::to_value(&request)?;
     conn.request("session/set_mode", params).await?;

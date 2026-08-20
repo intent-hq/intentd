@@ -227,7 +227,7 @@ pub const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAX_INBOUND_MESSAGE_BYTES;
 /// so the transport emits a throttled `warn` log — log-only, no wire
 /// behavior change. Known bulk-transfer methods are exempt (see
 /// [`is_bulk_transfer_method`]).
-pub const LARGE_MESSAGE_WARN_BYTES: usize = 1024 * 1024;
+pub(crate) const LARGE_MESSAGE_WARN_BYTES: usize = 1024 * 1024;
 
 /// Minimum interval between two large-frame warns for the same method, so a
 /// burst of oversized frames (e.g. a chunked upload missing an exemption)

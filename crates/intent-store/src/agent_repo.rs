@@ -44,7 +44,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
 /// baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
 /// metadata of usage-bearing messages — never message bodies.
-pub type AgentUsageRow = (
+pub(crate) type AgentUsageRow = (
     String,
     Option<String>,
     Option<TokenUsageTotals>,
@@ -2197,7 +2197,7 @@ impl Store {
     /// [`Store::activate_incremental_vacuum`] (`agent_message` has a TEXT
     /// primary key, so `VACUUM` may reassign its rowids and silently desync
     /// the rowid-keyed index). Runs in one write transaction.
-    pub async fn rebuild_agent_message_fts(&self) -> Result<()> {
+    pub(crate) async fn rebuild_agent_message_fts(&self) -> Result<()> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
             let mut tx = pool

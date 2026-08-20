@@ -602,59 +602,7 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
     batch
 }
 
-/// Build the `HostFn` bridging JS `host({ method, args })` calls back into
-/// the shared `WorkspaceApi`. Every namespace lives in `super::bindings`;
-/// unknown methods surface as a JS-visible error frame. `caller_agent_id`
-/// is forwarded to bindings that attribute their calls back to the spawning
-/// agent (e.g. `workspace.setAgentName`, `git.commit`,
-/// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
-/// `turn_attachments` is forwarded to bindings that register attachments
-/// mid-dispatch (`ws.app.question.ask`).
-///
-/// `pub` (re-exported as `intent_acp::make_workspace_host`) so callers that
-/// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
-/// scheduler in `intent-services` — reuse the exact same host environment.
-/// All `[agentFeatures]` toggles are treated as on; feature-gated callers use
-/// [`make_workspace_host_for`].
-pub fn make_workspace_host(
-    api: Arc<dyn WorkspaceApi>,
-    workspace_id: WorkspaceId,
-    caller_agent_id: Option<AgentId>,
-    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
-) -> HostFn {
-    make_workspace_host_for(
-        api,
-        workspace_id,
-        caller_agent_id,
-        turn_attachments,
-        AgentFeaturesSettings::default(),
-    )
-}
-
-/// Feature-aware variant of [`make_workspace_host`]: frames whose method is
-/// gated by a disabled `[agentFeatures]` toggle are denied with an explicit
-/// "disabled in settings" error before reaching the bindings (defense in
-/// depth behind the description/prelude pruning — a raw `host({...})` call
-/// cannot bypass the gate). Treats the caller as top-level; sub-agent
-/// bridges use [`make_workspace_host_for_bridge`].
-pub fn make_workspace_host_for(
-    api: Arc<dyn WorkspaceApi>,
-    workspace_id: WorkspaceId,
-    caller_agent_id: Option<AgentId>,
-    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
-    agent_features: AgentFeaturesSettings,
-) -> HostFn {
-    make_workspace_host_for_bridge(
-        api,
-        workspace_id,
-        caller_agent_id,
-        turn_attachments,
-        agent_features,
-        false,
-    )
-}
-
-/// [`make_workspace_host_for`] plus the sub-agent flag: `app.question.*`
+/// `HostFn` factory plus the sub-agent flag: `app.question.*`
 /// frames from a sub-agent caller are denied with the explicit
 /// top-level-only redirect error before the feature-gate check, so a raw
 /// `host({...})` call cannot bypass the description/prelude pruning and the

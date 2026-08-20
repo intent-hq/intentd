@@ -619,6 +619,324 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     assert!(seeded, "lite list must seed the displayStatus baseline");
 }
 
+/// Both list emit paths (`workspace.list` and the lite path behind
+/// `workspace.subscribe` seq-0) merge externally known PRs into each row's
+/// `pullRequests`: git-root PRs (`workspace_git_root.pull_requests`) and
+/// monitor-derived PRs (active + completed; cancelled excluded), deduped by
+/// URL with workspace > git-root > monitor priority. Purely an emit-path
+/// merge — nothing is persisted, and a row with no external sources keeps
+/// its stored value untouched.
+#[tokio::test]
+async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
+    use intent_core::{
+        PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
+        WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let pr_info = |number: u64, url: &str, title: &str| PullRequestInfo {
+        id: number.to_string(),
+        number,
+        url: url.to_string(),
+        title: title.to_string(),
+        status: PullRequestStatus::Open,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+    };
+    let git_root = |ws: &WorkspaceId, path: &str, prs: Vec<PullRequestInfo>| {
+        let ts = now_iso();
+        WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("o".into()),
+            repo_name: Some("r".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(prs),
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    };
+    let monitor = |ws: &WorkspaceId,
+                   owner: &str,
+                   name: &str,
+                   number: i64,
+                   state: PrMonitorState,
+                   snapshot: Option<String>| {
+        PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: ws.clone(),
+            agent_id: AgentId::from("agent-mon"),
+            repo_owner: owner.to_string(),
+            repo_name: name.to_string(),
+            pr_number: number,
+            state,
+            last_snapshot: snapshot,
+            baseline_snapshot: None,
+            pending_changes: vec![],
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "2026-01-02T00:00:00Z".into(),
+            updated_at: "2026-01-02T00:00:01Z".into(),
+        }
+    };
+
+    // ws1: NULL workspace PRs; one git-root PR, one snapshot-backed active
+    // monitor, one snapshotless completed monitor, one cancelled monitor
+    // (excluded), and a monitor duplicating the git-root PR's URL (deduped).
+    let ws1 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws1)).await.expect("ws1");
+    // Monitor rows FK onto agent_session; one session covers every monitor.
+    let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from("agent-mon"),
+        workspace_id: ws1.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Monitor Owner".into(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+    store.insert_agent_session(&session).await.expect("session");
+
+    store
+        .upsert_workspace_git_root(&git_root(
+            &ws1,
+            "/tmp/root-a",
+            vec![pr_info(1, "https://github.com/o/r/pull/1", "Root PR")],
+        ))
+        .await
+        .expect("ws1 root");
+    let snapshot_b = serde_json::json!({
+        "title": "Monitored PR",
+        "url": "https://github.com/o/r/pull/2",
+        "headSha": "abc123",
+        "conversationCount": 0,
+        "reviewCommentCount": 0,
+        "requirements": {
+            "state": "open",
+            "isDraft": false,
+            "hasConflicts": false,
+            "isBehind": false,
+            "mergeable": true,
+            "checks": {
+                "total": 0, "passed": 0, "failed": 0, "pending": 0,
+                "items": [], "failingRequired": [], "pendingRequired": [],
+                "requiredKnown": true
+            },
+            "approvals": { "decision": "none", "have": 0, "changesRequested": 0 },
+            "threads": { "unresolved": 0 },
+            "rulesKnown": false
+        }
+    })
+    .to_string();
+    for m in [
+        monitor(&ws1, "o", "r", 2, PrMonitorState::Active, Some(snapshot_b)),
+        monitor(&ws1, "o2", "r2", 7, PrMonitorState::Completed, None),
+        monitor(&ws1, "o", "r", 9, PrMonitorState::Cancelled, None),
+        // Snapshotless monitor on PR 1: synthesized URL duplicates the
+        // git-root entry, so the richer git-root entry wins.
+        monitor(&ws1, "o", "r", 1, PrMonitorState::Active, None),
+    ] {
+        store.insert_pr_monitor(&m).await.expect("monitor");
+    }
+
+    // ws2: the workspace's own entry wins over a same-URL git-root entry.
+    let ws2 = WorkspaceId::new();
+    let mut w2 = workspace(&ws2);
+    w2.pull_requests = Some(vec![pr_info(
+        5,
+        "https://github.com/o/r/pull/5",
+        "Workspace copy",
+    )]);
+    store.insert_workspace(&w2).await.expect("ws2");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &ws2,
+            "/tmp/root-b",
+            vec![
+                pr_info(5, "https://github.com/o/r/pull/5", "Root copy"),
+                pr_info(6, "https://github.com/o/r/pull/6", "Root-only PR"),
+            ],
+        ))
+        .await
+        .expect("ws2 root");
+
+    // ws3: no external sources — the stored (NULL) value stays untouched.
+    let ws3 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws3)).await.expect("ws3");
+
+    // ws4: a git root with an EMPTY pull_requests list contributes nothing —
+    // the stored NULL must not become `[]` on the wire.
+    let ws4 = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws4)).await.expect("ws4");
+    store
+        .upsert_workspace_git_root(&git_root(&ws4, "/tmp/root-c", vec![]))
+        .await
+        .expect("ws4 root");
+
+    // ws5: archived, with a git-root PR and a monitor — merged only when the
+    // list call includes archived workspaces.
+    let ws5 = WorkspaceId::new();
+    let mut w5 = workspace(&ws5);
+    w5.archived = true;
+    w5.status = intent_core::WorkspaceStatus::Archived;
+    store.insert_workspace(&w5).await.expect("ws5");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &ws5,
+            "/tmp/root-d",
+            vec![pr_info(
+                8,
+                "https://github.com/o/r/pull/8",
+                "Archived root PR",
+            )],
+        ))
+        .await
+        .expect("ws5 root");
+
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+    let assert_merged = |list: &[Workspace], path: &str| {
+        let r1 = list.iter().find(|w| w.id == ws1).expect("ws1 row");
+        let prs = r1.pull_requests.as_ref().expect("ws1 pullRequests");
+        let urls: Vec<_> = prs.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://github.com/o/r/pull/1",
+                "https://github.com/o/r/pull/2",
+                "https://github.com/o2/r2/pull/7",
+            ],
+            "{path}: git-root first, then monitor-derived; cancelled + dup excluded"
+        );
+        // Git-root entry beat the snapshotless duplicate monitor on PR 1.
+        assert_eq!(prs[0].title, "Root PR", "{path}");
+        // Snapshot-backed monitor entry: fields synthesized off the snapshot.
+        assert_eq!(prs[1].title, "Monitored PR", "{path}");
+        assert_eq!(prs[1].number, 2, "{path}");
+        assert_eq!(
+            prs[1].status,
+            intent_core::PullRequestStatus::Open,
+            "{path}"
+        );
+        assert_eq!(prs[1].head_sha.as_deref(), Some("abc123"), "{path}");
+        assert_eq!(prs[1].is_draft, Some(false), "{path}");
+        // Snapshotless completed monitor: URL/title synthesized from the
+        // repo identity; terminal without a verdict reads closed, not merged.
+        assert_eq!(prs[2].title, "o2/r2#7", "{path}");
+        assert_eq!(
+            prs[2].status,
+            intent_core::PullRequestStatus::Closed,
+            "{path}"
+        );
+
+        let r2 = list.iter().find(|w| w.id == ws2).expect("ws2 row");
+        let prs2 = r2.pull_requests.as_ref().expect("ws2 pullRequests");
+        assert_eq!(prs2.len(), 2, "{path}: same-URL root entry deduped");
+        assert_eq!(prs2[0].title, "Workspace copy", "{path}: workspace wins");
+        assert_eq!(prs2[1].title, "Root-only PR", "{path}");
+        // The merged list is a plain array on the wire.
+        let v = serde_json::to_value(r2).unwrap();
+        assert!(v["pullRequests"].is_array(), "{path}");
+
+        let r3 = list.iter().find(|w| w.id == ws3).expect("ws3 row");
+        assert!(
+            r3.pull_requests.is_none(),
+            "{path}: no external sources leaves the stored value untouched"
+        );
+
+        // Empty git-root list: stored NULL stays omitted on the wire.
+        let r4 = list.iter().find(|w| w.id == ws4).expect("ws4 row");
+        assert!(
+            r4.pull_requests.is_none(),
+            "{path}: empty git-root list must not materialize []"
+        );
+        let v4 = serde_json::to_value(r4).unwrap();
+        assert!(
+            v4.get("pullRequests").is_none(),
+            "{path}: pullRequests omitted, not []"
+        );
+    };
+
+    let full = svc.list_workspaces(false).await.expect("full list");
+    assert_merged(&full, "workspace.list");
+    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    assert_merged(&lite, "lite list");
+
+    // Archived-inclusive list: the archived row's git-root PR merges in.
+    let all = svc.list_workspaces_lite(true).await.expect("archived list");
+    let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
+    let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
+    assert_eq!(prs5.len(), 1);
+    assert_eq!(prs5[0].title, "Archived root PR");
+
+    // Archived-excluding bulk reads filter archived-workspace rows in SQL.
+    let roots = store
+        .list_workspace_git_roots_with_prs(false)
+        .await
+        .expect("roots");
+    assert!(
+        roots.iter().all(|r| r.workspace_id != ws5),
+        "archived workspace's roots excluded from the non-archived read"
+    );
+
+    // Emit-path only: nothing was persisted back to workspace.pull_requests.
+    let stored = store.get_workspace(&ws1).await.expect("ws1 stored");
+    assert!(stored.pull_requests.is_none(), "merge must not persist");
+}
+
 /// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
 /// (self filtered out, other-repo filtered out) with the PascalCase status.
 #[tokio::test]
@@ -1027,6 +1345,181 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
         .expect("meta2");
     assert_eq!(applied.tags, Some(vec!["a".to_string()]));
     assert_eq!(svc.get_note(ws, spec).await.unwrap().title, "Title");
+}
+
+/// Agent-flipped completion recording (verifier-flip wake triggers): a status
+/// write crossing INTO `complete` with an agent caller records the pair on
+/// that agent's session; the agent's own linked task and user-initiated
+/// (no-caller) writes record nothing; a transition back out of `complete`
+/// removes the pair regardless of caller. `task.markAsTask` boundary
+/// crossings behave the same.
+#[tokio::test]
+async fn flipped_completion_recorded_on_agent_complete_boundary() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    for id in ["own", "other", "user-flip"] {
+        let mut tn = note(&ws, id, "body");
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            ..Default::default()
+        });
+        store.insert_note(&tn).await.expect("insert task note");
+    }
+    let agent = AgentId::from("agent-flip");
+    let ts = now_iso();
+    store
+        .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: agent.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Flipper".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: Some(NoteId::from("own")),
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+        })
+        .await
+        .expect("session");
+    let svc = Services::new(store.clone());
+
+    // Crossing into `complete` on ANOTHER task records the pair.
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("other"),
+        "complete".into(),
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .expect("flip other");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), NoteId::from("other"))]
+    );
+
+    // The agent's own linked task note is excluded (stamped separately), and
+    // a user-initiated (no-caller) flip records nothing.
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("own"),
+        "complete".into(),
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .expect("flip own");
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("user-flip"),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("flip user");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), NoteId::from("other"))]
+    );
+
+    // A transition back out of `complete` removes the pair even without a
+    // caller — the flip is stale regardless of who reverted it.
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("other"),
+        "in_progress".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("revert other");
+    assert!(store
+        .list_agent_flipped_completions(&agent)
+        .await
+        .expect("list")
+        .is_empty());
+
+    // `task.markAsTask` boundary crossings record and remove the same way.
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("other"),
+        "complete".into(),
+        vec![],
+        None,
+        None,
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .expect("mark complete");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), NoteId::from("other"))]
+    );
+    svc.mark_as_task(
+        ws,
+        NoteId::from("other"),
+        "in_progress".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("mark in_progress");
+    assert!(store
+        .list_agent_flipped_completions(&agent)
+        .await
+        .expect("list")
+        .is_empty());
 }
 
 #[tokio::test]

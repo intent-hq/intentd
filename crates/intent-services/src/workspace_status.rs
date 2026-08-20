@@ -195,14 +195,17 @@ impl Services {
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
         // `activity: "agent_running"` with `displayStatus: "idle"`. Wait
-        // signals (hooks/monitors/subscriptions) no longer fold into the
-        // promotion — they surface as the orthogonal `waiting` flag above.
+        // signals (hooks/subscriptions) no longer fold into the promotion —
+        // they surface as the orthogonal `waiting` flag above — but
+        // agent-monitored PRs DO feed the PR rungs: an active monitor on an
+        // open PR (including cross-repo) reads as an open-PR signal.
         let display_status = compute_display_status(
             self.workspace_attention_signals(&ws.id, ws.attention).await,
             ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
+            self.workspace_monitor_pr_signals(&ws.id).await,
             ws.task_stats.as_ref(),
         );
         self.last_display_statuses
@@ -260,16 +263,19 @@ impl Services {
         let signals = self
             .workspace_attention_signals(workspace_id, ws.attention)
             .await;
-        // Wait signals (hooks/monitors/subscriptions) do not fold into the
-        // promotion — they surface as the orthogonal `waiting` flag on the
-        // read paths ([`Services::workspace_is_waiting`]); only a live agent
-        // turn promotes here.
+        // Wait signals (hooks/subscriptions) do not fold into the promotion
+        // — they surface as the orthogonal `waiting` flag on the read paths
+        // ([`Services::workspace_is_waiting`]); only a live agent turn
+        // promotes here. Agent-monitored PRs feed the PR rungs, so the
+        // monitor lifecycle choke points (register/complete/cancel) route
+        // through this recompute.
         let status = compute_display_status(
             signals,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
+            self.workspace_monitor_pr_signals(workspace_id).await,
             Some(&task_stats),
         );
         let Some(transitioned) =
@@ -445,6 +451,24 @@ pub(crate) struct AttentionSignals {
     pub(crate) needs_attention: bool,
 }
 
+/// Open/merged PR signals derived from the workspace's agent-owned PR
+/// monitors (persisted `pr_monitor` rows; probed by
+/// [`Services::workspace_monitor_pr_signals`]), so a workspace watching a PR
+/// via `ws.pr.monitor` — including a cross-repo PR that never appears in the
+/// workspace's own PR linkage — participates in the PR rungs of
+/// [`compute_display_status`]. Derived purely from persisted
+/// `state`/`last_snapshot` columns: no forge calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MonitorPrSignals {
+    /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR that
+    /// the forge reports mergeable — the `pr_ready` mapping.
+    pub(crate) ready: bool,
+    /// An ACTIVE monitor's last snapshot shows an open or draft PR.
+    pub(crate) open: bool,
+    /// A COMPLETED monitor's final snapshot shows the PR merged.
+    pub(crate) merged: bool,
+}
+
 /// Derive a workspace's `displayStatus` (canonical precedence, spec
 /// "Decision: BE-owned displayStatus"), folding in live agent activity
 /// (previously a client-side overlay) and the attention axes probed by
@@ -458,21 +482,26 @@ pub(crate) struct AttentionSignals {
 ///    `review_required` workspace attention flag — outranks a running agent.
 /// 3. `agent_running` → `in_progress`: a live agent always reads as active
 ///    work, whatever the PR/task rollup says. Wait signals (active hooks,
-///    active PR monitors, waiting agent subscriptions) do NOT fold in — an
-///    idle workspace watching an external condition keeps its base rollup
-///    and surfaces the orthogonal `Workspace.waiting` flag instead
+///    waiting agent subscriptions) do NOT fold in — an idle workspace
+///    watching an external condition keeps its base rollup and surfaces the
+///    orthogonal `Workspace.waiting` flag instead
 ///    ([`Services::workspace_is_waiting`]).
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
-///    When neither carries an open/draft entry but the workspace `prStatus`
-///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
-///    and yields `pr_open` (never `pr_ready`: the column carries no
-///    mergeable info).
+///    An ACTIVE PR monitor whose last snapshot shows an open/draft PR
+///    (`monitor_prs`) is the same rung: `pr_ready` when the snapshot says
+///    mergeable and not draft, else `pr_open` — so a workspace watching an
+///    open PR (including cross-repo) never falls through to
+///    `complete`/`idle`. When none of those carries an open/draft entry but
+///    the workspace `prStatus` column is `Open`/`Draft`, that column is the
+///    fallback PR-stage signal and yields `pr_open` (never `pr_ready`: the
+///    column carries no mergeable info).
 /// 5. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
 /// 6. Latest PR (linked, else most recently updated entry) merged — or
-///    `prStatus == Merged` — → `pr_merged`.
+///    `prStatus == Merged`, or a COMPLETED monitor whose final snapshot
+///    shows the PR merged — → `pr_merged`.
 /// 7. All tasks complete → `complete`; else `not_started`.
 /// 8. Without a running agent, a task-stage rollup (`in_progress` /
 ///    `not_started` from steps 5/7) demotes to `idle`; the PR stages and
@@ -480,14 +509,15 @@ pub(crate) struct AttentionSignals {
 ///
 /// The dismissible `unread` workspace attention flag (§9.9) never feeds the
 /// derivation. A merged PR in history never masks an open PR (step 4 scans
-/// `pullRequests` for open/draft entries) or open tasks (step 5 precedes
-/// the merged check).
+/// `pullRequests` and the monitor signals for open/draft entries) or open
+/// tasks (step 5 precedes the merged check).
 fn compute_display_status(
     signals: AttentionSignals,
     agent_running: bool,
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
     pr_status: Option<PullRequestStatus>,
+    monitor_prs: MonitorPrSignals,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
     if signals.failed {
@@ -502,7 +532,8 @@ fn compute_display_status(
     if agent_running {
         return WorkspaceDisplayStatus::InProgress;
     }
-    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
+    match compute_base_display_status(active_pr, pull_requests, pr_status, monitor_prs, task_stats)
+    {
         WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
             WorkspaceDisplayStatus::Idle
         }
@@ -517,6 +548,7 @@ fn compute_base_display_status(
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
     pr_status: Option<PullRequestStatus>,
+    monitor_prs: MonitorPrSignals,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
     let is_open = |pr: &&PullRequestInfo| {
@@ -538,6 +570,17 @@ fn compute_base_display_status(
         } else {
             WorkspaceDisplayStatus::PrOpen
         };
+    }
+    // Agent-monitored PRs are the same rung as the linked open PR above: an
+    // ACTIVE monitor on an open PR reads `pr_ready`/`pr_open` even when the
+    // PR belongs to another repo and never enters the workspace linkage. A
+    // linked open PR wins first only because it carries richer data; the
+    // mapping is identical.
+    if monitor_prs.ready {
+        return WorkspaceDisplayStatus::PrReady;
+    }
+    if monitor_prs.open {
+        return WorkspaceDisplayStatus::PrOpen;
     }
     if matches!(
         pr_status,
@@ -562,6 +605,7 @@ fn compute_base_display_status(
     });
     if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged)
         || pr_status == Some(PullRequestStatus::Merged)
+        || monitor_prs.merged
     {
         return WorkspaceDisplayStatus::PrMerged;
     }
@@ -618,14 +662,37 @@ fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent 
 
 /// Unit tests for the pure `compute_display_status` derivation (canonical
 /// precedence): failed → blocked → needs_attention → running agent →
-/// active/latest open PR → open tasks → merged PR → complete/not_started.
+/// active/latest open PR (linked or monitor-signalled) → open tasks →
+/// merged PR → complete/not_started.
 #[cfg(test)]
 mod display_status {
     use intent_core::{
         PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceTaskStats,
     };
 
-    use super::{compute_display_status, AttentionSignals};
+    use super::{AttentionSignals, MonitorPrSignals};
+
+    /// The pre-monitor-signals shape most tests use: no monitor signals.
+    /// Monitor-specific tests call [`super::compute_display_status`]
+    /// directly.
+    fn compute_display_status(
+        signals: AttentionSignals,
+        agent_running: bool,
+        active_pr: Option<&PullRequestInfo>,
+        pull_requests: &[PullRequestInfo],
+        pr_status: Option<PullRequestStatus>,
+        task_stats: Option<&WorkspaceTaskStats>,
+    ) -> WorkspaceDisplayStatus {
+        super::compute_display_status(
+            signals,
+            agent_running,
+            active_pr,
+            pull_requests,
+            pr_status,
+            MonitorPrSignals::default(),
+            task_stats,
+        )
+    }
 
     /// Legacy-shaped signal bundle: only the `needs_attention` axis set.
     fn sig(needs_attention: bool) -> AttentionSignals {
@@ -1171,6 +1238,141 @@ mod display_status {
                 None
             ),
             WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    /// Monitor-signal shorthand for the tests below.
+    fn monitors(open: bool, ready: bool, merged: bool) -> MonitorPrSignals {
+        MonitorPrSignals {
+            open,
+            ready,
+            merged,
+        }
+    }
+
+    /// Step 4 via monitors: an ACTIVE monitor on an open PR yields
+    /// `pr_open` (or `pr_ready` when the snapshot says mergeable, not
+    /// draft) even when the workspace has no PR linkage at all and every
+    /// task is complete — the cross-repo watch case.
+    #[test]
+    fn active_monitor_open_pr_is_pr_open_or_pr_ready() {
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                monitors(true, false, false),
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                monitors(true, true, false),
+                None
+            ),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    /// Step 6 via monitors: a COMPLETED monitor whose final snapshot shows
+    /// the PR merged reads `pr_merged` once all tasks are done — but open
+    /// tasks still mask it (step 5 precedes the merged check), and an
+    /// open-PR monitor signal outranks it on the same inputs.
+    #[test]
+    fn completed_merged_monitor_is_pr_merged_after_tasks_complete() {
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                monitors(false, false, true),
+                Some(&stats(2, 2, 0))
+            ),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                monitors(false, false, true),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::Idle
+        );
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                None,
+                monitors(true, false, true),
+                None
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    /// Precedence unchanged above the PR rungs: attention axes and a
+    /// running agent still outrank every monitor signal.
+    #[test]
+    fn attention_and_running_agent_outrank_monitor_signals() {
+        assert_eq!(
+            super::compute_display_status(
+                sig(true),
+                false,
+                None,
+                &[],
+                None,
+                monitors(true, true, false),
+                None
+            ),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                true,
+                None,
+                &[],
+                None,
+                monitors(true, true, false),
+                None
+            ),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    /// A linked open PR and an open-monitor signal are the same rung: the
+    /// linked PR's richer mapping wins first, so a non-mergeable linked PR
+    /// reads `pr_open` even when a monitor signals ready.
+    #[test]
+    fn linked_open_pr_wins_the_shared_rung() {
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                Some(&open),
+                &[],
+                None,
+                monitors(true, true, false),
+                None
+            ),
+            WorkspaceDisplayStatus::PrOpen
         );
     }
 }

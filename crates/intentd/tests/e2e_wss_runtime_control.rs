@@ -912,3 +912,140 @@ async fn runtime_toggled_wss_serves_system_status() {
         );
     }
 }
+
+/// Runtime `server.bindAddress` hook (monorepo#2900): changing the bind
+/// address while the WSS listener is running restarts it on the new address.
+/// Observable end to end: the listener stays connectable on the fixed port
+/// across both restarts, and `pairing.getInfo` advertises the bind-aware
+/// hosts (exactly the specific address for a loopback bind; the non-loopback
+/// enumeration for 0.0.0.0 — which never contains 127.0.0.1).
+#[tokio::test]
+async fn runtime_bind_address_change_restarts_listener() {
+    let data_dir = temp_data_dir();
+    // Fixed seeded port (no INTENTD_TCP_PORT=0 seam) so the restarted
+    // listener rebinds the same port and only the address changes.
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Default loopback bind: pairing advertises exactly 127.0.0.1.
+    let info = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    assert_eq!(
+        info["result"]["hosts"],
+        json!(["127.0.0.1"]),
+        "loopback bind advertises exactly 127.0.0.1: {info}"
+    );
+
+    // Widen the bind while the listener is running: the hook restarts it on
+    // 0.0.0.0 (same port). settings.update awaits the hook, so the restart is
+    // complete when the RPC returns.
+    let widen = uds_rpc(
+        &socket,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.bindAddress", "value": "0.0.0.0" }] }),
+    )
+    .await;
+    assert!(
+        widen.get("error").is_none(),
+        "settings.update bindAddress → 0.0.0.0 should succeed: {widen}"
+    );
+
+    // Listener is back up on the same port (0.0.0.0 includes loopback).
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let sub = wss_rpc(
+        &mut ws,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub.get("error").is_none(),
+        "events.subscribe after bindAddress widen should work: {sub}"
+    );
+
+    // Bind-aware advertisement followed the restart: an unspecified bind
+    // enumerates non-loopback local IPs, never 127.0.0.1.
+    let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
+    let hosts = info["result"]["hosts"].as_array().expect("hosts array");
+    assert!(
+        !hosts.iter().any(|h| h == "127.0.0.1"),
+        "0.0.0.0 bind must not advertise loopback: {info}"
+    );
+
+    // Narrow back to loopback: hook restarts again, listener survives, and
+    // the advertisement returns to exactly 127.0.0.1.
+    let narrow = uds_rpc(
+        &socket,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.bindAddress", "value": "127.0.0.1" }] }),
+    )
+    .await;
+    assert!(
+        narrow.get("error").is_none(),
+        "settings.update bindAddress → 127.0.0.1 should succeed: {narrow}"
+    );
+    let mut ws2 = connect_ws(port, cfg).await;
+    let sub2 = wss_rpc(
+        &mut ws2,
+        20,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub2.get("error").is_none(),
+        "events.subscribe after narrowing back to loopback should work: {sub2}"
+    );
+    let info = uds_rpc(&socket, 6, "pairing.getInfo", json!({})).await;
+    assert_eq!(
+        info["result"]["hosts"],
+        json!(["127.0.0.1"]),
+        "loopback bind advertises exactly 127.0.0.1 again: {info}"
+    );
+
+    // A non-IP value is rejected at write time (never deferred to the next
+    // listener start) and the running listener is untouched.
+    let bad = uds_rpc(
+        &socket,
+        7,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.bindAddress", "value": "not-an-ip" }] }),
+    )
+    .await;
+    let err = bad
+        .get("error")
+        .expect("non-IP bindAddress must be rejected")
+        .to_string();
+    assert!(err.contains("server.bindAddress"), "{bad}");
+    let mut ws3 = connect_ws(port, client_config(&fingerprint)).await;
+    let sub3 = wss_rpc(
+        &mut ws3,
+        30,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub3.get("error").is_none(),
+        "listener must survive a rejected bindAddress write: {sub3}"
+    );
+}

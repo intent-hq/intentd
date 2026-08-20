@@ -7,7 +7,7 @@
 //! than an allowlist, so new tools are denied by default for restricted agents.
 
 /// File modification tools — agents with these can edit the codebase.
-pub const FILE_WRITE_TOOLS: &[&str] = &[
+pub(crate) const FILE_WRITE_TOOLS: &[&str] = &[
     // Built-in auggie tools
     "str-replace-editor",
     "save-file",
@@ -25,10 +25,10 @@ pub const FILE_WRITE_TOOLS: &[&str] = &[
 
 /// Git tools — agents with these can mutate git state. (`git_status` is
 /// read-only and intentionally omitted.)
-pub const GIT_TOOLS: &[&str] = &["git_stage", "git_commit"];
+pub(crate) const GIT_TOOLS: &[&str] = &["git_stage", "git_commit"];
 
 /// Agent creation/delegation tools — agents with these can spawn/message agents.
-pub const AGENT_CREATION_TOOLS: &[&str] = &[
+pub(crate) const AGENT_CREATION_TOOLS: &[&str] = &[
     "create_agent",
     "delegate_task",
     "send_message_to_agent",
@@ -38,7 +38,7 @@ pub const AGENT_CREATION_TOOLS: &[&str] = &[
 ];
 
 /// Note + task + comment + primitive mutation tools.
-pub const NOTE_WRITE_TOOLS: &[&str] = &[
+pub(crate) const NOTE_WRITE_TOOLS: &[&str] = &[
     "create_note",
     "set_note_content",
     "add_to_note",
@@ -62,7 +62,7 @@ pub const NOTE_WRITE_TOOLS: &[&str] = &[
 ];
 
 /// Workspace modification tools.
-pub const WORKSPACE_WRITE_TOOLS: &[&str] = &[
+pub(crate) const WORKSPACE_WRITE_TOOLS: &[&str] = &[
     "rename_space",
     "rename_agent",
     "set_workspace_title",
@@ -71,13 +71,14 @@ pub const WORKSPACE_WRITE_TOOLS: &[&str] = &[
 
 /// Unified workspace JS API tool (bare + server-suffixed). It can perform any
 /// workspace mutation, so pure-text background agents must deny it.
-pub const UNIFIED_WORKSPACE_TOOLS: &[&str] = &["workspace_api", "workspace_api_workspace-mcp"];
+pub(crate) const UNIFIED_WORKSPACE_TOOLS: &[&str] =
+    &["workspace_api", "workspace_api_workspace-mcp"];
 
 /// Process/command execution tools.
-pub const EXECUTION_TOOLS: &[&str] = &["launch-process", "execute_command"];
+pub(crate) const EXECUTION_TOOLS: &[&str] = &["launch-process", "execute_command"];
 
 /// External communication tools.
-pub const EXTERNAL_TOOLS: &[&str] = &["web-fetch", "web-search", "github-api"];
+pub(crate) const EXTERNAL_TOOLS: &[&str] = &["web-fetch", "web-search", "github-api"];
 
 /// Subagent orchestration tools.
 ///
@@ -115,7 +116,7 @@ pub const SUBAGENT_TOOLS: &[&str] = &[
 
 /// Built-in tools that conflict with their workspace-MCP equivalents and are
 /// always removed (the MCP versions integrate with the agent lifecycle).
-pub const CONFLICTING_BUILTIN_TOOLS: &[&str] = &["create_agent"];
+pub(crate) const CONFLICTING_BUILTIN_TOOLS: &[&str] = &["create_agent"];
 
 /// The full set of categories denied for pure text-generation/analysis agents.
 fn full_denylist() -> Vec<&'static str> {
@@ -152,7 +153,8 @@ pub fn get_tool_denylist_for_agent_type(agent_type: &str) -> Vec<&'static str> {
 
 /// Whether an agent type is a restricted background agent (port of
 /// `isBackgroundAgentType`).
-pub fn is_background_agent_type(agent_type: &str) -> bool {
+#[cfg(test)]
+pub(crate) fn is_background_agent_type(agent_type: &str) -> bool {
     matches!(
         agent_type,
         "commit-message"
@@ -166,7 +168,8 @@ pub fn is_background_agent_type(agent_type: &str) -> bool {
 }
 
 /// All restricted background agent types (port of `getBackgroundAgentTypes`).
-pub fn background_agent_types() -> &'static [&'static str] {
+#[cfg(test)]
+pub(crate) fn background_agent_types() -> &'static [&'static str] {
     &[
         "commit-message",
         "pr-description",

@@ -291,3 +291,54 @@ async fn script_list_bootstrap_stays_within_statement_budget() {
         "script.list bootstrap exceeded the statement budget, log:\n{log}"
     );
 }
+
+/// Regression test for intent-hq/monorepo#2994: `workspace.transfer.plan`
+/// used to compute its per-table row stats with 2 statements per
+/// TRANSFER_TABLES entry (PRAGMA table_info + per-table aggregate, ~56
+/// statements for 28 tables), tripping the default statement budget on every
+/// call. The stats read is now batched to exactly two statements (one
+/// pragma_table_info join, one UNION ALL aggregate), keeping the whole
+/// dispatch well within the default budget of 25.
+#[tokio::test]
+async fn transfer_plan_stays_within_statement_budget() {
+    let (_daemon, socket, log_path) = spawn_daemon("itdp-plan", &[]);
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let repo = create_repo_with_config("{}");
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.transfer.plan",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    assert!(
+        resp["result"]["plan"]["manifest"]["tables"].is_array(),
+        "resp: {resp}"
+    );
+
+    // The statement-budget WARN (were it wrongly emitted) lands on stderr
+    // before the response frame is written, so a single read is sufficient.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &[
+                "exceeded SQL statement budget",
+                "method=workspace.transfer.plan"
+            ]
+        ),
+        0,
+        "workspace.transfer.plan exceeded the statement budget, log:\n{log}"
+    );
+}

@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Default reverse-request timeout. GUI intents are interactive, so this is more
 /// generous than the ACP request timeout.
-pub const DEFAULT_REVERSE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_REVERSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A JSON-RPC error returned by the client to a reverse request.
 #[derive(Debug, Clone)]
@@ -115,7 +115,7 @@ impl ReverseChannel {
     /// Returns `true` when the frame was a reverse reply (a string `rev-*` id,
     /// no `method`) addressed to one of our pending requests and was delivered;
     /// otherwise `false`, so the caller continues normal classification.
-    pub fn route_response(&self, value: &Value) -> bool {
+    pub(crate) fn route_response(&self, value: &Value) -> bool {
         let Some(obj) = value.as_object() else {
             return false;
         };

@@ -147,7 +147,7 @@ pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<S
 /// embedded quotes escaped). Any existing `-c`/`--config` entry for the same
 /// `key` is removed before the new value is appended. Port of
 /// `upsertCodexConfigArgs` (`provider-registry.ts`).
-pub fn upsert_codex_config_args(args: &[String], key: &str, value: &str) -> Vec<String> {
+pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) -> Vec<String> {
     let escaped = value.replace('"', "\\\"");
     let config_value = format!("{key}=\"{escaped}\"");
     let key_prefix = format!("{key}=");
@@ -504,7 +504,7 @@ pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
 /// exact PATH the spawned provider child sees, as directories. Exposed so
 /// pre-spawn probes (the pi CLI version gate) can resolve binaries against
 /// the same directories, in the same order, as the child would.
-pub fn enhanced_path_spawn_dirs(provider_binary: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn enhanced_path_spawn_dirs(provider_binary: Option<&Path>) -> Vec<PathBuf> {
     enhanced_path_dirs_with(
         provider_binary,
         home_dir().as_deref(),

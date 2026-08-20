@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 /// Directory under the data dir that chief provider children spawn in.
-pub const CHIEF_CWD_DIR_NAME: &str = "chief-cwd";
+pub(crate) const CHIEF_CWD_DIR_NAME: &str = "chief-cwd";
 
 /// The chief spawn-cwd dir for a data dir: `<data_dir>/chief-cwd`.
 pub fn chief_cwd_root(data_dir: &Path) -> PathBuf {

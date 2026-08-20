@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Directory under the data dir that holds per-agent stderr logs.
-pub const AGENT_LOGS_DIR_NAME: &str = "agent-logs";
+pub(crate) const AGENT_LOGS_DIR_NAME: &str = "agent-logs";
 
 /// Days a per-agent stderr log file is retained before the sweep deletes it.
 pub const AGENT_LOG_RETENTION_DAYS: u64 = 7;

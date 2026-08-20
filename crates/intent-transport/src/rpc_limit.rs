@@ -24,10 +24,10 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// JSON-RPC error code for a rejected over-limit request.
-pub const OVERLOAD_ERROR_CODE: i32 = -32011;
+pub(crate) const OVERLOAD_ERROR_CODE: i32 = -32011;
 
 /// JSON-RPC error message for a rejected over-limit request.
-pub const OVERLOAD_ERROR_MESSAGE: &str = "Server overloaded";
+pub(crate) const OVERLOAD_ERROR_MESSAGE: &str = "Server overloaded";
 
 /// Shared permit source for the slow-path spawn sites. Cheap to clone (an
 /// `Arc` inside); [`RpcLimiter::unlimited`] disables the cap entirely by

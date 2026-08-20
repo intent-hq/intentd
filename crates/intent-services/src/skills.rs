@@ -42,7 +42,7 @@ fn home_dir() -> Option<PathBuf> {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SkillMetadata {
+pub(crate) struct SkillMetadata {
     pub name: String,
     pub description: String,
     pub location: String,
@@ -95,20 +95,20 @@ static DISCOVERY_CACHE: once_cell::sync::Lazy<Mutex<HashMap<String, CacheEntry>>
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Public API: discover skills for a workspace
-pub async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
+pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
     let payload = load_skills_payload(workspace_path).await;
     payload.skills.clone()
 }
 
 /// Public API: format skills catalog for prompt injection
-pub async fn format_skills_catalog_for_prompt(workspace_path: &str) -> String {
+pub(crate) async fn format_skills_catalog_for_prompt(workspace_path: &str) -> String {
     let payload = load_skills_payload(workspace_path).await;
     payload.catalog.clone()
 }
 
 /// Public API: check if skills have changed and return new list if they have.
 /// Returns (skills, changed) where changed=true if the skill set differs from cache.
-pub async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMetadata>, bool) {
+pub(crate) async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMetadata>, bool) {
     let normalized = normalize_workspace_path(workspace_path);
     let cache_key = normalized
         .as_deref()
