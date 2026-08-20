@@ -286,7 +286,7 @@ impl McpHub {
     }
 
     /// Wire the event bus the hub publishes `mcp.servers:status-changed` onto.
-    pub fn set_event_bus(&self, bus: EventBus) {
+    pub(crate) fn set_event_bus(&self, bus: EventBus) {
         *self.inner.bus.lock().unwrap() = Some(bus);
     }
 

@@ -20,7 +20,7 @@ use crate::error::{AcpResult, JsonRpcError};
 const METHOD_NOT_FOUND: i64 = -32601;
 
 /// The `terminal/*` methods a provider may call (parity with the ACP schema).
-pub const TERMINAL_METHODS: [&str; 5] = [
+pub(crate) const TERMINAL_METHODS: [&str; 5] = [
     "terminal/create",
     "terminal/output",
     "terminal/wait_for_exit",
@@ -29,12 +29,12 @@ pub const TERMINAL_METHODS: [&str; 5] = [
 ];
 
 /// Whether `method` is a client-served terminal method.
-pub fn is_terminal_method(method: &str) -> bool {
+pub(crate) fn is_terminal_method(method: &str) -> bool {
     TERMINAL_METHODS.contains(&method)
 }
 
 /// The error returned for any `terminal/*` request when no PTY host is wired.
-pub fn unsupported_error(method: &str) -> JsonRpcError {
+pub(crate) fn unsupported_error(method: &str) -> JsonRpcError {
     JsonRpcError {
         code: METHOD_NOT_FOUND,
         message: format!("{method} is not supported (no terminal host wired)"),

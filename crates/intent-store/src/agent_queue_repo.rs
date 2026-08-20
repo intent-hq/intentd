@@ -204,7 +204,8 @@ impl Store {
     }
 
     /// Delete every persisted queue entry for one agent.
-    pub async fn delete_agent_queue(&self, agent_id: &AgentId) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) async fn delete_agent_queue(&self, agent_id: &AgentId) -> Result<()> {
         sqlx::query("DELETE FROM agent_queue WHERE agent_id = ?")
             .bind(&agent_id.0)
             .execute(self.write_pool())

@@ -16,7 +16,8 @@ mod tests;
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
 /// error code (never `-32601`) when the method is recognized but fails for other reasons.
-pub const ROUTER_METHODS: &[&str] = &[
+#[cfg(test)]
+pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.appendMessage",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
@@ -318,7 +319,8 @@ pub const ROUTER_METHODS: &[&str] = &[
 /// The daemon accepts these 2 alias forms and dispatches them to their canonical
 /// counterparts. The wire accepts both, but the canonical name is the documented
 /// form in docs/protocol/05-method-catalog.md.
-pub const METHOD_ALIASES: &[(&str, &str)] =
+#[cfg(test)]
+pub(crate) const METHOD_ALIASES: &[(&str, &str)] =
     &[("git.diff", "git.diffs"), ("git.log", "git.commits")];
 
 /// Fast-path methods (intercepted before `router::dispatch`).
@@ -329,7 +331,8 @@ pub const METHOD_ALIASES: &[(&str, &str)] =
 /// envelope validation but are dispatched earlier in the connection task for
 /// performance or to access per-connection state (e.g., `client_id` binding for
 /// drafts).
-pub const FASTPATH_METHODS: &[&str] = &[
+#[cfg(test)]
+pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "browser.exec",
     "client.hello",
     "drafts.clear",
@@ -373,7 +376,8 @@ pub const FASTPATH_METHODS: &[&str] = &[
 ///
 /// These are unsolicited notifications sent from the daemon to connected clients
 /// (no request `id`). `events.event` is the sole notification in protocol v2.0.
-pub const NOTIFICATIONS: &[&str] = &["events.event"];
+#[cfg(test)]
+pub(crate) const NOTIFICATIONS: &[&str] = &["events.event"];
 
 /// Client-served reverse RPCs (dispatched with `id: "rev-<n>"`).
 ///
@@ -381,7 +385,8 @@ pub const NOTIFICATIONS: &[&str] = &["events.event"];
 /// connected frontend. The daemon validates the envelope, then dispatches a
 /// reverse RPC back to the client with a synthetic `rev-<n>` request id and
 /// echoes the client's result back to the original caller.
-pub const REVERSE_METHODS: &[&str] = &[
+#[cfg(test)]
+pub(crate) const REVERSE_METHODS: &[&str] = &[
     "browser.exec",
     "host.openExternal",
     "host.openInEditor",

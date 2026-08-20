@@ -8,36 +8,19 @@
 pub use intent_core::Result;
 pub use intent_services::Services;
 
-pub use auth::{
-    extract_bearer_token, extract_token, generate_token, get_or_create_token, is_allowed_origin,
-    is_auth_enabled, validate_token, AsyncTokenStore, FileTokenStore, TokenStore,
-};
-pub use catalog::{
-    FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
-};
+pub use auth::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore, TokenStore};
 pub use context::{is_tcp_connection, with_connection_context};
 pub use control::{SystemControl, SystemStatus};
-pub use host::{
-    open_external, open_in_editor, pick_application, resolve_is_local, AppPicker, EditorLauncher,
-    EditorTarget, ExternalOpener, NoopAppPicker, OpenExternalError, OpenInEditorError,
-    OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
-};
-pub use host_env::{detect_display_server, detect_has_display, local_hostname};
+pub use host_env::{detect_has_display, local_hostname};
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
-pub use listener::{derive_pipe_name, serve_uds, serve_uds_with_reverse};
-pub use pairing::{build_pairing_uri, PAIRING_PAYLOAD_VERSION};
+pub use listener::{serve_uds, serve_uds_with_reverse};
 pub use protocol::{MAX_INBOUND_MESSAGE_BYTES, MAX_OUTBOUND_MESSAGE_BYTES, PROTOCOL_VERSION};
-pub use reverse::{
-    PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel, ReverseError,
-    DEFAULT_REVERSE_TIMEOUT,
-};
+pub use reverse::{PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel};
 pub use router::handle_message;
-pub use rpc_limit::{RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
-pub use server::{
-    collect_bind_interfaces, collect_local_ips, pairing_hosts, PairingSnapshot, ServerPairingInfo,
-};
-pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
+pub use rpc_limit::RpcLimiter;
+pub use server::{collect_bind_interfaces, collect_local_ips, PairingSnapshot, ServerPairingInfo};
+pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 
 /// Test-only process-global env setup. Runs before `main()` — and therefore
@@ -72,7 +55,7 @@ mod panic_guard;
 mod protocol;
 pub mod reverse;
 pub mod router;
-pub mod rpc_limit;
+pub(crate) mod rpc_limit;
 pub mod server;
 mod subscriptions;
 pub mod tls;

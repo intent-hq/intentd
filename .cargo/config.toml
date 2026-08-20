@@ -20,4 +20,4 @@
 # and only the sanitized verify builds consume the patch. Those warnings do
 # NOT mean the patch is broken; do not "fix" them by removing this file.
 [patch.crates-io]
-tokio-tungstenite = { git = "https://github.com/intent-hq/tokio-tungstenite", branch = "deflate" }
+tokio-tungstenite = { git = "https://github.com/intent-hq/tokio-tungstenite-fork", branch = "deflate" }

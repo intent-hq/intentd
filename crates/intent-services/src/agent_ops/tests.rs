@@ -6488,7 +6488,9 @@ async fn create_with_name_explicitly_set_false_stays_renameable() {
 /// session-level `contextReferences`, and `metadata.isBackground`
 /// (G-A1/P3-1.2c). Session-level `imageBlocks` persist but stay OFF the lite
 /// projection (list-payload cost contract) — they are served by
-/// `agent.getSession` only.
+/// `agent.getSession` only. `metadata.initialMessage` is detail-only and
+/// likewise stays OFF `agent.list` rows (monorepo#2932) while `agent.get`
+/// still serves it.
 #[tokio::test]
 async fn create_persists_and_reserves_gap_fields() {
     let (_t, svc, ws) = setup().await;
@@ -6542,11 +6544,16 @@ async fn create_persists_and_reserves_gap_fields() {
         Some(json!([{ "type": "image", "data": "abc" }]))
     );
 
-    // And on `agent.list`.
+    // And on `agent.list` — except `metadata.initialMessage`, which is
+    // detail-only and omitted from list rows (monorepo#2932).
     let agents = svc.agent_list_op(ws).await.expect("list");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].metadata.delegation_depth, Some(2));
     assert!(agents[0].metadata.is_background);
+    assert_eq!(
+        agents[0].metadata.initial_message, None,
+        "initialMessage must stay off agent.list rows (monorepo#2932)"
+    );
 }
 
 /// The top-level `isBackground` param wins over the `metadata` fallback, and

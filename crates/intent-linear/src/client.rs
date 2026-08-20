@@ -14,10 +14,10 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 
 /// Default Linear GraphQL endpoint.
-pub const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
+pub(crate) const LINEAR_API_URL: &str = "https://api.linear.app/graphql";
 
 /// Thin GraphQL transport over `reqwest`.
-pub struct LinearClient {
+pub(crate) struct LinearClient {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.
     api_key: String,

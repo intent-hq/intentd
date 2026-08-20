@@ -35,7 +35,7 @@ pub struct PairingSnapshot {
     pub port: Option<u16>,
     /// The address the running listener is bound to (`server.bindAddress`),
     /// when known — drives which hosts the pairing payload advertises
-    /// ([`pairing_hosts`]).
+    /// (`pairing_hosts`).
     pub bind_address: Option<std::net::IpAddr>,
 }
 
@@ -157,7 +157,7 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 /// An IPv6-unspecified bind (`::`) also accepts native IPv6 connections
 /// (v4-mapped sockets cover the IPv4 side), so its enumeration additionally
 /// carries the machine's global IPv6 addresses.
-pub fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
+pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
     match snapshot.bind_address {
         Some(addr) if !addr.is_unspecified() => vec![addr.to_string()],
         Some(std::net::IpAddr::V6(_)) => {

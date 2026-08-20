@@ -175,7 +175,8 @@ pub fn gated_reason_with_env(
 /// settings above this leaf crate); callers with settings access should use
 /// [`discover_providers_with_overrides`] so `installed` matches what
 /// `resolve_spawn` would actually spawn (monorepo#1065).
-pub fn discover_providers() -> Vec<ProviderAvailability> {
+#[cfg(test)]
+pub(crate) fn discover_providers() -> Vec<ProviderAvailability> {
     discover_providers_with_overrides(&|_| None)
 }
 

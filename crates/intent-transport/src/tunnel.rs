@@ -61,18 +61,18 @@ use crate::ws::{now_ms, ConnCmd};
 /// port `u16` big-endian).
 pub const OP_OPEN: u8 = 0x01;
 /// `OPEN_OK` — the daemon-side TCP connect succeeded (no payload).
-pub const OP_OPEN_OK: u8 = 0x02;
+pub(crate) const OP_OPEN_OK: u8 = 0x02;
 /// `OPEN_ERR` — the connect failed / was refused (payload: UTF-8 message).
-pub const OP_OPEN_ERR: u8 = 0x03;
+pub(crate) const OP_OPEN_ERR: u8 = 0x03;
 /// `DATA` — raw stream bytes (payload: bytes, may be empty).
-pub const OP_DATA: u8 = 0x04;
+pub(crate) const OP_DATA: u8 = 0x04;
 /// `EOF` — half-close: no more data in the sender's direction (no payload).
-pub const OP_EOF: u8 = 0x05;
+pub(crate) const OP_EOF: u8 = 0x05;
 /// `CLOSE` — full stream teardown (no payload).
-pub const OP_CLOSE: u8 = 0x06;
+pub(crate) const OP_CLOSE: u8 = 0x06;
 
 /// Frame header length: opcode (1 byte) + streamId (4 bytes, big-endian).
-pub const HEADER_LEN: usize = 5;
+pub(crate) const HEADER_LEN: usize = 5;
 
 /// Maximum concurrent streams per `/tunnel` connection; further `OPEN`s are
 /// answered with `OPEN_ERR` until a stream closes.
@@ -82,7 +82,7 @@ pub const MAX_STREAMS_PER_CONNECTION: usize = 32;
 /// transport limit is sized for JSON-RPC envelopes; tunnel frames get a much
 /// smaller cap so the bounded frame-count queues cannot buffer multi-GiB of
 /// payload against a stalled consumer (32 slots × payload is the worst case).
-pub const MAX_DATA_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_DATA_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// `/tunnel` inbound WebSocket message cap: one frame header + a max payload.
 pub const MAX_TUNNEL_MESSAGE_BYTES: usize = HEADER_LEN + MAX_DATA_PAYLOAD_BYTES;
 

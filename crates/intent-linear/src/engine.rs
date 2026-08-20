@@ -91,7 +91,7 @@ pub trait LinearEngine: Send + Sync {
 
 /// GraphQL-backed [`LinearEngine`] over [`LinearClient`].
 #[derive(Debug)]
-pub struct LinearEngineImpl {
+pub(crate) struct LinearEngineImpl {
     client: LinearClient,
 }
 

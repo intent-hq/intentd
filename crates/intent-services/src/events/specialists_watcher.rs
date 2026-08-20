@@ -39,7 +39,7 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// does not scale with the workspace count. The project tier per workspace no
 /// longer owns a stream at all: it rides the shared workspace-root stream via
 /// [`watch_tiers`].
-pub struct SpecialistsWatcher {
+pub(crate) struct SpecialistsWatcher {
     hub: Arc<SharedWatchHub>,
     _user_watchers: Vec<RootWatch>,
     workspace_watchers: Mutex<HashMap<WorkspaceId, TierWatch>>,
@@ -104,7 +104,7 @@ impl SpecialistsWatcher {
     /// path first (and primes the fingerprint so pre-existing specialists do
     /// not emit a spurious event), then the project tier is watched.
     /// Re-registering replaces the watch.
-    pub fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self.raw_tx.send(SpecialistsMsg::Add(
             workspace_id.clone(),
             workspace_path.clone(),
@@ -129,7 +129,7 @@ impl SpecialistsWatcher {
 
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watch and drop any pending flush so it stops emitting.
-    pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn remove_workspace(&self, workspace_id: &WorkspaceId) {
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.remove(workspace_id);
         }
@@ -141,7 +141,7 @@ impl SpecialistsWatcher {
     /// Suspend a workspace (archive): tear down its project-tier watch but
     /// KEEP the fingerprint, so the [`Self::resume_workspace`] catch-up can
     /// tell whether the set changed while the workspace was unwatched.
-    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn pause_workspace(&self, workspace_id: &WorkspaceId) {
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.remove(workspace_id);
         }
@@ -157,7 +157,7 @@ impl SpecialistsWatcher {
     /// happened in this process: a workspace archived before daemon start is
     /// never seeded (boot lists unarchived workspaces only), so its resume has
     /// no baseline and emits one benign event.
-    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self.raw_tx.send(SpecialistsMsg::Resume(
             workspace_id.clone(),
             workspace_path.clone(),

@@ -19,7 +19,7 @@ use intent_core::NoteVersion;
 
 /// One line's attribution result. Mirrors the FE `LineAttribution` struct.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LineAttribution {
+pub(crate) struct LineAttribution {
     /// 1-based line number in the current note content.
     pub line_number: usize,
     /// The line's current text (no trailing newline).
@@ -120,7 +120,10 @@ fn is_whitespace_only_change(version_line: &str, current_line: &str) -> bool {
 /// See [`LineAttribution`] for the returned per-line record. Empty content
 /// returns an empty vec (FE parity); a note with no versions returns one
 /// unattributed entry per current line.
-pub fn attribute_lines(current_content: &str, versions: &[NoteVersion]) -> Vec<LineAttribution> {
+pub(crate) fn attribute_lines(
+    current_content: &str,
+    versions: &[NoteVersion],
+) -> Vec<LineAttribution> {
     let current_lines: Vec<&str> = split_lines_js(current_content);
 
     // Handle empty content up front (FE early return).
