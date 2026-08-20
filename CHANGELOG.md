@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.24] - 2026-08-20
+
+### 🚀 Features
+
+- Stamp agent-flipped completions as wake triggers ([#1340](https://github.com/intent-hq/intentd/pull/1340))
+
+### 🐛 Bug Fixes
+
+- *(providers)* Version-gate auggie spawn and honor auggie-path marker ([#1299](https://github.com/intent-hq/intentd/pull/1299))
+- Reject agent.watch on idle target with no waiting reasons ([#1341](https://github.com/intent-hq/intentd/pull/1341))
+- Resolve rpc_profile budget warnings for transfer.plan, create, and list ([#1344](https://github.com/intent-hq/intentd/pull/1344))
+
+
 ## [0.7.23] - 2026-08-20
 
 ### 🚀 Features
