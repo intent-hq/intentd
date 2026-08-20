@@ -1921,6 +1921,13 @@ impl Services {
     /// a fixed number of store queries regardless of session count, and no
     /// message row beyond each session's newest user/assistant pair is ever
     /// fetched or decoded — full transcripts are never hydrated.
+    ///
+    /// List-payload cost contract (monorepo#2932): `metadata.initialMessage`
+    /// — the full spawn-time first message, the single largest per-session
+    /// field on real workspaces — is detail-only (no list-context consumer)
+    /// and is OMITTED from every row here; `agent.get` / `agent.getSession`
+    /// still serve it. Keeps a ~100-session response well under the 1 MiB
+    /// outbound frame warn threshold.
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
         let sessions = self
             .store
@@ -1951,6 +1958,9 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
+                // monorepo#2932: detail-only — omitted from list rows (see
+                // the doc comment above); `agent.get` still serves it.
+                lite.metadata.initial_message = None;
                 lite
             })
             .collect())
