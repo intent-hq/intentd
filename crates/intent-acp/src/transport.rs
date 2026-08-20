@@ -26,7 +26,7 @@ use crate::error::{AcpError, AcpResult, JsonRpcError};
 
 /// Default per-request timeout (§6.4). `initialize` uses its own, more
 /// generous timeout — see `handshake::initialize_timeout` (monorepo#616).
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of recent stderr entries retained (parity:
 /// `MAX_RECENT_STDERR_ERRORS`).
@@ -517,7 +517,8 @@ impl Connection {
 
     /// Whether any request correlation entries are still in flight (their
     /// futures are live and awaiting a response).
-    pub fn has_pending_requests(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn has_pending_requests(&self) -> bool {
         !self.pending.lock().unwrap().is_empty()
     }
 
@@ -560,7 +561,7 @@ impl Connection {
     }
 
     /// Whether a configured auth-error pattern has been seen on stderr.
-    pub fn auth_error_detected(&self) -> bool {
+    pub(crate) fn auth_error_detected(&self) -> bool {
         self.auth_error.load(Ordering::SeqCst)
     }
 

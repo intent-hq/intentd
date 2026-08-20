@@ -30,11 +30,11 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 
 /// Environment variable that overrides the default secrets-file path.
-pub const SECRETS_FILE_ENV: &str = "INTENTD_SECRETS_FILE";
+pub(crate) const SECRETS_FILE_ENV: &str = "INTENTD_SECRETS_FILE";
 
 /// Resolve the secrets-file path: [`SECRETS_FILE_ENV`] when set and non-empty,
 /// otherwise `~/intent/secrets.json` (`HOME`, falling back to `USERPROFILE`).
-pub fn default_secrets_path() -> PathBuf {
+pub(crate) fn default_secrets_path() -> PathBuf {
     if let Some(p) = std::env::var_os(SECRETS_FILE_ENV) {
         if !p.is_empty() {
             return PathBuf::from(p);

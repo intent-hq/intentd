@@ -59,15 +59,6 @@ impl FileService {
         }
     }
 
-    /// A service narrowed to `scope` (a relative subdirectory of `root`); reads
-    /// and writes outside that subtree are rejected.
-    pub fn with_scope(root: impl Into<PathBuf>, scope: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            scope: Some(scope.into()),
-        }
-    }
-
     /// The effective sandbox base (`root`, optionally narrowed by `scope`).
     fn base(&self) -> PathBuf {
         match &self.scope {

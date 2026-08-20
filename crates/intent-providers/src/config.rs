@@ -457,7 +457,7 @@ pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
 /// ONLY when no settings-derived default (provider of `model.default`, else
 /// `providers.active`) is reachable. No provider carries a privileged
 /// default designation.
-pub fn first_provider_config() -> &'static ProviderConfig {
+pub(crate) fn first_provider_config() -> &'static ProviderConfig {
     ACP_PROVIDERS
         .first()
         .expect("at least one ACP provider must be configured")
@@ -504,12 +504,14 @@ pub fn all_provider_ids() -> Vec<&'static str> {
 }
 
 /// Providers that can be disabled in settings. Port of `getDisableableProviders`.
-pub fn disableable_providers() -> Vec<&'static ProviderConfig> {
+#[cfg(test)]
+pub(crate) fn disableable_providers() -> Vec<&'static ProviderConfig> {
     ACP_PROVIDERS.iter().filter(|p| p.can_be_disabled).collect()
 }
 
 /// Providers that are always enabled. Port of `getAlwaysEnabledProviders`.
-pub fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
+#[cfg(test)]
+pub(crate) fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
     ACP_PROVIDERS
         .iter()
         .filter(|p| !p.can_be_disabled)

@@ -21,8 +21,7 @@ pub mod model;
 pub mod registry;
 pub mod token;
 
-pub use client::{LinearClient, LINEAR_API_URL};
-pub use engine::{LinearEngine, LinearEngineImpl};
+pub use engine::LinearEngine;
 pub use error::{Error, Result};
 pub use model::{
     AuthStatus, CreateIssueRequest, IssueFilter, LinearIssuePage, LinearIssueResult, LinearLabel,

@@ -90,7 +90,7 @@ impl GitStatusCache {
     /// Mark the cached status for `worktree` stale: the next read rescans.
     /// Also advances the generation, so a scan already in flight cannot store
     /// the pre-change snapshot it is about to produce.
-    pub fn invalidate(&self, worktree: &Path) {
+    pub(crate) fn invalidate(&self, worktree: &Path) {
         let key = git_status_singleflight::status_key(worktree);
         // `get_mut`, not `entry().or_default()`: with no slot there is nothing
         // cached and no in-flight store to guard against — `get` creates the

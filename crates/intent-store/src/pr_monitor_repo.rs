@@ -395,22 +395,6 @@ impl Store {
         .map_err(|e| intent_core::Error::Internal(format!("update pr monitor poll failed: {e}")))?;
         Ok(res.rows_affected() > 0)
     }
-
-    /// Delete a PR-monitor row; `NotFound` when absent.
-    pub async fn delete_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<()> {
-        let res = sqlx::query("DELETE FROM pr_monitor WHERE monitor_id = ?")
-            .bind(&monitor_id.0)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| intent_core::Error::Internal(format!("delete pr monitor failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(intent_core::Error::NotFound(format!(
-                "pr monitor {} not found",
-                monitor_id.0
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

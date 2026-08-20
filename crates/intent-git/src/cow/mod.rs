@@ -49,7 +49,7 @@ pub enum CowSupport {
 /// Statistics from a successful [`cow_clone_with_excludes`] call, for
 /// attribution of slow clones in provisioning logs.
 #[derive(Debug, Default)]
-pub struct CowCloneStats {
+pub(crate) struct CowCloneStats {
     /// The whole tree was cloned with a single primitive call (macOS fast
     /// path); no per-entry walk ran, so the other fields are all zero/empty.
     pub whole_tree: bool,
@@ -165,7 +165,7 @@ pub fn cow_clone(src: &Path, dst: &Path) -> Result<()> {
 /// ignored with a warning. With a non-empty exclusion list the whole-tree
 /// fast path is skipped (it cannot exclude anything) and the best-effort walk
 /// runs directly, still fast-cloning subtrees without excluded descendants.
-pub fn cow_clone_with_excludes(
+pub(crate) fn cow_clone_with_excludes(
     src: &Path,
     dst: &Path,
     excludes: &[String],

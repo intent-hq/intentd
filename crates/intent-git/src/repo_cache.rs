@@ -722,7 +722,8 @@ fn list_cached_branches_blocking(
 /// Returns the SHA the checkout lands on. On failure after the clone, the
 /// partially provisioned `checkout_path` is removed best-effort. Blocking —
 /// callers run it on the blocking pool.
-pub fn provision_direct_checkout(
+#[cfg(test)]
+pub(crate) fn provision_direct_checkout(
     cache_path: &Path,
     checkout_path: &Path,
     origin_url: &str,

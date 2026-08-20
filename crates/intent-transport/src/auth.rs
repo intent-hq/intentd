@@ -363,7 +363,7 @@ pub async fn get_or_create_token(store: &AsyncTokenStore) -> Result<String> {
 
 /// Validate a candidate token against the stored token using a length-checked,
 /// constant-time comparison. Port of `validateToken`.
-pub async fn validate_token(store: &AsyncTokenStore, candidate: &str) -> bool {
+pub(crate) async fn validate_token(store: &AsyncTokenStore, candidate: &str) -> bool {
     let Some(stored) = store.load_token().await else {
         return false;
     };
@@ -393,7 +393,7 @@ fn token_matches(stored: &str, candidate: &str) -> bool {
 /// Extract a bearer token from an `Authorization` header value, expecting the
 /// format `Bearer <token>` (case-insensitive scheme, regex `^Bearer\s+(\S+)$`).
 /// Port of `extractBearerToken`.
-pub fn extract_bearer_token(authorization: Option<&str>) -> Option<String> {
+pub(crate) fn extract_bearer_token(authorization: Option<&str>) -> Option<String> {
     let header = authorization?;
     if !header.get(..6)?.eq_ignore_ascii_case("Bearer") {
         return None;
@@ -412,7 +412,7 @@ pub fn extract_bearer_token(authorization: Option<&str>) -> Option<String> {
 /// Extract a token from a request: the `Authorization: Bearer <t>` header first,
 /// then the `?token=` query param of `request_target` (e.g. `/ws?token=abc`).
 /// Port of the server's private `extractToken(req)`.
-pub fn extract_token(authorization: Option<&str>, request_target: &str) -> Option<String> {
+pub(crate) fn extract_token(authorization: Option<&str>, request_target: &str) -> Option<String> {
     extract_bearer_token(authorization).or_else(|| extract_query_token(request_target))
 }
 
@@ -466,7 +466,7 @@ fn percent_decode(input: &str) -> String {
 /// Whether a WebSocket upgrade `Origin` is allowed. Native clients (iOS, CLI)
 /// send no Origin and pass; cross-origin browser upgrades are rejected. Port of
 /// `isAllowedWebSocketApiOrigin`.
-pub fn is_allowed_origin(origin: Option<&str>) -> bool {
+pub(crate) fn is_allowed_origin(origin: Option<&str>) -> bool {
     is_allowed_origin_with_host(origin, &local_hostname())
 }
 
@@ -537,7 +537,8 @@ fn origin_hostname(origin: &str) -> Option<String> {
 /// Whether bearer auth is required. Defaults per the config table: `true` on a
 /// TCP listener, `false` otherwise (UDS). An explicit `server.auth.enabled`
 /// setting overrides the default.
-pub fn is_auth_enabled(configured: Option<bool>, tcp: bool) -> bool {
+#[cfg(test)]
+pub(crate) fn is_auth_enabled(configured: Option<bool>, tcp: bool) -> bool {
     configured.unwrap_or(tcp)
 }
 

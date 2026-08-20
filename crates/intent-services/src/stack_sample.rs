@@ -12,24 +12,24 @@
 use intent_core::{Error, Result};
 
 /// Sampling-window clamp bounds and default (milliseconds).
-pub const MIN_DURATION_MS: i64 = 100;
-pub const MAX_DURATION_MS: i64 = 10_000;
-pub const DEFAULT_DURATION_MS: i64 = 1_000;
+pub(crate) const MIN_DURATION_MS: i64 = 100;
+pub(crate) const MAX_DURATION_MS: i64 = 10_000;
+pub(crate) const DEFAULT_DURATION_MS: i64 = 1_000;
 
 /// Sampling-frequency clamp bounds and default (Hz).
-pub const MIN_FREQUENCY_HZ: i64 = 1;
-pub const MAX_FREQUENCY_HZ: i64 = 250;
-pub const DEFAULT_FREQUENCY_HZ: i64 = 99;
+pub(crate) const MIN_FREQUENCY_HZ: i64 = 1;
+pub(crate) const MAX_FREQUENCY_HZ: i64 = 250;
+pub(crate) const DEFAULT_FREQUENCY_HZ: i64 = 99;
 
 /// Effective sampling window: absent/non-numeric → default, else clamped.
-pub fn effective_duration_ms(duration_ms: Option<i64>) -> i64 {
+pub(crate) fn effective_duration_ms(duration_ms: Option<i64>) -> i64 {
     duration_ms
         .unwrap_or(DEFAULT_DURATION_MS)
         .clamp(MIN_DURATION_MS, MAX_DURATION_MS)
 }
 
 /// Effective sampling frequency: absent/non-numeric → default, else clamped.
-pub fn effective_frequency_hz(frequency_hz: Option<i64>) -> i64 {
+pub(crate) fn effective_frequency_hz(frequency_hz: Option<i64>) -> i64 {
     frequency_hz
         .unwrap_or(DEFAULT_FREQUENCY_HZ)
         .clamp(MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ)
@@ -42,7 +42,7 @@ pub fn effective_frequency_hz(frequency_hz: Option<i64>) -> i64 {
 /// a concurrent call is rejected with a typed `Error::Internal` instead of
 /// being queued. The capture (guard install → sleep → report build/render)
 /// runs on the blocking pool so the async runtime is never stalled.
-pub async fn sample_stacks(
+pub(crate) async fn sample_stacks(
     duration_ms: Option<i64>,
     frequency_hz: Option<i64>,
 ) -> Result<serde_json::Value> {

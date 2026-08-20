@@ -27,9 +27,9 @@ use crate::ws::{ConnCmd, WsInner};
 /// it is busy, `start()` returns the bind error immediately (no port walking).
 pub const DEFAULT_PORT: u16 = 5181;
 /// Heartbeat ping cadence (`HEARTBEAT_INTERVAL_MS`).
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// No-pong deadline before a client is terminated (`HEARTBEAT_TIMEOUT_MS`).
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The shared, clonable start future (`io::Error` boxed in `Arc` so it is
 /// `Clone` for the `Shared` combinator).
