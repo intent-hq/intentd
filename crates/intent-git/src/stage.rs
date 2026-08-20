@@ -61,7 +61,7 @@ pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     for (raw, rel) in normalized {
         let rel_path = Path::new(&rel);
         let tracked = index.get_path(rel_path, 0).is_some();
-        if workdir.join(&rel).exists() {
+        if workdir.join(&rel).symlink_metadata().is_ok() {
             if !tracked && repo.status_should_ignore(rel_path).map_err(map_git_err)? {
                 first_unmatched.get_or_insert(raw);
                 continue;
@@ -508,6 +508,34 @@ mod tests {
         let f = st.files.iter().find(|f| f.path == "new.txt").unwrap();
         assert!(f.staged);
         assert_eq!(f.status, GitFileStatus::Added);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stages_dangling_symlink_with_valid_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = init_repo("stage-dangling-symlink");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "valid.txt", "valid\n");
+        let link = dir.path().join("dangling-link");
+        symlink("missing-target", &link).unwrap();
+        assert!(!link.exists());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+
+        stage(
+            dir.path(),
+            &["valid.txt".to_string(), "dangling-link".to_string()],
+        )
+        .unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(Path::new("valid.txt"), 0).is_some());
+        let link_entry = index
+            .get_path(Path::new("dangling-link"), 0)
+            .expect("dangling symlink is staged");
+        assert_eq!(link_entry.mode, 0o120000);
     }
 
     #[test]
