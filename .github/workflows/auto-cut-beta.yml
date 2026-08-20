@@ -1,34 +1,64 @@
-# Scheduled auto-merge of the release-plz Release PR — "auto-cut beta".
+# Auto-merge of the release-plz Release PR — "auto-cut beta".
 #
 # Merging the Release PR is what cuts a beta: the squash-merge push to main
 # triggers release-plz.yml, which pushes the vX.Y.Z tag, and the tag triggers
 # the cargo-dist release build + beta manifest publish. That merge used to be
-# a manual click; this workflow performs it on a schedule whenever the
+# a manual click; this workflow performs it automatically whenever the
 # Release PR is already green, so betas ship hands-free. Stable promotion
 # stays manual (promote-stable.yml) — this workflow only affects beta.
+#
+# Triggers — event-chained cut plus an hourly cron backstop:
+# - push to main: a merged change chains straight into a cut instead of
+#   waiting for the next cron tick. Push-triggered runs poll (30s interval,
+#   up to 15 min total) for release-plz to refresh the Release PR to
+#   include the pushed commit and for required check "CI Gate" to go green
+#   on the refreshed head, then merge through the same guardrail chain. Two
+#   guards keep push runs quiet when there is nothing to chain into:
+#     * the cut's own squash-merge push (the release commit itself) is
+#       recognized up front by its commit-message shape — the squash commit
+#       keeps release-plz's `chore(...): release vX.Y.Z` message — and
+#       exits before any polling, so a cut never chains into another cut;
+#     * the 60-minute throttle below silences anything that slips past the
+#       message check (belt and braces against self-retrigger loops).
+# - Hourly cron at :00: the backstop for pushes whose chained run timed out
+#   (e.g. slow CI on the refreshed head) or was throttled. Cron runs keep
+#   the check-once-and-exit behavior (no polling).
+#
+# Throttle — at most one cut per hour from automated runs: before merging,
+# cron and push runs read the latest vX.Y.Z tag's commit timestamp (when
+# the last release was cut) and exit quietly when it is younger than 60
+# minutes; the next cron tick retries, so a deferred change still ships
+# within ~1h ("always cut if there's a change and it's been an hour since
+# the last cut"). workflow_dispatch BYPASSES the throttle — manual dispatch
+# means a human wants the cut now — and keeps the dry_run input. The
+# throttle fails OPEN (unreadable tags must never block releases) and is
+# checked again right before the merge, so a push run that spent minutes
+# polling cannot slip a second cut inside the window.
 #
 # Guardrails:
 # - The `hold-release` label on the Release PR pauses auto-merge (skip with
 #   a notice) until the label is removed.
 # - Merge happens ONLY when GitHub already reports the PR clean: not a
 #   draft, mergeable, required check "CI Gate" green on the current head,
-#   and no unresolved review threads. Anything else logs and exits 0 — the
+#   and no unresolved review threads. Anything else logs and exits 0 (push
+#   runs first retry transient states within their bounded wait) — the
 #   next scheduled run retries. Never force-merges.
 # - The PR branch is never updated from here: release-plz owns the Release
 #   PR branch content and refreshes it on every push to main, which is how
 #   the ruleset's strict up-to-date requirement gets satisfied. A branch
-#   that is behind main is just skipped until release-plz catches it up.
+#   that is behind main is just skipped (push runs: retried within the
+#   polling budget) until release-plz catches it up.
 #
 # Token split: all read-only queries (PR discovery, labels, mergeability,
-# CI Gate via statusCheckRollup, review threads) authenticate with the
-# implicit GITHUB_TOKEN under least-privilege job permissions — fine-grained
-# PATs cannot read statusCheckRollup without Checks/Commit-statuses read
-# access. The merge itself authenticates with the RELEASE_PLZ_TOKEN PAT,
-# NOT the implicit GITHUB_TOKEN: pushes made with GITHUB_TOKEN do not
-# trigger other workflows, and the merge push to main must trigger
-# release-plz.yml's release job to push the tag. Fail-soft when the secret
-# is absent (same convention as INTENTD_RELEASES_TOKEN /
-# MONOREPO_ISSUES_TOKEN).
+# CI Gate via statusCheckRollup, review threads, tag reads for the
+# throttle) authenticate with the implicit GITHUB_TOKEN under
+# least-privilege job permissions — fine-grained PATs cannot read
+# statusCheckRollup without Checks/Commit-statuses read access. The merge
+# itself authenticates with the RELEASE_PLZ_TOKEN PAT, NOT the implicit
+# GITHUB_TOKEN: pushes made with GITHUB_TOKEN do not trigger other
+# workflows, and the merge push to main must trigger release-plz.yml's
+# release job to push the tag. Fail-soft when the secret is absent (same
+# convention as INTENTD_RELEASES_TOKEN / MONOREPO_ISSUES_TOKEN).
 
 name: Auto-cut beta
 
@@ -36,9 +66,11 @@ permissions: {}
 
 on:
   schedule:
-    # Hourly at :00; each run is a seconds-long API check that either
-    # squash-merges a green Release PR or exits quietly.
+    # Hourly at :00 (backstop); each run is a seconds-long API check that
+    # either squash-merges a green Release PR or exits quietly.
     - cron: "0 * * * *"
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -47,9 +79,10 @@ on:
         default: false
         type: boolean
 
-# Serialize runs so a scheduled run and a manual dispatch can never race a
-# merge of the same Release PR. `cancel-in-progress: false` because a run
-# that has already decided to merge must not be cancelled mid-merge.
+# Serialize runs so scheduled, push-triggered, and manually dispatched runs
+# can never race a merge of the same Release PR. `cancel-in-progress: false`
+# because a run that has already decided to merge must not be cancelled
+# mid-merge.
 concurrency:
   group: auto-cut-beta
   cancel-in-progress: false
@@ -61,11 +94,14 @@ jobs:
   # final merge.
   auto-merge-release-pr:
     name: Auto-merge green Release PR
-    # Seconds-long API-only job: pinned to ubuntu-latest (same rationale as
+    # API-only job (seconds on cron/dispatch runs; up to ~15 min of polling
+    # on push-triggered runs): pinned to ubuntu-latest (same rationale as
     # ci.yml's pr-title/gate jobs — a tinybox slot would be wasted on it).
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'intent-hq' }}
-    timeout-minutes: 5
+    # Covers the 15-min push-run polling budget plus headroom; cron and
+    # dispatch runs still finish in seconds.
+    timeout-minutes: 20
     permissions:
       pull-requests: read
       checks: read
@@ -96,138 +132,306 @@ jobs:
           # applied per-command, only where it is required.
           GH_TOKEN: ${{ github.token }}
           RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          # Boolean input; on schedule events the inputs context is empty and
-          # this renders "false".
+          # Boolean input; on schedule and push events the inputs context is
+          # empty and this renders "false".
           DRY_RUN: ${{ inputs.dry_run == true }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          # Push events only; used to recognize the cut's own merge push.
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message || '' }}
         run: |
           set -euo pipefail
 
-          # Identify the open release-plz Release PR: head branch
-          # `release-plz-*` and a release title in either pr_name form this
-          # repo has produced (see release-plz.yml's concurrency comment).
-          # Branch name and title alone are attacker-controlled (a fork PR
-          # can use both), so the candidate is also required to come from a
-          # branch in THIS repository (no fork heads), and its author is
-          # verified below against the release-plz PAT identity.
-          prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-            --json number,title,headRefName,isDraft,labels,isCrossRepository,author \
-            --jq '[.[] | select((.isCrossRepository == false)
-                  and (.headRefName | startswith("release-plz-"))
-                  and ((.title | startswith("chore: release v"))
-                    or (.title | startswith("chore(intentd): release v"))))]')
-          count=$(jq 'length' <<<"$prs")
-          if [[ "$count" -eq 0 ]]; then
-            echo "No open release-plz Release PR — no changes, no release."
-            exit 0
-          fi
-          if [[ "$count" -gt 1 ]]; then
-            # Should never happen (release-plz maintains a single Release
-            # PR); refuse to guess rather than merge the wrong one.
-            echo "::warning::Found $count open PRs that look like the Release PR ($(jq -r '[.[].number | tostring] | join(", #")' <<<"$prs" | sed 's/^/#/')); refusing to guess"
-            exit 0
-          fi
-          number=$(jq -r '.[0].number' <<<"$prs")
-          title=$(jq -r '.[0].title' <<<"$prs")
-          echo "Release PR: #$number ($title)"
-
-          # Bind the candidate to the release-plz identity: the Release PR
-          # is opened with the same RELEASE_PLZ_TOKEN PAT the merge below
-          # authenticates with, so its author must be the token's own login.
-          # This viewer lookup must run with the PAT (it resolves the PAT's
-          # identity, not the workflow's). Together with the same-repo check
-          # above, this pins the merge target to the repository-managed
-          # release-plz PR — a PR that merely imitates the branch-name/title
-          # shape never qualifies.
-          viewer=$(GH_TOKEN="$RELEASE_PLZ_TOKEN" gh api graphql \
-            -f query='query { viewer { login } }' \
-            --jq '.data.viewer.login')
-          author=$(jq -r '.[0].author.login' <<<"$prs")
-          if [[ -z "$viewer" || "$author" != "$viewer" ]]; then
-            echo "::warning::Release PR #$number author ($author) is not the release-plz PAT identity ($viewer); refusing to auto-merge"
-            exit 0
+          # Self-retrigger guard: the squash-merge this workflow performs is
+          # itself a push to main, which fires the push trigger again. The
+          # squash commit keeps the release commit's message (release-plz
+          # writes it in the same conventional form as the PR title), so
+          # recognize it up front and exit before any polling. The throttle
+          # below backstops a release merge whose message was reworded.
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            first_line=${HEAD_COMMIT_MSG%%$'\n'*}
+            case "$first_line" in
+              "chore: release v"* | "chore(intentd): release v"*)
+                echo "Push is the release squash-merge itself ($first_line); nothing to chain into."
+                exit 0
+                ;;
+            esac
           fi
 
-          # Pause guardrail: a human puts `hold-release` on the Release PR to
-          # stop auto-cutting (e.g. to batch more changes or hold a bad
-          # commit out of a beta); remove the label to resume.
-          if jq -e '.[0].labels | any(.name == "hold-release")' <<<"$prs" >/dev/null; then
-            echo "::notice::Release PR #$number carries the hold-release label; auto-merge paused until it is removed"
-            exit 0
+          # 60-minute throttle (cron and push runs; workflow_dispatch
+          # bypasses it — manual dispatch means a human wants the cut now):
+          # the latest vX.Y.Z tag's commit timestamp is when the last
+          # release was cut. Younger than 60 minutes → exit quietly; the
+          # next cron tick retries, so a deferred change still ships within
+          # ~1h. Every lookup failure fails OPEN (proceed): unreadable tags
+          # must never block releases.
+          throttle() {
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              return 0
+            fi
+            local tag tag_date tag_epoch age_min
+            tag=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" \
+              --jq '.[].ref | sub("^refs/tags/"; "")' 2>/dev/null \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || tag=""
+            if [[ -z "$tag" ]]; then
+              echo "No previous release tag found (or tags unreadable); throttle passes."
+              return 0
+            fi
+            tag_date=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" \
+              --jq '.commit.committer.date' 2>/dev/null) || tag_date=""
+            if [[ -z "$tag_date" ]]; then
+              echo "::warning::could not resolve the timestamp of latest release tag $tag; proceeding without throttle"
+              return 0
+            fi
+            tag_epoch=$(date -d "$tag_date" +%s 2>/dev/null) || tag_epoch=""
+            if [[ -z "$tag_epoch" ]]; then
+              echo "::warning::could not parse the timestamp of latest release tag $tag ($tag_date); proceeding without throttle"
+              return 0
+            fi
+            age_min=$(( ($(date +%s) - tag_epoch) / 60 ))
+            if (( age_min < 60 )); then
+              echo "Last cut ($tag) was ${age_min} min ago (<60 min); throttled — the next cron tick retries."
+              exit 0
+            fi
+            echo "Last cut ($tag) was ${age_min} min ago; throttle passes."
+          }
+
+          # Early throttle check saves push runs the 15-min poll when the
+          # window is plainly closed; re-checked right before the merge.
+          throttle
+
+          # Push-triggered runs (a change just landed on main) poll instead
+          # of checking once: release-plz needs a minute or two after the
+          # push to refresh the Release PR and CI another few minutes to
+          # turn CI Gate green on the refreshed head, so the run waits (30s
+          # interval, up to 15 min total) for the PR to exist, contain the
+          # pushed commit, and go green — then merges through the same
+          # guardrail chain. Cron and manual-dispatch runs keep the
+          # check-once-and-exit behavior (deadline stays 0, so transient()
+          # never retries).
+          deadline=0
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            deadline=$(( $(date +%s) + 15 * 60 ))
+            echo "Push-triggered chained cut: polling up to 15 min for a refreshed, green Release PR."
           fi
 
-          detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,mergeable,mergeStateStatus,statusCheckRollup)
-
-          if [[ $(jq -r '.isDraft' <<<"$detail") != "false" ]]; then
-            echo "Release PR #$number is a draft; skipping."
+          # Transient-condition helper: a push run with budget left returns
+          # so the caller can sleep 30s and retry; every other case logs and
+          # exits 0 — the next scheduled run retries. Hard guardrails below
+          # (fork/identity, hold-release, draft, conflicts, failed gate,
+          # unresolved threads) exit directly and are never retried.
+          transient() {
+            if [[ "$EVENT_NAME" == "push" ]] && (( $(date +%s) < deadline )); then
+              echo "$1 — retrying in 30s."
+              return 0
+            fi
+            echo "$1; skipping."
             exit 0
-          fi
+          }
 
-          # Strict up-to-date is enforced by the ruleset, and release-plz
-          # owns the branch content — never update the branch from here;
-          # release-plz refreshes the PR on the next push to main.
-          merge_state=$(jq -r '.mergeStateStatus' <<<"$detail")
-          if [[ "$merge_state" == "BEHIND" ]]; then
-            echo "Release PR #$number is behind main; leaving it for release-plz to refresh."
-            exit 0
-          fi
+          while :; do
+            # Identify the open release-plz Release PR: head branch
+            # `release-plz-*` and a release title in either pr_name form
+            # this repo has produced (see release-plz.yml's concurrency
+            # comment). Branch name and title alone are attacker-controlled
+            # (a fork PR can use both), so the candidate is also required to
+            # come from a branch in THIS repository (no fork heads), and its
+            # author is verified below against the release-plz PAT identity.
+            # Every read inside the loop treats failure as transient: a 5xx
+            # or rate-limit blip must not put a red X on the triggering
+            # commit (and lose a push run's remaining polling budget to the
+            # cron backstop) when simply retrying would have succeeded.
+            if ! prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --json number,title,headRefName,isDraft,labels,isCrossRepository,author \
+              --jq '[.[] | select((.isCrossRepository == false)
+                    and (.headRefName | startswith("release-plz-"))
+                    and ((.title | startswith("chore: release v"))
+                      or (.title | startswith("chore(intentd): release v"))))]'); then
+              transient "gh pr list failed (transient API error?)"
+              sleep 30; continue
+            fi
+            count=$(jq 'length' <<<"$prs")
+            if [[ "$count" -eq 0 ]]; then
+              transient "No open release-plz Release PR — no changes, no release (on push runs: release-plz may still be opening/refreshing it)"
+              sleep 30; continue
+            fi
+            if [[ "$count" -gt 1 ]]; then
+              # Should never happen (release-plz maintains a single Release
+              # PR); refuse to guess rather than merge the wrong one.
+              echo "::warning::Found $count open PRs that look like the Release PR ($(jq -r '[.[].number | tostring] | join(", #")' <<<"$prs" | sed 's/^/#/')); refusing to guess"
+              exit 0
+            fi
+            number=$(jq -r '.[0].number' <<<"$prs")
+            title=$(jq -r '.[0].title' <<<"$prs")
+            echo "Release PR: #$number ($title)"
 
-          mergeable=$(jq -r '.mergeable' <<<"$detail")
-          if [[ "$mergeable" != "MERGEABLE" ]]; then
-            echo "Release PR #$number is not mergeable (mergeable=$mergeable, mergeStateStatus=$merge_state); skipping."
-            exit 0
-          fi
+            # Bind the candidate to the release-plz identity: the Release PR
+            # is opened with the same RELEASE_PLZ_TOKEN PAT the merge below
+            # authenticates with, so its author must be the token's own
+            # login. This viewer lookup must run with the PAT (it resolves
+            # the PAT's identity, not the workflow's). Together with the
+            # same-repo check above, this pins the merge target to the
+            # repository-managed release-plz PR — a PR that merely imitates
+            # the branch-name/title shape never qualifies. The PAT identity
+            # cannot change mid-run, so the lookup runs once and is cached
+            # across loop iterations.
+            if [[ -z "${viewer:-}" ]]; then
+              if ! viewer=$(GH_TOKEN="$RELEASE_PLZ_TOKEN" gh api graphql \
+                -f query='query { viewer { login } }' \
+                --jq '.data.viewer.login'); then
+                viewer=""
+                transient "viewer lookup with the release-plz PAT failed (transient API error?)"
+                sleep 30; continue
+              fi
+            fi
+            author=$(jq -r '.[0].author.login' <<<"$prs")
+            if [[ -z "$viewer" || "$author" != "$viewer" ]]; then
+              echo "::warning::Release PR #$number author ($author) is not the release-plz PAT identity ($viewer); refusing to auto-merge"
+              exit 0
+            fi
 
-          # Required check "CI Gate" must be green on the current head
-          # (statusCheckRollup reflects the head commit). "missing" covers
-          # a head whose checks have not started yet.
-          gate=$(jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate")]
-            | if length == 0 then "missing"
-              elif all(.conclusion == "SUCCESS") then "success"
-              else (map(.conclusion // .status // "PENDING") | join(","))
-              end' <<<"$detail")
-          if [[ "$gate" != "success" ]]; then
-            echo "CI Gate is not green on the current head (state: $gate); skipping."
-            exit 0
-          fi
+            # Pause guardrail (checked before any waiting): a human puts
+            # `hold-release` on the Release PR to stop auto-cutting (e.g. to
+            # batch more changes or hold a bad commit out of a beta); remove
+            # the label to resume. The label is already in $prs, so a held
+            # PR exits immediately instead of polling for freshness first.
+            if jq -e '.[0].labels | any(.name == "hold-release")' <<<"$prs" >/dev/null; then
+              echo "::notice::Release PR #$number carries the hold-release label; auto-merge paused until it is removed"
+              exit 0
+            fi
 
-          # --paginate walks every reviewThreads page (an unresolved thread
-          # past the first page must still block the merge); --jq emits one
-          # per-page count, summed by awk.
-          unresolved=$(gh api graphql --paginate \
-            -f query='query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
-              repository(owner: $owner, name: $repo) {
-                pullRequest(number: $pr) {
-                  reviewThreads(first: 100, after: $endCursor) {
-                    nodes { isResolved }
-                    pageInfo { hasNextPage endCursor }
+            # Chained-cut freshness gate (push runs only): the Release PR
+            # head must already contain the pushed commit — otherwise
+            # release-plz has not refreshed the PR since the push, and
+            # merging now would cut a release WITHOUT the change that
+            # triggered this run. Compare status "ahead"/"identical" means
+            # the PR head's history contains PUSH_SHA. Read failures are
+            # treated as not-yet-refreshed (retried within the budget).
+            if [[ "$EVENT_NAME" == "push" ]]; then
+              head_ref=$(jq -r '.[0].headRefName' <<<"$prs")
+              cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_ref" \
+                --jq '.status' 2>/dev/null) || cmp_status=""
+              if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
+                transient "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
+                sleep 30; continue
+              fi
+            fi
+
+            if ! detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup); then
+              transient "gh pr view failed for Release PR #$number (transient API error?)"
+              sleep 30; continue
+            fi
+
+            if [[ $(jq -r '.isDraft' <<<"$detail") != "false" ]]; then
+              echo "Release PR #$number is a draft; skipping."
+              exit 0
+            fi
+
+            # Strict up-to-date is enforced by the ruleset, and release-plz
+            # owns the branch content — never update the branch from here;
+            # release-plz refreshes the PR on the next push to main. On push
+            # runs a behind head is exactly the refresh being waited for.
+            merge_state=$(jq -r '.mergeStateStatus' <<<"$detail")
+            if [[ "$merge_state" == "BEHIND" ]]; then
+              transient "Release PR #$number is behind main (release-plz refreshes it)"
+              sleep 30; continue
+            fi
+
+            # UNKNOWN just means GitHub is still computing mergeability;
+            # anything else non-MERGEABLE is a real conflict.
+            mergeable=$(jq -r '.mergeable' <<<"$detail")
+            if [[ "$mergeable" == "UNKNOWN" ]]; then
+              transient "Release PR #$number mergeability is still being computed (mergeable=UNKNOWN)"
+              sleep 30; continue
+            fi
+            if [[ "$mergeable" != "MERGEABLE" ]]; then
+              echo "Release PR #$number is not mergeable (mergeable=$mergeable, mergeStateStatus=$merge_state); skipping."
+              exit 0
+            fi
+
+            # Required check "CI Gate" must be green on the current head
+            # (statusCheckRollup reflects the head commit). "missing" covers
+            # a head whose checks have not started yet. A terminal
+            # non-success conclusion is a hard skip (retrying cannot rerun a
+            # failed check); anything else (missing/pending) is transient.
+            # FAILURE also matches STARTUP_FAILURE via substring —
+            # intentional, both are terminal. NEUTRAL/SKIPPED/STALE are
+            # terminal too (a gate in those states never becomes SUCCESS),
+            # so they hard-skip rather than burn the polling budget.
+            gate=$(jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate")]
+              | if length == 0 then "missing"
+                elif all(.conclusion == "SUCCESS") then "success"
+                else (map(.conclusion // .status // "PENDING") | join(","))
+                end' <<<"$detail")
+            if [[ "$gate" != "success" ]]; then
+              if grep -Eq 'FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED|NEUTRAL|SKIPPED|STALE' <<<"$gate"; then
+                echo "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
+                exit 0
+              fi
+              transient "CI Gate is not green on the current head (state: $gate)"
+              sleep 30; continue
+            fi
+
+            # --paginate walks every reviewThreads page (an unresolved
+            # thread past the first page must still block the merge); --jq
+            # emits one per-page count, summed by awk. pipefail makes a gh
+            # failure fail the whole pipeline (awk still prints 0, but the
+            # substitution's exit status is gh's), so a flaked read retries
+            # instead of being mistaken for "no unresolved threads".
+            if ! unresolved=$(gh api graphql --paginate \
+              -f query='query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100, after: $endCursor) {
+                      nodes { isResolved }
+                      pageInfo { hasNextPage endCursor }
+                    }
                   }
                 }
-              }
-            }' \
-            -f owner="${GITHUB_REPOSITORY%/*}" \
-            -f repo="${GITHUB_REPOSITORY#*/}" \
-            -F pr="$number" \
-            --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' \
-            | awk '{ sum += $1 } END { print sum + 0 }')
-          if [[ "$unresolved" -ne 0 ]]; then
-            echo "Release PR #$number has $unresolved unresolved review thread(s); skipping."
-            exit 0
-          fi
+              }' \
+              -f owner="${GITHUB_REPOSITORY%/*}" \
+              -f repo="${GITHUB_REPOSITORY#*/}" \
+              -F pr="$number" \
+              --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' \
+              | awk '{ sum += $1 } END { print sum + 0 }'); then
+              transient "reviewThreads query failed for Release PR #$number (transient API error?)"
+              sleep 30; continue
+            fi
+            if [[ "$unresolved" -ne 0 ]]; then
+              echo "Release PR #$number has $unresolved unresolved review thread(s); skipping."
+              exit 0
+            fi
 
-          if [[ "$DRY_RUN" == "true" ]]; then
-            echo "DRY RUN: would squash-merge Release PR #$number ($title)."
-            exit 0
-          fi
+            # Re-check the throttle at merge time: a push run may have spent
+            # minutes polling, and the previous cut's tag may only have been
+            # pushed (by release-plz.yml) after this run's early check.
+            # Accepted residual race: between a cut's squash-merge and
+            # release-plz.yml pushing its tag (a couple of minutes), this
+            # re-check still sees only the previous tag and fails open — a
+            # queued run whose freshness + CI Gate checks pass inside that
+            # window could cut twice in quick succession. In practice CI
+            # latency on the refreshed Release PR head keeps the window
+            # closed, and a double cut is wasteful but harmless (two valid
+            # releases), so no cut-in-progress detection is layered on.
+            throttle
 
-          # Squash-merge with the PAT so the push to main triggers
-          # release-plz.yml (tag push → cargo-dist build → beta manifest).
-          # The squash commit title defaults to the single release commit's
-          # message, which release-plz writes in the same conventional form
-          # as the PR title. A failure here is not fatal: the PR state may
-          # have changed under us, and the next scheduled run retries.
-          if GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --squash; then
-            echo "Squash-merged Release PR #$number ($title); release-plz.yml now cuts the tag and the beta publishes automatically."
-          else
-            echo "::warning::gh pr merge failed for Release PR #$number (state changed under us?); the next scheduled run retries"
-          fi
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "DRY RUN: would squash-merge Release PR #$number ($title)."
+              exit 0
+            fi
+
+            # Squash-merge with the PAT so the push to main triggers
+            # release-plz.yml (tag push → cargo-dist build → beta manifest).
+            # The squash commit title defaults to the single release
+            # commit's message, which release-plz writes in the same
+            # conventional form as the PR title. A failure here is not
+            # fatal: the PR state may have changed under us, and the next
+            # scheduled run retries.
+            if GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --squash; then
+              echo "Squash-merged Release PR #$number ($title); release-plz.yml now cuts the tag and the beta publishes automatically."
+            else
+              echo "::warning::gh pr merge failed for Release PR #$number (state changed under us?); the next scheduled run retries"
+            fi
+            exit 0
+          done
