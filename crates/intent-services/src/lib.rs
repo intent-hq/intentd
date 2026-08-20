@@ -7249,6 +7249,52 @@ fn apply_status_transition(task: &mut TaskMetadata, status: TaskStatus, now: &st
     }
 }
 
+/// Record/remove the caller agent's flipped-completion pairs when a task-note
+/// status write crosses the `complete` boundary. Recording requires an agent
+/// caller and skips the agent's own linked task note (its completion is
+/// already stamped as a wake trigger separately); a transition back out of
+/// `complete` removes the pair for every recording agent — the flip is stale
+/// regardless of who reverted it. Best-effort: failures are logged, never
+/// surfaced to the status write.
+async fn track_flipped_completion_boundary(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    was_complete: bool,
+    is_complete: bool,
+    now: &str,
+) {
+    if !was_complete && is_complete {
+        let Some(agent_id) = caller_agent_id else {
+            return;
+        };
+        match store.get_agent_session(agent_id).await {
+            // The agent's own linked task note is excluded.
+            Ok(session) if session.task_note_id.as_ref() == Some(note_id) => {}
+            Ok(_) => {
+                if let Err(e) = store
+                    .record_agent_flipped_completion(agent_id, workspace_id, note_id, now)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id.0, note = %note_id.0, error = %e, "record agent flipped completion failed");
+                }
+            }
+            // No session (e.g. deleted) → nothing to record against.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id.0, error = %e, "flipped-completion caller session lookup failed");
+            }
+        }
+    } else if was_complete && !is_complete {
+        if let Err(e) = store
+            .remove_agent_flipped_completions_for_task(workspace_id, note_id)
+            .await
+        {
+            tracing::warn!(note = %note_id.0, error = %e, "remove agent flipped completions failed");
+        }
+    }
+}
+
 /// Build a fresh task-note metadata with the markAsTask enrichment timestamps.
 fn fresh_task_metadata(status: TaskStatus, now: &str, peer_order: Option<i64>) -> TaskMetadata {
     let mut task = TaskMetadata {
@@ -17801,16 +17847,24 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
+                // A complete-boundary crossing records/removes the caller's
+                // flipped-completion pair (later stamped as a wake trigger).
+                track_flipped_completion_boundary(
+                    &store,
+                    caller_agent_id.as_ref(),
+                    &note.workspace_id,
+                    &note.id,
+                    previous_status == TaskStatus::Complete,
+                    new_status == TaskStatus::Complete,
+                    &now,
+                )
+                .await;
                 // LC-1: agent-attributed changes carry provenance — resolve the
                 // caller's display name best-effort for the agent actor.
-                let agent = match caller_agent_id {
+                let agent = match &caller_agent_id {
                     Some(agent_id) => Some((
                         agent_id.0.clone(),
-                        store
-                            .get_agent_session(&agent_id)
-                            .await
-                            .ok()
-                            .map(|s| s.name),
+                        store.get_agent_session(agent_id).await.ok().map(|s| s.name),
                     )),
                     None => None,
                 };
@@ -18145,6 +18199,19 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now.clone();
             store.update_note(&note).await?;
+            // A markAsTask that crosses the complete boundary records/removes
+            // the caller's flipped-completion pair, exactly like
+            // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
+            track_flipped_completion_boundary(
+                &store,
+                caller_agent_id.as_ref(),
+                &note.workspace_id,
+                &note.id,
+                previous_status == Some(TaskStatus::Complete),
+                new_status == TaskStatus::Complete,
+                &now,
+            )
+            .await;
             let agent = resolve_event_agent(&store, caller_agent_id.as_ref()).await;
             // The note's metadata changed, so subscribers need to refetch it
             // (§6.5) — without this a task-ness flip is invisible until the
