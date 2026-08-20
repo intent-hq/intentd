@@ -36,12 +36,12 @@ use intent_core::{
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
-    TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
+    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRootId, WorkspaceId,
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
@@ -1867,6 +1867,90 @@ impl Services {
     /// seq-0 snapshot is self-sufficient for client status rendering.
     pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
         self.store.count_task_stats(workspace_id).await
+    }
+
+    /// Merge externally known PRs into each list row's `pullRequests` for the
+    /// `workspace.list` / `workspace.subscribe` seq-0 emit paths: PRs
+    /// persisted on the workspace's secondary git roots
+    /// (`workspace_git_root.pull_requests`, monorepo#2053) and PRs known to
+    /// agent PR monitors (active + completed; cancelled excluded — the same
+    /// pool the FE builds after opening a workspace, PROTOCOL §6.9). Purely
+    /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
+    /// stays daemon-owned, and no forge calls are made (rung 1 of the
+    /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
+    /// O(PR-bearing rows) regardless of workspace count). Dedup is by PR
+    /// `url` — the one field every source carries that stays unambiguous
+    /// across repos — first-wins in source-priority order: workspace's own
+    /// PRs, then git-root PRs, then monitor-derived entries. A row with
+    /// nothing to merge is left untouched (a `None` stays omitted on the
+    /// wire, and an empty git-root list contributes nothing rather than
+    /// materializing `[]`); a store read failure degrades to serving the
+    /// base rows. `include_archived` mirrors the list call's flag so the
+    /// bulk reads never pay for archived workspaces the list won't return.
+    pub(crate) async fn merge_external_pull_requests(
+        &self,
+        list: &mut [Workspace],
+        include_archived: bool,
+    ) {
+        use std::collections::HashMap;
+        let roots = match self
+            .store
+            .list_workspace_git_roots_with_prs(include_archived)
+            .await
+        {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
+                Vec::new()
+            }
+        };
+        let monitors = match self
+            .store
+            .load_non_cancelled_pr_monitors(include_archived)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(error = %e, "workspace.list: pr monitor read failed; skipping");
+                Vec::new()
+            }
+        };
+        if roots.is_empty() && monitors.is_empty() {
+            return;
+        }
+        // Group externally sourced PRs per workspace, git-root entries before
+        // monitor-derived ones so the first-wins dedup below encodes the
+        // source priority. Empty lists are skipped so they can't flip an
+        // omitted workspace `pullRequests` into `[]`.
+        let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
+        for root in &roots {
+            if let Some(prs) = &root.pull_requests {
+                if prs.is_empty() {
+                    continue;
+                }
+                extras
+                    .entry(root.workspace_id.0.clone())
+                    .or_default()
+                    .extend(prs.iter().cloned());
+            }
+        }
+        for monitor in &monitors {
+            extras
+                .entry(monitor.workspace_id.0.clone())
+                .or_default()
+                .push(pr_monitor::pr_monitor_pr_info(monitor));
+        }
+        for ws in list.iter_mut() {
+            let Some(candidates) = extras.remove(ws.id.as_str()) else {
+                continue;
+            };
+            let merged = ws.pull_requests.get_or_insert_with(Vec::new);
+            for info in candidates {
+                if !merged.iter().any(|p| p.url == info.url) {
+                    merged.push(info);
+                }
+            }
+        }
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -12541,6 +12625,11 @@ impl WorkspaceApi for Services {
                 total_ms = started.elapsed().as_millis() as u64,
                 "workspace.list: aggregate enrichment"
             );
+            // Emit-path PR merge: fold git-root + monitor PRs into each
+            // row's `pullRequests` (after enrichment so displayStatus
+            // derivation still sees only the persisted workspace PRs).
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             // Background backfill: active workspaces with repository_path but missing
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
@@ -12585,6 +12674,11 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 this.enrich_display_status(ws).await;
             }
+            // Emit-path PR merge, same as the full list path: the seq-0
+            // snapshot must carry the same `pullRequests` a later
+            // `workspace.list` would.
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             Ok(list)
         })
     }

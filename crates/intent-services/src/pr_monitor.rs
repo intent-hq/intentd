@@ -32,7 +32,7 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
-    Result, WorkspaceId,
+    PullRequestInfo, PullRequestStatus, Result, WorkspaceId,
 };
 use intent_sourcecontrol::{RepoRef, SourceControl};
 use intent_store::{NewEvent, PrMonitorPollUpdate};
@@ -299,6 +299,57 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
         v["title"] = Value::String(title);
     }
     v
+}
+
+/// Synthesize a [`PullRequestInfo`] from a monitor row — the monitor-derived
+/// entry the `workspace.list` / `workspace.subscribe` seq-0 PR merge appends
+/// when no persisted source already carries the PR. Everything is read off
+/// the persisted row (the snapshot column is parsed, never re-fetched).
+/// Mirrors the FE's `mergeMonitoredPRs` fallbacks: URL/title synthesized from
+/// the repo identity when the monitor has no snapshot yet, and status
+/// resolved as snapshot state → draft flag → `completed` ⇒ closed (terminal
+/// covers both merged and closed; don't falsely claim merged) → open.
+pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
+    let snapshot: Option<PrMonitorSnapshot> = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let status = match snapshot.as_ref().map(|s| s.requirements.state.as_str()) {
+        Some("merged") => PullRequestStatus::Merged,
+        Some("closed") => PullRequestStatus::Closed,
+        Some("draft") => PullRequestStatus::Draft,
+        _ if snapshot.as_ref().is_some_and(|s| s.requirements.is_draft) => PullRequestStatus::Draft,
+        _ if m.state == PrMonitorState::Completed => PullRequestStatus::Closed,
+        _ => PullRequestStatus::Open,
+    };
+    let url = snapshot.as_ref().map(|s| s.url.clone()).unwrap_or_else(|| {
+        format!(
+            "https://github.com/{}/{}/pull/{}",
+            m.repo_owner, m.repo_name, m.pr_number
+        )
+    });
+    let title = snapshot
+        .as_ref()
+        .map(|s| s.title.clone())
+        .unwrap_or_else(|| format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number));
+    PullRequestInfo {
+        id: m.pr_number.to_string(),
+        number: m.pr_number as u64,
+        url,
+        title,
+        status,
+        // Monitor-row timestamps stand in for the PR's own (the snapshot
+        // does not carry them), mirroring the FE merge.
+        created_at: m.created_at.clone(),
+        updated_at: m.updated_at.clone(),
+        base_ref: None,
+        head_ref: None,
+        head_sha: snapshot.as_ref().and_then(|s| s.head_sha.clone()),
+        author: None,
+        mergeable: snapshot.as_ref().and_then(|s| s.requirements.mergeable),
+        mergeable_state: None,
+        is_draft: snapshot.as_ref().map(|s| s.requirements.is_draft),
+    }
 }
 
 /// The `messageMetadata` payload attached to every PR-monitor wake delivery
