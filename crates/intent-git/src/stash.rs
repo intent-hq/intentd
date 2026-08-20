@@ -7,17 +7,21 @@
 //! helpers expose the underlying libgit2 errors so [`crate::rebase`] can classify
 //! a pop conflict apart from an unrelated pop failure.
 
+#[cfg(test)]
 use std::path::Path;
 
 use git2::{ErrorCode, Oid, Repository, Signature, StashFlags};
+#[cfg(test)]
 use intent_core::Result;
 
+#[cfg(test)]
 use crate::map_git_err;
 
 /// `git stash push --include-untracked -m <msg>`: stash the dirty worktree
 /// (including untracked files). Returns `true` when a stash was created, `false`
 /// when there was nothing to stash.
-pub fn stash_push_include_untracked(worktree_path: &Path, message: &str) -> Result<bool> {
+#[cfg(test)]
+pub(crate) fn stash_push_include_untracked(worktree_path: &Path, message: &str) -> Result<bool> {
     let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
     push_include_untracked_raw(&mut repo, message)
         .map(|oid| oid.is_some())
@@ -25,7 +29,8 @@ pub fn stash_push_include_untracked(worktree_path: &Path, message: &str) -> Resu
 }
 
 /// `git stash pop`: apply the most recent stash and drop it on success.
-pub fn stash_pop(worktree_path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn stash_pop(worktree_path: &Path) -> Result<()> {
     let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
     pop_raw(&mut repo).map_err(map_git_err)
 }

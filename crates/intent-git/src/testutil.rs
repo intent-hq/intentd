@@ -88,13 +88,13 @@ pub fn checkout_branch(worktree: &Path, name: &str) {
 }
 
 /// Write a loose blob into the object DB and return its SHA.
-pub fn write_blob(worktree: &Path, bytes: &[u8]) -> String {
+pub(crate) fn write_blob(worktree: &Path, bytes: &[u8]) -> String {
     let repo = Repository::open(worktree).unwrap();
     repo.blob(bytes).unwrap().to_string()
 }
 
 /// Commit the superproject's current index with `msg` (HEAD advances).
-pub fn commit_super_index(super_path: &Path, msg: &str) {
+pub(crate) fn commit_super_index(super_path: &Path, msg: &str) {
     let repo = Repository::open(super_path).unwrap();
     let mut index = repo.index().unwrap();
     let tree_oid = index.write_tree().unwrap();
@@ -108,7 +108,7 @@ pub fn commit_super_index(super_path: &Path, msg: &str) {
 /// Point the gitlink at `sub_rel` to `sha` and commit — how an upstream
 /// bumps a submodule pin (the gitlink target need not exist in the
 /// superproject's odb, exactly like the real thing).
-pub fn commit_gitlink_bump(super_path: &Path, sub_rel: &str, sha: &str) {
+pub(crate) fn commit_gitlink_bump(super_path: &Path, sub_rel: &str, sha: &str) {
     let repo = Repository::open(super_path).unwrap();
     let mut index = repo.index().unwrap();
     let entry = git2::IndexEntry {
@@ -135,7 +135,7 @@ pub fn commit_gitlink_bump(super_path: &Path, sub_rel: &str, sha: &str) {
 /// default (CVE-2022-39253), which would fail a recursive clone /
 /// `submodule update --init` of local fixtures. Production caches GitHub
 /// repos over https and never hits this override.
-pub fn allow_file_submodules() {
+pub(crate) fn allow_file_submodules() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         std::env::set_var("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=always'");

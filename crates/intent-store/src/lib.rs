@@ -12,6 +12,7 @@ use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
 
+mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
 mod attachment_repo;
@@ -48,24 +49,25 @@ mod workspace_git_root_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
+pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
+pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    AgentUsageRow, InterruptedAgent, MessageFtsMatch, ReplaceMessage, SessionMessageProjection,
-    PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, ReplaceMessage, SessionMessageProjection, PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::AttachmentRecord;
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
-pub use diffs_repo::{DiffRow, NewDiff};
+pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
-pub use note_version_repo::MAX_NOTE_VERSIONS;
+#[cfg(test)]
+pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::PrMonitorPollUpdate;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
-pub use stop_redelivery_repo::StopRedeliveryRow;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
-pub use transfer_repo::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
+pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 
@@ -275,15 +277,6 @@ impl Store {
             write_pool,
             read_pool,
         })
-    }
-
-    /// Wrap an already-configured pool (e.g. for tests or shared composition).
-    /// The single pool is used for both reads and writes in test scenarios.
-    pub fn from_pool(pool: SqlitePool) -> Self {
-        Self {
-            write_pool: pool.clone(),
-            read_pool: pool,
-        }
     }
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
@@ -565,7 +558,7 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
 /// raise to 56 (intent-hq/intentd#296) roughly doubles the potential
 /// concurrent-agent read load, so the pool doubles to 32 to preserve the
 /// pool/agent-cap headroom ratio.
-pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
+pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false)

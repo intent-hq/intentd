@@ -40,7 +40,10 @@ use intent_store::{NewTrackedChange, Store};
 /// shared-path shrink, re-growth records as 0 until the diff exceeds a stale
 /// sibling's historical max (inherent to cumulative full-diff counters).
 /// Callers feed this growth into the global usage-stats recording (D5).
-pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result<(u64, u64)> {
+pub(crate) async fn track_change(
+    store: &Store,
+    mut change: NewTrackedChange,
+) -> Result<(u64, u64)> {
     change.path = normalize_path(&change.path);
     let prev = store.upsert_tracked_change(&change).await?;
     let (own_additions, own_deletions) = prev.unwrap_or((0, 0));
@@ -71,7 +74,7 @@ pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result
 /// Normalize a file path for consistent attribution lookups (parity with
 /// `attribution-engine.ts` `normalizePath`): backslashes → `/`, strip leading
 /// `/` and `./`, drop trailing `/`, and collapse repeated slashes.
-pub fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }

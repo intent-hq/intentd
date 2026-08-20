@@ -1940,6 +1940,13 @@ impl Services {
     /// a fixed number of store queries regardless of session count, and no
     /// message row beyond each session's newest user/assistant pair is ever
     /// fetched or decoded — full transcripts are never hydrated.
+    ///
+    /// List-payload cost contract (monorepo#2932): `metadata.initialMessage`
+    /// — the full spawn-time first message, the single largest per-session
+    /// field on real workspaces — is detail-only (no list-context consumer)
+    /// and is OMITTED from every row here; `agent.get` / `agent.getSession`
+    /// still serve it. Keeps a ~100-session response well under the 1 MiB
+    /// outbound frame warn threshold.
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
         let sessions = self
             .store
@@ -1970,6 +1977,9 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
+                // monorepo#2932: detail-only — omitted from list rows (see
+                // the doc comment above); `agent.get` still serves it.
+                lite.metadata.initial_message = None;
                 lite
             })
             .collect())
@@ -5577,15 +5587,22 @@ impl Services {
                 }]
             });
             // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
-            // the reporting child's linked task-note id so the delivery path
-            // can compute the "tasks now unblocked" section fresh at render
-            // time. Only the triggering fact is stored here.
+            // the reporting child's linked task-note id plus its recorded
+            // flipped completions (consumed here — this report wake is the
+            // completion cycle's one wake, since it disarms the idle-time
+            // delivery) so the delivery path can compute the "tasks now
+            // unblocked" section fresh at render time. Only the triggering
+            // facts are stored here.
+            let mut trigger_tasks: Vec<(String, String)> = Vec::new();
             if let Some(note_id) = &task_note_id {
-                ready_delta::stamp_trigger_tasks(
-                    &mut metadata,
-                    &[(workspace_id.0.clone(), note_id.0.clone())],
-                );
+                trigger_tasks.push((workspace_id.0.clone(), note_id.0.clone()));
             }
+            for pair in self.take_flipped_completion_triggers(&caller).await {
+                if !trigger_tasks.contains(&pair) {
+                    trigger_tasks.push(pair);
+                }
+            }
+            ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             // Machine-readable disarm flag (monorepo#2060 parity, the
             // `hookStillActive` twin): present iff this call flipped a watch;
             // omitted entirely when nothing was disarmed.
@@ -5593,16 +5610,50 @@ impl Services {
                 metadata["watchStillArmed"] = json!(false);
             }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
-            if let Err(e) = self
+            match self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
                 .await
             {
-                tracing::warn!(
-                    error = %e,
-                    parent = %parent.0,
-                    child = %caller.0,
-                    "failed to deliver reportToParent wake to parent"
-                );
+                Ok(_) => {
+                    // monorepo#2889: the parent just heard THIS report cycle —
+                    // record its identity (the report timestamp, the same
+                    // #2842 identity) in the per-pair delivery marker so the
+                    // same cycle's completion wake cannot re-embed the report
+                    // body. The `report_delivered` watch flag alone does not
+                    // survive the cycle: every re-arm path (agent.watch
+                    // adoption, SUB-1 sender auto-subscribe, watch reuse)
+                    // clears it as fresh interest (monorepo#2532), and a
+                    // parent with NO watch at report time still receives this
+                    // wake. The marker skip in
+                    // `deliver_completion_to_watches` leaves the watch ARMED,
+                    // so a re-armed watch still fires on a FUTURE cycle (new
+                    // timestamp). Grouped children never reach here (their
+                    // report defers to the aggregated wake), and a failed
+                    // send records nothing (the parent never heard the
+                    // report, so the completion wake must still carry it).
+                    // Best-effort: a write failure only restores the pre-fix
+                    // duplicate for this cycle.
+                    if let Err(e) = self
+                        .store
+                        .record_completion_wake_delivery(&parent, &caller, &saved_at, &now_iso())
+                        .await
+                    {
+                        tracing::warn!(
+                            parent = %parent.0,
+                            child = %caller.0,
+                            error = %e,
+                            "completion wake dedup record failed at reportToParent delivery"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        parent = %parent.0,
+                        child = %caller.0,
+                        "failed to deliver reportToParent wake to parent"
+                    );
+                }
             }
             // Marking flips the parent's waiting projection (report_delivered
             // watches are excluded), so publish the refreshed flags in the
@@ -7253,6 +7304,84 @@ impl Services {
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
+    /// The explicit-registration idle-target guard (monorepo#2972): a
+    /// RuntimeIdle target with NO waiting reason — nothing pending that
+    /// could ever produce a "next completion" — is rejected, because
+    /// accepting it either fires an instant synthetic wake replaying the
+    /// stale report (settled shape) or leaves a permanently-armed dead
+    /// watch (unsettled shape). Waiting reasons that keep the target
+    /// watchable: a ready-to-send queue entry or a busy worker (about to
+    /// run), an unresolved attention request (runs when the user answers),
+    /// pending structured questions (same parked-on-user-input shape),
+    /// live outgoing completion watches (runs when a watched target
+    /// settles), live event subscriptions (matching events wake it — same
+    /// accept-and-defer shape as hooks), an interrupted row (the resume
+    /// sweep re-runs it), active hooks, or active PR monitors (both wake
+    /// it on fire — the monorepo#2532 Gap B accept-and-defer shape).
+    /// Applied ONLY by the explicit registration ops (`agent.watch` /
+    /// `app.agents.waitFor`) and only AFTER the `check_watch_scope` gate:
+    /// out-of-scope targets must keep failing on scope alone, so the guard
+    /// cannot leak a foreign agent's idle/nothing-pending state.
+    /// Auto-subscribe paths pair the watch with a message that wakes the
+    /// target, and boot rehydration must keep delivering missed wakes.
+    /// Store probes fail open (accept): a false accept only reproduces the
+    /// pre-guard behavior, a false reject would block a legitimate watch.
+    async fn check_idle_target_watchable(&self, target_session: &AgentSession) -> Result<()> {
+        if !matches!(target_session.status, AgentStatus::RuntimeIdle) {
+            return Ok(());
+        }
+        let target_id = &target_session.id;
+        if self.has_ready_to_send(target_id)
+            || self.agent_is_busy(target_id.clone())
+            || target_session.attention_request_kind.is_some()
+            || self.agent_is_waiting_on_agents(target_id)
+            || !self
+                .list_event_subscriptions_for_agent(target_id)
+                .is_empty()
+            || self.pending_question_count(target_id).await > 0
+        {
+            return Ok(());
+        }
+        match self.store.get_interrupted_agent(target_id).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "idle-target watch guard: interrupted_agent check failed for {}: {e}",
+                    target_id.0
+                );
+                return Ok(());
+            }
+        }
+        match self.store.count_active_hooks_by_agent(target_id).await {
+            Ok(0) => {}
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "idle-target watch guard: active-hook count failed for {}: {e}",
+                    target_id.0
+                );
+                return Ok(());
+            }
+        }
+        if !self
+            .active_pr_monitors_for_agent(target_id)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        Err(Error::InvalidParams(format!(
+            "agent {} is idle with nothing pending (no active hooks, no PR monitors, \
+             no event subscriptions, no queued messages, no outgoing waits, no \
+             unresolved attention request or pending questions, no interrupted turn) — \
+             it has no future completion to watch. Wake it instead: agent.send \
+             delivers a message and auto-arms a completion watch on the sender, or \
+             agent.wakeOrCreate resumes its task",
+            target_id.0
+        )))
+    }
+
     /// `agent.watch` (monorepo#1229): explicit caller→target subscription to
     /// the target's harness-curated completion set — idle/completed, failed,
     /// deleted, blocker raised, discussion requested. Unlike the
@@ -7261,7 +7390,9 @@ impl Services {
     /// `agent_request_attention_op` wakes it). The registration is durably
     /// persisted before returning. Fails closed on a nonexistent target and
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
-    /// cross-workspace targets for non-chief callers.
+    /// cross-workspace targets for non-chief callers, and the idle-target
+    /// guard (monorepo#2972, [`Services::check_idle_target_watchable`])
+    /// rejects a RuntimeIdle target with no waiting reason.
     pub(crate) async fn agent_watch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -7285,6 +7416,15 @@ impl Services {
         // `agent_watch_completion_op`.
         let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
         let caller_home_ws = resolved_home.unwrap_or_else(|| workspace_id.clone());
+        // Scope gate BEFORE the idle-target guard: an out-of-scope target
+        // must fail on scope alone, so the guard cannot leak a foreign
+        // agent's idle/nothing-pending state. (`register_agent_watch_durable`
+        // re-checks the same gate as the single-registration-path backstop.)
+        crate::agent_subscriptions::check_watch_scope(
+            &caller_home_ws,
+            &target_session.workspace_id,
+        )?;
+        self.check_idle_target_watchable(&target_session).await?;
         let target_ws = target_session.workspace_id;
         let id = self
             .register_agent_watch_durable(
@@ -7478,7 +7618,13 @@ impl Services {
                     target.0
                 )));
             }
+            // Scope gate FIRST: an out-of-scope target must fail on scope
+            // alone, so the idle-target guard below cannot leak a foreign
+            // agent's idle/nothing-pending state.
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            // Idle-target guard (monorepo#2972): same up-front validation
+            // loop as the scope gate, so a rejection is side-effect free.
+            self.check_idle_target_watchable(&session).await?;
             // Pair uniqueness: an explicit registration on a child the caller
             // ALREADY watches (ungrouped or grouped) is rejected
             // up front — before any side-effectful registration — instead of

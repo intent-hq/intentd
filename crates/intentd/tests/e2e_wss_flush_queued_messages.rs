@@ -485,6 +485,22 @@ async fn await_prompts(prompt_log: &Path, min_lines: usize) -> Vec<String> {
     panic!("prompt log never reached {min_lines} entries");
 }
 
+/// The `agent.getConversation` user row whose first text block starts with
+/// `needle` (metadata assertions need the full row, not just its text).
+fn user_row<'a>(conv: &'a Value, needle: &str) -> &'a Value {
+    conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .find(|m| {
+            m["contentBlocks"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with(needle))
+        })
+        .unwrap_or_else(|| panic!("missing user row {needle:?}: {conv}"))
+}
+
 /// User-row texts from `agent.getConversation`, in transcript order.
 fn user_row_texts(conv: &Value) -> Vec<String> {
     conv["messages"]
@@ -597,6 +613,9 @@ fn shrink_lengths(queue_lengths: &[usize]) -> &[usize] {
 ///    echoes carry the combined turn's `turnId` — the one named by the
 ///    single `agent:queue:processing` — never a per-entry id that matches
 ///    no processing/stream lifecycle.
+/// 5. Batch grouping: both flushed rows carry the SAME
+///    `metadata.queueInfo.batchId` on `agent.getConversation`; the direct
+///    kick-off row carries none.
 #[tokio::test]
 async fn flush_combines_queued_messages_into_one_turn_over_wss() {
     let Some(script) = gate("WSS queued-message flush E2E") else {
@@ -719,6 +738,24 @@ async fn flush_combines_queued_messages_into_one_turn_over_wss() {
         "combined header is wire-only, never a transcript row: {users:?}"
     );
 
+    // (5) Batch grouping stamp: both flushed rows share ONE
+    // metadata.queueInfo.batchId; the kick-off row (direct send) has none.
+    let row = |needle: &str| user_row(&conv, needle);
+    let batch_id = row(QUEUED_ONE)["metadata"]["queueInfo"]["batchId"]
+        .as_str()
+        .expect("flushed row carries queueInfo.batchId")
+        .to_string();
+    assert!(!batch_id.is_empty(), "batchId is a non-empty string");
+    assert_eq!(
+        row(QUEUED_TWO)["metadata"]["queueInfo"]["batchId"].as_str(),
+        Some(batch_id.as_str()),
+        "both flushed user rows share the batch's id"
+    );
+    assert!(
+        row(KICKOFF_MSG)["metadata"]["queueInfo"]["batchId"].is_null(),
+        "the direct-send kick-off row carries no batchId"
+    );
+
     // Queue is empty after the flush.
     let queue = wss_rpc(
         &mut setup.rpc,
@@ -823,6 +860,21 @@ async fn flush_disabled_drains_queue_one_turn_per_message_over_wss() {
         "per-message dequeue-wait note: {}",
         prompts[2]
     );
+
+    // One-at-a-time drains group nothing: no user row carries a batchId.
+    let conv = wss_rpc(
+        &mut setup.rpc,
+        20,
+        "agent.getConversation",
+        json!({ "agentId": setup.agent_id }),
+    )
+    .await;
+    for needle in [KICKOFF_MSG, QUEUED_ONE, QUEUED_TWO] {
+        assert!(
+            user_row(&conv, needle)["metadata"]["queueInfo"]["batchId"].is_null(),
+            "single-message drains never stamp a batchId: {needle:?}"
+        );
+    }
 }
 
 /// FLUSH-3 (`agents.flushQueuedMessages = "systemOnly"` in `config.toml`):

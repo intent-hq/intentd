@@ -10,14 +10,14 @@ use tokio::net::TcpListener;
 
 /// One captured request: the raw head (request line + headers) and body.
 #[derive(Debug, Clone)]
-pub struct CapturedRequest {
+pub(crate) struct CapturedRequest {
     pub head: String,
     pub body: Vec<u8>,
 }
 
 impl CapturedRequest {
     /// The request body as (lossy) UTF-8 — fine for multipart text asserts.
-    pub fn body_text(&self) -> String {
+    pub(crate) fn body_text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 }

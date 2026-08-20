@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 
 /// Every provider `host.providerAuthStatus` can probe, in response order.
-pub const AUTH_PROBE_PROVIDERS: &[&str] = &[
+pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "auggie",
     "claude-code",
     "codex",

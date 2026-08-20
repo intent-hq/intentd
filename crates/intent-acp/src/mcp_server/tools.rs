@@ -24,7 +24,7 @@ const fn p(name: &'static str, ty: &'static str, required: bool) -> Param {
 }
 
 /// A tool definition: name, human description, and its parameter list.
-pub struct ToolDef {
+pub(crate) struct ToolDef {
     /// Registry tool name (`workspace_api`); agents see it with the
     /// provider-appended server suffix (`workspace_api_workspace-mcp`).
     pub name: &'static str,
@@ -86,7 +86,7 @@ impl ToolDef {
 
 /// The full tool registry (pre-denylist). Returns the chief variant when
 /// `is_chief` is true (full `ws.app.*` surface), base variant otherwise.
-pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
+pub(crate) fn all_tools(is_chief: bool) -> &'static [ToolDef] {
     if is_chief {
         ALL_TOOLS_CHIEF
     } else {
@@ -121,7 +121,7 @@ pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
 /// matching `bindings/<ns>.rs`, preventing silent drift when the description
 /// or the bindings change; `namespace_index_matches_documented_surface`
 /// keeps the index in lockstep with the API sections.
-pub const WORKSPACE_API_DESCRIPTION: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
+pub(crate) const WORKSPACE_API_DESCRIPTION: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
 
 Rules:
   - Your code is wrapped in `(async () => { ... })()` before execution.
@@ -221,7 +221,7 @@ API:
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
-  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars).
@@ -326,7 +326,7 @@ Examples (the final one shows the N+1 pattern: list items first, then batch-read
 /// Chief-workspace variant of [`WORKSPACE_API_DESCRIPTION`]: includes the
 /// full `ws.app.*` surface (agents, settings, specialists, ui, workspaces).
 /// Reference wording from `workspace-js-api-tool.ts` lines 58–78.
-pub const WORKSPACE_API_DESCRIPTION_CHIEF: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
+pub(crate) const WORKSPACE_API_DESCRIPTION_CHIEF: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
 
 Rules:
   - Your code is wrapped in `(async () => { ... })()` before execution.
@@ -449,7 +449,7 @@ API:
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
-  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps.
@@ -892,7 +892,7 @@ pub(super) fn help_namespace(
 /// carry options; when it is empty — the all-defaults case — the assembled
 /// text is returned unchanged, so the default description stays
 /// byte-identical by construction.
-pub fn workspace_api_description_with_model_options(
+pub(crate) fn workspace_api_description_with_model_options(
     is_chief: bool,
     features: &AgentFeaturesSettings,
     model_options: &[SpecialistModelOptions],

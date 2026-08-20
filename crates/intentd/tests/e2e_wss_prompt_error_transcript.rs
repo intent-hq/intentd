@@ -317,6 +317,161 @@ fn blocks_text(message: &Value) -> String {
     serde_json::to_string(&message["contentBlocks"]).unwrap_or_default()
 }
 
+/// The observed monorepo#3007 failure detail: a Node fetch EPIPE with the
+/// provider's `apiStatus: unavailable` JSON, wrapped in a -32603 `data`.
+const FETCH_EPIPE_UNAVAILABLE: &str = "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
+    {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}";
+
+/// Regression for monorepo#3007 over the real WSS transport: the provider
+/// fails `session/prompt` twice with a transient fetch failure (`-32603`
+/// wrapping EPIPE + `apiStatus: unavailable`, zero output streamed), then
+/// succeeds. The daemon must retry in place on the same connection — the
+/// turn completes with the third attempt's response, NO `agent:failed` is
+/// emitted, and the session never parks in `error`.
+#[tokio::test]
+async fn transient_prompt_fetch_failure_retries_in_place_over_wss() {
+    let Some(script) = gate("WSS transient prompt retry E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let attempt_file = data_dir.join("attempts.txt");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // Transient shape, output-free: NO streamBeforeErrorText — the failed
+    // attempts stream nothing, so the in-place retry guard stays armed.
+    let behavior = json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": FETCH_EPIPE_UNAVAILABLE,
+        },
+        "promptRpcErrorAttempts": 2,
+        "response": "recovered after transient fetch failures",
+    })
+    .to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
+        ("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10"),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-3007-RETRY", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "prompt that blips" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The turn must settle successfully: agent:stream:end WITHOUT any
+    // agent:failed or status=error along the way — the two transient
+    // failures are absorbed by the in-place retry.
+    let mut saw_end = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => {
+                panic!("agent:failed emitted despite in-place retry (monorepo#3007): {frame}");
+            }
+            Some("agent:status-changed") if event["data"]["status"] == "error" => {
+                panic!("session parked in error despite in-place retry: {frame}");
+            }
+            Some("agent:stream:end") => {
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_end, "turn completed after transient-failure retries");
+
+    // Exactly three attempts hit the mock: initial + 2 retries. The attempt
+    // file holds the NEXT attempt number, so 3 calls leave "4".
+    let attempts = std::fs::read_to_string(&attempt_file).unwrap_or_default();
+    assert_eq!(
+        attempts.trim(),
+        "4",
+        "mock served exactly 3 session/prompt attempts (initial + 2 retries)"
+    );
+
+    // The recovered response persisted as the turn's assistant row and the
+    // session is NOT in error.
+    let convo = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = convo["messages"]
+        .as_array()
+        .expect("conversation messages array");
+    assert!(
+        messages.iter().any(|m| m["role"] == "assistant"
+            && blocks_text(m).contains("recovered after transient fetch failures")),
+        "recovered turn's response persisted: {convo}"
+    );
+    let session = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_ne!(
+        session["session"]["status"], "error",
+        "recovered turn must not park the session in error: {session}"
+    );
+}
+
 /// PROMPTERR-1 (#479): provider streams a warning chunk then fails the prompt
 /// with a JSON-RPC -32603 carrying the real detail in `data`. The daemon must
 /// (1) persist the pre-error chunk so `agent.getConversation` returns it,

@@ -127,7 +127,7 @@ fn slim_image(block: &mut Value, ordinal: usize, thumbnails: Option<&Value>) {
 /// Return `input` augmented with `_acpTitle = title` when `title` is non-empty.
 /// A `Null` input is coerced to `{}` so the marker can attach; non-object,
 /// non-null inputs (arrays / scalars) pass through verbatim.
-pub fn attach_acp_title(input: Value, title: &str) -> Value {
+pub(crate) fn attach_acp_title(input: Value, title: &str) -> Value {
     if title.is_empty() {
         return match input {
             Value::Null => Value::Object(Map::new()),
@@ -169,14 +169,14 @@ pub fn build_tool_use_block(
 /// MIME type identifying a proposal resource content item (§7.1). Aliases the
 /// bindings' canonical constant (parity with the FE contract in
 /// `cloudlands-fe/src/shared/types/proposal-resource.ts`).
-pub const PROPOSAL_RESOURCE_MIME: &str = intent_acp::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE;
+pub(crate) const PROPOSAL_RESOURCE_MIME: &str = intent_acp::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE;
 
 /// Find the first well-formed proposal resource item in a `tool_result` output
 /// array: `{ type: "resource", resource: { mimeType: <proposal MIME>, text } }`
 /// with `text` a string (the JSON the FE parses into a `Proposal`). Returns
 /// `None` for a non-array output, no matching item, or a malformed resource
 /// (wrong MIME, missing/non-string `text`).
-pub fn find_proposal_resource(output: &Value) -> Option<&Value> {
+pub(crate) fn find_proposal_resource(output: &Value) -> Option<&Value> {
     output.as_array()?.iter().find(|item| {
         item.get("type").and_then(Value::as_str) == Some("resource")
             && item.get("resource").is_some_and(|r| {

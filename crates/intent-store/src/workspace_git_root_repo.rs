@@ -248,6 +248,35 @@ impl Store {
         rows.iter().map(root_from_row).collect()
     }
 
+    /// Every git root across ALL workspaces that carries a discovered
+    /// `pull_requests` list, oldest first — the single bulk read backing the
+    /// `workspace.list` / `workspace.subscribe` seq-0 PR merge (one query per
+    /// list call instead of one per workspace). SQL-filtered on
+    /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
+    /// owning workspace being live, so cost is O(PR-bearing roots of returned
+    /// workspaces) and a large archive never inflates the hot list paths.
+    pub async fn list_workspace_git_roots_with_prs(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<WorkspaceGitRoot>> {
+        let archived_filter = if include_archived {
+            ""
+        } else {
+            " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
+        };
+        let sql = format!(
+            "SELECT {COLUMNS} FROM workspace_git_root WHERE pull_requests IS NOT NULL\
+             {archived_filter} ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("list workspace git roots with prs failed: {e}"))
+            })?;
+        rows.iter().map(root_from_row).collect()
+    }
+
     /// Delete a git root by id; `NotFound` when absent.
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
         let res = sqlx::query("DELETE FROM workspace_git_root WHERE id = ?")

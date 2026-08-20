@@ -22,12 +22,11 @@ pub mod model;
 pub mod registry;
 pub mod token;
 
-pub use client::{SentryClient, SENTRY_API_BASE_URL};
-pub use engine::{SentryEngine, SentryEngineImpl};
+pub use engine::SentryEngine;
 pub use error::{Error, Result};
 pub use model::{
     FetchIssuesRequest, IssueStatusFilter, SentryAuthState, SentryIssueLevel, SentryIssuePage,
     SentryIssueResult, SentryIssueStatus, SentryProject,
 };
 pub use registry::{SentryRegistry, SentrySettings};
-pub use token::{Credentials, TokenSource};
+pub use token::TokenSource;

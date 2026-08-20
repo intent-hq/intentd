@@ -20,7 +20,7 @@ use crate::token_usage::{UNKNOWN_MODEL, UNKNOWN_PROVIDER};
 /// `usage_stats_hourly.bucket_utc`: `"YYYY-MM-DDTHH:00:00Z"`. Buckets are
 /// stored in UTC; local wall-clock grouping uses the [`LocalStamp`] recorded
 /// next to the bucket (D12).
-pub fn hour_bucket_utc(t: OffsetDateTime) -> String {
+pub(crate) fn hour_bucket_utc(t: OffsetDateTime) -> String {
     let t = t.to_offset(UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:00:00Z",
@@ -33,7 +33,7 @@ pub fn hour_bucket_utc(t: OffsetDateTime) -> String {
 
 /// Render the local wall-clock stamp persisted next to a UTC bucket (D12):
 /// `t` under `offset` as a calendar date (`"YYYY-MM-DD"`) plus hour-of-day.
-pub fn local_stamp(t: OffsetDateTime, offset: UtcOffset) -> LocalStamp {
+pub(crate) fn local_stamp(t: OffsetDateTime, offset: UtcOffset) -> LocalStamp {
     let l = t.to_offset(offset);
     LocalStamp {
         date: format!("{:04}-{:02}-{:02}", l.year(), u8::from(l.month()), l.day()),
@@ -50,7 +50,7 @@ pub fn local_stamp(t: OffsetDateTime, offset: UtcOffset) -> LocalStamp {
 /// client's `tzOffsetMinutes` — exactly the pre-D12 grouping behavior. (A
 /// UTC fallback stamp would be worse: readers prefer any well-formed stamp,
 /// so it would silently pin those rows to UTC wall-clock.)
-pub fn recording_local_offset() -> Option<UtcOffset> {
+pub(crate) fn recording_local_offset() -> Option<UtcOffset> {
     UtcOffset::current_local_offset().ok()
 }
 
@@ -59,7 +59,7 @@ pub fn recording_local_offset() -> Option<UtcOffset> {
 /// per counter. The clamp absorbs snapshot regressions — e.g. the first
 /// report of a recreated ACP session restarting from zero — at the cost of
 /// under-counting that one turn, which is preferable to a huge bogus delta.
-pub fn turn_token_delta(
+pub(crate) fn turn_token_delta(
     prev: Option<&TokenUsageTotals>,
     next: &TokenUsageTotals,
 ) -> TokenUsageTotals {
@@ -152,7 +152,7 @@ fn split_glued_digits(token: &str) -> impl Iterator<Item = &str> {
 /// known family" apart from the raw passthrough — display strings like
 /// `"Opus 4.8 with 1M context · Best for everyday, complex tasks"` tokenize
 /// on spaces and resolve to `"Opus 4.8"`.
-pub fn known_family_model_name(raw: &str) -> Option<String> {
+pub(crate) fn known_family_model_name(raw: &str) -> Option<String> {
     // Path-style provider prefixes ("anthropic/claude-...") never carry model
     // identity — keep only the final segment. Trailing bracketed suffixes
     // ("[1m]") and glued family+digit tokens ("sonnet5") are defense-in-depth
@@ -205,7 +205,7 @@ pub(crate) fn version_bearing_display<'a>(
 /// `claude-opus-4-8`, `anthropic/claude-opus-4.8-20260115`, and `Opus 4.8`
 /// all → `"Opus 4.8"`). Unrecognized non-empty ids pass through unchanged
 /// (minus any path prefix); empty/blank → `"unknown"`.
-pub fn normalize_model_name(raw: &str) -> String {
+pub(crate) fn normalize_model_name(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return UNKNOWN_MODEL.to_string();
@@ -239,7 +239,7 @@ pub(crate) fn is_placeholder_model(model: Option<&str>) -> bool {
 /// when the session row is readable, and pass `None` when even the provider
 /// is unknowable, e.g. the row read failed). `"unknown"` only on that
 /// unknowable tail.
-pub fn stats_model_key(
+pub(crate) fn stats_model_key(
     raw_model: Option<&str>,
     resolved_model: Option<&str>,
     provider_id: Option<&str>,
@@ -263,7 +263,7 @@ pub fn stats_model_key(
 /// when the session row is readable), trimmed and lowercased; `"unknown"`
 /// when the provider is unknowable — the session row read failed, or the row
 /// predates provider attribution.
-pub fn stats_provider_key(provider_id: Option<&str>) -> String {
+pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
@@ -282,7 +282,7 @@ pub fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// default.
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
-pub async fn record_session_started(
+pub(crate) async fn record_session_started(
     store: &Store,
     raw_model: Option<&str>,
     provider: Option<&str>,
@@ -318,7 +318,7 @@ pub async fn record_session_started(
 /// construction — clearing those (e.g. `metrics.clearAgentStats`) never
 /// touches `usage_stats_hourly`. Best-effort: errors are logged, never
 /// propagated.
-pub async fn record_lines_changed(
+pub(crate) async fn record_lines_changed(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: Option<&str>,

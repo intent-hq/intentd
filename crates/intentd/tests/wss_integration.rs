@@ -927,6 +927,71 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     srv.ws.stop().await;
 }
 
+/// monorepo#2932 — list-payload cost contract for `metadata.initialMessage`:
+/// the full spawn-time first message persists on the session and is served by
+/// the detail reads (`agent.get` / `agent.getSession`), but `agent.list` rows
+/// OMIT it (absent, never `null`) — it is the single largest per-session
+/// field on real workspaces and has no list-context consumer, so serving it
+/// per row scaled the frame past the 1 MiB outbound warn threshold at ~100
+/// sessions.
+#[tokio::test]
+async fn wss_agent_list_omits_initial_message() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"List Slim"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Persist an initialMessage via the create-time metadata harvest.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Slim","metadata":{{"initialMessage":"a long spawn-time first message"}}}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Detail read still serves it.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["metadata"]["initialMessage"].as_str(),
+        Some("a long spawn-time first message"),
+        "agent.get keeps serving metadata.initialMessage: {got}"
+    );
+
+    // The list row omits the field entirely.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let row = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("created agent in list");
+    assert!(
+        row["metadata"].is_object(),
+        "list row must carry a metadata object: {row}"
+    );
+    assert!(
+        row["metadata"].get("initialMessage").is_none(),
+        "agent.list rows must omit metadata.initialMessage (monorepo#2932): {row}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#564: `agent.sendMessage` to a nonexistent agent id (e.g. a
 /// truncated id) fails closed with `-32602` naming the unknown id — it must
 /// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
