@@ -1184,8 +1184,10 @@ where
 /// - registration publishes `agent:subscriptions-changed` in `__chief__`,
 /// - each target's completion delivers a `[WORKSPACE EVENTS]` wake into the
 ///   chief transcript and the consumed watches drain the registry,
-/// - a re-registered wait is removed one-at-a-time by the scoped
-///   `agent.cancelSubscriptions` (`subscriptionId`), an unknown id is
+/// - a retried wait on the settled (idle, nothing-pending) targets is
+///   rejected by the monorepo#2972 idle-target guard over the wire,
+/// - waits re-registered on fresh targets are removed one-at-a-time by the
+///   scoped `agent.cancelSubscriptions` (`subscriptionId`), an unknown id is
 ///   rejected with `-32602`, and the unscoped call removes the rest.
 #[tokio::test]
 async fn chief_waitfor_immediate_cross_workspace_over_wss() {
@@ -1205,17 +1207,40 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
               try { await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'immediate' }); }\n\
               catch (error) { duplicateError = error.message; }\n\
               return { ...first, duplicateError };";
+    // The SECOND_ROUND turn first retries the settled (RuntimeIdle,
+    // nothing-pending) targets — the monorepo#2972 idle-target guard must
+    // reject them over the wire — then registers waits on the FRESH
+    // (never-run) targets for the cancelSubscriptions arms below.
+    let round2_js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+              const settled = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
+              let idleError = null;\n\
+              try { await ws.app.agents.waitFor({ agentIds: settled, waitMode: 'immediate' }); }\n\
+              catch (error) { idleError = error.message; }\n\
+              const fresh = listing.threads.filter((t) => String(t.agentName).startsWith('Fresh ')).map((t) => t.agentId);\n\
+              const second = await ws.app.agents.waitFor({ agentIds: fresh, waitMode: 'immediate' });\n\
+              return { ...second, idleError };";
     let behavior = json!({
         "response": "ok",
-        "rules": [{
-            "ifPromptContains": "REGISTER_WAITS",
-            "toolCall": {
-                "name": "workspace_api",
-                "arguments": { "code": js, "summary": "waitFor immediate e2e" },
+        "rules": [
+            {
+                "ifPromptContains": "SECOND_ROUND",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": round2_js, "summary": "waitFor round 2 e2e" },
+                },
+                "response": "round 2 waits registered",
+                "emitToolBlocks": true,
             },
-            "response": "waits registered",
-            "emitToolBlocks": true,
-        }],
+            {
+                "ifPromptContains": "REGISTER_WAITS",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": js, "summary": "waitFor immediate e2e" },
+                },
+                "response": "waits registered",
+                "emitToolBlocks": true,
+            },
+        ],
     })
     .to_string();
     let env: [(&str, &str); 4] = [
@@ -1411,17 +1436,15 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     )
     .await;
 
-    // Re-register waits on the settled targets. They are `RuntimeIdle`
-    // WITHOUT a completion report (plain turns, no `agent.reportToParent`),
-    // so the conservative registration-time reconciliation predicate — the
-    // same one rehydration uses — treats them as re-waitable rather than
-    // settled: the fresh watches stay armed and would fire on the targets'
-    // NEXT turn end. (Terminal Completed/Error targets DO reconcile into an
-    // immediate synthetic wake — covered by the
-    // `app_agents_wait_*_reconciles_already_settled_target*` unit tests.)
+    // Round 2: a retried wait on the settled targets is REJECTED by the
+    // monorepo#2972 idle-target guard (they sit RuntimeIdle with nothing
+    // pending — no future completion to watch), then waits on two FRESH
+    // (never-run, `pending`) targets register normally.
     // → 2 fresh watches → scoped `agent.cancelSubscriptions` removes ONE by
     // `subscriptionId`, an unknown id errors, and the unscoped call removes
     // the rest — all over the wire.
+    let (_ws3_id, _f1_id) = seed_target(&mut rpc, 40, "Wait WS Three", "Fresh One").await;
+    let (_ws4_id, _f2_id) = seed_target(&mut rpc, 42, "Wait WS Four", "Fresh Two").await;
     let resp = wss_rpc_envelope(
         &mut rpc,
         30,
@@ -1429,11 +1452,27 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
         json!({
             "workspaceId": CHIEF_WORKSPACE_ID,
             "agentId": chief_id,
-            "content": "one more round: REGISTER_WAITS again",
+            "content": "one more round: SECOND_ROUND",
         }),
     )
     .await;
     assert_eq!(resp["result"]["success"], json!(true), "round 2: {resp}");
+    // The tool result surfaces the idle-target rejection for the settled
+    // targets alongside the successful fresh registrations.
+    let round2_result = poll_conversation(&mut rpc, 800, &chief_id, "round 2 tool result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v.get("idleError").is_some())
+    })
+    .await;
+    let idle_error = round2_result["idleError"]
+        .as_str()
+        .expect("settled-target retry must surface the idle-target guard error");
+    assert!(
+        idle_error.contains("idle with nothing pending"),
+        "idle-target guard rejection over the wire: {idle_error}"
+    );
     let resub = poll_subscriptions(
         &mut rpc,
         700,

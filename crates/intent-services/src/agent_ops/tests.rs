@@ -2378,10 +2378,26 @@ async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
 
     // Re-arm on the settled child: the reconcile now synthesizes the
     // REPORTED historical idle (hook gone, report + timestamp retained) —
-    // the marker recorded by the settlement wake must suppress it.
-    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
-        .await
-        .expect("re-watch");
+    // the marker recorded by the settlement wake must suppress it. The
+    // monorepo#2972 guard rejects an explicit `agent.watch` on this settled
+    // no-waiting-reason shape, so drive the registration + reconcile through
+    // the internal path (the auto-subscribe shape the guard does not gate)
+    // to keep this marker pin exercised.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-watch");
+    svc.reconcile_watch_child_on_rehydration(
+        &child,
+        &ws,
+        crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+    )
+    .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
         1,
@@ -2438,10 +2454,19 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
     assert!(svc.find_watches_for_child(&child).is_empty());
 
     // The stale wake must NOT have recorded the second cycle's identity: a
-    // re-armed watch still receives the second completion.
-    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
-        .await
-        .expect("re-watch");
+    // re-armed watch still receives the second completion. (Internal
+    // registration path: the monorepo#2972 guard rejects an explicit
+    // `agent.watch` on the settled no-waiting-reason child, and this pin is
+    // about the delivery-path identity, not the registration reconcile.)
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-watch");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -16466,6 +16491,446 @@ async fn wait_for_reconcile_defers_on_reported_idle_child_with_active_monitor() 
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "settled watch retired"
+    );
+}
+
+/// monorepo#2972 (settled flavor): `agent.watch` on a RuntimeIdle target
+/// with a persisted completion report and NO waiting reasons (no hooks, PR
+/// monitors, queued messages, outgoing watches, or interrupted row) is
+/// rejected with an actionable error — pre-fix the registration-time
+/// reconcile fired an instant synthetic wake replaying the stale report.
+#[tokio::test]
+async fn agent_watch_rejects_settled_idle_target_with_no_waiting_reasons() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("done a while ago".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+
+    let err = svc
+        .agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect_err("idle target with no waiting reasons must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.contains(&target.0), "error names the target: {msg}");
+            assert!(
+                msg.contains("agent.send") && msg.contains("wakeOrCreate"),
+                "error points at the wake alternatives: {msg}"
+            );
+        }
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "rejection is side-effect free — no watch registered"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant synthetic wake replaying the stale report"
+    );
+}
+
+/// monorepo#2972 (dead-watch flavor): `agent.watch` on a RuntimeIdle target
+/// WITHOUT a completion report and no waiting reasons is rejected too —
+/// pre-fix the conservative reconcile left the watch permanently armed for
+/// a completion that could never come (observed live: watch a173ced6, armed
+/// 25+ hours on a long-idle agent).
+#[tokio::test]
+async fn agent_watch_rejects_unreported_idle_target_with_no_waiting_reasons() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+
+    let err = svc
+        .agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect_err("unreported idle target with no waiting reasons must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}"
+    );
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "no permanently-armed dead watch left behind"
+    );
+}
+
+/// monorepo#2972 (`app.agents.waitFor` call site): the same idle-target
+/// guard rejects BOTH modes, side-effect free — no watches (not even for a
+/// valid co-target listed first) and no group.
+#[tokio::test]
+async fn app_agents_wait_rejects_idle_target_with_no_waiting_reasons() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let live = create_agent(&svc, &ws, "Live").await;
+    let idle = create_agent(&svc, &ws, "Idle").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&idle)
+        .await
+        .expect("idle session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("finished earlier".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark idle");
+
+    for mode in [None, Some("after_all".to_string())] {
+        let err = svc
+            .app_agents_wait_op(
+                ws.clone(),
+                caller.clone(),
+                vec![live.0.clone(), idle.0.clone()],
+                mode.clone(),
+            )
+            .await
+            .expect_err("waitFor including an idle no-waiting-reason target must be rejected");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&idle.0),
+                "error names the offending target: {msg}"
+            ),
+            other => panic!("expected Error::InvalidParams, got {other:?}"),
+        }
+        assert!(
+            svc.list_watches_for_parent(&caller).is_empty(),
+            "rejection leaves no watches (not even for the valid live target)"
+        );
+        assert!(
+            svc.delegation_group_for_parent(&caller).is_none(),
+            "rejection leaves no partially-initialized group"
+        );
+    }
+}
+
+/// monorepo#2972 guard boundary: a RuntimeIdle target whose pending message
+/// queue holds a ready-to-send entry WILL run again — the registration is
+/// accepted, no instant wake fires (the queue-interim classification defers
+/// the settled replay), and the watch stays armed for the real completion.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_queued_message() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("reported before the queue filled".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.enqueue_message(
+        &target,
+        "follow-up work".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("queued-message target is accepted");
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant synthetic wake — the queued message defers the replay"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed for the redriven turn's real completion"
+    );
+}
+
+/// monorepo#2972 guard boundary: an idle target with an unresolved attention
+/// request (blocker/discussion) is waiting on user input, not settled — the
+/// registration is accepted and the watch stays armed.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_pending_attention() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.store()
+        .set_attention_request(&ws, &target, "blocker", "sandbox exploded", &now_iso())
+        .await
+        .expect("set attention request");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("attention-pending target is accepted");
+    assert_eq!(parent_message_count(&svc, &watcher).await, 0);
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed until the blocker resolves and the agent completes"
+    );
+}
+
+/// monorepo#2972 guard boundary: an idle target with an interrupted row is
+/// mid-heal — the resume sweep will run it again, so the registration is
+/// accepted and defers (the settled predicate already excludes interrupted
+/// rows, so no instant wake fires either).
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_interrupted_row() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("interrupted mid-cycle".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.store()
+        .insert_interrupted_agent(&target, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("interrupted target is accepted");
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant wake — the interrupted row blocks the settled predicate"
+    );
+    assert_eq!(svc.find_watches_for_child(&target).len(), 1);
+}
+
+/// monorepo#2972 guard boundary: an idle target parked on a live
+/// `ws.event.subscribe` subscription is woken by matching events and will
+/// produce a real completion — same accept-and-defer shape as an active
+/// hook, so the registration is accepted.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_event_subscription() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("parked on events".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.register_event_subscription(
+        &ws,
+        Some(target.clone()),
+        &["file:*".to_string()],
+        None,
+        None,
+    )
+    .await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("event-subscribed target is accepted");
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed for the event-driven turn's real completion"
+    );
+}
+
+/// monorepo#2972 guard boundary: an idle target holding pending structured
+/// questions is parked on user input that will run it when answered — same
+/// waiting shape as an attention request, so the registration is accepted.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_pending_question() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let question_block = json!({
+        "type": "resource",
+        "resource": {
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "uri": "intent-question://q-guard",
+            "text": "{}"
+        }
+    });
+    let msg = svc
+        .store()
+        .append_agent_message(&target, "assistant", &json!([question_block]), &now_iso())
+        .await
+        .expect("append question message");
+    svc.record_pending_questions_marker(&ws, &target, &msg.id)
+        .await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("question-holding target is accepted");
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed until the answer runs the target to a real completion"
+    );
+}
+
+/// monorepo#2972 gate ordering: a non-chief caller naming a cross-workspace
+/// dead-idle target fails on scope ALONE at both call sites — the scope
+/// error, not the idle-guard error, so the guard cannot leak a foreign
+/// agent's idle/nothing-pending state.
+#[tokio::test]
+async fn watch_scope_gate_precedes_idle_target_guard() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let caller = create_agent(&svc, &ws_a, "Caller").await;
+    let remote = create_agent(&svc, &ws_b, "Remote").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&remote)
+        .await
+        .expect("remote session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("settled elsewhere".into());
+    svc.store()
+        .update_agent_session(&ws_b, &s)
+        .await
+        .expect("mark remote");
+
+    let watch_err = svc
+        .agent_watch_op(ws_a.clone(), caller.clone(), remote.clone())
+        .await
+        .expect_err("cross-workspace watch rejected");
+    match &watch_err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("cross-workspace") && !msg.contains("nothing pending"),
+            "agent.watch fails on scope alone, not the idle guard: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+
+    let wait_err = svc
+        .app_agents_wait_op(ws_a.clone(), caller.clone(), vec![remote.0.clone()], None)
+        .await
+        .expect_err("cross-workspace wait rejected");
+    match &wait_err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("cross-workspace") && !msg.contains("nothing pending"),
+            "app.agents.waitFor fails on scope alone, not the idle guard: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// monorepo#2972 rehydration parity: the idle-target guard applies ONLY at
+/// explicit registration. A watch armed while the target was still working
+/// and rehydrated after a restart with the target parked RuntimeIdle +
+/// report (no waiting reasons) still fires its missed wake at boot — report
+/// = settlement semantics unchanged.
+#[tokio::test]
+async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (watcher, target) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let watcher = create_agent(&svc, &ws, "Watcher").await;
+        let target = create_agent(&svc, &ws, "Target").await;
+        // Registered while the target is still un-run (guard passes), then
+        // the target settles and the daemon dies before the wake delivers.
+        svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+            .await
+            .expect("watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        let mut s = svc
+            .store()
+            .get_agent_session(&target)
+            .await
+            .expect("target session");
+        s.status = intent_core::AgentStatus::RuntimeIdle;
+        s.completion_report = Some("finished while daemon was down".into());
+        s.completion_report_timestamp = Some(now_iso());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark target");
+        (watcher, target)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &watcher).await,
+        1,
+        "missed wake still delivers at boot — rehydration semantics unchanged"
+    );
+    let text = parent_messages_text(&restarted, &watcher).await;
+    assert!(text.contains("finished while daemon was down"), "{text}");
+    assert!(
+        restarted.find_watches_for_child(&target).is_empty(),
+        "reconciled watch consumed"
     );
 }
 
