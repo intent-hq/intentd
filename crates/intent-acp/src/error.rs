@@ -162,6 +162,10 @@ const TERMINAL_MESSAGE_MARKERS: &[&str] = &[
     "status 4",
     "status: 4",
     "status code 4",
+    // JSON renderings (no space after the colon), e.g. a bridge error
+    // embedding `{"status":404,...}` verbatim.
+    "\"status\":4",
+    "\"status\": 4",
     "400 bad request",
     "401 unauthorized",
     "403 forbidden",
@@ -426,6 +430,8 @@ mod classifier_tests {
             "JSON-RPC error -32603: Internal error: invalid_request_error",
             "JSON-RPC error -32603: Internal error: model not found: claude-nope",
             "JSON-RPC error -32603: Internal error: fetch failed: 403 Forbidden",
+            // JSON status rendering (no space after the colon).
+            "JSON-RPC error -32603: Internal error: fetch failed: {\"status\":404,\"error\":\"not found\"}",
             "JSON-RPC error -32603: Internal error: invalid api key",
             "some unrelated failure",
         ] {

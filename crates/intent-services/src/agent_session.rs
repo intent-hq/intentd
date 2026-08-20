@@ -2154,6 +2154,19 @@ impl Services {
         // classification below (terminal / silent redrive / sleep-resume)
         // unchanged. Genuinely terminal errors (auth, invalid request,
         // model-not-found, 4xx) never classify transient and fail fast.
+        //
+        // Two boundary notes:
+        // - Bridge-side idempotency is assumed, not proven: the guard proves
+        //   the DAEMON attempt was output-free, but whether the provider
+        //   bridge (codex-acp / auggie) already appended the user prompt to
+        //   its session history before the failed fetch is bridge-internal.
+        //   Accepted risk: worst case the retried prompt duplicates the user
+        //   message in provider-side context (never in daemon-persisted
+        //   transcript), which is strictly better than killing the turn.
+        // - No cancel race with the backoff sleep: a user stop is delivered
+        //   by `AgentManager::interrupt`/`stop` aborting this turn worker
+        //   (`worker.abort()`), which drops this whole future — sleep, loop,
+        //   and all — so a retry can never re-dispatch after a stop.
         let mut fetch_retry_attempt: u32 = 0;
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
