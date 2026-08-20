@@ -429,6 +429,12 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         stderr.contains("External connections enabled"),
         "should report external connections were enabled: {stderr}"
     );
+    // Unattended enable keeps the persisted bind address (fresh config here,
+    // so the loopback default) and reports it (monorepo#2900).
+    assert!(
+        stderr.contains("listening on 127.0.0.1"),
+        "should report the effective bind address: {stderr}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("intent://pair?v=1&host="),

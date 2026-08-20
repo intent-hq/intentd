@@ -10634,7 +10634,8 @@ impl Services {
 
     /// Apply server runtime control hooks after `settings.update` persists
     /// `server.wsApi.*` changes (§5.12): `server.wsApi.enabled` starts/stops the
-    /// WSS listener; `server.wsApi.port` restarts it when running.
+    /// WSS listener; `server.wsApi.port` / `server.bindAddress` restart it when
+    /// running (the start path re-reads both persisted values).
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
     ///
@@ -10706,6 +10707,42 @@ impl Services {
                                     port = port,
                                     "server.wsApi.port → {}: persisted (listener not running)",
                                     port
+                                );
+                            }
+                        }
+                    }
+                    "server.bindAddress" => {
+                        if let Some(addr) = change.get("value").and_then(|v| v.as_str()) {
+                            // Check if listener is running
+                            if control.ws_listener_port().await.is_some() {
+                                // Listener is running: restart it on the new
+                                // bind address (start re-reads the persisted
+                                // value)
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarting WSS listener",
+                                    addr
+                                );
+                                control.stop_ws_listener().await;
+                                control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        bind_address = addr,
+                                        "server.bindAddress → {}: failed to restart WSS listener", addr
+                                    );
+                                    Error::Internal(format!("failed to restart WSS listener on {}: {}", addr, e))
+                                })?;
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarted WSS listener",
+                                    addr
+                                );
+                            } else {
+                                // Listener is not running: persisting the value is enough
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: persisted (listener not running)",
+                                    addr
                                 );
                             }
                         }
@@ -10893,6 +10930,11 @@ impl WorkspaceApi for Services {
                 // when server.wsApi.enabled changes, restart it when
                 // server.wsApi.port changes while running.
                 if let Some(control) = self.server_control.get() {
+                    // Remember whether the listener was up before the hooks so a
+                    // failed batch (e.g. a restart-on-new-value hook that stopped
+                    // the listener and then failed to start it) can put it back
+                    // up after the persistence rollback.
+                    let listener_was_running = control.ws_listener_port().await.is_some();
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
@@ -10990,6 +11032,25 @@ impl WorkspaceApi for Services {
                                     "settings.update compensating hook application failed during rollback"
                                 );
                                 // Log but don't fail — the persistence rollback succeeded
+                            }
+                        }
+
+                        // A restart-on-new-value hook (port / bindAddress) stops the
+                        // listener before starting it, so a start failure leaves it
+                        // down even though the compensating hooks saw nothing to
+                        // restart. The persisted values are rolled back by now and
+                        // start re-reads them, so bring the listener back up if it
+                        // was running when the batch began.
+                        if listener_was_running && control.ws_listener_port().await.is_none() {
+                            match control.start_ws_listener().await {
+                                Ok(port) => tracing::info!(
+                                    port,
+                                    "settings.update rollback: restarted WSS listener on prior settings"
+                                ),
+                                Err(restart_err) => tracing::error!(
+                                    error = ?restart_err,
+                                    "settings.update rollback: failed to restart WSS listener on prior settings"
+                                ),
                             }
                         }
 
