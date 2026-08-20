@@ -9,7 +9,7 @@
 
 use intent_core::{
     AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
-    UsageCost, WorkspaceId,
+    UsageCost, WorkspaceId, PENDING_QUESTIONS_MESSAGE_ID_KEY,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -1472,6 +1472,76 @@ impl Store {
                 if exists.is_some() {
                     return Ok(false);
                 }
+            }
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(true)
+    }
+
+    /// CAS-set one session metadata key unless a later user row already
+    /// answers `question_message_id`. The answer observation and marker write
+    /// share one SQL statement, so a delayed marker set cannot resurrect a
+    /// question after its tagged answer has committed.
+    pub async fn set_pending_questions_marker_if_unanswered(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected: Option<Option<&str>>,
+        question: &AgentMessage,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let guarded = expected.is_some();
+        let expected_value = expected.flatten();
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+             metadata = json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, ?), \
+             updated_at = ? \
+             WHERE id = ? AND workspace_id = ? \
+               AND (? = 0 OR json_extract(metadata, '$.' || ?) IS ?) \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM agent_message \
+                   WHERE agent_id = ? AND seq > ? AND role = 'user' \
+                     AND json_extract(metadata, '$.type') = 'question_answers' \
+                     AND json_extract(metadata, '$.answeredQuestionsMessageId') = ?\
+               )",
+        )
+        .bind(PENDING_QUESTIONS_MESSAGE_ID_KEY)
+        .bind(&question.id)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(guarded as i64)
+        .bind(PENDING_QUESTIONS_MESSAGE_ID_KEY)
+        .bind(expected_value)
+        .bind(&id.0)
+        .bind(question.seq)
+        .bind(&question.id)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            Error::Internal(format!(
+                "set unanswered question session metadata key failed: {e}"
+            ))
+        })?
+        .rows_affected();
+        if rows == 0 {
+            let exists =
+                sqlx::query("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .fetch_optional(self.read_pool())
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("agent session existence check failed: {e}"))
+                    })?;
+            if exists.is_some() {
+                return Ok(false);
             }
             return Err(Error::NotFound(format!("agent session {id}")));
         }

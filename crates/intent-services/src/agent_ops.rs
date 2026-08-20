@@ -4822,12 +4822,11 @@ impl Services {
         };
         match self
             .store
-            .set_agent_session_metadata_key(
+            .set_pending_questions_marker_if_unanswered(
                 workspace_id,
                 agent_id,
-                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
-                message_id,
                 expected,
+                &candidate,
                 &now_iso(),
             )
             .await
@@ -4869,6 +4868,16 @@ impl Services {
     ) -> bool {
         let lock = self.pending_question_mutation_locks.lock_for(agent_id);
         let _guard = lock.lock().await;
+        self.clear_pending_questions_marker_locked(workspace_id, agent_id, expected)
+            .await
+    }
+
+    async fn clear_pending_questions_marker_locked(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        expected: Option<&str>,
+    ) -> bool {
         let expected_owned = match expected {
             Some(value) => Some(Some(value.to_string())),
             None => match self.store.get_agent_session_summary(agent_id).await {
@@ -5020,14 +5029,16 @@ impl Services {
         let Some(answered) = answered_questions_message_id(message_metadata) else {
             return false;
         };
+        self.park_pending_marker_mutation("clear", answered).await;
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         if session.pending_questions_message_id() != Some(answered) {
             return false;
         }
-        self.park_pending_marker_mutation("clear", answered).await;
-        self.clear_pending_questions_marker(workspace_id, agent_id, Some(answered))
+        self.clear_pending_questions_marker_locked(workspace_id, agent_id, Some(answered))
             .await
     }
 
