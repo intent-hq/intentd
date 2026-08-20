@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.23] - 2026-08-20
+
+### 🚀 Features
+
+- *(services)* Merge git-root and monitor PRs into pullRequests on list emit paths ([#1330](https://github.com/intent-hq/intentd/pull/1330))
+- Fold agent-monitored PRs into the displayStatus derivation ([#1329](https://github.com/intent-hq/intentd/pull/1329))
+- *(services)* Stamp shared queueInfo.batchId on batch-flushed rows ([#1335](https://github.com/intent-hq/intentd/pull/1335))
+
+### 🐛 Bug Fixes
+
+- Preserve hook nextRunAt across daemon restarts ([#1327](https://github.com/intent-hq/intentd/pull/1327))
+- Suppress same-settlement duplicate report delivery after reportToParent wake ([#1326](https://github.com/intent-hq/intentd/pull/1326))
+- Default WSS bind to 127.0.0.1; bind-address picker in pair flow ([#1325](https://github.com/intent-hq/intentd/pull/1325))
+- Omit metadata.initialMessage from agent.list rows (monorepo#2932) ([#1337](https://github.com/intent-hq/intentd/pull/1337))
+
+### 📚 Documentation
+
+- Teach ws.browser docs + help text the tab ownership ops ([#1319](https://github.com/intent-hq/intentd/pull/1319))
+
+### ⚙️ Miscellaneous Tasks
+
+- Tighten unused-externally pub items to pub(crate); delete dead code ([#1331](https://github.com/intent-hq/intentd/pull/1331))
+- Remove unused crate dependencies and add cargo-shear CI gate ([#1323](https://github.com/intent-hq/intentd/pull/1323))
+- Audit dead_code allows; delete dead code, justify keepers ([#1324](https://github.com/intent-hq/intentd/pull/1324))
+
+
 ## [0.7.22] - 2026-08-19
 
 ### 🐛 Bug Fixes
