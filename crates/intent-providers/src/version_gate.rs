@@ -133,7 +133,9 @@ pub fn auggie_cli_gate(probe: &PiCliProbe) -> PiCliGate {
 /// optional leading `v` is accepted, and a missing patch defaults to 0
 /// (`0.80.4`, `pi 0.80.4`, `v0.80.4`, `pi version 0.80` all parse). At least
 /// `major.minor` is required so bare integers are never mistaken for versions.
-fn parse_cli_version(output: &str) -> Option<(u64, u64, u64)> {
+/// Public so candidate selection can compare versions numerically (lexical
+/// string order ranks 0.6.9 above 0.6.10).
+pub fn parse_cli_version(output: &str) -> Option<(u64, u64, u64)> {
     output.split_whitespace().find_map(parse_version_token)
 }
 

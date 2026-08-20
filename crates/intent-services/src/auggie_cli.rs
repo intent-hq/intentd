@@ -10,8 +10,9 @@
 //!
 //! This module resolves auggie the version-gate-aware way: it walks the
 //! ordered candidate list from
-//! [`intent_providers::find_auggie_candidates`] (explicit
-//! `providers.paths["auggie"]` → `~/.augment/bin/auggie` →
+//! [`intent_providers::find_auggie_candidates`] (explicit override —
+//! `context.auggiePath` over `providers.paths["auggie"]` —
+//! → `~/.augment/bin/auggie` →
 //! `~/.augment/auggie-path` marker → each enhanced-PATH hit), probes
 //! `--version` on each, and picks the first one new enough — skipping an
 //! incompatible earlier hit rather than launching it. If none qualify it
@@ -33,9 +34,10 @@ pub(crate) struct AuggieCandidate {
 /// Resolve the auggie binary to launch, version-gated. Blocking (spawns
 /// `<candidate> --version`, ≤3s each) — call from a blocking context.
 ///
-/// `explicit_path` is the `providers.paths["auggie"]` override (already
-/// trimmed/validated by the caller). Returns the first candidate that is new
-/// enough, or an error if none qualify.
+/// `explicit_path` is the explicit override (`context.auggiePath` over
+/// `providers.paths["auggie"]`, already trimmed/merged by the caller —
+/// `agent_manager::auggie_explicit_path_setting`). Returns the first
+/// candidate that is new enough, or an error if none qualify.
 pub(crate) fn select_auggie_for_spawn(explicit_path: Option<&str>) -> crate::Result<PathBuf> {
     let candidates: Vec<AuggieCandidate> = intent_providers::find_auggie_candidates(explicit_path)
         .into_iter()
@@ -69,7 +71,7 @@ pub(crate) fn select_from_candidates(candidates: Vec<AuggieCandidate>) -> crate:
                 // Track the highest too-old version seen for the error message.
                 if newest_too_old
                     .as_deref()
-                    .is_none_or(|cur| cur < found.as_str())
+                    .is_none_or(|cur| version_lt(cur, found))
                 {
                     newest_too_old = Some(found.clone());
                 }
@@ -92,16 +94,41 @@ pub(crate) fn select_from_candidates(candidates: Vec<AuggieCandidate>) -> crate:
     )))
 }
 
+/// Whether version `a` is older than `b`, comparing parsed
+/// `major.minor.patch` triples (lexical string order would rank 0.6.9 above
+/// 0.6.10). Falls back to string order when either side does not parse —
+/// [`PiCliGate::TooOld`] always carries a `format_version`-shaped triple, so
+/// the fallback is defensive only.
+fn version_lt(a: &str, b: &str) -> bool {
+    use intent_providers::version_gate::parse_cli_version;
+    match (parse_cli_version(a), parse_cli_version(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => a < b,
+    }
+}
+
 /// Run `<path> --version` with a 3s budget and return the trimmed first stdout
 /// line, or `None` on spawn failure, nonzero exit, timeout, or empty output
-/// (same shape as [`crate::pi_cli`]'s probe).
+/// (same shape as [`crate::pi_cli`]'s probe). Probes with the same enhanced
+/// PATH the real ACP spawn uses ([`intent_providers::enhanced_path`] over the
+/// candidate) so an nvm shim's `#!/usr/bin/env node` resolves the sibling
+/// `node` instead of exiting 127 and slipping through as permissive Unknown.
 fn run_version_probe(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
+    // `enhanced_path` only prepends the parent dir of an absolute path, so
+    // lexically absolutize a path-shaped candidate first (same treatment as
+    // `provider_auth::probe_command`).
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
     let mut child = Command::new(path)
         .arg("--version")
+        .env("PATH", intent_providers::enhanced_path(Some(&abs)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -205,6 +232,21 @@ mod tests {
     }
 
     #[test]
+    fn newest_too_old_compares_versions_numerically() {
+        // 0.6.10 > 0.6.9 numerically even though lexical string order says
+        // otherwise — the error must name 0.6.10 regardless of probe order.
+        for order in [["0.6.9", "0.6.10"], ["0.6.10", "0.6.9"]] {
+            let err = select_from_candidates(vec![
+                cand("/a", PiCliGate::TooOld(order[0].into())),
+                cand("/b", PiCliGate::TooOld(order[1].into())),
+            ])
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("0.6.10"), "{msg}");
+        }
+    }
+
+    #[test]
     fn no_candidates_errors_as_missing() {
         let err = select_from_candidates(vec![]).unwrap_err();
         let msg = err.to_string();
@@ -230,5 +272,44 @@ mod tests {
         // Explicit path resolves and probes to 0.35.0 → selected.
         let selected = select_auggie_for_spawn(good.to_str()).unwrap();
         assert_eq!(selected, good);
+    }
+
+    /// Regression (PR #1299): the probe must run with the spawn-time enhanced
+    /// PATH so an nvm-style shim whose interpreter is only findable via the
+    /// candidate's own directory gates from its real version instead of
+    /// exiting 127 → `Failed` → permissive `Unknown`.
+    #[cfg(unix)]
+    #[test]
+    fn probe_enhanced_path_resolves_shim_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .prefix("intent-auggie-cli-shim-")
+            .tempdir()
+            .expect("tempdir");
+        // Interpreter stub that only exists in the candidate's directory
+        // (a unique name so the inherited PATH can never resolve it).
+        let interp = dir.path().join("intent-test-auggie-interp");
+        std::fs::write(&interp, "#!/bin/sh\necho 0.1.0\n").unwrap();
+        std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // nvm-shim shape: the interpreter resolves via env over PATH, like
+        // `#!/usr/bin/env node`.
+        let shim = dir.path().join("auggie");
+        std::fs::write(&shim, "#!/usr/bin/env intent-test-auggie-interp\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The enhanced PATH prepends the candidate's parent dir, so the probe
+        // resolves the interpreter and reports the shim's real version.
+        assert_eq!(run_version_probe(&shim).as_deref(), Some("0.1.0"));
+
+        // And selection gates the shim as too old (0.1.0 < min) rather than
+        // selecting it permissively as Unknown — pre-fix, the 127 probe
+        // failure made this return Ok(shim).
+        match select_auggie_for_spawn(shim.to_str()) {
+            Ok(selected) => assert_ne!(selected, shim, "too-old shim must not be selected"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("cannot start Auggie agent"), "{msg}");
+            }
+        }
     }
 }
