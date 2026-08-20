@@ -2,7 +2,7 @@
 # volumes (monorepo#1253).
 #
 # The 8 tinybox runner slots share the box, and ci.yml keeps per-slot
-# persistent CARGO_TARGET_DIRs under /raid/ci-target on the 300G /raid
+# persistent CARGO_TARGET_DIRs under /raid/ci-target on the 3.6T /raid
 # volume ("prune ci-target if disk gets tight" — this workflow is that
 # pruning, made automatic). Up to 8 multi-GiB copies per job flavor
 # accumulate, plus smaller per-slot tool dirs on $HOME, and the root volume
@@ -182,7 +182,11 @@ jobs:
               fi
               remove "$dir"
             done < <(lru_candidates "$root")
-            echo "LRU candidates exhausted: /raid free $(free_gib /raid) GiB (target ${target} GiB, dry_run=$DRY_RUN)"
+            if [ "$(free_gib /raid)" -ge "$target" ]; then
+              echo "/raid free reached ${target} GiB — LRU eviction done"
+            else
+              echo "LRU candidates exhausted: /raid free $(free_gib /raid) GiB (target ${target} GiB, dry_run=$DRY_RUN)"
+            fi
           }
           # $HOME/ci-target window: 7 days by default, overridden by the
           # home_days dispatch input. Reject anything but an integer >= 1 —
