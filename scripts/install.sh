@@ -38,6 +38,13 @@
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
 # serves the same data dir the install-time CLI used.
 #
+# Before a service is registered, the target data dir's schema is checked
+# against the release being installed: a database written by a NEWER intentd
+# aborts the install (the daemon refuses to open it, so the service would only
+# crash-loop). The check skips silently on a fresh data dir, without sqlite3,
+# or when the installed daemon cannot report its schema version — including
+# when no daemon has been downloaded yet, so it does not fire on a first run.
+#
 # Idempotent: re-running replaces the installed binary atomically, and
 # service setup restarts an already-registered service instead of
 # duplicating it.
@@ -108,6 +115,79 @@ apply_auto_resume() {
   else
     warn "could not set agents.resumeInterruptedOnStart=$auto_resume — set it later with: intentd settings agents.resumeInterruptedOnStart $auto_resume"
   fi
+}
+
+# The data dir the daemon will serve, mirroring intent-core's resolution:
+# INTENTD_DATA_DIR wins, else the platform default (`directories` crate,
+# ProjectDirs "intentd").
+resolve_data_dir() {
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    printf '%s' "$INTENTD_DATA_DIR"
+  elif [ "$os" = "Darwin" ]; then
+    printf '%s' "$HOME/Library/Application Support/intentd"
+  else
+    printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}/intentd"
+  fi
+}
+
+# Refuse to register a service that could only crash-loop: when the target data
+# dir's database was written by a newer intentd, the daemon rejects it
+# ("database schema is newer than this intentd build ... downgrades are
+# unsupported") and launchd/systemd restarts it forever, invisibly. Must run
+# before any unit is written or loaded.
+#
+# Every unknown is a skip, never a failure — a fresh machine, a host without
+# sqlite3, and a daemon that cannot answer `max-migration` must all install
+# exactly as before. The binary is asked for its own ceiling rather than a
+# baked-in version→migration table, which would rot on every release.
+#
+# Reach, precisely: `$install_dir/intentd` is the *sitter*, which forwards
+# `max-migration` to the daemon it has ALREADY installed. One-shot subcommands
+# never trigger a download, so the check is answered — and can only fire — when
+# a daemon is already present and new enough to know the subcommand. On a first
+# install (no daemon downloaded yet) and against any daemon predating
+# `max-migration`, the answer is empty and this skips: the guard bites on
+# re-installs and upgrades, not on the very first one-liner run.
+preflight_data_dir_schema() {
+  data_dir=$(resolve_data_dir)
+  db_path="$data_dir/intentd.db"
+  [ -f "$db_path" ] || return 0
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    info "skipping the data-dir schema check (sqlite3 not found)"
+    return 0
+  fi
+  # Fails (empty) when there is no _sqlx_migrations table — a data dir no
+  # intentd has migrated yet. An empty table coalesces to 0.
+  db_migration=$(sqlite3 "$db_path" \
+    'select coalesce(max(version), 0) from _sqlx_migrations' 2>/dev/null) || db_migration=""
+  case "$db_migration" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  [ "$db_migration" -gt 0 ] || return 0
+
+  info "checking the existing data dir at $data_dir..."
+  build_migration=$("$install_dir/intentd" max-migration 2>/dev/null) || build_migration=""
+  case "$build_migration" in
+    '' | *[!0-9]*)
+      info "skipping the data-dir schema check (this build does not report its schema version)"
+      return 0
+      ;;
+  esac
+
+  [ "$db_migration" -gt "$build_migration" ] || return 0
+  fail "the data dir at $data_dir was written by a NEWER intentd than the one just installed
+  database schema:  migration $db_migration
+  this release:     migration $build_migration (the newest it can open)
+intentd refuses to open a newer database — downgrades are unsupported — so the
+service would restart forever without ever serving. No service was installed.
+Pick one:
+  * install a newer release, then re-run this installer:
+      $install_dir/intentd sitter channel beta --redownload
+  * give this install its own data dir:
+      INTENTD_DATA_DIR=\"\$HOME/.intentd\" sh install.sh
+  * if that data dir belongs to a newer intentd already running (e.g. the
+    Intent.app sidecar), use it instead of registering a second service"
 }
 
 setup_service_linux() {
@@ -411,6 +491,11 @@ main() {
   fi
 
   if [ "$service_mode" = "yes" ]; then
+    # Before anything is written or asked: a data dir this release cannot open
+    # must abort here, not after a unit is registered (and not after prompting
+    # for answers that would be thrown away).
+    preflight_data_dir_schema
+
     # Auto-resume choice: flag beats the env var beats the prompt (both were
     # lowercased + validated above). Same /dev/tty pattern as the service
     # prompt; `auto` — or no terminal — is the daemon default and writes

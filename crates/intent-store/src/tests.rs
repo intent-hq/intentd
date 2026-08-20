@@ -115,6 +115,20 @@ async fn migration_status_reports_current_after_open() {
     );
 }
 
+/// `max_embedded_migration` (printed by `intentd max-migration`, which
+/// `scripts/install.sh` preflights an existing data dir against) must report
+/// the same ceiling `Store::open` enforces: the newest migration this build
+/// embeds. Pinned to `migration_status().expected` rather than a literal so it
+/// tracks every new migration automatically.
+#[tokio::test]
+async fn max_embedded_migration_matches_newest_expected_migration() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let status = store.migration_status().await.expect("migration status");
+    let newest = *status.expected.iter().max().expect("migrations embedded");
+    assert_eq!(crate::max_embedded_migration(), newest);
+}
+
 /// `Store::open` refuses to run against a database whose `_sqlx_migrations`
 /// table records a version not embedded in this build (i.e. the DB was
 /// created by a newer intentd): it must surface a clear "downgrades are
