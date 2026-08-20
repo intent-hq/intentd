@@ -7169,12 +7169,17 @@ impl Services {
     /// watch (unsettled shape). Waiting reasons that keep the target
     /// watchable: a ready-to-send queue entry or a busy worker (about to
     /// run), an unresolved attention request (runs when the user answers),
+    /// pending structured questions (same parked-on-user-input shape),
     /// live outgoing completion watches (runs when a watched target
-    /// settles), an interrupted row (the resume sweep re-runs it), active
-    /// hooks, or active PR monitors (both wake it on fire — the
-    /// monorepo#2532 Gap B accept-and-defer shape). Applied ONLY by the
-    /// explicit registration ops (`agent.watch` / `app.agents.waitFor`):
-    /// auto-subscribe paths pair the watch with a message that wakes the
+    /// settles), live event subscriptions (matching events wake it — same
+    /// accept-and-defer shape as hooks), an interrupted row (the resume
+    /// sweep re-runs it), active hooks, or active PR monitors (both wake
+    /// it on fire — the monorepo#2532 Gap B accept-and-defer shape).
+    /// Applied ONLY by the explicit registration ops (`agent.watch` /
+    /// `app.agents.waitFor`) and only AFTER the `check_watch_scope` gate:
+    /// out-of-scope targets must keep failing on scope alone, so the guard
+    /// cannot leak a foreign agent's idle/nothing-pending state.
+    /// Auto-subscribe paths pair the watch with a message that wakes the
     /// target, and boot rehydration must keep delivering missed wakes.
     /// Store probes fail open (accept): a false accept only reproduces the
     /// pre-guard behavior, a false reject would block a legitimate watch.
@@ -7187,6 +7192,10 @@ impl Services {
             || self.agent_is_busy(target_id.clone())
             || target_session.attention_request_kind.is_some()
             || self.agent_is_waiting_on_agents(target_id)
+            || !self
+                .list_event_subscriptions_for_agent(target_id)
+                .is_empty()
+            || self.pending_question_count(target_id).await > 0
         {
             return Ok(());
         }
@@ -7221,9 +7230,11 @@ impl Services {
         }
         Err(Error::InvalidParams(format!(
             "agent {} is idle with nothing pending (no active hooks, no PR monitors, \
-             no queued messages, no outgoing waits) — it has no future completion to \
-             watch. Wake it instead: agent.send delivers a message and auto-arms a \
-             completion watch on the sender, or agent.wakeOrCreate resumes its task",
+             no event subscriptions, no queued messages, no outgoing waits, no \
+             unresolved attention request or pending questions, no interrupted turn) — \
+             it has no future completion to watch. Wake it instead: agent.send \
+             delivers a message and auto-arms a completion watch on the sender, or \
+             agent.wakeOrCreate resumes its task",
             target_id.0
         )))
     }
@@ -7255,7 +7266,6 @@ impl Services {
                 target_agent_id.0
             )));
         }
-        self.check_idle_target_watchable(&target_session).await?;
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
         // Anchor the watch in the caller's HOME workspace (falls back to the
@@ -7263,6 +7273,15 @@ impl Services {
         // `agent_watch_completion_op`.
         let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
         let caller_home_ws = resolved_home.unwrap_or_else(|| workspace_id.clone());
+        // Scope gate BEFORE the idle-target guard: an out-of-scope target
+        // must fail on scope alone, so the guard cannot leak a foreign
+        // agent's idle/nothing-pending state. (`register_agent_watch_durable`
+        // re-checks the same gate as the single-registration-path backstop.)
+        crate::agent_subscriptions::check_watch_scope(
+            &caller_home_ws,
+            &target_session.workspace_id,
+        )?;
+        self.check_idle_target_watchable(&target_session).await?;
         let target_ws = target_session.workspace_id;
         let id = self
             .register_agent_watch_durable(
@@ -7456,10 +7475,13 @@ impl Services {
                     target.0
                 )));
             }
+            // Scope gate FIRST: an out-of-scope target must fail on scope
+            // alone, so the idle-target guard below cannot leak a foreign
+            // agent's idle/nothing-pending state.
+            crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
             // Idle-target guard (monorepo#2972): same up-front validation
             // loop as the scope gate, so a rejection is side-effect free.
             self.check_idle_target_watchable(&session).await?;
-            crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
             // Pair uniqueness: an explicit registration on a child the caller
             // ALREADY watches (ungrouped or grouped) is rejected
             // up front — before any side-effectful registration — instead of
