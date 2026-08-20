@@ -173,7 +173,17 @@ jobs:
       # fingerprints, so every package rebuilds the workspace from scratch
       # (~2 min x 15 packages; release-plz/release-plz#2996 documents the
       # per-package verify mechanism). sccache keys on content hashes rather
-      # than mtimes, so those identical rustc invocations become cache hits.
+      # than mtimes, so the recurring rustc invocations become cache hits —
+      # but note the hit pattern: sccache (v0.17.0) also hashes rustc's cwd
+      # into the cache key, and each verify build runs from its own
+      # extracted dir ($CARGO_TARGET_DIR/package/<name>-<version>/), so the
+      # 15 per-package builds do NOT hit each other within a run. Hits are
+      # run-over-run: the fixed CARGO_TARGET_DIR keeps each package's
+      # extraction path stable across pushes, so run N+1 hits run N's
+      # entries, resetting whenever a release bumps versions (the version
+      # is in the path). Crates that invoke the system linker (bins,
+      # dylibs, proc-macros) and build-script runs are never cached, so
+      # expect partial hit rates.
       #
       # Idempotent install guard like the pkg-config one above: install the
       # pinned, checksum-verified musl binary only if sccache is not already
@@ -220,13 +230,20 @@ jobs:
       # local disk cache is designed for concurrent access, so one cache
       # shared across the tinybox slots maximizes hit rates. It lives on
       # /raid like the target dirs — $HOME sits on the much smaller root
-      # volume.
+      # volume. SCCACHE_DIR is read by the sccache server when it starts,
+      # and clients reuse an already-running server on the default port, so
+      # any future sccache adoption on these runners must reuse this exact
+      # dir (or set a distinct SCCACHE_SERVER_PORT). SCCACHE_CACHE_SIZE is
+      # set explicitly: the 10 GiB default could thrash via eviction across
+      # the 15 per-package cwd-variants of the workspace dep graph, and
+      # /raid has room to spare.
       - name: Enable sccache
         shell: bash
         run: |
           if command -v sccache >/dev/null; then
             echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
             echo "SCCACHE_DIR=/raid/ci-target/intentd/sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_CACHE_SIZE=50G" >> "$GITHUB_ENV"
             echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
           fi
       # The verify builds use the dev profile and nothing ever reads their
@@ -243,13 +260,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
       # Surface cache hit rates in the log; `always()` keeps them visible
-      # when release-pr fails. Skips cleanly when sccache was never enabled.
+      # when release-pr fails. Skips cleanly when sccache was never
+      # enabled, and never fails the job — this step is observability only
+      # (bash runs with -e, and --show-stats can itself error, e.g. by
+      # auto-starting a server when /raid is momentarily unwritable).
       - name: Show sccache stats
         if: ${{ always() }}
         shell: bash
         run: |
           if [ -n "${RUSTC_WRAPPER:-}" ] && command -v sccache >/dev/null; then
-            sccache --show-stats
+            sccache --show-stats || echo "::warning::sccache stats unavailable"
           else
             echo "sccache not enabled; skipping stats"
           fi
