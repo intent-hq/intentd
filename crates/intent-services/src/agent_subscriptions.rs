@@ -1428,10 +1428,12 @@ impl Services {
                             self.mark_interim_skipped_idle(child_id);
                             return;
                         }
-                        // Registration-time hook/PR-monitor deferral
-                        // (monorepo#2532 Gap B): a NEW explicit watch on a
-                        // reported idle child that still owns active hooks or
-                        // PR monitors asks for the child's NEXT completion —
+                        // Registration-time hook/PR-monitor/event-subscription
+                        // deferral (monorepo#2532 Gap B; subscriptions added
+                        // with monorepo#2972): a NEW explicit watch on a
+                        // reported idle child that still owns active hooks,
+                        // PR monitors, or live event subscriptions asks for
+                        // the child's NEXT completion —
                         // the caller already has the report, so an instant
                         // synthetic idle (whose #1945 report bypass would
                         // skip the live path's deferrals) fires the fresh
@@ -1450,7 +1452,8 @@ impl Services {
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
                             && (!self.active_hooks_for_agent(child_id).await.is_empty()
-                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
+                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                || !self.list_event_subscriptions_for_agent(child_id).is_empty())
                         {
                             self.mark_interim_skipped_idle_stale_report(child_id);
                             return;
