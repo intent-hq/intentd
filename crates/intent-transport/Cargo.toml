@@ -38,3 +38,6 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 ctor = "1.0.10"
+
+[lints]
+workspace = true
