@@ -4728,15 +4728,17 @@ impl Services {
     /// question-bearing turn overwrites an older marker, which is exactly the
     /// spec's "newest set supersedes" rule. Atomic single-key `json_set` so
     /// sibling metadata keys (`dismissedQuestionsMessageId`,
-    /// `lastSeenMessageId`) are preserved. Best-effort: a failure is logged
-    /// and never fails the turn (the hold simply stays as it was).
+    /// `lastSeenMessageId`) are preserved. A successful write emits
+    /// `agent:updated` with the marker so clients re-read the AgentLite
+    /// projection. Best-effort: a failure is logged and never fails the turn
+    /// (the hold simply stays as it was).
     pub(crate) async fn record_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         message_id: &str,
     ) {
-        if let Err(e) = self
+        match self
             .store
             .set_agent_session_metadata_key(
                 workspace_id,
@@ -4748,20 +4750,36 @@ impl Services {
             )
             .await
         {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+            Ok(_) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingQuestionsMessageId": message_id,
+                    }),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+            }
         }
     }
 
     /// Clear the pending-questions marker (written as the empty string, which
     /// reads back as "no pending questions" while still marking the session as
-    /// marker-aware so the pre-upgrade tail-walk fallback stays off).
+    /// marker-aware so the pre-upgrade tail-walk fallback stays off). A
+    /// successful write emits `agent:updated` with the written empty string so
+    /// clients can distinguish the clear from a legacy-absent marker.
     /// Best-effort: a failure is logged and never fails the caller.
     pub(crate) async fn clear_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
-        if let Err(e) = self
+        match self
             .store
             .set_agent_session_metadata_key(
                 workspace_id,
@@ -4773,7 +4791,21 @@ impl Services {
             )
             .await
         {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+            Ok(_) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingQuestionsMessageId": "",
+                    }),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+            }
         }
     }
 

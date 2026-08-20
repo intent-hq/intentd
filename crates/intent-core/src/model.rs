@@ -2840,6 +2840,12 @@ pub struct AgentMetadata {
     /// reload). Omitted when nothing was dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_questions_message_id: Option<String>,
+    /// Authoritative pending-question marker (PROTOCOL §5.5): a non-empty
+    /// message id means that message's questions are pending; an empty string
+    /// means no questions are pending. Omitted only for legacy sessions whose
+    /// raw metadata never carried the marker key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questions_message_id: Option<String>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -3054,6 +3060,12 @@ impl AgentLite {
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
+        let pending_questions_message_id = session.pending_questions_marker_written().then(|| {
+            session
+                .pending_questions_message_id()
+                .unwrap_or_default()
+                .to_string()
+        });
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let metadata = AgentMetadata {
@@ -3072,6 +3084,7 @@ impl AgentLite {
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
+            pending_questions_message_id,
             last_seen_message_id,
             is_initial_agent,
         };
@@ -4974,13 +4987,12 @@ mod tests {
         assert_eq!(v["lastActivity"], "t1");
     }
 
-    /// `metadata.isInitialAgent` is presence-detected: omitted from the
-    /// `AgentLite` metadata projection when the raw session metadata lacks the
-    /// key, and equally omitted when the key is present but not the JSON
-    /// boolean `true` (`false` or a non-boolean value) — never `false`, never
-    /// `null` (PROTOCOL §5.5).
+    /// Presence-sensitive AgentLite metadata fields preserve their distinct
+    /// wire states: `pendingQuestionsMessageId` is omitted for legacy rows,
+    /// emitted with a message id when set, and emitted as `""` when cleared;
+    /// `isInitialAgent` is emitted only for the JSON boolean `true`.
     #[test]
-    fn agent_lite_is_initial_agent_omitted_unless_true() {
+    fn agent_lite_presence_sensitive_metadata_wire_shape() {
         let session = |metadata: Option<serde_json::Value>| AgentSession {
             harness_version: CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
@@ -5029,6 +5041,15 @@ mod tests {
             let lite = AgentLite::from_session(session(metadata), 0, None, None, None, None, None);
             serde_json::to_value(&lite).unwrap()
         };
+
+        let legacy = project(Some(json!({})));
+        assert!(legacy["metadata"]
+            .get("pendingQuestionsMessageId")
+            .is_none());
+        let set = project(Some(json!({ PENDING_QUESTIONS_MESSAGE_ID_KEY: "msg-q1" })));
+        assert_eq!(set["metadata"]["pendingQuestionsMessageId"], "msg-q1");
+        let cleared = project(Some(json!({ PENDING_QUESTIONS_MESSAGE_ID_KEY: "" })));
+        assert_eq!(cleared["metadata"]["pendingQuestionsMessageId"], "");
 
         // No metadata at all, key absent, `false`, and non-boolean values all
         // omit the key entirely.

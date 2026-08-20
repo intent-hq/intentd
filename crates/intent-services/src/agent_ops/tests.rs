@@ -23730,6 +23730,80 @@ fn answer_metadata(answered: &str) -> serde_json::Value {
     json!({ "type": "question_answers", "answeredQuestionsMessageId": answered })
 }
 
+/// The client-visible, transcript-free projections and their update
+/// invalidations preserve all marker states: absent for legacy sessions,
+/// non-empty while pending, and written-empty after a matching answer.
+#[tokio::test]
+async fn pending_marker_projects_on_list_get_and_update_events() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    let legacy_get = svc
+        .agent_get_op(id.clone(), None)
+        .await
+        .expect("legacy get");
+    assert_eq!(legacy_get.metadata.pending_questions_message_id, None);
+    let legacy_list = svc.agent_list_op(ws.clone()).await.expect("legacy list");
+    assert_eq!(legacy_list[0].metadata.pending_questions_message_id, None);
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".into(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+    let set_event = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("set event timed out")
+        .expect("subscription closed");
+    assert_eq!(set_event[0].data["pendingQuestionsMessageId"], asked_id);
+
+    let set_get = svc.agent_get_op(id.clone(), None).await.expect("set get");
+    assert_eq!(
+        set_get.metadata.pending_questions_message_id.as_deref(),
+        Some(asked_id.as_str())
+    );
+    let set_list = svc.agent_list_op(ws.clone()).await.expect("set list");
+    assert_eq!(
+        set_list[0].metadata.pending_questions_message_id.as_deref(),
+        Some(asked_id.as_str())
+    );
+
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".into(),
+        json!([{ "type": "text", "text": "Q: x\nA: y" }]),
+        Some(answer_metadata(&asked_id)),
+    )
+    .await
+    .expect("append answer");
+    let clear_event = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("clear event timed out")
+        .expect("subscription closed");
+    assert_eq!(clear_event[0].data["pendingQuestionsMessageId"], "");
+
+    let cleared_get = svc
+        .agent_get_op(id.clone(), None)
+        .await
+        .expect("cleared get");
+    assert_eq!(
+        cleared_get.metadata.pending_questions_message_id.as_deref(),
+        Some("")
+    );
+    let cleared_list = svc.agent_list_op(ws).await.expect("cleared list");
+    assert_eq!(
+        cleared_list[0]
+            .metadata
+            .pending_questions_message_id
+            .as_deref(),
+        Some("")
+    );
+}
+
 /// The marker is written on a question-bearing append, is OVERWRITTEN (not
 /// appended to) by a newer question set, and survives an intervening plain
 /// user row and a question-free assistant turn — the whole point of the
