@@ -23,7 +23,14 @@ use std::time::{Duration, Instant};
 
 /// Wall-clock budget one list/get call spends waiting for a single aggregate
 /// before degrading to the last known value / omission.
-const AGGREGATE_BUDGET: Duration = Duration::from_millis(1_500);
+///
+/// Kept below the rpc_profile duration budget for hot RPCs (1000 ms): a cold
+/// CoW probe used to wait up to 1500 ms inside the `workspace.list` dispatch,
+/// so the first list after daemon start was guaranteed to draw a
+/// duration-budget WARN regardless of actual list cost
+/// (intent-hq/monorepo#2994). An over-budget probe still completes detached
+/// and backfills the cache for the next poll.
+const AGGREGATE_BUDGET: Duration = Duration::from_millis(900);
 
 /// Cap on concurrent per-workspace enrichment tasks in `workspace.list`, so a
 /// large workspace count doesn't burst-issue unbounded concurrent store reads.
