@@ -7,10 +7,18 @@
 # pruning, made automatic). Up to 8 multi-GiB copies per job flavor
 # accumulate, plus smaller per-slot tool dirs on $HOME, and the root volume
 # reached box-level ENOSPC when the target dirs lived there (killed jobs
-# mid-run). Deletion here is age-based (mtime), oldest first, and strictly
-# path-allowlisted:
+# mid-run). Deletion is strictly path-allowlisted and runs in two tiers:
+# age-based passes (mtime, oldest first), then a size-based LRU pass —
+# a heavy CI day can fill /raid with dirs too fresh for any age window
+# (monorepo#2959: prune run 32347260356 freed nothing at 28 GiB free),
+# so when /raid free is still below min_free_target (default 100 GiB;
+# workflow_dispatch input) after the age passes, per-slot target dirs
+# are evicted regardless of age, least-recent-activity first, until the
+# target is reached or candidates run out:
 #   /raid/ci-target/*/*/*  per-slot cargo target dirs — stale > 7 days,
-#                          tightened to > 2 days while /raid free < 100 GiB
+#                          tightened to > 2 days while /raid free is below
+#                          min_free_target, then LRU-evicted while still
+#                          below it
 #   ~/ci-target/*/*/*      legacy pre-/raid target dirs on the root volume —
 #                          stale > 7 days (the home_days dispatch input
 #                          overrides the window), tightened to > 1 day while
@@ -20,11 +28,17 @@
 #   ~/setup-pnpm-*         per-slot pnpm dests — stale > 7 days
 #   ~/.install-action      legacy shared install-action dir — stale > 7 days
 # Shared caches (~/.cargo registry, ~/.rustup toolchains) are never touched.
-# An entry is only deleted when nothing inside it was modified within the
-# window (recursive mtime check), so a running job's target dir is never
-# deleted — ci.yml's fail-fast preflight is the emergency backstop between
-# these daily runs. The run log doubles as a disk report (df + per-entry
-# size/age table). No sudo anywhere.
+# In the age-based passes an entry is only deleted when nothing inside it
+# was modified within the window (recursive mtime check), so a running
+# job's target dir is never deleted; the LRU pass keeps that guarantee
+# with its own rails — it skips this runner's own slot and any dir with
+# activity within the last 15 minutes (a running job modifies its target
+# dir continuously), and orders candidates by last activity inside the dir
+# so warm slots are evicted last. Target dirs are warm caches only, so an
+# LRU eviction costs a rebuild, not correctness. Every deletion (or
+# dry-run candidate) is echoed. ci.yml's fail-fast preflight is the
+# emergency backstop between these daily runs. The run log doubles as a
+# disk report (df + per-entry size/age table). No sudo anywhere.
 name: Tinybox prune
 
 on:
@@ -42,6 +56,14 @@ on:
           $HOME/ci-target prune window in days (>= 1). Empty = automatic
           (7 days). Either way the window tightens to 1 day while the root
           volume is low on space.
+        type: string
+        default: ""
+      min_free_target:
+        description: >-
+          /raid free-space target in GiB (>= 1). Empty = automatic
+          (100). While /raid free is below it, the /raid window tightens
+          to 2 days; if still below after all age passes, per-slot target
+          dirs are LRU-evicted regardless of age until it is reached.
         type: string
         default: ""
 
@@ -86,6 +108,7 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run == true }}
           HOME_DAYS: ${{ inputs.home_days }}
+          MIN_FREE_TARGET: ${{ inputs.min_free_target }}
         run: |
           set -euo pipefail
           free_gib() { df -Pk "$1" | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
@@ -102,6 +125,10 @@ jobs:
           # -mmin gives a strict N*24h window (-mtime rounds to whole days);
           # `|| true` keeps a dir vanishing mid-check from failing the run.
           is_fresh() { [ -n "$(find "$1" -mmin -"$(( $2 * 1440 ))" -print -quit 2>/dev/null || true)" ]; }
+          # Active = anything inside modified within the last 15 minutes —
+          # the LRU pass's running-job guard (a running job modifies its
+          # target dir continuously, so an active slot is never evicted).
+          is_active() { [ -n "$(find "$1" -mmin -15 -print -quit 2>/dev/null || true)" ]; }
           # Stale per-slot target dirs at exactly <root>/<repo>/<slot>/<job>,
           # oldest first; the case guard re-asserts the allowlist. $2 is the
           # ci-target root: /raid/ci-target (primary) or $HOME/ci-target
@@ -117,6 +144,46 @@ jobs:
               remove "$dir"
             done < <(find "$root" -mindepth 3 -maxdepth 3 -type d -mmin +"$(( days * 1440 ))" -printf '%T@ %p\n' 2>/dev/null | sort -n)
           }
+          # Size-based LRU eviction (monorepo#2959): a heavy CI day can fill
+          # /raid with per-slot dirs younger than any age window, which the
+          # age-based passes cannot touch (prune run 32347260356 freed
+          # nothing at 28 GiB free). Target dirs are warm caches only —
+          # evicting a fresh one costs a rebuild, not correctness — so while
+          # /raid free is below the target, evict candidates in LRU order
+          # (least recent activity first; activity = newest mtime inside the
+          # dir, so warm slots go last) until the target is reached or
+          # candidates run out. Rails on top of the shared path allowlist:
+          # never this runner's own slot, and never a dir active within the
+          # last 15 minutes (is_active, re-checked live at eviction time).
+          # Under dry_run nothing is freed, so the pass echoes every
+          # candidate it would evict.
+          lru_candidates() {
+            { find "$1" -mindepth 3 -maxdepth 3 -type d 2>/dev/null || true; } | while IFS= read -r dir; do
+              ts=$({ find "$dir" -printf '%T@\n' 2>/dev/null || true; } | awk '$1>m{m=$1} END{if(m!="")print m}')
+              [ -n "$ts" ] || continue
+              printf '%s %s\n' "$ts" "$dir"
+            done | sort -n
+          }
+          lru_evict() {
+            local target="$1" root=/raid/ci-target
+            while IFS= read -r entry; do
+              if [ "$(free_gib /raid)" -ge "$target" ]; then
+                echo "/raid free reached ${target} GiB — LRU eviction done"
+                return 0
+              fi
+              dir="${entry#* }"
+              case "$dir" in "$root/"?*) ;; *) continue ;; esac
+              if [ -n "${RUNNER_NAME:-}" ]; then
+                case "$dir" in "$root"/*/"$RUNNER_NAME"/*) echo "skipping own slot: $dir"; continue ;; esac
+              fi
+              if is_active "$dir"; then
+                echo "skipping active (modified < 15 min ago): $dir"
+                continue
+              fi
+              remove "$dir"
+            done < <(lru_candidates "$root")
+            echo "LRU candidates exhausted: /raid free $(free_gib /raid) GiB (target ${target} GiB, dry_run=$DRY_RUN)"
+          }
           # $HOME/ci-target window: 7 days by default, overridden by the
           # home_days dispatch input. Reject anything but an integer >= 1 —
           # a 0-day window would defeat the freshness check and delete
@@ -128,14 +195,34 @@ jobs:
             home_days=$(( 10#$HOME_DAYS ))
             [ "$home_days" -ge 1 ] || { echo "invalid home_days: $HOME_DAYS" >&2; exit 1; }
           fi
-          echo "free before: /raid $(free_gib /raid) GiB, root volume $(free_gib "$HOME") GiB (home window: ${home_days}d)"
+          # /raid free-space target: 100 GiB by default, overridden by the
+          # min_free_target dispatch input (same integer >= 1 validation as
+          # home_days). While /raid free is below it the age window tightens
+          # to 2 days; if still below after all age passes, LRU eviction
+          # engages. Scheduled runs get the default, so the daily cron
+          # self-heals a disk wedged by fresh dirs.
+          min_free_target=100
+          if [ -n "$MIN_FREE_TARGET" ]; then
+            case "$MIN_FREE_TARGET" in *[!0-9]*) echo "invalid min_free_target: $MIN_FREE_TARGET" >&2; exit 1 ;; esac
+            min_free_target=$(( 10#$MIN_FREE_TARGET ))
+            [ "$min_free_target" -ge 1 ] || { echo "invalid min_free_target: $MIN_FREE_TARGET" >&2; exit 1; }
+          fi
+          echo "free before: /raid $(free_gib /raid) GiB, root volume $(free_gib "$HOME") GiB (home window: ${home_days}d, /raid target: ${min_free_target} GiB)"
           prune_targets 7 /raid/ci-target
           prune_targets "$home_days" "$HOME/ci-target"
-          # Comfort target: with < 100 GiB free on /raid the next day's
-          # coverage jobs could still crowd the volume, so tighten to 2 days.
-          if [ "$(free_gib /raid)" -lt 100 ]; then
-            echo "/raid free < 100 GiB after 7-day pass — tightening to 2 days"
+          # Comfort target: with less than the free-space target on /raid the
+          # next day's coverage jobs could still crowd the volume, so tighten
+          # to 2 days.
+          if [ "$(free_gib /raid)" -lt "$min_free_target" ]; then
+            echo "/raid free < ${min_free_target} GiB after 7-day pass — tightening to 2 days"
             prune_targets 2 /raid/ci-target
+          fi
+          # Still below the target after every age-based pass: the space is
+          # held by dirs too fresh for any age window (monorepo#2959) — fall
+          # back to size-based LRU eviction.
+          if [ "$(free_gib /raid)" -lt "$min_free_target" ]; then
+            echo "/raid free < ${min_free_target} GiB after age-based passes — size-based LRU eviction"
+            lru_evict "$min_free_target"
           fi
           # Root volume: all 8 slots share $HOME on it, and box-level ENOSPC
           # kills jobs mid-run, so tighten hard — while free space is
