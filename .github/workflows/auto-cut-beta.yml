@@ -237,12 +237,19 @@ jobs:
             # (a fork PR can use both), so the candidate is also required to
             # come from a branch in THIS repository (no fork heads), and its
             # author is verified below against the release-plz PAT identity.
-            prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            # Every read inside the loop treats failure as transient: a 5xx
+            # or rate-limit blip must not put a red X on the triggering
+            # commit (and lose a push run's remaining polling budget to the
+            # cron backstop) when simply retrying would have succeeded.
+            if ! prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
               --json number,title,headRefName,isDraft,labels,isCrossRepository,author \
               --jq '[.[] | select((.isCrossRepository == false)
                     and (.headRefName | startswith("release-plz-"))
                     and ((.title | startswith("chore: release v"))
-                      or (.title | startswith("chore(intentd): release v"))))]')
+                      or (.title | startswith("chore(intentd): release v"))))]'); then
+              transient "gh pr list failed (transient API error?)"
+              sleep 30; continue
+            fi
             count=$(jq 'length' <<<"$prs")
             if [[ "$count" -eq 0 ]]; then
               transient "No open release-plz Release PR — no changes, no release (on push runs: release-plz may still be opening/refreshing it)"
@@ -265,13 +272,31 @@ jobs:
             # the PAT's identity, not the workflow's). Together with the
             # same-repo check above, this pins the merge target to the
             # repository-managed release-plz PR — a PR that merely imitates
-            # the branch-name/title shape never qualifies.
-            viewer=$(GH_TOKEN="$RELEASE_PLZ_TOKEN" gh api graphql \
-              -f query='query { viewer { login } }' \
-              --jq '.data.viewer.login')
+            # the branch-name/title shape never qualifies. The PAT identity
+            # cannot change mid-run, so the lookup runs once and is cached
+            # across loop iterations.
+            if [[ -z "${viewer:-}" ]]; then
+              if ! viewer=$(GH_TOKEN="$RELEASE_PLZ_TOKEN" gh api graphql \
+                -f query='query { viewer { login } }' \
+                --jq '.data.viewer.login'); then
+                viewer=""
+                transient "viewer lookup with the release-plz PAT failed (transient API error?)"
+                sleep 30; continue
+              fi
+            fi
             author=$(jq -r '.[0].author.login' <<<"$prs")
             if [[ -z "$viewer" || "$author" != "$viewer" ]]; then
               echo "::warning::Release PR #$number author ($author) is not the release-plz PAT identity ($viewer); refusing to auto-merge"
+              exit 0
+            fi
+
+            # Pause guardrail (checked before any waiting): a human puts
+            # `hold-release` on the Release PR to stop auto-cutting (e.g. to
+            # batch more changes or hold a bad commit out of a beta); remove
+            # the label to resume. The label is already in $prs, so a held
+            # PR exits immediately instead of polling for freshness first.
+            if jq -e '.[0].labels | any(.name == "hold-release")' <<<"$prs" >/dev/null; then
+              echo "::notice::Release PR #$number carries the hold-release label; auto-merge paused until it is removed"
               exit 0
             fi
 
@@ -292,16 +317,11 @@ jobs:
               fi
             fi
 
-            # Pause guardrail: a human puts `hold-release` on the Release PR
-            # to stop auto-cutting (e.g. to batch more changes or hold a bad
-            # commit out of a beta); remove the label to resume.
-            if jq -e '.[0].labels | any(.name == "hold-release")' <<<"$prs" >/dev/null; then
-              echo "::notice::Release PR #$number carries the hold-release label; auto-merge paused until it is removed"
-              exit 0
+            if ! detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup); then
+              transient "gh pr view failed for Release PR #$number (transient API error?)"
+              sleep 30; continue
             fi
-
-            detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
-              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup)
 
             if [[ $(jq -r '.isDraft' <<<"$detail") != "false" ]]; then
               echo "Release PR #$number is a draft; skipping."
@@ -335,13 +355,17 @@ jobs:
             # a head whose checks have not started yet. A terminal
             # non-success conclusion is a hard skip (retrying cannot rerun a
             # failed check); anything else (missing/pending) is transient.
+            # FAILURE also matches STARTUP_FAILURE via substring —
+            # intentional, both are terminal. NEUTRAL/SKIPPED/STALE are
+            # terminal too (a gate in those states never becomes SUCCESS),
+            # so they hard-skip rather than burn the polling budget.
             gate=$(jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate")]
               | if length == 0 then "missing"
                 elif all(.conclusion == "SUCCESS") then "success"
                 else (map(.conclusion // .status // "PENDING") | join(","))
                 end' <<<"$detail")
             if [[ "$gate" != "success" ]]; then
-              if grep -Eq 'FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED' <<<"$gate"; then
+              if grep -Eq 'FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED|NEUTRAL|SKIPPED|STALE' <<<"$gate"; then
                 echo "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
                 exit 0
               fi
@@ -351,8 +375,11 @@ jobs:
 
             # --paginate walks every reviewThreads page (an unresolved
             # thread past the first page must still block the merge); --jq
-            # emits one per-page count, summed by awk.
-            unresolved=$(gh api graphql --paginate \
+            # emits one per-page count, summed by awk. pipefail makes a gh
+            # failure fail the whole pipeline (awk still prints 0, but the
+            # substitution's exit status is gh's), so a flaked read retries
+            # instead of being mistaken for "no unresolved threads".
+            if ! unresolved=$(gh api graphql --paginate \
               -f query='query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $pr) {
@@ -367,7 +394,10 @@ jobs:
               -f repo="${GITHUB_REPOSITORY#*/}" \
               -F pr="$number" \
               --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' \
-              | awk '{ sum += $1 } END { print sum + 0 }')
+              | awk '{ sum += $1 } END { print sum + 0 }'); then
+              transient "reviewThreads query failed for Release PR #$number (transient API error?)"
+              sleep 30; continue
+            fi
             if [[ "$unresolved" -ne 0 ]]; then
               echo "Release PR #$number has $unresolved unresolved review thread(s); skipping."
               exit 0
@@ -376,6 +406,14 @@ jobs:
             # Re-check the throttle at merge time: a push run may have spent
             # minutes polling, and the previous cut's tag may only have been
             # pushed (by release-plz.yml) after this run's early check.
+            # Accepted residual race: between a cut's squash-merge and
+            # release-plz.yml pushing its tag (a couple of minutes), this
+            # re-check still sees only the previous tag and fails open — a
+            # queued run whose freshness + CI Gate checks pass inside that
+            # window could cut twice in quick succession. In practice CI
+            # latency on the refreshed Release PR head keeps the window
+            # closed, and a double cut is wasteful but harmless (two valid
+            # releases), so no cut-in-progress detection is layered on.
             throttle
 
             if [[ "$DRY_RUN" == "true" ]]; then
