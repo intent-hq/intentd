@@ -258,6 +258,37 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
+    /// List a workspace's ACTIVE monitors plus only its most recently updated
+    /// COMPLETED monitor (`LIMIT 1`), oldest first — the displayStatus
+    /// derivation read (active rows feed the open-PR signals, the latest
+    /// completed row the merged signal, matching linked-PR "latest" step-6
+    /// semantics). Completed rows are retained indefinitely, so the bound
+    /// keeps this hot-path read O(active monitors) instead of O(all monitor
+    /// history in the workspace); cancelled rows are excluded entirely.
+    pub async fn list_display_status_pr_monitors_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitor>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? AND state = 'active' \
+             UNION ALL \
+             SELECT {COLUMNS} FROM (SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? \
+             AND state = 'completed' ORDER BY updated_at DESC LIMIT 1) \
+             ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "list display-status pr monitors by workspace failed: {e}"
+                ))
+            })?;
+        rows.iter().map(monitor_from_row).collect()
+    }
+
     /// Every `active` monitor across all workspaces, oldest first — the poll
     /// loop's per-tick read and the boot rehydration read.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
@@ -546,6 +577,76 @@ mod tests {
             created_at: ts.to_string(),
             updated_at: ts.to_string(),
         }
+    }
+
+    /// The displayStatus derivation read returns every ACTIVE row plus only
+    /// the most recently updated COMPLETED row (`LIMIT 1`) — never older
+    /// completed rows (retained indefinitely) and never cancelled rows —
+    /// so the hot-path read stays bounded.
+    #[tokio::test]
+    async fn display_status_read_bounds_completed_rows_to_latest() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let mk = |pr_number: i64, state: PrMonitorState, created: &str, updated: &str| {
+            let mut m = test_monitor(&ws_id, &agent_id, created);
+            m.pr_number = pr_number;
+            m.state = state;
+            m.updated_at = updated.to_string();
+            m
+        };
+        let active_a = mk(
+            1,
+            PrMonitorState::Active,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let active_b = mk(
+            2,
+            PrMonitorState::Active,
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        let completed_old = mk(
+            3,
+            PrMonitorState::Completed,
+            "2026-01-03T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        );
+        let completed_latest = mk(
+            4,
+            PrMonitorState::Completed,
+            "2026-01-04T00:00:00Z",
+            "2026-01-05T00:00:00Z",
+        );
+        let cancelled = mk(
+            5,
+            PrMonitorState::Cancelled,
+            "2026-01-06T00:00:00Z",
+            "2026-01-06T00:00:00Z",
+        );
+        for m in [
+            &active_a,
+            &active_b,
+            &completed_old,
+            &completed_latest,
+            &cancelled,
+        ] {
+            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+        }
+
+        let rows = store
+            .list_display_status_pr_monitors_by_workspace(&ws_id)
+            .await
+            .expect("list");
+        let ids: Vec<&str> = rows.iter().map(|m| m.monitor_id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                active_a.monitor_id.0.as_str(),
+                active_b.monitor_id.0.as_str(),
+                completed_latest.monitor_id.0.as_str(),
+            ],
+            "all active rows + only the latest completed row, oldest first"
+        );
     }
 
     /// `baseline_snapshot` round-trips through insert/get, and
