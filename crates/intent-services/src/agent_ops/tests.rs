@@ -19103,13 +19103,24 @@ async fn agent_edit_truncate_drops_edited_message_and_tail() {
         json!("first question")
     );
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_UPDATED
-        && e.data["truncatedCount"] == json!(2)
-        && e.data["remainingCount"] == json!(2)));
+    // Marker reconciliation can emit the marker-aware empty clear before the
+    // truncate summary. An unbatched subscription delivers those as separate
+    // batches, so wait for the event this assertion owns instead of assuming
+    // it is in the first batch.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let batch = sub.recv().await.expect("open");
+            if batch.iter().any(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["truncatedCount"] == json!(2)
+                    && e.data["remainingCount"] == json!(2)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("truncate summary event");
 }
 
 /// Truncating at the FIRST user message empties the transcript.
