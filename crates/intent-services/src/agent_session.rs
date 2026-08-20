@@ -38,6 +38,68 @@ use crate::agent_ops::{
 };
 use crate::{token_usage, usage_stats, Services};
 
+/// Derive the cross-layer, content-free stream correlation value used only in
+/// diagnostics. The input is an existing wire `turnId` (or the assistant
+/// `messageId` on interruption paths that have no turn id); the raw id is never
+/// logged. FNV-1a is fixed here so non-Rust clients can derive the same 16-hex
+/// value without a dependency or protocol field.
+pub(crate) fn opaque_stream_ref(id: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Emit one bounded, content-free lifecycle diagnostic. Callers pass only a
+/// fixed stage/outcome vocabulary and counts; no transcript, identifiers,
+/// provider payloads, request ids, or errors enter this record. At most one
+/// record is emitted for each stage a turn reaches.
+pub(crate) fn trace_stream_lifecycle(
+    correlation_id: Option<&str>,
+    correlation_basis: &'static str,
+    stage: &'static str,
+    elapsed: Option<Duration>,
+    block_count: usize,
+    outcome: &'static str,
+) {
+    let Some(correlation_id) = correlation_id else {
+        return;
+    };
+    let elapsed_ms = elapsed.map_or(0, |value| {
+        u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+    });
+    tracing::info!(
+        target: "intent_services::stream_lifecycle",
+        turnCorrelation = %opaque_stream_ref(correlation_id),
+        correlationBasis = correlation_basis,
+        stage,
+        elapsed_ms,
+        elapsed_known = elapsed.is_some(),
+        block_count,
+        outcome,
+        "stream lifecycle"
+    );
+}
+
+/// Join the assistant-message correlation used by content stages to the
+/// turn-only correlation available to worker fallback paths. Both values are
+/// fixed-size opaque hashes; neither raw id enters the diagnostic bundle.
+pub(crate) fn trace_stream_correlation_mapping(message_id: &str, turn_id: Option<&str>) {
+    let Some(turn_id) = turn_id else {
+        return;
+    };
+    tracing::info!(
+        target: "intent_services::stream_lifecycle",
+        turnCorrelation = %opaque_stream_ref(message_id),
+        turnOnlyCorrelation = %opaque_stream_ref(turn_id),
+        correlationBasis = "mapping",
+        stage = "correlation_mapping",
+        "stream lifecycle correlation mapping"
+    );
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -620,6 +682,8 @@ pub(crate) struct FlushedTurn {
     /// Whether the flushed slot carried any blocks — the zero-output test the
     /// stop-redelivery arm (intent-hq/monorepo#1757) keys off.
     pub(crate) had_output: bool,
+    /// Total persisted block count, including tool/thought/resource blocks.
+    pub(crate) block_count: usize,
     /// The flushed content's `type: "text"` block strings, for the terminal
     /// `agent:stream:end` live-preview fields.
     pub(crate) text_blocks: Vec<String>,
@@ -1607,6 +1671,7 @@ impl Services {
         // Derived before the flush consumes the blocks; `text_block_strings`
         // copies only the text, leaving mid-turn tool payloads uncloned.
         let had_output = !live.blocks.is_empty();
+        let block_count = live.blocks.len();
         let text_blocks = text_block_strings(&live.blocks);
         let message_id = self
             .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by, true)
@@ -1614,6 +1679,7 @@ impl Services {
         Some(FlushedTurn {
             message_id,
             had_output,
+            block_count,
             text_blocks,
         })
     }
@@ -1670,6 +1736,7 @@ impl Services {
         interrupted_by: Option<&InterruptedBy>,
         owns_slot: bool,
     ) -> Option<String> {
+        let block_count = live.blocks.len();
         let mut metadata = json!({
             "interrupted": true,
             "stopReason": "interrupted",
@@ -1697,6 +1764,14 @@ impl Services {
             .await
         {
             Ok(message) => {
+                trace_stream_lifecycle(
+                    Some(live.message_id.as_str()),
+                    "message",
+                    "assistant_persisted",
+                    None,
+                    block_count,
+                    "interrupted",
+                );
                 // Best-effort: resolve workspace from the session so the
                 // projection cache drops without requiring the caller to pass
                 // workspace_id on this interrupt flush path. The same lookup
@@ -2197,6 +2272,7 @@ impl Services {
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
+        trace_stream_correlation_mapping(&message_id, turn_id);
         let mut transcript = Transcript::new(message_id.clone());
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
@@ -2393,6 +2469,7 @@ impl Services {
         let turn_cost = transcript.usage_cost.clone();
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
+        let block_count = blocks.len();
         let last_response_summary = last_response_summary(&blocks);
         // Final-value preview for the terminal `agent:stream:end` below: the
         // last throttled `agent:stream:activity` may have missed the response
@@ -2532,6 +2609,7 @@ impl Services {
         // queue entry (the imminent drain is itself the nudge). The counter
         // clears on any clean (non-truncated) completion — the stall
         // episode is over.
+        let mut truncation_terminal_outcome = "suspected_truncated_ineligible";
         let truncation_redrive = if suspected_truncated
             && !questions_persisted
             && !self.has_ready_to_send(agent_id)
@@ -2551,6 +2629,7 @@ impl Services {
                 self.arm_truncation_redrive(agent_id);
                 true
             } else {
+                truncation_terminal_outcome = "truncation_cap_exhausted";
                 tracing::warn!(
                     agent = %agent_id,
                     streak,
@@ -2593,6 +2672,14 @@ impl Services {
                     &now_iso(),
                 )
                 .await?;
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "assistant_persisted",
+                Some(turn_started.elapsed()),
+                block_count,
+                if result.is_ok() { "complete" } else { "failed" },
+            );
             self.invalidate_agent_list_cache(workspace_id);
             // Persisted-row event pair (PROTOCOL §6.5): the assistant turn
             // flush emits `agent:message` + `agent:last-message` like every
@@ -2730,6 +2817,14 @@ impl Services {
                     )
                     .await;
                     self.stash_pending_terminal_error(agent_id, persist);
+                    trace_stream_lifecycle(
+                        Some(message_id.as_str()),
+                        "message",
+                        "terminal_failure",
+                        Some(turn_started.elapsed()),
+                        block_count,
+                        "failed",
+                    );
                 }
             }
         }
@@ -2745,6 +2840,23 @@ impl Services {
         // registration order) when any were drained — omitted otherwise
         // (monorepo#732 fix wave: live delivery of turn-end attachments).
         if !pre_output_transport_failure {
+            let outcome = if result.is_err() {
+                "failed"
+            } else if suspected_truncated && truncation_redrive {
+                "suspected_truncated_redrive"
+            } else if suspected_truncated {
+                truncation_terminal_outcome
+            } else {
+                "complete"
+            };
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "agent_stream_end",
+                Some(turn_started.elapsed()),
+                block_count,
+                outcome,
+            );
             let mut end_data = json!({ "agentId": agent_id.0 });
             if message_persisted {
                 end_data["messageId"] = json!(message_id);
@@ -2798,6 +2910,18 @@ impl Services {
                 );
             }
             Ok(stop_reason) if !self.has_ready_to_send(agent_id) => {
+                trace_stream_lifecycle(
+                    Some(message_id.as_str()),
+                    "message",
+                    "agent_idle",
+                    Some(turn_started.elapsed()),
+                    block_count,
+                    if suspected_truncated {
+                        truncation_terminal_outcome
+                    } else {
+                        "complete"
+                    },
+                );
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "stream_complete",
@@ -2899,6 +3023,14 @@ impl Services {
                 );
             }
             Err(e) => {
+                trace_stream_lifecycle(
+                    Some(message_id.as_str()),
+                    "message",
+                    "agent_failed",
+                    Some(turn_started.elapsed()),
+                    block_count,
+                    "failed",
+                );
                 let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
