@@ -40,6 +40,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 /// Persisted cache key for the current Auggie catalog wire shape.
+/// Keep in sync with intent-services/src/model_catalog.rs; that constant is crate-private.
 const AUGGIE_CATALOG_VERSION: &str = "preserve-legacy-v1";
 
 /// Lowercase hex sha256 digest of `bytes`.
@@ -3801,6 +3802,36 @@ JSON
     assert_eq!(
         std::fs::read_to_string(&calls).unwrap(),
         "model list --json\n"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_provider_auggie_failure_includes_warning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = test_tempdir("intentd-wss-models-provider-failure-");
+    let bin = dir.path().join("auggie");
+    std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let request =
+        r#"{"jsonrpc":"2.0","id":49,"method":"models.list","params":{"providerId":"auggie"}}"#;
+    let response = wss_call(srv.port, srv.cfg.clone(), request).await;
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 49,
+            "result": {
+                "providerId": "auggie",
+                "models": [],
+                "source": "static",
+                "warning": "auggie CLI unavailable or returned no models"
+            }
+        })
     );
     srv.ws.stop().await;
 }

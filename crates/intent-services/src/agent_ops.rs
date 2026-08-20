@@ -4031,10 +4031,10 @@ impl Services {
         force_refresh: bool,
     ) -> Result<Value> {
         let Some(provider_id) = provider_id else {
-            return self.models_list_auggie_op(force_refresh).await;
+            return self.models_list_auggie_op(force_refresh, false).await;
         };
         if provider_id == "auggie" {
-            let mut response = self.models_list_auggie_op(force_refresh).await?;
+            let mut response = self.models_list_auggie_op(force_refresh, true).await?;
             response["providerId"] = Value::String(provider_id);
             return Ok(response);
         }
@@ -4084,21 +4084,36 @@ impl Services {
     /// fallback when the probe fails with no last-good list. A failed probe
     /// with a last-good cached list serves it labeled `stale: true` +
     /// `warning` — never silently — whether or not the read was forced.
-    async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
+    /// The provider-scoped wire shape also keeps the resolver warning on an
+    /// empty static fallback; the legacy shape omits it for compatibility.
+    async fn models_list_auggie_op(
+        &self,
+        force_refresh: bool,
+        include_fallback_warning: bool,
+    ) -> Result<Value> {
         let auggie_bin = self.auggie_bin.clone();
-        self.models_list_auggie_with(
-            force_refresh,
-            crate::model_catalog::ModelCatalogCache::now_ms(),
-            || Box::pin(fetch_auggie_models_rich(auggie_bin)),
-        )
-        .await
+        let mut response = self
+            .models_list_auggie_with(
+                force_refresh,
+                crate::model_catalog::ModelCatalogCache::now_ms(),
+                || Box::pin(fetch_auggie_models_rich(auggie_bin)),
+            )
+            .await?;
+        if !include_fallback_warning && response["source"] == "static" {
+            response
+                .as_object_mut()
+                .expect("Auggie model response must be an object")
+                .remove("warning");
+        }
+        Ok(response)
     }
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
     /// (the unit-test seam). Delegates all cache policy — indefinite serving,
     /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
-    /// resolved rows onto the legacy wire shape.
+    /// resolved rows onto the shared internal shape. The caller removes the
+    /// empty-fallback warning only when it must preserve the legacy wire shape.
     async fn models_list_auggie_with<F>(
         &self,
         force_refresh: bool,
@@ -4149,7 +4164,13 @@ impl Services {
                 }
                 Ok(out)
             }
-            None => Ok(json!({ "models": [], "source": "static" })),
+            None => {
+                let mut out = json!({ "models": [], "source": "static" });
+                if let Some(warning) = resolved.warning {
+                    out["warning"] = Value::String(warning);
+                }
+                Ok(out)
+            }
         }
     }
 

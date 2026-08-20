@@ -80,9 +80,10 @@ fn auggie_catalog_version() -> String {
     AUGGIE_CATALOG_VERSION.to_string()
 }
 
-/// auggie source: the rich CLI fetch already backing `models.list`
-/// (discovery via `resolve_auggie_bin` — registry sources are plain fns with
-/// no `Services` handle, so the `auggie_bin` test seam is unavailable here).
+/// Auggie registry source. The models.list handler uses its Services-aware
+/// fetch so tests and configured binaries keep working; this plain function is
+/// retained for registry uniformity while the entry supplies the shared cache
+/// version key and remains usable by registry-level consumers.
 fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
         match crate::agent_ops::fetch_auggie_models_rich(None).await {

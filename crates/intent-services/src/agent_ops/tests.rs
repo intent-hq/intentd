@@ -9566,6 +9566,36 @@ async fn models_list_legacy_old_entry_served_without_probe() {
 }
 
 #[tokio::test]
+async fn models_list_auggie_empty_fallback_warning_matches_wire_shape() {
+    let (_t, svc, _ws) = setup().await;
+    let svc = svc.with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let internal = svc
+        .models_list_auggie_with(false, now, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch fallback");
+    assert_eq!(
+        internal["warning"],
+        "auggie CLI unavailable or returned no models"
+    );
+
+    let legacy = svc.models_list_op(None, false).await.expect("legacy read");
+    assert_eq!(legacy["source"], "static");
+    assert!(legacy.get("warning").is_none(), "{legacy}");
+
+    let provider = svc
+        .models_list_op(Some("auggie".to_string()), false)
+        .await
+        .expect("provider read");
+    assert_eq!(provider["providerId"], "auggie");
+    assert_eq!(provider["source"], "static");
+    assert_eq!(
+        provider["warning"],
+        "auggie CLI unavailable or returned no models"
+    );
+}
+
+#[tokio::test]
 async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
     // The dual-cache divergence is gone: rows fetched via the legacy path are
     // served to `providerId: "auggie"` reads, and vice versa.
