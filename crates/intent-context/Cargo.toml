@@ -20,3 +20,6 @@ nix = { workspace = true, features = ["signal", "process"] }
 ctor = "1.0.10"
 tempfile = "3"
 tokio = { workspace = true }
+
+[lints]
+workspace = true
