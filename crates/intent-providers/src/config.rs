@@ -51,6 +51,18 @@ pub const PI_CLI_MIN_VERSION: &str = "0.80.4";
 /// [`PI_CLI_MIN_VERSION`]; re-check when bumping the pin.
 pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.80.4+";
 
+/// Minimum `auggie` CLI version the ACP agent-spawn path requires. The daemon
+/// launches auggie with `--acp --allow-indexing --model … --remove-tool …`;
+/// the full flag set landed in auggie 0.7.0 (ACP with model selection and
+/// `--allow-indexing`), so an older binary rejects the launch with an "Unknown
+/// arguments" error. Feeds the pure version-gate decision in
+/// [`crate::version_gate`]; re-check when the launch flags change.
+pub const AUGGIE_CLI_MIN_VERSION: &str = "0.7.0";
+
+/// Auggie CLI version requirement for user-facing messages. Must match
+/// [`AUGGIE_CLI_MIN_VERSION`]; re-check when bumping the minimum.
+pub const AUGGIE_CLI_REQUIREMENT: &str = "auggie 0.7.0+";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
