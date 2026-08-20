@@ -57,6 +57,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     ("interrupted_agent", "workspace_id = ?1"),
+    ("agent_flipped_completion", "workspace_id = ?1"),
     ("delegation_group", "workspace_id = ?1"),
     (
         "completion_watch",
@@ -528,6 +529,7 @@ mod tests {
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
+            format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
             format!("INSERT INTO delegation_group (group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, created_at, updated_at) VALUES ('g-{ws}', '{ws}', '{agent}', 'after_all', '[]', '{t}', '{t}')"),
             format!("INSERT INTO completion_watch (id, parent_workspace_id, child_workspace_id, parent_agent_id, child_agent_id, created_at) VALUES ('cwp-{ws}', '{ws}', '{peer}', '{agent}', 'child', '{t}')"),
             format!("INSERT INTO completion_watch (id, parent_workspace_id, child_workspace_id, parent_agent_id, child_agent_id, created_at) VALUES ('cwc-{ws}', '{peer}', '{ws}', 'parent', '{agent}', '{t}')"),
@@ -747,6 +749,7 @@ agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
+agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at
 delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, completed_agent_ids, deleted_agent_ids, sealed, delivered, event_summaries, raw_events, created_at, updated_at
 completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at

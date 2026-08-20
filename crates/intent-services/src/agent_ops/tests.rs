@@ -27406,6 +27406,304 @@ async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
     );
 }
 
+/// A child that flipped OTHER task notes to `complete` joins those flips
+/// into its completion wake's trigger stamp alongside its own linked task —
+/// and the flip set is CONSUMED on stamp: a second completion cycle stamps
+/// only the own task, never re-attributing the old flips.
+#[tokio::test]
+async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let own = link_task_note(&svc, &ws, &child, "Own task", "complete").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(child.clone()),
+    )
+    .await
+    .expect("child flips other task");
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "one wake");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([
+            { "workspaceId": ws.0, "taskNoteId": own.0 },
+            { "workspaceId": ws.0, "taskNoteId": flipped.0 },
+        ]),
+        "own task + flipped completion both stamped: {metadata}"
+    );
+    assert!(
+        svc.store()
+            .list_agent_flipped_completions(&child)
+            .await
+            .expect("list flips")
+            .is_empty(),
+        "flips consumed on stamp"
+    );
+
+    // Second completion cycle: re-arm and idle again — only the own task is
+    // stamped, the consumed flip is never re-attributed.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-arm watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 2, "second wake");
+    let metadata = session.messages[1].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([{ "workspaceId": ws.0, "taskNoteId": own.0 }]),
+        "second cycle stamps nothing stale: {metadata}"
+    );
+}
+
+/// A child with NO linked task note that flipped another task still stamps
+/// that flip as its completion wake's trigger (previously such wakes were
+/// unannotated).
+#[tokio::test]
+async fn unlinked_child_completion_wake_stamps_flips_only() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Free").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(child.clone()),
+    )
+    .await
+    .expect("child flips task");
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([{ "workspaceId": ws.0, "taskNoteId": flipped.0 }]),
+        "flip stamped without a linked own task: {metadata}"
+    );
+    assert!(
+        svc.store()
+            .list_agent_flipped_completions(&child)
+            .await
+            .expect("list flips")
+            .is_empty(),
+        "flips consumed on stamp"
+    );
+}
+
+/// `agent.reportToParent` joins the reporting child's flipped completions
+/// into the report wake's trigger stamp (and consumes them) — the report
+/// wake is the cycle's one wake, since it disarms the idle-time delivery.
+#[tokio::test]
+async fn report_to_parent_wake_stamps_and_consumes_flips() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let own = link_task_note(&svc, &ws, &child, "Own task", "in_progress").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(child.clone()),
+    )
+    .await
+    .expect("child flips other task");
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child.clone()))
+        .await
+        .expect("report");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), baseline + 1, "one report wake");
+    let metadata = session.messages[baseline]
+        .metadata
+        .as_ref()
+        .expect("metadata");
+    assert_eq!(
+        metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([
+            { "workspaceId": ws.0, "taskNoteId": own.0 },
+            { "workspaceId": ws.0, "taskNoteId": flipped.0 },
+        ]),
+        "report wake stamps own task + flip: {metadata}"
+    );
+    assert!(
+        svc.store()
+            .list_agent_flipped_completions(&child)
+            .await
+            .expect("list flips")
+            .is_empty(),
+        "flips consumed at report time"
+    );
+}
+
+/// after_all aggregated wake: a settled member's flipped completions are
+/// captured (and consumed) at group RECORD time and survive into the
+/// aggregated wake's trigger stamp alongside every member's own task.
+#[tokio::test]
+async fn group_wake_includes_flipped_completion_triggers() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let t1 = create_agent(&svc, &ws, "One").await;
+    let t2 = create_agent(&svc, &ws, "Two").await;
+    let n1 = link_task_note(&svc, &ws, &t1, "Task one", "complete").await;
+    let n2 = link_task_note(&svc, &ws, &t2, "Task two", "complete").await;
+    let flipped = seed_task(&svc, &ws, "Flipped task").await;
+    svc.task_update_note_status(
+        ws.clone(),
+        flipped.clone(),
+        "complete".into(),
+        None,
+        Some(t1.clone()),
+    )
+    .await
+    .expect("t1 flips other task");
+
+    svc.app_agents_wait_op(
+        ws.clone(),
+        caller.clone(),
+        vec![t1.0.clone(), t2.0.clone()],
+        Some("after_all".into()),
+    )
+    .await
+    .expect("waitFor after_all");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t1,
+        json!({ "agentId": t1.0, "completionReport": "one done" }),
+    ))
+    .await;
+    // The flip was consumed when t1's settlement was RECORDED — before the
+    // group fires.
+    assert!(
+        svc.store()
+            .list_agent_flipped_completions(&t1)
+            .await
+            .expect("list flips")
+            .is_empty(),
+        "flips consumed at group record time"
+    );
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t2,
+        json!({ "agentId": t2.0, "completionReport": "two done" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    let ids: Vec<&str> = metadata[UNBLOCKED_TRIGGER_TASKS_KEY]
+        .as_array()
+        .expect("trigger array on group wake")
+        .iter()
+        .map(|t| t["taskNoteId"].as_str().unwrap())
+        .collect();
+    for expected in [&n1.0, &flipped.0, &n2.0] {
+        assert!(
+            ids.contains(&expected.as_str()),
+            "{expected} stamped on the group wake: {metadata}"
+        );
+    }
+}
+
 /// The no-manager `agent.sendQueuedMessageNow` path (question-hold park →
 /// explicit send with no AgentManager attached) resolves the unblocked
 /// section at persist time — parity with the manager path and the store-only
