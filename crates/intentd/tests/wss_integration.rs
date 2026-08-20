@@ -981,6 +981,10 @@ async fn wss_agent_list_omits_initial_message() {
         .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
         .expect("created agent in list");
     assert!(
+        row["metadata"].is_object(),
+        "list row must carry a metadata object: {row}"
+    );
+    assert!(
         row["metadata"].get("initialMessage").is_none(),
         "agent.list rows must omit metadata.initialMessage (monorepo#2932): {row}"
     );
