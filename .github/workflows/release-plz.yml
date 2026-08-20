@@ -166,9 +166,90 @@ jobs:
       - name: Set persistent cargo target dir
         shell: bash
         run: echo "CARGO_TARGET_DIR=/raid/ci-target/intentd/$RUNNER_NAME/release-plz-pr/target" >> "$GITHUB_ENV"
+      # The shared target dir above can't make the verify builds warm:
+      # release-plz runs `cargo package` per git_only package, and cargo
+      # verifies each one by re-extracting the packaged tarball and building
+      # it. Extraction resets file mtimes, which invalidates cargo's
+      # fingerprints, so every package rebuilds the workspace from scratch
+      # (~2 min x 15 packages; release-plz/release-plz#2996 documents the
+      # per-package verify mechanism). sccache keys on content hashes rather
+      # than mtimes, so those identical rustc invocations become cache hits.
+      #
+      # Idempotent install guard like the pkg-config one above: install the
+      # pinned, checksum-verified musl binary only if sccache is not already
+      # present. ~/.local/bin is not on the runner's default PATH, so also
+      # check the install destination directly — that keeps repeat runs from
+      # re-downloading. The staged-copy + rename makes the final install
+      # atomic, so concurrent installs from other tinybox slots (shared
+      # $HOME) can't leave a partially written binary. Fail-soft: if
+      # download/checksum/extract fails, warn and continue without sccache —
+      # the job still works, just uncached. (Explicit && chaining, not
+      # `set -e`, because -e is suppressed inside an if condition.)
+      - name: Install sccache if missing
+        shell: bash
+        run: |
+          bin_dir="$HOME/.local/bin"
+          if command -v sccache >/dev/null; then exit 0; fi
+          if [ -x "$bin_dir/sccache" ]; then
+            echo "$bin_dir" >> "$GITHUB_PATH"
+            exit 0
+          fi
+          version=v0.17.0
+          name="sccache-$version-x86_64-unknown-linux-musl"
+          sha256=67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006
+          tmp=$(mktemp -d)
+          staged="$bin_dir/.sccache-staged.$$"
+          if curl -fsSL --retry 3 -o "$tmp/$name.tar.gz" \
+               "https://github.com/mozilla/sccache/releases/download/$version/$name.tar.gz" \
+             && echo "$sha256  $tmp/$name.tar.gz" | sha256sum -c --quiet - \
+             && tar -xzf "$tmp/$name.tar.gz" -C "$tmp" \
+             && chmod 0755 "$tmp/$name/sccache" \
+             && mkdir -p "$bin_dir" \
+             && cp "$tmp/$name/sccache" "$staged" \
+             && mv -f "$staged" "$bin_dir/sccache"; then
+            echo "$bin_dir" >> "$GITHUB_PATH"
+          else
+            echo "::warning::sccache install failed; continuing without compile caching"
+          fi
+          rm -rf "$tmp" "$staged"
+      # Exported via $GITHUB_ENV instead of static job env so that when the
+      # install guard fell through, RUSTC_WRAPPER is simply never set and
+      # builds proceed unwrapped. CARGO_INCREMENTAL=0 because sccache does
+      # not cache incremental compilation. Unlike CARGO_TARGET_DIR above,
+      # SCCACHE_DIR is deliberately NOT keyed on $RUNNER_NAME: sccache's
+      # local disk cache is designed for concurrent access, so one cache
+      # shared across the tinybox slots maximizes hit rates. It lives on
+      # /raid like the target dirs — $HOME sits on the much smaller root
+      # volume.
+      - name: Enable sccache
+        shell: bash
+        run: |
+          if command -v sccache >/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_DIR=/raid/ci-target/intentd/sccache" >> "$GITHUB_ENV"
+            echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+          fi
+      # The verify builds use the dev profile and nothing ever reads their
+      # debug info, so drop it: less to compile, smaller artifacts to cache.
+      # Independent of sccache — applies even when the install guard fell
+      # back to uncached builds.
+      - name: Drop debug info from verify builds
+        shell: bash
+        run: echo "CARGO_PROFILE_DEV_DEBUG=false" >> "$GITHUB_ENV"
       - name: Run release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # Surface cache hit rates in the log; `always()` keeps them visible
+      # when release-pr fails. Skips cleanly when sccache was never enabled.
+      - name: Show sccache stats
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ -n "${RUSTC_WRAPPER:-}" ] && command -v sccache >/dev/null; then
+            sccache --show-stats
+          else
+            echo "sccache not enabled; skipping stats"
+          fi
