@@ -91,6 +91,9 @@ libc = "0.2"
 [target.'cfg(any(all(target_os = "linux", target_env = "musl"), target_os = "macos"))'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }
 
+[lints]
+workspace = true
+
 [package.metadata.cargo-shear]
 # openssl-sys is a link-time dependency only: it vendors/statically links OpenSSL for
 # the libgit2/libssh2 chain on musl and macOS and is never referenced from Rust code,

@@ -23,3 +23,6 @@ libc = "0.2"
 [dev-dependencies]
 ctor = "1.0.10"
 tempfile = "3"
+
+[lints]
+workspace = true
