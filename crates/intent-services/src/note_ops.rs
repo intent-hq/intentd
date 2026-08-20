@@ -40,7 +40,7 @@ fn find_next_heading(s: &str) -> Option<usize> {
 }
 
 /// `note.add` — returns `(new_content, position_info)`.
-pub fn apply_add(
+pub(crate) fn apply_add(
     old: &str,
     content: &str,
     heading: Option<&str>,
@@ -85,7 +85,7 @@ pub fn apply_add(
 /// `note.edit` — first exact-match replacement. Returns
 /// `(new_content, match_position, was_empty)`; `match_position` is a scalar
 /// (char) offset, or `-1` when the note was empty.
-pub fn apply_edit(old: &str, old_text: &str, new_text: &str) -> Result<(String, i64, bool)> {
+pub(crate) fn apply_edit(old: &str, old_text: &str, new_text: &str) -> Result<(String, i64, bool)> {
     if old.is_empty() {
         return Ok((new_text.to_string(), -1, true));
     }
@@ -105,7 +105,7 @@ pub fn apply_edit(old: &str, old_text: &str, new_text: &str) -> Result<(String, 
 }
 
 /// `note.editLines` — 1-based inclusive replace/delete/insert.
-pub fn apply_edit_lines(old: &str, start: i64, end: i64, content: &str) -> Result<String> {
+pub(crate) fn apply_edit_lines(old: &str, start: i64, end: i64, content: &str) -> Result<String> {
     if start < 1 {
         return Err(Error::Internal(
             "start must be a positive integer".to_string(),
@@ -173,7 +173,7 @@ fn colon_extract(s: &str) -> Option<String> {
 
 /// `note.setContent` content cleaner (quote-strip, JSON-value extraction,
 /// truncation and empty guards). The >50% reduction guard lives in the service.
-pub fn clean_set_content(content: &str) -> Result<String> {
+pub(crate) fn clean_set_content(content: &str) -> Result<String> {
     let mut clean = content.to_string();
     if clean.starts_with('"') || clean.starts_with("\\\"") {
         clean = remove_first_char(&clean);
@@ -252,7 +252,7 @@ fn strip_agent_comments(s: &str) -> String {
 }
 
 /// `note.listTasks` — parse checkbox rows from note content.
-pub fn parse_tasks(content: &str) -> Vec<NoteTaskRow> {
+pub(crate) fn parse_tasks(content: &str) -> Vec<NoteTaskRow> {
     content
         .split('\n')
         .enumerate()
@@ -315,7 +315,7 @@ fn match_task_line(line: &str) -> Option<(char, String)> {
 }
 
 /// Parse an asset id from a raw id or a `workspace-asset://host/<id>` URL.
-pub fn parse_asset_id(asset: &str) -> Result<String> {
+pub(crate) fn parse_asset_id(asset: &str) -> Result<String> {
     match asset.strip_prefix("workspace-asset://") {
         Some(after) => match after.find('/') {
             Some(slash) if slash > 0 && slash + 1 < after.len() => {
@@ -334,7 +334,7 @@ pub fn parse_asset_id(asset: &str) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Map a checkbox status word to its marker; `None` if unrecognized.
-pub fn checkbox_for(word: &str) -> Option<&'static str> {
+pub(crate) fn checkbox_for(word: &str) -> Option<&'static str> {
     match word {
         "todo" => Some("[ ]"),
         "in-progress" => Some("[/]"),
@@ -397,7 +397,7 @@ fn parse_dash_checkbox(line: &str) -> Option<(usize, usize, char)> {
 /// `task_text` exactly (primary), else the first checkbox line containing it
 /// (fallback). `checkbox` is the bracket marker (e.g. `[x]`). Errors with the
 /// TS "Task not found" message when nothing matches.
-pub fn apply_task_status(content: &str, task_text: &str, checkbox: &str) -> Result<String> {
+pub(crate) fn apply_task_status(content: &str, task_text: &str, checkbox: &str) -> Result<String> {
     let normalized = task_text.trim();
     let mut found = false;
     let mut out: Vec<String> = Vec::with_capacity(content.split('\n').count());
@@ -445,7 +445,7 @@ pub fn apply_task_status(content: &str, task_text: &str, checkbox: &str) -> Resu
 
 /// Outcome of [`apply_task_line_update`].
 #[derive(Debug)]
-pub struct TaskLineUpdate {
+pub(crate) struct TaskLineUpdate {
     pub content: String,
     pub previous_text: String,
     pub new_text: String,
@@ -455,7 +455,7 @@ pub struct TaskLineUpdate {
 /// `task.update` — atomic single-line edit (1-based `line`) with an optional
 /// `expected` conflict check. `status` is a validated word (`todo`/`in-progress`
 /// /`done`) or `None` to keep the current status; `text` replaces the task text.
-pub fn apply_task_line_update(
+pub(crate) fn apply_task_line_update(
     content: &str,
     line: i64,
     text: Option<&str>,
@@ -552,7 +552,7 @@ fn line_of(content: &str, idx: usize) -> usize {
 /// [`plaintext_projection`]): editor clients derive anchors from the rendered
 /// document's *plain text*, which drops markdown syntax and joins blocks with
 /// no separator.
-pub fn find_and_anchor_text(
+pub(crate) fn find_and_anchor_text(
     content: &str,
     search_context: &str,
     comment_target: &str,
@@ -873,11 +873,11 @@ fn plaintext_fallback_anchor(
 
 /// Amount of surrounding text captured on add / used for recovery matching
 /// (reference `CONTEXT_LENGTH = 50` in `markdown-anchor-recovery.ts`).
-pub const ANCHOR_CONTEXT_LEN: usize = 50;
+pub(crate) const ANCHOR_CONTEXT_LEN: usize = 50;
 
 /// Health of a comment's anchor markers in a note's markdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnchorState {
+pub(crate) enum AnchorState {
     /// Both markers present with a valid range.
     Healthy,
     /// Both markers absent — the anchored span was removed entirely.
@@ -893,7 +893,7 @@ pub enum AnchorState {
 /// Start/end byte offsets of a comment's `<!--anchor:{id}:…-->` markers, if
 /// found. `start`/`end` point at the first byte of each marker.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct AnchorPositions {
+pub(crate) struct AnchorPositions {
     pub start: Option<usize>,
     pub end: Option<usize>,
 }
@@ -908,7 +908,7 @@ fn end_marker(comment_id: &str) -> String {
 
 /// Byte offsets of the `{id}:start` / `{id}:end` markers (reference
 /// `findAnchorsInMarkdown`).
-pub fn find_anchor_positions(markdown: &str, comment_id: &str) -> AnchorPositions {
+pub(crate) fn find_anchor_positions(markdown: &str, comment_id: &str) -> AnchorPositions {
     let start_pat = start_marker(comment_id);
     let end_pat = end_marker(comment_id);
     AnchorPositions {
@@ -919,7 +919,7 @@ pub fn find_anchor_positions(markdown: &str, comment_id: &str) -> AnchorPosition
 
 /// Classify a comment's anchor state in `markdown` (reference
 /// `scanForProblematicAnchors` + healthy/missing cases).
-pub fn classify_anchor_state(markdown: &str, comment_id: &str) -> AnchorState {
+pub(crate) fn classify_anchor_state(markdown: &str, comment_id: &str) -> AnchorState {
     let start_pat = start_marker(comment_id);
     let end_pat = end_marker(comment_id);
     let start = markdown.find(&start_pat);
@@ -946,7 +946,7 @@ pub fn classify_anchor_state(markdown: &str, comment_id: &str) -> AnchorState {
 
 /// Up to [`ANCHOR_CONTEXT_LEN`] characters (UTF-8-safe) immediately preceding
 /// `pos` in `content`. Reference `extractAnchoredText.contextBefore`.
-pub fn context_before(content: &str, pos: usize) -> String {
+pub(crate) fn context_before(content: &str, pos: usize) -> String {
     // Walk backwards up to CONTEXT_LENGTH chars from `pos`.
     let start = content[..pos]
         .char_indices()
@@ -960,7 +960,7 @@ pub fn context_before(content: &str, pos: usize) -> String {
 
 /// Up to [`ANCHOR_CONTEXT_LEN`] characters (UTF-8-safe) immediately following
 /// `pos` in `content`. Reference `extractAnchoredText.contextAfter`.
-pub fn context_after(content: &str, pos: usize) -> String {
+pub(crate) fn context_after(content: &str, pos: usize) -> String {
     let end = content[pos..]
         .char_indices()
         .take(ANCHOR_CONTEXT_LEN)
@@ -972,7 +972,7 @@ pub fn context_after(content: &str, pos: usize) -> String {
 
 /// Remove every `{id}:start` / `{id}:end` marker occurrence from `markdown`
 /// (reference `removeAnchors`; used to scrub broken/degenerate anchors).
-pub fn remove_anchor_markers(markdown: &str, comment_id: &str) -> String {
+pub(crate) fn remove_anchor_markers(markdown: &str, comment_id: &str) -> String {
     let start_pat = start_marker(comment_id);
     let end_pat = end_marker(comment_id);
     markdown.replace(&start_pat, "").replace(&end_pat, "")
@@ -985,7 +985,7 @@ const ANCHOR_MARKER_PREFIX: &str = "<!--anchor:";
 /// and validates client-supplied ids against this same canonical form);
 /// anything else — e.g. the literal `{id}` in documentation examples — is
 /// ordinary user content.
-pub fn is_canonical_uuid(id: &str) -> bool {
+pub(crate) fn is_canonical_uuid(id: &str) -> bool {
     let b = id.as_bytes();
     if b.len() != 36 {
         return false;
@@ -1026,7 +1026,7 @@ fn parse_uuid_anchor_marker(rest: &str) -> Option<(&str, usize)> {
 /// unterminated lookalike followed by a real marker is one HTML comment in
 /// rendered markdown, so the whole run (including text between them) is
 /// dropped, matching what a renderer would hide.
-pub fn strip_anchor_marker_text(s: &str) -> String {
+pub(crate) fn strip_anchor_marker_text(s: &str) -> String {
     let mut cur = s.to_string();
     loop {
         let mut out = String::with_capacity(cur.len());
@@ -1054,7 +1054,7 @@ pub fn strip_anchor_marker_text(s: &str) -> String {
 /// (markers of rows already flagged `is_orphaned`) alike. Non-UUID
 /// marker-lookalikes (documentation literals such as
 /// `<!--anchor:{id}:start-->`) are user content and are never touched.
-pub fn scrub_phantom_anchor_markers(
+pub(crate) fn scrub_phantom_anchor_markers(
     content: &str,
     live_ids: &std::collections::HashSet<String>,
 ) -> String {
@@ -1081,7 +1081,7 @@ pub fn scrub_phantom_anchor_markers(
 
 /// Outcome of an anchor recovery attempt (reference `RecoveryResult`).
 #[derive(Debug, Clone)]
-pub enum RecoveryOutcome {
+pub(crate) enum RecoveryOutcome {
     /// Markers restored — caller should adopt the returned markdown.
     Recovered(String),
     /// Recovery failed — caller should scrub any stray markers and mark the
@@ -1098,7 +1098,7 @@ pub enum RecoveryOutcome {
 /// original `anchor_text` is not used as an extra constraint here (it can
 /// itself have been partly edited); the surviving marker + neighbor word are
 /// what pin the recovered range, matching the reference behavior.
-pub fn recover_partial_anchor(
+pub(crate) fn recover_partial_anchor(
     markdown: &str,
     comment_id: &str,
     anchor_before: Option<&str>,
@@ -1228,7 +1228,7 @@ fn trailing_word(s: &str) -> String {
 
 /// One task parsed from a `@@@task` block.
 #[derive(Debug, Default)]
-pub struct ParsedTaskBlock {
+pub(crate) struct ParsedTaskBlock {
     pub title: String,
     pub content: String,
     /// Raw `key=` header attribute (local key, unresolved).
@@ -1245,7 +1245,7 @@ pub struct ParsedTaskBlock {
 }
 
 /// Result of [`extract_task_blocks`].
-pub struct TaskBlocksResult {
+pub(crate) struct TaskBlocksResult {
     pub tasks: Vec<ParsedTaskBlock>,
     pub content_without_blocks: String,
 }
@@ -1293,7 +1293,7 @@ fn parse_task_block_content(block: &str) -> Option<ParsedTaskBlock> {
 
 /// True if the content contains at least one `@@@task`/`@@@tasks` fence-and-close
 /// pair (valid title not required), matching the TS `hasTaskBlocks` regex test.
-pub fn has_task_blocks(content: &str) -> bool {
+pub(crate) fn has_task_blocks(content: &str) -> bool {
     !scan_blocks(content).is_empty()
 }
 
@@ -1468,7 +1468,7 @@ fn scan_blocks(content: &str) -> Vec<ScannedBlock> {
 
 /// `extractTasksBlocks` — parse all `@@@task` blocks and replace them with
 /// indexed placeholders (valid) or a removed-marker (invalid).
-pub fn extract_task_blocks(content: &str) -> TaskBlocksResult {
+pub(crate) fn extract_task_blocks(content: &str) -> TaskBlocksResult {
     let blocks = scan_blocks(content);
     let mut tasks = Vec::new();
     let mut out = String::new();
@@ -1502,7 +1502,7 @@ pub fn extract_task_blocks(content: &str) -> TaskBlocksResult {
 /// non-lookbehind transforms in `stripMarkdownFormatting`). Single-character
 /// italic markers are intentionally left intact (the TS version relies on
 /// lookbehind, unavailable here); task titles are otherwise normalized.
-pub fn strip_markdown_formatting(text: &str) -> String {
+pub(crate) fn strip_markdown_formatting(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
@@ -1589,7 +1589,7 @@ fn strip_leading_headers(s: &str) -> String {
 
 /// File extension (with leading dot) for a mime type (default `.png`), the
 /// inverse of [`mime_from_extension`], per the TS `getExtensionFromMimeType`.
-pub fn extension_from_mime(mime_type: &str) -> &'static str {
+pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
     match mime_type {
         "image/png" => ".png",
         "image/jpeg" | "image/jpg" => ".jpg",
@@ -1604,7 +1604,7 @@ pub fn extension_from_mime(mime_type: &str) -> &'static str {
 
 /// Strip an optional `data:<mime>;base64,` URL prefix from an asset payload,
 /// mirroring the TS `data.replace(/^data:[^;]+;base64,/, '')`.
-pub fn strip_data_url_prefix(data: &str) -> &str {
+pub(crate) fn strip_data_url_prefix(data: &str) -> &str {
     if let Some(rest) = data.strip_prefix("data:") {
         if let Some((mime, payload)) = rest.split_once(";base64,") {
             if !mime.contains(';') {
@@ -1618,7 +1618,7 @@ pub fn strip_data_url_prefix(data: &str) -> &str {
 /// Mint a unique asset id `<timestamp36>-<hash8><ext>`, the TS peer's
 /// `${Date.now().toString(36)}-${contentHash}${extension}` shape (the 8-char
 /// content-hash fragment is an opaque uniqueness hint, not a stable digest).
-pub fn new_asset_id(base64_data: &str, mime_type: &str) -> String {
+pub(crate) fn new_asset_id(base64_data: &str, mime_type: &str) -> String {
     use std::hash::{Hash, Hasher};
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1651,7 +1651,7 @@ fn to_base36(mut n: u128) -> String {
 }
 
 /// Mime type from an asset's extension (default `image/png`), per the TS map.
-pub fn mime_from_extension(asset_id: &str) -> String {
+pub(crate) fn mime_from_extension(asset_id: &str) -> String {
     let ext = asset_id
         .rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase())

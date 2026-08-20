@@ -642,7 +642,7 @@ impl Services {
     /// Monitors owned by an agent, oldest first. Cancelled rows are excluded
     /// (they are removed from the UI); completed rows are retained so merged
     /// PRs stay visible.
-    pub async fn pr_monitors_for_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
+    pub(crate) async fn pr_monitors_for_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
         Ok(self
             .store
             .list_pr_monitors_by_agent(agent_id)
@@ -654,7 +654,7 @@ impl Services {
 
     /// Monitors in a workspace, oldest first, with the same cancelled-row
     /// exclusion as the per-agent view.
-    pub async fn pr_monitors_for_workspace(
+    pub(crate) async fn pr_monitors_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
@@ -887,7 +887,7 @@ impl Services {
     /// Deliver a monitor's pending consolidated wake right now, bypassing the
     /// remaining debounce window, and reset the debounce state. A no-op
     /// (`Ok(false)`) when nothing is pending.
-    pub async fn pr_monitor_flush(
+    pub(crate) async fn pr_monitor_flush(
         &self,
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
@@ -914,7 +914,7 @@ impl Services {
     /// re-poll finds nothing changed vs. the emit baseline. A forge fetch
     /// failure records `lastError` (like a sweep poll) and propagates the
     /// error.
-    pub async fn pr_monitor_check_and_flush(
+    pub(crate) async fn pr_monitor_check_and_flush(
         &self,
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,

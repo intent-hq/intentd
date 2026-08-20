@@ -55,7 +55,7 @@ pub trait ExecPolicy: Send + Sync {
 
 /// v1 stub: every command is allowed. The seam is what matters; policies land
 /// separately behind this trait.
-pub struct AllowAllPolicy;
+pub(crate) struct AllowAllPolicy;
 
 impl ExecPolicy for AllowAllPolicy {
     fn evaluate(&self, _command: &str, _args: &[String]) -> Result<(), String> {
@@ -82,7 +82,7 @@ pub struct HostExecArgs {
 
 /// Upper bound on `timeoutMs` to keep a runaway request from wedging the daemon
 /// (10 minutes matches the outer bound on other short-lived host probes).
-pub const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+pub(crate) const MAX_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
 /// A `host.exec` failure with the error code the transport should surface.
 #[derive(Debug)]
@@ -249,7 +249,7 @@ fn node_resolve(base: &str, rel: &str) -> Result<PathBuf, HostExecError> {
 /// path is used as the containment root (sandboxed agent containment).
 /// Public so the streaming surface (`host_exec_stream`) can reuse the guard
 /// bit-identically instead of re-deriving it.
-pub async fn resolve_cwd_within_workspace(
+pub(crate) async fn resolve_cwd_within_workspace(
     api: &dyn WorkspaceApi,
     workspace_id: &str,
     cwd: &str,

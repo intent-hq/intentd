@@ -27,12 +27,12 @@ use yrs::{Doc, GetString, OffsetKind, Options, Text, Transact, TransactionMut};
 /// Reference parity (`SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000`): sweep sessions
 /// idle for more than a day. Wired from the composition root via
 /// [`crate::Services::spawn_crdt_session_sweep_loop`].
-pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Reference parity (`updateContent` cadence): the yrs-side sweep runs once
 /// per hour. Wired from the composition root via
 /// [`crate::Services::spawn_crdt_session_sweep_loop`].
-pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Name of the `yrs::Text` container that mirrors the note's markdown content.
 const CONTENT_TEXT_KEY: &str = "content";
@@ -44,7 +44,7 @@ struct Session {
 
 /// Session-only CRDT store keyed by `(workspace_id, note_id)`.
 #[derive(Default)]
-pub struct CrdtNoteManager {
+pub(crate) struct CrdtNoteManager {
     sessions: Mutex<HashMap<(WorkspaceId, NoteId), Session>>,
 }
 
@@ -72,7 +72,7 @@ impl CrdtNoteManager {
     /// on first touch. Subsequent calls compute the diff against the doc's
     /// current text (never `base_content` after seeding), matching the
     /// reference `applyContentUpdate`.
-    pub fn apply_full_content(
+    pub(crate) fn apply_full_content(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
@@ -114,7 +114,7 @@ impl CrdtNoteManager {
     /// storage. Called after surgical `note.*` mutations that write content
     /// directly (add / edit / editLines / task.update / task.updateStatus /
     /// restoreVersion).
-    pub fn invalidate(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
+    pub(crate) fn invalidate(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
         let key = (workspace_id.clone(), note_id.clone());
         let mut sessions = self.lock_sessions();
         sessions.remove(&key);
@@ -129,7 +129,7 @@ impl CrdtNoteManager {
     /// Driven by the composition-root sweeper spawned in
     /// [`crate::Services::spawn_crdt_session_sweep_loop`] using
     /// [`SESSION_SWEEP_INTERVAL`] / [`SESSION_IDLE_TIMEOUT`].
-    pub fn sweep_stale(&self, timeout: Duration) -> usize {
+    pub(crate) fn sweep_stale(&self, timeout: Duration) -> usize {
         let now = Instant::now();
         let mut sessions = self.lock_sessions();
         let before = sessions.len();
@@ -139,7 +139,7 @@ impl CrdtNoteManager {
 
     /// True if a live session exists for `(workspace, note)`.
     #[cfg(test)]
-    pub fn has_session(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> bool {
+    pub(crate) fn has_session(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> bool {
         let key = (workspace_id.clone(), note_id.clone());
         self.lock_sessions().contains_key(&key)
     }
@@ -147,7 +147,7 @@ impl CrdtNoteManager {
     /// Test-only: seed the last-access timestamp so `sweep_stale` observes an
     /// aged session without waiting real time.
     #[cfg(test)]
-    pub fn set_last_access_for_test(
+    pub(crate) fn set_last_access_for_test(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,

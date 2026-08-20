@@ -20,7 +20,8 @@ mod bindings;
 mod dispatch;
 mod tools;
 
-pub use tools::{MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, ToolDef};
+pub(crate) use tools::ToolDef;
+pub use tools::{MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions};
 
 // Static description const, exposed for the segment-assembly parity tests
 // in `crate::tests` (the assembled all-defaults description must be
@@ -32,7 +33,7 @@ pub(crate) use tools::WORKSPACE_API_DESCRIPTION;
 // `intent-services::tool_block` reuses these so validation and resource-item
 // construction cannot drift from what `ws.app.proposal.show` emits.
 pub use bindings::app::proposal::{
-    is_valid_proposal, proposal_resource_uri, PROPOSAL_KINDS, PROPOSAL_RESOURCE_MIME_TYPE,
+    is_valid_proposal, proposal_resource_uri, PROPOSAL_RESOURCE_MIME_TYPE,
 };
 
 // Canonical question MIME type (§7.1): the question-hold derivation in
@@ -43,10 +44,8 @@ pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 // Hook-scheduler seam: the background hook runner in `intent-services`
 // evaluates agent scripts with the same `ws.*` prelude + host dispatch the
 // `workspace_api` tool installs, so the two environments cannot drift.
-pub use bindings::prelude as bindings_prelude;
-pub use bindings::prelude_for as bindings_prelude_for;
 pub use bindings::prelude_for_bridge as bindings_prelude_for_bridge;
-pub use dispatch::{make_workspace_host, make_workspace_host_for, make_workspace_host_for_bridge};
+pub use dispatch::make_workspace_host_for_bridge;
 
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -151,7 +150,8 @@ impl WorkspaceMcpServer {
     }
 
     /// Override the denied tool names directly (testing / custom policies).
-    pub fn with_denylist<I, S>(mut self, names: I) -> Self
+    #[cfg(test)]
+    pub(crate) fn with_denylist<I, S>(mut self, names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -229,7 +229,8 @@ impl WorkspaceMcpServer {
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
     /// tests finish in milliseconds.
-    pub fn with_workspace_api_timeout(mut self, timeout: Duration) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_workspace_api_timeout(mut self, timeout: Duration) -> Self {
         self.workspace_api_timeout = timeout;
         self
     }
@@ -243,7 +244,8 @@ impl WorkspaceMcpServer {
     }
 
     /// Whether `name` is denied for this agent.
-    pub fn is_denied(&self, name: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_denied(&self, name: &str) -> bool {
         self.denylist.contains(name)
     }
 
@@ -263,7 +265,7 @@ impl WorkspaceMcpServer {
     }
 
     /// The tool definitions exposed to this agent (full registry minus denylist).
-    pub fn available_tools(&self) -> Vec<&'static ToolDef> {
+    pub(crate) fn available_tools(&self) -> Vec<&'static ToolDef> {
         tools::all_tools(self.is_chief)
             .iter()
             .filter(|t| !self.denylist.contains(t.name))

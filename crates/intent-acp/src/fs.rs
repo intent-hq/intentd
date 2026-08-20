@@ -64,16 +64,6 @@ impl FileService {
         }
     }
 
-    /// A service narrowed to `scope` (a relative subdirectory of `root`); reads
-    /// and writes outside that subtree are rejected.
-    pub fn with_scope(root: impl Into<PathBuf>, scope: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            scope: Some(scope.into()),
-            alias: None,
-        }
-    }
-
     /// Alias an absolute prefix onto the root: requests under `alias` are
     /// rebased onto `root` (e.g. guest `/workspace/src/x.rs` → host
     /// `<sandbox>/src/x.rs` for microVM sessions, monorepo#1120 EE-5).

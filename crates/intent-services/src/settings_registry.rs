@@ -44,7 +44,7 @@ use toml_edit::DocumentMut;
 /// Every TOML-backed setting, addressed by its dotted wire path. Mirrors the
 /// [`SettingsFile`] schema leaf-for-leaf (maps such as `providers.paths` are
 /// single leaves — their dynamic children are not individually addressable).
-pub const KNOWN_PATHS: &[&str] = &[
+pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.active",
     "providers.enabled",
     "providers.paths",
@@ -173,7 +173,7 @@ const SELF_WRITE_WINDOW: Duration = Duration::from_secs(10);
 /// compares against the recent history of these to suppress self-write
 /// events (see [`SettingsRegistry::is_self_write`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WriteStamp {
+pub(crate) struct WriteStamp {
     /// Monotonic counter, incremented on every successful self-write.
     pub generation: u64,
     /// Hash of the exact file content written (see
@@ -308,7 +308,7 @@ impl SettingsRegistry {
     /// Legacy values captured at load (dotted wire path → JSON value; empty
     /// when the file had none). Non-empty until [`SettingsRegistry::strip_legacy`]
     /// runs.
-    pub fn legacy_values(&self) -> LegacySettings {
+    pub(crate) fn legacy_values(&self) -> LegacySettings {
         self.inner
             .lock()
             .expect("settings registry lock poisoned")
@@ -324,7 +324,7 @@ impl SettingsRegistry {
     /// paths. Callers run this only **after** the captured values are safely
     /// persisted elsewhere, so a failed import keeps the file intact for the
     /// next boot to retry.
-    pub fn strip_legacy(&self) -> Result<Vec<String>> {
+    pub(crate) fn strip_legacy(&self) -> Result<Vec<String>> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         if inner.legacy.is_empty() {
             return Ok(Vec::new());
@@ -350,7 +350,7 @@ impl SettingsRegistry {
     }
 
     /// All dotted wire paths the registry manages.
-    pub fn known_paths() -> &'static [&'static str] {
+    pub(crate) fn known_paths() -> &'static [&'static str] {
         KNOWN_PATHS
     }
 
@@ -380,7 +380,8 @@ impl SettingsRegistry {
     }
 
     /// Identity of the most recent self-written file content, if any.
-    pub fn write_stamp(&self) -> Option<WriteStamp> {
+    #[cfg(test)]
+    pub(crate) fn write_stamp(&self) -> Option<WriteStamp> {
         self.inner
             .lock()
             .expect("settings registry lock poisoned")
@@ -401,7 +402,7 @@ impl SettingsRegistry {
     /// [`SELF_WRITE_WINDOW`], across the last [`SELF_WRITE_HISTORY`] writes)
     /// — the file watcher uses this to suppress events for the daemon's own
     /// writes, including stale/coalesced reads of an earlier write-back.
-    pub fn is_self_write(&self, text: &str) -> bool {
+    pub(crate) fn is_self_write(&self, text: &str) -> bool {
         let hash = content_hash(text);
         self.inner
             .lock()

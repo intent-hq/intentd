@@ -14,13 +14,13 @@ use crate::engine::{TranscribeRequest, Transcript, VoiceEngine};
 use crate::error::{Error, Result};
 
 /// Default ElevenLabs REST base URL.
-pub const ELEVENLABS_API_BASE_URL: &str = "https://api.elevenlabs.io";
+pub(crate) const ELEVENLABS_API_BASE_URL: &str = "https://api.elevenlabs.io";
 
 /// Scribe model used for batch transcription (keyterms require v2).
 const MODEL_ID: &str = "scribe_v2";
 
 /// ElevenLabs Scribe implementation of [`VoiceEngine`].
-pub struct ElevenLabsEngine {
+pub(crate) struct ElevenLabsEngine {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.
     api_key: String,

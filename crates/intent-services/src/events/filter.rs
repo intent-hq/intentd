@@ -14,7 +14,7 @@ use intent_core::{parse_iso, ActorType, Event};
 
 /// Category wildcards that a bare `*` subscription expands to. Mirrors
 /// `VALID_EVENT_CATEGORY_WILDCARDS` in `ws-event-api.ts`.
-pub const VALID_EVENT_CATEGORY_WILDCARDS: &[&str] = &[
+pub(crate) const VALID_EVENT_CATEGORY_WILDCARDS: &[&str] = &[
     "agent:*",
     "file:*",
     "task:*",
@@ -33,7 +33,7 @@ pub const VALID_EVENT_CATEGORY_WILDCARDS: &[&str] = &[
 /// (monorepo#1229): every entry of [`VALID_EVENT_CATEGORY_WILDCARDS`] except
 /// `agent:*` — agent events are internal for agent callers, who watch other
 /// agents via `ws.agent.watch` instead.
-pub const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
+pub(crate) const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
     "file:*",
     "task:*",
     "git:*",
@@ -53,13 +53,13 @@ pub const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
 /// events the original TS hard-excluded as `INTERNAL_OBSERVABILITY_EVENTS` —
 /// plus `chat:stream:delta`, the one high-volume streaming type outside the
 /// `agent:` prefix. The prefix rule also covers the `agent:*` pattern itself.
-pub fn is_agent_restricted_event_type(event_type: &str) -> bool {
+pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
     event_type.starts_with("agent:") || event_type == "chat:stream:delta"
 }
 
 /// Default coalescing window applied when a subscriber requests batching
 /// without a value (TS `options.batchWindow || 500`).
-pub const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(500);
+pub(crate) const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(500);
 
 /// Criteria a [`super::bus::Subscription`] matches events against. Empty
 /// collections / `None` fields are ignored (AND-combined like the TS filter).
@@ -93,7 +93,8 @@ impl SubscriptionFilter {
     /// `exclude_self` (default `true` in the TS) drops the subscriber's own
     /// events; `batch_window` defaults to [`DEFAULT_BATCH_WINDOW`], and a
     /// zero window is treated as unset (TS `batchWindow || 500`).
-    pub fn for_subscriber(
+    #[cfg(test)]
+    pub(crate) fn for_subscriber(
         event_types: &[String],
         self_actor_id: Option<&str>,
         exclude_self: bool,
@@ -119,7 +120,7 @@ impl SubscriptionFilter {
 /// Expand subscription event types: a bare `*` becomes every entry of
 /// [`VALID_EVENT_CATEGORY_WILDCARDS`]; all other entries pass through
 /// unchanged. Mirrors `resolveSubscriptionEventTypes`.
-pub fn resolve_event_types(event_types: &[String]) -> Vec<String> {
+pub(crate) fn resolve_event_types(event_types: &[String]) -> Vec<String> {
     let mut resolved = Vec::new();
     for ev in event_types {
         if ev == "*" {
@@ -135,7 +136,7 @@ pub fn resolve_event_types(event_types: &[String]) -> Vec<String> {
 /// silently narrows to [`AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS`] (no
 /// `agent:*`); all other entries pass through unchanged — explicit restricted
 /// types are rejected upstream at subscribe time, before resolution.
-pub fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<String> {
+pub(crate) fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<String> {
     let mut resolved = Vec::new();
     for ev in event_types {
         if ev == "*" {
@@ -165,7 +166,7 @@ pub fn event_type_matches(event_type: &str, pattern: &str) -> bool {
 
 /// Whether `event` satisfies every set criterion of `filter` (AND logic).
 /// Field order and short-circuiting mirror the TS `matchesFilter`.
-pub fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool {
+pub(crate) fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool {
     if filter.exclude_agent_events && is_agent_restricted_event_type(&event.event_type) {
         return false;
     }

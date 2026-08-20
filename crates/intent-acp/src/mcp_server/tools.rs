@@ -24,7 +24,7 @@ const fn p(name: &'static str, ty: &'static str, required: bool) -> Param {
 }
 
 /// A tool definition: name, human description, and its parameter list.
-pub struct ToolDef {
+pub(crate) struct ToolDef {
     /// Registry tool name (`workspace_api`); agents see it with the
     /// provider-appended server suffix (`workspace_api_workspace-mcp`).
     pub name: &'static str,
@@ -86,7 +86,7 @@ impl ToolDef {
 
 /// The full tool registry (pre-denylist). Returns the chief variant when
 /// `is_chief` is true (full `ws.app.*` surface), base variant otherwise.
-pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
+pub(crate) fn all_tools(is_chief: bool) -> &'static [ToolDef] {
     if is_chief {
         ALL_TOOLS_CHIEF
     } else {
@@ -121,7 +121,7 @@ pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
 /// matching `bindings/<ns>.rs`, preventing silent drift when the description
 /// or the bindings change; `namespace_index_matches_documented_surface`
 /// keeps the index in lockstep with the API sections.
-pub const WORKSPACE_API_DESCRIPTION: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
+pub(crate) const WORKSPACE_API_DESCRIPTION: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
 
 Rules:
   - Your code is wrapped in `(async () => { ... })()` before execution.
@@ -331,7 +331,7 @@ Examples (the final one shows the N+1 pattern: list items first, then batch-read
 /// Chief-workspace variant of [`WORKSPACE_API_DESCRIPTION`]: includes the
 /// full `ws.app.*` surface (agents, settings, specialists, ui, workspaces).
 /// Reference wording from `workspace-js-api-tool.ts` lines 58–78.
-pub const WORKSPACE_API_DESCRIPTION_CHIEF: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
+pub(crate) const WORKSPACE_API_DESCRIPTION_CHIEF: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
 
 Rules:
   - Your code is wrapped in `(async () => { ... })()` before execution.
@@ -962,7 +962,7 @@ pub struct MicrovmSpawnHints {
 /// only for microVM-capable workspaces; with neither — the all-defaults case
 /// — the assembled text is returned unchanged, so the default description
 /// stays byte-identical by construction.
-pub fn workspace_api_description_with_model_options(
+pub(crate) fn workspace_api_description_with_model_options(
     is_chief: bool,
     features: &AgentFeaturesSettings,
     cow_capable: bool,

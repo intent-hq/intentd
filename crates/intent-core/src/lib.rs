@@ -17,7 +17,7 @@ fn disable_node_compile_cache() {
 }
 
 pub mod agent_configs;
-pub mod agent_logs;
+pub(crate) mod agent_logs;
 pub mod chief_cwd;
 pub mod clock;
 pub mod config;
@@ -32,18 +32,16 @@ pub mod server_control;
 pub mod settings_file;
 pub mod slug;
 pub mod tilde;
-pub mod traits;
+pub(crate) mod traits;
 pub mod transfer;
 pub mod turn_attachments;
 
-pub use agent_configs::{
-    agent_configs_root, create_agent_configs_dir, sweep_agent_configs, AGENT_CONFIGS_DIR_NAME,
-};
+pub use agent_configs::{agent_configs_root, create_agent_configs_dir, sweep_agent_configs};
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
-    sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
+    sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
-pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd, CHIEF_CWD_DIR_NAME};
+pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
     iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
 };
@@ -68,17 +66,17 @@ pub use model::{
     cap_json_value, last_tool_use_preview, slim_body_size, ConversationProjection,
     SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
-pub use model::{chief_workspace, is_chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
+pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    AnchorContext, AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
-    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
-    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
-    CommentType, CommentWire, ContentType, ContextItem, CreatedTaskEntry, DiskUsageBreakdownEntry,
-    Draft, Event, EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, Comment, CommentAddResult,
+    CommentAnchor, CommentAnchorType, CommentDeleteResult, CommentGetThreadResult,
+    CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
+    CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary, CommentType,
+    CommentWire, ContentType, ContextItem, CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event,
+    EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
     ExecutionEnvironmentRepoConfig, FileActivity, FileStatus, GitAgentCommitResult,
     GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
     GitStatus, GuestImageRef, Hook, HookState, KnownRepo, LineAttributionAuthor,
@@ -90,19 +88,19 @@ pub use model::{
     PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
     RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script,
     ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
-    SetupScriptGeneratedBy, SuggestionDiff, TaskAgentLink, TaskAssignAgentResult,
-    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
-    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
-    WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
-    WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate,
+    SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
+    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace, WorkspaceActivity,
+    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage, WorkspaceDisplayStatus,
+    WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
+pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use path_utils::prewarm_login_shell_path;
-pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
+pub use secrets::FileSecretStore;
 pub use server_control::ServerControl;
 pub use settings_file::{
     FlushQueuedMessagesMode, LegacySettings, SandboxType, SettingsFile, DEFAULT_CONFIG_TEMPLATE,

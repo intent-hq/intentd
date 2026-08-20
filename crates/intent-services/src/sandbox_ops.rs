@@ -17,12 +17,12 @@ use crate::now_iso;
 /// critical path (monorepo#871). NOTE: this seam is compiled into release
 /// binaries too (release-mode e2e runs need it); it is inert unless the
 /// namespaced env var is set to a positive integer.
-pub const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
+pub(crate) const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
 
 /// Test hook: force [`provision_sandbox`] to fail with an internal error
 /// (after the optional delay above), exercising the fallback-to-shared-mode
 /// path on provisioning failure. Inert unless set to `1`.
-pub const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
+pub(crate) const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
 
 /// Parse the delay override in milliseconds; anything unset, non-numeric, or
 /// non-positive disables the hook.
@@ -113,7 +113,7 @@ pub enum DirtyHandling {
 }
 
 /// Configuration for sandbox provisioning.
-pub struct ProvisionConfig {
+pub(crate) struct ProvisionConfig {
     /// Workspaces root directory (from config.workspaces_root).
     pub workspaces_root: PathBuf,
 }
@@ -502,7 +502,7 @@ fn remove_empty_sandbox_parents(sandbox_path: &std::path::Path) {
 /// sandbox must never be observable through a stale session pointer
 /// (a respawned microVM agent would otherwise skip re-provisioning and
 /// fall back to mounting the canonical directory).
-pub async fn discard_sandbox(
+pub(crate) async fn discard_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
@@ -595,7 +595,8 @@ pub async fn push_conflict_recovery_branch(
 
 /// Garbage-collect orphaned sandboxes: remove sandboxes whose agent no longer exists
 /// or whose directory is missing.
-pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
+#[cfg(test)]
+pub(crate) async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
     let all_sandboxes = store.list_all_sandboxes().await?;
 
     for sandbox in all_sandboxes {
@@ -669,7 +670,7 @@ pub async fn merge_sandbox(
 /// the awaiting future is dropped — so a cancelled caller (e.g. the 30s
 /// `workspace_api` eval timeout, monorepo stranded-`merging` incident) can
 /// never abandon the canonical repo mid-mutation.
-pub async fn merge_sandbox_with(
+pub(crate) async fn merge_sandbox_with(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,

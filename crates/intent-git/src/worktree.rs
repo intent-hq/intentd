@@ -54,7 +54,8 @@ impl WorktreeLocks {
 
 /// Create a linked worktree named `name` at `worktree_path` for the repository at
 /// `repo_path` (wraps `git worktree add`). The repository must have a commit.
-pub fn create_worktree(repo_path: &Path, name: &str, worktree_path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn create_worktree(repo_path: &Path, name: &str, worktree_path: &Path) -> Result<()> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     repo.worktree(name, worktree_path, None)
         .map_err(map_git_err)?;
@@ -200,7 +201,8 @@ pub fn worktree_branch(worktree_path: &Path) -> Option<String> {
 /// by [`remove_detached_worktree`] (recursive removal) — so callers that hold
 /// a per-repo lock can run the phases separately and keep the expensive
 /// recursive delete outside the lock.
-pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     if let Some(trash) = detach_worktree(repo_path, worktree_path)? {
         remove_detached_worktree(&trash)?;
     }

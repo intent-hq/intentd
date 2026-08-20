@@ -42,26 +42,22 @@ pub(crate) mod workspace;
 /// fragments are `const &str` expressions, and `concat!` only accepts
 /// literals.
 ///
-/// `pub` (re-exported as `intent_acp::bindings_prelude`) so callers that
-/// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
-/// scheduler in `intent-services` — install the exact same environment.
+/// Test-only shorthand for [`prelude_for`] with default features; the
+/// prelude tests compare gated outputs against this baseline.
+#[cfg(test)]
 pub fn prelude() -> String {
     prelude_for(&AgentFeaturesSettings::default())
 }
 
-/// Feature-aware variant of [`prelude`]: namespaces disabled in
-/// `[agentFeatures]` are omitted entirely, so agent code touching them fails
-/// with a clear `ws.<ns> is undefined` TypeError. With every toggle on — the
-/// default — the output is byte-identical to [`prelude`].
-///
-/// `pub` (re-exported as `intent_acp::bindings_prelude_for`) so the
-/// background hook scheduler in `intent-services` installs the same gated
-/// environment its owning session's `workspace_api` bridge would.
-pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
+/// Feature-aware prelude: namespaces disabled in `[agentFeatures]` are
+/// omitted entirely, so agent code touching them fails with a clear
+/// `ws.<ns> is undefined` TypeError. With every toggle on — the default —
+/// nothing is omitted.
+pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     prelude_for_bridge(features, false)
 }
 
-/// [`prelude_for`] plus the sub-agent flag: a sub-agent environment forces
+/// `prelude_for` plus the sub-agent flag: a sub-agent environment forces
 /// `structuredQuestions` off so `ws.app.question` is omitted through the
 /// exact same pruning machinery as the settings toggle (the surfaces cannot
 /// drift). Mirrors `WorkspaceMcpServer::effective_agent_features`; used by

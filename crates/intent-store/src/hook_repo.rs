@@ -367,7 +367,8 @@ impl Store {
     }
 
     /// Delete a hook row; `NotFound` when absent.
-    pub async fn delete_hook(&self, hook_id: &HookId) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) async fn delete_hook(&self, hook_id: &HookId) -> Result<()> {
         let res = sqlx::query("DELETE FROM hook WHERE hook_id = ?")
             .bind(&hook_id.0)
             .execute(self.write_pool())

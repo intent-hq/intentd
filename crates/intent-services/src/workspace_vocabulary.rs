@@ -30,10 +30,10 @@ use tokio::sync::Mutex;
 
 /// Settings path of the workspace-vocabulary size cap (a TOML-backed catalog
 /// entry — number, default 50, min 0, max 100; PROTOCOL §5.12, v4.6).
-pub const MAX_TERMS_SETTING_PATH: &str = "voice.workspaceVocabulary.maxTerms";
+pub(crate) const MAX_TERMS_SETTING_PATH: &str = "voice.workspaceVocabulary.maxTerms";
 
 /// Default `voice.workspaceVocabulary.maxTerms` when unset or malformed.
-pub const DEFAULT_MAX_TERMS: usize = 50;
+pub(crate) const DEFAULT_MAX_TERMS: usize = 50;
 
 /// Per-file size cap; larger files are skipped outright.
 const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
@@ -54,7 +54,8 @@ const SKIP_DIRS: [&str; 2] = ["node_modules", "target"];
 /// string from the settings table): a non-negative JSON integer is honored
 /// (`0` disables derivation); absent or malformed degrades to
 /// [`DEFAULT_MAX_TERMS`] — never an error.
-pub fn parse_max_terms_setting(raw: Option<&str>) -> usize {
+#[cfg(test)]
+pub(crate) fn parse_max_terms_setting(raw: Option<&str>) -> usize {
     match raw {
         None => DEFAULT_MAX_TERMS,
         Some(s) => serde_json::from_str::<serde_json::Value>(s)
@@ -70,7 +71,8 @@ pub fn parse_max_terms_setting(raw: Option<&str>) -> usize {
 /// passes it to [`WorkspaceVocabularyCache::vocabulary_with_max_terms`]; this
 /// raw read only serves callers without a settings service (tests). Read
 /// failures degrade to the default.
-pub async fn resolve_max_terms(store: &Store) -> usize {
+#[cfg(test)]
+pub(crate) async fn resolve_max_terms(store: &Store) -> usize {
     let raw = store
         .get_setting(MAX_TERMS_SETTING_PATH)
         .await
@@ -83,7 +85,7 @@ pub async fn resolve_max_terms(store: &Store) -> usize {
 /// (the settings service returns numbers as JSON floats): a non-negative
 /// finite number is truncated and honored (`0` disables derivation); absent
 /// or malformed degrades to [`DEFAULT_MAX_TERMS`] — never an error.
-pub fn parse_max_terms_value(value: Option<&serde_json::Value>) -> usize {
+pub(crate) fn parse_max_terms_value(value: Option<&serde_json::Value>) -> usize {
     value
         .and_then(|v| v.as_f64())
         .filter(|n| n.is_finite() && *n >= 0.0)
@@ -115,7 +117,7 @@ struct CacheEntry {
 /// all entries live in memory (derivation is deterministic and re-runs on
 /// daemon restart).
 #[derive(Default)]
-pub struct WorkspaceVocabularyCache {
+pub(crate) struct WorkspaceVocabularyCache {
     entries: Mutex<HashMap<String, CacheEntry>>,
     /// Number of full extractor runs (cache misses); test observability.
     derivations: AtomicUsize,
@@ -127,12 +129,14 @@ impl WorkspaceVocabularyCache {
     }
 
     /// Number of full derivations (extractor runs) performed so far.
-    pub fn derivation_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn derivation_count(&self) -> usize {
         self.derivations.load(Ordering::Relaxed)
     }
 
     /// Ranked vocabulary for `workspace_id`, reading the
     /// `voice.workspaceVocabulary.maxTerms` setting at derivation time.
+    #[cfg(test)]
     pub async fn vocabulary(&self, store: &Store, workspace_id: &WorkspaceId) -> Vec<String> {
         let max_terms = resolve_max_terms(store).await;
         self.vocabulary_with_max_terms(store, workspace_id, max_terms)
@@ -141,7 +145,7 @@ impl WorkspaceVocabularyCache {
 
     /// Ranked vocabulary with an explicit cap. `0` returns empty immediately
     /// — no store reads, no filesystem walk.
-    pub async fn vocabulary_with_max_terms(
+    pub(crate) async fn vocabulary_with_max_terms(
         &self,
         store: &Store,
         workspace_id: &WorkspaceId,

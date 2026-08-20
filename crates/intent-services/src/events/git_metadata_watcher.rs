@@ -57,7 +57,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// — for linked worktrees — a registration on the repo's shared common-dir
 /// watch. All of it ends when the watcher drops (clean-shutdown contract shared
 /// with the other watchers); debouncing lives in the refresher.
-pub struct GitMetadataWatcher {
+pub(crate) struct GitMetadataWatcher {
     _sub: SubHandle,
     task: JoinHandle<()>,
     /// Linked worktrees only: this workspace's registration on the shared

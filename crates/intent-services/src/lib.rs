@@ -102,7 +102,7 @@ mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
 pub mod provider_auth;
-pub mod provider_catalog;
+pub(crate) mod provider_catalog;
 pub mod provider_models;
 pub mod repo_config;
 mod rtk;
@@ -114,7 +114,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
-pub mod stack_sample;
+pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
@@ -122,7 +122,7 @@ mod transfer;
 mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
-pub mod transfer_materialize;
+pub(crate) mod transfer_materialize;
 #[cfg(test)]
 mod transfer_roundtrip;
 mod unsloth_server;
@@ -138,17 +138,15 @@ mod v1_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
-pub use mcp_servers::McpHub;
-pub use sandbox_ops::ProvisionOutcome;
+pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
     max_concurrent_adapters, max_concurrent_agents, migrate_cow_isolation_to_sandbox,
     migrate_default_vocabulary, migrate_quick_action_settings, InMemorySecretStore, SecretStore,
 };
-pub use settings_registry::{
-    SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
-};
-pub use terminal_ops::PtyTerminalHost;
+pub use settings_registry::{SettingOrigin, SettingsRegistry};
+pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
+pub(crate) use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
 /// canonical resolver (`find_auggie`, managed binary, enhanced PATH) without
@@ -176,10 +174,9 @@ pub use events::{
     Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
-pub use pr_ops::{
-    fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
-    MergeRequirementsChecks, MergeRequirementsThreads, PrRefreshOutcome,
-};
+pub use pr_ops::PrRefreshOutcome;
+#[cfg(test)]
+pub(crate) use pr_ops::{fetch_merge_requirements, MergeRequirements};
 
 /// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
 /// selector returns `true` for these). After a daemon crash the runtime
@@ -944,7 +941,8 @@ impl Services {
     /// Pin the PR-monitor poll cadence, bypassing the live
     /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
     /// are clamped when read.
-    pub fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_poll_seconds = Some(seconds);
         self
     }
@@ -958,7 +956,8 @@ impl Services {
     }
 
     /// Override the per-agent active-monitor cap.
-    pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
         self.pr_monitors_max_per_agent = cap;
         self
     }
@@ -1092,7 +1091,7 @@ impl Services {
 
     /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
     /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
+    pub(crate) fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
         self.effective_settings().agents.flush_queued_messages
     }
 
@@ -1873,7 +1872,10 @@ impl Services {
     /// other note bodies — and matches [`compute_task_stats`] semantics
     /// exactly. Wired into `list_workspaces_lite` so the workspace.subscribe
     /// seq-0 snapshot is self-sufficient for client status rendering.
-    pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+    pub(crate) async fn cheap_task_stats(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceTaskStats> {
         self.store.count_task_stats(workspace_id).await
     }
 
@@ -2800,7 +2802,8 @@ impl Services {
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
     /// the timeout-fallback path completes in milliseconds.
-    pub fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self
     }
@@ -2895,7 +2898,7 @@ impl Services {
     /// (the store upsert never touches the column). Returns the stored row.
     /// Callers (the `ws.git.registerRoot` MCP binding, submodule
     /// auto-detection) validate the path before reaching this.
-    pub async fn register_git_root(
+    pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
     ) -> Result<intent_core::WorkspaceGitRoot> {
@@ -2912,7 +2915,7 @@ impl Services {
     /// Delete a workspace git root and emit `gitRoot:unregistered`
     /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
     /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
-    pub async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
+    pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
         publish_event(
@@ -3649,7 +3652,10 @@ impl Services {
     /// only usage metadata (not full message logs) when a scan does run. As a
     /// reconciler it never clobbers a fresher live snapshot with an all-zero
     /// tally (see [`Services::recompute_workspace_token_usage`]).
-    pub async fn scan_workspace_token_usage(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+    pub(crate) async fn scan_workspace_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
         // Cheap change detection: skip when the watermark is unchanged (finding F2).
         let current_watermark = self
             .store
@@ -8300,7 +8306,7 @@ fn default_workspaces_root() -> PathBuf {
 /// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
 /// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
 /// `$HOME` default would panic — else the same root the service layer uses.
-pub fn try_default_workspaces_root() -> Option<PathBuf> {
+pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -10479,7 +10485,7 @@ fn search_done_event(
 /// Maximum merge attempts the background sweep will make per sandbox before
 /// leaving it `merge_pending` for manual handling (`sandbox.cow.merge` /
 /// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
-pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
+pub(crate) const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 
 /// How long a sandbox may sit `merging` (per its claim-time `updated_at`)
 /// before the sweep's watchdog treats the claim as orphaned and resets the
@@ -26108,20 +26114,6 @@ impl Services {
         sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
     }
 
-    /// Discard a sandbox: remove the directory and database record.
-    pub async fn discard_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) -> Result<()> {
-        sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
-    }
-
-    /// Garbage-collect orphaned sandboxes (startup GC).
-    pub async fn gc_orphaned_sandboxes(&self) -> Result<()> {
-        sandbox_ops::gc_orphaned_sandboxes(&self.store).await
-    }
-
     /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).
     /// Called by the delegate op BEFORE it returns, so the child's turn
     /// worker observes the gate before its first spawn attempt. The returned
@@ -27883,22 +27875,22 @@ mod specialists;
 mod ac_status_singleflight;
 mod accept_changes;
 pub mod diffs;
-pub mod file_tracking;
+pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
-pub mod usage_rate;
-pub mod usage_stats;
-pub mod usage_stats_read;
-pub mod session_stats {}
+pub(crate) mod usage_rate;
+pub(crate) mod usage_stats;
+pub(crate) mod usage_stats_read;
+pub(crate) mod session_stats {}
 
 /// Worktree setup-script detection and template generation (PROTOCOL §5.25).
 /// Ports the reference `setup-scripts.ipc.ts` detection + template logic, with
 /// the package-manager-specific `ProjectType` collapsed to the coarse protocol
 /// enum (`node`/`python`/`go`/`rust`/`ruby`).
-pub mod setup_scripts {
+pub(crate) mod setup_scripts {
     use std::path::Path;
 
     use intent_core::{now_epoch_ms, ProjectType, SetupScript, SetupScriptGeneratedBy};
@@ -27906,7 +27898,7 @@ pub mod setup_scripts {
     /// Wrap a hand-authored script body into a `SetupScript` stamped
     /// `generatedBy: "user"` with a fresh `updatedAt` (used by create/update and
     /// `saveSetupScript`).
-    pub fn user_script(script: String) -> SetupScript {
+    pub(crate) fn user_script(script: String) -> SetupScript {
         SetupScript {
             script,
             project_type: None,
@@ -27943,7 +27935,7 @@ pub mod setup_scripts {
     /// type, mirroring the reference per-type templates (env-file copy from
     /// `$MAIN_CHECKOUT` + dependency install). The generic fallback copies common
     /// config files only.
-    pub fn template_for(project_type: Option<ProjectType>) -> String {
+    pub(crate) fn template_for(project_type: Option<ProjectType>) -> String {
         const HEADER: &str = "#!/usr/bin/env bash\nset -euo pipefail\n# Available variables: \
             $MAIN_CHECKOUT, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH\n\n";
         const COPY_ENV: &str = "# Copy environment files from the main checkout\n\
@@ -28090,7 +28082,8 @@ fn extract_markdown_image_urls(content: &str) -> Vec<String> {
 /// settings access (the transport's host.providerDiscovery arm) should use
 /// [`discover_providers_with_npx_overrides`] so `installed` matches what the
 /// spawn path would actually resolve (monorepo#1065).
-pub fn discover_providers_with_npx() -> serde_json::Value {
+#[cfg(test)]
+pub(crate) fn discover_providers_with_npx() -> serde_json::Value {
     discover_providers_with_npx_overrides(&std::collections::HashMap::new())
 }
 

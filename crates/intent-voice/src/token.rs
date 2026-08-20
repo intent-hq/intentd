@@ -24,7 +24,7 @@ use crate::registry::VoiceProvider;
 const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Secrets-store account (= sensitive setting path) for a provider's API key.
-pub fn secret_account(provider: VoiceProvider) -> &'static str {
+pub(crate) fn secret_account(provider: VoiceProvider) -> &'static str {
     match provider {
         VoiceProvider::ElevenLabs => "voice.elevenlabs.apiKey",
         VoiceProvider::OpenAi => "voice.openai.apiKey",
@@ -32,7 +32,7 @@ pub fn secret_account(provider: VoiceProvider) -> &'static str {
 }
 
 /// Environment variable fallback for a provider's API key.
-pub fn env_var(provider: VoiceProvider) -> &'static str {
+pub(crate) fn env_var(provider: VoiceProvider) -> &'static str {
     match provider {
         VoiceProvider::ElevenLabs => "ELEVENLABS_API_KEY",
         VoiceProvider::OpenAi => "OPENAI_API_KEY",

@@ -185,7 +185,7 @@ const TERMINAL_MESSAGE_MARKERS: &[&str] = &[
 /// Denylist wins over allowlist: a message carrying a terminal marker (4xx /
 /// auth / quota) is never transient, even if it also mentions a closed
 /// connection.
-pub fn message_is_transient_upstream_disconnect(message: &str) -> bool {
+pub(crate) fn message_is_transient_upstream_disconnect(message: &str) -> bool {
     let msg = message.to_ascii_lowercase();
     if TERMINAL_MESSAGE_MARKERS.iter().any(|m| msg.contains(m)) {
         return false;

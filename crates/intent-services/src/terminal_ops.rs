@@ -580,7 +580,7 @@ fn terminal_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> 
 
 /// ACP [`TerminalHost`] adapter: runs an agent's client-served `terminal/*`
 /// calls on the shared [`PtyHost`], scoped to the agent session id (§6.7).
-pub struct PtyTerminalHost {
+pub(crate) struct PtyTerminalHost {
     pty: Arc<PtyHost>,
     /// Settings registry backing the credential-injection gate
     /// ([`git_credential_env`]); `None` (minimal compositions) disables
@@ -594,12 +594,13 @@ pub struct PtyTerminalHost {
 
 impl PtyTerminalHost {
     /// Wire the adapter over the shared host (argv-only terminal spawn).
+    #[cfg(test)]
     pub fn new(pty: Arc<PtyHost>, settings: Option<Arc<SettingsRegistry>>) -> Self {
         Self::with_shell_mode(pty, settings, false)
     }
 
     /// Like [`Self::new`], with an explicit shell-wrap mode for the provider.
-    pub fn with_shell_mode(
+    pub(crate) fn with_shell_mode(
         pty: Arc<PtyHost>,
         settings: Option<Arc<SettingsRegistry>>,
         terminal_requires_shell: bool,

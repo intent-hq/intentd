@@ -87,7 +87,8 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// Together with [`TRANSFER_TABLES`] this must cover the entire live schema
 /// (enforced by `every_live_table_has_an_explicit_transfer_decision`), so a
 /// new table cannot silently skip the transfer decision.
-pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+#[cfg(test)]
+pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",

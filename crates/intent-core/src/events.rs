@@ -19,7 +19,7 @@ pub const FILE_PREFIX: &str = "file:";
 pub const FILE_CHANGED: &str = "file:changed";
 pub const FILE_CREATED: &str = "file:created";
 pub const FILE_DELETED: &str = "file:deleted";
-pub const FILE_RENAMED: &str = "file:renamed";
+pub(crate) const FILE_RENAMED: &str = "file:renamed";
 
 // Agent lifecycle events.
 pub const AGENT_STARTED: &str = "agent:started";
@@ -52,17 +52,17 @@ pub const AGENT_RENAMED: &str = "agent:renamed";
 pub const AGENT_UPDATED: &str = "agent:updated";
 pub const AGENT_IDLE: &str = "agent:idle";
 pub const AGENT_STATUS_CHANGED: &str = "agent:status-changed";
-pub const AGENT_MESSAGE_SENT: &str = "agent:message:sent";
-pub const AGENT_MESSAGE_RECEIVED: &str = "agent:message:received";
-pub const AGENT_SUBSCRIBED: &str = "agent:subscribed";
-pub const AGENT_UNSUBSCRIBED: &str = "agent:unsubscribed";
-pub const AGENT_WOKEN_BY_SUBSCRIPTION: &str = "agent:woken-by-subscription";
-pub const AGENT_DELIVERY_CONFIRMED: &str = "agent:delivery-confirmed";
-pub const AGENT_EVENT_DELIVERY_FAILED: &str = "agent:event-delivery-failed";
-pub const AGENT_EVENT_DELIVERY_TIMEOUT: &str = "agent:event-delivery-timeout";
-pub const AGENT_SUBSCRIPTIONS_RESTORED: &str = "agent:subscriptions-restored";
+pub(crate) const AGENT_MESSAGE_SENT: &str = "agent:message:sent";
+pub(crate) const AGENT_MESSAGE_RECEIVED: &str = "agent:message:received";
+pub(crate) const AGENT_SUBSCRIBED: &str = "agent:subscribed";
+pub(crate) const AGENT_UNSUBSCRIBED: &str = "agent:unsubscribed";
+pub(crate) const AGENT_WOKEN_BY_SUBSCRIPTION: &str = "agent:woken-by-subscription";
+pub(crate) const AGENT_DELIVERY_CONFIRMED: &str = "agent:delivery-confirmed";
+pub(crate) const AGENT_EVENT_DELIVERY_FAILED: &str = "agent:event-delivery-failed";
+pub(crate) const AGENT_EVENT_DELIVERY_TIMEOUT: &str = "agent:event-delivery-timeout";
+pub(crate) const AGENT_SUBSCRIPTIONS_RESTORED: &str = "agent:subscriptions-restored";
 pub const AGENT_SUBSCRIPTIONS_CHANGED: &str = "agent:subscriptions-changed";
-pub const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
+pub(crate) const AGENT_MESSAGE_DELIVERY_FAILED: &str = "agent:message:delivery-failed";
 
 // Agent streaming events (for the WebSocket API). All share the
 // `agent:stream:` prefix — the high-volume stream family the §10.2
@@ -114,8 +114,8 @@ pub const CHAT_STREAM_DELTA: &str = "chat:stream:delta";
 // Agent queue events (for the WebSocket API).
 pub const AGENT_QUEUE_UPDATED: &str = "agent:queue:updated";
 pub const AGENT_QUEUE_PROCESSING: &str = "agent:queue:processing";
-pub const AGENT_QUEUE_PROCESSING_CANCELLED: &str = "agent:queue:processing-cancelled";
-pub const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
+pub(crate) const AGENT_QUEUE_PROCESSING_CANCELLED: &str = "agent:queue:processing-cancelled";
+pub(crate) const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
 
 // Agent process-registry lifecycle events (new in intentd; PROTOCOL §6.5). Emitted
 // by the daemon-internal `ProcessRegistry` when a spawn queues for admission
@@ -130,7 +130,7 @@ pub const AGENT_PROCESS_RESUMED: &str = "agent:process:resumed";
 pub const AGENT_PROCESS_EVICTED: &str = "agent:process:evicted";
 
 // Agent user message events (cross-client sync).
-pub const AGENT_USER_MESSAGE_SENT: &str = "agent:user-message:sent";
+pub(crate) const AGENT_USER_MESSAGE_SENT: &str = "agent:user-message:sent";
 
 // Agent permission events (new in intentd; PROTOCOL §8). The TS reference
 // surfaced `session/request_permission` over Electron IPC rather than a
@@ -177,7 +177,7 @@ pub const GIT_COMMIT: &str = "git:commit";
 pub const GIT_PUSH: &str = "git:push";
 pub const GIT_PULL: &str = "git:pull";
 pub const GIT_BRANCH: &str = "git:branch";
-pub const GIT_MERGE: &str = "git:merge";
+pub(crate) const GIT_MERGE: &str = "git:merge";
 
 // Workspace-git-root events (multi git root tracking,
 // intent-hq/monorepo#2053). Emitted when a secondary git root is registered
@@ -223,7 +223,7 @@ pub const TASK_AGENT_LINKED: &str = "task:agent-linked";
 pub const TASK_AGENT_UNLINKED: &str = "task:agent-unlinked";
 
 // Terminal events.
-pub const TERMINAL_COMMAND: &str = "terminal:command";
+pub(crate) const TERMINAL_COMMAND: &str = "terminal:command";
 // Interactive PTY streaming family (new in intentd; PROTOCOL §5.13/§6.5). The
 // daemon fans live PTY output to subscribers as `terminal:data` (base64 `chunk`)
 // and signals process exit with `terminal:exit`; `terminal:title`/`terminal:cwd`
@@ -231,8 +231,8 @@ pub const TERMINAL_COMMAND: &str = "terminal:command";
 // self-sufficient and carry the `terminalId`.
 pub const TERMINAL_DATA: &str = "terminal:data";
 pub const TERMINAL_EXIT: &str = "terminal:exit";
-pub const TERMINAL_TITLE: &str = "terminal:title";
-pub const TERMINAL_CWD: &str = "terminal:cwd";
+pub(crate) const TERMINAL_TITLE: &str = "terminal:title";
+pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 
 // Script streaming family (new in intentd; PROTOCOL §5.8/§6.5). Scripts run on
 // the unified PTY host (§12); the daemon fans live script output to subscribers
@@ -271,12 +271,12 @@ pub const PR_MONITOR_COMPLETED: &str = "prMonitor:completed";
 pub const PR_MONITOR_CANCELLED: &str = "prMonitor:cancelled";
 
 // Test events.
-pub const TEST_STARTED: &str = "test:started";
-pub const TEST_COMPLETED: &str = "test:completed";
+pub(crate) const TEST_STARTED: &str = "test:started";
+pub(crate) const TEST_COMPLETED: &str = "test:completed";
 
 // Build events.
-pub const BUILD_STARTED: &str = "build:started";
-pub const BUILD_COMPLETED: &str = "build:completed";
+pub(crate) const BUILD_STARTED: &str = "build:started";
+pub(crate) const BUILD_COMPLETED: &str = "build:completed";
 
 // Workspace events.
 pub const WORKSPACE_CREATED: &str = "workspace:created";
@@ -302,7 +302,7 @@ pub const WORKSPACE_CLOSED: &str = "workspace:closed";
 // no setup. Idempotent replays publish nothing (same as `workspace:created`).
 pub const WORKSPACE_SETUP_STARTED: &str = "workspace:setup:started";
 pub const WORKSPACE_SETUP_COMPLETED: &str = "workspace:setup:completed";
-pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
+pub(crate) const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // Workspace status-change family (new in intentd; PROTOCOL §6.5). Self-sufficient
 // payloads carry the new derived value so the FE flips the green/blue dot with no
 // follow-up fetch: `workspace:activity-changed` → `{ workspaceId, activity }`,
@@ -344,8 +344,8 @@ pub const WORKSPACE_TRANSFER_READY: &str = "workspace:transfer:ready";
 pub const WORKSPACE_TRANSFER_FAILED: &str = "workspace:transfer:failed";
 
 // Spec / goal events.
-pub const SPEC_UPDATED: &str = "spec:updated";
-pub const GOAL_UPDATED: &str = "goal:updated";
+pub(crate) const SPEC_UPDATED: &str = "spec:updated";
+pub(crate) const GOAL_UPDATED: &str = "goal:updated";
 
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
@@ -360,7 +360,7 @@ pub const COMMENT_RESOLVED: &str = "comment:resolved";
 // `changes:tracked` → `{ workspaceId, changes: TrackedChange[] }`,
 // `changes:git-status` → `{ workspaceId, status: WorkspaceGitStatus }`,
 // `changes:metrics-changed` → `{ workspaceId, agentId?, metrics: Metrics }`.
-pub const CHANGES_TRACKED: &str = "changes:tracked";
+pub(crate) const CHANGES_TRACKED: &str = "changes:tracked";
 pub const CHANGES_GIT_STATUS: &str = "changes:git-status";
 pub const CHANGES_METRICS_CHANGED: &str = "changes:metrics-changed";
 
@@ -401,7 +401,7 @@ pub const HOST_EXEC_STDERR: &str = "host:exec:stderr";
 pub const HOST_EXEC_EXIT: &str = "host:exec:exit";
 
 // MCP events.
-pub const MCP_NOTIFICATION: &str = "mcp:notification";
+pub(crate) const MCP_NOTIFICATION: &str = "mcp:notification";
 
 // External MCP-server lifecycle (new in intentd; PROTOCOL §5.22/§6.5, §18.3).
 // Emitted on every health/lifecycle transition (started/stopped/error/
