@@ -1374,8 +1374,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// of the newest window; `around_index` seeks to the page containing that
     /// 0-based ordinal (from the oldest message), clamped into
     /// `[0, totalMessages - 1]`. The two seek params are mutually exclusive
-    /// (enforced at the transport boundary); absent both, behavior is
-    /// byte-identical to before.
+    /// (enforced at the transport boundary). The optional `projection`
+    /// requests bounded tool/image block bodies
+    /// ([`crate::ConversationProjection`]); absent all optional params,
+    /// behavior is byte-identical to before.
+    #[allow(clippy::too_many_arguments)]
     fn agent_get_conversation(
         &self,
         agent_id: AgentId,
@@ -1384,6 +1387,7 @@ pub trait WorkspaceApi: Send + Sync {
         page_token: Option<String>,
         around_message_id: Option<String>,
         around_index: Option<i64>,
+        projection: Option<crate::ConversationProjection>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             agent_id,
@@ -1392,10 +1396,35 @@ pub trait WorkspaceApi: Send + Sync {
             page_token,
             around_message_id,
             around_index,
+            projection,
         );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_conversation not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.getMessageBlock`: one full content block of one persisted
+    /// message, by block id — `{ block }` (PROTOCOL §5.5). The on-demand
+    /// counterpart of the `projection: "slim"` conversation read: a client
+    /// holding a truncated block fetches the full body here. Block ids are
+    /// the served identity — persisted assistant ids and the serve-time
+    /// synthetic `{messageId}:{index}` ids both resolve. Bounded cost: one
+    /// primary-key message row read, never a transcript hydration.
+    /// `NotFound` on an unknown agent or a workspace mismatch;
+    /// `InvalidParams` on an unknown message or block id.
+    fn agent_get_message_block(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, message_id, block_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_get_message_block not implemented".to_string(),
             ))
         })
     }

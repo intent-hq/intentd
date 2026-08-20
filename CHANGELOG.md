@@ -2,6 +2,85 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.23] - 2026-08-20
+
+### 🚀 Features
+
+- *(services)* Merge git-root and monitor PRs into pullRequests on list emit paths ([#1330](https://github.com/intent-hq/intentd/pull/1330))
+- Fold agent-monitored PRs into the displayStatus derivation ([#1329](https://github.com/intent-hq/intentd/pull/1329))
+- *(services)* Stamp shared queueInfo.batchId on batch-flushed rows ([#1335](https://github.com/intent-hq/intentd/pull/1335))
+
+### 🐛 Bug Fixes
+
+- Preserve hook nextRunAt across daemon restarts ([#1327](https://github.com/intent-hq/intentd/pull/1327))
+- Suppress same-settlement duplicate report delivery after reportToParent wake ([#1326](https://github.com/intent-hq/intentd/pull/1326))
+- Default WSS bind to 127.0.0.1; bind-address picker in pair flow ([#1325](https://github.com/intent-hq/intentd/pull/1325))
+- Omit metadata.initialMessage from agent.list rows (monorepo#2932) ([#1337](https://github.com/intent-hq/intentd/pull/1337))
+
+### 📚 Documentation
+
+- Teach ws.browser docs + help text the tab ownership ops ([#1319](https://github.com/intent-hq/intentd/pull/1319))
+
+### ⚙️ Miscellaneous Tasks
+
+- Tighten unused-externally pub items to pub(crate); delete dead code ([#1331](https://github.com/intent-hq/intentd/pull/1331))
+- Remove unused crate dependencies and add cargo-shear CI gate ([#1323](https://github.com/intent-hq/intentd/pull/1323))
+- Audit dead_code allows; delete dead code, justify keepers ([#1324](https://github.com/intent-hq/intentd/pull/1324))
+
+
+## [0.7.22] - 2026-08-19
+
+### 🐛 Bug Fixes
+
+- Persist agent:failed wake dedup so restarts and re-arms never re-deliver historical failures ([#1316](https://github.com/intent-hq/intentd/pull/1316))
+- Enrich agent:failed and agent:deleted wake events with agentName ([#1318](https://github.com/intent-hq/intentd/pull/1318))
+- Auto-redrive suspected-truncated turns on delegated in-task agents ([#1317](https://github.com/intent-hq/intentd/pull/1317))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump sha2 to 0.11 ([#1321](https://github.com/intent-hq/intentd/pull/1321))
+
+
+## [0.7.21] - 2026-08-19
+
+### 🚀 Features
+
+- Byte-budget slim conversation pages at ~512KB ([#1314](https://github.com/intent-hq/intentd/pull/1314))
+
+### 🐛 Bug Fixes
+
+- Dedup completion wakes per (watcher, completion) so restarts and re-arms never re-deliver ([#1313](https://github.com/intent-hq/intentd/pull/1313))
+
+
+## [0.7.20] - 2026-08-18
+
+### 📚 Documentation
+
+- Teach agents to reuse existing browser tabs ([#1310](https://github.com/intent-hq/intentd/pull/1310))
+
+
+## [0.7.19] - 2026-08-18
+
+### 🚀 Features
+
+- Agent.getMessageBlock — one full content block on demand (protocol v7.2) ([#1306](https://github.com/intent-hq/intentd/pull/1306))
+- LastToolUse preview column + agent:last-message event ([#1307](https://github.com/intent-hq/intentd/pull/1307))
+
+
+## [0.7.18] - 2026-08-18
+
+### 🚀 Features
+
+- Slim tool/image projection for conversation reads ([#1304](https://github.com/intent-hq/intentd/pull/1304))
+
+
+## [0.7.17] - 2026-08-18
+
+### 🐛 Bug Fixes
+
+- Repo-cache create progress visibility, re-clone signal, freshness TTL, env-overridable timeouts ([#1301](https://github.com/intent-hq/intentd/pull/1301))
+
+
 ## [0.7.16] - 2026-08-17
 
 ### 🚀 Features

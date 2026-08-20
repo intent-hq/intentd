@@ -644,11 +644,16 @@ async function handlePrompt(id, params) {
     note('session/update', { sessionId: SESSION_ID, update });
   }
 
-  // Emit text response
-  note('session/update', {
-    sessionId: SESSION_ID,
-    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
-  });
+  // Emit text response. `omitResponse: true` on the active behavior/rule
+  // suppresses it entirely — a turn with NO session/update traffic that still
+  // resolves a clean stopReason, the exact monorepo#2863 truncation shape
+  // (silent tail with zero streamed progress).
+  if (active.omitResponse !== true) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+    });
+  }
 
   // Emit tool blocks if emitToolBlocks is enabled (opt-in for transcript persistence testing)
   if (active.emitToolBlocks && toolResults.length > 0) {

@@ -39,6 +39,14 @@ use tokio_tungstenite::tungstenite::Message;
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
+/// Lowercase hex sha256 digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
 struct MemTokenStore(Mutex<Option<String>>);
@@ -914,6 +922,71 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     assert_eq!(
         row["harnessFeatures"], *features,
         "agent.list rows carry the persisted harnessFeatures snapshot: {listed}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// monorepo#2932 — list-payload cost contract for `metadata.initialMessage`:
+/// the full spawn-time first message persists on the session and is served by
+/// the detail reads (`agent.get` / `agent.getSession`), but `agent.list` rows
+/// OMIT it (absent, never `null`) — it is the single largest per-session
+/// field on real workspaces and has no list-context consumer, so serving it
+/// per row scaled the frame past the 1 MiB outbound warn threshold at ~100
+/// sessions.
+#[tokio::test]
+async fn wss_agent_list_omits_initial_message() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"List Slim"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Persist an initialMessage via the create-time metadata harvest.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Slim","metadata":{{"initialMessage":"a long spawn-time first message"}}}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Detail read still serves it.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["metadata"]["initialMessage"].as_str(),
+        Some("a long spawn-time first message"),
+        "agent.get keeps serving metadata.initialMessage: {got}"
+    );
+
+    // The list row omits the field entirely.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let row = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("created agent in list");
+    assert!(
+        row["metadata"].is_object(),
+        "list row must carry a metadata object: {row}"
+    );
+    assert!(
+        row["metadata"].get("initialMessage").is_none(),
+        "agent.list rows must omit metadata.initialMessage (monorepo#2932): {row}"
     );
 
     srv.ws.stop().await;
@@ -2236,6 +2309,195 @@ async fn wss_agent_mark_seen_round_trip() {
     )
     .await;
     assert_eq!(bad["error"]["code"], -32602, "missing messageId: {bad}");
+
+    srv.ws.stop().await;
+}
+
+/// `agent:last-message` + `AgentLite.lastToolUse` (PROTOCOL §6.5/§5.5): a
+/// transcript persist emits BOTH the lean `agent:message` echo (unchanged
+/// shape) and the content-bearing `agent:last-message` companion carrying
+/// the preview projections — including `lastToolUse` (`{ name, input }`)
+/// when the appended row bears a `tool_use` block — and `agent.get` serves
+/// the same preview from the persisted 0098 column. A follow-up tool-less
+/// assistant persist emits a companion WITHOUT `lastToolUse` (the cleared
+/// state) and `agent.get` drops the field.
+#[tokio::test]
+async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS LastToolUse"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"ToolUse Agent"}}}}"#
+        )],
+    )
+    .await;
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // One persistent connection: subscribe BEFORE the persists so both
+    // event notifications are delivered to this client.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    async fn next_event(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        event_type: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == event_type
+                        {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => continue,
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+    }
+    let sub = send_and_wait(
+        &mut ws,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{{"eventTypes":["agent:message","agent:last-message"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        3,
+    )
+    .await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // Persist an assistant row bearing a tool_use block. Issued over a
+    // SEPARATE connection so the subscriber socket above receives only the
+    // event notifications (send_and_wait would otherwise discard an event
+    // frame interleaved before the RPC response).
+    let appended = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"running a tool"}},{{"type":"tool_use","id":"m:1","name":"view","input":{{"path":"/tmp/f"}},"toolCallId":"tc-1"}}]}}}}"#
+        ),
+    )
+    .await;
+    let message_id = appended["result"]["message"]["id"]
+        .as_str()
+        .expect("appended message id")
+        .to_string();
+
+    // The lean echo keeps its pre-existing shape (no preview fields).
+    let echo = next_event(&mut ws, "agent:message").await;
+    assert_eq!(echo["data"]["agentId"], agent_id.as_str());
+    assert_eq!(echo["data"]["messageId"], message_id.as_str());
+    assert_eq!(echo["data"]["role"], "assistant");
+    assert!(
+        echo["data"].get("lastToolUse").is_none(),
+        "agent:message stays the id-only echo: {echo}"
+    );
+
+    // The companion carries the preview projections (§6.5).
+    let last = next_event(&mut ws, "agent:last-message").await;
+    assert_eq!(last["data"]["agentId"], agent_id.as_str());
+    assert_eq!(last["data"]["messageId"], message_id.as_str());
+    assert_eq!(last["data"]["role"], "assistant");
+    assert_eq!(last["data"]["lastMessageRole"], "assistant");
+    assert_eq!(last["data"]["lastMessageId"], message_id.as_str());
+    assert_eq!(last["data"]["lastAgentResponse"], "running a tool");
+    assert_eq!(
+        last["data"]["lastToolUse"],
+        serde_json::json!({"name": "view", "input": {"path": "/tmp/f"}}),
+        "companion carries the bounded tool preview: {last}"
+    );
+    assert!(
+        last["data"].get("lastUserMessage").is_none(),
+        "assistant echo omits lastUserMessage: {last}"
+    );
+
+    // Served on the AgentLite projection from the persisted column.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["lastToolUse"],
+        serde_json::json!({"name": "view", "input": {"path": "/tmp/f"}}),
+        "agent.get serves lastToolUse from the persisted column: {got}"
+    );
+
+    // A newer tool-less assistant persist clears: the companion omits
+    // `lastToolUse` and `agent.get` drops the field. Separate connection,
+    // same reasoning as the first persist.
+    let cleared = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"all done"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(cleared["result"]["success"], true, "append: {cleared}");
+    let last2 = next_event(&mut ws, "agent:last-message").await;
+    assert_eq!(last2["data"]["lastAgentResponse"], "all done");
+    assert!(
+        last2["data"].get("lastToolUse").is_none(),
+        "tool-less persist omits lastToolUse (cleared state): {last2}"
+    );
+    let got2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        got2["result"]["agent"].get("lastToolUse").is_none(),
+        "agent.get drops lastToolUse after a tool-less persist: {got2}"
+    );
 
     srv.ws.stop().await;
 }
@@ -7959,6 +8221,466 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `agent.getConversation` / `chat.subscribe` slim projection over the real
+/// WSS wire (§5.5, §7.1): `projection: "slim"` bounds oversized
+/// tool_use/tool_result bodies (additive `inputTruncated`/`outputTruncated`
+/// flags, pairing ids intact) and swaps oversized image data for the
+/// write-time thumbnail (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the
+/// seq-0 snapshot of a slim subscription serves the same bounded blocks;
+/// absent param stays byte-identical full fidelity; a bad value is `-32602`.
+#[tokio::test]
+async fn wss_conversation_slim_projection_bounds_blocks() {
+    use base64::Engine as _;
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Slim"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Slim"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // One message with an oversized tool pair, an under-budget tool pair,
+    // and an oversized image (noise PNG defeats compression, so the write
+    // path persists a real thumbnail for it).
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let img = image::RgbImage::from_fn(512, 384, |x, y| {
+        let v = (x.wrapping_mul(31).wrapping_add(y.wrapping_mul(17)) % 251) as u8;
+        image::Rgb([v, v.wrapping_add(97), v.wrapping_add(193)])
+    });
+    let mut buf = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .expect("encode test png");
+    let img_b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+    assert!(img_b64.len() > SLIM_PROJECTION_BUDGET_BYTES);
+    let content = json!([
+        { "type": "tool_use", "id": "m:0", "name": "view", "toolCallId": "tc-1",
+          "input": { "path": "big.rs", "blob": big } },
+        { "type": "tool_result", "id": "m:1", "tool_use_id": "tc-1",
+          "output": big, "is_error": false },
+        { "type": "tool_use", "id": "m:2", "name": "ls", "toolCallId": "tc-2",
+          "input": { "path": "." } },
+        { "type": "tool_result", "id": "m:3", "tool_use_id": "tc-2",
+          "output": "ok", "is_error": false },
+        { "type": "image", "id": "m:4", "data": img_b64, "mimeType": "image/png" },
+    ]);
+    srv.store
+        .append_agent_message(&agent, "assistant", &content, &now_iso())
+        .await
+        .expect("append message");
+
+    // Absent param: byte-identical full fidelity.
+    let full = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        full["result"]["messages"][0]["contentBlocks"], content,
+        "absent projection stays byte-identical"
+    );
+
+    // Slim read: bounded bodies, additive flags, pairing intact.
+    let slim = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+        ),
+    )
+    .await;
+    let blocks = slim["result"]["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("slim blocks");
+    let assert_slim_blocks = |blocks: &[Value], label: &str| {
+        let tu = &blocks[0];
+        assert_eq!(tu["inputTruncated"], true, "{label}: {tu}");
+        assert_eq!(tu["name"], "view", "{label}");
+        assert_eq!(tu["toolCallId"], "tc-1", "{label}");
+        assert!(
+            serde_json::to_string(&tu["input"]).unwrap().len()
+                <= SLIM_PROJECTION_BUDGET_BYTES + 256,
+            "{label}: input bounded"
+        );
+        let tr = &blocks[1];
+        assert_eq!(tr["outputTruncated"], true, "{label}");
+        assert_eq!(tr["tool_use_id"], "tc-1", "{label}");
+        assert!(
+            tr["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES,
+            "{label}: output bounded"
+        );
+        assert_eq!(blocks[2], content[2], "{label}: under-budget untouched");
+        assert_eq!(blocks[3], content[3], "{label}: under-budget untouched");
+        let img_block = &blocks[4];
+        assert_eq!(img_block["dataTruncated"], true, "{label}");
+        assert_eq!(img_block["dataIsThumbnail"], true, "{label}");
+        assert_eq!(
+            img_block["dataBytes"].as_u64().unwrap() as usize,
+            img_b64.len(),
+            "{label}"
+        );
+        let served = img_block["data"].as_str().expect("thumbnail data");
+        assert!(served.len() < img_b64.len(), "{label}: thumbnail smaller");
+    };
+    assert_slim_blocks(blocks, "slim read");
+
+    // chat.subscribe with the slim projection: the seq-0 snapshot serves the
+    // same bounded blocks.
+    let snap = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+        ),
+        5,
+    )
+    .await;
+    let snap_blocks = snap["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("snapshot blocks");
+    assert_slim_blocks(snap_blocks, "slim snapshot");
+
+    // A bad projection value is -32602 on both methods.
+    let bad = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","projection":"tiny"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602);
+    let bad_sub = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"tiny"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_sub["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// Slim page byte budget over the real WSS wire (§5.5): a block-heavy
+/// transcript (the observed 2.87MB-frame class: many messages × ~80 capped
+/// tool blocks each) served with `projection: "slim"` stops early at the
+/// ~512KB page budget — every frame stays bounded by budget + one message —
+/// the `nextToken` walk reconstructs the full transcript with no gaps or
+/// duplicates, and the `chat.subscribe` seq-0 snapshot (which reuses the
+/// read) stays under the bound too. The full (absent-projection) read is
+/// unbudgeted.
+#[tokio::test]
+async fn wss_slim_conversation_pages_are_byte_budgeted() {
+    use intent_core::{AgentId, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Budget"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Budget"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // 46 messages × 40 tool pairs (80 blocks) with oversized bodies: each
+    // block caps at the ~2KB block budget, but 80 capped blocks × 46
+    // messages ≈ 7MB+ of slim page weight — the exact class the page budget
+    // exists to bound.
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 2);
+    for m in 0..46 {
+        let mut blocks = Vec::new();
+        for p in 0..40 {
+            blocks.push(json!({
+                "type": "tool_use", "id": format!("m{m}:{}", p * 2), "name": "view",
+                "toolCallId": format!("tc-{m}-{p}"),
+                "input": { "path": "big.rs", "blob": big },
+            }));
+            blocks.push(json!({
+                "type": "tool_result", "id": format!("m{m}:{}", p * 2 + 1),
+                "tool_use_id": format!("tc-{m}-{p}"), "output": big, "is_error": false,
+            }));
+        }
+        srv.store
+            .append_agent_message(&agent, "assistant", &json!(blocks), &now_iso())
+            .await
+            .expect("append block-heavy message");
+    }
+
+    // Slim nextToken walk: every frame bounded, sequence exact.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let token_field = match &token {
+            Some(t) => format!(r#","nextToken":"{t}""#),
+            None => String::new(),
+        };
+        let page = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","projection":"slim"{token_field}}}}}"#
+            ),
+        )
+        .await;
+        let frame_bytes = serde_json::to_string(&page["result"]).unwrap().len();
+        // One slim message here is ~80 blocks × ~2KB caps ≈ 170KB; allow
+        // budget + one message of headroom, still far under the old
+        // multi-MB frames and the transport's 1 MiB warn threshold.
+        assert!(
+            frame_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
+            "slim frame bounded by budget + one message: {frame_bytes}"
+        );
+        let msgs = page["result"]["messages"].as_array().expect("messages");
+        assert!(!msgs.is_empty(), "budgeted pages are never empty");
+        assert_eq!(page["result"]["totalMessages"], 46);
+        let ids: Vec<String> = msgs
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        walked.splice(0..0, ids);
+        pages += 1;
+        assert!(pages <= 46, "walk terminates");
+        match page["result"]["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert!(pages > 1, "budget forced multiple pages: {pages}");
+    assert_eq!(walked.len(), 46, "no gaps or duplicates in the walk");
+    let unique: std::collections::HashSet<&String> = walked.iter().collect();
+    assert_eq!(unique.len(), 46, "no duplicates in the walk");
+
+    // The slim seq-0 chat snapshot reuses the budgeted read: bounded too.
+    let snap = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+        ),
+        4,
+    )
+    .await;
+    let snap_bytes = serde_json::to_string(&snap).unwrap().len();
+    assert!(
+        snap_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
+        "slim seq-0 snapshot bounded: {snap_bytes}"
+    );
+    assert!(
+        !snap["messages"].as_array().expect("messages").is_empty(),
+        "snapshot serves the newest bounded page"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// `agent.getMessageBlock` over the real WSS wire (§5.5): one FULL content
+/// block by id — the on-demand counterpart of the slim projection. A
+/// persisted assistant block id and a serve-time synthetic
+/// `{messageId}:{index}` id both resolve; the returned block is the full,
+/// unprojected body (no slim flags) even when a slim read truncated it;
+/// unknown message/block ids are `-32602` naming the id; a workspace
+/// mismatch and an unknown agent are not-found; missing required params are
+/// `-32602`.
+#[tokio::test]
+async fn wss_agent_get_message_block_serves_full_block() {
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Block"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Block"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // One row: an id-less text block (synthetic id at serve time) plus an
+    // oversized tool_result with a persisted id (slim would truncate it).
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let content = json!([
+        { "type": "text", "text": "hello" },
+        { "type": "tool_result", "id": "blk-full", "tool_use_id": "tc-1",
+          "output": big, "is_error": false },
+    ]);
+    let row_id = srv
+        .store
+        .append_agent_message(&agent, "user", &content, &now_iso())
+        .await
+        .expect("append message")
+        .id;
+
+    // Persisted block id: the full, unprojected body — no slim flags.
+    let by_persisted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"blk-full","workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(by_persisted["jsonrpc"], "2.0");
+    assert_eq!(by_persisted["id"], 3);
+    let block = &by_persisted["result"]["block"];
+    assert_eq!(block["output"].as_str().expect("full output"), big);
+    assert!(
+        block.get("outputTruncated").is_none(),
+        "no slim flags on the full block: {block}"
+    );
+    assert_eq!(block, &content[1], "byte-identical to the stored block");
+
+    // Synthetic block id: `{messageId}:0` resolves the id-less text block,
+    // served with the synthetic id stamped (matching agent.getConversation).
+    let by_synthetic = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{row_id}:0"}}}}"#
+        ),
+    )
+    .await;
+    let block = &by_synthetic["result"]["block"];
+    assert_eq!(block["text"], "hello");
+    assert_eq!(block["id"].as_str(), Some(format!("{row_id}:0").as_str()));
+
+    // Unknown message id / unknown block id: -32602 naming the id.
+    let bad_msg = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"m-missing","blockId":"b"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_msg["error"]["code"], -32602);
+    assert!(
+        bad_msg["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("m-missing"),
+        "names the message id: {bad_msg}"
+    );
+    let bad_block = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{row_id}:9"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_block["error"]["code"], -32602);
+    assert!(
+        bad_block["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(":9"),
+        "names the block id: {bad_block}"
+    );
+
+    // Cross-workspace mismatch and unknown agent: not-found, fail closed.
+    let other_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.create","params":{"title":"Other"}}"#,
+    )
+    .await;
+    let other_ws_id = other_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("other workspace id");
+    let mismatch = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{row_id}","blockId":"{row_id}:0","workspaceId":"{other_ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], -32602);
+    assert_eq!(mismatch["error"]["data"]["code"], "not-found");
+    let unknown_agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getMessageBlock","params":{{"agentId":"agent-00000000-0000-0000-0000-000000000000","messageId":"{row_id}","blockId":"{row_id}:0"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(unknown_agent["error"]["code"], -32602);
+    assert_eq!(unknown_agent["error"]["data"]["code"], "not-found");
+
+    // Missing required params: -32602.
+    let missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
 /// `search.messages` over the real WSS wire (§5.15): FTS5-backed search over
 /// persisted user/assistant messages. Covers the reworked contract — global
 /// scope when `workspaceId` is absent, `workspaceId` as a hard scope filter,
@@ -8711,7 +9433,7 @@ async fn wss_file_attachment_upload_round_trip() {
     srv.store.insert_workspace(&w).await.expect("insert ws");
 
     let payload: Vec<u8> = (0u32..50_000).flat_map(|i| i.to_le_bytes()).collect();
-    let sha = format!("{:x}", Sha256::digest(&payload));
+    let sha = sha256_hex(&payload);
     let mid = payload.len() / 2;
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
 
@@ -8942,7 +9664,7 @@ async fn wss_workspace_import_lifecycle() {
     .expect("session row");
     zip.finish().expect("zip");
     let archive = buf.into_inner();
-    let sha = format!("{:x}", Sha256::digest(&archive));
+    let sha = sha256_hex(&archive);
 
     // begin → { importId, maxChunkBytes }.
     let begin = wss_call(
@@ -9313,7 +10035,7 @@ async fn wss_workspace_export_lifecycle() {
         );
     }
     assert_eq!(archive.len() as u64, size);
-    assert_eq!(format!("{:x}", Sha256::digest(&archive)), sha);
+    assert_eq!(sha256_hex(&archive), sha);
     let reread = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -9574,7 +10296,7 @@ async fn wss_workspace_import_commit_materializes_git() {
         .expect("refs write");
     zip.finish().expect("zip");
     let archive = buf.into_inner();
-    let sha = format!("{:x}", Sha256::digest(&archive));
+    let sha = sha256_hex(&archive);
 
     // begin → chunk → commit over the wire.
     let begin = wss_call(

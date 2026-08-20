@@ -414,6 +414,13 @@ impl Harness for V1 {
         )
     }
 
+    fn truncation_redrive_nudge(&self) -> String {
+        "[SYSTEM NOTE] Automatic redrive (monorepo#2863): your last turn appears truncated — \
+         it ended after a sustained period of silence without completing your assigned task. \
+         Assess where you left off and continue the work."
+            .to_string()
+    }
+
     fn note_images_notice(&self, n: usize) -> String {
         format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
     }

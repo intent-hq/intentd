@@ -36,12 +36,12 @@ use intent_core::{
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
-    TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
+    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRootId, WorkspaceId,
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
@@ -96,13 +96,13 @@ mod model_catalog;
 mod nested_repos;
 mod note_ops;
 mod one_shot_acp;
-mod pagination;
+pub mod pagination;
 pub mod pi_cli;
 mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
 pub mod provider_auth;
-pub mod provider_catalog;
+pub(crate) mod provider_catalog;
 pub mod provider_models;
 pub mod repo_config;
 mod rtk;
@@ -113,7 +113,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
-pub mod stack_sample;
+pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
@@ -121,7 +121,7 @@ mod transfer;
 mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
-pub mod transfer_materialize;
+pub(crate) mod transfer_materialize;
 #[cfg(test)]
 mod transfer_roundtrip;
 mod unsloth_server;
@@ -137,17 +137,15 @@ mod v1_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
-pub use mcp_servers::McpHub;
-pub use sandbox_ops::ProvisionOutcome;
+pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
     max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
     migrate_quick_action_settings, InMemorySecretStore, SecretStore,
 };
-pub use settings_registry::{
-    SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
-};
-pub use terminal_ops::PtyTerminalHost;
+pub use settings_registry::{SettingOrigin, SettingsRegistry};
+pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
+pub(crate) use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
 /// canonical resolver (`find_auggie`, managed binary, enhanced PATH) without
@@ -175,10 +173,9 @@ pub use events::{
     Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
-pub use pr_ops::{
-    fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
-    MergeRequirementsChecks, MergeRequirementsThreads, PrRefreshOutcome,
-};
+pub use pr_ops::PrRefreshOutcome;
+#[cfg(test)]
+pub(crate) use pr_ops::{fetch_merge_requirements, MergeRequirements};
 
 /// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
 /// selector returns `true` for these). After a daemon crash the runtime
@@ -509,6 +506,17 @@ pub struct Services {
     /// Shared across clones so the turn writer and the `agent.diagnostics`
     /// read door observe the same state.
     last_turn_silent_tails: agent_session::LastTurnSilentTails,
+    /// Per-agent consecutive suspected-truncation auto-redrive counter
+    /// (intent-hq/monorepo#2863): see [`agent_session::TruncationRedrives`].
+    /// Shared across clones so consecutive turns of one agent accumulate the
+    /// same stall-episode streak.
+    truncation_redrives: agent_session::TruncationRedrives,
+    /// One-shot truncation auto-redrive handoff flags
+    /// (intent-hq/monorepo#2863): see
+    /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
+    /// the `run_prompt_turn` arm and the turn worker's take observe the same
+    /// state.
+    pending_truncation_redrive: agent_session::PendingTruncationRedrives,
     /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
     /// tests simulate an in-flight worker without spawning a real
     /// [`AgentManager`]. Production composition always attaches a manager and
@@ -876,6 +884,8 @@ impl Services {
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
+            truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -924,7 +934,8 @@ impl Services {
     /// Pin the PR-monitor poll cadence, bypassing the live
     /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
     /// are clamped when read.
-    pub fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_poll_seconds = Some(seconds);
         self
     }
@@ -938,7 +949,8 @@ impl Services {
     }
 
     /// Override the per-agent active-monitor cap.
-    pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
         self.pr_monitors_max_per_agent = cap;
         self
     }
@@ -1072,7 +1084,7 @@ impl Services {
 
     /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
     /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
+    pub(crate) fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
         self.effective_settings().agents.flush_queued_messages
     }
 
@@ -1853,8 +1865,95 @@ impl Services {
     /// other note bodies — and matches [`compute_task_stats`] semantics
     /// exactly. Wired into `list_workspaces_lite` so the workspace.subscribe
     /// seq-0 snapshot is self-sufficient for client status rendering.
-    pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+    pub(crate) async fn cheap_task_stats(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceTaskStats> {
         self.store.count_task_stats(workspace_id).await
+    }
+
+    /// Merge externally known PRs into each list row's `pullRequests` for the
+    /// `workspace.list` / `workspace.subscribe` seq-0 emit paths: PRs
+    /// persisted on the workspace's secondary git roots
+    /// (`workspace_git_root.pull_requests`, monorepo#2053) and PRs known to
+    /// agent PR monitors (active + completed; cancelled excluded — the same
+    /// pool the FE builds after opening a workspace, PROTOCOL §6.9). Purely
+    /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
+    /// stays daemon-owned, and no forge calls are made (rung 1 of the
+    /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
+    /// O(PR-bearing rows) regardless of workspace count). Dedup is by PR
+    /// `url` — the one field every source carries that stays unambiguous
+    /// across repos — first-wins in source-priority order: workspace's own
+    /// PRs, then git-root PRs, then monitor-derived entries. A row with
+    /// nothing to merge is left untouched (a `None` stays omitted on the
+    /// wire, and an empty git-root list contributes nothing rather than
+    /// materializing `[]`); a store read failure degrades to serving the
+    /// base rows. `include_archived` mirrors the list call's flag so the
+    /// bulk reads never pay for archived workspaces the list won't return.
+    pub(crate) async fn merge_external_pull_requests(
+        &self,
+        list: &mut [Workspace],
+        include_archived: bool,
+    ) {
+        use std::collections::HashMap;
+        let roots = match self
+            .store
+            .list_workspace_git_roots_with_prs(include_archived)
+            .await
+        {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
+                Vec::new()
+            }
+        };
+        let monitors = match self
+            .store
+            .load_non_cancelled_pr_monitors(include_archived)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(error = %e, "workspace.list: pr monitor read failed; skipping");
+                Vec::new()
+            }
+        };
+        if roots.is_empty() && monitors.is_empty() {
+            return;
+        }
+        // Group externally sourced PRs per workspace, git-root entries before
+        // monitor-derived ones so the first-wins dedup below encodes the
+        // source priority. Empty lists are skipped so they can't flip an
+        // omitted workspace `pullRequests` into `[]`.
+        let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
+        for root in &roots {
+            if let Some(prs) = &root.pull_requests {
+                if prs.is_empty() {
+                    continue;
+                }
+                extras
+                    .entry(root.workspace_id.0.clone())
+                    .or_default()
+                    .extend(prs.iter().cloned());
+            }
+        }
+        for monitor in &monitors {
+            extras
+                .entry(monitor.workspace_id.0.clone())
+                .or_default()
+                .push(pr_monitor::pr_monitor_pr_info(monitor));
+        }
+        for ws in list.iter_mut() {
+            let Some(candidates) = extras.remove(ws.id.as_str()) else {
+                continue;
+            };
+            let merged = ws.pull_requests.get_or_insert_with(Vec::new);
+            for info in candidates {
+                if !merged.iter().any(|p| p.url == info.url) {
+                    merged.push(info);
+                }
+            }
+        }
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -2649,7 +2748,8 @@ impl Services {
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
     /// the timeout-fallback path completes in milliseconds.
-    pub fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self
     }
@@ -2744,7 +2844,7 @@ impl Services {
     /// (the store upsert never touches the column). Returns the stored row.
     /// Callers (the `ws.git.registerRoot` MCP binding, submodule
     /// auto-detection) validate the path before reaching this.
-    pub async fn register_git_root(
+    pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
     ) -> Result<intent_core::WorkspaceGitRoot> {
@@ -2761,7 +2861,7 @@ impl Services {
     /// Delete a workspace git root and emit `gitRoot:unregistered`
     /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
     /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
-    pub async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
+    pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
         publish_event(
@@ -3498,7 +3598,10 @@ impl Services {
     /// only usage metadata (not full message logs) when a scan does run. As a
     /// reconciler it never clobbers a fresher live snapshot with an all-zero
     /// tally (see [`Services::recompute_workspace_token_usage`]).
-    pub async fn scan_workspace_token_usage(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+    pub(crate) async fn scan_workspace_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
         // Cheap change detection: skip when the watermark is unchanged (finding F2).
         let current_watermark = self
             .store
@@ -4365,6 +4468,29 @@ impl Services {
         }
     }
 
+    /// Take (consume) the agent's recorded flipped completions as trigger
+    /// `(workspace_id, task_note_id)` pairs for wake stamping. Consuming at
+    /// the stamp point guarantees a flip is attributed as an
+    /// `unblockedTriggerTasks` trigger at most once — a later completion
+    /// cycle can never re-attribute a stale flip. Best-effort: a store
+    /// failure is logged and the wake proceeds without flip triggers.
+    pub(crate) async fn take_flipped_completion_triggers(
+        &self,
+        agent_id: &AgentId,
+    ) -> Vec<(String, String)> {
+        match self.store.take_agent_flipped_completions(agent_id).await {
+            Ok(pairs) => pairs.into_iter().map(|(ws, n)| (ws.0, n.0)).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "take agent flipped completions failed; wake proceeds without flip triggers"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Wake every parent whose watch matches child_id, then drop that watch:
     /// every ungrouped watch is deliver-once-and-retire. group_id = Some
     /// watches defer to the AS-4 delegation-group fan-in and are left
@@ -4616,18 +4742,141 @@ impl Services {
         // delivery/render time against CURRENT task state (never here), so a
         // wake that sits queued behind a busy parent cannot carry a stale
         // snapshot.
-        let trigger_tasks: Vec<(String, String)> =
-            if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
-                match self.store.get_agent_session(child_id).await {
-                    Ok(s) => match s.task_note_id {
+        //
+        // Completion identity (intent-hq/monorepo#2842): a reported
+        // `agent:idle` is identified by the session's persisted
+        // `completion_report_timestamp` (set with the report by
+        // `agent.reportToParent`, cleared at each turn's start — so a given
+        // completion keeps one identity across replays and a FUTURE
+        // completion always gets a new one). The ungrouped loop below skips
+        // a watcher whose recorded delivered identity matches — a boot
+        // reconcile replaying the child's historical completion, or a watch
+        // re-armed on an already-completed child, delivers at most once per
+        // completion. Identity guards (PR #1313 review):
+        // - The event must CARRY a report key — raw presence, deliberately
+        //   NOT the #1945 `completion_reported` non-empty filter, so an
+        //   EMPTY report still identifies its completion cycle — and the
+        //   carried text must MATCH the session's persisted report: a stale
+        //   reported idle consumed only after the child already reported
+        //   again must not adopt the newer cycle's identity (recording it
+        //   would suppress the genuinely new completion after a re-arm).
+        //   Mismatch fails open: identity None, delivered as before,
+        //   nothing recorded.
+        // - A report-less idle (a genuine unreported completion, or a
+        //   monorepo#2532 Gap B settlement whose stale report keys were
+        //   deliberately dropped) is never skip-checked — the Gap B
+        //   settlement is the parent's one wake for the settled cycle, so
+        //   suppressing it would strand the re-armed watch. It DOES settle
+        //   the session's persisted report cycle though, so the
+        //   delivery-path marker write (`record_identity` below) falls back
+        //   to the session timestamp when the event carries no report key;
+        //   genuine unreported completions have no session timestamp and
+        //   record nothing. `session_report_ts` also keys the
+        //   report_delivered retirement branch, whose completion cycle is
+        //   identified by the session's report even when the event payload
+        //   does not carry it.
+        let event_report_raw: Option<&str> = event
+            .data
+            .get("completionReport")
+            .or_else(|| event.data.get("report"))
+            .and_then(|v| v.as_str());
+        let (trigger_tasks, completion_identity, session_report_ts): (
+            Vec<(String, String)>,
+            Option<String>,
+            Option<String>,
+        ) = if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
+            match self.store.get_agent_session(child_id).await {
+                Ok(s) => {
+                    let identity = if event_report_raw.is_some()
+                        && event_report_raw == s.completion_report.as_deref()
+                    {
+                        s.completion_report_timestamp.clone()
+                    } else {
+                        None
+                    };
+                    let trigger = match s.task_note_id {
                         Some(n) => vec![(s.workspace_id.0, n.0)],
                         None => Vec::new(),
-                    },
-                    Err(_) => Vec::new(),
+                    };
+                    (trigger, identity, s.completion_report_timestamp)
+                }
+                Err(_) => (Vec::new(), None, None),
+            }
+        } else {
+            (Vec::new(), None, None)
+        };
+        // Failure identity (intent-hq/monorepo#2862): an `agent:failed` is
+        // identified by the session's persisted `stop_reason_timestamp`
+        // (stamped with the Error status BEFORE the event reaches the bus —
+        // durable-before-observable, monorepo#2050 — and cleared on
+        // `agent.retry` / turn start, so one failure cycle keeps one
+        // identity and a post-retry failure always gets a new one). Same
+        // guard shape as the completion identity above: derived only when
+        // the event carries a NON-EMPTY `error` matching the session's
+        // persisted `stop_reason` — a mismatch (stale event, or an emit
+        // path that never persisted the reason) fails open: identity None,
+        // delivered as before, nothing recorded. The `failed:` prefix keeps
+        // failure identities from ever cross-matching a completion identity
+        // in the shared per-pair marker row.
+        //
+        // The match also accepts the ONE known wrap relationship (PR #1316
+        // review): the streaming prompt-failure path persists the wrapped
+        // `internal error: session/prompt failed: {e}` as `stop_reason` but
+        // emits the RAW `{e}` as the live event's `error` — reconstructing
+        // the wrapper from the event text lets that (most common) failure
+        // mode record its marker on live delivery too, instead of failing
+        // open and leaving the first restart/re-arm replay deliverable.
+        // Replays synthesized from the persisted state carry the wrapped
+        // text verbatim and take the exact-match arm.
+        let failure_identity: Option<String> =
+            if !watches.is_empty() && event.event_type == AGENT_FAILED {
+                match failure_error_text.as_deref() {
+                    Some(err) if !err.is_empty() => {
+                        match self.store.get_agent_session(child_id).await {
+                            Ok(s) => {
+                                let wrapped = Error::Internal(format!(
+                                    "{} {err}",
+                                    crate::agent_manager::PROMPT_FAILED_PREFIX
+                                ))
+                                .to_string();
+                                let persisted = s.stop_reason.as_deref();
+                                if persisted == Some(err) || persisted == Some(wrapped.as_str()) {
+                                    s.stop_reason_timestamp.map(|ts| format!("failed:{ts}"))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
                 }
             } else {
-                Vec::new()
+                None
             };
+        // The identity the delivery-path marker write records. The skip
+        // check stays on the stricter event-carried `completion_identity`;
+        // the record additionally covers the report-less Gap B settlement
+        // (see the identity guards above). A failure identity (monorepo#2862)
+        // participates in both.
+        let record_identity: Option<&str> = completion_identity
+            .as_deref()
+            .or_else(|| {
+                if event_report_raw.is_none() {
+                    session_report_ts.as_deref()
+                } else {
+                    None
+                }
+            })
+            .or(failure_identity.as_deref());
+        // Flipped-completion triggers (consumed on stamp): the child's
+        // recorded flips of OTHER task notes join the trigger set alongside
+        // its own linked task. Taken LAZILY at the first stamp point that
+        // needs them — never up front — so a pass that skips every delivery
+        // (deferral, report_delivered retirement, replay dedup) leaves the
+        // rows for the wake that actually stamps them; one take is shared by
+        // every watch in this pass so multiple watchers stamp the same set.
+        let mut taken_flip_triggers: Option<Vec<(String, String)>> = None;
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4676,23 +4925,36 @@ impl Services {
                         .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
                 });
                 // Record-time trigger capture (intent-hq/monorepo#2044): a
-                // task-linked child's `agent:idle` stamps its linked task
-                // onto the RECORDED event, so the aggregated wake keeps the
-                // trigger even if the child session is deleted before the
-                // group settles (`try_fire_group` reads the stamp first and
-                // only falls back to a live session lookup).
-                let trigger = child_session.as_ref().and_then(|s| {
-                    (event.event_type == AGENT_IDLE)
-                        .then(|| {
-                            s.task_note_id
-                                .clone()
-                                .map(|n| (s.workspace_id.0.clone(), n.0))
-                        })
-                        .flatten()
-                });
+                // settled child's `agent:idle` stamps its linked task plus
+                // its recorded flipped completions (consumed here) onto the
+                // RECORDED event, so the aggregated wake keeps the triggers
+                // even if the child session is deleted before the group
+                // settles (`try_fire_group` reads the stamp first and only
+                // falls back to a live session lookup).
+                let mut triggers: Vec<(String, String)> = Vec::new();
+                if event.event_type == AGENT_IDLE {
+                    if let Some(s) = child_session.as_ref() {
+                        if let Some(n) = &s.task_note_id {
+                            triggers.push((s.workspace_id.0.clone(), n.0.clone()));
+                        }
+                    }
+                    let flips = match &taken_flip_triggers {
+                        Some(f) => f.clone(),
+                        None => {
+                            let f = self.take_flipped_completion_triggers(child_id).await;
+                            taken_flip_triggers = Some(f.clone());
+                            f
+                        }
+                    };
+                    for pair in flips {
+                        if !triggers.contains(&pair) {
+                            triggers.push(pair);
+                        }
+                    }
+                }
                 let report = child_session.and_then(|s| s.completion_report);
                 let group_annotated;
-                let event = if attention.is_some() || trigger.is_some() {
+                let event = if attention.is_some() || !triggers.is_empty() {
                     let mut e = event.clone();
                     if let Some((kind, reason)) = &attention {
                         agent_subscriptions::annotate_attention_request(
@@ -4701,13 +4963,10 @@ impl Services {
                             Some(reason),
                         );
                     }
-                    if let Some((ws, task)) = &trigger {
-                        crate::agent_ops::ready_delta::stamp_event_trigger_task(
-                            &mut e.data,
-                            ws,
-                            task,
-                        );
-                    }
+                    crate::agent_ops::ready_delta::stamp_event_trigger_tasks(
+                        &mut e.data,
+                        &triggers,
+                    );
                     group_annotated = e;
                     &group_annotated
                 } else {
@@ -4785,8 +5044,49 @@ impl Services {
                     parent = %watch.parent_agent_id.0,
                     "skipping agent:idle wake — report already delivered at reportToParent time"
                 );
-                // Remove the watch now that the completion cycle is done.
-                if self.remove_watch(&watch.id) {
+                // Remove the watch now that the completion cycle is done —
+                // BEFORE the awaited marker write below (PR #1313 review): a
+                // re-arm adopts the existing watch id, so an await parked
+                // between the loop's watch snapshot and this removal would
+                // widen the window where the stale snapshot removes a
+                // freshly re-armed watch (losing its future wake). The
+                // reorder leaves only a marker-less instant in which a
+                // re-arm's registration reconcile could replay the
+                // historical completion — a bounded single duplicate
+                // (fail-open), strictly better than a lost wake.
+                let removed = self.remove_watch(&watch.id);
+                // monorepo#2842: the completion cycle ends here for this
+                // parent — the report-time wake already delivered this
+                // completion, so persist its identity for the pair. A watch
+                // re-armed later (or a boot reconcile replaying the child's
+                // historical completion after a restart) matches the marker
+                // and is skipped instead of re-delivering. Keyed on the
+                // SESSION's report timestamp (not the event's): this branch
+                // is reached by unreported idle payloads too, and the cycle
+                // being retired is the session's persisted report. A
+                // best-effort write: a failure only loses the dedup for this
+                // completion. Recorded even when the watch was concurrently
+                // removed — the report-time wake was delivered either way.
+                if let Some(identity) = session_report_ts.as_deref() {
+                    if let Err(e) = self
+                        .store
+                        .record_completion_wake_delivery(
+                            &watch.parent_agent_id,
+                            child_id,
+                            identity,
+                            &now_iso(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            child = %child_id.0,
+                            parent = %watch.parent_agent_id.0,
+                            error = %e,
+                            "completion wake dedup record failed at report-delivered retirement"
+                        );
+                    }
+                }
+                if removed {
                     self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                         .await;
                     // Watch-removal backstop (issue intent-hq/monorepo#1643):
@@ -4820,6 +5120,50 @@ impl Services {
                     continue;
                 }
             }
+            // monorepo#2842: suppress a replayed identical completion wake to
+            // the same parent. The persisted per-pair marker records the
+            // identity (the child's completion_report_timestamp) of the last
+            // completion wake delivered — a boot reconcile re-synthesizing
+            // the child's HISTORICAL completion after a restart, or a watch
+            // re-armed on an already-completed child, matches the marker and
+            // is skipped, leaving the watch armed for a FUTURE completion
+            // (which carries a fresh report timestamp and delivers normally).
+            // Checked BEFORE the watch removal, like the failure dedup above,
+            // so the suppressed replay never consumes the one-shot watch. A
+            // marker read failure fails open (deliver as before): dedup is a
+            // guard, a missed suppression only restores the pre-fix wake.
+            // monorepo#2862: `agent:failed` replays are suppressed the same
+            // way, keyed on the failure identity (the session's
+            // `stop_reason_timestamp`) — a restart or re-arm on a child
+            // parked in Error must not re-deliver the failure the parent
+            // already heard; a post-retry failure carries a fresh timestamp
+            // and delivers normally.
+            if let Some(identity) = completion_identity
+                .as_deref()
+                .or(failure_identity.as_deref())
+            {
+                let delivered = self
+                    .store
+                    .get_completion_wake_delivery(&watch.parent_agent_id, child_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            child = %child_id.0,
+                            parent = %watch.parent_agent_id.0,
+                            error = %e,
+                            "completion wake dedup read failed; delivering"
+                        );
+                        None
+                    });
+                if delivered.as_deref() == Some(identity) {
+                    tracing::info!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        "skipping replayed completion wake — same completion already delivered; watch stays armed"
+                    );
+                    continue;
+                }
+            }
             // STAB-18 fix: remove the ungrouped watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
@@ -4837,6 +5181,45 @@ impl Services {
                 );
                 continue;
             }
+            // monorepo#2842: persist the completion's identity for this pair
+            // — AFTER the one-shot watch removal committed the delivery
+            // decision, but BEFORE the wake send (PR #1313 review):
+            // `deliver_parent_wake` persists the wake and spawns the
+            // parent's worker before returning, so a worker turn re-arming a
+            // watch on the already-completed child in that window must
+            // already find the marker (its registration reconcile would
+            // otherwise replay the historical completion). The write covers
+            // `record_identity` (the event-carried identity, or the
+            // session's report cycle a report-less Gap B settlement wake
+            // settles). Best-effort: a write failure only loses the dedup
+            // for this completion (the pre-fix behavior). If the send below
+            // fails, the parent misses the wake either way (the watch is
+            // already removed — the STAB-18 stance: a missed wake beats a
+            // duplicate), so recording first costs nothing. NB this stance
+            // consciously applies to FAILURE identities too (monorepo#2862),
+            // inverting the #840 in-memory record's after-send ordering: a
+            // failed send now also suppresses the boot/re-arm replay that
+            // could previously have healed the missed failure wake — same
+            // missed-beats-duplicate tradeoff as completions.
+            if let Some(identity) = record_identity {
+                if let Err(e) = self
+                    .store
+                    .record_completion_wake_delivery(
+                        &watch.parent_agent_id,
+                        child_id,
+                        identity,
+                        &now_iso(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        error = %e,
+                        "completion wake dedup record failed"
+                    );
+                }
+            }
             // `remove_watch` just retired the one-shot watch, so the wake
             // carries the retirement + re-arm suffix (issue monorepo#2051)
             // and the machine-readable `watchStillArmed: false` metadata
@@ -4845,7 +5228,27 @@ impl Services {
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
-            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
+            // Join the child's recorded flipped completions (consumed at
+            // this first stamp) into the trigger set alongside its own
+            // linked task — a genuine `agent:idle` completion only; failure
+            // and deletion wakes never attribute triggers.
+            let mut stamped_triggers = trigger_tasks.clone();
+            if event.event_type == AGENT_IDLE && !interim_idle {
+                let flips = match &taken_flip_triggers {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = self.take_flipped_completion_triggers(child_id).await;
+                        taken_flip_triggers = Some(f.clone());
+                        f
+                    }
+                };
+                for pair in flips {
+                    if !stamped_triggers.contains(&pair) {
+                        stamped_triggers.push(pair);
+                    }
+                }
+            }
+            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &stamped_triggers);
             if let Err(e) = self
                 .deliver_parent_wake(
                     &parent_ws,
@@ -4864,7 +5267,9 @@ impl Services {
             }
             // monorepo#840: record the delivered failure only AFTER the wake
             // succeeded, so a failed delivery never suppresses the next
-            // identical failure the parent has yet to hear about.
+            // identical failure the parent has yet to hear about (unlike the
+            // completion marker above, a failure watch is NOT consumed by a
+            // suppressed delivery — the retry re-delivers).
             if let Some(err) = failure_error_text.as_deref() {
                 self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
@@ -4959,9 +5364,10 @@ impl Services {
         let mut metadata = build_event_notification_metadata(&event_refs);
         // Enqueue-time trigger record (intent-hq/monorepo#2044), aggregated
         // form: every group member that settled via a genuine `agent:idle`
-        // completion and has a linked task note contributes its task id.
-        // Only the triggering facts are stamped — the unblocked enumeration
-        // is computed fresh at delivery/render time. Prefer the record-time
+        // completion contributes its record-time trigger stamp — its linked
+        // task plus any flipped completions consumed when it settled. Only
+        // the triggering facts are stamped — the unblocked enumeration is
+        // computed fresh at delivery/render time. Prefer the record-time
         // stamp on the raw event (captured when the child settled, so it
         // survives the child's deletion before group settlement); the live
         // session lookup is a fallback for events recorded before the stamp
@@ -4971,8 +5377,9 @@ impl Services {
             if event.event_type != AGENT_IDLE {
                 continue;
             }
-            if let Some(pair) = crate::agent_ops::ready_delta::event_trigger_task(&event.data) {
-                trigger_tasks.push(pair);
+            let stamped = crate::agent_ops::ready_delta::event_trigger_tasks(&event.data);
+            if !stamped.is_empty() {
+                trigger_tasks.extend(stamped);
                 continue;
             }
             let Some(child) = completion_event_child_id(event) else {
@@ -5960,7 +6367,12 @@ async fn reanchor_note_comments(
                     note_ops::RecoveryOutcome::Recovered(new_md) => {
                         current = new_md;
                     }
-                    note_ops::RecoveryOutcome::Failed(_) => {
+                    note_ops::RecoveryOutcome::Failed(reason) => {
+                        tracing::debug!(
+                            comment_id = %comment.id,
+                            reason,
+                            "partial-anchor recovery failed; orphaning comment"
+                        );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
                         let mut updated = comment.clone();
@@ -6907,6 +7319,52 @@ fn apply_status_transition(task: &mut TaskMetadata, status: TaskStatus, now: &st
     }
 }
 
+/// Record/remove the caller agent's flipped-completion pairs when a task-note
+/// status write crosses the `complete` boundary. Recording requires an agent
+/// caller and skips the agent's own linked task note (its completion is
+/// already stamped as a wake trigger separately); a transition back out of
+/// `complete` removes the pair for every recording agent — the flip is stale
+/// regardless of who reverted it. Best-effort: failures are logged, never
+/// surfaced to the status write.
+async fn track_flipped_completion_boundary(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    was_complete: bool,
+    is_complete: bool,
+    now: &str,
+) {
+    if !was_complete && is_complete {
+        let Some(agent_id) = caller_agent_id else {
+            return;
+        };
+        match store.get_agent_session(agent_id).await {
+            // The agent's own linked task note is excluded.
+            Ok(session) if session.task_note_id.as_ref() == Some(note_id) => {}
+            Ok(_) => {
+                if let Err(e) = store
+                    .record_agent_flipped_completion(agent_id, workspace_id, note_id, now)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id.0, note = %note_id.0, error = %e, "record agent flipped completion failed");
+                }
+            }
+            // No session (e.g. deleted) → nothing to record against.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id.0, error = %e, "flipped-completion caller session lookup failed");
+            }
+        }
+    } else if was_complete && !is_complete {
+        if let Err(e) = store
+            .remove_agent_flipped_completions_for_task(workspace_id, note_id)
+            .await
+        {
+            tracing::warn!(note = %note_id.0, error = %e, "remove agent flipped completions failed");
+        }
+    }
+}
+
 /// Build a fresh task-note metadata with the markAsTask enrichment timestamps.
 fn fresh_task_metadata(status: TaskStatus, now: &str, peer_order: Option<i64>) -> TaskMetadata {
     let mut task = TaskMetadata {
@@ -7097,7 +7555,7 @@ fn default_workspaces_root() -> PathBuf {
 /// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
 /// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
 /// `$HOME` default would panic — else the same root the service layer uses.
-pub fn try_default_workspaces_root() -> Option<PathBuf> {
+pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -9276,7 +9734,7 @@ fn search_done_event(
 /// Maximum merge attempts the background sweep will make per sandbox before
 /// leaving it `merge_pending` for manual handling (`sandbox.cow.merge` /
 /// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
-pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
+pub(crate) const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 
 /// Outcome tally for one [`Services::sweep_merge_pending_sandboxes`] pass,
 /// used by the daemon's periodic loop for logging and by unit tests.
@@ -10376,7 +10834,8 @@ impl Services {
 
     /// Apply server runtime control hooks after `settings.update` persists
     /// `server.wsApi.*` changes (§5.12): `server.wsApi.enabled` starts/stops the
-    /// WSS listener; `server.wsApi.port` restarts it when running.
+    /// WSS listener; `server.wsApi.port` / `server.bindAddress` restart it when
+    /// running (the start path re-reads both persisted values).
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
     ///
@@ -10448,6 +10907,42 @@ impl Services {
                                     port = port,
                                     "server.wsApi.port → {}: persisted (listener not running)",
                                     port
+                                );
+                            }
+                        }
+                    }
+                    "server.bindAddress" => {
+                        if let Some(addr) = change.get("value").and_then(|v| v.as_str()) {
+                            // Check if listener is running
+                            if control.ws_listener_port().await.is_some() {
+                                // Listener is running: restart it on the new
+                                // bind address (start re-reads the persisted
+                                // value)
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarting WSS listener",
+                                    addr
+                                );
+                                control.stop_ws_listener().await;
+                                control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        bind_address = addr,
+                                        "server.bindAddress → {}: failed to restart WSS listener", addr
+                                    );
+                                    Error::Internal(format!("failed to restart WSS listener on {}: {}", addr, e))
+                                })?;
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarted WSS listener",
+                                    addr
+                                );
+                            } else {
+                                // Listener is not running: persisting the value is enough
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: persisted (listener not running)",
+                                    addr
                                 );
                             }
                         }
@@ -10635,6 +11130,11 @@ impl WorkspaceApi for Services {
                 // when server.wsApi.enabled changes, restart it when
                 // server.wsApi.port changes while running.
                 if let Some(control) = self.server_control.get() {
+                    // Remember whether the listener was up before the hooks so a
+                    // failed batch (e.g. a restart-on-new-value hook that stopped
+                    // the listener and then failed to start it) can put it back
+                    // up after the persistence rollback.
+                    let listener_was_running = control.ws_listener_port().await.is_some();
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
@@ -10732,6 +11232,25 @@ impl WorkspaceApi for Services {
                                     "settings.update compensating hook application failed during rollback"
                                 );
                                 // Log but don't fail — the persistence rollback succeeded
+                            }
+                        }
+
+                        // A restart-on-new-value hook (port / bindAddress) stops the
+                        // listener before starting it, so a start failure leaves it
+                        // down even though the compensating hooks saw nothing to
+                        // restart. The persisted values are rolled back by now and
+                        // start re-reads them, so bring the listener back up if it
+                        // was running when the batch began.
+                        if listener_was_running && control.ws_listener_port().await.is_none() {
+                            match control.start_ws_listener().await {
+                                Ok(port) => tracing::info!(
+                                    port,
+                                    "settings.update rollback: restarted WSS listener on prior settings"
+                                ),
+                                Err(restart_err) => tracing::error!(
+                                    error = ?restart_err,
+                                    "settings.update rollback: failed to restart WSS listener on prior settings"
+                                ),
                             }
                         }
 
@@ -12222,6 +12741,11 @@ impl WorkspaceApi for Services {
                 total_ms = started.elapsed().as_millis() as u64,
                 "workspace.list: aggregate enrichment"
             );
+            // Emit-path PR merge: fold git-root + monitor PRs into each
+            // row's `pullRequests` (after enrichment so displayStatus
+            // derivation still sees only the persisted workspace PRs).
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             // Background backfill: active workspaces with repository_path but missing
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
@@ -12266,6 +12790,11 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 this.enrich_display_status(ws).await;
             }
+            // Emit-path PR merge, same as the full list path: the seq-0
+            // snapshot must carry the same `pullRequests` a later
+            // `workspace.list` would.
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             Ok(list)
         })
     }
@@ -14457,6 +14986,8 @@ impl WorkspaceApi for Services {
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
         let last_turn_silent_tails = self.last_turn_silent_tails.clone();
+        let truncation_redrives = self.truncation_redrives.clone();
+        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         // Full handle for the direct completion delivery below (Services is
         // Clone — the same capture pattern the spawn helpers use).
@@ -14530,6 +15061,14 @@ impl WorkspaceApi for Services {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);
+                truncation_redrives
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                pending_truncation_redrive
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
                 agent_queues
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -14567,7 +15106,10 @@ impl WorkspaceApi for Services {
                         correlation_id: None,
                         parent_event_id: None,
                         metadata: None,
-                        data: serde_json::json!({ "agentId": session.id.0 }),
+                        data: serde_json::json!({
+                            "agentId": session.id.0,
+                            "agentName": session.name,
+                        }),
                     },
                 )
                 .await;
@@ -14595,7 +15137,10 @@ impl WorkspaceApi for Services {
                     correlation_id: None,
                     parent_event_id: None,
                     metadata: None,
-                    data: serde_json::json!({ "agentId": session.id.0 }),
+                    data: serde_json::json!({
+                        "agentId": session.id.0,
+                        "agentName": session.name,
+                    }),
                 };
                 services
                     .deliver_completion_to_watches(&session.id, &event)
@@ -17372,16 +17917,24 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
+                // A complete-boundary crossing records/removes the caller's
+                // flipped-completion pair (later stamped as a wake trigger).
+                track_flipped_completion_boundary(
+                    &store,
+                    caller_agent_id.as_ref(),
+                    &note.workspace_id,
+                    &note.id,
+                    previous_status == TaskStatus::Complete,
+                    new_status == TaskStatus::Complete,
+                    &now,
+                )
+                .await;
                 // LC-1: agent-attributed changes carry provenance — resolve the
                 // caller's display name best-effort for the agent actor.
-                let agent = match caller_agent_id {
+                let agent = match &caller_agent_id {
                     Some(agent_id) => Some((
                         agent_id.0.clone(),
-                        store
-                            .get_agent_session(&agent_id)
-                            .await
-                            .ok()
-                            .map(|s| s.name),
+                        store.get_agent_session(agent_id).await.ok().map(|s| s.name),
                     )),
                     None => None,
                 };
@@ -17716,6 +18269,19 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now.clone();
             store.update_note(&note).await?;
+            // A markAsTask that crosses the complete boundary records/removes
+            // the caller's flipped-completion pair, exactly like
+            // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
+            track_flipped_completion_boundary(
+                &store,
+                caller_agent_id.as_ref(),
+                &note.workspace_id,
+                &note.id,
+                previous_status == Some(TaskStatus::Complete),
+                new_status == TaskStatus::Complete,
+                &now,
+            )
+            .await;
             let agent = resolve_event_agent(&store, caller_agent_id.as_ref()).await;
             // The note's metadata changed, so subscribers need to refetch it
             // (§6.5) — without this a task-ness flip is invisible until the
@@ -20885,6 +21451,7 @@ impl WorkspaceApi for Services {
         page_token: Option<String>,
         around_message_id: Option<String>,
         around_index: Option<i64>,
+        projection: Option<intent_core::ConversationProjection>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_get_conversation_op(
@@ -20894,8 +21461,22 @@ impl WorkspaceApi for Services {
                 page_token,
                 around_message_id,
                 around_index,
+                projection,
             )
             .await
+        })
+    }
+
+    fn agent_get_message_block(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_get_message_block_op(agent_id, message_id, block_id, workspace_id)
+                .await
         })
     }
 
@@ -24201,20 +24782,6 @@ impl Services {
         sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
     }
 
-    /// Discard a sandbox: remove the directory and database record.
-    pub async fn discard_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) -> Result<()> {
-        sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
-    }
-
-    /// Garbage-collect orphaned sandboxes (startup GC).
-    pub async fn gc_orphaned_sandboxes(&self) -> Result<()> {
-        sandbox_ops::gc_orphaned_sandboxes(&self.store).await
-    }
-
     /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).
     /// Called by the delegate op BEFORE it returns, so the child's turn
     /// worker observes the gate before its first spawn attempt. The returned
@@ -25976,22 +26543,22 @@ mod specialists;
 mod ac_status_singleflight;
 mod accept_changes;
 pub mod diffs;
-pub mod file_tracking;
+pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
-pub mod usage_rate;
-pub mod usage_stats;
-pub mod usage_stats_read;
-pub mod session_stats {}
+pub(crate) mod usage_rate;
+pub(crate) mod usage_stats;
+pub(crate) mod usage_stats_read;
+pub(crate) mod session_stats {}
 
 /// Worktree setup-script detection and template generation (PROTOCOL §5.25).
 /// Ports the reference `setup-scripts.ipc.ts` detection + template logic, with
 /// the package-manager-specific `ProjectType` collapsed to the coarse protocol
 /// enum (`node`/`python`/`go`/`rust`/`ruby`).
-pub mod setup_scripts {
+pub(crate) mod setup_scripts {
     use std::path::Path;
 
     use intent_core::{now_epoch_ms, ProjectType, SetupScript, SetupScriptGeneratedBy};
@@ -25999,7 +26566,7 @@ pub mod setup_scripts {
     /// Wrap a hand-authored script body into a `SetupScript` stamped
     /// `generatedBy: "user"` with a fresh `updatedAt` (used by create/update and
     /// `saveSetupScript`).
-    pub fn user_script(script: String) -> SetupScript {
+    pub(crate) fn user_script(script: String) -> SetupScript {
         SetupScript {
             script,
             project_type: None,
@@ -26036,7 +26603,7 @@ pub mod setup_scripts {
     /// type, mirroring the reference per-type templates (env-file copy from
     /// `$MAIN_CHECKOUT` + dependency install). The generic fallback copies common
     /// config files only.
-    pub fn template_for(project_type: Option<ProjectType>) -> String {
+    pub(crate) fn template_for(project_type: Option<ProjectType>) -> String {
         const HEADER: &str = "#!/usr/bin/env bash\nset -euo pipefail\n# Available variables: \
             $MAIN_CHECKOUT, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH\n\n";
         const COPY_ENV: &str = "# Copy environment files from the main checkout\n\
@@ -26183,7 +26750,8 @@ fn extract_markdown_image_urls(content: &str) -> Vec<String> {
 /// settings access (the transport's host.providerDiscovery arm) should use
 /// [`discover_providers_with_npx_overrides`] so `installed` matches what the
 /// spawn path would actually resolve (monorepo#1065).
-pub fn discover_providers_with_npx() -> serde_json::Value {
+#[cfg(test)]
+pub(crate) fn discover_providers_with_npx() -> serde_json::Value {
     discover_providers_with_npx_overrides(&std::collections::HashMap::new())
 }
 

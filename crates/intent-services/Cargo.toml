@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.7.16"
+version = "0.7.23"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,19 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.7.16" }
-intent-store = { path = "../intent-store", version = "0.7.16" }
-intent-git = { path = "../intent-git", version = "0.7.16" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.7.16" }
-intent-linear = { path = "../intent-linear", version = "0.7.16" }
-intent-sentry = { path = "../intent-sentry", version = "0.7.16" }
+intent-core = { path = "../intent-core", version = "0.7.23" }
+intent-store = { path = "../intent-store", version = "0.7.23" }
+intent-git = { path = "../intent-git", version = "0.7.23" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.7.23" }
+intent-linear = { path = "../intent-linear", version = "0.7.23" }
+intent-sentry = { path = "../intent-sentry", version = "0.7.23" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.7.16" }
-intent-js = { path = "../intent-js", version = "0.7.16" }
-intent-context = { path = "../intent-context", version = "0.7.16" }
-intent-providers = { path = "../intent-providers", version = "0.7.16" }
-intent-pty = { path = "../intent-pty", version = "0.7.16" }
-intent-search = { path = "../intent-search", version = "0.7.16" }
+intent-acp = { path = "../intent-acp", version = "0.7.23" }
+intent-js = { path = "../intent-js", version = "0.7.23" }
+intent-context = { path = "../intent-context", version = "0.7.23" }
+intent-providers = { path = "../intent-providers", version = "0.7.23" }
+intent-pty = { path = "../intent-pty", version = "0.7.23" }
+intent-search = { path = "../intent-search", version = "0.7.23" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
@@ -40,7 +40,7 @@ toml_edit = "0.25.5"
 tempfile = "3"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
-sha2 = "0.10"
+sha2 = "0.11"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
@@ -50,6 +50,7 @@ async-trait = "0.1"
 git2.workspace = true
 sqlx.workspace = true
 ctor = "1.0.10"
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }

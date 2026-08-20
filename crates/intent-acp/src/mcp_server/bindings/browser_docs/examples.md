@@ -1,21 +1,101 @@
 # Browser API Examples
 
-## Opening Local HTML Files
+## Reusing a Tab Already at the Target URL
 
-You can open local files directly using file:// URLs:
+List tabs before opening one. If a tab you own already has the target URL or that
+target's rewritten/redirected `finalUrl`, focus it by `tabId` and continue working in
+that tab. An unowned (user) tab at the target URL must be claimed first (see "Claiming
+and Resizing Tabs" below); tabs owned by other agents are never reused. For example,
+when targeting `http://daemon.localhost:8000`:
 
 ```json
-// Open a local HTML file
 {
   "actions": [
-    { "action": "openTab", "url": "file:///Users/me/project/index.html" }
+    { "action": "listTabs" }
+  ]
+}
+// A matching result may show the rewritten finalUrl instead of the requested alias.
+// Each tab carries its owner and sizing info:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, ... }
+
+{
+  "actions": [
+    { "action": "focusTab", "tabId": "tab-abc123" },
+    { "action": "getAccessibilityTree", "tabId": "tab-abc123" }
+  ]
+}
+```
+
+Use `openTab` only after `listTabs` shows no reusable tab with the target URL or its
+rewritten/redirected `finalUrl`, or when the user explicitly asks for another tab,
+side-by-side view, or second instance. A different URL may open in a new tab; do not
+navigate an existing tab away from its current URL merely to avoid opening a tab for a
+different URL. Leave user-opened extra tabs in place.
+
+## Claiming and Resizing Tabs
+
+Tabs are agent-owned: you can only manipulate tabs you own. To work in an unowned
+(user) tab, claim it first — `width` is required, omitted `height` defaults to 800:
+
+```json
+// Find unowned tabs
+{
+  "actions": [
+    { "action": "listTabs", "scope": "unclaimed" }
+  ]
+}
+// → tabs with ownerAgentId: null and native sizing:
+// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", ... }
+
+// Claim it — atomic, first-claim-wins; ownership transfer and viewport emulation
+// at the given size happen in one step
+{
+  "actions": [
+    { "action": "claimTab", "tabId": "tab-user1", "width": 1280, "height": 800 }
   ]
 }
 
-// Navigate an existing tab to a different local file
+// Later, change the owned tab's emulated size (omitted height keeps the current one)
 {
   "actions": [
-    { "action": "navigate", "url": "file:///Users/me/project/other.html" }
+    { "action": "resizeTab", "tabId": "tab-user1", "width": 375, "height": 667 }
+  ]
+}
+```
+
+Ownership failures come back as structured action-result errors (inside the
+per-action `{ action, success: false, error }` envelope, never a top-level failure):
+
+```json
+// Claim lost to an earlier claim — no stealing; the error names the owner
+// { action: "claimTab", success: false, errorCode: "already-claimed", ownerAgentId: "<other-agent-id>", error: "Tab ... is owned by agent ..." }
+
+// Op on a tab you do not own — a not-owner on an unowned tab carries no owner
+// to name (ownerAgentId: null); the remedy is claimTab
+// { action: "resizeTab", success: false, errorCode: "not-owner", ownerAgentId: null, error: "Tab ... is not owned by you ..." }
+```
+
+Agent-issued `openTab` also accepts optional `width` / `height` (emulated from
+creation; defaults 1280×800 when omitted):
+
+```json
+{
+  "actions": [
+    { "action": "openTab", "url": "http://localhost:5173", "width": 1440, "height": 900 }
+  ]
+}
+```
+
+## Opening Local HTML Files
+
+After confirming no tab already has the target URL, you can open local files directly
+using file:// URLs:
+
+```json
+// No existing tab has this URL, so open it
+{
+  "actions": [
+    { "action": "openTab", "url": "file:///Users/me/project/index.html" }
   ]
 }
 ```
@@ -31,7 +111,7 @@ alias to target it explicitly — and bind `0.0.0.0` so a remote client can reac
 //    terminal for long-running processes — ws.host.exec is one-shot and would block:
 //    ws.script.create("http-server", "python3 -m http.server 8000 --bind 0.0.0.0", "service")
 
-// 2. Open it using the daemon.localhost alias
+// 2. After listTabs confirms no tab has this URL, open it using the daemon.localhost alias
 {
   "actions": [
     { "action": "openTab", "url": "http://daemon.localhost:8000" }
@@ -40,10 +120,11 @@ alias to target it explicitly — and bind `0.0.0.0` so a remote client can reac
 // The result echoes the rewrite, e.g.:
 // { requestedUrl: "http://daemon.localhost:8000", finalUrl: "http://10.0.0.5:8000/", rewritten: true, reason: "..." }
 
-// To target an app on the user's machine instead, use client.localhost
+// To target an app on the user's machine instead, use client.localhost. After the same
+// listTabs check, open a new tab if no tab already has this different URL.
 {
   "actions": [
-    { "action": "navigate", "url": "http://client.localhost:5173" }
+    { "action": "openTab", "url": "http://client.localhost:5173" }
   ]
 }
 ```
@@ -98,29 +179,39 @@ connections there, re-open with the same `remotePort`.
 
 ## Cleaning Up Tabs
 
-Close tabs you opened for testing/automation when you are done with them. `closeTab`
-requires an explicit `tabId` (discover it via `listTabs`) — it never falls back to the
-sequence-level default `tabId`.
+Start by listing tabs and reusing a matching one. Close a tab when you are done only if
+you opened it for testing or automation; do not close a user-opened tab that you reused.
+`closeTab` requires an explicit `tabId` — it never falls back to the sequence-level
+default `tabId`.
 
 ```json
-// Open a tab, find its id, work with it, then close it
+// First look for a tab already at the target URL
+{
+  "actions": [
+    { "action": "listTabs" }
+  ]
+}
+// If a matching tab exists, focus and reuse it. Leave it open if the user opened it.
+
+// If no matching tab exists, open one for this work
 {
   "actions": [
     { "action": "openTab", "url": "http://localhost:5173" }
   ]
 }
 
+// Discover the explicit id of the tab you opened
 {
   "actions": [
     { "action": "listTabs" }
   ]
 }
-// Returns tabs with their ids, e.g. { tabId: "tab-abc123", url: "http://localhost:5173", ... }
+// Returns tabs with their ids, e.g. { tabId: "tab-new456", url: "http://localhost:5173", ... }
 
 {
   "actions": [
-    { "action": "getAccessibilityTree", "tabId": "tab-abc123" },
-    { "action": "closeTab", "tabId": "tab-abc123" }
+    { "action": "getAccessibilityTree", "tabId": "tab-new456" },
+    { "action": "closeTab", "tabId": "tab-new456" }
   ]
 }
 ```

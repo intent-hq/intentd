@@ -186,7 +186,7 @@ pub fn commit_paths_with_trailers(
 /// by a single blank line. When neither id is given the cleaned message is
 /// returned unchanged (no trailing blank line). The output round-trips with
 /// [`crate::history::parse_trailers`].
-pub fn build_commit_message(
+pub(crate) fn build_commit_message(
     message: &str,
     agent_id: Option<&str>,
     linked_note_id: Option<&str>,

@@ -192,6 +192,16 @@ make test     # cargo test against packages/intentd
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
 
+One commit-message hazard worth repeating here: release tooling treats the literal
+`BREAKING CHANGE:` / `BREAKING-CHANGE:` (and `Release-As:`) token appearing anywhere in
+a commit body as a real footer, and squash merges fold every branch commit message into
+the squash body — so a commit that merely *quotes* the token causes a false major bump
+(or, for `Release-As:`, a forced pinned version); this accidentally cut cloudlands-fe
+v3.0.0 — see intent-hq/monorepo#2988. Never write
+the literal token in commit messages, PR titles/bodies, or review comments unless an
+actual breaking change is intended; when describing the mechanism, write "the
+breaking-change footer token" or similar instead.
+
 ## Filing issues
 
 File bugs on [intent-hq/monorepo](https://github.com/intent-hq/monorepo/issues) — the

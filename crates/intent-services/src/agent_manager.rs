@@ -189,6 +189,54 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     }
 }
 
+/// Batch-flush grouping stamp: when a flush delivers two or more entries as
+/// ONE combined turn ([`prepare_flush_turn`]), every drained entry's
+/// `messageMetadata` gains the same freshly minted `queueInfo.batchId`
+/// (uuid, PROTOCOL §5.5), so clients can group the N persisted user rows.
+/// Must run AFTER [`annotate_dequeue_wait`]: this stamp creates `queueInfo`
+/// when absent, and the wait stamp never overwrites an existing one. The
+/// stamp is additive — an entry whose wait fell below the annotation
+/// threshold gets a `queueInfo` carrying only `batchId`, and an entry that
+/// already carries `queueInfo` keeps its `queuedAt` / `waitedMs` (and any
+/// prior `batchId`: a mid-flush persist failure requeues already-stamped
+/// entries, and keeping the first batch's id groups the retry's rows with
+/// the rows the first attempt already persisted). Same skips as the wait
+/// stamp: `persisted: true` requeues (row already durable, never rewritten)
+/// and a non-object `messageMetadata` are left alone. Single-entry drains
+/// never stamp — there is nothing to group.
+fn stamp_flush_batch_id(entries: &mut [QueuedMessage]) {
+    if entries.len() < 2 {
+        return;
+    }
+    let batch_id = Value::String(Uuid::new_v4().to_string());
+    for msg in entries.iter_mut() {
+        if msg.persisted {
+            continue;
+        }
+        let metadata = msg.message_metadata.get_or_insert_with(|| json!({}));
+        let Value::Object(map) = metadata else {
+            tracing::warn!(
+                id = %msg.id,
+                "flush batchId stamp skipped: messageMetadata is not an object"
+            );
+            continue;
+        };
+        match map.entry("queueInfo").or_insert_with(|| json!({})) {
+            Value::Object(queue_info) => {
+                queue_info
+                    .entry("batchId")
+                    .or_insert_with(|| batch_id.clone());
+            }
+            _ => {
+                tracing::warn!(
+                    id = %msg.id,
+                    "flush batchId stamp skipped: queueInfo is not an object"
+                );
+            }
+        }
+    }
+}
+
 /// Delivery-time "tasks now unblocked" annotation (intent-hq/monorepo#2044):
 /// completion wakes stamp only the triggering task ids on their
 /// `messageMetadata` at enqueue time; THIS is where the unblocked enumeration
@@ -535,7 +583,7 @@ fn now_ms() -> u64 {
 /// Async callback that tears down one process when the registry evicts/reaps it
 /// (the Rust analog of the TS `ProcessEntry.kill`). The manager wires this to
 /// drop the agent's [`AgentHandle`], killing the child and aborting its tasks.
-pub type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+pub(crate) type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Async callback for process-cap lifecycle events (queueing/resuming/eviction).
 /// Invoked by the registry when a spawn queues, resumes, or an idle process is
@@ -543,16 +591,16 @@ pub type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 /// parameter is the machine-readable `reason` — [`REASON_SLOTS`] or
 /// [`REASON_MEMORY_BUDGET`] — naming which admission constraint drove the event
 /// (monorepo#2063).
-pub type ProcessEventFn =
+pub(crate) type ProcessEventFn =
     Arc<dyn Fn(&AgentId, &str, usize, usize, &str) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// `reason` value for `agent:process:*` events driven by the concurrency slot
 /// cap (all slots active / a slot freed).
-pub const REASON_SLOTS: &str = "slots";
+pub(crate) const REASON_SLOTS: &str = "slots";
 
 /// `reason` value for `agent:process:*` events driven by the aggregate memory
 /// budget (monorepo#2063).
-pub const REASON_MEMORY_BUDGET: &str = "memory-budget";
+pub(crate) const REASON_MEMORY_BUDGET: &str = "memory-budget";
 
 struct ProcessEntry {
     last_active_ms: u64,
@@ -996,7 +1044,7 @@ impl ProcessRegistry {
     /// Chainable builder; returns `Self` so the manager can wire this after
     /// construction. The callback signature is
     /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
-    pub fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
+    pub(crate) fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
         self
     }
@@ -1012,7 +1060,8 @@ impl ProcessRegistry {
     }
 
     /// Whether `agent_id` is currently registered.
-    pub fn is_registered(&self, agent_id: &AgentId) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_registered(&self, agent_id: &AgentId) -> bool {
         self.inner.lock().unwrap().entries.contains_key(agent_id)
     }
 
@@ -1063,7 +1112,7 @@ impl ProcessRegistry {
     }
 
     /// Mark a process as actively streaming (never evicted while active).
-    pub fn mark_active(&self, agent_id: &AgentId) {
+    pub(crate) fn mark_active(&self, agent_id: &AgentId) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.get_mut(agent_id) {
             entry.is_active = true;
@@ -1074,7 +1123,7 @@ impl ProcessRegistry {
     /// Mark a process idle (eligible for eviction) and wake a queued spawn so it
     /// can take the freed slot immediately. When a waiter is resumed, logs + emits
     /// `agent:process:resumed` via the event callback.
-    pub fn mark_idle(&self, agent_id: &AgentId) {
+    pub(crate) fn mark_idle(&self, agent_id: &AgentId) {
         let resumed_agent = {
             let mut inner = self.inner.lock().unwrap();
             let existed = match inner.entries.get_mut(agent_id) {
@@ -1231,7 +1280,7 @@ impl ProcessRegistry {
     ///
     /// An unregistered agent admits immediately too — its child must spawn,
     /// and `create_agent`'s [`Self::acquire`] is that path's gate.
-    pub async fn acquire_turn_start(&self, agent_id: &AgentId) {
+    pub(crate) async fn acquire_turn_start(&self, agent_id: &AgentId) {
         loop {
             enum Action {
                 Admit,
@@ -1338,7 +1387,7 @@ impl ProcessRegistry {
 
     /// Evict idle processes in LRU order (the idle-reap hook; full
     /// timer/memory-pressure triggering is M5). Returns the number evicted.
-    pub async fn evict_idle(&self, max: Option<usize>) -> usize {
+    pub(crate) async fn evict_idle(&self, max: Option<usize>) -> usize {
         let max = max.unwrap_or(usize::MAX);
         let mut evicted = 0;
         while evicted < max {
@@ -1374,7 +1423,7 @@ impl ProcessRegistry {
     /// daemon restart. The reap loop task is the only production caller and
     /// is aborted only at shutdown; a future caller must not wrap this in a
     /// timeout/select that can drop it mid-kill.
-    pub async fn evict_idle_older_than<C, R>(
+    pub(crate) async fn evict_idle_older_than<C, R>(
         &self,
         ttl: Duration,
         try_claim: C,
@@ -1440,7 +1489,7 @@ impl ProcessRegistry {
     /// contract as [`Self::evict_idle_older_than`], including the
     /// re-validation before each kill and the NOT-cancellation-safe caveat —
     /// dropping this future at the `kill().await` leaks the held claim.
-    pub async fn evict_while_over_budget<C, R>(&self, try_claim: C, release: R) -> usize
+    pub(crate) async fn evict_while_over_budget<C, R>(&self, try_claim: C, release: R) -> usize
     where
         C: Fn(&AgentId) -> bool,
         R: Fn(&AgentId),
@@ -1726,7 +1775,7 @@ type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
 /// it — after which the rows are gone and a spawn attempt fails `NotFound`
 /// on its own store read.
 #[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
-pub struct TeardownFence {
+pub(crate) struct TeardownFence {
     stopping: Arc<Mutex<HashSet<AgentId>>>,
     ids: Vec<AgentId>,
 }
@@ -2053,7 +2102,7 @@ impl AgentManager {
     /// Per-agent subtree memory attribution from the installed probe
     /// (monorepo#2063 A2), or an empty map when no probe is wired (tests /
     /// bare wiring) or no sample has landed yet.
-    pub fn agent_memory_samples(&self) -> HashMap<AgentId, u64> {
+    pub(crate) fn agent_memory_samples(&self) -> HashMap<AgentId, u64> {
         self.tree_probe
             .get()
             .map(|p| p.agent_samples())
@@ -2096,13 +2145,13 @@ impl AgentManager {
     /// Resolve an outstanding interactive permission prompt (`agent.respondPermission`,
     /// PROTOCOL §8): deliver `outcome` to the blocked client handler. Returns
     /// `false` when no such prompt is outstanding (already answered or timed out).
-    pub fn respond_permission(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
+    pub(crate) fn respond_permission(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
         self.permissions.resolve(request_id, outcome)
     }
 
     /// Snapshot every outstanding permission prompt (`agent.pendingPermissions`,
     /// PROTOCOL §8), for a (re)connecting client to recover what awaits an answer.
-    pub fn pending_permissions(&self) -> Vec<PermissionRequestData> {
+    pub(crate) fn pending_permissions(&self) -> Vec<PermissionRequestData> {
         self.permissions.pending()
     }
 
@@ -2123,7 +2172,7 @@ impl AgentManager {
 
     /// Number of currently-tracked agents spawned with the given provider id
     /// (e.g. `"unsloth"`), for `unsloth.status`'s `attachedAgentCount`.
-    pub fn count_agents_with_provider(&self, provider_id: &str) -> usize {
+    pub(crate) fn count_agents_with_provider(&self, provider_id: &str) -> usize {
         self.handles
             .lock()
             .unwrap()
@@ -2134,7 +2183,7 @@ impl AgentManager {
 
     /// The daemon-owned singleton Unsloth server manager, for the
     /// `unsloth.status` / `unsloth.stop` RPCs.
-    pub fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerManager> {
+    pub(crate) fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerManager> {
         &self.unsloth
     }
 
@@ -3560,7 +3609,7 @@ impl AgentManager {
     /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
     /// child that would outlive its deleted session as a ghost process.
     #[must_use = "hold the fence until the swept agents' session rows are deleted"]
-    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+    pub(crate) async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
         // Arm the fence BEFORE the first detach: from here on, every lazy
         // spawn for a swept agent is refused (`ensure_started` fast-fail +
         // the `create_agent` install fence), so no replacement child can
@@ -3650,6 +3699,13 @@ impl AgentManager {
         // and the orphaned context describes the aborted turn, not a future
         // failure.
         self.services.discard_pending_terminal_error(agent_id);
+        // A stale truncation auto-redrive arm (monorepo#2863) is dropped on
+        // the same terms: it belongs to the aborted turn. The consecutive
+        // streak clears with it — a manual stop ends the stall episode, so a
+        // later unrelated truncation must start a fresh episode rather than
+        // inherit the old count and hit the cap early.
+        self.services.take_truncation_redrive(agent_id);
+        self.services.clear_truncation_redrives(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -3764,6 +3820,13 @@ impl AgentManager {
         // context describes the aborted turn, so it must not survive into a
         // later failure's settle.
         self.services.discard_pending_terminal_error(agent_id);
+        // A stale truncation auto-redrive arm (monorepo#2863) is dropped on
+        // the same terms: it belongs to the aborted turn. The consecutive
+        // streak clears with it — an interrupt ends the stall episode, so a
+        // later unrelated truncation must start a fresh episode rather than
+        // inherit the old count and hit the cap early.
+        self.services.take_truncation_redrive(agent_id);
+        self.services.clear_truncation_redrives(agent_id);
         // Persist the streamed-so-far assistant content as an interrupted
         // assistant row, stamped with the interruption reason (+ sender
         // attribution on preemption). Runs AFTER the abort (a worker append
@@ -4115,7 +4178,7 @@ impl AgentManager {
 
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
     /// `agent.sendMessage` to decide queue-vs-stream).
-    pub fn is_busy(&self, agent_id: &AgentId) -> bool {
+    pub(crate) fn is_busy(&self, agent_id: &AgentId) -> bool {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
@@ -4129,7 +4192,7 @@ impl AgentManager {
     /// while holding the `busy` lock. That makes a claim/release visible
     /// atomically from this snapshot's perspective: a busy agent always has
     /// its `agent_ws` entry.
-    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+    pub(crate) fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
         let busy = self.busy.lock().unwrap();
         let agent_ws = self.agent_ws.lock().unwrap();
         let mut active = busy
@@ -4959,12 +5022,7 @@ impl AgentManager {
         // agent:message / agent:stream:* events follow"). Mirrors the
         // queue-drain (`persist_user`) and wake-delivery emits.
         self.services
-            .publish_agent_mutation_event(
-                &workspace_id,
-                &agent_id,
-                intent_core::events::AGENT_MESSAGE,
-                crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
-            )
+            .publish_agent_message_events(&workspace_id, &agent_id, &message, Some(&turn_id))
             .await;
         // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
         // `question_answers` naming the marked assistant message resolves the
@@ -5287,7 +5345,7 @@ impl AgentManager {
     /// redriven — the explicit "send now" is a user action, same spirit as
     /// the documented fresh-`agent.sendMessage` recovery path (the STAB-52
     /// drain gate does not apply here by design).
-    pub async fn send_queued_message_now(
+    pub(crate) async fn send_queued_message_now(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
@@ -5431,15 +5489,11 @@ impl AgentManager {
             // Emit `agent:message` (role=user) with the persisted row id,
             // mirroring the `send_message` direct-send branch (§5.5).
             self.services
-                .publish_agent_mutation_event(
+                .publish_agent_message_events(
                     &workspace_id,
                     &agent_id,
-                    intent_core::events::AGENT_MESSAGE,
-                    crate::agent_ops::agent_message_event_payload(
-                        &agent_id,
-                        &message,
-                        Some(entry.turn_id.as_str()),
-                    ),
+                    &message,
+                    Some(entry.turn_id.as_str()),
                 )
                 .await;
             // Answer intake (PROTOCOL §5.5, question hold): an answer that was
@@ -5606,7 +5660,7 @@ impl AgentManager {
     ///   back to the hard `stop` kill. Preemption is skipped instead and the
     ///   message queues keep-alive behind the starting turn (`queued: true`),
     ///   draining right after it — the agent is never killed.
-    pub async fn interrupt_send_message(
+    pub(crate) async fn interrupt_send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
@@ -6175,6 +6229,10 @@ impl AgentManager {
             worker.abort();
         }
         self.services.discard_pending_terminal_error(&agent_id);
+        // Retry is the clean-slate escape hatch for the truncation-redrive
+        // episode too (monorepo#2863): drop the streak and any stale arm.
+        self.services.clear_truncation_redrives(&agent_id);
+        self.services.take_truncation_redrive(&agent_id);
         self.release_in_flight_slot(&agent_id).await;
 
         // Tear down any stale child handle (use kill_child_only to avoid
@@ -6362,12 +6420,7 @@ impl AgentManager {
                 Ok(message) => {
                     self.services.invalidate_agent_list_cache(workspace_id);
                     self.services
-                        .publish_agent_mutation_event(
-                            workspace_id,
-                            agent_id,
-                            intent_core::events::AGENT_MESSAGE,
-                            crate::agent_ops::agent_message_event_payload(agent_id, &message, None),
-                        )
+                        .publish_agent_message_events(workspace_id, agent_id, &message, None)
                         .await;
                 }
                 Err(e) => {
@@ -8029,6 +8082,62 @@ async fn run_message_worker(
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;
+                        // Truncation auto-redrive (intent-hq/monorepo#2863):
+                        // `run_prompt_turn` classified this turn as suspected-
+                        // truncated on a delegated in-task agent, suppressed
+                        // its terminal `agent:idle`, and armed the one-shot
+                        // handoff flag — inject the system nudge as a NEW
+                        // persisted, user-visible turn on the same session,
+                        // mirroring the idle-timeout warning turn: the busy
+                        // slot stays held and the `continue` bypasses the
+                        // queue drain below, so queued messages cannot jump
+                        // ahead of the nudge. The nudge is a user-role row
+                        // tagged `{"type": "auto_redrive"}` so the transcript
+                        // stays attributable.
+                        if mgr.services.take_truncation_redrive(&agent_id) {
+                            tracing::warn!(
+                                agent = %agent_id,
+                                "suspected-truncated turn — injecting the auto-redrive nudge (monorepo#2863)"
+                            );
+                            let nudge = crate::harness::latest().truncation_redrive_nudge();
+                            let nudge_turn_id = new_message_id();
+                            let nudge_metadata = json!({ "type": "auto_redrive" });
+                            user_persisted = persist_user(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &nudge,
+                                None,
+                                None,
+                                Some(&nudge_metadata),
+                                Some(&nudge_turn_id),
+                            )
+                            .await;
+                            content = nudge;
+                            options = TurnOptions {
+                                turn_id: Some(nudge_turn_id),
+                                message_metadata: Some(nudge_metadata),
+                                ..TurnOptions::default()
+                            };
+                            // New message → fresh silent-redrive budget
+                            // (monorepo#764).
+                            silent_redrive_used = false;
+                            // Fail closed (#547): a nudge row that never
+                            // reached the transcript must not drive a turn.
+                            if !user_persisted {
+                                handle_drain_persist_failure(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &content,
+                                    &options,
+                                )
+                                .await;
+                                mgr.release_in_flight_slot(&agent_id).await;
+                                break 'outer;
+                            }
+                            continue 'outer;
+                        }
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
@@ -8903,7 +9012,9 @@ enum FlushPrep {
 /// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
 /// correlate with the single `agent:queue:processing`/`agent:stream:*`
 /// lifecycle (monorepo#1022 turn-correlation contract). Queue entries keep
-/// their own `turn_id`s (ids/messageMetadata/queueInfo are untouched).
+/// their own `turn_id`s and ids; the only metadata mutation beyond the
+/// single-drain annotations is the shared `queueInfo.batchId` grouping stamp
+/// ([`stamp_flush_batch_id`]) on every entry of the batch.
 ///
 /// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
 /// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
@@ -8942,6 +9053,10 @@ async fn prepare_flush_turn(
         annotate_dequeue_wait(entry);
         stale_flags.push(stale);
     }
+    // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
+    // when absent; the wait stamp never overwrites an existing one): every
+    // row persisted by this flush shares one fresh batchId.
+    stamp_flush_batch_id(&mut entries);
     // Delivery-time unblocked hints (monorepo#2044): all completion wakes in
     // this batch coalesce into ONE fresh delta, appended to the last
     // trigger-carrying entry. Runs before the row persists (same placement
@@ -9173,12 +9288,7 @@ async fn persist_user(
             .schedule_last_activity_event(workspace_id.clone());
     }
     mgr.services
-        .publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            intent_core::events::AGENT_MESSAGE,
-            crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
-        )
+        .publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
         .await;
     // Answer intake (PROTOCOL §5.5, question hold): same contract as the
     // direct-send persist — a `question_answers` tag naming the marked
@@ -9711,12 +9821,7 @@ async fn publish_error_status_and_requeue(
             Ok(message) => {
                 mgr.services.invalidate_agent_list_cache(workspace_id);
                 mgr.services
-                    .publish_agent_mutation_event(
-                        workspace_id,
-                        agent_id,
-                        intent_core::events::AGENT_MESSAGE,
-                        json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
-                    )
+                    .publish_agent_message_events(workspace_id, agent_id, &message, None)
                     .await;
             }
             Err(e) => {
@@ -9805,6 +9910,8 @@ async fn discard_failure_for_vanished_session(
     mgr.services.clear_failure_streak(agent_id);
     mgr.services.discard_pending_terminal_error(agent_id);
     mgr.services.clear_turn_silent_tail(agent_id);
+    mgr.services.clear_truncation_redrives(agent_id);
+    mgr.services.take_truncation_redrive(agent_id);
     true
 }
 
@@ -9898,7 +10005,9 @@ async fn handle_drain_persist_failure(
 
 /// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
 /// `agent_session.rs`): `Error::Internal(format!("session/prompt failed: {e}"))`.
-const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
+/// `pub(crate)` so the failure-wake identity guard (`lib.rs`, monorepo#2862)
+/// can reconstruct the persisted wrapper from a raw-text `agent:failed` emit.
+pub(crate) const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 
 /// The ACP cancellation surface inside the [`PROMPT_FAILED_PREFIX`] wrapper,
 /// if any. The structured `AcpError` is flattened to a string at the wrap
@@ -10092,6 +10201,16 @@ async fn handle_terminal_turn_failure(
     // Tear down the (likely dead) child so the retry path spawns fresh. Safe
     // from within the worker: only kills child/handle, no worker/busy touch.
     mgr.kill_child_only(agent_id).await;
+
+    // A stale truncation auto-redrive arm (monorepo#2863) must not survive a
+    // terminal failure: `run_prompt_turn` arms BEFORE the assistant-row
+    // flush, so a `?`-propagated store error after the arm lands here with
+    // the flag still set — a later plain `sendMessage` turn would consume it
+    // and inject a spurious nudge. The streak clears with it: the failed
+    // turn ends the stall episode, same terms as the stop/interrupt/retry/
+    // delete teardown sites.
+    mgr.services.take_truncation_redrive(agent_id);
+    mgr.services.clear_truncation_redrives(agent_id);
 
     let error_text = error.to_string();
     if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {

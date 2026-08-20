@@ -17,7 +17,7 @@ use crate::engine::{TranscribeRequest, Transcript, VoiceEngine};
 use crate::error::{Error, Result};
 
 /// Default OpenAI REST base URL.
-pub const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
+pub(crate) const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
 
 /// Default transcription model (the `voice.openai.model` catalog default).
 const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
@@ -25,7 +25,7 @@ const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
 const FALLBACK_MODEL: &str = "whisper-1";
 
 /// OpenAI implementation of [`VoiceEngine`].
-pub struct OpenAiEngine {
+pub(crate) struct OpenAiEngine {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.
     api_key: String,

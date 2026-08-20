@@ -15,9 +15,9 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
-    EventActor, NoteId, Result, SessionStats, TaskStatus, WorkspaceApi, WorkspaceId,
-    MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
+    ConversationProjection, Error, Event, EventActor, NoteId, Result, SessionStats, TaskStatus,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH, SLIM_PAGE_BUDGET_BYTES,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
@@ -1379,6 +1379,44 @@ pub(crate) fn agent_message_event_payload(
     payload
 }
 
+/// The `agent:last-message` event payload (PROTOCOL §6.5): the id-only
+/// `agent:message` echo enriched with the persisted preview projections the
+/// write just computed — derived from the appended row itself, no extra
+/// queries. A `user`/`assistant` row (by construction the session's newest
+/// such message) carries `lastMessageRole`/`lastMessageId` plus its
+/// role-specific preview: `lastAgentResponse` (assistant) or
+/// `lastUserMessage` (user), and `lastToolUse` (the
+/// [`intent_core::last_tool_use_preview`] of the row's content — present
+/// only when the row carries a `tool_use` block; its ABSENCE on a
+/// user/assistant echo means the session's `lastToolUse` is now cleared,
+/// matching the overwritten 0098 column). System (and other) rows keep the
+/// base echo shape — the preview columns were not touched, so no preview
+/// fields ride along. Every optional field is omitted (never `null`).
+pub(crate) fn agent_last_message_event_payload(
+    agent_id: &AgentId,
+    message: &AgentMessage,
+    turn_id: Option<&str>,
+) -> Value {
+    let mut payload = agent_message_event_payload(agent_id, message, turn_id);
+    if message.role != "user" && message.role != "assistant" {
+        return payload;
+    }
+    payload["lastMessageRole"] = json!(message.role);
+    payload["lastMessageId"] = json!(message.id);
+    let blocks = text_blocks(&message.content);
+    if message.role == "assistant" {
+        if let (Some(last_response), _) = last_response_and_digest_from_blocks(&blocks) {
+            payload["lastAgentResponse"] = json!(last_response);
+        }
+    } else if let Some(last_user) = user_text_from_blocks(&blocks) {
+        payload["lastUserMessage"] = json!(last_user);
+    }
+    if let Some(preview) = intent_core::last_tool_use_preview(&message.content) {
+        payload["lastToolUse"] = preview;
+    }
+    payload
+}
+
 /// Whether a wire `priority` requests interrupt delivery (PROTOCOL §5.5):
 /// `"interrupt"` preempts the in-flight turn keep-alive; anything else (or
 /// absent) is normal queue-vs-stream delivery.
@@ -1648,8 +1686,9 @@ fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
     let last_user = last_user_message(&session.messages);
     let (last_role, last_id) = last_message_role_and_id(&session.messages);
+    let last_tool_use = last_tool_use_from_messages(&session.messages);
     let count = session.messages.len() as u64;
-    AgentLite::from_session(
+    let mut lite = AgentLite::from_session(
         session,
         count,
         last_response,
@@ -1657,7 +1696,23 @@ fn project_lite(session: AgentSession) -> AgentLite {
         digest,
         last_role,
         last_id,
-    )
+    );
+    lite.last_tool_use = last_tool_use;
+    lite
+}
+
+/// Derive `lastToolUse` from a loaded transcript: the newest
+/// `user`/`assistant` message's last `tool_use` block preview — the same
+/// [`intent_core::last_tool_use_preview`] the write path persists into the
+/// 0098 column, so this loaded-transcript path and the projection paths
+/// (which serve the persisted column) agree. `None` when that message
+/// carries no `tool_use` block or no user/assistant message exists.
+fn last_tool_use_from_messages(messages: &[AgentMessage]) -> Option<Value> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user" || m.role == "assistant")
+        .and_then(|m| intent_core::last_tool_use_preview(&m.content))
 }
 
 /// Derive `lastMessageRole`/`lastMessageId` from a loaded transcript: the
@@ -1696,7 +1751,7 @@ fn project_lite_from_projection(
         .last_user_text_blocks
         .as_deref()
         .and_then(user_text_from_blocks);
-    AgentLite::from_session(
+    let mut lite = AgentLite::from_session(
         session,
         projection.message_count,
         last_response,
@@ -1704,7 +1759,9 @@ fn project_lite_from_projection(
         digest,
         projection.last_message_role.clone(),
         projection.last_message_id.clone(),
-    )
+    );
+    lite.last_tool_use = projection.last_tool_use.clone();
+    lite
 }
 
 /// Whether `blocks` contains a `tool_use` block with no matching `tool_result`
@@ -1801,6 +1858,19 @@ fn stamp_synthetic_block_ids(mut message: AgentMessage) -> AgentMessage {
     message
 }
 
+/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
+/// `projection: "slim"`) to one served message. The block bounding itself
+/// lives in [`crate::tool_block::slim_message_blocks`], shared with the live
+/// `chat.subscribe` stream so deltas and snapshots agree byte-for-byte. Runs
+/// AFTER [`stamp_synthetic_block_ids`] so the flags land on the final served
+/// block identity.
+fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) -> AgentMessage {
+    if let Some(blocks) = message.content.as_array_mut() {
+        crate::tool_block::slim_message_blocks(blocks, thumbnails);
+    }
+    message
+}
+
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
     /// the runtime manager's busy set. Only the small busy set reaches SQLite,
@@ -1851,6 +1921,13 @@ impl Services {
     /// a fixed number of store queries regardless of session count, and no
     /// message row beyond each session's newest user/assistant pair is ever
     /// fetched or decoded — full transcripts are never hydrated.
+    ///
+    /// List-payload cost contract (monorepo#2932): `metadata.initialMessage`
+    /// — the full spawn-time first message, the single largest per-session
+    /// field on real workspaces — is detail-only (no list-context consumer)
+    /// and is OMITTED from every row here; `agent.get` / `agent.getSession`
+    /// still serve it. Keeps a ~100-session response well under the 1 MiB
+    /// outbound frame warn threshold.
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
         let sessions = self
             .store
@@ -1881,6 +1958,9 @@ impl Services {
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
                 lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
+                // monorepo#2932: detail-only — omitted from list rows (see
+                // the doc comment above); `agent.get` still serves it.
+                lite.metadata.initial_message = None;
                 lite
             })
             .collect())
@@ -2239,6 +2319,19 @@ impl Services {
     /// cursor, so older continuation is ordinary paging. Absent both params
     /// (and any seek-minted forward token), the response is byte-identical
     /// to before — no `prevToken` key is added.
+    ///
+    /// Slim page budget (§5.5): under `projection: "slim"` the served page is
+    /// additionally bounded by [`SLIM_PAGE_BUDGET_BYTES`] total serialized
+    /// bytes — `limit` counts messages, but a message can carry hundreds of
+    /// (individually capped) blocks, so a message-counted slim page could
+    /// still serialize to multiple MB. The trim keeps the page's anchor end
+    /// (newest for legacy backward pages, oldest for forward continuations,
+    /// the target for seek pages — always at least one message) and re-mints
+    /// the continuation cursor(s) at the first excluded row, so existing
+    /// token loops resume seamlessly with more round-trips. `totalMessages`
+    /// / `truncated` semantics are unchanged (transcript-wide, not
+    /// page-length). Full (absent-projection) reads are never budgeted.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -2247,6 +2340,7 @@ impl Services {
         page_token: Option<String>,
         around_message_id: Option<String>,
         around_index: Option<i64>,
+        projection: Option<ConversationProjection>,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -2272,36 +2366,46 @@ impl Services {
         // the legacy backward contract applies unchanged. `prev_token` is
         // `Some(..)` only on seek/forward pages — the legacy path never adds
         // the `prevToken` key, keeping absent-param responses byte-identical.
+        // The slim page budget's admission anchor mirrors the direction the
+        // page's consumer walks (see `budget_page`): legacy backward pages
+        // keep the newest suffix, forward continuations keep the oldest
+        // prefix, seek pages keep the target and grow outward. Tracked here
+        // (as a global target index for seeks) so a budget trim below can
+        // re-mint the right cursor(s).
+        let mut slim_anchor = crate::pagination::BudgetAnchor::Newest;
         let seek_win = if let Some(mid) = around_message_id {
             let index = self
                 .store
                 .get_agent_message_index(&agent_id, &mid)
                 .await?
                 .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {mid}")))?;
-            Some(crate::pagination::page_window_around(
-                total,
-                limit,
-                index.max(0) as usize,
-            ))
+            let index = index.max(0) as usize;
+            slim_anchor = crate::pagination::BudgetAnchor::Target(index);
+            Some(crate::pagination::page_window_around(total, limit, index))
         } else if let Some(idx) = around_index {
             // Ordinal seek: clamp into [0, total - 1] — client estimates are
             // approximate, so an overshooting index lands on the newest page
             // instead of erroring (negatives were rejected at the boundary).
             let clamped = (idx.max(0) as usize).min(total.saturating_sub(1));
+            slim_anchor = crate::pagination::BudgetAnchor::Target(clamped);
             Some(crate::pagination::page_window_around(total, limit, clamped))
         } else {
-            page_token
+            let w = page_token
                 .as_deref()
-                .and_then(|t| crate::pagination::forward_page_window(total, limit, t))
+                .and_then(|t| crate::pagination::forward_page_window(total, limit, t));
+            if w.is_some() {
+                slim_anchor = crate::pagination::BudgetAnchor::Oldest;
+            }
+            w
         };
-        let (start, end, next_token, prev_token) = match seek_win {
+        let (start, end, mut next_token, mut prev_token) = match seek_win {
             Some(w) => (w.start, w.end, w.next_token, Some(w.prev_token)),
             None => {
                 let w = crate::pagination::page_window(total, limit, page_token.as_deref());
                 (w.start, w.end, w.next_token, None)
             }
         };
-        let page: Vec<AgentMessage> = self
+        let mut page: Vec<AgentMessage> = self
             .store
             .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
             .await?
@@ -2309,6 +2413,53 @@ impl Services {
             .map(strip_anonymous_tool_blocks)
             .map(stamp_synthetic_block_ids)
             .collect();
+        if projection == Some(ConversationProjection::Slim) {
+            // One bounded thumbnails read sized by the page (RPC cost
+            // contract: O(rows returned); the common all-text page selects
+            // nothing). Absent-projection reads never reach here, keeping
+            // them byte-identical to before.
+            let ids: Vec<String> = page.iter().map(|m| m.id.clone()).collect();
+            let thumbnails = self
+                .store
+                .get_agent_message_thumbnails(&agent_id, &ids)
+                .await?;
+            page = page
+                .into_iter()
+                .map(|m| {
+                    let thumbs = thumbnails.get(&m.id);
+                    apply_slim_projection(m, thumbs)
+                })
+                .collect();
+            // Page byte budget (§5.5): the per-block bound above caps each
+            // body, but `limit` counts messages and a message can carry
+            // hundreds of blocks, so a slim page could still serialize to
+            // multiple MB. Trim the page to `SLIM_PAGE_BUDGET_BYTES` from
+            // its anchor (the anchor row always serves, so a single
+            // over-budget message still pages through) and re-mint the
+            // continuation cursor(s) at the first excluded row, so existing
+            // `nextToken`/`prevToken` loops resume with no gaps or
+            // duplicates — they just make more round-trips. The full
+            // (absent-projection) read never reaches here.
+            let anchor = match slim_anchor {
+                crate::pagination::BudgetAnchor::Target(global) => {
+                    crate::pagination::BudgetAnchor::Target(global.saturating_sub(start))
+                }
+                other => other,
+            };
+            let sizes: Vec<usize> = page
+                .iter()
+                .map(crate::pagination::serialized_size)
+                .collect();
+            let (lo, hi) = crate::pagination::budget_page(&sizes, anchor, SLIM_PAGE_BUDGET_BYTES);
+            if (lo, hi) != (0, page.len()) {
+                page.truncate(hi);
+                page.drain(..lo);
+                next_token = crate::pagination::remint_backward_token(start + lo);
+                if prev_token.is_some() {
+                    prev_token = Some(crate::pagination::remint_forward_token(start + hi, total));
+                }
+            }
+        }
         let mut result = json!({
             "agentId": agent_id,
             "messages": page,
@@ -2325,6 +2476,62 @@ impl Services {
                 .insert("prevToken".to_string(), json!(prev));
         }
         Ok(result)
+    }
+
+    /// `agent.getMessageBlock` (PROTOCOL §5.5): one FULL content block of one
+    /// persisted message, by block id — the on-demand counterpart of the slim
+    /// conversation projection. The row is served through the same
+    /// [`strip_anonymous_tool_blocks`] + [`stamp_synthetic_block_ids`] passes
+    /// as `agent.getConversation` (NEVER the slim bounding), so block identity
+    /// matches the served conversation byte-for-byte — persisted assistant ids
+    /// and serve-time synthetic `{messageId}:{index}` ids both resolve — and
+    /// the returned block is always the full, unprojected body. Bounded cost
+    /// (RPC cost contract): a metadata-only session read plus ONE primary-key
+    /// message row read; the transcript is never hydrated.
+    ///
+    /// Frame-size note: a block whose serialized response exceeds the
+    /// transport's 40 MiB outbound frame cap (`MAX_OUTBOUND_MESSAGE_BYTES`)
+    /// surfaces as the standard `-32010` oversized-response error naming
+    /// `responseBytes` and the limit — explicit, not a hang. Such a block is
+    /// rare by construction (the matching inbound cap bounds what clients can
+    /// persist; base64 attachments top out ~33.4 MiB) and is equally
+    /// unservable via unprojected `agent.getConversation`, where it takes the
+    /// whole page down rather than just itself. The slim flags
+    /// (`inputBytes`/`outputBytes`/`dataBytes`) carry the full body size, so
+    /// a client can predict the fetch size before calling.
+    pub(crate) async fn agent_get_message_block_op(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        // Metadata-only scope check — same fail-closed contract as
+        // `agent_get_conversation_op`: a cross-workspace mismatch is
+        // `NotFound`, indistinguishable from an unknown agent.
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let message = self
+            .store
+            .get_agent_message_by_id(&agent_id, &message_id)
+            .await?
+            .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {message_id}")))?;
+        let message = stamp_synthetic_block_ids(strip_anonymous_tool_blocks(message));
+        let block = message
+            .content
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b.get("id").and_then(Value::as_str) == Some(block_id.as_str()))
+            })
+            .cloned()
+            .ok_or_else(|| Error::InvalidParams(format!("unknown block id: {block_id}")))?;
+        Ok(json!({ "block": block }))
     }
 
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
@@ -2350,6 +2557,36 @@ impl Services {
                 metadata: None,
                 data,
             },
+        )
+        .await;
+    }
+
+    /// Publish the persisted-row event pair (PROTOCOL §6.5): the lean
+    /// `agent:message` echo followed by the content-bearing
+    /// `agent:last-message` companion — every transcript persist emits both,
+    /// so clients that only know the old echo are untouched while preview
+    /// consumers converge with zero follow-up RPCs. Payloads derive from the
+    /// appended row itself ([`agent_message_event_payload`] /
+    /// [`agent_last_message_event_payload`]); no extra queries.
+    pub(crate) async fn publish_agent_message_events(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message: &AgentMessage,
+        turn_id: Option<&str>,
+    ) {
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            agent_message_event_payload(agent_id, message, turn_id),
+        )
+        .await;
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            intent_core::events::AGENT_LAST_MESSAGE,
+            agent_last_message_event_payload(agent_id, message, turn_id),
         )
         .await;
     }
@@ -3027,17 +3264,20 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
-        // Capture the workspace before deleting so the post-delete agent:deleted
-        // emit can be workspace-scoped. If the session is already gone, skip the
-        // emit gracefully rather than failing the idempotent delete. When the
-        // caller declares a workspace, reject a cross-workspace bare-id probe
-        // by mapping to `NotFound` before touching the store.
-        let session_workspace_id = self
+        // Capture the workspace (and name, for the event's `agentName`
+        // enrichment — intent-hq/monorepo#2869) before deleting so the
+        // post-delete agent:deleted emit can be workspace-scoped. If the
+        // session is already gone, skip the emit gracefully rather than
+        // failing the idempotent delete. When the caller declares a
+        // workspace, reject a cross-workspace bare-id probe by mapping to
+        // `NotFound` before touching the store.
+        let session_meta = self
             .store
             .get_agent_session(&agent_id)
             .await
             .ok()
-            .map(|s| s.workspace_id);
+            .map(|s| (s.workspace_id, s.name));
+        let session_workspace_id = session_meta.as_ref().map(|(ws, _)| ws.clone());
         if let (Some(ws), Some(session_ws)) = (workspace_id.as_ref(), session_workspace_id.as_ref())
         {
             if session_ws != ws {
@@ -3065,8 +3305,11 @@ impl Services {
             .remove(&agent_id);
         // Silent-tail record (intent-hq/monorepo#2669): in-memory, keyed by
         // agent — drop it with the session so the map never leaks entries
-        // for deleted agents.
+        // for deleted agents. The truncation-redrive counter and handoff
+        // flag (monorepo#2863) are dropped on the same terms.
         self.clear_turn_silent_tail(&agent_id);
+        self.clear_truncation_redrives(&agent_id);
+        self.take_truncation_redrive(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
@@ -3079,7 +3322,7 @@ impl Services {
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;
-        if let Some(workspace_id) = session_workspace_id {
+        if let Some((workspace_id, agent_name)) = session_meta {
             crate::publish_event(
                 &self.event_bus,
                 intent_store::NewEvent {
@@ -3091,7 +3334,7 @@ impl Services {
                     correlation_id: None,
                     parent_event_id: None,
                     metadata: None,
-                    data: json!({ "agentId": agent_id.0 }),
+                    data: json!({ "agentId": agent_id.0, "agentName": agent_name }),
                 },
             )
             .await;
@@ -3511,13 +3754,8 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
-        self.publish_agent_mutation_event(
-            &session.workspace_id,
-            &agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(&agent_id, &message, None),
-        )
-        .await;
+        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+            .await;
         // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
         // as the turn-end and user-send persists: an appended assistant row
         // bearing question blocks arms the pending marker, an appended user
@@ -4194,14 +4432,9 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                // Publish agent:message event using the store-returned message id.
-                self.publish_agent_mutation_event(
-                    &session.workspace_id,
-                    &agent_id,
-                    AGENT_MESSAGE,
-                    agent_message_event_payload(&agent_id, &message, None),
-                )
-                .await;
+                // Publish agent:message events using the store-returned message id.
+                self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+                    .await;
                 // Answer intake (PROTOCOL §5.5, question hold): parity with
                 // the runtime `AgentManager::send_message` persist — a
                 // `question_answers` tag naming the marked assistant message
@@ -4352,14 +4585,9 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
-        // Publish agent:message event using the store-returned message id.
-        self.publish_agent_mutation_event(
-            &session.workspace_id,
-            &agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(&agent_id, &message, None),
-        )
-        .await;
+        // Publish agent:message events using the store-returned message id.
+        self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
+            .await;
         // Answer intake (PROTOCOL §5.5, question hold): parity with the
         // runtime `send_queued_message_now` persist — only a matching answer
         // tag clears the marker, and only that clear can retire the
@@ -5216,15 +5444,22 @@ impl Services {
                 }]
             });
             // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
-            // the reporting child's linked task-note id so the delivery path
-            // can compute the "tasks now unblocked" section fresh at render
-            // time. Only the triggering fact is stored here.
+            // the reporting child's linked task-note id plus its recorded
+            // flipped completions (consumed here — this report wake is the
+            // completion cycle's one wake, since it disarms the idle-time
+            // delivery) so the delivery path can compute the "tasks now
+            // unblocked" section fresh at render time. Only the triggering
+            // facts are stored here.
+            let mut trigger_tasks: Vec<(String, String)> = Vec::new();
             if let Some(note_id) = &task_note_id {
-                ready_delta::stamp_trigger_tasks(
-                    &mut metadata,
-                    &[(workspace_id.0.clone(), note_id.0.clone())],
-                );
+                trigger_tasks.push((workspace_id.0.clone(), note_id.0.clone()));
             }
+            for pair in self.take_flipped_completion_triggers(&caller).await {
+                if !trigger_tasks.contains(&pair) {
+                    trigger_tasks.push(pair);
+                }
+            }
+            ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             // Machine-readable disarm flag (monorepo#2060 parity, the
             // `hookStillActive` twin): present iff this call flipped a watch;
             // omitted entirely when nothing was disarmed.
@@ -5232,16 +5467,50 @@ impl Services {
                 metadata["watchStillArmed"] = json!(false);
             }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
-            if let Err(e) = self
+            match self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
                 .await
             {
-                tracing::warn!(
-                    error = %e,
-                    parent = %parent.0,
-                    child = %caller.0,
-                    "failed to deliver reportToParent wake to parent"
-                );
+                Ok(_) => {
+                    // monorepo#2889: the parent just heard THIS report cycle —
+                    // record its identity (the report timestamp, the same
+                    // #2842 identity) in the per-pair delivery marker so the
+                    // same cycle's completion wake cannot re-embed the report
+                    // body. The `report_delivered` watch flag alone does not
+                    // survive the cycle: every re-arm path (agent.watch
+                    // adoption, SUB-1 sender auto-subscribe, watch reuse)
+                    // clears it as fresh interest (monorepo#2532), and a
+                    // parent with NO watch at report time still receives this
+                    // wake. The marker skip in
+                    // `deliver_completion_to_watches` leaves the watch ARMED,
+                    // so a re-armed watch still fires on a FUTURE cycle (new
+                    // timestamp). Grouped children never reach here (their
+                    // report defers to the aggregated wake), and a failed
+                    // send records nothing (the parent never heard the
+                    // report, so the completion wake must still carry it).
+                    // Best-effort: a write failure only restores the pre-fix
+                    // duplicate for this cycle.
+                    if let Err(e) = self
+                        .store
+                        .record_completion_wake_delivery(&parent, &caller, &saved_at, &now_iso())
+                        .await
+                    {
+                        tracing::warn!(
+                            parent = %parent.0,
+                            child = %caller.0,
+                            error = %e,
+                            "completion wake dedup record failed at reportToParent delivery"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        parent = %parent.0,
+                        child = %caller.0,
+                        "failed to deliver reportToParent wake to parent"
+                    );
+                }
             }
             // Marking flips the parent's waiting projection (report_delivered
             // watches are excluded), so publish the refreshed flags in the
@@ -5462,13 +5731,8 @@ impl Services {
         {
             Ok(message) => {
                 self.invalidate_agent_list_cache(&workspace_id);
-                self.publish_agent_mutation_event(
-                    &workspace_id,
-                    &caller,
-                    intent_core::events::AGENT_MESSAGE,
-                    json!({ "agentId": caller.0, "messageId": message.id, "role": "system" }),
-                )
-                .await;
+                self.publish_agent_message_events(&workspace_id, &caller, &message, None)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -6897,6 +7161,84 @@ impl Services {
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
+    /// The explicit-registration idle-target guard (monorepo#2972): a
+    /// RuntimeIdle target with NO waiting reason — nothing pending that
+    /// could ever produce a "next completion" — is rejected, because
+    /// accepting it either fires an instant synthetic wake replaying the
+    /// stale report (settled shape) or leaves a permanently-armed dead
+    /// watch (unsettled shape). Waiting reasons that keep the target
+    /// watchable: a ready-to-send queue entry or a busy worker (about to
+    /// run), an unresolved attention request (runs when the user answers),
+    /// pending structured questions (same parked-on-user-input shape),
+    /// live outgoing completion watches (runs when a watched target
+    /// settles), live event subscriptions (matching events wake it — same
+    /// accept-and-defer shape as hooks), an interrupted row (the resume
+    /// sweep re-runs it), active hooks, or active PR monitors (both wake
+    /// it on fire — the monorepo#2532 Gap B accept-and-defer shape).
+    /// Applied ONLY by the explicit registration ops (`agent.watch` /
+    /// `app.agents.waitFor`) and only AFTER the `check_watch_scope` gate:
+    /// out-of-scope targets must keep failing on scope alone, so the guard
+    /// cannot leak a foreign agent's idle/nothing-pending state.
+    /// Auto-subscribe paths pair the watch with a message that wakes the
+    /// target, and boot rehydration must keep delivering missed wakes.
+    /// Store probes fail open (accept): a false accept only reproduces the
+    /// pre-guard behavior, a false reject would block a legitimate watch.
+    async fn check_idle_target_watchable(&self, target_session: &AgentSession) -> Result<()> {
+        if !matches!(target_session.status, AgentStatus::RuntimeIdle) {
+            return Ok(());
+        }
+        let target_id = &target_session.id;
+        if self.has_ready_to_send(target_id)
+            || self.agent_is_busy(target_id.clone())
+            || target_session.attention_request_kind.is_some()
+            || self.agent_is_waiting_on_agents(target_id)
+            || !self
+                .list_event_subscriptions_for_agent(target_id)
+                .is_empty()
+            || self.pending_question_count(target_id).await > 0
+        {
+            return Ok(());
+        }
+        match self.store.get_interrupted_agent(target_id).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "idle-target watch guard: interrupted_agent check failed for {}: {e}",
+                    target_id.0
+                );
+                return Ok(());
+            }
+        }
+        match self.store.count_active_hooks_by_agent(target_id).await {
+            Ok(0) => {}
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "idle-target watch guard: active-hook count failed for {}: {e}",
+                    target_id.0
+                );
+                return Ok(());
+            }
+        }
+        if !self
+            .active_pr_monitors_for_agent(target_id)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        Err(Error::InvalidParams(format!(
+            "agent {} is idle with nothing pending (no active hooks, no PR monitors, \
+             no event subscriptions, no queued messages, no outgoing waits, no \
+             unresolved attention request or pending questions, no interrupted turn) — \
+             it has no future completion to watch. Wake it instead: agent.send \
+             delivers a message and auto-arms a completion watch on the sender, or \
+             agent.wakeOrCreate resumes its task",
+            target_id.0
+        )))
+    }
+
     /// `agent.watch` (monorepo#1229): explicit caller→target subscription to
     /// the target's harness-curated completion set — idle/completed, failed,
     /// deleted, blocker raised, discussion requested. Unlike the
@@ -6905,7 +7247,9 @@ impl Services {
     /// `agent_request_attention_op` wakes it). The registration is durably
     /// persisted before returning. Fails closed on a nonexistent target and
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
-    /// cross-workspace targets for non-chief callers.
+    /// cross-workspace targets for non-chief callers, and the idle-target
+    /// guard (monorepo#2972, [`Services::check_idle_target_watchable`])
+    /// rejects a RuntimeIdle target with no waiting reason.
     pub(crate) async fn agent_watch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -6929,6 +7273,15 @@ impl Services {
         // `agent_watch_completion_op`.
         let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
         let caller_home_ws = resolved_home.unwrap_or_else(|| workspace_id.clone());
+        // Scope gate BEFORE the idle-target guard: an out-of-scope target
+        // must fail on scope alone, so the guard cannot leak a foreign
+        // agent's idle/nothing-pending state. (`register_agent_watch_durable`
+        // re-checks the same gate as the single-registration-path backstop.)
+        crate::agent_subscriptions::check_watch_scope(
+            &caller_home_ws,
+            &target_session.workspace_id,
+        )?;
+        self.check_idle_target_watchable(&target_session).await?;
         let target_ws = target_session.workspace_id;
         let id = self
             .register_agent_watch_durable(
@@ -7122,7 +7475,13 @@ impl Services {
                     target.0
                 )));
             }
+            // Scope gate FIRST: an out-of-scope target must fail on scope
+            // alone, so the idle-target guard below cannot leak a foreign
+            // agent's idle/nothing-pending state.
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            // Idle-target guard (monorepo#2972): same up-front validation
+            // loop as the scope gate, so a rejection is side-effect free.
+            self.check_idle_target_watchable(&session).await?;
             // Pair uniqueness: an explicit registration on a child the caller
             // ALREADY watches (ungrouped or grouped) is rejected
             // up front — before any side-effectful registration — instead of
@@ -9242,16 +9601,11 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(workspace_id.clone());
         }
-        // Publish agent:message event using the store-returned message id.
+        // Publish agent:message events using the store-returned message id.
         // Wake deliveries carry no user retry record, so no turnId (spec
         // non-goal — the worker still mints one internally at spawn).
-        self.publish_agent_mutation_event(
-            workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            agent_message_event_payload(agent_id, &message, None),
-        )
-        .await;
+        self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+            .await;
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
@@ -9339,14 +9693,9 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                // Publish agent:message event using the store-returned message id.
-                self.publish_agent_mutation_event(
-                    workspace_id,
-                    agent_id,
-                    AGENT_MESSAGE,
-                    agent_message_event_payload(agent_id, &message, None),
-                )
-                .await;
+                // Publish agent:message events using the store-returned message id.
+                self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -10907,13 +11256,8 @@ impl Services {
             self.invalidate_agent_list_cache(&workspace_id);
 
             // Emit agent:message + agent:updated so live UIs render the marker.
-            self.publish_agent_mutation_event(
-                &workspace_id,
-                agent_id,
-                AGENT_MESSAGE,
-                json!({ "agentId": agent_id.0, "messageId": marker.id, "role": "system" }),
-            )
-            .await;
+            self.publish_agent_message_events(&workspace_id, agent_id, &marker, None)
+                .await;
             self.publish_agent_mutation_event(
                 &workspace_id,
                 agent_id,
@@ -11070,7 +11414,10 @@ impl Services {
                             correlation_id: None,
                             parent_event_id: None,
                             metadata: None,
-                            data: json!({ "agentId": agent_id.0 }),
+                            data: json!({
+                                "agentId": agent_id.0,
+                                "agentName": session.name.clone(),
+                            }),
                         };
                         self.record_group_child_completion(
                             &group.group_id,
@@ -11111,14 +11458,9 @@ impl Services {
             )));
         }
 
-        // Emit agent:message event so live UIs see the new message
-        self.publish_agent_mutation_event(
-            &workspace_id,
-            agent_id,
-            AGENT_MESSAGE,
-            json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
-        )
-        .await;
+        // Emit agent:message events so live UIs see the new message
+        self.publish_agent_message_events(&workspace_id, agent_id, &message, None)
+            .await;
 
         Ok(())
     }

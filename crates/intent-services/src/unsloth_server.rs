@@ -122,7 +122,7 @@ const UNSLOTH_INSTALL_HINT: &str =
 /// transitions the user should notice (e.g. a model switch restarting the
 /// server out from under live agents).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusLevel {
+pub(crate) enum StatusLevel {
     Info,
     Warning,
 }
@@ -141,7 +141,7 @@ impl StatusLevel {
 /// ("starting server", "downloading/loading model…") plus a severity the
 /// caller surfaces to the user (e.g. as `agent:stream:status` events with
 /// the matching `level`).
-pub type StatusCallback = dyn Fn(StatusLevel, String) + Send + Sync;
+pub(crate) type StatusCallback = dyn Fn(StatusLevel, String) + Send + Sync;
 
 /// The error for a missing `unsloth` binary (graceful degradation: the
 /// provider is unavailable with a clear install message). `InvalidInput`
@@ -350,7 +350,7 @@ pub(crate) fn best_fitting_quant(
 /// RPC. Constructed by [`UnslothServerManager::status_snapshot`]; `None`
 /// from that method means no server is running.
 #[derive(Debug, Clone)]
-pub struct UnslothStatus {
+pub(crate) struct UnslothStatus {
     /// Full HF repo id currently served (or being started).
     pub repo_id: String,
     /// Port the server actually listens on — may differ from the configured
@@ -642,7 +642,7 @@ impl Default for UnslothConfig {
 /// on the [`crate::agent_manager::AgentManager`]; the async mutex serializes
 /// concurrent unsloth-agent spawns so exactly one start/restart runs at a
 /// time (the second spawner reuses the endpoint the first one produced).
-pub struct UnslothServerManager {
+pub(crate) struct UnslothServerManager {
     state: TokioMutex<Option<ManagedServer>>,
     config: UnslothConfig,
     /// Quant variants already selected this daemon lifetime, keyed by repo
@@ -740,7 +740,7 @@ impl UnslothServerManager {
     /// (`unsloth` spawns `llama-server` as a child holding the model
     /// weights) — best-effort: a sampling failure yields zeros rather than
     /// failing the whole snapshot.
-    pub async fn status_snapshot(&self) -> Option<UnslothStatus> {
+    pub(crate) async fn status_snapshot(&self) -> Option<UnslothStatus> {
         let identity = lock_ignore_poison(&self.identity).clone()?;
         if let Some(pid) = identity.pid {
             if !pid_is_alive(pid) {

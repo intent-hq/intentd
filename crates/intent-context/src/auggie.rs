@@ -219,14 +219,18 @@ fn build_command(auggie_path: &Path, args: &[&str]) -> Command {
 }
 
 /// True when `output` looks like an auth/login failure (§8.2).
-pub fn is_auth_failure(output: &str) -> bool {
+pub(crate) fn is_auth_failure(output: &str) -> bool {
     let lower = output.to_lowercase();
     AUTH_FAILURE_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 /// Classify the `--version` probe output into an [`EngineAvailability`] (§8.2):
 /// auth-failure patterns become a non-error "needs login" `Unavailable`.
-pub fn classify_availability(stdout: &str, stderr: &str, success: bool) -> EngineAvailability {
+pub(crate) fn classify_availability(
+    stdout: &str,
+    stderr: &str,
+    success: bool,
+) -> EngineAvailability {
     let combined = format!("{stdout}\n{stderr}");
     if is_auth_failure(&combined) {
         return EngineAvailability::Unavailable {

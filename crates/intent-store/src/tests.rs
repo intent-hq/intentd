@@ -100,7 +100,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
         ]
     );
     assert_eq!(
@@ -110,7 +110,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
         ]
     );
 }
@@ -6169,4 +6169,150 @@ async fn hook_load_active_and_delete() {
     let active = store.load_active_hooks().await.expect("reload active");
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].hook_id.0, "hook-run");
+}
+
+/// Agent-flipped completion rows: dedup by primary key, oldest-first eviction
+/// at the per-agent cap, cross-agent removal by task, and survival across a
+/// store reopen (daemon restart).
+#[tokio::test]
+async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_a = AgentId::from("agent-flip-a");
+    let agent_b = AgentId::from("agent-flip-b");
+    for id in [&agent_a, &agent_b] {
+        store
+            .insert_agent_session(&sample_agent_session(id, &ws))
+            .await
+            .expect("insert session");
+    }
+
+    // Dedup: re-recording the same pair keeps one row.
+    let first = NoteId::from("task-first");
+    store
+        .record_agent_flipped_completion(&agent_a, &ws, &first, "2026-01-01T00:00:00Z")
+        .await
+        .expect("record");
+    store
+        .record_agent_flipped_completion(&agent_a, &ws, &first, "2026-01-01T00:00:01Z")
+        .await
+        .expect("re-record");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent_a)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), first.clone())]
+    );
+
+    // Cap: recording CAP more pairs evicts the oldest (`first`), leaving
+    // exactly CAP rows with the newest present.
+    for i in 0..crate::AGENT_FLIPPED_COMPLETIONS_CAP {
+        store
+            .record_agent_flipped_completion(
+                &agent_a,
+                &ws,
+                &NoteId::from(format!("task-{i:02}")),
+                &format!("2026-01-01T00:01:{i:02}Z"),
+            )
+            .await
+            .expect("record capped");
+    }
+    let listed = store
+        .list_agent_flipped_completions(&agent_a)
+        .await
+        .expect("list capped");
+    assert_eq!(listed.len(), crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize);
+    assert!(
+        !listed.iter().any(|(_, n)| n == &first),
+        "oldest row evicted at the cap"
+    );
+    assert_eq!(listed.last().unwrap().1, NoteId::from("task-49"));
+
+    // Removal by task deletes the pair for EVERY recording agent.
+    let shared = NoteId::from("task-00");
+    store
+        .record_agent_flipped_completion(&agent_b, &ws, &shared, "2026-01-01T00:02:00Z")
+        .await
+        .expect("record b");
+    store
+        .remove_agent_flipped_completions_for_task(&ws, &shared)
+        .await
+        .expect("remove");
+    assert!(!store
+        .list_agent_flipped_completions(&agent_a)
+        .await
+        .expect("list a")
+        .iter()
+        .any(|(_, n)| n == &shared));
+    assert!(store
+        .list_agent_flipped_completions(&agent_b)
+        .await
+        .expect("list b")
+        .is_empty());
+
+    // Reopen the store from the same path: rows persist across a restart.
+    drop(store);
+    let reopened = Store::open(&tmp.path).await.expect("reopen store");
+    let listed = reopened
+        .list_agent_flipped_completions(&agent_a)
+        .await
+        .expect("list after reopen");
+    assert_eq!(
+        listed.len(),
+        crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize - 1
+    );
+
+    // Take (consume-on-stamp read): returns the rows oldest-first and
+    // clears them — a second take is empty. Empty take is a no-op.
+    let taken = reopened
+        .take_agent_flipped_completions(&agent_a)
+        .await
+        .expect("take");
+    assert_eq!(taken, listed);
+    assert!(reopened
+        .list_agent_flipped_completions(&agent_a)
+        .await
+        .expect("list after take")
+        .is_empty());
+    assert!(reopened
+        .take_agent_flipped_completions(&agent_a)
+        .await
+        .expect("second take")
+        .is_empty());
+
+    // Deleting the recording agent's session cascades its flip rows via the
+    // FK; other agents' rows are untouched.
+    for (agent, note) in [(&agent_a, "task-keep"), (&agent_b, "task-doomed")] {
+        reopened
+            .record_agent_flipped_completion(
+                agent,
+                &ws,
+                &NoteId::from(note),
+                "2026-01-01T00:03:00Z",
+            )
+            .await
+            .expect("record for cascade");
+    }
+    assert!(reopened
+        .delete_agent_session(&ws, &agent_b)
+        .await
+        .expect("delete session"));
+    assert!(reopened
+        .list_agent_flipped_completions(&agent_b)
+        .await
+        .expect("list b after cascade")
+        .is_empty());
+    assert_eq!(
+        reopened
+            .list_agent_flipped_completions(&agent_a)
+            .await
+            .expect("list a after cascade"),
+        vec![(ws.clone(), NoteId::from("task-keep"))]
+    );
 }

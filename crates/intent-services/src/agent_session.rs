@@ -133,7 +133,7 @@ fn transport_closed_error(err: &AcpError) -> bool {
 /// only from `availableModes` rather than blindly asking for a mode the agent
 /// never offered.
 #[derive(Debug, Clone)]
-pub struct AcpSessionOpened {
+pub(crate) struct AcpSessionOpened {
     /// The canonical `acpSessionId` to drive future turns.
     pub session_id: String,
     /// The modes the provider advertised in `session/new` / `session/load`, if
@@ -156,7 +156,7 @@ pub struct AcpSessionOpened {
 /// `reasoning_effort` for codex-acp), so discovery keys on the CATEGORY and
 /// carries the adapter's own id for the `session/set_config_option` call.
 #[derive(Debug, Clone)]
-pub struct ThoughtLevelOption {
+pub(crate) struct ThoughtLevelOption {
     /// The adapter's config id, sent as `configId`.
     pub config_id: String,
     /// The value the adapter reported as current at session open — the
@@ -177,7 +177,7 @@ impl ThoughtLevelOption {
     /// sentinel (claude-agent-acp lists it alongside the real levels; it is a
     /// clear-selection affordance, not a level). `None` when nothing remains —
     /// the persisted column stays NULL rather than `Some(empty)`.
-    pub fn surfaced_levels(&self) -> Option<Vec<String>> {
+    pub(crate) fn surfaced_levels(&self) -> Option<Vec<String>> {
         let levels: Vec<String> = self
             .values
             .iter()
@@ -721,6 +721,31 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
     5 * 60 * 1000
 }
 
+/// Per-agent consecutive suspected-truncation auto-redrive counter
+/// (intent-hq/monorepo#2863): incremented each time `run_prompt_turn` arms an
+/// auto-redrive for a suspected-truncated turn, cleared on any turn that
+/// resolves without the truncation suspicion (real progress ends the stall
+/// episode). In-memory only, like [`LastTurnSilentTails`] — a restart resets
+/// the episode, which is safe (the next truncated turn simply starts a fresh
+/// bounded episode). Shared across [`Services`] clones.
+pub(crate) type TruncationRedrives = Arc<Mutex<HashMap<AgentId, u32>>>;
+
+/// One-shot per-agent truncation auto-redrive handoff flags
+/// (intent-hq/monorepo#2863): armed by `run_prompt_turn` when it suppresses
+/// the terminal `agent:idle` for a redrive-eligible truncated turn, taken by
+/// the turn worker to inject the system nudge turn. Same single-shot
+/// stash/take contract as the pending-terminal-error registry
+/// (monorepo#2050); worker-abort paths discard stale flags. Shared across
+/// [`Services`] clones.
+pub(crate) type PendingTruncationRedrives = Arc<Mutex<std::collections::HashSet<AgentId>>>;
+
+/// Max consecutive suspected-truncation auto-redrives per stall episode
+/// (intent-hq/monorepo#2863): the 1st–3rd back-to-back truncated turns each
+/// get a system nudge; past the cap the turn falls through to today's
+/// behavior (terminal `agent:idle` with the #2669 advisory fields, which the
+/// #1016 stall-annotation path then surfaces to the parent).
+pub(crate) const MAX_CONSECUTIVE_TRUNCATION_REDRIVES: u32 = 3;
+
 /// Per-agent chain of detached turn-end usage-bookkeeping tasks
 /// (monorepo#738): the `JoinHandle` of the most recently spawned bookkeeping
 /// task per agent. Each new turn's task awaits its predecessor before
@@ -1121,7 +1146,8 @@ impl Services {
     /// Test seam: [`set_live_turn`](Self::set_live_turn) with the final text
     /// block marked CLOSED (e.g. flushed by a tool call, no new text since) —
     /// the live preview derivation must not clip it.
-    pub fn set_live_turn_closed_final_block(
+    #[cfg(test)]
+    pub(crate) fn set_live_turn_closed_final_block(
         &self,
         agent_id: &AgentId,
         message_id: &str,
@@ -1208,6 +1234,97 @@ impl Services {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(agent_id);
+    }
+
+    /// Increment and return the agent's consecutive suspected-truncation
+    /// auto-redrive count (intent-hq/monorepo#2863). Called when
+    /// `run_prompt_turn` decides a truncated turn is redrive-eligible; the
+    /// returned count (1-based) is compared against
+    /// [`MAX_CONSECUTIVE_TRUNCATION_REDRIVES`] by the caller.
+    pub(crate) fn bump_truncation_redrives(&self, agent_id: &AgentId) -> u32 {
+        let mut map = self
+            .truncation_redrives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(agent_id.clone()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Clear the agent's suspected-truncation redrive counter
+    /// (intent-hq/monorepo#2863) — called on any turn resolution WITHOUT the
+    /// truncation suspicion (the stall episode ended: the agent made real
+    /// progress or failed through a different path) and on agent/workspace
+    /// delete teardown so the map never leaks entries for dead agents.
+    pub(crate) fn clear_truncation_redrives(&self, agent_id: &AgentId) {
+        self.truncation_redrives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id);
+    }
+
+    /// Arm the one-shot truncation auto-redrive handoff flag
+    /// (intent-hq/monorepo#2863): set by `run_prompt_turn` when it suppresses
+    /// the terminal `agent:idle` for a redrive-eligible truncated turn, taken
+    /// by the turn worker right after `run_turn` returns to inject the nudge
+    /// turn. Same stash/take shape as the pending-terminal-error handoff
+    /// (monorepo#2050).
+    pub(crate) fn arm_truncation_redrive(&self, agent_id: &AgentId) {
+        self.pending_truncation_redrive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(agent_id.clone());
+    }
+
+    /// Take (and clear) the truncation auto-redrive handoff flag for
+    /// `agent_id` — see [`arm_truncation_redrive`](Self::arm_truncation_redrive).
+    /// Worker-abort paths (stop/interrupt/retry/delete) also route here to
+    /// discard a stale flag: an orphaned arm from an aborted turn must not
+    /// redrive a later, unrelated turn.
+    pub(crate) fn take_truncation_redrive(&self, agent_id: &AgentId) -> bool {
+        self.pending_truncation_redrive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id)
+    }
+
+    /// The intent-hq/monorepo#2863 auto-redrive eligibility predicate: the
+    /// agent is DELEGATED (has a parent), has an assigned task note whose
+    /// status is exactly `in_progress`, and has NOT persisted a completion
+    /// report (a report means the child considers the work done — the parent
+    /// must receive that wake, not a redrive). Root/user-facing agents and
+    /// taskless agents keep today's WARN + advisory behavior. Every store
+    /// failure fails CLOSED (returns `false`) — an auto-redrive is an
+    /// automatic turn on the user's behalf, so uncertainty must fall through
+    /// to the observable idle path, never spin a turn on stale state.
+    pub(crate) async fn truncation_redrive_eligible(&self, agent_id: &AgentId) -> bool {
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return false;
+        };
+        if session.parent_agent_id.is_none() {
+            return false;
+        }
+        if session
+            .completion_report
+            .as_deref()
+            .is_some_and(|r| !r.is_empty())
+        {
+            return false;
+        }
+        let Some(task_note_id) = session.task_note_id.as_ref() else {
+            return false;
+        };
+        let Ok(note) = self
+            .store
+            .get_note(&session.workspace_id, task_note_id)
+            .await
+        else {
+            return false;
+        };
+        matches!(
+            note.metadata.task.as_ref().map(|t| t.status),
+            Some(intent_core::TaskStatus::InProgress)
+        )
     }
 
     /// Clear an agent's live-turn slot at a NORMAL turn end, leaving a pinned
@@ -1491,12 +1608,22 @@ impl Services {
             )
             .await
         {
-            Ok(_) => {
+            Ok(message) => {
                 // Best-effort: resolve workspace from the session so the
                 // projection cache drops without requiring the caller to pass
-                // workspace_id on this interrupt flush path.
+                // workspace_id on this interrupt flush path. The same lookup
+                // scopes the persisted-row event pair (§6.5) — the flushed
+                // partial row is a transcript persist like any other, so
+                // preview subscribers converge on its `lastToolUse` too.
                 if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                     self.invalidate_agent_list_cache(&session.workspace_id);
+                    self.publish_agent_message_events(
+                        &session.workspace_id,
+                        agent_id,
+                        &message,
+                        None,
+                    )
+                    .await;
                 }
                 if owns_slot {
                     self.clear_live_turn(agent_id);
@@ -1680,7 +1807,7 @@ impl Services {
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to
     /// pick a permissive `session/set_mode` target from `availableModes`).
-    pub async fn open_acp_session(
+    pub(crate) async fn open_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
@@ -1744,7 +1871,7 @@ impl Services {
     /// reused instead of being clobbered. Returns the canonical `acpSessionId`
     /// with modes only when the freshly-opened session won the CAS — otherwise
     /// the modes belong to some other session and callers must not act on them.
-    pub async fn recreate_acp_session(
+    pub(crate) async fn recreate_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
@@ -1814,7 +1941,7 @@ impl Services {
     /// when one was stored and the agent advertised the `loadSession` capability.
     /// Returns the resumed id plus the modes the provider advertised in
     /// `session/load`, or `None` when resume is not possible (§6.5).
-    pub async fn resume_acp_session(
+    pub(crate) async fn resume_acp_session(
         &self,
         conn: &Connection,
         init: &InitializeResponse,
@@ -2179,6 +2306,57 @@ impl Services {
                 "turn resolved normally after a sustained silent tail — suspected truncation (monorepo#2669)"
             );
         }
+        // Auto-redrive decision (intent-hq/monorepo#2863): a suspected-
+        // truncated turn on a DELEGATED agent whose assigned task is still
+        // in_progress (and that has no persisted completion report) is sent
+        // back to the agent with a system nudge instead of surfacing a
+        // normal idle/completion to watchers — in the incident a single
+        // manual nudge restored productivity instantly every time.
+        // Bounded per stall episode: streamed activity before the silence
+        // restarts the consecutive accounting at 1 (real progress, same
+        // semantics as the idle-timeout streak); a fully silent truncated
+        // turn increments it; past MAX_CONSECUTIVE_TRUNCATION_REDRIVES the
+        // turn falls through to today's idle + advisory fields, which the
+        // #1016 stall-annotation path surfaces to the parent. Excluded and
+        // left to today's behavior: root/user-facing agents and taskless
+        // agents (WARN + advisory only, per the issue's guard scope),
+        // question-bearing turns (the redrive would bury the pending Q&A
+        // behind the question hold's back), and turns with a ready-to-send
+        // queue entry (the imminent drain is itself the nudge). The counter
+        // clears on any clean (non-truncated) completion — the stall
+        // episode is over.
+        let truncation_redrive = if suspected_truncated
+            && !questions_persisted
+            && !self.has_ready_to_send(agent_id)
+            && self.truncation_redrive_eligible(agent_id).await
+        {
+            if any_update_received {
+                self.clear_truncation_redrives(agent_id);
+            }
+            let streak = self.bump_truncation_redrives(agent_id);
+            if streak <= MAX_CONSECUTIVE_TRUNCATION_REDRIVES {
+                tracing::warn!(
+                    agent = %agent_id,
+                    streak,
+                    silent_tail_ms,
+                    "suspected truncation on a delegated in-task agent — arming auto-redrive (monorepo#2863)"
+                );
+                self.arm_truncation_redrive(agent_id);
+                true
+            } else {
+                tracing::warn!(
+                    agent = %agent_id,
+                    streak,
+                    "suspected truncation — consecutive-redrive cap spent, falling through to idle + advisory (monorepo#2863)"
+                );
+                false
+            }
+        } else {
+            if !suspected_truncated && result.is_ok() {
+                self.clear_truncation_redrives(agent_id);
+            }
+            false
+        };
         // Abnormal finish reason (PROTOCOL §7): a turn that resolved with a
         // non-`end_turn` stop reason (`refusal`, `max_tokens`,
         // `max_turn_requests`, …) is durably tagged on the assistant row so
@@ -2197,7 +2375,8 @@ impl Services {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
-            self.store
+            let message = self
+                .store
                 .append_agent_message_with_id(
                     agent_id,
                     &message_id,
@@ -2208,6 +2387,13 @@ impl Services {
                 )
                 .await?;
             self.invalidate_agent_list_cache(workspace_id);
+            // Persisted-row event pair (PROTOCOL §6.5): the assistant turn
+            // flush emits `agent:message` + `agent:last-message` like every
+            // other transcript persist, so preview subscribers learn the
+            // final persisted `lastToolUse` with zero follow-up RPCs (the
+            // streaming activity preview carries no tool input).
+            self.publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
+                .await;
             message_persisted = true;
         }
         // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
@@ -2387,7 +2573,21 @@ impl Services {
         // drain loop is about to flip the next message to in-flight, so the
         // agent is not actually idle. A queue containing only under-edit
         // messages (`editing = true`) is treated as empty for this check.
+        //
+        // An armed truncation auto-redrive (intent-hq/monorepo#2863) also
+        // suppresses `agent:idle`: the agent is NOT idle — the turn worker
+        // is about to inject the nudge turn on the same session — so a
+        // completion wake here would tell the parent the work finished while
+        // the redrive is still trying to resume it. On cap exhaustion the
+        // flag is false and this arm fires as today (advisory fields
+        // included), so watchers get exactly one idle per stall episode.
         match &result {
+            Ok(_) if truncation_redrive => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    "agent:idle suppressed — truncation auto-redrive armed (monorepo#2863)",
+                );
+            }
             Ok(stop_reason) if !self.has_ready_to_send(agent_id) => {
                 let mut data = json!({
                     "agentId": agent_id.0,
@@ -2755,8 +2955,12 @@ impl Services {
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(message) => {
                     self.invalidate_agent_list_cache(workspace_id);
+                    // Same persisted-row event pair as the prompt-turn flush
+                    // (§6.5); wake turns carry no turn correlation id.
+                    self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                        .await;
                     message_persisted = true;
                 }
                 Err(e) => {
@@ -3366,13 +3570,23 @@ impl Services {
         // failure without a follow-up `agent.get`. Optional: OMITTED entirely
         // for parentless agents — never `null`. Enriched centrally here so
         // every terminal-failure emit site (prompt turn, idle-timeout cap,
-        // spawn/turn terminal pair) carries it. Best-effort: a store error —
-        // or a non-object payload (guarded via `as_object_mut` so a malformed
-        // `data` can't panic the index-assign) — leaves the payload untouched.
-        if event_type == AGENT_FAILED && data.get("parentAgentId").is_none() {
+        // spawn/turn terminal pair) carries it. The same session read also
+        // stamps `agentName` (intent-hq/monorepo#2869) so completion-wake
+        // subscribers never fall back to rendering the raw agent id.
+        // Best-effort: a store error — or a non-object payload (guarded via
+        // `as_object_mut` so a malformed `data` can't panic the index-assign)
+        // — leaves the payload untouched.
+        if event_type == AGENT_FAILED
+            && (data.get("parentAgentId").is_none() || data.get("agentName").is_none())
+        {
             if let Ok(session) = self.store.get_agent_session(agent_id).await {
-                if let (Some(parent), Some(map)) = (session.parent_agent_id, data.as_object_mut()) {
-                    map.insert("parentAgentId".to_string(), Value::String(parent.0));
+                if let Some(map) = data.as_object_mut() {
+                    if let Some(parent) = session.parent_agent_id {
+                        map.entry("parentAgentId".to_string())
+                            .or_insert(Value::String(parent.0));
+                    }
+                    map.entry("agentName".to_string())
+                        .or_insert(Value::String(session.name));
                 }
             }
         }

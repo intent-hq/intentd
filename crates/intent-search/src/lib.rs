@@ -1,6 +1,6 @@
 //! intent-search — BE-owned `search.*` namespace (§14).
 //!
-//! Depends on `intent-core` (errors) and `intent-store` (§3.2), plus the
+//! Depends on `intent-core` (errors), plus the
 //! ripgrep libraries (`grep`/`ignore`/`globset`). This slice implements the
 //! file-based methods (`search.inFiles`, `search.fileNames`) over a
 //! gitignore-aware worktree walk, plus the per-request cancellation registry

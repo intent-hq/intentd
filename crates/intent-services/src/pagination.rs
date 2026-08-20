@@ -22,9 +22,9 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 /// Default page size when the client omits `limit`.
-pub const DEFAULT_PAGE_LIMIT: usize = 50;
+pub(crate) const DEFAULT_PAGE_LIMIT: usize = 50;
 /// Hard server-side cap on page size.
-pub const MAX_PAGE_LIMIT: usize = 200;
+pub(crate) const MAX_PAGE_LIMIT: usize = 200;
 
 /// Clamp a client-supplied `limit` into the contract range. `None` yields the
 /// default (50); zero/negative clamp up to 1; values over the cap clamp down to
@@ -96,7 +96,7 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
 /// cursors index from the oldest end, so both are append-stable (Q13), and
 /// both are opaque base64 on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeekPageWindow {
+pub(crate) struct SeekPageWindow {
     pub start: usize,
     pub end: usize,
     pub next_token: Option<String>,
@@ -120,7 +120,7 @@ fn seek_window(len: usize, start: usize, end: usize) -> SeekPageWindow {
 /// target and the rest to the target and newer rows, clamped at either edge so
 /// the page stays full whenever `len >= limit`; the target index is always
 /// inside `start..end` (given `index < len`).
-pub fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekPageWindow {
+pub(crate) fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekPageWindow {
     let limit = clamp_limit(limit);
     let start = index.min(len).saturating_sub(limit / 2);
     let end = (start + limit).min(len);
@@ -132,12 +132,148 @@ pub fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekP
 /// minted by a seek page's `prev_token`. Returns `None` for backward or
 /// malformed tokens, which callers fall through to the [`page_window`]
 /// contract — so pre-existing backward tokens keep byte-identical behavior.
-pub fn forward_page_window(len: usize, limit: Option<i64>, token: &str) -> Option<SeekPageWindow> {
+pub(crate) fn forward_page_window(
+    len: usize,
+    limit: Option<i64>,
+    token: &str,
+) -> Option<SeekPageWindow> {
     let f = decode_token(token)?.get("f").and_then(Value::as_u64)? as usize;
     let limit = clamp_limit(limit);
     let start = f.min(len);
     let end = (start + limit).min(len);
     Some(seek_window(len, start, end))
+}
+
+/// Admission anchor for [`budget_page`] — which end of a page the byte
+/// budget grows from, mirroring the direction its consumer walks:
+///
+/// - `Newest`: legacy backward pages (client walks newest→oldest), so the
+///   newest suffix is kept and the oldest rows are dropped.
+/// - `Oldest`: forward (`prevToken`-minted) continuations (client walks
+///   oldest→newest toward the live tail), so the oldest prefix is kept.
+/// - `Target(pos)`: seek pages (`aroundMessageId` / `aroundIndex`) — `pos`
+///   is the target's position WITHIN the page slice; the target is always
+///   kept (even alone over budget) and the page grows outward from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetAnchor {
+    Newest,
+    Oldest,
+    Target(usize),
+}
+
+/// Trim a page to a byte budget (the §5.5 slim page budget): given each
+/// row's serialized size, return the kept contiguous `lo..hi` subrange of
+/// the page slice. The anchor row is always admitted — a single row over
+/// budget still serves alone (never an empty page, no infinite loop) — and
+/// further rows are admitted only while the cumulative size stays within
+/// `budget`, stopping at the first row that would exceed it (pages stay
+/// contiguous; rows are never skipped over). `Target` grows outward
+/// alternating older-first (mirroring the unbudgeted half-older split);
+/// each direction stops independently at its first non-fitting row.
+pub fn budget_page(sizes: &[usize], anchor: BudgetAnchor, budget: usize) -> (usize, usize) {
+    let n = sizes.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    match anchor {
+        BudgetAnchor::Newest => {
+            let mut lo = n;
+            let mut total = 0usize;
+            while lo > 0 {
+                let s = sizes[lo - 1];
+                if lo != n && total.saturating_add(s) > budget {
+                    break;
+                }
+                total = total.saturating_add(s);
+                lo -= 1;
+            }
+            (lo, n)
+        }
+        BudgetAnchor::Oldest => {
+            let mut hi = 0;
+            let mut total = 0usize;
+            while hi < n {
+                let s = sizes[hi];
+                if hi != 0 && total.saturating_add(s) > budget {
+                    break;
+                }
+                total = total.saturating_add(s);
+                hi += 1;
+            }
+            (0, hi)
+        }
+        BudgetAnchor::Target(pos) => {
+            let pos = pos.min(n - 1);
+            let mut lo = pos;
+            let mut hi = pos + 1;
+            let mut total = sizes[pos];
+            let mut can_older = lo > 0;
+            let mut can_newer = hi < n;
+            while can_older || can_newer {
+                if can_older {
+                    let s = sizes[lo - 1];
+                    if total.saturating_add(s) <= budget {
+                        total = total.saturating_add(s);
+                        lo -= 1;
+                        can_older = lo > 0;
+                    } else {
+                        can_older = false;
+                    }
+                }
+                if can_newer {
+                    let s = sizes[hi];
+                    if total.saturating_add(s) <= budget {
+                        total = total.saturating_add(s);
+                        hi += 1;
+                        can_newer = hi < n;
+                    } else {
+                        can_newer = false;
+                    }
+                }
+            }
+            (lo, hi)
+        }
+    }
+}
+
+/// Re-mint the backward continuation token after a budget trim moved a
+/// page's effective start: `{"b": start}` while older rows remain. Same
+/// cursor shape as [`page_window`], so the resumed page picks up exactly at
+/// the first excluded (older) row.
+pub fn remint_backward_token(start: usize) -> Option<String> {
+    (start > 0).then(|| encode_token(&json!({ "b": start })))
+}
+
+/// Re-mint the forward continuation token after a budget trim moved a
+/// page's effective end: `{"f": end}` while newer rows remain. Same cursor
+/// shape as [`seek_window`], so the resumed page picks up exactly at the
+/// first excluded (newer) row.
+pub(crate) fn remint_forward_token(end: usize, len: usize) -> Option<String> {
+    (end < len).then(|| encode_token(&json!({ "f": end })))
+}
+
+/// Serialized JSON byte size of one served row, for the §5.5 slim page
+/// budget. Counted through a discarding writer so no page-sized string is
+/// allocated just to be measured; a row that fails to serialize measures 0
+/// and is admitted (fail-open, matching [`intent_core::slim_body_size`]).
+/// Shared by the paginated read (`agent_ops`) and the seq-0 chat snapshot's
+/// live-turn merge (`intent-transport`), so both sides of the budget agree
+/// on what a row weighs.
+pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = CountingSink(0);
+    serde_json::to_writer(&mut sink, row)
+        .map(|()| sink.0)
+        .unwrap_or(0)
 }
 
 /// A page of items plus the opaque token for the next (older) page.
@@ -150,7 +286,11 @@ pub struct Page<T> {
 /// Paginate a chronological (oldest→newest) slice into a newest→oldest page.
 /// Items within the returned page are ordered newest-first; `next_token` follows
 /// the contract in [`page_window`].
-pub fn paginate_slice<T: Clone>(source: &[T], limit: Option<i64>, token: Option<&str>) -> Page<T> {
+pub(crate) fn paginate_slice<T: Clone>(
+    source: &[T],
+    limit: Option<i64>,
+    token: Option<&str>,
+) -> Page<T> {
     let win = page_window(source.len(), limit, token);
     let items = source[win.start..win.end].iter().rev().cloned().collect();
     Page {
@@ -164,7 +304,7 @@ pub fn paginate_slice<T: Clone>(source: &[T], limit: Option<i64>, token: Option<
 /// historical-output reads. Trailing blank lines are trimmed (mirroring the
 /// legacy formatted reads) before paging; the per-page size follows the standard
 /// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
-pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
+pub(crate) fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
     let mut lines: Vec<&str> = text.split('\n').collect();
     while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
         lines.pop();
@@ -186,13 +326,13 @@ pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) 
 /// not append-stable against inserts at the newest end — appropriate for
 /// time-windowed event queries and immutable commit history, where the live
 /// tail is read separately (Q13).
-pub fn offset_token(next_offset: usize) -> String {
+pub(crate) fn offset_token(next_offset: usize) -> String {
     encode_token(&json!({ "o": next_offset }))
 }
 
 /// Decode an offset-style continuation token into its offset. A missing or
 /// malformed token starts from offset 0 (the newest page).
-pub fn parse_offset(token: Option<&str>) -> usize {
+pub(crate) fn parse_offset(token: Option<&str>) -> usize {
     token
         .and_then(decode_token)
         .and_then(|v| v.get("o").and_then(Value::as_u64))

@@ -17,12 +17,12 @@ use crate::now_iso;
 /// critical path (monorepo#871). NOTE: this seam is compiled into release
 /// binaries too (release-mode e2e runs need it); it is inert unless the
 /// namespaced env var is set to a positive integer.
-pub const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
+pub(crate) const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
 
 /// Test hook: force [`provision_sandbox`] to fail with an internal error
 /// (after the optional delay above), exercising the fallback-to-shared-mode
 /// path on provisioning failure. Inert unless set to `1`.
-pub const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
+pub(crate) const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
 
 /// Parse the delay override in milliseconds; anything unset, non-numeric, or
 /// non-positive disables the hook.
@@ -90,7 +90,7 @@ pub enum MergeOutcome {
 }
 
 /// Configuration for sandbox provisioning.
-pub struct ProvisionConfig {
+pub(crate) struct ProvisionConfig {
     /// Workspaces root directory (from config.workspaces_root).
     pub workspaces_root: PathBuf,
 }
@@ -310,7 +310,7 @@ fn provision_sandbox_blocking(
 }
 
 /// Discard a sandbox: remove the directory and the database record.
-pub async fn discard_sandbox(
+pub(crate) async fn discard_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
@@ -334,7 +334,8 @@ pub async fn discard_sandbox(
 
 /// Garbage-collect orphaned sandboxes: remove sandboxes whose agent no longer exists
 /// or whose directory is missing.
-pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
+#[cfg(test)]
+pub(crate) async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
     let all_sandboxes = store.list_all_sandboxes().await?;
 
     for sandbox in all_sandboxes {
@@ -378,7 +379,7 @@ pub async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
 /// 7. On success: return Merged with the applied range.
 ///
 /// The canonical repository is never left mid-merge/cherry-pick (always abort on failure).
-pub async fn merge_sandbox(
+pub(crate) async fn merge_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,

@@ -183,13 +183,29 @@
 //! non-integer is `-32602`; supplying it together with `aroundMessageId`
 //! is `-32602` naming the conflict), carrying the same `nextToken` /
 //! `prevToken` seek cursors as `aroundMessageId` pages — no method-catalog
-//! change, 293 router methods, 332 total.
+//! change, 293 router methods, 332 total. Version 7.2 adds the
+//! `agent.getMessageBlock` router method (additive; §5.5): one FULL content
+//! block of one persisted message by block id — the on-demand counterpart
+//! of the `projection: "slim"` conversation read — `{ block }`, resolving
+//! persisted assistant ids and serve-time synthetic `{messageId}:{index}`
+//! ids alike (unknown message/block id is `-32602` naming the id; unknown
+//! agent or workspace mismatch is not-found); the
+//! `agent:last-message` event (additive; §6.5): the content-bearing
+//! companion emitted alongside EVERY `agent:message` — the id-only echo
+//! enriched with the persisted preview projections the write just computed
+//! (`lastMessageRole`/`lastMessageId` plus `lastAgentResponse` /
+//! `lastUserMessage` / `lastToolUse` on user/assistant rows) — and the
+//! additive `AgentLite.lastToolUse` field (§5.5): the newest
+//! user/assistant message's LAST `tool_use` block preview
+//! (`{ name, input?, inputTruncated?, inputBytes? }`, input bounded by the
+//! §5.5 slim budget), denormalized at message-write time
+//! (migration 0098) — 294 router methods, 333 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.1";
+pub const PROTOCOL_VERSION: &str = "7.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
@@ -211,7 +227,7 @@ pub const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAX_INBOUND_MESSAGE_BYTES;
 /// so the transport emits a throttled `warn` log — log-only, no wire
 /// behavior change. Known bulk-transfer methods are exempt (see
 /// [`is_bulk_transfer_method`]).
-pub const LARGE_MESSAGE_WARN_BYTES: usize = 1024 * 1024;
+pub(crate) const LARGE_MESSAGE_WARN_BYTES: usize = 1024 * 1024;
 
 /// Minimum interval between two large-frame warns for the same method, so a
 /// burst of oversized frames (e.g. a chunked upload missing an exemption)

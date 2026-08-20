@@ -11550,7 +11550,7 @@ mod merge_user_mcp_servers_tests {
     use intent_acp::{NormalizedMcpServer, NormalizedMcpServers};
     use serde_json::json;
 
-    use super::{manager, TempDb};
+    use super::TempDb;
     use crate::agent_manager::AgentManager;
     use crate::agent_manager::BusEventSink;
     use crate::events::EventBus;
@@ -11896,12 +11896,6 @@ mod merge_user_mcp_servers_tests {
             Some(inherited.as_str()),
             "baseline PATH only — no injected override"
         );
-    }
-
-    // Prevent dead-code warnings for `manager` when this module compiles alone.
-    #[allow(dead_code)]
-    async fn _use_manager() {
-        let _ = manager().await;
     }
 }
 
@@ -12672,6 +12666,152 @@ mod dequeue_wait_tests {
         assert_eq!(
             text, "direct hello",
             "immediate deliveries carry no dequeue-wait note"
+        );
+    }
+}
+
+/// Batch-flush grouping stamp: [`super::stamp_flush_batch_id`] mints ONE
+/// fresh `queueInfo.batchId` per multi-entry flush and stamps it on every
+/// drained entry — including sub-threshold-wait entries that carry no other
+/// queueInfo — without ever overwriting existing queueInfo fields, skipping
+/// `persisted: true` requeues, and never stamping a single-entry drain.
+#[cfg(test)]
+mod flush_batch_id_tests {
+    use super::dequeue_wait_tests::{iso_secs_ago, queued_msg};
+    use super::*;
+
+    #[test]
+    fn flush_stamps_one_shared_batch_id_on_all_entries() {
+        // Both entries waited past the annotation threshold, so the wait
+        // stamp runs first (as in prepare_flush_turn) and batchId lands
+        // NEXT TO queuedAt/waitedMs inside the same queueInfo object.
+        let queued_at = iso_secs_ago(60);
+        let mut entries = vec![
+            queued_msg("first", &queued_at, false),
+            queued_msg("second", &queued_at, false),
+        ];
+        for e in entries.iter_mut() {
+            super::super::annotate_dequeue_wait(e);
+        }
+        super::super::stamp_flush_batch_id(&mut entries);
+        let info = |i: usize| entries[i].message_metadata.as_ref().unwrap()["queueInfo"].clone();
+        let batch_id = info(0)["batchId"]
+            .as_str()
+            .expect("batchId is a string")
+            .to_string();
+        assert!(!batch_id.is_empty(), "batchId is non-empty");
+        assert_eq!(
+            info(1)["batchId"].as_str(),
+            Some(batch_id.as_str()),
+            "every entry of the batch shares ONE batchId"
+        );
+        for i in [0, 1] {
+            assert!(
+                info(i)["queuedAt"].as_str().is_some() && info(i)["waitedMs"].as_u64().is_some(),
+                "wait-stamp fields ride alongside batchId: {}",
+                info(i)
+            );
+        }
+    }
+
+    #[test]
+    fn single_entry_drain_gets_no_batch_id() {
+        let mut entries = vec![queued_msg("solo", &iso_secs_ago(60), false)];
+        super::super::stamp_flush_batch_id(&mut entries);
+        assert_eq!(
+            entries[0].message_metadata, None,
+            "nothing to group — a single-entry drain is never stamped"
+        );
+    }
+
+    #[test]
+    fn sub_threshold_entry_in_batch_gets_batch_id_only() {
+        // One entry drains sub-threshold (no wait note, no queuedAt/waitedMs
+        // — monorepo#2353): it still gets the grouping stamp, as a queueInfo
+        // carrying ONLY batchId.
+        let mut entries = vec![
+            queued_msg("waited", &iso_secs_ago(60), false),
+            queued_msg("instant hop", &intent_core::now_iso(), false),
+        ];
+        for e in entries.iter_mut() {
+            super::super::annotate_dequeue_wait(e);
+        }
+        assert_eq!(
+            entries[1].message_metadata, None,
+            "precondition: sub-threshold wait stamped no queueInfo"
+        );
+        super::super::stamp_flush_batch_id(&mut entries);
+        let sub = &entries[1].message_metadata.as_ref().unwrap()["queueInfo"];
+        assert!(sub["batchId"].as_str().is_some(), "batchId stamped: {sub}");
+        assert_eq!(
+            sub.as_object().unwrap().len(),
+            1,
+            "sub-threshold queueInfo carries ONLY batchId: {sub}"
+        );
+        assert_eq!(
+            sub["batchId"],
+            entries[0].message_metadata.as_ref().unwrap()["queueInfo"]["batchId"],
+            "sub-threshold entry shares the batch's id"
+        );
+    }
+
+    #[test]
+    fn existing_queue_info_fields_are_never_overwritten() {
+        // A requeued entry carrying its first-delivery queueInfo keeps
+        // queuedAt/waitedMs untouched — batchId is purely additive.
+        let mut entries = vec![
+            queued_msg("fresh", &iso_secs_ago(60), false),
+            queued_msg("requeued", &iso_secs_ago(60), false),
+        ];
+        entries[1].message_metadata = Some(json!({
+            "queueInfo": { "queuedAt": "2026-01-01T00:00:00Z", "waitedMs": 42 }
+        }));
+        super::super::stamp_flush_batch_id(&mut entries);
+        let info = &entries[1].message_metadata.as_ref().unwrap()["queueInfo"];
+        assert_eq!(info["queuedAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(info["waitedMs"], 42);
+        assert!(
+            info["batchId"].as_str().is_some(),
+            "batchId added alongside the kept fields: {info}"
+        );
+    }
+
+    #[test]
+    fn pre_existing_batch_id_is_kept() {
+        // A mid-flush persist failure requeues entries already stamped;
+        // keeping the first batch's id groups the retry's rows with the rows
+        // the first attempt already persisted.
+        let mut entries = vec![
+            queued_msg("retried", &iso_secs_ago(60), false),
+            queued_msg("fresh", &iso_secs_ago(60), false),
+        ];
+        entries[0].message_metadata = Some(json!({ "queueInfo": { "batchId": "batch-orig" } }));
+        super::super::stamp_flush_batch_id(&mut entries);
+        assert_eq!(
+            entries[0].message_metadata.as_ref().unwrap()["queueInfo"]["batchId"],
+            "batch-orig",
+            "an already-stamped entry keeps its first batch's id"
+        );
+    }
+
+    #[test]
+    fn persisted_entries_are_never_stamped() {
+        // The persisted entry's transcript row is already durable and never
+        // rewritten; the fresh entry in the same flush is still stamped.
+        let mut entries = vec![
+            queued_msg("already durable", &iso_secs_ago(60), true),
+            queued_msg("fresh", &iso_secs_ago(60), false),
+        ];
+        super::super::stamp_flush_batch_id(&mut entries);
+        assert_eq!(
+            entries[0].message_metadata, None,
+            "persisted requeues are never stamped"
+        );
+        assert!(
+            entries[1].message_metadata.as_ref().unwrap()["queueInfo"]["batchId"]
+                .as_str()
+                .is_some(),
+            "the batch's fresh entries are still stamped"
         );
     }
 }

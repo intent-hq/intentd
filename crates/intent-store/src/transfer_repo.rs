@@ -57,6 +57,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     ("interrupted_agent", "workspace_id = ?1"),
+    ("agent_flipped_completion", "workspace_id = ?1"),
     ("delegation_group", "workspace_id = ?1"),
     (
         "completion_watch",
@@ -87,7 +88,8 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// Together with [`TRANSFER_TABLES`] this must cover the entire live schema
 /// (enforced by `every_live_table_has_an_explicit_transfer_decision`), so a
 /// new table cannot silently skip the transfer decision.
-pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+#[cfg(test)]
+pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",
@@ -138,6 +140,14 @@ pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          captured in `interrupted_agent`",
     ),
     (
+        "completion_wake_delivery",
+        "per-daemon delivered-completion dedup bookkeeping (monorepo#2842); its \
+         (parent, child) rows can span workspaces (chief parents) so a \
+         workspace-scoped export could violate the agent_session FKs on import, \
+         and losing a marker fails open — at worst one already-delivered \
+         completion wake repeats once on the target",
+    ),
+    (
         "agent_message_fts",
         "derived FTS5 index over `agent_message`; the target's insert triggers \
          rebuild it from the imported rows",
@@ -174,36 +184,89 @@ impl Store {
     /// an estimate of the payload carried by an export, not on-disk size.
     /// Read-only. Tables with zero rows are still listed (count 0), so the
     /// manifest shape is stable across workspaces.
+    ///
+    /// Batched to exactly two statements — one `pragma_table_info` join for
+    /// every table's columns, one `UNION ALL` aggregate over all tables — so
+    /// the `workspace.transfer.plan` dispatch stays within the rpc_profile
+    /// statement budget instead of issuing 2 statements per table
+    /// (intent-hq/monorepo#2994).
     pub async fn transfer_table_stats(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TransferTableStat>> {
-        let mut stats = Vec::with_capacity(TRANSFER_TABLES.len());
-        for (table, predicate) in TRANSFER_TABLES {
-            let columns = self.table_columns(table).await?;
-            let size_expr = if columns.is_empty() {
-                "0".to_string()
-            } else {
-                columns
-                    .iter()
-                    .map(|c| format!("COALESCE(LENGTH(CAST(\"{c}\" AS BLOB)), 0)"))
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            };
-            let sql = format!(
-                "SELECT COUNT(*) AS n, COALESCE(SUM({size_expr}), 0) AS b \
-                 FROM \"{table}\" WHERE {predicate}"
-            );
-            let row = sqlx::query_as::<_, (i64, i64)>(&sql)
-                .bind(&workspace_id.0)
-                .fetch_one(self.read_pool())
-                .await
-                .map_err(|e| Error::Internal(format!("transfer stats for {table} failed: {e}")))?;
-            stats.push(TransferTableStat {
+        // Statement 1: column names of every transfer table, in declaration
+        // order (same source of truth as `table_columns`, one round-trip).
+        // The names are interpolated as single-quoted literals, which relies
+        // on TRANSFER_TABLES entries never containing a quote — a name with
+        // one would silently drop out of the column map and report size 0.
+        debug_assert!(
+            TRANSFER_TABLES.iter().all(|(t, _)| !t.contains('\'')),
+            "TRANSFER_TABLES names must not contain quotes"
+        );
+        let names = TRANSFER_TABLES
+            .iter()
+            .map(|(t, _)| format!("'{t}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let col_rows = sqlx::query_as::<_, (String, String)>(&format!(
+            "SELECT m.name, p.name FROM sqlite_master m \
+             JOIN pragma_table_info(m.name) p \
+             WHERE m.type = 'table' AND m.name IN ({names}) \
+             ORDER BY m.name, p.cid"
+        ))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("transfer stats table_info failed: {e}")))?;
+        let mut columns: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (table, col) in col_rows {
+            columns.entry(table).or_default().push(col);
+        }
+
+        // Statement 2: one aggregate arm per table, UNION ALL'd; `?1` is the
+        // workspace id in every arm's predicate. The literal arm index keys
+        // the merge back into TRANSFER_TABLES order.
+        let sql = TRANSFER_TABLES
+            .iter()
+            .enumerate()
+            .map(|(i, (table, predicate))| {
+                let size_expr = match columns.get(*table) {
+                    Some(cols) if !cols.is_empty() => cols
+                        .iter()
+                        .map(|c| format!("COALESCE(LENGTH(CAST(\"{c}\" AS BLOB)), 0)"))
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                    _ => "0".to_string(),
+                };
+                format!(
+                    "SELECT {i} AS i, COUNT(*) AS n, COALESCE(SUM({size_expr}), 0) AS b \
+                     FROM \"{table}\" WHERE {predicate}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("transfer stats aggregate failed: {e}")))?;
+
+        let mut stats: Vec<TransferTableStat> = TRANSFER_TABLES
+            .iter()
+            .map(|(table, _)| TransferTableStat {
                 name: (*table).to_string(),
-                row_count: row.0,
-                approx_bytes: row.1,
-            });
+                row_count: 0,
+                approx_bytes: 0,
+            })
+            .collect();
+        for (i, n, b) in rows {
+            let Some(stat) = usize::try_from(i).ok().and_then(|i| stats.get_mut(i)) else {
+                return Err(Error::Internal(format!(
+                    "transfer stats aggregate returned unknown arm index {i}"
+                )));
+            };
+            stat.row_count = n;
+            stat.approx_bytes = b;
         }
         Ok(stats)
     }
@@ -519,6 +582,7 @@ mod tests {
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
+            format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
             format!("INSERT INTO delegation_group (group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, created_at, updated_at) VALUES ('g-{ws}', '{ws}', '{agent}', 'after_all', '[]', '{t}', '{t}')"),
             format!("INSERT INTO completion_watch (id, parent_workspace_id, child_workspace_id, parent_agent_id, child_agent_id, created_at) VALUES ('cwp-{ws}', '{ws}', '{peer}', '{agent}', 'child', '{t}')"),
             format!("INSERT INTO completion_watch (id, parent_workspace_id, child_workspace_id, parent_agent_id, child_agent_id, created_at) VALUES ('cwc-{ws}', '{peer}', '{ws}', 'parent', '{agent}', '{t}')"),
@@ -734,10 +798,11 @@ note_version: note_id, workspace_id, v, date, author_id, author_name, author_typ
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features
-agent_message: id, agent_id, seq, role, content, created_at, metadata
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview
+agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
+agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at
 delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, completed_agent_ids, deleted_agent_ids, sealed, delivered, event_summaries, raw_events, created_at, updated_at
 completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
