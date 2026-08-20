@@ -1723,19 +1723,6 @@ impl Services {
                             session.attention_request_kind.as_deref(),
                             session.attention_request_reason.as_deref(),
                         );
-                        // Record-time trigger capture (intent-hq/monorepo#2044):
-                        // same stamp as the live record paths, so the
-                        // aggregated wake keeps the trigger even if this
-                        // reconciled child is deleted before the group fires.
-                        if event_type == intent_core::events::AGENT_IDLE {
-                            if let Some(n) = &session.task_note_id {
-                                crate::agent_ops::ready_delta::stamp_event_trigger_task(
-                                    &mut data,
-                                    &session.workspace_id.0,
-                                    &n.0,
-                                );
-                            }
-                        }
                         // monorepo#1945: a non-empty persisted
                         // completion_report (set by `agent.reportToParent`)
                         // is the child's explicit completion signal — it
@@ -1814,6 +1801,28 @@ impl Services {
                             data["isWaitingForOtherAgents"] = serde_json::json!(!self
                                 .waiting_watches_for_parent(&child_id)
                                 .is_empty());
+                        }
+                        // Record-time trigger capture (intent-hq/monorepo#2044):
+                        // same stamp as the live record paths — the child's
+                        // linked task plus its recorded flipped completions
+                        // (consumed here) — so the aggregated wake keeps the
+                        // triggers even if this reconciled child is deleted
+                        // before the group fires. Placed AFTER the deferral
+                        // checks above so a deferred (not-recorded) idle never
+                        // consumes the flip set.
+                        if event_type == intent_core::events::AGENT_IDLE {
+                            let mut triggers: Vec<(String, String)> = Vec::new();
+                            if let Some(n) = &session.task_note_id {
+                                triggers.push((session.workspace_id.0.clone(), n.0.clone()));
+                            }
+                            for pair in self.take_flipped_completion_triggers(&child_id).await {
+                                if !triggers.contains(&pair) {
+                                    triggers.push(pair);
+                                }
+                            }
+                            crate::agent_ops::ready_delta::stamp_event_trigger_tasks(
+                                &mut data, &triggers,
+                            );
                         }
                         let report = session.completion_report;
                         // Child completion events fire in the CHILD's own
@@ -1989,14 +1998,21 @@ impl Services {
                 )
             });
             // Record-time trigger capture (intent-hq/monorepo#2044): stamp
-            // the settled child's linked task onto the recorded event so the
-            // aggregated wake keeps the trigger even if the child session is
-            // deleted before the group settles.
-            let trigger = session.as_ref().and_then(|s| {
-                s.task_note_id
-                    .clone()
-                    .map(|n| (s.workspace_id.0.clone(), n.0))
-            });
+            // the settled child's linked task plus its recorded flipped
+            // completions (consumed here) onto the recorded event so the
+            // aggregated wake keeps the triggers even if the child session
+            // is deleted before the group settles.
+            let mut triggers: Vec<(String, String)> = Vec::new();
+            if let Some(s) = session.as_ref() {
+                if let Some(n) = &s.task_note_id {
+                    triggers.push((s.workspace_id.0.clone(), n.0.clone()));
+                }
+            }
+            for pair in self.take_flipped_completion_triggers(agent_id).await {
+                if !triggers.contains(&pair) {
+                    triggers.push(pair);
+                }
+            }
             let report = session.and_then(|s| s.completion_report);
             let mut data = event_data.clone();
             if let Some(s) = &stall {
@@ -2005,9 +2021,7 @@ impl Services {
             if let Some((kind, reason)) = &attention {
                 annotate_attention_request(&mut data, kind.as_deref(), reason.as_deref());
             }
-            if let Some((ws, task)) = &trigger {
-                crate::agent_ops::ready_delta::stamp_event_trigger_task(&mut data, ws, task);
-            }
+            crate::agent_ops::ready_delta::stamp_event_trigger_tasks(&mut data, &triggers);
             let event = Event {
                 id: String::new(),
                 workspace_id: workspace_id.clone(),

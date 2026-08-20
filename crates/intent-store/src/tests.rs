@@ -6267,4 +6267,22 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         listed.len(),
         crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize - 1
     );
+
+    // Take (consume-on-stamp read): returns the rows oldest-first and
+    // clears them — a second take is empty. Empty take is a no-op.
+    let taken = reopened
+        .take_agent_flipped_completions(&agent_a)
+        .await
+        .expect("take");
+    assert_eq!(taken, listed);
+    assert!(reopened
+        .list_agent_flipped_completions(&agent_a)
+        .await
+        .expect("list after take")
+        .is_empty());
+    assert!(reopened
+        .take_agent_flipped_completions(&agent_a)
+        .await
+        .expect("second take")
+        .is_empty());
 }

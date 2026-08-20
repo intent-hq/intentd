@@ -79,6 +79,27 @@ impl Store {
         Ok(())
     }
 
+    /// Take (list and clear) the agent's recorded flipped completions,
+    /// oldest-first — the consume-on-stamp read used at wake composition,
+    /// so a flip is attributed as a trigger at most once and can never be
+    /// re-attributed by a later completion cycle.
+    pub async fn take_agent_flipped_completions(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<(WorkspaceId, NoteId)>> {
+        let rows = self.list_agent_flipped_completions(agent_id).await?;
+        if !rows.is_empty() {
+            sqlx::query("DELETE FROM agent_flipped_completion WHERE agent_id = ?")
+                .bind(&agent_id.0)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("take agent_flipped_completion failed: {e}"))
+                })?;
+        }
+        Ok(rows)
+    }
+
     /// The agent's recorded flipped completions, oldest-first.
     pub async fn list_agent_flipped_completions(
         &self,
