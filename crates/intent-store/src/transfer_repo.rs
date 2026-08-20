@@ -196,6 +196,13 @@ impl Store {
     ) -> Result<Vec<TransferTableStat>> {
         // Statement 1: column names of every transfer table, in declaration
         // order (same source of truth as `table_columns`, one round-trip).
+        // The names are interpolated as single-quoted literals, which relies
+        // on TRANSFER_TABLES entries never containing a quote — a name with
+        // one would silently drop out of the column map and report size 0.
+        debug_assert!(
+            TRANSFER_TABLES.iter().all(|(t, _)| !t.contains('\'')),
+            "TRANSFER_TABLES names must not contain quotes"
+        );
         let names = TRANSFER_TABLES
             .iter()
             .map(|(t, _)| format!("'{t}'"))
