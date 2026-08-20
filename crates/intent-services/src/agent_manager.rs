@@ -192,6 +192,54 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     }
 }
 
+/// Batch-flush grouping stamp: when a flush delivers two or more entries as
+/// ONE combined turn ([`prepare_flush_turn`]), every drained entry's
+/// `messageMetadata` gains the same freshly minted `queueInfo.batchId`
+/// (uuid, PROTOCOL §5.5), so clients can group the N persisted user rows.
+/// Must run AFTER [`annotate_dequeue_wait`]: this stamp creates `queueInfo`
+/// when absent, and the wait stamp never overwrites an existing one. The
+/// stamp is additive — an entry whose wait fell below the annotation
+/// threshold gets a `queueInfo` carrying only `batchId`, and an entry that
+/// already carries `queueInfo` keeps its `queuedAt` / `waitedMs` (and any
+/// prior `batchId`: a mid-flush persist failure requeues already-stamped
+/// entries, and keeping the first batch's id groups the retry's rows with
+/// the rows the first attempt already persisted). Same skips as the wait
+/// stamp: `persisted: true` requeues (row already durable, never rewritten)
+/// and a non-object `messageMetadata` are left alone. Single-entry drains
+/// never stamp — there is nothing to group.
+fn stamp_flush_batch_id(entries: &mut [QueuedMessage]) {
+    if entries.len() < 2 {
+        return;
+    }
+    let batch_id = Value::String(Uuid::new_v4().to_string());
+    for msg in entries.iter_mut() {
+        if msg.persisted {
+            continue;
+        }
+        let metadata = msg.message_metadata.get_or_insert_with(|| json!({}));
+        let Value::Object(map) = metadata else {
+            tracing::warn!(
+                id = %msg.id,
+                "flush batchId stamp skipped: messageMetadata is not an object"
+            );
+            continue;
+        };
+        match map.entry("queueInfo").or_insert_with(|| json!({})) {
+            Value::Object(queue_info) => {
+                queue_info
+                    .entry("batchId")
+                    .or_insert_with(|| batch_id.clone());
+            }
+            _ => {
+                tracing::warn!(
+                    id = %msg.id,
+                    "flush batchId stamp skipped: queueInfo is not an object"
+                );
+            }
+        }
+    }
+}
+
 /// Delivery-time "tasks now unblocked" annotation (intent-hq/monorepo#2044):
 /// completion wakes stamp only the triggering task ids on their
 /// `messageMetadata` at enqueue time; THIS is where the unblocked enumeration
@@ -9466,7 +9514,9 @@ enum FlushPrep {
 /// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
 /// correlate with the single `agent:queue:processing`/`agent:stream:*`
 /// lifecycle (monorepo#1022 turn-correlation contract). Queue entries keep
-/// their own `turn_id`s (ids/messageMetadata/queueInfo are untouched).
+/// their own `turn_id`s and ids; the only metadata mutation beyond the
+/// single-drain annotations is the shared `queueInfo.batchId` grouping stamp
+/// ([`stamp_flush_batch_id`]) on every entry of the batch.
 ///
 /// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
 /// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
@@ -9505,6 +9555,10 @@ async fn prepare_flush_turn(
         annotate_dequeue_wait(entry);
         stale_flags.push(stale);
     }
+    // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
+    // when absent; the wait stamp never overwrites an existing one): every
+    // row persisted by this flush shares one fresh batchId.
+    stamp_flush_batch_id(&mut entries);
     // Delivery-time unblocked hints (monorepo#2044): all completion wakes in
     // this batch coalesce into ONE fresh delta, appended to the last
     // trigger-carrying entry. Runs before the row persists (same placement
