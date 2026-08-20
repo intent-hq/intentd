@@ -12,6 +12,7 @@ use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
 
+mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
 mod attachment_repo;
@@ -48,6 +49,7 @@ mod workspace_git_root_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
+pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{

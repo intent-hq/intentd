@@ -1348,6 +1348,181 @@ async fn update_metadata_skips_spec_title_but_applies_tags() {
     assert_eq!(svc.get_note(ws, spec).await.unwrap().title, "Title");
 }
 
+/// Agent-flipped completion recording (verifier-flip wake triggers): a status
+/// write crossing INTO `complete` with an agent caller records the pair on
+/// that agent's session; the agent's own linked task and user-initiated
+/// (no-caller) writes record nothing; a transition back out of `complete`
+/// removes the pair regardless of caller. `task.markAsTask` boundary
+/// crossings behave the same.
+#[tokio::test]
+async fn flipped_completion_recorded_on_agent_complete_boundary() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    for id in ["own", "other", "user-flip"] {
+        let mut tn = note(&ws, id, "body");
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            ..Default::default()
+        });
+        store.insert_note(&tn).await.expect("insert task note");
+    }
+    let agent = AgentId::from("agent-flip");
+    let ts = now_iso();
+    store
+        .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: agent.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Flipper".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: Some(NoteId::from("own")),
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+        })
+        .await
+        .expect("session");
+    let svc = Services::new(store.clone());
+
+    // Crossing into `complete` on ANOTHER task records the pair.
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("other"),
+        "complete".into(),
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .expect("flip other");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), NoteId::from("other"))]
+    );
+
+    // The agent's own linked task note is excluded (stamped separately), and
+    // a user-initiated (no-caller) flip records nothing.
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("own"),
+        "complete".into(),
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .expect("flip own");
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("user-flip"),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("flip user");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), NoteId::from("other"))]
+    );
+
+    // A transition back out of `complete` removes the pair even without a
+    // caller — the flip is stale regardless of who reverted it.
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("other"),
+        "in_progress".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("revert other");
+    assert!(store
+        .list_agent_flipped_completions(&agent)
+        .await
+        .expect("list")
+        .is_empty());
+
+    // `task.markAsTask` boundary crossings record and remove the same way.
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("other"),
+        "complete".into(),
+        vec![],
+        None,
+        None,
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .expect("mark complete");
+    assert_eq!(
+        store
+            .list_agent_flipped_completions(&agent)
+            .await
+            .expect("list"),
+        vec![(ws.clone(), NoteId::from("other"))]
+    );
+    svc.mark_as_task(
+        ws,
+        NoteId::from("other"),
+        "in_progress".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("mark in_progress");
+    assert!(store
+        .list_agent_flipped_completions(&agent)
+        .await
+        .expect("list")
+        .is_empty());
+}
+
 #[tokio::test]
 async fn list_tasks_and_delete_and_scoping() {
     let (_tmp, svc, ws, id) = setup("- [ ] one\n- [x] two").await;
