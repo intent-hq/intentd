@@ -9,14 +9,14 @@
 //! [`MAX_KEYTERM_CHARS`] chars — the Scribe v2 limits).
 
 /// Style hint prefixed to the composed OpenAI `prompt`.
-pub const OPENAI_STYLE_HINT: &str = "Technical dictation in a software-engineering app; \
+pub(crate) const OPENAI_STYLE_HINT: &str = "Technical dictation in a software-engineering app; \
      preserve code identifiers and file paths verbatim.";
 
 /// ElevenLabs Scribe v2 keyterm cap (batch API allows up to 100 terms).
-pub const MAX_KEYTERMS: usize = 100;
+pub(crate) const MAX_KEYTERMS: usize = 100;
 
 /// ElevenLabs Scribe v2 per-keyterm length cap.
-pub const MAX_KEYTERM_CHARS: usize = 50;
+pub(crate) const MAX_KEYTERM_CHARS: usize = 50;
 
 /// Merge the configured `vocabulary` with request `keyterms`: vocabulary
 /// terms first, then request terms; duplicates dropped case-insensitively

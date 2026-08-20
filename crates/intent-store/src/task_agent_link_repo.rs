@@ -33,26 +33,6 @@ impl Store {
         Ok(link.clone())
     }
 
-    /// Look up a single link by its full key; `None` when absent.
-    pub async fn get_task_agent_link(
-        &self,
-        workspace_id: &WorkspaceId,
-        note_id: &NoteId,
-        task_key: &str,
-    ) -> Result<Option<TaskAgentLink>> {
-        let row = sqlx::query(&format!(
-            "SELECT {TASK_AGENT_LINK_COLUMNS} FROM task_agent_link \
-             WHERE workspace_id = ? AND note_id = ? AND task_key = ?"
-        ))
-        .bind(&workspace_id.0)
-        .bind(note_id.as_str())
-        .bind(task_key)
-        .fetch_optional(self.read_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("get task agent link failed: {e}")))?;
-        row.as_ref().map(map_link_row).transpose()
-    }
-
     /// Delete a single link by its full key. Returns whether a row was
     /// actually removed; deleting an unknown key is not an error.
     pub async fn delete_task_agent_link(

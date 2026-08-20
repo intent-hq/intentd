@@ -444,7 +444,8 @@ impl Store {
     /// Legacy alias for `delete_ephemeral_events_before`. Preserved for
     /// backward compatibility during the transition; new callers should use
     /// `delete_ephemeral_events_before` directly.
-    pub async fn delete_stream_events_before(&self, cutoff: &str) -> Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn delete_stream_events_before(&self, cutoff: &str) -> Result<u64> {
         self.delete_ephemeral_events_before(cutoff).await
     }
 

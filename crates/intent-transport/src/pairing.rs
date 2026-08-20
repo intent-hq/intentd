@@ -18,7 +18,7 @@ use intent_core::{Error, Result};
 
 /// Version of the `intent://pair` payload format (the `v` query parameter and
 /// the `version` field of the `pairing.getInfo` result).
-pub const PAIRING_PAYLOAD_VERSION: u32 = 1;
+pub(crate) const PAIRING_PAYLOAD_VERSION: u32 = 1;
 
 /// Build the pairing payload URI:
 /// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>`.
@@ -28,7 +28,12 @@ pub const PAIRING_PAYLOAD_VERSION: u32 = 1;
 /// through unchanged, but a token injected via `INTENTD_AUTH_TOKEN` may contain
 /// reserved characters (`&`, `=`, `%`, …) that would otherwise make the query
 /// string ambiguous.
-pub fn build_pairing_uri(hosts: &[String], port: u16, fingerprint: &str, token: &str) -> String {
+pub(crate) fn build_pairing_uri(
+    hosts: &[String],
+    port: u16,
+    fingerprint: &str,
+    token: &str,
+) -> String {
     let hosts = hosts
         .iter()
         .map(|h| encode_query_value(h))

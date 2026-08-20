@@ -28,5 +28,5 @@ pub use intent_core::Result;
 pub mod host;
 pub mod scrollback;
 
-pub use host::{Attachment, PtyExit, PtyHost, PtyId, PtyInfo, PtySignal, PtySize, SpawnSpec};
-pub use scrollback::{Scrollback, DEFAULT_SCROLLBACK_BYTES};
+pub use host::{Attachment, PtyExit, PtyHost, PtyId, PtySize, SpawnSpec};
+pub use scrollback::Scrollback;

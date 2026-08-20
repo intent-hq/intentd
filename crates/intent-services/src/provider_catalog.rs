@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 /// default from settings (`model.default` prefix, else `providers.active`).
 /// Gating is evaluated against the daemon's process environment (see
 /// [`provider_visible`]).
-pub fn build_providers_catalog() -> Value {
+pub(crate) fn build_providers_catalog() -> Value {
     build_providers_catalog_with_env(&|var| std::env::var_os(var).is_some())
 }
 

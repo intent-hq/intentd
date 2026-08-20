@@ -28,7 +28,7 @@ const SUBMODULE_UPDATE_POLL: Duration = Duration::from_millis(50);
 /// `GIT_TERMINAL_PROMPT=0` for fail-fast, stdin null, stdout discarded, stderr
 /// piped, wall-clock deadline + `Child::kill`. Errors when git is not on PATH,
 /// a submodule is unreachable, or the update exceeds the timeout.
-pub fn update_submodules(worktree_path: &Path) -> Result<()> {
+pub(crate) fn update_submodules(worktree_path: &Path) -> Result<()> {
     update_submodules_with_timeout(worktree_path, SUBMODULE_UPDATE_TIMEOUT)
 }
 
@@ -90,7 +90,7 @@ pub(crate) fn update_submodules_with_timeout(
 
 /// Check whether a repository has configured submodules by testing for a
 /// `.gitmodules` file in the worktree root.
-pub fn has_submodules(worktree_path: &Path) -> bool {
+pub(crate) fn has_submodules(worktree_path: &Path) -> bool {
     worktree_path.join(".gitmodules").exists()
 }
 
@@ -162,7 +162,7 @@ const MAX_SUBMODULE_NESTING: u32 = 10;
 /// cannot be opened) still contributes its own path, just nothing beneath
 /// it; a path that cannot be joined safely (`..`, absolute, …) is never
 /// descended into.
-pub fn recursive_submodule_paths(
+pub(crate) fn recursive_submodule_paths(
     worktree_path: &Path,
 ) -> Result<std::collections::BTreeSet<String>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
@@ -286,7 +286,7 @@ pub fn submodule_containing<'a>(
 /// itself, rather than something inside it). Spelling-insensitive in the same
 /// way as [`submodule_containing`]: `sub/`, `sub/.` and `./sub` all name the
 /// gitlink `sub`, and `ignore_case` folds case where the filesystem does.
-pub fn is_submodule_path(
+pub(crate) fn is_submodule_path(
     submodules: &std::collections::BTreeSet<String>,
     rel_path: &str,
     ignore_case: bool,
@@ -313,7 +313,7 @@ pub fn is_submodule_path(
 ///
 /// Matching folds case when the repo has `core.ignorecase` set (the default on
 /// macOS/Windows), where a case-variant spelling names the same file on disk.
-pub fn reject_submodule_internal_paths(repo: &Repository, paths: &[String]) -> Result<()> {
+pub(crate) fn reject_submodule_internal_paths(repo: &Repository, paths: &[String]) -> Result<()> {
     let submodules = submodule_paths(repo)?;
     if submodules.is_empty() {
         return Ok(());
