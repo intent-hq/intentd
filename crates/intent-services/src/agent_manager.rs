@@ -6565,6 +6565,31 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             }
         }
+        // auggie version gate (monorepo#1045): before a fresh child spawns,
+        // pick a version-compatible auggie by probing `--version` down the
+        // discovery-precedence candidate list and selecting the first new
+        // enough for the launch flags (`--acp/--allow-indexing/--model/
+        // --remove-tool`, which require auggie
+        // `AUGGIE_CLI_MIN_VERSION`+). A stale nvm auggie earlier on the
+        // daemon's minimal PATH is skipped rather than launched with flags it
+        // does not understand; if none qualify, fail fast with a clear,
+        // actionable error instead of a cryptic "Unknown arguments" spawn.
+        // Only for a fresh spawn (a reused live child already runs the binary
+        // it was spawned with) and never for the npx-fallback path. The probe
+        // is blocking (subprocess, ≤3s per candidate), so it runs off the
+        // runtime.
+        if resolved.provider.id == "auggie"
+            && resolved.provider_binary.is_some()
+            && !self.contains(agent_id)
+        {
+            let explicit = auggie_explicit_path_setting(&settings);
+            let selected = tokio::task::spawn_blocking(move || {
+                crate::auggie_cli::select_auggie_for_spawn(explicit.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
+            resolved.provider_binary = Some(selected);
+        }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
         // spawns, make sure the daemon-managed Unsloth server is running and
         // ready for the session's model, and thread the resulting endpoint
@@ -7921,6 +7946,24 @@ fn read_provider_path_setting(
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Explicit auggie path for the version-gated spawn selector:
+/// `context.auggiePath` wins over `providers.paths["auggie"]`, matching the
+/// transport-host precedence (`configured_auggie_path` /
+/// `resolve_auggie_override`). The gate's fail-fast error recommends
+/// `context.auggiePath`, so the spawn path must honor it.
+fn auggie_explicit_path_setting(
+    settings: &intent_core::settings_file::SettingsFile,
+) -> Option<String> {
+    settings
+        .context
+        .auggie_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| read_provider_path_setting(settings, "auggie"))
 }
 
 /// Background turn worker: drive the current message to completion, then drain
@@ -12487,6 +12530,67 @@ mod provider_path_override_tests {
             resolved.provider_binary.as_deref(),
             Some(opencode_stub.as_path())
         );
+    }
+}
+
+#[cfg(test)]
+mod auggie_explicit_path_tests {
+    //! Precedence for the auggie spawn selector's explicit path:
+    //! `context.auggiePath` wins over `providers.paths["auggie"]` (transport
+    //! parity — the gate's fail-fast error recommends `context.auggiePath`).
+
+    use super::*;
+
+    fn settings(
+        context_path: Option<&str>,
+        providers_path: Option<&str>,
+    ) -> intent_core::settings_file::SettingsFile {
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.context.auggie_path = context_path.map(str::to_string);
+        if let Some(p) = providers_path {
+            settings
+                .providers
+                .paths
+                .insert("auggie".to_string(), p.to_string());
+        }
+        settings
+    }
+
+    #[test]
+    fn context_auggie_path_wins_over_providers_paths() {
+        let s = settings(Some("/from/context/auggie"), Some("/from/providers/auggie"));
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/context/auggie")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_providers_paths_when_context_unset() {
+        let s = settings(None, Some("/from/providers/auggie"));
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/providers/auggie")
+        );
+    }
+
+    #[test]
+    fn blank_context_path_falls_back_and_value_is_trimmed() {
+        let s = settings(Some("   "), Some("/from/providers/auggie"));
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/providers/auggie")
+        );
+        let s = settings(Some("  /from/context/auggie  "), None);
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/context/auggie")
+        );
+    }
+
+    #[test]
+    fn none_when_neither_is_set() {
+        assert_eq!(auggie_explicit_path_setting(&settings(None, None)), None);
     }
 }
 

@@ -38,7 +38,7 @@ permissions:
 #
 # LOCAL CUSTOMIZATION (see "Create GitHub Release" below): every release is
 # published as a GitHub Pre-release regardless of the version suffix. Tagged
-# releases are the beta channel; promote-stable.yml clears the prerelease flag
+# releases are the alpha channel; promote-stable.yml clears the prerelease flag
 # and marks the promoted version as Latest.
 on:
   pull_request:

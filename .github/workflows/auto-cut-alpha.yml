@@ -1,11 +1,12 @@
-# Auto-merge of the release-plz Release PR — "auto-cut beta".
+# Auto-merge of the release-plz Release PR — "auto-cut alpha".
 #
-# Merging the Release PR is what cuts a beta: the squash-merge push to main
+# Merging the Release PR is what cuts an alpha: the squash-merge push to main
 # triggers release-plz.yml, which pushes the vX.Y.Z tag, and the tag triggers
-# the cargo-dist release build + beta manifest publish. That merge used to be
-# a manual click; this workflow performs it automatically whenever the
-# Release PR is already green, so betas ship hands-free. Stable promotion
-# stays manual (promote-stable.yml) — this workflow only affects beta.
+# the cargo-dist release build + alpha channel manifest publish. That merge
+# used to be a manual click; this workflow performs it automatically whenever
+# the Release PR is already green, so alphas ship hands-free. Beta and stable
+# promotions stay manual (promote-beta.yml / promote-stable.yml) — this
+# workflow only affects the alpha cut.
 #
 # Triggers — event-chained cut plus an hourly cron backstop:
 # - push to main: a merged change chains straight into a cut instead of
@@ -60,7 +61,7 @@
 # release job to push the tag. Fail-soft when the secret is absent (same
 # convention as INTENTD_RELEASES_TOKEN / MONOREPO_ISSUES_TOKEN).
 
-name: Auto-cut beta
+name: Auto-cut alpha
 
 permissions: {}
 
@@ -84,7 +85,7 @@ on:
 # because a run that has already decided to merge must not be cancelled
 # mid-merge.
 concurrency:
-  group: auto-cut-beta
+  group: auto-cut-alpha
   cancel-in-progress: false
 
 jobs:
@@ -292,7 +293,7 @@ jobs:
 
             # Pause guardrail (checked before any waiting): a human puts
             # `hold-release` on the Release PR to stop auto-cutting (e.g. to
-            # batch more changes or hold a bad commit out of a beta); remove
+            # batch more changes or hold a bad commit out of an alpha); remove
             # the label to resume. The label is already in $prs, so a held
             # PR exits immediately instead of polling for freshness first.
             if jq -e '.[0].labels | any(.name == "hold-release")' <<<"$prs" >/dev/null; then
@@ -422,14 +423,15 @@ jobs:
             fi
 
             # Squash-merge with the PAT so the push to main triggers
-            # release-plz.yml (tag push → cargo-dist build → beta manifest).
+            # release-plz.yml (tag push → cargo-dist build → alpha channel
+            # manifest).
             # The squash commit title defaults to the single release
             # commit's message, which release-plz writes in the same
             # conventional form as the PR title. A failure here is not
             # fatal: the PR state may have changed under us, and the next
             # scheduled run retries.
             if GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --squash; then
-              echo "Squash-merged Release PR #$number ($title); release-plz.yml now cuts the tag and the beta publishes automatically."
+              echo "Squash-merged Release PR #$number ($title); release-plz.yml now cuts the tag and the alpha publishes automatically."
             else
               echo "::warning::gh pr merge failed for Release PR #$number (state changed under us?); the next scheduled run retries"
             fi
