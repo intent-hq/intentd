@@ -2147,13 +2147,17 @@ impl Services {
         // network weather, not a terminal turn failure. The prompt is
         // re-dispatched on the SAME live connection with exponential backoff,
         // but ONLY while the attempt is provably output-free (no
-        // `session/update` received at all) and the notification channel is
-        // still open — nothing was streamed, persisted, or emitted, so the
-        // retried unit is idempotent. Once anything streamed, or once the
-        // budget is spent, the error falls through to the existing
-        // classification below (terminal / silent redrive / sleep-resume)
-        // unchanged. Genuinely terminal errors (auth, invalid request,
-        // model-not-found, 4xx) never classify transient and fail fast.
+        // `session/update` received at all), side-effect-free (no
+        // agent→client request — `fs/write_text_file`, `terminal/*`,
+        // `session/request_permission` — forwarded since the turn started,
+        // per the connection's client-request watermark) and the
+        // notification channel is still open — nothing was streamed,
+        // persisted, or emitted, so the retried unit is idempotent. Once
+        // anything streamed or side-effected, or once the budget is spent,
+        // the error falls through to the existing classification below
+        // (terminal / silent redrive / sleep-resume) unchanged. Genuinely
+        // terminal errors (auth, invalid request, model-not-found, 4xx)
+        // never classify transient and fail fast.
         //
         // Two boundary notes:
         // - Bridge-side idempotency is assumed, not proven: the guard proves
@@ -2168,6 +2172,10 @@ impl Services {
         //   (`worker.abort()`), which drops this whole future — sleep, loop,
         //   and all — so a retry can never re-dispatch after a stop.
         let mut fetch_retry_attempt: u32 = 0;
+        // Agent→client request watermark at turn start: any bump means a
+        // client-served handler may have side-effected on behalf of this
+        // turn, so the attempt is no longer provably idempotent.
+        let client_request_watermark = conn.client_request_seq();
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
             tokio::pin!(prompt_fut);
@@ -2207,6 +2215,7 @@ impl Services {
                     if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
                         && !closed
                         && !any_update_received
+                        && conn.client_request_seq() == client_request_watermark
                         && intent_acp::is_transient_provider_fetch_failure(e) =>
                 {
                     fetch_retry_attempt += 1;
@@ -2221,6 +2230,28 @@ impl Services {
                         "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
                     );
                     tokio::time::sleep(delay).await;
+                    // Re-drain after the backoff: a straggling update (or a
+                    // channel close) can land DURING the sleep, and
+                    // re-dispatching without observing it would duplicate
+                    // output the provider already streamed. If the recheck
+                    // flips any guard, fall through to classification with
+                    // this attempt's error instead of retrying.
+                    while let Ok(note) = notifications.try_recv() {
+                        activity.touch();
+                        any_update_received = true;
+                        updates_applied |= self
+                            .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                            .await;
+                    }
+                    if any_update_received || conn.client_request_seq() != client_request_watermark
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            attempt = fetch_retry_attempt,
+                            "output arrived during retry backoff — abandoning retry (monorepo#3007)"
+                        );
+                        break attempt_result;
+                    }
                 }
                 _ => break attempt_result,
             }

@@ -3474,6 +3474,123 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
     );
 }
 
+/// Mock agent that issues one side-effecting agent→client request
+/// (`fs/write_text_file`) and then fails `session/prompt` with a
+/// transient-shaped `-32603` — the request line is written BEFORE the error
+/// response on the same pipe, so the reader is guaranteed to bump the
+/// client-request watermark before the prompt future resolves.
+fn spawn_mock_agent_with_client_request_then_transient_failure<R, W>(
+    read: R,
+    write: W,
+    error_data: String,
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let req = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1000,
+                    "method": "fs/write_text_file",
+                    "params": { "sessionId": ACP_SID, "path": "/tmp/x", "content": "x" },
+                });
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": "Internal error", "data": error_data },
+                });
+                write
+                    .write_all(format!("{req}\n{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    });
+    (handle, prompt_calls)
+}
+
+/// Side-effect guard (monorepo#3007): a transient-shaped failure on an
+/// attempt that already issued an agent→client request (`fs/write_text_file`)
+/// is NOT retried — the handler may have side-effected (file written,
+/// terminal command run), so re-dispatching is no longer provably idempotent
+/// even though no `session/update` streamed.
+#[tokio::test]
+async fn transient_fetch_failure_after_client_request_is_not_retried() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (_agent, prompt_calls) = spawn_mock_agent_with_client_request_then_transient_failure(
+        c2a_agent,
+        a2c_agent,
+        FETCH_EPIPE_UNAVAILABLE.to_string(),
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-request failure is not retried in place");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-request failure keeps the terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "no retry after a side-effecting client request"
+    );
+}
+
 /// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the
 /// sleep-resume enrollment tests: reports a fixed overlap answer regardless of
 /// the queried window.
