@@ -72,6 +72,12 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
+          # LOCAL CUSTOMIZATION of this cargo-dist-generated file: the plan job
+          # runs on every PR/push and these uploads default to 90-day retention,
+          # accumulating thousands of artifacts against the org storage quota.
+          # Both are only downloaded by later jobs of the same run, so 1 day is
+          # safe. Re-apply this after any `dist generate`.
+          retention-days: 1
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.
@@ -88,6 +94,9 @@ jobs:
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
+          # LOCAL CUSTOMIZATION: same-run consumers only; see cargo-dist-cache
+          # above. Re-apply this after any `dist generate`.
+          retention-days: 1
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
