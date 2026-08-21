@@ -87,11 +87,13 @@ dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden 
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
 Revealing an existing tab is `showTab`-only.
 
-- `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by mounting it into a
-  panel. Owner-only: on a tab you do not own it returns the structured `not-owner`
-  error. `focus` defaults to false: the tab is mounted without being activated and
-  without moving panel focus; `focus: true` reveals AND activates — the tab becomes
-  the panel's active tab and the panel takes focus. Idempotent on an already-visible
+- `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by activating it in a
+  visible panel. Owner-only: on a tab you do not own it returns the structured
+  `not-owner` error. `focus` defaults to false: the tab is activated in a visible
+  panel without moving panel/keyboard focus and without displacing the
+  currently-viewed conversation; `focus: true` reveals AND focuses — the tab becomes
+  its panel's active tab and the panel takes focus. The reveal is persisted: a
+  revealed tab stays visible across app restarts. Idempotent on an already-visible
   tab: with `focus: false` it is a no-op success; with `focus: true` it still
   activates the tab and focuses its panel. An unknown `tabId` fails as an
   action-result error naming the unknown id.
@@ -109,8 +111,9 @@ Tab operations do not require the workspace to be currently open/visible in the 
 every action (`openTab` hidden or visible, `closeTab`, `showTab`, `evaluate`,
 `screenshot`, …) works regardless of workspace visibility — webviews spin up in the
 background as needed. Visibility/activation effects apply to the persisted layout
-state: `showTab` mounts (and with `focus: true`, activates) the tab in the
-workspace's layout so it is correct when the user next opens the workspace. When the
+state: `showTab` activates the tab in a visible panel of the workspace's layout (and
+with `focus: true`, also focuses it) so it is correct when the user next opens the
+workspace. When the
 workspace is not currently visible in the UI, no actual UI focus/activation is
 attempted: `showTab { focus: true }`, `focusTab`, and `openTab { visible: true }`
 succeed, apply their state effects, skip the UI focus attempt, and the action result

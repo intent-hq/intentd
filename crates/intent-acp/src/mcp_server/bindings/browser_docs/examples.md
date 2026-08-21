@@ -110,14 +110,14 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 // listTabs shows the tab with visibility: "hidden":
 // { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", ... }
 
-// Reveal it when the user should see it — mounted without stealing focus
+// Reveal it when the user should see it — activated in a visible panel without stealing focus
 {
   "actions": [
     { "action": "showTab", "tabId": "tab-bg1" }
   ]
 }
 
-// Reveal AND activate (explicit opt-in to moving focus)
+// Reveal AND focus (explicit opt-in to moving focus)
 {
   "actions": [
     { "action": "showTab", "tabId": "tab-bg1", "focus": true }
