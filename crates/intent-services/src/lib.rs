@@ -12787,6 +12787,27 @@ impl WorkspaceApi for Services {
                     ),
                 }
             }
+            // List-frame slimming (monorepo#3041), following the v4.2
+            // `diskUsage` precedent — optional fields simply never present on
+            // list rows, no wire-shape change. Applied after the join-merge so
+            // the guarantee also covers base rows served on the panic
+            // degradation path above (a base row still carries its persisted
+            // `tokenUsage`):
+            // - `tokenUsage` is detail-only (clients read it via
+            //   `workspace.getTokenUsage` + the tokenUsage-changed event,
+            //   never off list rows) and dominated large frames (~26% of a
+            //   real 180-workspace payload).
+            // - `agentSummary` on ARCHIVED rows: archived workspaces render
+            //   no HUD/coverflow agent cards, yet their accumulated sessions
+            //   made archived rows the bulk of the aggregate (~65% of
+            //   agentSummary bytes measured). Active rows keep the full
+            //   summary; `workspace.get` keeps both fields for detail reads.
+            for ws in &mut list {
+                ws.token_usage = None;
+                if ws.archived {
+                    ws.agent_summary = None;
+                }
+            }
             tracing::debug!(
                 workspaces = count,
                 total_ms = started.elapsed().as_millis() as u64,
@@ -12830,6 +12851,9 @@ impl WorkspaceApi for Services {
                 ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
                 ws.agent_summary = None;
                 ws.diff_summary = None;
+                // Detail-only on the wire (monorepo#3041): list rows never
+                // carry `tokenUsage` — same rationale as the full list path.
+                ws.token_usage = None;
                 ws.cow_supported = cow_supported;
                 // Keep PR fields if already on the row (cheap, already stored);
                 // do not fetch/refresh them here.
