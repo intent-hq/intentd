@@ -73,9 +73,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("proposal.") {
-        return proposal::dispatch(api, workspace_id, rest, args)
-            .await
-            .map(Some);
+        return proposal::dispatch(api, workspace_id, rest, args).map(Some);
     }
     if let Some(rest) = method.strip_prefix("settings.") {
         return settings::dispatch(api, workspace_id, rest, args)

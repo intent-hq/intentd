@@ -80,7 +80,7 @@ async fn rpc(
     resp["result"].clone()
 }
 
-async fn boot(
+fn boot(
     bus: &EventBus,
 ) -> (
     PathBuf,
@@ -134,7 +134,7 @@ async fn setup() -> (
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
     (
         socket,
         server,
@@ -163,7 +163,7 @@ async fn setup_with_bus() -> (
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
     (
         socket,
         server,

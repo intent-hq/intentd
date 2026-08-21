@@ -2028,7 +2028,7 @@ mod display_status_events {
         // End the run: during the grace window the status stays in_progress
         // (workspace_activity still reports AgentRunning) — no event yet
         // (assert_silent's 300ms watch sits inside the 500ms window).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_silent(&mut sub).await;
 
         // After the debounce window the demotion to idle emits.
@@ -2616,7 +2616,7 @@ mod display_status_events {
 
         let mut sub = subscribe(&h);
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // Wait out the debounced idle recompute: blocked outranks both
         // transitions, so nothing emits (assert_silent's 300ms watch
         // covers the 100ms debounce window).
@@ -2654,7 +2654,7 @@ mod display_status_events {
         // End then immediately begin again: the second begin cancels the
         // pending idle debounce, so no demotion ever emits (assert_silent's
         // 300ms watch covers the 100ms window).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         h.services.agent_activity_begin(&h.ws).await;
         assert_silent(&mut sub).await;
     }

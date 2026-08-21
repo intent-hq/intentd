@@ -235,6 +235,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_tracked_change_row(r: &SqliteRow) -> Result<TrackedChangeRow> {
     Ok(TrackedChangeRow {
         id: r.get("id"),

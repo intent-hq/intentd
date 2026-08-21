@@ -4496,12 +4496,12 @@ impl AgentManager {
     /// Release the in-flight slot without persisting agent status (used when
     /// terminal spawn failure already persisted Error status and we only need
     /// to release `busy/agent_ws` so a future message can restart the worker).
-    async fn release_in_flight_slot(&self, agent_id: &AgentId) {
+    fn release_in_flight_slot(&self, agent_id: &AgentId) {
         let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
         };
         if let Some(workspace_id) = workspace_id {
-            self.services.agent_activity_end(&workspace_id).await;
+            self.services.agent_activity_end(&workspace_id);
         }
     }
 
@@ -4528,7 +4528,7 @@ impl AgentManager {
             return;
         };
         if let Some(workspace_id) = workspace_id {
-            self.services.agent_activity_end(&workspace_id).await;
+            self.services.agent_activity_end(&workspace_id);
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
                 .await;
         }
@@ -5371,7 +5371,7 @@ impl AgentManager {
                         // Release the slot without overwriting the Error
                         // status just persisted, so `agent.retry` (or a
                         // future message) can redrive.
-                        self.release_in_flight_slot(&agent_id).await;
+                        self.release_in_flight_slot(&agent_id);
                     }
                 }
                 return;
@@ -5475,7 +5475,7 @@ impl AgentManager {
                 .await;
             // Release the slot without overwriting the Error status just
             // persisted, so `agent.retry` (or a future message) can redrive.
-            self.release_in_flight_slot(&agent_id).await;
+            self.release_in_flight_slot(&agent_id);
             return;
         }
         self.spawn_worker(
@@ -6414,7 +6414,7 @@ impl AgentManager {
         // episode too (monorepo#2863): drop the streak and any stale arm.
         self.services.clear_truncation_redrives(&agent_id);
         self.services.take_truncation_redrive(&agent_id);
-        self.release_in_flight_slot(&agent_id).await;
+        self.release_in_flight_slot(&agent_id);
 
         // Tear down any stale child handle (use kill_child_only to avoid
         // overwriting the status we just set)
@@ -8330,7 +8330,7 @@ async fn run_message_worker(
                                     &options,
                                 )
                                 .await;
-                                mgr.release_in_flight_slot(&agent_id).await;
+                                mgr.release_in_flight_slot(&agent_id);
                                 break 'outer;
                             }
                             continue 'outer;
@@ -8489,7 +8489,7 @@ async fn run_message_worker(
                                         &options,
                                     )
                                     .await;
-                                    mgr.release_in_flight_slot(&agent_id).await;
+                                    mgr.release_in_flight_slot(&agent_id);
                                     break 'outer;
                                 }
                                 continue 'outer;
@@ -8545,7 +8545,7 @@ async fn run_message_worker(
                                 &e,
                             )
                             .await;
-                            mgr.release_in_flight_slot(&agent_id).await;
+                            mgr.release_in_flight_slot(&agent_id);
                             break 'outer;
                         } else if suspend_interrupt_error(&e) {
                             // Sleep-induced interruption (Task C):
@@ -8627,7 +8627,7 @@ async fn run_message_worker(
                             // Release the in-flight slot without overwriting the
                             // Error status just persisted, so `agent.retry` (or a
                             // future message) can restart the worker.
-                            mgr.release_in_flight_slot(&agent_id).await;
+                            mgr.release_in_flight_slot(&agent_id);
                             break 'outer;
                         }
                     }
@@ -8658,7 +8658,7 @@ async fn run_message_worker(
                 // Release the in-flight slot without overwriting the Error status
                 // that handle_terminal_spawn_failure just persisted. This allows
                 // a future message (or agent.retry) to restart the worker.
-                mgr.release_in_flight_slot(&agent_id).await;
+                mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
         }
@@ -8770,7 +8770,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id).await;
+                        mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
                     }
                 }
@@ -8859,7 +8859,7 @@ async fn run_message_worker(
             if !user_persisted {
                 handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
                     .await;
-                mgr.release_in_flight_slot(&agent_id).await;
+                mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
             continue;
@@ -8993,7 +8993,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id).await;
+                        mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
                     }
                 }
@@ -9048,7 +9048,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id).await;
+                        mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
                     }
                 }
@@ -9115,7 +9115,7 @@ async fn run_message_worker(
             if !user_persisted {
                 handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
                     .await;
-                mgr.release_in_flight_slot(&agent_id).await;
+                mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
             continue 'outer;

@@ -68,6 +68,7 @@ fn debug_includes_variant_name() {
 
 #[test]
 fn result_alias_is_usable() {
+    #[allow(clippy::unnecessary_wraps)] // exercising the Result alias is the point of the test
     fn ok() -> Result<u32> {
         Ok(42)
     }

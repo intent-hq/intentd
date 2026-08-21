@@ -109,7 +109,7 @@ impl DiskUsageCache {
     /// → `(None, true)` while the first walk backfills. `refreshing` is
     /// `true` iff a walk for this directory is in flight or was just armed
     /// by this call.
-    pub(crate) async fn poll(
+    pub(crate) fn poll(
         self: &Arc<Self>,
         workspace_dir: PathBuf,
     ) -> (Option<WorkspaceDiskUsage>, bool) {
@@ -335,7 +335,7 @@ mod tests {
     /// Poll until the cache backfills an entry for `dir`.
     async fn poll_until_some(cache: &Arc<DiskUsageCache>, dir: &Path) -> WorkspaceDiskUsage {
         for _ in 0..200 {
-            if let (Some(u), _) = cache.poll(dir.to_path_buf()).await {
+            if let (Some(u), _) = cache.poll(dir.to_path_buf()) {
                 return u;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -423,14 +423,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_file(&dir.path().join("f.bin"), 8192);
         let cache = Arc::new(DiskUsageCache::new());
-        let (usage, refreshing) = cache.poll(dir.path().to_path_buf()).await;
+        let (usage, refreshing) = cache.poll(dir.path().to_path_buf());
         assert!(usage.is_none());
         assert!(refreshing, "first call arms the walk");
         let usage = poll_until_some(&cache, dir.path()).await;
         assert!(usage.bytes > 0);
         assert_eq!(usage.file_count, 1);
         drain_in_flight(&cache).await;
-        let (usage, refreshing) = cache.poll(dir.path().to_path_buf()).await;
+        let (usage, refreshing) = cache.poll(dir.path().to_path_buf());
         assert!(usage.is_some());
         assert!(!refreshing, "settled fresh entry is not refreshing");
     }
@@ -443,7 +443,7 @@ mod tests {
         let cache = Arc::new(DiskUsageCache::with_ttl(Duration::from_secs(3600)));
         let first = poll_until_some(&cache, dir.path()).await;
         write_file(&dir.path().join("g.bin"), 1 << 20);
-        let (served, refreshing) = cache.poll(dir.path().to_path_buf()).await;
+        let (served, refreshing) = cache.poll(dir.path().to_path_buf());
         assert_eq!(
             served.as_ref(),
             Some(&first),
@@ -466,7 +466,7 @@ mod tests {
         let old = poll_until_some(&cache, dir.path()).await;
         drain_in_flight(&cache).await;
         write_file(&dir.path().join("g.bin"), 1 << 20);
-        let (served, refreshing) = cache.poll(dir.path().to_path_buf()).await;
+        let (served, refreshing) = cache.poll(dir.path().to_path_buf());
         assert_eq!(
             served.unwrap().bytes,
             old.bytes,
@@ -474,7 +474,7 @@ mod tests {
         );
         assert!(refreshing, "stale entry reports the armed revalidation");
         for _ in 0..200 {
-            if let (Some(u), _) = cache.poll(dir.path().to_path_buf()).await {
+            if let (Some(u), _) = cache.poll(dir.path().to_path_buf()) {
                 if u.bytes > old.bytes {
                     return;
                 }
@@ -492,7 +492,7 @@ mod tests {
         write_file(&dir.path().join("f.bin"), 8192);
         let cache = Arc::new(DiskUsageCache::new());
         let guard = try_begin(&cache.in_flight, dir.path().to_path_buf()).unwrap();
-        let (usage, refreshing) = cache.poll(dir.path().to_path_buf()).await;
+        let (usage, refreshing) = cache.poll(dir.path().to_path_buf());
         assert!(usage.is_none());
         assert!(refreshing, "in-flight walk reports refreshing");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -519,7 +519,7 @@ mod tests {
             let dir = root.path().join(format!("ws-{index}"));
             fs::create_dir(&dir).unwrap();
             write_file(&dir.join("f.bin"), 8192);
-            assert!(cache.poll(dir).await.0.is_none());
+            assert!(cache.poll(dir).0.is_none());
         }
 
         assert_eq!(cache.in_flight.lock().unwrap().len(), DIR_COUNT);
@@ -552,10 +552,10 @@ mod tests {
             .usage
             .clone();
         fs::remove_dir_all(&ws).unwrap();
-        let served = cache.poll(ws.clone()).await.0.unwrap();
+        let served = cache.poll(ws.clone()).0.unwrap();
         assert_eq!(served, old);
         drain_in_flight(&cache).await;
-        let again = cache.poll(ws.clone()).await.0.unwrap();
+        let again = cache.poll(ws.clone()).0.unwrap();
         assert_eq!(again, old, "failed refresh retained last-good value");
     }
 
@@ -565,9 +565,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("never-created");
         let cache = Arc::new(DiskUsageCache::new());
-        assert!(cache.poll(ws.clone()).await.0.is_none());
+        assert!(cache.poll(ws.clone()).0.is_none());
         drain_in_flight(&cache).await;
-        assert!(cache.poll(ws.clone()).await.0.is_none());
+        assert!(cache.poll(ws.clone()).0.is_none());
         assert!(cache.entries.lock().unwrap().is_empty());
     }
 }

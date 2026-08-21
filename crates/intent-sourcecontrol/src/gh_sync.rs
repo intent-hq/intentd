@@ -492,6 +492,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn token() -> Option<SecretString> {
         Some(SecretString::from("gho_test_sync"))
     }
@@ -558,6 +559,7 @@ mod tests {
         sync_token_to_gh(store).await;
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn revoked() -> Option<SecretString> {
         Some(SecretString::from("gho_test_revoked"))
     }

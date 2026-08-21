@@ -90,6 +90,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_diff_row(r: &SqliteRow) -> Result<DiffRow> {
     Ok(DiffRow {
         id: r.get("id"),

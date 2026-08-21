@@ -276,6 +276,7 @@ mod tests {
         SitterArgs::parse_from(args.iter().map(OsString::from), env.map(OsString::from))
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option field it is compared against
     fn resolved(channel: Channel, origin: ChannelOrigin) -> Option<ResolvedChannel> {
         Some(ResolvedChannel { channel, origin })
     }

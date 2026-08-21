@@ -304,6 +304,7 @@ pub(crate) fn get_buffer(
 /// `isExecutingCommand` is the child's liveness (the spawned process is the
 /// running command). `daemon_boot_id` is the daemon's per-process boot id, so
 /// clients can tell which daemon lifetime a (possibly empty) list belongs to.
+#[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
 pub(crate) fn list(
     pty: &PtyHost,
     workspace_id: &WorkspaceId,

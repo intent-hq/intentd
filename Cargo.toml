@@ -10,18 +10,14 @@ homepage = "https://github.com/intent-hq/intentd"
 license = "Apache-2.0"
 
 # Pedantic ratchet: `clippy::pedantic` is enabled workspace-wide at `warn` (enforced by
-# the `-D warnings` gate). Every lint below currently fires somewhere in the workspace
-# and is explicitly allowed so the gate stays green. TEMPORARY(burndown) allows are
-# removed one by one as their findings are fixed; PERMANENT allows stay, with rationale.
+# the `-D warnings` gate). The burndown is complete — new findings are fixed or given a
+# per-site `#[allow]` with a one-line justification. PERMANENT allows stay, with rationale.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # PERMANENT: splitting hundreds of long functions is a risky mass refactor, not a warnings pass.
 too_many_lines = "allow"
 # PERMANENT: fixing means boxing futures broadly; a perf/architecture decision, out of scope.
 large_futures = "allow"
-# TEMPORARY(burndown): the allows below are removed as their findings are fixed.
-unnecessary_wraps = "allow"
-unused_async = "allow"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

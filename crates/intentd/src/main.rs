@@ -4124,6 +4124,7 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
 
 /// Print one setting (`settings.get` output shape) from the already-fetched
 /// `settings.get` result: value, type, default, origin, description.
+#[allow(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
 fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");

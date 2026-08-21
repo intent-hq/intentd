@@ -2229,7 +2229,7 @@ impl Services {
         if !is_dir {
             return Ok(serde_json::json!({ "refreshing": false }));
         }
-        let (usage, refreshing) = self.disk_usage.poll(dir).await;
+        let (usage, refreshing) = self.disk_usage.poll(dir);
         let mut result = serde_json::json!({ "refreshing": refreshing });
         if let Some(usage) = usage {
             result["diskUsage"] = serde_json::to_value(usage)
@@ -2299,7 +2299,7 @@ impl Services {
     /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
     /// within the window cancels the idle flip. A decrement with no tracked session
     /// is a no-op.
-    pub(crate) async fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
             match map.get_mut(workspace_id) {
@@ -26283,16 +26283,13 @@ impl Services {
                     ));
                 }
             };
-            if let Err(e) = self
-                .ac_advance_trunk(
-                    worktree,
-                    trunk,
-                    &commit_hash,
-                    has_remote_trunk,
-                    token.as_deref(),
-                )
-                .await
-            {
+            if let Err(e) = self.ac_advance_trunk(
+                worktree,
+                trunk,
+                &commit_hash,
+                has_remote_trunk,
+                token.as_deref(),
+            ) {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -26315,16 +26312,13 @@ impl Services {
                     ));
                 }
             };
-            if let Err(e) = self
-                .ac_advance_trunk(
-                    worktree,
-                    trunk,
-                    &current,
-                    has_remote_trunk,
-                    token.as_deref(),
-                )
-                .await
-            {
+            if let Err(e) = self.ac_advance_trunk(
+                worktree,
+                trunk,
+                &current,
+                has_remote_trunk,
+                token.as_deref(),
+            ) {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -26360,7 +26354,8 @@ impl Services {
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
     /// `token` is the caller-resolved GitHub token (the merge flow resolves it
     /// once via [`Self::ac_git_token`] and threads it through).
-    async fn ac_advance_trunk(
+    #[allow(clippy::unused_self)] // instance method for parity with the other ac_* steps
+    fn ac_advance_trunk(
         &self,
         worktree: &Path,
         trunk: &str,

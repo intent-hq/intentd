@@ -84,6 +84,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_link_row(r: &SqliteRow) -> Result<TaskAgentLink> {
     Ok(TaskAgentLink {
         workspace_id: WorkspaceId::from(r.get::<String, _>("workspace_id")),

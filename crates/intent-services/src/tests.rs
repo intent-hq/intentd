@@ -7705,7 +7705,7 @@ mod change_event_parity {
 
         // A nested begin/end pair stays non-zero → NO event is emitted.
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_eq!(
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::AgentRunning
@@ -7713,7 +7713,7 @@ mod change_event_parity {
 
         // Last session leaves flight: AgentRunning → Idle (emits idle after debounce).
         // If the nested pair had emitted, this would observe agent_running instead.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // Wait for debounce window to expire.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let ev = recv_one(&mut sub).await;
@@ -7730,7 +7730,7 @@ mod change_event_parity {
         assert_eq!(got.activity, WorkspaceActivity::Idle);
 
         // Decrementing past zero is a saturating no-op (no panic, stays Idle).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_eq!(
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::Idle
@@ -7753,7 +7753,7 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_eq!(ev["data"]["activity"], "agent_running");
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // Quickly re-begin activity within the debounce window (race scenario).
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7833,7 +7833,7 @@ mod change_event_parity {
         );
 
         // End agent activity: the workspace returns to idle after debounce window.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // During grace window, workspace_activity() still reports AgentRunning.
         assert_eq!(
             h.services.workspace_activity(&h.ws),
@@ -7894,7 +7894,7 @@ mod change_event_parity {
             "dismiss_attention MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// Regression for STAB-N: `archive_workspace` must derive activity.
@@ -7918,7 +7918,7 @@ mod change_event_parity {
             "archive_workspace MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// Regression for STAB-N: `unarchive_workspace` must derive activity.
@@ -7948,7 +7948,7 @@ mod change_event_parity {
             "unarchive_workspace MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// Regression for STAB-N: `mark_seen` must derive activity.
@@ -7974,7 +7974,7 @@ mod change_event_parity {
             "mark_seen MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// The BE raises `attention`, it persists across a store reload, the raise is
@@ -27798,7 +27798,7 @@ mod last_activity_events {
         assert_eq!(ev["data"]["activity"], "agent_running");
 
         // End agent activity → schedules idle flip after 100ms.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // Re-begin within the window → cancels the pending idle flip and emits AgentRunning.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -27831,7 +27831,7 @@ mod last_activity_events {
         );
 
         // Clean up.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
@@ -27853,7 +27853,7 @@ mod last_activity_events {
         assert_eq!(ev["data"]["activity"], "agent_running");
 
         // End agent activity → schedules idle flip after 100ms.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // Before the window expires, no idle event yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -27935,7 +27935,7 @@ mod last_activity_events {
         );
 
         // End agent activity → schedules idle flip after 100ms.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // During the grace window, workspace_activity() MUST still report AgentRunning.
         tokio::time::sleep(Duration::from_millis(50)).await;

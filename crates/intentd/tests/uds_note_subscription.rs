@@ -112,7 +112,7 @@ async fn rpc(
     resp["result"].clone()
 }
 
-async fn boot(
+fn boot(
     bus: &EventBus,
 ) -> (
     PathBuf,
@@ -150,7 +150,7 @@ async fn note_subscribe_snapshot_then_ordered_deltas() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     // RPC connection (mutations + their responses only).
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -267,7 +267,7 @@ async fn replace_group_swaps_and_firehose_coexists() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);

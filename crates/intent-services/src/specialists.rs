@@ -872,6 +872,7 @@ impl SpecialistsService {
     /// lower ones for the same id while `hidden` and the config scalars
     /// inherit across tiers (PROTOCOL §5.11). `workspace_path` adds the
     /// project tier.
+    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {

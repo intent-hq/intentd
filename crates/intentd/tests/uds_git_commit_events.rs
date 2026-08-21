@@ -183,7 +183,7 @@ async fn wait_for_sub_count(bus: &EventBus, target: usize) {
     );
 }
 
-async fn boot(
+fn boot(
     store: Store,
 ) -> (
     PathBuf,
@@ -253,7 +253,7 @@ async fn git_commit_emits_git_commit_and_changes_git_status_over_uds() {
     let ws = workspace_row(&ws_id, repo, "main");
     store.insert_workspace(&ws).await.expect("insert workspace");
 
-    let (socket, shutdown, server, bus, _ws_root, _sock_dir) = boot(store).await;
+    let (socket, shutdown, server, bus, _ws_root, _sock_dir) = boot(store);
 
     // Subscriber first (change events are point-in-time; no replay).
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
