@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.32] - 2026-08-21
+
+### 📚 Documentation
+
+- ShowTab reveals by activating in a visible panel without stealing focus ([#1384](https://github.com/intent-hq/intentd/pull/1384))
+
+
 ## [0.7.31] - 2026-08-21
 
 ### 🔧 Refactor
