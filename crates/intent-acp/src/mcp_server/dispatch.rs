@@ -356,7 +356,8 @@ impl WorkspaceMcpServer {
     /// inside the git tree — and a short redirect message (total size, limit,
     /// absolute path, head preview, inspection hints) is returned instead.
     /// When the redirect cannot be written (e.g. no resolvable workspace
-    /// directory) the untruncated output is returned — the tool call never
+    /// directory) a truncated head — never more than `max_chars` of the
+    /// output — is returned instead (monorepo#3038); the tool call never
     /// fails because of the redirect.
     async fn finalize_workspace_api_output(
         &self,
@@ -387,9 +388,17 @@ impl WorkspaceMcpServer {
             Err(reason) => {
                 tracing::warn!(
                     "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
-                     could not be redirected to a file ({reason}); returning it untruncated"
+                     could not be redirected to a file ({reason}); returning truncated head"
                 );
-                workspace_api_success(&text)
+                let head: String = text.chars().take(max_chars).collect();
+                workspace_api_success(&format!(
+                    "Output too large: {total_chars} characters (limit: {max_chars}). \
+                     The full output could NOT be written to a file ({reason}), so \
+                     everything past the first {max_chars} characters was dropped. \
+                     Re-run the call with a narrower query (filter, project fewer \
+                     fields, or page the results) to see the rest.\n\n\
+                     First {max_chars} characters:\n{head}"
+                ))
             }
         }
     }
