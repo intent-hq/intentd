@@ -45,7 +45,7 @@ pub async fn read_repo_config(repo_path: &Path) -> RepoConfig {
     let config_path = get_config_file_path(repo_path);
 
     match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => parse_repo_config_tolerant(&content, &format!("{repo_path:?}")),
+        Ok(content) => parse_repo_config_tolerant(&content, &repo_path.display().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // File doesn't exist — that's fine, return empty config
             RepoConfig::default()
@@ -95,7 +95,7 @@ pub(crate) async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> R
 
     // Ensure .intent directory exists
     tokio::fs::create_dir_all(&intent_dir).await.map_err(|e| {
-        intent_core::Error::Internal(format!("Failed to create .intent directory: {}", e))
+        intent_core::Error::Internal(format!("Failed to create .intent directory: {e}"))
     })?;
 
     // Ensure .gitignore exists (never overwrite)
@@ -103,7 +103,7 @@ pub(crate) async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> R
         tokio::fs::write(&gitignore_path, REPO_INTENT_GITIGNORE)
             .await
             .map_err(|e| {
-                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {}", e))
+                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {e}"))
             })?;
         tracing::info!("Created .intent/.gitignore at {:?}", gitignore_path);
     }
@@ -142,7 +142,7 @@ pub(crate) async fn merge_repo_config(
     }
 
     let config: RepoConfig = serde_json::from_value(Value::Object(merged))
-        .map_err(|e| intent_core::Error::InvalidParams(format!("invalid config: {}", e)))?;
+        .map_err(|e| intent_core::Error::InvalidParams(format!("invalid config: {e}")))?;
 
     let config_path = get_config_file_path(repo_path);
     write_config_file(&config_path, &config).await?;
@@ -171,13 +171,13 @@ async fn read_raw_config_object(repo_path: &Path) -> serde_json::Map<String, Val
 /// and write it to `config_path`.
 async fn write_config_file(config_path: &Path, config: &RepoConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config).map_err(|e| {
-        intent_core::Error::Internal(format!("Failed to serialize repo config: {}", e))
+        intent_core::Error::Internal(format!("Failed to serialize repo config: {e}"))
     })?;
-    let content_with_newline = format!("{}\n", content);
+    let content_with_newline = format!("{content}\n");
 
     tokio::fs::write(config_path, content_with_newline)
         .await
-        .map_err(|e| intent_core::Error::Internal(format!("Failed to write repo config: {}", e)))?;
+        .map_err(|e| intent_core::Error::Internal(format!("Failed to write repo config: {e}")))?;
 
     tracing::info!("Wrote repo config at {:?}", config_path);
     Ok(())
@@ -190,14 +190,14 @@ pub(crate) async fn ensure_intent_dir(repo_path: &Path) -> Result<()> {
     let gitignore_path = intent_dir.join(".gitignore");
 
     tokio::fs::create_dir_all(&intent_dir).await.map_err(|e| {
-        intent_core::Error::Internal(format!("Failed to create .intent directory: {}", e))
+        intent_core::Error::Internal(format!("Failed to create .intent directory: {e}"))
     })?;
 
     if !gitignore_path.exists() {
         tokio::fs::write(&gitignore_path, REPO_INTENT_GITIGNORE)
             .await
             .map_err(|e| {
-                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {}", e))
+                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {e}"))
             })?;
         tracing::info!("Initialized .intent directory at {:?}", gitignore_path);
     }
@@ -206,6 +206,7 @@ pub(crate) async fn ensure_intent_dir(repo_path: &Path) -> Result<()> {
 }
 
 /// Check if a repo has an `.intent/config.json` file.
+#[must_use]
 pub fn has_repo_config(repo_path: &Path) -> bool {
     get_config_file_path(repo_path).exists()
 }
@@ -357,7 +358,7 @@ mod tests {
     }
 
     /// Helper to build a merge patch from a JSON literal.
-    fn patch(v: Value) -> serde_json::Map<String, Value> {
+    fn patch(v: &Value) -> serde_json::Map<String, Value> {
         v.as_object().unwrap().clone()
     }
 
@@ -376,7 +377,7 @@ mod tests {
 
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -400,10 +401,12 @@ mod tests {
         };
         write_repo_config(repo.path(), config).await.unwrap();
 
-        let merged =
-            merge_repo_config(repo.path(), patch(serde_json::json!({"setupScript": null})))
-                .await
-                .unwrap();
+        let merged = merge_repo_config(
+            repo.path(),
+            patch(&serde_json::json!({"setupScript": null})),
+        )
+        .await
+        .unwrap();
         assert!(merged.setup_script.is_none());
         assert_eq!(merged.branch_prefix.as_deref(), Some("feature/"));
 
@@ -436,7 +439,7 @@ mod tests {
         // Unknown keys absent from the patch survive a merge.
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -446,7 +449,7 @@ mod tests {
         // Unknown keys present in the patch overwrite; explicit null clears them.
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"customKey": "updated", "anotherKey": null})),
+            patch(&serde_json::json!({"customKey": "updated", "anotherKey": null})),
         )
         .await
         .unwrap();
@@ -464,7 +467,7 @@ mod tests {
         let repo = temp_repo();
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -488,7 +491,7 @@ mod tests {
 
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -499,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn merge_invalid_field_type_errors() {
         let repo = temp_repo();
-        let err = merge_repo_config(repo.path(), patch(serde_json::json!({"branchPrefix": 42})))
+        let err = merge_repo_config(repo.path(), patch(&serde_json::json!({"branchPrefix": 42})))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid config"));

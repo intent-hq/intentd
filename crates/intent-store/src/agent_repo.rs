@@ -76,7 +76,7 @@ const MESSAGE_USAGE_JSON_SQL: &str = "json_object('usage', \
 /// covers pre-existing rows that are not.
 ///
 /// Must stay equivalent to the `WHERE` clause of the partial index
-/// `idx_agent_message_usage` (migration 0081) — SQLite only satisfies the
+/// `idx_agent_message_usage` (migration 0081) — `SQLite` only satisfies the
 /// filter from that index when the predicates match, and without the index
 /// the filter would load and JSON-parse every message body in the session.
 const MESSAGE_USAGE_PRESENT_SQL: &str = "CASE WHEN json_valid(content) THEN \
@@ -94,7 +94,7 @@ const MESSAGE_USAGE_PRESENT_SQL: &str = "CASE WHEN json_valid(content) THEN \
 /// with `agent_token_tally`'s fallback rule); a malformed snapshot/baseline
 /// decodes to `None` and stays on the fallback too.
 ///
-/// That fallback read is bounded (monorepo#1571): SQLite projects each
+/// That fallback read is bounded (monorepo#1571): `SQLite` projects each
 /// message's usage object ([`MESSAGE_USAGE_JSON_SQL`]) and drops rows carrying
 /// none ([`MESSAGE_USAGE_PRESENT_SQL`], satisfied from the partial index
 /// `idx_agent_message_usage`), so the bytes crossing the store boundary — and
@@ -135,7 +135,9 @@ pub(crate) async fn fetch_agent_usage_rows(
         // (monorepo#738) — and when it does run it projects usage metadata in
         // SQL rather than message bodies (monorepo#1571).
         let contents: Vec<serde_json::Value> =
-            if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+            if intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+                Vec::new()
+            } else {
                 let message_sql = format!(
                     "SELECT {MESSAGE_USAGE_JSON_SQL} AS usage_json FROM agent_message \
                      WHERE agent_id = ? AND {MESSAGE_USAGE_PRESENT_SQL} ORDER BY seq ASC"
@@ -154,8 +156,6 @@ pub(crate) async fn fetch_agent_usage_rows(
                         usage_json.and_then(|s| serde_json::from_str(&s).ok())
                     })
                     .collect()
-            } else {
-                Vec::new()
             };
 
         result.push((agent_id, model, snapshot, baseline, contents));
@@ -164,7 +164,7 @@ pub(crate) async fn fetch_agent_usage_rows(
 }
 
 /// Interrupted agent record (INT-41). Returned by
-/// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
+/// [`Store::list_interrupted_agents`], joined with `agent_session` and workspace.
 #[derive(Debug, Clone)]
 pub struct InterruptedAgent {
     pub agent_id: AgentId,
@@ -222,7 +222,7 @@ pub struct SessionMessageProjection {
     pub last_tool_use: Option<serde_json::Value>,
 }
 
-/// Per-block character cap applied inside SQLite when extracting projection
+/// Per-block character cap applied inside `SQLite` when extracting projection
 /// text (monorepo#1010 P1b). Assistant blocks keep their TAIL — the
 /// `AgentLite` preview is the last non-empty line and the `<agent_digest>`
 /// span is appended at the end — while user blocks keep their HEAD
@@ -376,13 +376,12 @@ fn batch_preview_col_values(messages: &[OwnedBatchMessage]) -> Result<BatchPrevi
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
-fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
-    v.as_ref()
-        .map(|value| {
-            serde_json::to_string(value)
-                .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
-        })
-        .transpose()
+fn json_col_to_db(v: Option<&serde_json::Value>) -> Result<Option<String>> {
+    v.map(|value| {
+        serde_json::to_string(value)
+            .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
+    })
+    .transpose()
 }
 
 /// Decode an optional JSON payload column back into its `serde_json::Value`.
@@ -398,9 +397,8 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
 /// staying NULL. `serde_json` string-array encoding is deterministic, so the
 /// encoded form doubles as the change-detection comparand in
 /// [`Store::set_agent_effort_levels`].
-fn effort_levels_to_db(levels: &Option<Vec<String>>) -> Result<Option<String>> {
+fn effort_levels_to_db(levels: Option<&Vec<String>>) -> Result<Option<String>> {
     levels
-        .as_ref()
         .map(|v| {
             serde_json::to_string(v)
                 .map_err(|e| Error::Internal(format!("encode effort_levels failed: {e}")))
@@ -433,18 +431,18 @@ fn bind_session_insert<'q>(
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
         .bind(&s.name)
-        .bind(s.name_explicitly_set as i64)
+        .bind(i64::from(s.name_explicitly_set))
         .bind(&s.model)
         .bind(&s.provider)
         .bind(enum_to_db(&s.status)?)
-        .bind(s.is_active as i64)
+        .bind(i64::from(s.is_active))
         .bind(&s.system_prompt)
         .bind(&s.created_at)
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.specialist)
         .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-        .bind(s.skip_auto_commit as i64)
+        .bind(i64::from(s.skip_auto_commit))
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
         .bind(&s.attention_request_kind)
@@ -452,10 +450,10 @@ fn bind_session_insert<'q>(
         .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
-        .bind(json_col_to_db(&s.context_references)?)
-        .bind(json_col_to_db(&s.image_blocks)?)
-        .bind(json_col_to_db(&s.file_blocks)?)
-        .bind(s.is_background as i64)
+        .bind(json_col_to_db(s.context_references.as_ref())?)
+        .bind(json_col_to_db(s.image_blocks.as_ref())?)
+        .bind(json_col_to_db(s.file_blocks.as_ref())?)
+        .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
@@ -463,27 +461,29 @@ fn bind_session_insert<'q>(
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
-        .bind(effort_levels_to_db(&s.effort_levels)?)
-        .bind(task_graph_enabled as i64)
+        .bind(effort_levels_to_db(s.effort_levels.as_ref())?)
+        .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
-        .bind(json_col_to_db(&s.harness_features)?))
+        .bind(json_col_to_db(s.harness_features.as_ref())?))
 }
 
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
     /// append messages via [`Store::append_agent_message`].
     ///
-    /// A UNIQUE violation on the id (a concurrent create raced past the
-    /// service-layer availability precheck) is `Error::InvalidParams` naming
-    /// the id — the same `-32602` contract as the precheck — so the
-    /// duplicate-id behavior stays robust under concurrency instead of
-    /// degrading to an opaque `-32603`.
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         self.insert_agent_session_with_task_graph(s, false).await
     }
 
     /// Insert a session with the daemon-owned task-graph feature snapshot that
     /// governs delivery-time teaching for the lifetime of this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
     pub async fn insert_agent_session_with_task_graph(
         &self,
         s: &AgentSession,
@@ -498,7 +498,7 @@ impl Store {
             .await
             .map_err(|e| {
                 if e.as_database_error()
-                    .is_some_and(|d| d.is_unique_violation())
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
                 {
                     // Agent ids are server-minted (`agent-{uuid}`), so a
                     // UNIQUE(id) violation is a server-side anomaly, not a
@@ -516,15 +516,19 @@ impl Store {
 
     /// Insert an agent-session row together with its full message log in ONE
     /// write transaction: either the session and every message commit, or
-    /// nothing does. Messages get minted UUIDv7 ids and 0-based monotonic
+    /// nothing does. Messages get minted `UUIDv7` ids and 0-based monotonic
     /// `seq` values in slice order. Built for the legacy-transcript importer,
     /// whose idempotency check is session-id presence — a partially-persisted
     /// transcript would otherwise be skipped forever on re-runs. The session's
     /// last-message preview columns (0066), `last_message_role` (0070), and
     /// `last_message_id` (0088) are computed from the batch inside
     /// the same transaction. Uses
-    /// whole-transaction retry to absorb SQLITE_BUSY (code 5) during lock
+    /// whole-transaction retry to absorb `SQLITE_BUSY` (code 5) during lock
     /// upgrade (STAB-7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_agent_session_with_messages(
         &self,
         s: &AgentSession,
@@ -580,7 +584,7 @@ impl Store {
                 sqlx::query(&insert_sql)
                     .bind(&id)
                     .bind(&s.id.0)
-                    .bind(idx as i64)
+                    .bind(i64::try_from(idx).unwrap_or(i64::MAX))
                     .bind(role)
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
@@ -615,6 +619,10 @@ impl Store {
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session(&self, id: &AgentId) -> Result<AgentSession> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
@@ -638,6 +646,10 @@ impl Store {
     /// message bodies (`agent.get` `AgentLite` projection, workspace scope
     /// checks — monorepo#958), skipping the full transcript hydration that
     /// `get_agent_session` performs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSession> {
         let sql = format!("SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
@@ -651,11 +663,63 @@ impl Store {
         }
     }
 
+    /// Batched status projection: the persisted [`AgentStatus`] of every id
+    /// in `ids`, in ONE `IN`-list query (the `agent.getSubscriptions`
+    /// `agentStatuses` map — intent-hq/monorepo#3018). Replaces a per-agent
+    /// `get_agent_session` loop that hydrated each agent's full message log
+    /// just to read `status`, so the caller stays at one statement and zero
+    /// transcript bytes regardless of how many agents are present. Ids
+    /// without a session row are simply absent from the result, and a row
+    /// whose stored `status` fails to decode (e.g. a daemon downgrade after
+    /// a newer build persisted a new variant) is skipped with a WARN — both
+    /// best-effort, matching the old loop's skip-on-error behavior; order is
+    /// unspecified. The id list is chunked well under `SQLite`'s 32766
+    /// bind-variable cap (same defense as `bulk_upsert_scripts`), so an
+    /// implausibly large `ids` costs extra statements instead of erroring.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_agent_statuses(&self, ids: &[AgentId]) -> Result<Vec<(AgentId, AgentStatus)>> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id, status FROM agent_session WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            let rows = query
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("get agent statuses failed: {e}")))?;
+            for row in &rows {
+                let id: String = row.get("id");
+                match enum_from_db::<AgentStatus>(&row.get::<String, _>("status")) {
+                    Ok(status) => out.push((AgentId(id), status)),
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %id,
+                            error = %e,
+                            "decode agent status failed; omitting agent from status batch"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Read the daemon-owned task-graph snapshot captured when this agent was
     /// created. Prefers the whole-harness `harness_features` snapshot's
     /// `taskGraph` value (0096) and falls back to the legacy
     /// `task_graph_enabled` column (0095) for pre-snapshot rows — behavior
     /// identical for every row written before the fold.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_task_graph_enabled(&self, id: &AgentId) -> Result<bool> {
         sqlx::query_scalar::<_, i64>(
             "SELECT COALESCE(harness_features ->> '$.taskGraph', task_graph_enabled) \
@@ -678,6 +742,10 @@ impl Store {
     /// list ordering. Returns the persisted value after the conditional write
     /// (a lost race returns the winner's snapshot). `NotFound` if the session
     /// is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn materialize_agent_session_harness_features(
         &self,
         id: &AgentId,
@@ -710,6 +778,10 @@ impl Store {
     /// a single column and skips the full message-log fetch that
     /// `get_agent_session` performs. `NotFound` if the session is absent,
     /// matching `get_agent_session`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_status(&self, id: &AgentId) -> Result<AgentStatus> {
         let row = sqlx::query("SELECT status FROM agent_session WHERE id = ?")
             .bind(&id.0)
@@ -724,6 +796,10 @@ impl Store {
 
     /// Lightweight timestamp-only lookup for daemon-global active-agent probes.
     /// Selects no session metadata or transcript content.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_updated_at(&self, id: &AgentId) -> Result<String> {
         let row = sqlx::query("SELECT updated_at FROM agent_session WHERE id = ?")
             .bind(&id.0)
@@ -739,6 +815,10 @@ impl Store {
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
     /// full message-log fetch that `get_agent_session` performs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_name(&self, id: &AgentId) -> Result<Option<String>> {
         let row = sqlx::query("SELECT name FROM agent_session WHERE id = ?")
             .bind(&id.0)
@@ -749,6 +829,10 @@ impl Store {
     }
 
     /// List a workspace's sessions (each with its message log), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_sessions(
         &self,
         workspace_id: &WorkspaceId,
@@ -772,10 +856,14 @@ impl Store {
 
     /// List a workspace's sessions WITHOUT message logs, oldest first. Used by hot
     /// paths (`derive_last_activity`, `enrich_workspace_aggregates`) that only need
-    /// session metadata (name, status, updated_at, etc.) and never read the message
+    /// session metadata (name, status, `updated_at`, etc.) and never read the message
     /// bodies (finding F1: eliminates full agent-message-log hydration from
     /// `workspace.list` / `workspace.get` emit). Reuses the `list_all_agent_sessions`
     /// row-mapping pattern (§9.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
@@ -801,8 +889,12 @@ impl Store {
     /// never decoded as JSON and never loading overflow pages — so
     /// coordinators can see session-size pressure before turns start dying
     /// under context bloat (intent-hq/monorepo#2669). Returns a map keyed
-    /// by agent_id with `(message_count, has_assistant, conversation_bytes)`
+    /// by `agent_id` with `(message_count, has_assistant, conversation_bytes)`
     /// tuples.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_message_stats(
         &self,
         workspace_id: &WorkspaceId,
@@ -828,9 +920,9 @@ impl Store {
             stats.insert(
                 agent_id,
                 (
-                    message_count as u64,
+                    message_count.cast_unsigned(),
                     assistant_count != 0,
-                    conversation_bytes.max(0) as u64,
+                    conversation_bytes.max(0).cast_unsigned(),
                 ),
             );
         }
@@ -846,8 +938,12 @@ impl Store {
     /// `agent_message.content` is never touched on this path. A NULL or
     /// corrupt column degrades to `None` ([`decode_preview_col`]) rather than
     /// being repaired; it converges the next time a message is appended.
-    /// Returns a map keyed by agent_id with one entry per session in the
+    /// Returns a map keyed by `agent_id` with one entry per session in the
     /// workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_message_projections(
         &self,
         workspace_id: &WorkspaceId,
@@ -871,7 +967,7 @@ impl Store {
             projections.insert(
                 agent_id,
                 SessionMessageProjection {
-                    message_count: message_count as u64,
+                    message_count: message_count.cast_unsigned(),
                     last_assistant_text_blocks: decode_preview_col(
                         row.get("last_assistant_preview"),
                     ),
@@ -891,6 +987,10 @@ impl Store {
     /// persisted preview columns (0066) plus a correlated message count. A
     /// session with no messages (or an unknown agent id) returns the zero
     /// projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_message_projection(
         &self,
         agent_id: &AgentId,
@@ -909,7 +1009,7 @@ impl Store {
         };
         let message_count: i64 = row.get("message_count");
         Ok(SessionMessageProjection {
-            message_count: message_count as u64,
+            message_count: message_count.cast_unsigned(),
             last_assistant_text_blocks: decode_preview_col(row.get("last_assistant_preview")),
             last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
             last_message_role: row.get("last_message_role"),
@@ -918,25 +1018,29 @@ impl Store {
         })
     }
 
-    /// Get the agent_message watermark for a workspace: the count of messages
+    /// Get the `agent_message` watermark for a workspace: the count of messages
     /// across all agents. This is used by the token-usage scan loop to skip
     /// workspaces that have not changed since the last scan (finding F2).
     /// Returns 0 for workspaces with no agents or no messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_message_watermark(&self, workspace_id: &WorkspaceId) -> Result<u64> {
-        let sql = r#"
+        let sql = r"
             SELECT COUNT(*) as count
             FROM agent_message
             WHERE agent_id IN (
                 SELECT id FROM agent_session WHERE workspace_id = ?
             )
-        "#;
+        ";
         let row = sqlx::query(sql)
             .bind(&workspace_id.0)
             .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get workspace message watermark failed: {e}")))?;
         let count: i64 = row.get("count");
-        Ok(count as u64)
+        Ok(count.cast_unsigned())
     }
 
     /// Upsert one session's cumulative end-of-turn token-usage snapshot
@@ -945,6 +1049,10 @@ impl Store {
     /// summed). Scoped to `workspace_id` (defense-in-depth — matches the
     /// pattern of the other `agent_session` update helpers). `NotFound` if
     /// the session row is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_token_usage(
         &self,
         workspace_id: &WorkspaceId,
@@ -984,6 +1092,10 @@ impl Store {
     /// matches NULL), so a resolution is never attached to a model a
     /// concurrent `agent.setModel` changed. Returns whether the write
     /// landed. Scoped to `workspace_id` (defense-in-depth).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_resolved_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -1026,6 +1138,10 @@ impl Store {
     /// the new model. Idempotent: an absent row or an already-NULL column is
     /// a no-op, not an error — the caller just updated the session, so
     /// nothing actionable hides behind a zero row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_agent_session_resolved_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -1048,6 +1164,10 @@ impl Store {
     /// [`Store::set_agent_session_last_turn_model`]. Scoped to `workspace_id`
     /// (defense-in-depth). `NotFound` if the session row is absent or the
     /// workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_last_turn_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -1078,6 +1198,10 @@ impl Store {
     /// turn" identity. `model` is the spawn-resolved model id (`None` for
     /// the provider default). Scoped to `workspace_id` (defense-in-depth);
     /// an absent row is a no-op (the caller just read the session).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_last_turn_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -1112,6 +1236,10 @@ impl Store {
     /// placeholder/absent models (D13). Scoped to `workspace_id`
     /// (defense-in-depth). `NotFound` if the session row is absent or the
     /// workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     #[allow(clippy::type_complexity)]
     pub async fn get_agent_session_token_usage(
         &self,
@@ -1149,17 +1277,21 @@ impl Store {
     }
 
     /// Get lightweight usage data for all agents in a workspace: for each agent,
-    /// returns the agent_id, model, the persisted end-of-turn `token_usage`
+    /// returns the `agent_id`, model, the persisted end-of-turn `token_usage`
     /// snapshot (if any), the persisted `token_usage_baseline` folded from
     /// prior ACP sessions (if any, monorepo#737), and per-message usage
-    /// metadata (for tallying without full AgentSession hydration; finding F2).
+    /// metadata (for tallying without full `AgentSession` hydration; finding F2).
     /// Messages are read ONLY for sessions whose decoded snapshot and baseline
     /// carry no token report — the tally falls back to message sums for those
     /// alone (see `agent_token_tally`), so report-backed sessions return an
-    /// empty list (monorepo#738) — and that read is bounded: SQLite projects
+    /// empty list (monorepo#738) — and that read is bounded: `SQLite` projects
     /// each message's usage metadata and drops rows carrying none, so message
     /// bodies never cross the boundary (monorepo#1571). A malformed
     /// snapshot/baseline decodes to `None` and therefore stays on the fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_agent_usage_data(
         &self,
         workspace_id: &WorkspaceId,
@@ -1177,6 +1309,10 @@ impl Store {
     /// crash has no live worker after restart, so the heal sweeps the whole
     /// table once before serving. Sessions are returned WITHOUT their message
     /// logs (the heal does not need them) to keep the sweep O(rows).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
         let rows = sqlx::query(&sql)
@@ -1198,6 +1334,10 @@ impl Store {
     /// general session writers. The one intentional provider change — a
     /// cross-provider `agent.setModel` — goes through the narrow
     /// [`Store::set_agent_session_model`] instead (monorepo#882).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_agent_session(
         &self,
         workspace_id: &WorkspaceId,
@@ -1264,25 +1404,25 @@ impl Store {
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
         .bind(&s.name)
-        .bind(s.name_explicitly_set as i64)
+        .bind(i64::from(s.name_explicitly_set))
         .bind(&s.model)
         .bind(&s.provider)
         .bind(enum_to_db(&s.status)?)
-        .bind(s.is_active as i64)
+        .bind(i64::from(s.is_active))
         .bind(&s.system_prompt)
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.specialist)
         .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-        .bind(s.skip_auto_commit as i64)
+        .bind(i64::from(s.skip_auto_commit))
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
-        .bind(json_col_to_db(&s.context_references)?)
-        .bind(json_col_to_db(&s.image_blocks)?)
-        .bind(json_col_to_db(&s.file_blocks)?)
-        .bind(s.is_background as i64)
+        .bind(json_col_to_db(s.context_references.as_ref())?)
+        .bind(json_col_to_db(s.image_blocks.as_ref())?)
+        .bind(json_col_to_db(s.file_blocks.as_ref())?)
+        .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
@@ -1311,6 +1451,10 @@ impl Store {
     /// writer is still rejected by [`Store::update_agent_session`]'s
     /// immutability guard. Scoped to `workspace_id` (defense-in-depth).
     /// `NotFound` if the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -1349,6 +1493,10 @@ impl Store {
     /// `agent.setModel` write this call must not stomp. Scoped to
     /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
     /// or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_system_prompt(
         &self,
         workspace_id: &WorkspaceId,
@@ -1379,6 +1527,10 @@ impl Store {
     /// write would clear every column absent from the summary. Scoped to
     /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
     /// or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_agent_session_metadata(
         &self,
         workspace_id: &WorkspaceId,
@@ -1420,6 +1572,10 @@ impl Store {
     /// callers re-read and retry); `NotFound` when the session is absent or
     /// the workspace does not match. `updated_at` is refreshed on a successful
     /// write only.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_metadata_key(
         &self,
         workspace_id: &WorkspaceId,
@@ -1449,7 +1605,7 @@ impl Store {
         .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
-        .bind(guarded as i64)
+        .bind(i64::from(guarded))
         .bind(key)
         .bind(expected_value)
         .execute(self.write_pool())
@@ -1493,6 +1649,10 @@ impl Store {
     /// `stop_reason_timestamp` is coupled to `stop_reason`: setting a reason
     /// stamps the column with `updated_at`, clearing the reason clears it, and
     /// leaving the reason untouched leaves the timestamp untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_agent_session_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -1510,7 +1670,7 @@ impl Store {
                      WHERE id=? AND workspace_id=?",
                 )
                 .bind(enum_to_db(&status)?)
-                .bind(is_active as i64)
+                .bind(i64::from(is_active))
                 .bind(updated_at)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
@@ -1530,7 +1690,7 @@ impl Store {
                      WHERE id=? AND workspace_id=?",
                 )
                 .bind(enum_to_db(&status)?)
-                .bind(is_active as i64)
+                .bind(i64::from(is_active))
                 .bind(updated_at)
                 .bind(reason)
                 .bind(stop_reason_timestamp)
@@ -1556,6 +1716,10 @@ impl Store {
     /// `workspace_id` (defense-in-depth guard — matches the pattern of
     /// `set_agent_session_status` and `update_agent_session`). `NotFound` if
     /// the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn refresh_agent_session_timestamp(
         &self,
         workspace_id: &WorkspaceId,
@@ -1585,6 +1749,10 @@ impl Store {
     /// was set (the common case — no write, no event). Scoped to `workspace_id`
     /// (defense-in-depth). `updated_at` is refreshed to the supplied timestamp.
     /// `NotFound` if the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn clear_completion_report(
         &self,
         workspace_id: &WorkspaceId,
@@ -1640,6 +1808,10 @@ impl Store {
     /// request nor clobber a fresh one. Scoped to `workspace_id`
     /// (defense-in-depth). `NotFound` if the session is absent or the
     /// workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_attention_request(
         &self,
         workspace_id: &WorkspaceId,
@@ -1676,6 +1848,10 @@ impl Store {
     /// `workspace_id` (defense-in-depth); `updated_at` is refreshed to the
     /// supplied timestamp. `NotFound` if the session is absent or the
     /// workspace does not match. Mirrors [`Store::clear_completion_report`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn clear_attention_request(
         &self,
         workspace_id: &WorkspaceId,
@@ -1721,6 +1897,10 @@ impl Store {
     /// from the caller). The ONLY post-insert mutator of the column (the
     /// full-row [`Store::update_agent_session`] deliberately excludes it).
     /// `NotFound` if the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_agent_effort_levels(
         &self,
         workspace_id: &WorkspaceId,
@@ -1728,7 +1908,7 @@ impl Store {
         levels: Option<&[String]>,
         updated_at: &str,
     ) -> Result<bool> {
-        let encoded = effort_levels_to_db(&levels.map(<[String]>::to_vec))?;
+        let encoded = effort_levels_to_db(levels.map(<[String]>::to_vec).as_ref())?;
         let rows = sqlx::query(
             "UPDATE agent_session SET effort_levels=?, updated_at=? \
              WHERE id=? AND workspace_id=? AND effort_levels IS NOT ?",
@@ -1765,19 +1945,27 @@ impl Store {
     /// a daemon restart, so any `is_active=1` flag after boot is stale. Called
     /// early in startup (before listeners) to ensure no races with live turn
     /// spawns. Returns the count of rows reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn reset_all_active_flags(&self) -> Result<usize> {
         let rows = sqlx::query("UPDATE agent_session SET is_active=0 WHERE is_active=1")
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("reset active flags failed: {e}")))?
             .rows_affected();
-        Ok(rows as usize)
+        Ok(usize::try_from(rows).unwrap_or(usize::MAX))
     }
 
     /// Set `acp_session_id` write-once (the provider `session:created` path).
     /// Scoped to `workspace_id` (defense-in-depth). Errors if it is already set
     /// to a different value (§9.5). `NotFound` if the session is absent or the
     /// workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn set_acp_session_id(
         &self,
         workspace_id: &WorkspaceId,
@@ -1822,6 +2010,10 @@ impl Store {
     /// CAS-loss (diverged) branch writes nothing and therefore never folds;
     /// the CAS predicate is re-checked inside the write transaction, so a
     /// swap that races between this read and the write also loses cleanly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist or belongs to a different workspace; `Error::Internal` if the transactional read or write fails.
     pub async fn replace_acp_session_id(
         &self,
         workspace_id: &WorkspaceId,
@@ -1871,7 +2063,7 @@ impl Store {
     /// IMMEDIATE mode acquires the RESERVED (write) lock upfront — readers may
     /// still proceed, especially in WAL mode — avoiding the
     /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
     /// `max_connections=1` on the write pool, concurrent writers serialize at
     /// `pool.acquire()` instead. The CAS-loss early return happens before any
     /// write statement, so the guard's COMMIT closes a read-only transaction —
@@ -1915,15 +2107,14 @@ impl Store {
                 return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
             }
             let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
-                .map(|r| {
+                .map_or((None, None), |r| {
                     (
                         r.get::<Option<String>, _>("token_usage")
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         r.get::<Option<String>, _>("token_usage_baseline")
                             .and_then(|s| serde_json::from_str(&s).ok()),
                     )
-                })
-                .unwrap_or((None, None));
+                });
             let folded = match (&baseline, &snapshot) {
                 (None, None) => None,
                 (b, s) => {
@@ -1970,6 +2161,10 @@ impl Store {
     /// Delete an agent session and its message log (the `agent_message` rows
     /// cascade). Scoped to `workspace_id` (defense-in-depth). Returns whether a
     /// row was removed (`agent.delete`, §5.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_agent_session(
         &self,
         workspace_id: &WorkspaceId,
@@ -2126,7 +2321,7 @@ async fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
 
 /// [`thumbnails_col_value`] for a whole batch, positionally aligned with
 /// `messages`. Awaited before the batch write transaction opens, so a
-/// SQLITE_BUSY retry re-runs only the SQL, never the image work.
+/// `SQLITE_BUSY` retry re-runs only the SQL, never the image work.
 async fn batch_thumbnails_col_values(messages: &[OwnedBatchMessage]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(messages.len());
     for (_, content, _, _) in messages {
@@ -2141,7 +2336,7 @@ async fn batch_thumbnails_col_values(messages: &[OwnedBatchMessage]) -> Vec<Opti
 /// (intent-services `search_ops`) so index and preview agree: a bare JSON
 /// string is used as-is, an array of content blocks contributes each block's
 /// string `text` field joined by single spaces (order pinned to the array
-/// index via aggregate `ORDER BY`, SQLite 3.44+), and any other shape falls
+/// index via aggregate `ORDER BY`, `SQLite` 3.44+), and any other shape falls
 /// back to its compact JSON encoding. The `json_valid` guard keeps non-JSON
 /// content (impossible from the store's serde-encoded write paths) from
 /// erroring the statement. The 0074 migration's triggers/backfill embed the
@@ -2241,6 +2436,10 @@ impl Store {
     /// soft, so a decisively better bm25 match still wins. Rows order by
     /// adjusted rank, then newest-first, one row per matching message.
     /// `limit` `None` → no cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn search_agent_messages_fts(
         &self,
         match_expr: &str,
@@ -2301,8 +2500,12 @@ impl Store {
             .collect()
     }
 
-    /// Append a message to an agent's insert-only log, minting a UUIDv7 id and
+    /// Append a message to an agent's insert-only log, minting a `UUIDv7` id and
     /// the next monotonic `seq`, and return the persisted [`AgentMessage`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if allocating the next `seq`, encoding the message, or the insert transaction fails.
     pub async fn append_agent_message(
         &self,
         agent_id: &AgentId,
@@ -2320,6 +2523,10 @@ impl Store {
     /// stored verbatim as JSON on the row and round-trips on transcript reads;
     /// callers with no per-message metadata continue to use
     /// [`Store::append_agent_message`] which stores `NULL`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if allocating the next `seq`, encoding the message, or the insert transaction fails.
     pub async fn append_agent_message_with_metadata(
         &self,
         agent_id: &AgentId,
@@ -2357,12 +2564,16 @@ impl Store {
     /// MAX. Only the INSERT transaction commits data, so once it completes the
     /// message row (and its preview column) is durable. No committed message can
     /// be lost. Assistant-message append
-    /// (the streaming path) is additionally protected by the AgentManager's
+    /// (the streaming path) is additionally protected by the `AgentManager`'s
     /// per-agent single-flight slot, serializing turns for one agent and
     /// eliminating the seq-race window on that hot path. User-message appends
     /// (sendMessage, sendQueuedMessageNow, wake delivery) can still race if fired
     /// concurrently for one agent, but the UNIQUE constraint will reject
     /// duplicates rather than silently corrupting the seq order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if allocating the next `seq`, encoding the message/metadata, or the insert transaction fails.
     pub async fn append_agent_message_with_id(
         &self,
         agent_id: &AgentId,
@@ -2486,6 +2697,10 @@ impl Store {
     /// Read an agent's messages in chronological (`seq` ascending) order. When
     /// `limit` is set, returns the most-recent `limit` messages (still ordered
     /// oldest→newest), matching `agent.getConversation` (PROTOCOL §5.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_messages(
         &self,
         agent_id: &AgentId,
@@ -2519,6 +2734,10 @@ impl Store {
     /// service-layer alternative pages full rows (content blobs included)
     /// back until it finds a non-system row. `None` when the log is empty or
     /// all-system.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_last_non_system_message(
         &self,
         agent_id: &AgentId,
@@ -2540,6 +2759,10 @@ impl Store {
     /// over the primary key, at most ONE decoded message regardless of
     /// transcript size. `None` when the id is unknown or belongs to a
     /// different agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_message_by_id(
         &self,
         agent_id: &AgentId,
@@ -2564,6 +2787,10 @@ impl Store {
     /// unique. One aggregate statement over `idx_agent_parent`, so cost is
     /// O(this agent's children), never O(workspace sessions). Backs the
     /// `runningSubAgents` snapshot field.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_unsettled_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
         let terminal = [
             AgentStatus::Completed,
@@ -2585,11 +2812,15 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("count unsettled child agents failed: {e}")))?
         .get::<i64, _>("n");
-        Ok(n as u64)
+        Ok(n.cast_unsigned())
     }
 
     /// Total number of messages logged for an agent (`agent.getConversation`
     /// `totalMessages`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_agent_messages(&self, agent_id: &AgentId) -> Result<i64> {
         let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM agent_message WHERE agent_id = ?")
             .bind(&agent_id.0)
@@ -2606,6 +2837,10 @@ impl Store {
     /// rows over the `UNIQUE(agent_id, seq)` index without fetching or
     /// decoding any `content`. An unknown message id (or a row belonging to a
     /// different agent) resolves to `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_message_index(
         &self,
         agent_id: &AgentId,
@@ -2632,6 +2867,10 @@ impl Store {
     /// caller slices it, this selects and decodes only the requested page.
     /// Out-of-range windows (offset at/past the end, or an empty log) return
     /// an empty vec. Negative inputs are clamped to zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_messages_page(
         &self,
         agent_id: &AgentId,
@@ -2660,6 +2899,10 @@ impl Store {
     /// stored JSON map `{"<image ordinal>": {"data", "mimeType"}}`; a row
     /// whose stored JSON fails to decode is skipped with a WARN (slim reads
     /// then degrade to data-omitted flags, same as a legacy row).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_agent_message_thumbnails(
         &self,
         agent_id: &AgentId,
@@ -2702,7 +2945,7 @@ impl Store {
     }
 
     /// Atomically clear the agent's message log and reinsert `messages` under
-    /// fresh 0-based monotonic `seq` values. Row ids are minted here (UUIDv7)
+    /// fresh 0-based monotonic `seq` values. Row ids are minted here (`UUIDv7`)
     /// so callers cannot smuggle stale ids across the swap; the returned
     /// [`AgentMessage`]s carry the new id/`seq` pairing. Used by the FE's
     /// edit-truncate transcript-mutation path (`agent.replaceMessages`,
@@ -2713,8 +2956,12 @@ impl Store {
     /// recomputed from the replacement batch inside the same transaction
     /// (NULL when the batch has no message of that role / no user/assistant
     /// message).
-    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn replace_agent_messages(
         &self,
         agent_id: &AgentId,
@@ -2758,7 +3005,7 @@ impl Store {
                 "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
             );
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
-                let seq = idx as i64;
+                let seq = i64::try_from(idx).unwrap_or(i64::MAX);
                 let id = Uuid::now_v7().to_string();
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
@@ -2823,6 +3070,10 @@ impl Store {
     /// Record an interrupted in-flight agent. Upserts: if a pending row exists
     /// (daemon restarted before resumption), updates to the latest state. Returns
     /// `true` if inserted/updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the upsert fails.
     pub async fn insert_interrupted_agent(
         &self,
         agent_id: &AgentId,
@@ -2847,6 +3098,10 @@ impl Store {
     /// while the daemon-restart / heal paths pass `None` (untouched by
     /// auto-resume). The idempotent upsert refreshes the reason too, so a row
     /// re-enrolled under a new reason carries the latest one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the upsert fails.
     pub async fn insert_interrupted_agent_with_reason(
         &self,
         agent_id: &AgentId,
@@ -2876,8 +3131,12 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// List pending interrupted agents, joined with agent_session (name) and
+    /// List pending interrupted agents, joined with `agent_session` (name) and
     /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
                           ia.reason, ag.name AS agent_name, w.title AS workspace_name \
@@ -2905,6 +3164,10 @@ impl Store {
     }
 
     /// Get a single pending interrupted agent by ID. Returns None if not found or not pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_interrupted_agent(
         &self,
         agent_id: &AgentId,
@@ -2937,6 +3200,10 @@ impl Store {
     /// Set the resolution (resumed|abandoned) for an interrupted agent. Returns
     /// `true` if a pending row was updated, `false` if the agent was not found or
     /// already resolved (caller should fail the operation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_interrupted_resolution(
         &self,
         agent_id: &AgentId,
@@ -2955,9 +3222,13 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Reset an interrupted agent row back to pending (resolution=NULL, resolved_at=NULL).
+    /// Reset an interrupted agent row back to pending (resolution=NULL, `resolved_at=NULL`).
     /// Used when a resume attempt claimed the row but failed post-claim, to restore
     /// retryability. Returns `true` if a row was updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn reset_interrupted_resolution(&self, agent_id: &AgentId) -> Result<bool> {
         let sql = "UPDATE interrupted_agent SET resolution = 'pending', resolved_at = NULL \
                    WHERE agent_id = ?";
@@ -3448,6 +3719,7 @@ mod tests {
     /// serves the block with data omitted.
     #[tokio::test]
     async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
+        use base64::Engine as _;
         use intent_core::now_iso;
 
         let tmp = TempDb::new("test-thumbnails");
@@ -3473,7 +3745,6 @@ mod tests {
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
             .expect("encode test png");
-        use base64::Engine as _;
         let data = base64::engine::general_purpose::STANDARD.encode(&buf);
 
         let with_image = store
@@ -3993,11 +4264,12 @@ mod tests {
         assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
     }
 
+    #[allow(clippy::similar_names)] // snap(shot)/swap future are both domain terms
     /// Stress loop for the `BEGIN IMMEDIATE` conversion (monorepo#783,
     /// mirroring the #738 verification loop shape): each iteration races
     /// `replace_acp_session_id` (fold + id swap) against a concurrent
     /// write-pool writer (the token-usage recompute) and asserts ZERO
-    /// SQLITE_BUSY failures — IMMEDIATE mode serializes writers at
+    /// `SQLITE_BUSY` failures — IMMEDIATE mode serializes writers at
     /// `pool.acquire()` instead of racing the DEFERRED lock upgrade.
     ///
     /// Run standalone with:
@@ -5568,8 +5840,11 @@ mod tests {
                 .get_agent_messages_page(&agent_id, offset, limit)
                 .await
                 .expect("page read");
-            let start = (offset as usize).min(full.len());
-            let end = (start + limit as usize).min(full.len());
+            let start = usize::try_from(offset)
+                .expect("non-negative")
+                .min(full.len());
+            let end =
+                (start + usize::try_from(limit).expect("value fits in usize")).min(full.len());
             let expected: Vec<_> = full[start..end].iter().map(|m| (m.seq, &m.id)).collect();
             let got: Vec<_> = page.iter().map(|m| (m.seq, &m.id)).collect();
             assert_eq!(got, expected, "window offset={offset} limit={limit}");
@@ -5669,6 +5944,68 @@ mod tests {
         }
     }
 
+    /// `get_agent_statuses` returns every requested id's persisted status in
+    /// one batched query, skips ids without a session row, skips (rather
+    /// than fails on) a row whose stored status does not decode, and returns
+    /// empty for an empty id list (intent-hq/monorepo#3018 — the
+    /// `agent.getSubscriptions` `agentStatuses` projection).
+    #[tokio::test]
+    async fn get_agent_statuses_batches_ids_and_skips_missing() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-statuses".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let idle = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let active = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&idle, &ws_id, &ts, None))
+            .await
+            .expect("insert idle session");
+        let mut active_session = baseline_test_session(&active, &ws_id, &ts, None);
+        active_session.status = AgentStatus::Active;
+        store
+            .insert_agent_session(&active_session)
+            .await
+            .expect("insert active session");
+
+        // A row whose persisted status no longer decodes (e.g. a daemon
+        // downgrade after a newer build wrote a new variant) must be
+        // skipped, not fail the whole batch.
+        let corrupt = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&corrupt, &ws_id, &ts, None))
+            .await
+            .expect("insert corrupt session");
+        sqlx::query("UPDATE agent_session SET status = 'from-the-future' WHERE id = ?")
+            .bind(&corrupt.0)
+            .execute(store.write_pool())
+            .await
+            .expect("write undecodable status");
+
+        let missing = AgentId("agent-missing".to_string());
+        let mut statuses = store
+            .get_agent_statuses(&[idle.clone(), active.clone(), missing, corrupt])
+            .await
+            .expect("batched statuses");
+        statuses.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut expected = vec![(idle, AgentStatus::Idle), (active, AgentStatus::Active)];
+        expected.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        assert_eq!(statuses, expected);
+
+        assert!(store
+            .get_agent_statuses(&[])
+            .await
+            .expect("empty id list")
+            .is_empty());
+    }
+
     /// `update_agent_session_metadata` writes only `metadata` + `updated_at`:
     /// columns absent from the summary projection (`system_prompt`) survive,
     /// and the write is workspace-scoped (`NotFound` on mismatch or missing).
@@ -5733,7 +6070,7 @@ mod tests {
     /// from `{}`, a non-object column is preserved under
     /// `priorNonObjectMetadata`, `system_prompt` is untouched, the CAS guard
     /// enforces expected-absent / expected-value semantics (guard miss →
-    /// `Ok(false)`, no write), and missing/mismatched sessions are NotFound.
+    /// `Ok(false)`, no write), and missing/mismatched sessions are `NotFound`.
     #[tokio::test]
     async fn set_agent_session_metadata_key_atomic_and_guarded() {
         use intent_core::now_iso;
@@ -6741,7 +7078,7 @@ mod tests {
             )
             .bind(Uuid::now_v7().to_string())
             .bind(&full.0)
-            .bind(seq as i64)
+            .bind(i64::try_from(seq).expect("value fits in i64"))
             .bind(*role)
             .bind(serde_json::to_string(content).expect("encode"))
             .bind(&ts)
@@ -7602,8 +7939,8 @@ mod tests {
     }
 
     /// `last_tool_use_preview` (0098) is maintained at message-write time:
-    /// a user/assistant append stamps the row's last tool_use block preview
-    /// (NULL actively clears when the row carries no tool_use), system/tool
+    /// a user/assistant append stamps the row's last `tool_use` block preview
+    /// (NULL actively clears when the row carries no `tool_use`), system/tool
     /// appends are transparent, an over-budget input is capped with the
     /// additive truncation flags, and `replace_agent_messages` recomputes
     /// from the batch. Both projection read paths serve the column.
@@ -7786,7 +8123,7 @@ mod tests {
     }
 
     /// The 0098 migration backfill stamps `last_tool_use_preview` from the
-    /// newest user/assistant row's LAST tool_use block: a small input is
+    /// newest user/assistant row's LAST `tool_use` block: a small input is
     /// stored whole, an over-budget input stores only the truncation flags
     /// (the SQL backfill's one bounded divergence from the Rust write path),
     /// and tool-less / empty transcripts stay NULL.
@@ -8253,7 +8590,7 @@ mod tests {
             )
             .bind(Uuid::now_v7().to_string())
             .bind(&agent.0)
-            .bind(seq as i64)
+            .bind(i64::try_from(seq).expect("value fits in i64"))
             .bind(*role)
             .bind(*content)
             .bind(&ts)

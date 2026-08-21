@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const CHIEF_CWD_DIR_NAME: &str = "chief-cwd";
 
 /// The chief spawn-cwd dir for a data dir: `<data_dir>/chief-cwd`.
+#[must_use]
 pub fn chief_cwd_root(data_dir: &Path) -> PathBuf {
     data_dir.join(CHIEF_CWD_DIR_NAME)
 }
@@ -23,6 +24,10 @@ pub fn chief_cwd_root(data_dir: &Path) -> PathBuf {
 /// directory is never world-readable; on other platforms this is a plain
 /// `create_dir_all`. Pre-existing directories are left untouched, so the
 /// call is idempotent across spawns.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if creating the directory chain fails.
 pub fn create_chief_cwd_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -41,6 +46,10 @@ pub fn create_chief_cwd_dir(dir: &Path) -> std::io::Result<()> {
 /// the same pressure the shared `/tmp` caused. The composition root calls
 /// this once at startup, before any chief child spawns, so nothing inside
 /// is live. A missing directory is a no-op.
+///
+/// # Errors
+///
+/// Returns the first I/O error from listing or removing entries (a missing directory is a no-op success).
 pub fn sweep_chief_cwd(dir: &Path) -> std::io::Result<()> {
     if !dir.is_dir() {
         return Ok(());

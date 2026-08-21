@@ -22,6 +22,7 @@
 //! (the [`crate::transfer_git::TransferRefsManifest`]).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -190,9 +191,9 @@ impl Services {
     /// never have its staging directory removed.
     async fn sweep_orphaned_staging_dirs(&self) {
         let root = self.import_staging_root();
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(entries) => entries,
-            Err(_) => return, // no staging root yet — nothing to sweep
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+            // no staging root yet — nothing to sweep
+            return;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -530,12 +531,12 @@ impl Services {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
         let ws = self.store.get_workspace(&workspace_id).await?;
-        publish_event(&self.event_bus, workspace_created_event(&ws)).await;
+        publish_event(self.event_bus.as_ref(), workspace_created_event(&ws)).await;
         // Imports run no setup stage: publish the completion immediately so
         // the watcher registry starts this workspace's watchers instead of
         // holding the deferred start until the setup backstop expires.
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             workspace_setup_completed_event(&workspace_id, false, None),
         )
         .await;
@@ -551,9 +552,9 @@ impl Services {
     /// Copy `assets/<assetId>` files into `<assets_root>/<workspaceId>/`.
     /// Best-effort: an unset assets root or a copy failure is logged.
     async fn place_imported_assets(&self, workspace_id: &WorkspaceId, assets_dir: &Path) {
-        let mut entries = match tokio::fs::read_dir(assets_dir).await {
-            Ok(entries) => entries,
-            Err(_) => return, // no assets/ in the archive
+        let Ok(mut entries) = tokio::fs::read_dir(assets_dir).await else {
+            // no assets/ in the archive
+            return;
         };
         let Some(root) = self.assets_root.clone() else {
             tracing::warn!(
@@ -591,7 +592,7 @@ impl Services {
     /// `worktree_path` cleared, `checkout_mode` → direct, `branch` → the
     /// bundled branch, `base_commit_sha` backfill, sandbox path rewrites,
     /// dropping sandbox rows whose branch is absent from the bundle) are
-    /// written back onto the JSON rows, so the apply()'d versions are what
+    /// written back onto the JSON rows, so the `apply()`'d versions are what
     /// land in the store. An error fails the commit: materialization is
     /// all-or-nothing on disk, no rows have been inserted, and the staging
     /// session survives for retry or abort. Returns the materialization
@@ -791,11 +792,10 @@ fn assemble_and_extract(
             "assembled archive is {total} bytes, expected {declared_size}"
         )));
     }
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let actual: String = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     if actual != declared_sha256 {
         return Err(Error::InvalidParams(format!(
             "archive checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
@@ -1054,7 +1054,9 @@ async fn rollback_materialized_attachments(created: &[PathBuf]) {
 /// JSON row (not this struct) is what lands in the store.
 fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value) -> Workspace {
     let s = |key: &str| -> Option<String> {
-        row.get(key).and_then(|v| v.as_str()).map(|v| v.to_string())
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string)
     };
     let now = now_iso();
     Workspace {
@@ -1194,7 +1196,7 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **workspace**: `worktree_path`, `repository_path`, and `path` are
 ///   rewritten under `<target_root>/<workspaceId>/`; PR linkage columns are
 ///   kept (monitors re-poll).
-/// - **agent_session**: `acp_session_id` / `backend_session_id` nulled (no
+/// - **`agent_session`**: `acp_session_id` / `backend_session_id` nulled (no
 ///   stale resume, ACP sessions are process-local), `is_active` forced 0;
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
 ///   a stop reason, and each such agent gains an `interrupted_agent` row
@@ -1202,7 +1204,7 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
-/// - **interrupted_agent**: exported pending rows are kept; synthesized rows
+/// - **`interrupted_agent`**: exported pending rows are kept; synthesized rows
 ///   for newly-interrupted agents are added unless the agent already has one.
 fn transform_rows(
     rows: Vec<(String, Vec<serde_json::Value>)>,
@@ -1275,10 +1277,10 @@ fn transform_rows(
                         .to_string();
                     if let Some(serde_json::Value::String(path)) = map.get_mut("path") {
                         // <ws-dir>/sandboxes/<agentId>/<last component>
-                        let slug = Path::new(path.as_str())
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "repo".to_string());
+                        let slug = Path::new(path.as_str()).file_name().map_or_else(
+                            || "repo".to_string(),
+                            |s| s.to_string_lossy().to_string(),
+                        );
                         *path = ws_dir
                             .join("sandboxes")
                             .join(&agent)
@@ -1832,11 +1834,10 @@ mod tests {
     fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        hasher.finalize().iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -1998,8 +1999,7 @@ mod tests {
             stats
                 .iter()
                 .find(|s| s.name == n)
-                .map(|s| s.row_count)
-                .unwrap_or(-1)
+                .map_or(-1, |s| s.row_count)
         };
         assert_eq!(row_count("draft"), 0);
         assert_eq!(row_count("note"), 1);
@@ -2082,10 +2082,10 @@ mod tests {
     /// diverges from the branch HEAD actually pointed at when the bundle was
     /// built (`feature`) — the bundle wins. Commit must materialize the
     /// checkout and sandbox on disk, rewrite the stored workspace row
-    /// (repository_path → checkout, worktree_path cleared, checkout_mode
-    /// direct, branch → the bundled branch, base_commit_sha backfilled),
+    /// (`repository_path` → checkout, `worktree_path` cleared, `checkout_mode`
+    /// direct, branch → the bundled branch, `base_commit_sha` backfilled),
     /// rewrite the stored sandbox path, and drop the bundle-less sandbox
-    /// row — WITHOUT registering the workspace-owned checkout in known_repo
+    /// row — WITHOUT registering the workspace-owned checkout in `known_repo`
     /// (intent-hq/monorepo#2227).
     #[tokio::test]
     async fn import_commit_materializes_git() {

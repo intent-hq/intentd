@@ -589,6 +589,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.
+#[must_use]
 pub fn is_known_event_type(event_type: &str) -> bool {
     ALL_EVENT_TYPES.contains(&event_type)
 }

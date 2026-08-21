@@ -124,7 +124,11 @@ pub(crate) fn resolve_event_types(event_types: &[String]) -> Vec<String> {
     let mut resolved = Vec::new();
     for ev in event_types {
         if ev == "*" {
-            resolved.extend(VALID_EVENT_CATEGORY_WILDCARDS.iter().map(|s| s.to_string()));
+            resolved.extend(
+                VALID_EVENT_CATEGORY_WILDCARDS
+                    .iter()
+                    .map(std::string::ToString::to_string),
+            );
         } else {
             resolved.push(ev.clone());
         }
@@ -143,7 +147,7 @@ pub(crate) fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<Strin
             resolved.extend(
                 AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS
                     .iter()
-                    .map(|s| s.to_string()),
+                    .map(std::string::ToString::to_string),
             );
         } else {
             resolved.push(ev.clone());
@@ -155,6 +159,7 @@ pub(crate) fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<Strin
 /// Match one event type against one pattern. A `prefix:*` pattern matches any
 /// type starting with `prefix:`; every other pattern is an exact match. Mirrors
 /// the `matchesFilter` rule (`endsWith(":*")` → `startsWith(slice(0,-1))`).
+#[must_use]
 pub fn event_type_matches(event_type: &str, pattern: &str) -> bool {
     if pattern.ends_with(":*") {
         let prefix = &pattern[..pattern.len() - 1];
@@ -225,7 +230,7 @@ mod tests {
             event_type: event_type.to_string(),
             actor: EventActor {
                 actor_type,
-                id: actor_id.map(|s| s.to_string()),
+                id: actor_id.map(std::string::ToString::to_string),
                 ..Default::default()
             },
             session_id: None,

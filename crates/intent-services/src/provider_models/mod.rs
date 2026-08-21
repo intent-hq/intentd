@@ -352,11 +352,10 @@ pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
     .await;
     match outcome {
         Ok(models) if !models.is_empty() => Some(true),
-        Ok(_) => None,
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
             Some(false)
         }
-        Err(_) => None,
+        Ok(_) | Err(_) => None,
     }
 }
 

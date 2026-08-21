@@ -14,8 +14,8 @@
 //!
 //! The `direct` outcome is forced deterministically via the
 //! `INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH` daemon seam, so the test does
-//! not depend on host CoW support: on a non-CoW filesystem the duplicate's
-//! probe already selects `direct`, and on a CoW filesystem the seam makes the
+//! not depend on host `CoW` support: on a non-CoW filesystem the duplicate's
+//! probe already selects `direct`, and on a `CoW` filesystem the seam makes the
 //! clone itself report Unsupported, exercising the standalone-source retry arm
 //! that falls back to a plain local clone (never a linked worktree).
 //!
@@ -203,7 +203,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -279,7 +279,8 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

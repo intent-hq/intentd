@@ -18,8 +18,9 @@ fn is_valid_slug_word(w: &str) -> bool {
 }
 
 /// Generate a random `adjective-animal` base slug (TS
-/// `generateWorkspaceSlug`). Uses a fresh UUIDv4 as the entropy source so the
+/// `generateWorkspaceSlug`). Uses a fresh `UUIDv4` as the entropy source so the
 /// crate needs no extra RNG dependency.
+#[must_use]
 pub fn generate_workspace_slug() -> String {
     let bytes = *uuid::Uuid::new_v4().as_bytes();
     let adj = u16::from_le_bytes([bytes[0], bytes[1]]) as usize % ADJECTIVES.len();
@@ -29,6 +30,7 @@ pub fn generate_workspace_slug() -> String {
 
 /// Append a numeric collision suffix (TS `appendSlugSuffix`):
 /// `auth-fix` + 2 → `auth-fix-2`.
+#[must_use]
 pub fn append_slug_suffix(base: &str, number: u32) -> String {
     format!("{base}-{number}")
 }
@@ -53,11 +55,11 @@ pub(crate) fn extract_base_slug(slug: &str) -> &str {
 /// [`ADJECTIVES`]/[`ANIMALS`] dictionaries used by [`generate_workspace_slug`]
 /// (TS `isWorkspaceSlug`). Used by callers that decide whether the workspace
 /// still needs a human title — a slug-shaped title is treated as untitled.
+#[must_use]
 pub fn is_workspace_slug(s: &str) -> bool {
     let base = extract_base_slug(s);
-    let (adj, animal) = match base.split_once('-') {
-        Some(pair) => pair,
-        None => return false,
+    let Some((adj, animal)) = base.split_once('-') else {
+        return false;
     };
     if animal.contains('-') || !is_valid_slug_word(adj) || !is_valid_slug_word(animal) {
         return false;
@@ -69,6 +71,7 @@ pub fn is_workspace_slug(s: &str) -> bool {
 /// `extractLocalSlug` / `generateLocalSlug`; fast, no LLM). Returns `None`
 /// when nothing meaningful can be extracted — the caller falls back to
 /// [`generate_workspace_slug`].
+#[must_use]
 pub fn extract_local_slug(prompt: &str) -> Option<String> {
     if prompt.trim().len() < 3 {
         return None;

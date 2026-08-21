@@ -10,12 +10,12 @@
 //!
 //! The mock advertises `loadSession`, records every session establishment
 //! (one `{ method, sessionId, pid }` JSON line per `session/new` /
-//! `session/load`) to MOCK_AGENT_SESSION_LOG, and fails prompts ONLY on
+//! `session/load`) to `MOCK_AGENT_SESSION_LOG`, and fails prompts ONLY on
 //! load-established sessions. Sequence proven on the wire:
-//! turn 1 `session/new` + prompt OK → idle child SIGKILLed out-of-band →
+//! turn 1 `session/new` + prompt OK → idle child `SIGKILLed` out-of-band →
 //! turn 2 respawn resumes via `session/load`, prompt rejected (poisoned) →
 //! `agent.retry` → fresh `session/new`, prompt OK. Session log must read
-//! exactly ["new", "load", "new"] — a second "load" is the #940 regression.
+//! exactly `["new", "load", "new"]` — a second "load" is the #940 regression.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -61,7 +61,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -209,7 +209,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -233,7 +233,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -399,6 +399,7 @@ where
     panic!("agent session never settled to idle; last: {last}");
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// POISONED-RECREATE (monorepo#940): a `session/load`-resumed session that
 /// deterministically rejects prompts with the chat-stream 400 `invalidArgument`
 /// payload parks the agent in `error` with `sessionCorrupted: true`, and
@@ -448,7 +449,8 @@ async fn poisoned_session_retry_recreates_instead_of_resuming_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

@@ -98,8 +98,7 @@ impl StatusSingleFlight {
             .lock()
             .unwrap()
             .get(key)
-            .map(|flight| flight.result.receiver_count())
-            .unwrap_or(0)
+            .map_or(0, |flight| flight.result.receiver_count())
     }
 
     #[cfg(test)]
@@ -108,8 +107,7 @@ impl StatusSingleFlight {
             .lock()
             .unwrap()
             .get(key)
-            .map(|flight| flight.retirement_waiters.load(Ordering::SeqCst))
-            .unwrap_or(0)
+            .map_or(0, |flight| flight.retirement_waiters.load(Ordering::SeqCst))
     }
 
     #[cfg(test)]

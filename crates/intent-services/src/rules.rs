@@ -28,8 +28,7 @@ const MAX_RULE_CONTENT_LEN: usize = 50_000;
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Wrap user-rule content for prompt injection (port of
@@ -67,8 +66,7 @@ fn file_mtime_ms(path: &Path) -> i64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Strip an optional leading YAML frontmatter block, returning the body (port of
@@ -314,19 +312,19 @@ pub(crate) struct SpecialistPromptInjection {
     pub role_reminder: Option<String>,
 }
 
-/// Build the mode-dependent isolation hint for Task 6 (CoW agent sandboxes).
+/// Build the mode-dependent isolation hint for Task 6 (`CoW` agent sandboxes).
 /// Returns `Some(hint)` when the agent's isolation mode and specialist warrant
 /// a context block, `None` otherwise. The hint selection keys off the agent's
-/// actual effective isolation (session.sandbox_path presence) and workspace mode,
+/// actual effective isolation (`session.sandbox_path` presence) and workspace mode,
 /// not just the workspace cowIsolation setting, so it reflects what the agent is
 /// actually running under.
 ///
 /// Hint matrix (per spec line 104-110):
-/// - Sandboxed implementor (session.sandbox_path present + specialist="implementor"):
+/// - Sandboxed implementor (`session.sandbox_path` present + specialist="implementor"):
 ///   isolation context block with sandbox path, branch, base commit, caches-warm
 ///   notice, branch-switching warning, and conflict-bounce resolution instructions.
 /// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
-///   direct-mode + cow_supported=true): parallel delegation safety guidance.
+///   direct-mode + `cow_supported=true`): parallel delegation safety guidance.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
 pub(crate) fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
@@ -416,9 +414,9 @@ async fn build_rtk_instruction(
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
 /// `.augment/agent-rules/{type}.md` → bundled built-in) → workspace override →
-/// live workspace rule files → mode-dependent isolation hints (Task 6: CoW
+/// live workspace rule files → mode-dependent isolation hints (Task 6: `CoW`
 /// sandboxing context for implementors, parallel delegation safety for
-/// coordinators when CoW is enabled) → specialist role section (PP-1, reference
+/// coordinators when `CoW` is enabled) → specialist role section (PP-1, reference
 /// layer 4.8: after specialization/user rules, when the session has one) →
 /// mandatory-actions footer (recency; the reference `getMandatoryActionsFooter`)
 /// which contributes the `## Role Reminder` (specialist agents only) and — for
@@ -580,7 +578,7 @@ pub(crate) async fn assemble_system_prompt(
         // effective state even when the workspace toggle is currently on. The
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
-            auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
+            auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
         parts.push(harness.suggested_next_steps_block(effective_auto_commit));
     }
     if parts.is_empty() {
@@ -733,7 +731,7 @@ mod tests {
     }
 
     /// Helper to create a test workspace with a repository path
-    fn make_test_workspace(repo_path: PathBuf) -> Workspace {
+    fn make_test_workspace(repo_path: &Path) -> Workspace {
         let ts = intent_core::now_iso();
         Workspace {
             id: intent_core::WorkspaceId("test-ws".to_string()),
@@ -787,20 +785,20 @@ mod tests {
         let skills_dir = repo_path.join(".augment").join("skills").join("test-skill");
         tokio::fs::create_dir_all(&skills_dir).await.unwrap();
 
-        let skill_content = r#"---
+        let skill_content = r"---
 name: test-skill
 description: A test skill for prompt assembly
 ---
 
 This is a test skill.
-"#;
+";
         tokio::fs::write(skills_dir.join("SKILL.md"), skill_content)
             .await
             .unwrap();
 
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
-        let workspace = make_test_workspace(repo_path.to_path_buf());
+        let workspace = make_test_workspace(repo_path);
 
         let prompt = assemble_system_prompt(
             &store,
@@ -858,7 +856,7 @@ This is a test skill.
 
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
-        let workspace = make_test_workspace(repo_path.to_path_buf());
+        let workspace = make_test_workspace(repo_path);
 
         let prompt = assemble_system_prompt(
             &store,

@@ -218,7 +218,7 @@ pub(crate) fn run_model_arg(repo_id: &str, quant: &str) -> String {
 fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Full-precision GGUF export tags. Valid files in unsloth repos, but never
@@ -559,7 +559,7 @@ impl ManagedServer {
 
     /// OS pid of the owned child; `None` for an adopted server.
     fn pid(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|c| c.id())
+        self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
     /// Snapshot the retained output tail as one newline-joined string. Waits
@@ -910,7 +910,14 @@ impl UnslothServerManager {
         let binary =
             (self.config.resolve_binary)(unsloth_cli_override).ok_or_else(missing_binary_error)?;
 
-        if !attach {
+        if attach {
+            status(
+                StatusLevel::Info,
+                format!(
+                    "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
+                ),
+            );
+        } else {
             status(
                 StatusLevel::Info,
                 format!("Starting Unsloth server for {repo_id}…"),
@@ -984,7 +991,7 @@ impl UnslothServerManager {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 return Err(stop_requested_error());
             }
-            let server = self.start_server(&binary, repo_id, &quant, port)?;
+            let server = Self::start_server(&binary, repo_id, &quant, port)?;
             self.set_identity(Some(ServerIdentity {
                 repo_id: server.repo_id.clone(),
                 pid: server.pid(),
@@ -993,13 +1000,6 @@ impl UnslothServerManager {
             }));
             *state = Some(server);
             self.set_phase(Some("starting"));
-        } else {
-            status(
-                StatusLevel::Info,
-                format!(
-                    "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
-                ),
-            );
         }
 
         match self
@@ -1123,13 +1123,7 @@ impl UnslothServerManager {
     /// as its own process-group leader with captured output. `port` is the
     /// resolved listen port (the configured one, or a picked free one when
     /// the configured port was busy).
-    fn start_server(
-        &self,
-        binary: &Path,
-        repo_id: &str,
-        quant: &str,
-        port: u16,
-    ) -> Result<ManagedServer> {
+    fn start_server(binary: &Path, repo_id: &str, quant: &str, port: u16) -> Result<ManagedServer> {
         let mut cmd = Command::new(binary);
         cmd.arg("run")
             .arg("--model")
@@ -1213,10 +1207,9 @@ impl UnslothServerManager {
             ProbeOutcome::UpNotReady => {}
             // 200 unauthenticated is NOT the managed server's shape (it
             // requires auth even on /v1/models) — treat as foreign.
-            ProbeOutcome::Ready => return None,
+            ProbeOutcome::Ready | ProbeOutcome::Down => return None,
             // The port is bind-busy but nothing answers HTTP: not an
             // Unsloth server (e.g. a raw TCP service).
-            ProbeOutcome::Down => return None,
         }
 
         let mut server = ManagedServer {
@@ -1660,7 +1653,7 @@ fn redact_key_material(text: &str) -> String {
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok()
     }
     #[cfg(not(unix))]
     {
@@ -1744,7 +1737,7 @@ async fn kill_server_child(child: &mut Child) {
     use nix::unistd::Pid;
     if let Some(pid) = child.id() {
         let descendants = intent_acp::descendant_pids(pid).await;
-        let pgid = Pid::from_raw(pid as i32);
+        let pgid = Pid::from_raw(pid.cast_signed());
         let _ = killpg(pgid, Signal::SIGTERM);
         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         let _ = killpg(pgid, Signal::SIGKILL);
@@ -1995,7 +1988,7 @@ mod tests {
         assert_eq!(
             ep.limit,
             Some(UnslothModelLimit {
-                context: 262144,
+                context: 262_144,
                 output: 8192
             })
         );
@@ -2142,9 +2135,7 @@ mod tests {
             let config = GENERATED_CONFIG_FIXTURE
                 .replace("127.0.0.1:8888", &format!("127.0.0.1:{port}"))
                 .replace('\'', "");
-            let run = run_behavior
-                .map(str::to_string)
-                .unwrap_or_else(|| "sleep 300".to_string());
+            let run = run_behavior.map_or_else(|| "sleep 300".to_string(), str::to_string);
             let script = format!(
                 "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) {run} ;;\n  start) mkdir -p '{cfg}' && cat > '{cfg}/opencode.json' <<'EOF'\n{config}\nEOF\n  ;;\nesac\n",
                 log = log.display(),
@@ -2411,7 +2402,7 @@ mod tests {
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             mgr.ensure_endpoint(REPO, None, 2, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("cold start");
@@ -2432,7 +2423,7 @@ mod tests {
             let m3 = messages.clone();
             let ep = mgr
                 .ensure_endpoint(other, None, 2, &move |lvl, m| {
-                    m3.lock().unwrap().push((lvl, m))
+                    m3.lock().unwrap().push((lvl, m));
                 })
                 .await
                 .expect("switch");
@@ -2487,7 +2478,7 @@ mod tests {
             let m2 = messages.clone();
             let other = "unsloth/other-model-GGUF";
             mgr.ensure_endpoint(other, None, 0, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("switch");
@@ -2529,7 +2520,7 @@ mod tests {
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             mgr.ensure_endpoint(REPO, None, 1, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("dead-child respawn");
@@ -2695,7 +2686,7 @@ mod tests {
 
         /// `kill(pid, 0)` liveness probe via nix.
         unsafe fn libc_kill_probe(pid: u32) -> bool {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok()
         }
 
         #[tokio::test]
@@ -2890,7 +2881,7 @@ mod tests {
             // Reap the child directly (this test process is its true OS
             // parent), forcing the terminal "exited and reaped" state that a
             // signal-0 probe can actually observe.
-            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid.cast_signed()), None);
 
             assert!(
                 mgr.status_snapshot().await.is_none(),

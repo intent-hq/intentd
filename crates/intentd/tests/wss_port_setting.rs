@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Mock ServerControl that captures port from start_ws_listener calls
+/// Mock `ServerControl` that captures port from `start_ws_listener` calls
 struct MockPortServerControl {
     should_fail: bool,
     requested_port: Arc<tokio::sync::Mutex<Option<u16>>>,
@@ -138,6 +138,8 @@ async fn rpc(
 
 /// Test that server.wsApi.port setting exists and can be read/updated
 #[tokio::test]
+// Port values are small whole-valued floats: casts are exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn port_setting_crud() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -217,6 +219,8 @@ async fn port_setting_crud() {
 
 /// Test that changing port while listener is running triggers restart
 #[tokio::test]
+// Port values are small whole-valued floats: casts are exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn port_change_restarts_listener() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");

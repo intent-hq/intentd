@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{map_err, opt_str, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.file = {
         read: (path) => host({ method: 'file.read', args: { path } }),
@@ -25,7 +25,7 @@ pub(crate) const PRELUDE: &str = r#"
         getAttachment: (attachmentId, destDir) =>
             host({ method: 'file.getAttachment', args: { attachmentId, destDir } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

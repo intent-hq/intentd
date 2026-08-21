@@ -147,6 +147,7 @@ pub(crate) fn attach_acp_title(input: Value, title: &str) -> Value {
 /// `{ type, id, name, input, toolCallId, metadata:{ toolKind, status } }`.
 /// `name` is the real tool name (already derived, §6.6 `toolName`); `title`
 /// is the raw ACP title echoed as `input._acpTitle`.
+#[must_use]
 pub fn build_tool_use_block(
     block_id: &str,
     name: &str,
@@ -190,6 +191,7 @@ pub(crate) fn find_proposal_resource(output: &Value) -> Option<&Value> {
 /// verbatim (`{ type: "resource", resource: {…} }`) with the stable block id
 /// stamped on. Shared by `record_tool` (persisted) and `tool_delta` (live) so
 /// the shapes agree byte-for-byte.
+#[must_use]
 pub fn build_proposal_resource_block(block_id: &str, item: &Value) -> Value {
     let mut block = item.clone();
     if let Some(obj) = block.as_object_mut() {
@@ -218,6 +220,7 @@ const COLLAPSED_PROPOSAL_MAX_BYTES: usize = 256 * 1024;
 /// identical to the array path. Note the guards verify *shape*, not
 /// *provenance*: a collapsed output byte-identical to a `ws.app.proposal.show`
 /// echo is indistinguishable from one and will be lifted.
+#[must_use]
 pub fn lift_proposal_resource(output: &Value) -> Option<Value> {
     if let Some(item) = find_proposal_resource(output) {
         return Some(item.clone());

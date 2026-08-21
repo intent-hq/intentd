@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{map_err, opt_str, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.primitive = {
         addReference: (noteId, semanticId, description, snapshot) =>
@@ -35,7 +35,7 @@ pub(crate) const PRELUDE: &str = r#"
                 args: { noteId, agentId, goal, description },
             }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

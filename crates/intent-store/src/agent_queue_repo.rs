@@ -30,6 +30,10 @@ impl Store {
     /// clears the agent's persisted queue. Every row must belong to
     /// `agent_id` — a mismatch fails fast instead of silently persisting
     /// rows under the wrong agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn replace_agent_queue(
         &self,
         agent_id: &AgentId,
@@ -102,6 +106,10 @@ impl Store {
     /// rollback or a crash window where the messages are durable on
     /// NEITHER queue — this op commits the hand-off as a single unit.
     /// Every row must belong to `to`; a mismatch fails fast.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn move_agent_queue(
         &self,
         from: &AgentId,
@@ -176,6 +184,10 @@ impl Store {
     /// whole load — rehydration is best-effort and the caller skips entries
     /// it cannot decode. Legacy rows with a NULL `turn_id` (pre-monorepo#1022)
     /// load with `turn_id` defaulted to the row `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
         let rows = sqlx::query(
             "SELECT q.id, q.agent_id, q.position, q.payload, q.created_at, \

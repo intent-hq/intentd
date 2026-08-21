@@ -38,6 +38,10 @@ pub struct CommitRecord {
 
 /// Read up to `limit` commits of first-parent, non-merge history from `HEAD`,
 /// newest first. An empty repository (unborn `HEAD`) yields an empty list.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> {
     history_since(worktree_path, None, limit, true)
 }
@@ -48,6 +52,10 @@ pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> 
 /// to the full `HEAD` history. With `include_files = false` the per-commit tree
 /// diff is skipped entirely — `files` is `None` — which keeps the walk cheap for
 /// callers that only need commit metadata (e.g. `accept-changes.getStatus`).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the revwalk fails or another libgit2 operation fails.
 pub fn history_since(
     worktree_path: &Path,
     base_ref: Option<&str>,
@@ -125,13 +133,16 @@ pub fn history_since(
         limit,
         base_ref = base_ref.unwrap_or(""),
         include_files,
-        pushed_check_ms = pushed_elapsed.as_millis() as u64,
-        per_commit_diff_ms = diff_elapsed.as_millis() as u64,
-        other_ms = total
-            .saturating_sub(diff_elapsed)
-            .saturating_sub(pushed_elapsed)
-            .as_millis() as u64,
-        total_ms = total.as_millis() as u64,
+        pushed_check_ms = u64::try_from(pushed_elapsed.as_millis()).unwrap_or(u64::MAX),
+        per_commit_diff_ms = u64::try_from(diff_elapsed.as_millis()).unwrap_or(u64::MAX),
+        other_ms = u64::try_from(
+            total
+                .saturating_sub(diff_elapsed)
+                .saturating_sub(pushed_elapsed)
+                .as_millis()
+        )
+        .unwrap_or(u64::MAX),
+        total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
         "history_since: revwalk + per-commit tree diffs"
     );
     if total >= SLOW_GIT_WARN_THRESHOLD {
@@ -139,7 +150,7 @@ pub fn history_since(
             worktree = %worktree_path.display(),
             limit,
             commits = out.len(),
-            total_ms = total.as_millis() as u64,
+            total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
             "history_since: slow history read"
         );
     }
@@ -240,11 +251,20 @@ pub struct CommitDetails {
     pub files: Vec<CommitFileChange>,
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Resolve `commit_hash` (full SHA or short ref) against `worktree_path` and
 /// return its metadata plus the per-file `(additions, deletions)` diff against
 /// the first parent. A root commit (no parent) diffs against the empty tree, so
 /// every file appears as additions. An unresolvable hash returns
 /// [`Error::NotFound`].
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] if `commit_hash` does not resolve to a commit; `Error::Internal` if another libgit2 operation fails.
+///
+/// # Panics
+///
+/// Panics if a diff delta reported by libgit2 cannot be re-fetched by index (an internal libgit2 invariant violation).
 pub fn commit_details(worktree_path: &Path, commit_hash: &str) -> Result<CommitDetails> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let obj = repo
@@ -306,6 +326,10 @@ pub fn commit_details(worktree_path: &Path, commit_hash: &str) -> Result<CommitD
 ///
 /// This is the boundary for `file-tracking.loadCommits` so the Changes panel
 /// only shows workspace-owned commits (`boundary..HEAD`).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn resolve_workspace_boundary(
     worktree_path: &Path,
     base_ref: Option<&str>,
@@ -317,7 +341,7 @@ pub fn resolve_workspace_boundary(
         tracing::debug!(
             resolved = boundary.is_some(),
             base_ref = base_ref.unwrap_or(""),
-            total_ms = started.elapsed().as_millis() as u64,
+            total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "resolve_workspace_boundary"
         );
     }
@@ -332,15 +356,15 @@ fn resolve_workspace_boundary_inner(
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
 
     // Get HEAD first - if unavailable, no boundary can be resolved
-    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
-        Some(oid) => oid,
-        None => return Ok(None), // Detached/missing HEAD → no boundary
+    let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
+        // Detached/missing HEAD → no boundary
+        return Ok(None);
     };
 
     // Try merge-base first (rebase-resilient)
     if let Some(base_ref) = base_ref {
         // Try origin/<base_ref> first, then <base_ref>
-        for ref_name in [format!("origin/{}", base_ref), base_ref.to_string()] {
+        for ref_name in [format!("origin/{base_ref}"), base_ref.to_string()] {
             if let Ok(obj) = repo.revparse_single(&ref_name) {
                 if let Ok(base_oid) = repo.merge_base(head_oid, obj.id()) {
                     return Ok(Some(base_oid.to_string()));
@@ -372,6 +396,10 @@ fn resolve_workspace_boundary_inner(
 /// `include_files = false` the per-commit tree diff is skipped entirely —
 /// `files` is `None` — keeping the walk O(commits) cheap for list payloads;
 /// clients fetch per-file data on demand via `git.commitDetails`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the revwalk fails or another libgit2 operation fails.
 pub fn history_bounded(
     worktree_path: &Path,
     boundary_sha: Option<&str>,
@@ -460,13 +488,16 @@ pub fn history_bounded(
         include_older,
         include_files,
         bounded = boundary_sha.is_some(),
-        pushed_check_ms = pushed_elapsed.as_millis() as u64,
-        per_commit_diff_ms = diff_elapsed.as_millis() as u64,
-        other_ms = total
-            .saturating_sub(diff_elapsed)
-            .saturating_sub(pushed_elapsed)
-            .as_millis() as u64,
-        total_ms = total.as_millis() as u64,
+        pushed_check_ms = u64::try_from(pushed_elapsed.as_millis()).unwrap_or(u64::MAX),
+        per_commit_diff_ms = u64::try_from(diff_elapsed.as_millis()).unwrap_or(u64::MAX),
+        other_ms = u64::try_from(
+            total
+                .saturating_sub(diff_elapsed)
+                .saturating_sub(pushed_elapsed)
+                .as_millis()
+        )
+        .unwrap_or(u64::MAX),
+        total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
         "history_bounded: revwalk + per-commit tree diffs"
     );
     if total >= SLOW_GIT_WARN_THRESHOLD {
@@ -474,7 +505,7 @@ pub fn history_bounded(
             worktree = %worktree_path.display(),
             limit,
             commits = out.len(),
-            total_ms = total.as_millis() as u64,
+            total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
             "history_bounded: slow history read"
         );
     }

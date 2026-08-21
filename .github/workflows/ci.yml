@@ -131,15 +131,25 @@ jobs:
       # slots share one /raid CI-scratch volume, and the per-slot persistent
       # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
       # can fill it — a full volume kills jobs mid-run with ENOSPC. If free
-      # space is below the job's threshold, self-prune stale per-slot
-      # ci-target dirs first (mtime older than 2 days, oldest first, never
-      # this job's own dir, never anything outside /raid/ci-target — shared
-      # caches like ~/.cargo and ~/.rustup are untouched), then fail with an
-      # actionable message if space is still short. Thresholds: 10 GiB here
-      # (small target dir with debuginfo off), 30 GiB for the instrumented
-      # coverage jobs. Exact no-op on burst runners (step skipped).
-      # tinybox-prune.yml does the routine scheduled pruning; this is only
-      # the emergency backstop.
+      # space is below the job's threshold, self-prune in two tiers: first
+      # stale per-slot ci-target dirs (mtime older than 2 days, oldest
+      # first), then — a heavy CI day fills /raid with dirs too fresh for
+      # any age window (the 2026-08-20/08-21 exhaustions: 0 GiB free, every
+      # dir <2 days old, so the stale pass freed nothing and could only
+      # fail) — LRU-evict idle dirs regardless of age until this job's need
+      # is met — the same rails as tinybox-prune.yml's LRU pass, ordered
+      # like the emergency purge that recovered both incidents (intentd
+      # run 32447747968): by the dir's own top-level mtime, not the
+      # prune's recursive last-activity key. Rails in both tiers: never
+      # anything outside /raid/ci-target (shared caches like ~/.cargo and
+      # ~/.rustup are untouched), never a dir this job may use, and
+      # recursive-mtime freshness/activity checks so a dir a live job is
+      # writing to is not deleted.
+      # Fails with an actionable message if space is still short.
+      # Thresholds: 10 GiB here (small target dir with debuginfo off),
+      # 30 GiB for the instrumented coverage jobs. Exact no-op on burst
+      # runners (step skipped). tinybox-prune.yml does the routine
+      # scheduled pruning; this is only the emergency backstop.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -159,15 +169,48 @@ jobs:
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
             # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            # `|| true` keeps a dir vanishing mid-check (find) or another
+            # slot's preflight racing us to the same deletion (rm) from
+            # failing the job.
             [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
-            rm -rf -- "$dir"
+            rm -rf -- "$dir" || true
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          # Escalation tier: under heavy churn everything on the volume can
+          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
+          # stale pass nothing to prune — LRU-evict idle ci-target dirs
+          # until this job's need is met. Ordering key: the dir's own
+          # top-level mtime, matching the emergency purge — not
+          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
+          # touches the top level after creation, so this approximates
+          # creation order and a recently-used-but-idle dir can be evicted
+          # before a colder one; acceptable here, since every candidate is
+          # an idle warm cache and the ordering stays cheap for a per-job
+          # step. Concurrent preflights on other slots are safe: target
+          # dirs are warm caches (eviction costs a rebuild, not
+          # correctness), a live job's dir is shielded by the recursive
+          # 15-minute activity check (a job actively writing keeps its
+          # target dir fresh — though a >15 min quiet phase can look idle,
+          # a bounded risk: one retryable job failure, no data loss), the
+          # own-slot skip covers every dir this slot may use, and `|| true`
+          # on rm tolerates another slot's preflight racing us to the same
+          # candidate.
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
+              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
+              echo "evicting: $dir"
+              rm -rf -- "$dir" || true
+              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
@@ -467,15 +510,48 @@ jobs:
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
             # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            # `|| true` keeps a dir vanishing mid-check (find) or another
+            # slot's preflight racing us to the same deletion (rm) from
+            # failing the job.
             [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
-            rm -rf -- "$dir"
+            rm -rf -- "$dir" || true
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          # Escalation tier: under heavy churn everything on the volume can
+          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
+          # stale pass nothing to prune — LRU-evict idle ci-target dirs
+          # until this job's need is met. Ordering key: the dir's own
+          # top-level mtime, matching the emergency purge — not
+          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
+          # touches the top level after creation, so this approximates
+          # creation order and a recently-used-but-idle dir can be evicted
+          # before a colder one; acceptable here, since every candidate is
+          # an idle warm cache and the ordering stays cheap for a per-job
+          # step. Concurrent preflights on other slots are safe: target
+          # dirs are warm caches (eviction costs a rebuild, not
+          # correctness), a live job's dir is shielded by the recursive
+          # 15-minute activity check (a job actively writing keeps its
+          # target dir fresh — though a >15 min quiet phase can look idle,
+          # a bounded risk: one retryable job failure, no data loss), the
+          # own-slot skip covers every dir this slot may use, and `|| true`
+          # on rm tolerates another slot's preflight racing us to the same
+          # candidate.
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
+              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
+              echo "evicting: $dir"
+              rm -rf -- "$dir" || true
+              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -624,15 +700,48 @@ jobs:
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
             # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            # `|| true` keeps a dir vanishing mid-check (find) or another
+            # slot's preflight racing us to the same deletion (rm) from
+            # failing the job.
             [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
-            rm -rf -- "$dir"
+            rm -rf -- "$dir" || true
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          # Escalation tier: under heavy churn everything on the volume can
+          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
+          # stale pass nothing to prune — LRU-evict idle ci-target dirs
+          # until this job's need is met. Ordering key: the dir's own
+          # top-level mtime, matching the emergency purge — not
+          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
+          # touches the top level after creation, so this approximates
+          # creation order and a recently-used-but-idle dir can be evicted
+          # before a colder one; acceptable here, since every candidate is
+          # an idle warm cache and the ordering stays cheap for a per-job
+          # step. Concurrent preflights on other slots are safe: target
+          # dirs are warm caches (eviction costs a rebuild, not
+          # correctness), a live job's dir is shielded by the recursive
+          # 15-minute activity check (a job actively writing keeps its
+          # target dir fresh — though a >15 min quiet phase can look idle,
+          # a bounded risk: one retryable job failure, no data loss), the
+          # own-slot skip covers every dir this slot may use, and `|| true`
+          # on rm tolerates another slot's preflight racing us to the same
+          # candidate.
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
+              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
+              echo "evicting: $dir"
+              rm -rf -- "$dir" || true
+              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -852,12 +961,27 @@ jobs:
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/bin/intentd$'
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
 
+  # Release-script regression tests: runs the stubbed-gh harness for
+  # scripts/aggregate-channel-notes.sh (an idempotent re-promotion must
+  # rebuild the aggregate from the notes-base marker, and a legacy body
+  # without a marker is left untouched — never collapsed to one section).
+  # Seconds-long like the other utility jobs, so it runs directly on
+  # ubuntu-latest.
+  release-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test aggregate-channel-notes.sh
+        run: ./scripts/test-aggregate-channel-notes.sh
+
   # Single required status check for branch protection: fans in check, build,
-  # coverage-e2e, coverage-all, pr-title, conflict-markers, and deb-packaging
-  # (ported from cloudlands-fe's "CI Gate" pattern — see
+  # coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging,
+  # and release-scripts (ported from cloudlands-fe's "CI Gate" pattern — see
   # packages/cloudlands-fe/.github/workflows/intent-pr.yml). build /
-  # deb-packaging must succeed outright: neither carries an event-gated `if`,
-  # so a skip there is itself a failure signal. check must succeed outright
+  # deb-packaging / release-scripts must succeed outright: none carries an
+  # event-gated `if`, so a skip there is itself a failure signal. check must
+  # succeed outright
   # on pull_request runs (a skip there — e.g. after a route failure — fails
   # the gate, exactly as before); only on push to main, where it is
   # job-skipped as redundant (see the `on: push` comment), does the gate
@@ -875,12 +999,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     if: always()
-    needs: [check, build, coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging]
+    needs: [check, build, coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging, release-scripts]
     steps:
       - name: Check results
         run: |
           if [ "${{ needs.build.result }}" != "success" ] || \
-             [ "${{ needs.deb-packaging.result }}" != "success" ]; then
+             [ "${{ needs.deb-packaging.result }}" != "success" ] || \
+             [ "${{ needs.release-scripts.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
           fi

@@ -1,6 +1,6 @@
 //! Wire-facing domain structs (§9.1). Every struct uses
 //! `#[serde(rename_all = "camelCase")]` so JSON matches the existing TS types
-//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / snake_case
+//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / `snake_case`
 //! string forms, which are also their stored DB representations.
 
 use std::collections::BTreeMap;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
-/// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
+/// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
 /// `Deleted`), matching the TS string enum exactly; these are also the stored DB
 /// words (the column DEFAULT is unused — inserts always bind explicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ pub enum WorkspaceAttention {
 }
 
 /// Pull-request lifecycle status (§9.1; TS `PullRequestStatus` in
-/// `src/shared/types.ts`). Wire values are the PascalCase variant names
+/// `src/shared/types.ts`). Wire values are the `PascalCase` variant names
 /// (`Open`/`Closed`/`Merged`/`Draft`), matching the TS string enum exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PullRequestStatus {
@@ -111,7 +111,7 @@ pub enum NoteVisibility {
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned canonical status rollup over the active/latest PR,
 /// `taskStats`, live agent activity, and the per-workspace attention axes.
-/// Wire values are the snake_case variant names, matching the FE union
+/// Wire values are the `snake_case` variant names, matching the FE union
 /// exactly. Canonical precedence (§6.5): `Failed` (a top-level agent parked
 /// in `error`) > `Blocked` (a top-level pending `blocker` attention
 /// request) > `NeedsAttention` (discussion requests, pending structured
@@ -138,6 +138,9 @@ pub enum WorkspaceDisplayStatus {
 }
 
 /// Workspace entity (§9.1).
+// The bool fields mirror the protocol's wire shape; grouping them would
+// change the serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -242,8 +245,8 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
-    /// Whether CoW isolation is supported on this machine. Computed as:
-    /// cow_probe(workspacesRoot, workspacesRoot) Supported — a machine
+    /// Whether `CoW` isolation is supported on this machine. Computed as:
+    /// `cow_probe(workspacesRoot, workspacesRoot)` Supported — a machine
     /// capability of the workspaces root's filesystem, independent of the
     /// workspace or checkout mode. Used by the FE to gate the Copy-on-Write
     /// opt-in toggle.
@@ -333,6 +336,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 /// virtual scope for Chief-of-Staff agents that never appears in
 /// `workspace.list` and is never persisted, but `workspace.get` returns
 /// this shape and `agent.create` accepts its id as the workspace scope.
+#[must_use]
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
@@ -406,6 +410,7 @@ impl UsageCost {
     /// an accepted consequence of storing a single figure — a cross-currency
     /// numeric comparison is semantically meaningless and the daemon never
     /// invents a conversion rate.
+    #[must_use]
     pub fn merge(lhs: Option<&UsageCost>, rhs: Option<&UsageCost>) -> Option<UsageCost> {
         match (lhs, rhs) {
             (None, None) => None,
@@ -446,6 +451,8 @@ pub struct TokenUsageTotals {
     pub cost: Option<UsageCost>,
 }
 
+// serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -473,6 +480,7 @@ impl TokenUsageTotals {
 /// the end-of-turn token report. Shared by the store's usage-row fetch (which
 /// hydrates message contents only for fallback sessions, monorepo#738) and the
 /// tally itself, so the two decisions can never drift apart.
+#[must_use]
 pub fn token_usage_reported(
     baseline: Option<&TokenUsageTotals>,
     snapshot: Option<&TokenUsageTotals>,
@@ -609,7 +617,7 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scripts: Option<Vec<RepoScript>>,
 
-    /// Repo-root-relative directory prefixes excluded from CoW checkout
+    /// Repo-root-relative directory prefixes excluded from `CoW` checkout
     /// provisioning (`workspace.create`/`workspace.duplicate`): matching
     /// directories are not cloned into the checkout (e.g. huge caches that
     /// slow the clone down). `.git` and the repo root itself cannot be
@@ -677,6 +685,7 @@ pub struct WorkspaceTaskStats {
 /// (`TASK_LINK_REGEX_FLEXIBLE`). Shared by the enriched `taskStats` path
 /// (intent-services `compute_task_stats`) and the cheap store-level counting
 /// query (`Store::count_task_stats`) so the two stay in lock-step.
+#[must_use]
 pub fn extract_spec_task_ids(content: &str) -> std::collections::HashSet<String> {
     const MARKER: &str = "(intent://local/task/";
     let mut ids = std::collections::HashSet::new();
@@ -787,7 +796,7 @@ pub struct WorkspaceCreate {
     pub repository_name: Option<String>,
     pub worktree_path: Option<String>,
     pub scope: Option<String>,
-    /// Opt out of the isolated checkout (worktree or CoW clone) and work
+    /// Opt out of the isolated checkout (worktree or `CoW` clone) and work
     /// directly in the repository folder. Canonical wire name is
     /// `skipIsolation`; `skipWorktree` is the deprecated pre-CoW alias
     /// (either set ⇒ direct mode). The persisted column keeps its historical
@@ -820,7 +829,7 @@ pub struct WorkspaceCreate {
     /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
     /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
     /// it as `data.progressId`, and provisioning paths that stream nothing
-    /// today (worktree / CoW / direct) emit milestone frames. Absent keeps
+    /// today (worktree / `CoW` / direct) emit milestone frames. Absent keeps
     /// the legacy event behavior exactly. Never persisted.
     pub progress_id: Option<String>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
@@ -970,6 +979,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
+#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -994,6 +1004,7 @@ pub struct NoteMetadata {
 impl NoteMetadata {
     /// True when no metadata field is populated; used by [`Note`]'s
     /// `skip_serializing_if` so plain notes omit the `metadata` key entirely.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.task.is_none()
     }
@@ -1850,6 +1861,7 @@ pub struct CommentWire {
 
 impl CommentWire {
     /// Map a stored [`Comment`] to its nested wire shape.
+    #[must_use]
     pub fn from_comment(c: &Comment) -> Self {
         let anchor_context = match (&c.anchor_before, &c.anchor_after) {
             (None, None) => None,
@@ -2268,6 +2280,7 @@ pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
 /// and passes through). Shared by the serve-time slim projection
 /// (intent-services `tool_block`) and the write-time `lastToolUse` preview
 /// (intent-store, [`last_tool_use_preview`]).
+#[must_use]
 pub fn slim_body_size(body: &serde_json::Value) -> usize {
     struct CountingSink(usize);
     impl std::io::Write for CountingSink {
@@ -2283,9 +2296,7 @@ pub fn slim_body_size(body: &serde_json::Value) -> usize {
         serde_json::Value::String(s) => s.len(),
         other => {
             let mut sink = CountingSink(0);
-            serde_json::to_writer(&mut sink, other)
-                .map(|()| sink.0)
-                .unwrap_or(0)
+            serde_json::to_writer(&mut sink, other).map_or(0, |()| sink.0)
         }
     }
 }
@@ -2500,6 +2511,7 @@ pub enum MessageOrigin {
 
 impl MessageOrigin {
     /// `true` for [`MessageOrigin::User`].
+    #[must_use]
     pub fn is_user(self) -> bool {
         matches!(self, MessageOrigin::User)
     }
@@ -2524,6 +2536,9 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// the provider's `session:created`), `nameExplicitlySet`, `systemPrompt`, etc.
 /// `messages` is the append-only conversation log; `stats` is a derived snapshot
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
+// The bool fields mirror the TS wire shape; grouping them would change the
+// serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -2627,11 +2642,11 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
-    /// workspaces with CoW support). `None` for shared-mode agents.
+    /// workspaces with `CoW` support). `None` for shared-mode agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
     /// Sandbox path when this agent runs in a CoW-isolated sandbox. The full path
-    /// to the CoW clone of the workspace directory that serves as this agent's
+    /// to the `CoW` clone of the workspace directory that serves as this agent's
     /// working root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_path: Option<String>,
@@ -2854,6 +2869,9 @@ pub struct AgentMetadata {
 /// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
 /// transcript, a nested `metadata` object, and the runtime activity flags the
 /// iOS coverflow reads.
+// The bool fields mirror the TS wire shape; grouping them would change the
+// serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -3170,6 +3188,13 @@ pub struct AgentDelegateInput {
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
     pub model: Option<String>,
+    /// Explicit ACP provider for the delegated child (PROTOCOL §5.5).
+    /// Disambiguates models that exist under multiple providers. Wins over
+    /// every derived resolution rung (compound-`model` prefix, specialist
+    /// frontmatter, settings default); must name a known, available
+    /// provider, and a compound `model` naming a DIFFERENT provider is a
+    /// contradiction — both reject with `-32602` before any side effect.
+    pub provider: Option<String>,
     /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
     /// Wins over the chosen model option's `reasoningEffort` and the
     /// specialist's frontmatter scalar; validated against the cached model
@@ -3179,8 +3204,8 @@ pub struct AgentDelegateInput {
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
     /// Sandbox isolation mode: "cow" (copy-on-write sandbox) or "shared" (default).
-    /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
-    /// the workspace directory. Falls back to shared mode if CoW is unsupported.
+    /// When "cow" and `CoW` is supported, the agent runs in an isolated `CoW` clone of
+    /// the workspace directory. Falls back to shared mode if `CoW` is unsupported.
     pub isolation: Option<String>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
@@ -3189,7 +3214,7 @@ pub struct AgentDelegateInput {
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task
-    /// `specialist`/`model`/`reasoningEffort` overrides. Mutually exclusive
+    /// `specialist`/`model`/`provider`/`reasoningEffort` overrides. Mutually exclusive
     /// with `taskNoteId`/`noteId`/`taskText`, and the single-task-only
     /// `agentInstructions`/`force` are rejected alongside it; when present
     /// the result enumerates every listed task with its disposition
@@ -3214,7 +3239,7 @@ pub struct AgentDelegateInput {
 #[serde(untagged)]
 pub enum BatchTaskEntry {
     /// Bare task-note id — inherits the call's top-level
-    /// `specialist`/`model`/`reasoningEffort` defaults.
+    /// `specialist`/`model`/`provider`/`reasoningEffort` defaults.
     Id(NoteId),
     /// Object entry with per-task overrides.
     Options(BatchTaskOptions),
@@ -3222,6 +3247,7 @@ pub enum BatchTaskEntry {
 
 impl BatchTaskEntry {
     /// The task-note id this entry addresses, regardless of shape.
+    #[must_use]
     pub fn task_note_id(&self) -> &NoteId {
         match self {
             BatchTaskEntry::Id(id) => id,
@@ -3231,7 +3257,7 @@ impl BatchTaskEntry {
 }
 
 /// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
-/// `specialist`/`model`/`reasoningEffort` override the call's top-level
+/// `specialist`/`model`/`provider`/`reasoningEffort` override the call's top-level
 /// defaults for that task only. `agentInstructions` is carried solely so the
 /// delegate op can reject it with a clear error — it is never honored (each
 /// started task's first message resolves from its own task note).
@@ -3248,6 +3274,8 @@ pub struct BatchTaskOptions {
     pub specialist: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
@@ -3795,7 +3823,7 @@ mod tests {
 
     use serde_json::json;
 
-    /// [`last_tool_use_preview`] derivation: the LAST tool_use block wins,
+    /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
     /// an under-budget input passes through whole (no flags), an over-budget
     /// input is capped with the additive `inputTruncated`/`inputBytes`
     /// flags, a tool-less / non-array content yields `None`, and a missing
@@ -3826,7 +3854,10 @@ mod tests {
         let preview = last_tool_use_preview(&big).unwrap();
         assert_eq!(preview["name"], "write_file");
         assert_eq!(preview["inputTruncated"], true);
-        assert!(preview["inputBytes"].as_u64().unwrap() as usize > SLIM_PROJECTION_BUDGET_BYTES);
+        assert!(
+            usize::try_from(preview["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
+                > SLIM_PROJECTION_BUDGET_BYTES
+        );
         assert_eq!(preview["input"]["path"], "/tmp/a.txt");
         let served = serde_json::to_string(&preview["input"]).unwrap();
         assert!(
@@ -3960,7 +3991,7 @@ mod tests {
                 assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
                 assert!(o.agent_instructions.is_none());
             }
-            other => panic!("expected Options, got {other:?}"),
+            other @ BatchTaskEntry::Id(_) => panic!("expected Options, got {other:?}"),
         }
         assert_eq!(tasks[2].task_note_id().0, "min-id");
 
@@ -4289,7 +4320,7 @@ mod tests {
         }
     }
 
-    /// `WorkspaceStatus` serializes to the PascalCase TS `WorkspaceStatus` string
+    /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string
     /// enum (`src/shared/types.ts`): `Active`/`Inactive`/`Archived`/`Deleted`.
     #[test]
     fn workspace_status_wire_forms_match_ts() {
@@ -4307,7 +4338,7 @@ mod tests {
         }
     }
 
-    /// `Workspace` emits PascalCase `status` and omits absent optionals
+    /// `Workspace` emits `PascalCase` `status` and omits absent optionals
     /// (`skip_serializing_if`) so the iOS decoder sees the documented field set
     /// without nulls.
     #[test]

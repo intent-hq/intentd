@@ -167,7 +167,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -223,6 +223,10 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 
 #[tokio::test]
 async fn resolve_interrupted_resume_and_abandon() {
+    // Phase 5: Verify the resumed agent received the reworded continuation
+    // message as the last user-role message (and that it no longer mentions
+    // "intentd").
+    use intent_core::AgentId;
     let data_dir = temp_data_dir();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
@@ -246,9 +250,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
     let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
-    if !await_uds(&socket).await {
-        panic!("daemon did not start");
-    }
+    assert!(await_uds(&socket).await, "daemon did not start");
 
     let ws_id = "ws-resolve-test";
     let agent_resume = format!("agent-{}", Uuid::new_v4().simple());
@@ -391,7 +393,8 @@ async fn resolve_interrupted_resume_and_abandon() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
 
     // Open WSS connection
     let cfg = client_config(&fp);
@@ -434,10 +437,6 @@ async fn resolve_interrupted_resume_and_abandon() {
         "expected 0 interrupted agents after resolve"
     );
 
-    // Phase 5: Verify the resumed agent received the reworded continuation
-    // message as the last user-role message (and that it no longer mentions
-    // "intentd").
-    use intent_core::AgentId;
     let resume_agent_id = AgentId(agent_resume.clone());
     let resumed_session = store
         .get_agent_session(&resume_agent_id)
@@ -569,9 +568,7 @@ async fn resolve_interrupted_invalid_params_validation() {
     cmd.process_group(0);
     let child = cmd.spawn().expect("spawn intentd serve");
     let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
-    if !await_uds(&socket).await {
-        panic!("daemon did not start");
-    }
+    assert!(await_uds(&socket).await, "daemon did not start");
 
     // Fetch fingerprint and port
     let status = common::await_wss_status(&socket).await;
@@ -579,7 +576,8 @@ async fn resolve_interrupted_invalid_params_validation() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
 
     // Open WSS connection
     let cfg = client_config(&fp);

@@ -107,10 +107,7 @@ async fn rpc(socket: &Path, frame: Value, read_timeout: Duration) -> Option<Valu
 async fn wait_for_log_marker(log: &Path, marker: &str) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if std::fs::read_to_string(log)
-                .map(|s| s.contains(marker))
-                .unwrap_or(false)
-            {
+            if std::fs::read_to_string(log).is_ok_and(|s| s.contains(marker)) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

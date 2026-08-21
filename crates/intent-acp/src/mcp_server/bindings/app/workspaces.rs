@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.workspaces = {
@@ -25,7 +25,7 @@ pub(crate) const PRELUDE: &str = r#"
         bulkArchive: (ids) => host({ method: 'app.workspaces.bulkArchive', args: { ids } }),
         bulkDelete: (ids) => host({ method: 'app.workspaces.bulkDelete', args: { ids } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -61,7 +61,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
             if let Some(arr) = s.as_array() {
                 Some(
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                        .filter_map(|v| v.as_str().map(str::to_lowercase))
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -282,11 +282,12 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 
     // RFC3986 percent-encode the id portion for URI path segment use
     let encoded_id = super::proposal::percent_encode_path_segment(id);
-    format!("intent-proposal://{}/{}", kind, encoded_id)
+    format!("intent-proposal://{kind}/{encoded_id}")
 }
 
 /// Return a proposal with dual text+resource content items.
-fn proposal_result(proposal: Value) -> Result<Value, String> {
+#[allow(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
+fn proposal_result(proposal: &Value) -> Result<Value, String> {
     // Build resource name from preview.title
     let name = proposal
         .get("preview")
@@ -306,7 +307,7 @@ fn proposal_result(proposal: Value) -> Result<Value, String> {
     let resource_item = json!({
         "type": "resource",
         "resource": {
-            "uri": proposal_resource_uri(&proposal),
+            "uri": proposal_resource_uri(proposal),
             "name": name,
             "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
             "text": serde_json::to_string(&proposal).unwrap_or_else(|_| "{}".to_string())
@@ -726,7 +727,7 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
     let title = params
         .get("title")
         .and_then(Value::as_str)
-        .map(|s| format!(": {}", s))
+        .map(|s| format!(": {s}"))
         .unwrap_or_default();
 
     let mut fields = normalize_workspace_create_fields(&params);
@@ -867,7 +868,7 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         "preview": preview
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -890,8 +891,7 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         .repository_name
         .as_deref()
         .or(workspace.repository_path.as_deref())
-        .map(String::from)
-        .unwrap_or_else(|| format!("{:?}", workspace.status));
+        .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
     let proposal = json!({
         "kind": "bulk-op",
@@ -913,7 +913,7 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         }
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -936,8 +936,7 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         .repository_name
         .as_deref()
         .or(workspace.repository_path.as_deref())
-        .map(String::from)
-        .unwrap_or_else(|| format!("{:?}", workspace.status));
+        .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
     let proposal = json!({
         "kind": "bulk-op",
@@ -960,7 +959,7 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         }
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -997,8 +996,7 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
             .repository_name
             .as_deref()
             .or(workspace.repository_path.as_deref())
-            .map(String::from)
-            .unwrap_or_else(|| format!("{:?}", workspace.status));
+            .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
         bulk_items.push(json!({
             "id": id,
@@ -1024,7 +1022,7 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
         }
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -1061,8 +1059,7 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
             .repository_name
             .as_deref()
             .or(workspace.repository_path.as_deref())
-            .map(String::from)
-            .unwrap_or_else(|| format!("{:?}", workspace.status));
+            .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
         bulk_items.push(json!({
             "id": id,
@@ -1089,7 +1086,7 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
         }
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 #[cfg(test)]
@@ -1386,7 +1383,7 @@ mod tests {
         assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
     }
 
-    /// Helper: run `create` against a fresh FakeApi and return the proposal.
+    /// Helper: run `create` against a fresh `FakeApi` and return the proposal.
     async fn create_proposal(args: serde_json::Value) -> Value {
         create_proposal_with(Arc::new(FakeApi::default()), args).await
     }

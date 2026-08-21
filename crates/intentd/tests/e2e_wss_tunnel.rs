@@ -162,7 +162,7 @@ async fn start_with(limits: TunnelLimits) -> Server {
         ..WsOptions::default()
     };
     let ws =
-        WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
+        WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -430,7 +430,8 @@ async fn tunnel_concurrent_stream_cap_enforced() {
     let echo_port = spawn_echo_listener().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
-    let cap = intent_transport::tunnel::MAX_STREAMS_PER_CONNECTION as u32;
+    let cap =
+        u32::try_from(intent_transport::tunnel::MAX_STREAMS_PER_CONNECTION).expect("small cap");
     for id in 0..cap {
         send_frame(
             &mut ws,

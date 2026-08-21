@@ -41,6 +41,10 @@ impl SentryRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no
     /// credential pair is available. Async because the secrets-store lookup
     /// runs on the blocking pool with a bounded timeout (see [`token::resolve`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConfigured`] when no credential pair is available; propagates client-construction failures.
     pub async fn from_settings(settings: &SentrySettings) -> Result<Arc<dyn SentryEngine>> {
         let creds = resolve_credentials(settings).await?;
         let client = SentryClient::new(

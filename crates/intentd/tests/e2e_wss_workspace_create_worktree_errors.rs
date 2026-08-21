@@ -1,6 +1,6 @@
 //! WSS end-to-end test for workspace.create worktree failure error codes.
 //! Drives the real WS transport and asserts that a "branch already checked
-//! out" failure surfaces as -32602 (InvalidParams) with an actionable message
+//! out" failure surfaces as -32602 (`InvalidParams`) with an actionable message
 //! instead of a generic -32603 (Internal error).
 
 #![cfg(unix)]

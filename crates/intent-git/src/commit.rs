@@ -32,6 +32,10 @@ pub struct CommitOutcome {
 
 /// Create a commit from the current index (already-staged changes), mirroring
 /// `git commit -m <message>`. Errors when there is nothing staged to commit.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if there is nothing staged to commit or another libgit2 operation fails.
 pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut index = repo.index().map_err(map_git_err)?;
@@ -68,6 +72,10 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
 /// via [`build_commit_message`] before committing the staged index. Mirrors
 /// [`commit`] except for the trailer-aware message; used by the agent commit path
 /// while bare [`commit`] backs `git.commit`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if there is nothing staged to commit or another libgit2 operation fails.
 pub fn commit_with_trailers(
     worktree_path: &Path,
     message: &str,
@@ -85,6 +93,10 @@ pub fn commit_with_trailers(
 /// attribution-filtered `git.agentCommit` fallback so another actor's staged
 /// work cannot ride along. `paths` are worktree-relative; a path missing from
 /// the working tree is committed as a deletion.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if a path is inside a registered submodule, a pathspec matches no files, or another libgit2 operation fails.
 pub fn commit_paths_with_trailers(
     worktree_path: &Path,
     message: &str,
@@ -227,6 +239,10 @@ fn collapse_blank_lines(s: &str) -> String {
 
 /// All distinct paths with worktree changes (staged, unstaged, or untracked),
 /// the auto-stage set for `agentCommit` in the absence of agent attribution.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
     let st = crate::status::status(worktree_path)?;
     let mut paths = Vec::new();
@@ -242,6 +258,10 @@ pub fn all_changed_paths(worktree_path: &Path) -> Result<Vec<String>> {
 /// for a `userRequested` `agentCommit` given no explicit `files`: a user
 /// checkpoint commits what the user staged (plain `git commit` semantics)
 /// instead of sweeping every change in the worktree into the commit.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn staged_paths(worktree_path: &Path) -> Result<Vec<String>> {
     let st = crate::status::status(worktree_path)?;
     let mut paths = Vec::new();

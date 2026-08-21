@@ -1,6 +1,6 @@
 [package]
 name = "intent-core"
-version = "0.7.24"
+version = "0.7.33"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -23,3 +23,6 @@ libc = "0.2"
 [dev-dependencies]
 ctor = "1.0.10"
 tempfile = "3"
+
+[lints]
+workspace = true

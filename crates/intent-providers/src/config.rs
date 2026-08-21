@@ -73,7 +73,7 @@ pub enum ProviderRuntime {
     Node,
     /// Electron binary run with `ELECTRON_RUN_AS_NODE=1` (still V8).
     Electron,
-    /// Natively-compiled binary — not V8, no NODE_OPTIONS handling.
+    /// Natively-compiled binary — not V8, no `NODE_OPTIONS` handling.
     Native,
 }
 
@@ -98,6 +98,9 @@ pub enum InjectionMechanism {
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
 /// intentionally omitted — they are Electron IPC / renderer concerns and are
 /// not part of the §6.9 field list.
+// Static registry entries port the TS `ACPProviderConfig` field-for-field;
+// the independent capability bools stay flat for parity.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderConfig {
     /// Unique identifier (e.g., `auggie`, `opencode`).
@@ -116,7 +119,7 @@ pub struct ProviderConfig {
     /// Flag for model selection (e.g., `--model`). `None` when the provider
     /// passes model config through other mechanisms (env vars, custom args).
     pub model_flag: Option<&'static str>,
-    /// Default agent name for the ACP session (e.g., `build` for OpenCode).
+    /// Default agent name for the ACP session (e.g., `build` for `OpenCode`).
     pub default_agent: Option<&'static str>,
     /// Whether the provider implements the ACP `authenticate` method.
     pub supports_authenticate: bool,
@@ -253,6 +256,7 @@ impl ProviderConfig {
     /// targets the `unsloth` CLI itself (the secondary binary the
     /// daemon-managed server lifecycle shells out to). Every other provider
     /// owns its own primary.
+    #[must_use]
     pub fn primary_binary_provider_id(&self) -> &'static str {
         match self.id {
             "unsloth" => "opencode",
@@ -461,6 +465,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
 ];
 
 /// Find a provider by id, or `None` if unknown.
+#[must_use]
 pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
     ACP_PROVIDERS.iter().find(|p| p.id == provider_id)
 }
@@ -476,6 +481,7 @@ pub(crate) fn first_provider_config() -> &'static ProviderConfig {
 }
 
 /// The first registered provider id (see [`first_provider_config`]).
+#[must_use]
 pub fn first_provider_id() -> &'static str {
     first_provider_config().id
 }
@@ -489,6 +495,7 @@ const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 /// when unknown. Unknown ids warn (see [`warns_on_unknown_provider`]) so
 /// registry gaps surface in logs instead of silently spawning the fallback
 /// agent. Port of `getProviderConfig`.
+#[must_use]
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
     find_provider(provider_id).unwrap_or_else(|| {
         let fallback = first_provider_config();
@@ -511,6 +518,7 @@ pub(crate) fn warns_on_unknown_provider(provider_id: &str) -> bool {
 }
 
 /// All registered provider ids, in definition order. Port of `getAllProviderIds`.
+#[must_use]
 pub fn all_provider_ids() -> Vec<&'static str> {
     ACP_PROVIDERS.iter().map(|p| p.id).collect()
 }
@@ -535,10 +543,10 @@ pub(crate) fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
 /// `{command} login`). Port of `getProviderAuthErrorMessage`.
 pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
     let config = provider_config(provider_id);
-    let login_cmd = config
-        .login_command_hint
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| format!("{} login", config.command));
+    let login_cmd = config.login_command_hint.map_or_else(
+        || format!("{} login", config.command),
+        std::string::ToString::to_string,
+    );
 
     if is_remote {
         format!(
@@ -556,6 +564,7 @@ pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
 /// Whether an error message indicates the provider needs authentication,
 /// using the provider's configured `auth_error_patterns` (case-insensitive).
 /// Port of `isProviderAuthenticationError`.
+#[must_use]
 pub fn is_provider_authentication_error(provider_id: &str, error_message: &str) -> bool {
     let config = provider_config(provider_id);
     let Some(patterns) = config.auth_error_patterns else {

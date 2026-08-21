@@ -1,7 +1,7 @@
-//! ElevenLabs Scribe provider (`POST /v1/speech-to-text`, multipart).
+//! `ElevenLabs` Scribe provider (`POST /v1/speech-to-text`, multipart).
 //!
 //! Uses `model_id=scribe_v2` — required for keyterm biasing. Merged keyterms
-//! are sent as repeated `keyterms` form fields (the encoding the ElevenLabs
+//! are sent as repeated `keyterms` form fields (the encoding the `ElevenLabs`
 //! SDKs produce for array data parts).
 //!
 //! GUARDRAIL: the API key is a secret. It is stored only to build the
@@ -13,13 +13,13 @@ use serde_json::Value;
 use crate::engine::{TranscribeRequest, Transcript, VoiceEngine};
 use crate::error::{Error, Result};
 
-/// Default ElevenLabs REST base URL.
+/// Default `ElevenLabs` REST base URL.
 pub(crate) const ELEVENLABS_API_BASE_URL: &str = "https://api.elevenlabs.io";
 
 /// Scribe model used for batch transcription (keyterms require v2).
 const MODEL_ID: &str = "scribe_v2";
 
-/// ElevenLabs Scribe implementation of [`VoiceEngine`].
+/// `ElevenLabs` Scribe implementation of [`VoiceEngine`].
 pub(crate) struct ElevenLabsEngine {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.
@@ -32,7 +32,7 @@ impl std::fmt::Debug for ElevenLabsEngine {
         f.debug_struct("ElevenLabsEngine")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -54,7 +54,7 @@ impl ElevenLabsEngine {
     }
 
     /// Build the multipart form for one attempt (forms are not cloneable).
-    fn build_form(&self, request: &TranscribeRequest) -> Result<reqwest::multipart::Form> {
+    fn build_form(request: &TranscribeRequest) -> Result<reqwest::multipart::Form> {
         let file_name = file_name_for(&request.mime_type);
         let part = reqwest::multipart::Part::bytes(request.audio.clone())
             .file_name(file_name)
@@ -90,7 +90,7 @@ pub(crate) fn file_name_for(mime_type: &str) -> String {
 impl VoiceEngine for ElevenLabsEngine {
     async fn transcribe(&self, request: TranscribeRequest) -> Result<Transcript> {
         let url = format!("{}/v1/speech-to-text", self.base_url);
-        let form = self.build_form(&request)?;
+        let form = Self::build_form(&request)?;
         let resp = self
             .http
             .post(&url)
@@ -121,7 +121,12 @@ impl VoiceEngine for ElevenLabsEngine {
             .and_then(|words| words.last())
             .and_then(|w| w.get("end"))
             .and_then(Value::as_f64)
-            .map(|secs| (secs * 1000.0) as u64);
+            // Float→int casts saturate; durations are non-negative seconds.
+            .map(|secs| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = (secs * 1000.0) as u64;
+                ms
+            });
         Ok(Transcript { text, duration_ms })
     }
 

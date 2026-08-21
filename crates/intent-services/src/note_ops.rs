@@ -9,6 +9,7 @@
 //! actionable message directly.
 
 use intent_core::{Error, NoteTaskRow, Result};
+use std::fmt::Write as _;
 
 /// JS `\s` (ASCII subset): space, tab, the line terminators, FF and VT.
 fn is_js_space_char(c: char) -> bool {
@@ -98,7 +99,7 @@ pub(crate) fn apply_edit(old: &str, old_text: &str, new_text: &str) -> Result<(S
         ))),
         Some(idx) => {
             let new_content = format!("{}{}{}", &old[..idx], new_text, &old[idx + old_text.len()..]);
-            let match_position = old[..idx].chars().count() as i64;
+            let match_position = i64::try_from(old[..idx].chars().count()).expect("value fits in i64");
             Ok((new_content, match_position, false))
         }
     }
@@ -125,7 +126,7 @@ pub(crate) fn apply_edit_lines(old: &str, start: i64, end: i64, content: &str) -
         return Ok(content.to_string());
     }
     let lines: Vec<&str> = old.split('\n').collect();
-    let total = lines.len() as i64;
+    let total = i64::try_from(lines.len()).expect("value fits in i64");
     if start > total {
         return Err(Error::Internal(format!(
             "start ({start}) exceeds total lines in note ({total})"
@@ -137,11 +138,11 @@ pub(crate) fn apply_edit_lines(old: &str, start: i64, end: i64, content: &str) -
         )));
     }
     let mut result: Vec<&str> = Vec::new();
-    result.extend_from_slice(&lines[..(start as usize - 1)]);
+    result.extend_from_slice(&lines[..(usize::try_from(start).expect("value fits in usize") - 1)]);
     if !content.is_empty() {
         result.extend(content.split('\n'));
     }
-    result.extend_from_slice(&lines[end as usize..]);
+    result.extend_from_slice(&lines[usize::try_from(end).expect("value fits in usize")..]);
     Ok(result.join("\n"))
 }
 
@@ -288,7 +289,7 @@ fn match_task_line(line: &str) -> Option<(char, String)> {
         chars.next();
     }
     match chars.next() {
-        Some('-') | Some('*') => {}
+        Some('-' | '*') => {}
         _ => return None,
     }
     while matches!(chars.peek(), Some(c) if is_js_space_char(*c)) {
@@ -297,9 +298,8 @@ fn match_task_line(line: &str) -> Option<(char, String)> {
     if chars.next() != Some('[') {
         return None;
     }
-    let checkbox = match chars.next() {
-        Some(c @ (' ' | 'x' | 'X' | '/')) => c,
-        _ => return None,
+    let Some(checkbox @ (' ' | 'x' | 'X' | '/')) = chars.next() else {
+        return None;
     };
     if chars.next() != Some(']') {
         return None;
@@ -463,27 +463,24 @@ pub(crate) fn apply_task_line_update(
     expected: Option<&str>,
 ) -> Result<TaskLineUpdate> {
     let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
-    let total = lines.len() as i64;
+    let total = i64::try_from(lines.len()).expect("value fits in i64");
     if line > total {
         return Err(Error::Internal(format!(
             "Line {line} does not exist. Note has {total} lines."
         )));
     }
-    let current = lines[(line - 1) as usize].clone();
+    let current = lines[usize::try_from(line - 1).expect("value fits in usize")].clone();
     let parsed = parse_dash_checkbox(&current);
-    let (box_start, after_idx, cb) = match parsed {
-        Some(v) => v,
-        None => {
-            let trunc: String = current.chars().take(50).collect();
-            let ellipsis = if current.chars().count() > 50 {
-                "..."
-            } else {
-                ""
-            };
-            return Err(Error::Internal(format!(
-                "Line {line} is not a task. Expected format: \"- [ ] task text\". Found: \"{trunc}{ellipsis}\""
-            )));
-        }
+    let Some((box_start, after_idx, cb)) = parsed else {
+        let trunc: String = current.chars().take(50).collect();
+        let ellipsis = if current.chars().count() > 50 {
+            "..."
+        } else {
+            ""
+        };
+        return Err(Error::Internal(format!(
+            "Line {line} is not a task. Expected format: \"- [ ] task text\". Found: \"{trunc}{ellipsis}\""
+        )));
     };
     let prefix = &current[..box_start];
     let current_task_text = current[after_idx..].trim_start();
@@ -505,7 +502,8 @@ pub(crate) fn apply_task_line_update(
         Some(t) => t.trim().to_string(),
         None => current_task_text.to_string(),
     };
-    lines[(line - 1) as usize] = format!("{prefix}{checkbox} {final_text}");
+    lines[usize::try_from(line - 1).expect("value fits in usize")] =
+        format!("{prefix}{checkbox} {final_text}");
     Ok(TaskLineUpdate {
         content: lines.join("\n"),
         previous_text: current_task_text.to_string(),
@@ -568,13 +566,10 @@ pub(crate) fn find_and_anchor_text(
         return Ok((from, to, line_of(content, from)));
     }
     let ctx_from = ctx[0];
-    let rel = match search_context.find(comment_target) {
-        Some(r) => r,
-        None => {
-            return Err(Error::InvalidParams(
-                "The comment target was not found within the search context.".to_string(),
-            ))
-        }
+    let Some(rel) = search_context.find(comment_target) else {
+        return Err(Error::InvalidParams(
+            "The comment target was not found within the search context.".to_string(),
+        ));
     };
     if count_occurrences(search_context, comment_target) > 1 {
         return Err(Error::InvalidParams(
@@ -621,7 +616,7 @@ fn list_marker_len(line: &str) -> Option<usize> {
         b'-' | b'*' | b'+' => (b.get(1) == Some(&b' ')).then_some(2),
         b'0'..=b'9' => {
             let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
-            (matches!(b.get(digits), Some(b'.') | Some(b')')) && b.get(digits + 1) == Some(&b' '))
+            (matches!(b.get(digits), Some(b'.' | b')')) && b.get(digits + 1) == Some(&b' '))
                 .then_some(digits + 2)
         }
         _ => None,
@@ -653,7 +648,7 @@ fn plaintext_projection(md: &str) -> PlaintextProjection {
             let body = &line[indent..];
             let hashes = body.bytes().take_while(|b| *b == b'#').count();
             let skip = if (1..=6).contains(&hashes)
-                && matches!(body.as_bytes().get(hashes), Some(b' ') | Some(b'\t'))
+                && matches!(body.as_bytes().get(hashes), Some(b' ' | b'\t'))
             {
                 hashes + 1
             } else if body.starts_with("> ") {
@@ -953,8 +948,7 @@ pub(crate) fn context_before(content: &str, pos: usize) -> String {
         .rev()
         .take(ANCHOR_CONTEXT_LEN)
         .last()
-        .map(|(idx, _)| idx)
-        .unwrap_or(pos);
+        .map_or(pos, |(idx, _)| idx);
     content[start..pos].to_string()
 }
 
@@ -965,8 +959,7 @@ pub(crate) fn context_after(content: &str, pos: usize) -> String {
         .char_indices()
         .take(ANCHOR_CONTEXT_LEN)
         .last()
-        .map(|(idx, ch)| pos + idx + ch.len_utf8())
-        .unwrap_or(pos);
+        .map_or(pos, |(idx, ch)| pos + idx + ch.len_utf8());
     content[pos..end].to_string()
 }
 
@@ -1217,8 +1210,7 @@ fn trailing_word(s: &str) -> String {
         .rev()
         .take_while(|(_, c)| !c.is_whitespace())
         .last()
-        .map(|(i, _)| i)
-        .unwrap_or(trimmed.len());
+        .map_or(trimmed.len(), |(i, _)| i);
     trimmed[start..].to_string()
 }
 
@@ -1478,7 +1470,7 @@ pub(crate) fn extract_task_blocks(content: &str) -> TaskBlocksResult {
         out.push_str(&content[cursor..block.start]);
         match parse_task_block_content(&block.body) {
             Some(mut task) => {
-                out.push_str(&format!("<!-- task-block-placeholder-{valid_index} -->"));
+                let _ = write!(out, "<!-- task-block-placeholder-{valid_index} -->");
                 task.key = block.header.key;
                 task.depends_on = block.header.depends_on;
                 task.conflicts_with = block.header.conflicts_with;
@@ -1520,25 +1512,22 @@ fn strip_paired(s: &str, delim: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     loop {
-        match rest.find(delim) {
-            Some(open) => {
-                let after = &rest[open + delim.len()..];
-                match after.find(delim) {
-                    Some(close) if close > 0 => {
-                        out.push_str(&rest[..open]);
-                        out.push_str(&after[..close]);
-                        rest = &after[close + delim.len()..];
-                    }
-                    _ => {
-                        out.push_str(&rest[..open + delim.len()]);
-                        rest = after;
-                    }
+        if let Some(open) = rest.find(delim) {
+            let after = &rest[open + delim.len()..];
+            match after.find(delim) {
+                Some(close) if close > 0 => {
+                    out.push_str(&rest[..open]);
+                    out.push_str(&after[..close]);
+                    rest = &after[close + delim.len()..];
+                }
+                _ => {
+                    out.push_str(&rest[..open + delim.len()]);
+                    rest = after;
                 }
             }
-            None => {
-                out.push_str(rest);
-                break;
-            }
+        } else {
+            out.push_str(rest);
+            break;
         }
     }
     out
@@ -1562,7 +1551,7 @@ fn strip_links(s: &str) -> String {
                 }
             }
         }
-        out.push_str(&rest[..open + 1]);
+        out.push_str(&rest[..=open]);
         rest = &rest[open + 1..];
     }
     out.push_str(rest);
@@ -1591,7 +1580,6 @@ fn strip_leading_headers(s: &str) -> String {
 /// inverse of [`mime_from_extension`], per the TS `getExtensionFromMimeType`.
 pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
     match mime_type {
-        "image/png" => ".png",
         "image/jpeg" | "image/jpg" => ".jpg",
         "image/gif" => ".gif",
         "image/webp" => ".webp",
@@ -1622,8 +1610,7 @@ pub(crate) fn new_asset_id(base64_data: &str, mime_type: &str) -> String {
     use std::hash::{Hash, Hasher};
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     base64_data.hash(&mut hasher);
     let hash8 = format!("{:016x}", hasher.finish())[..8].to_string();
@@ -1657,7 +1644,6 @@ pub(crate) fn mime_from_extension(asset_id: &str) -> String {
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
@@ -2417,6 +2403,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
     fn save_asset_helpers() {
         assert_eq!(extension_from_mime("image/jpeg"), ".jpg");
         assert_eq!(extension_from_mime("image/webp"), ".webp");
@@ -2513,7 +2500,7 @@ mod tests {
         let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
             RecoveryOutcome::Recovered(m) => m,
-            other => panic!("expected Recovered, got {other:?}"),
+            other @ RecoveryOutcome::Failed(_) => panic!("expected Recovered, got {other:?}"),
         };
         assert!(
             recovered.contains("<!--anchor:c1:start-->target<!--anchor:c1:end--> post"),
@@ -2533,7 +2520,7 @@ mod tests {
         let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
             RecoveryOutcome::Recovered(m) => m,
-            other => panic!("expected Recovered, got {other:?}"),
+            other @ RecoveryOutcome::Failed(_) => panic!("expected Recovered, got {other:?}"),
         };
         assert!(
             recovered.contains("pre <!--anchor:c1:start-->target<!--anchor:c1:end--> post"),
@@ -2586,7 +2573,7 @@ mod tests {
     const PHANTOM_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+        ids.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]

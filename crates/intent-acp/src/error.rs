@@ -25,7 +25,7 @@ pub struct JsonRpcError {
 /// Cap on the rendered `data` payload appended by [`JsonRpcError`]'s Display
 /// (monorepo#519): `data` is provider-controlled and unbounded, and the
 /// rendered string flows into `stop_reason` persistence, `agent:failed`
-/// events, and logs. Sized so real actionable details (e.g. the ChatGPT
+/// events, and logs. Sized so real actionable details (e.g. the `ChatGPT`
 /// backend 400 nested by codex-acp, ~300 bytes — monorepo#479) render in
 /// full while pathological payloads stay bounded.
 pub(crate) const MAX_RENDERED_DATA_BYTES: usize = 1024;
@@ -240,6 +240,7 @@ pub(crate) fn message_is_transient_upstream_disconnect(message: &str) -> bool {
 /// flattened, as bare strings).
 ///
 /// Pure classification only: no I/O, no state, no resume decision.
+#[must_use]
 pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
     match err {
         AcpError::Auth(_)
@@ -266,6 +267,7 @@ pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
 /// (silent redrive on a fresh child, sleep-resume enrollment). The terminal
 /// denylist wins as usual: auth failures, invalid requests, and
 /// model-not-found rejections are never retried.
+#[must_use]
 pub fn is_transient_provider_fetch_failure(err: &AcpError) -> bool {
     match err {
         AcpError::Rpc(e) => {

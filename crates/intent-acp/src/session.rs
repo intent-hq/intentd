@@ -88,6 +88,7 @@ fn session_setup_timeout() -> Duration {
 /// Public so the service layer's warn-and-continue path can render the
 /// actual configured window in the timeout-warning message instead of a
 /// hardcoded literal.
+#[must_use]
 pub fn prompt_idle_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -109,6 +110,7 @@ pub struct ActivityTracker {
 
 impl ActivityTracker {
     /// Create a new tracker initialized to "now".
+    #[must_use]
     pub fn new() -> Self {
         Self {
             last_active_ms: Arc::new(AtomicU64::new(elapsed_ms())),
@@ -121,6 +123,7 @@ impl ActivityTracker {
     }
 
     /// Milliseconds since the last activity.
+    #[must_use]
     pub fn idle_ms(&self) -> u64 {
         elapsed_ms().saturating_sub(self.last_active_ms.load(Ordering::SeqCst))
     }
@@ -136,13 +139,17 @@ impl Default for ActivityTracker {
 fn elapsed_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    start.elapsed().as_millis() as u64
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// `session/new` with `{ cwd, mcpServers, _meta? }` → the agent's session id and initial
 /// state. The caller persists `response.session_id` as `AgentSession.acpSessionId`
 /// (write-once) for later resume (§6.5). `meta` (if present) is provider-specific
 /// metadata for system-prompt injection or other extensions.
+///
+/// # Errors
+///
+/// Returns [`AcpError::Protocol`] if the response does not deserialize; otherwise propagates the transport/RPC error from the request.
 pub async fn new_session(
     conn: &Connection,
     cwd: impl Into<PathBuf>,
@@ -163,6 +170,10 @@ pub async fn new_session(
 /// valid when the agent advertised the `loadSession` capability — check with
 /// [`supports_load_session`] first (§6.5). `meta` (if present) is provider-specific
 /// metadata for system-prompt injection or other extensions.
+///
+/// # Errors
+///
+/// Returns [`AcpError::Protocol`] if the response does not deserialize; otherwise propagates the transport/RPC error from the request.
 pub async fn load_session(
     conn: &Connection,
     session_id: &str,
@@ -202,6 +213,10 @@ pub struct PromptOutcome {
 /// sustained period of silence (no `session/update` traffic). The caller must
 /// update `activity` on every incoming notification; the prompt loop polls it
 /// to enforce the idle window. Actively-streaming turns never time out.
+///
+/// # Errors
+///
+/// Returns [`AcpError::PromptIdleTimeout`] after a sustained period with no `session/update` traffic; [`AcpError::Protocol`] if the response does not deserialize; otherwise propagates the transport/RPC error.
 pub async fn prompt(
     conn: &Connection,
     session_id: &str,
@@ -233,7 +248,7 @@ pub async fn prompt(
                     usage: response.usage,
                 });
             }
-            _ = tokio::time::sleep(poll_interval) => {
+            () = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());
                 if idle >= idle_window {
                     // Early return drops req_fut; its pending-map entry is
@@ -251,6 +266,10 @@ pub async fn prompt(
 /// grok today; parity with the reference acp-provider's post-session
 /// `session/set_model`). The request shape is `{ sessionId, modelId }` — the
 /// pinned `agent-client-protocol` schema has no typed request for it yet.
+///
+/// # Errors
+///
+/// Propagates the transport/RPC error if the request fails.
 pub async fn set_session_model(
     conn: &Connection,
     session_id: &str,
@@ -269,6 +288,10 @@ pub async fn set_session_model(
 /// verified live against claude-agent-acp@0.60.0 (2026-07-22), whose response
 /// echoes the updated `configOptions` list; the pinned `agent-client-protocol`
 /// schema has no typed request for it yet.
+///
+/// # Errors
+///
+/// Propagates the transport/RPC error if the request fails.
 pub async fn set_session_config_option(
     conn: &Connection,
     session_id: &str,
@@ -284,7 +307,11 @@ pub async fn set_session_config_option(
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
 /// the agent then resolves the in-flight `session/prompt` with
 /// `StopReason::Cancelled`). Hard-cancel/reap process-tree kill is
-/// `SpawnedAgent::kill` (orchestrated by the AgentManager, M3.6) (§6.5).
+/// `SpawnedAgent::kill` (orchestrated by the `AgentManager`, M3.6) (§6.5).
+///
+/// # Errors
+///
+/// Returns [`AcpError::Transport`] if sending the notification fails.
 pub async fn cancel(conn: &Connection, session_id: &str) -> AcpResult<()> {
     let notification = CancelNotification::new(SessionId::new(session_id));
     let params = serde_json::to_value(&notification)?;
@@ -292,6 +319,7 @@ pub async fn cancel(conn: &Connection, session_id: &str) -> AcpResult<()> {
 }
 
 /// Whether the agent advertised the `loadSession` capability in its handshake.
+#[must_use]
 pub fn supports_load_session(init: &InitializeResponse) -> bool {
     init.agent_capabilities.load_session
 }
@@ -394,6 +422,7 @@ pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate>
 /// Parse a `session/update` notification and map it. Returns `None` when the
 /// method is not `session/update`, the params fail to parse, or the variant has
 /// no canonical event. Keeps schema parsing inside `intent-acp`.
+#[must_use]
 pub fn map_notification(note: &IncomingNotification) -> Option<MappedUpdate> {
     if note.method != "session/update" {
         return None;
@@ -545,6 +574,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// tool-call mappers' [`resolve_input_and_name`]) feeds the rewritten
 /// `{server}_{tool}` string in as `title`, keeping the two equivalent on
 /// every path.
+#[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_affix(name);

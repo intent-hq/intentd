@@ -158,6 +158,7 @@ async fn boot() -> Fixture {
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let services = Services::new(store)
         .with_workspaces_root(workspaces_root)
+        .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let tls = ensure_tls_certificate(&dir).expect("cert");
@@ -169,7 +170,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(api, bus.clone(), &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
@@ -251,7 +252,6 @@ async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
                         return v;
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
                 Message::Close(_) => panic!("connection closed mid-stream"),
                 _ => {}
             }
@@ -327,17 +327,14 @@ fn apply_incremental_entity(messages: &mut Vec<Value>, entity: &Value) {
         .position(|b| b["id"].as_str() == Some(block_id.as_str()));
     if let Some(fragment) = block.get("textDelta").and_then(|v| v.as_str()) {
         // Incremental fragment: append onto the accumulated text.
-        match pos {
-            Some(bi) => {
-                let acc = blocks[bi]["text"].as_str().unwrap_or_default().to_string();
-                blocks[bi]["text"] = json!(format!("{acc}{fragment}"));
-            }
-            None => {
-                let mut b = block.clone();
-                b.as_object_mut().unwrap().remove("textDelta");
-                b["text"] = json!(fragment);
-                blocks.push(b);
-            }
+        if let Some(bi) = pos {
+            let acc = blocks[bi]["text"].as_str().unwrap_or_default().to_string();
+            blocks[bi]["text"] = json!(format!("{acc}{fragment}"));
+        } else {
+            let mut b = block.clone();
+            b.as_object_mut().unwrap().remove("textDelta");
+            b["text"] = json!(fragment);
+            blocks.push(b);
         }
     } else {
         // Full block (non-text passthrough or terminal reconcile): upsert.
@@ -730,7 +727,7 @@ async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
         )
         .await
         .expect("append assistant message");
-    fx.bus.publish_transient(&stream_event(
+    let _ = fx.bus.publish_transient(&stream_event(
         &ws_id,
         &agent_id,
         CHAT_STREAM_DELTA,
@@ -739,14 +736,14 @@ async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
             "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
         }),
     ));
-    fx.bus.publish_transient(&stream_event(
+    let _ = fx.bus.publish_transient(&stream_event(
         &ws_id,
         &agent_id,
         AGENT_STREAM_END,
         json!({ "agentId": agent_id }),
     ));
     for _ in 0..2048 {
-        fx.bus.publish_transient(&NewEvent {
+        let _ = fx.bus.publish_transient(&NewEvent {
             workspace_id: WorkspaceId::from(ws_id.as_str()),
             timestamp: now_iso(),
             event_type: "note:created".to_string(),

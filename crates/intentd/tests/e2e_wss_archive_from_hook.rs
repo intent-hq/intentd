@@ -61,14 +61,14 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         let _ = self.child.wait();
         if std::thread::panicking() {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -220,7 +220,7 @@ async fn wss_rpc_envelope(ws: &mut TlsWs, method: &str, params: Value) -> Value 
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -281,7 +281,7 @@ async fn wss_event_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> Opti
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -414,7 +414,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -464,9 +465,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     let mut hook_id = None::<String>;
     while hook_id.is_none() {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("hook:scheduled never landed"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("hook:scheduled never landed")
         };
         if ev["type"] == json!("hook:scheduled") && ev["data"]["name"] == json!("archiver") {
             assert_eq!(ev["data"]["agentId"], json!(agent_id), "hook owner: {ev}");
@@ -486,11 +486,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let mut hook_cancelled = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while archive_delta.is_none() || !hook_cancelled {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => {
-                panic!("timed out: archive_delta={archive_delta:?} hook_cancelled={hook_cancelled}")
-            }
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out: archive_delta={archive_delta:?} hook_cancelled={hook_cancelled}")
         };
         match ev["type"].as_str().unwrap_or_default() {
             "workspace:updated" if ev["data"]["changes"]["archived"] == json!(true) => {
@@ -586,7 +583,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
         // stall could elapse before `hook.runNow`'s archive lands — the wake
         // then takes the idle delivery-time gate instead and the test
         // silently stops covering the end-of-turn drain path.
-        "firstTurnDelayMs": common::test_timeout(Duration::from_millis(4000)).as_millis() as u64,
+        "firstTurnDelayMs": u64::try_from(common::test_timeout(Duration::from_secs(4)).as_millis()).unwrap_or(u64::MAX),
         "response": "acknowledged",
     })
     .to_string();
@@ -607,7 +604,8 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -658,9 +656,8 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     let mut hook_id = None::<String>;
     while hook_id.is_none() {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("hook:scheduled never landed"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("hook:scheduled never landed")
         };
         if ev["type"] == json!("hook:scheduled") && ev["data"]["name"] == json!("archiver") {
             hook_id = Some(ev["data"]["hookId"].as_str().expect("hookId").to_string());
@@ -679,11 +676,10 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let mut hook_cancelled = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !archive_delta_seen || !hook_cancelled {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!(
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: archive_delta_seen={archive_delta_seen} hook_cancelled={hook_cancelled}"
-            ),
+            )
         };
         match ev["type"].as_str().unwrap_or_default() {
             "workspace:updated" if ev["data"]["changes"]["archived"] == json!(true) => {

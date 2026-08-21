@@ -125,7 +125,7 @@ async fn refresh_loop(
                 }
                 None => return,
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 let now = tokio::time::Instant::now();
                 let due: Vec<WorkspaceId> = pending
                     .iter()
@@ -208,7 +208,7 @@ async fn refresh_workspace(
             return;
         }
     };
-    if let Err(e) = bus.publish(&changes_git_status_event(ws_id, status)).await {
+    if let Err(e) = bus.publish(&changes_git_status_event(ws_id, &status)).await {
         tracing::warn!(workspace = %ws_id, error = %e, "changes:git-status publish failed");
     }
 }

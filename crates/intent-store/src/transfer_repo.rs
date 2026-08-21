@@ -187,9 +187,13 @@ impl Store {
     ///
     /// Batched to exactly two statements — one `pragma_table_info` join for
     /// every table's columns, one `UNION ALL` aggregate over all tables — so
-    /// the `workspace.transfer.plan` dispatch stays within the rpc_profile
+    /// the `workspace.transfer.plan` dispatch stays within the `rpc_profile`
     /// statement budget instead of issuing 2 statements per table
     /// (intent-hq/monorepo#2994).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if either aggregate query fails.
     pub async fn transfer_table_stats(
         &self,
         workspace_id: &WorkspaceId,
@@ -283,11 +287,15 @@ impl Store {
     }
 
     /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
-    /// (`column name → value`), in table order. Values map SQLite storage
+    /// (`column name → value`), in table order. Values map `SQLite` storage
     /// classes to JSON: NULL → `null`, INTEGER → number, REAL → number,
     /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
     /// payload the export archive writes to `rows/<table>.jsonl` and
     /// [`Store::transfer_import_rows`] round-trips on the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn transfer_export_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -318,6 +326,10 @@ impl Store {
     /// their children. Every row's keys are validated against the live
     /// schema. Nothing is visible unless the whole batch commits. Returns
     /// the number of rows inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
     pub async fn transfer_import_rows(
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
@@ -386,7 +398,7 @@ impl Store {
     }
 }
 
-/// Serialize one SQLite row to a JSON object keyed by column name (see
+/// Serialize one `SQLite` row to a JSON object keyed by column name (see
 /// [`Store::transfer_export_rows`] for the storage-class mapping).
 fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json::Value> {
     let mut object = serde_json::Map::with_capacity(row.columns().len());
@@ -420,7 +432,7 @@ fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json:
     Ok(serde_json::Value::Object(object))
 }
 
-/// Bind one exported JSON value back to its SQLite storage class (the inverse
+/// Bind one exported JSON value back to its `SQLite` storage class (the inverse
 /// of [`row_to_json`]).
 fn bind_json_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
@@ -430,7 +442,7 @@ fn bind_json_value<'q>(
 ) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
     Ok(match value {
         serde_json::Value::Null => query.bind(Option::<String>::None),
-        serde_json::Value::Bool(b) => query.bind(*b as i64),
+        serde_json::Value::Bool(b) => query.bind(i64::from(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 query.bind(i)
@@ -491,6 +503,8 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
+// Byte extraction from a 24-bit accumulator: truncation is the point.
+#[allow(clippy::cast_possible_truncation)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -528,6 +542,7 @@ mod tests {
     use super::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
     use crate::Store;
     use intent_core::WorkspaceId;
+    use std::fmt::Write as _;
     use uuid::Uuid;
 
     /// A unique temp DB path cleaned up on drop (mirrors `crate::tests::TempDb`,
@@ -835,7 +850,7 @@ attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_p
             .fetch_all(store.read_pool())
             .await
             .expect("table_info");
-            actual.push_str(&format!("{table}: {}\n", cols.join(", ")));
+            let _ = writeln!(actual, "{table}: {}", cols.join(", "));
         }
         let actual = actual.trim_end();
 

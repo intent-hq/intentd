@@ -1,4 +1,4 @@
-//! Hermetic ACP E2E: comprehensive coverage of agent→BE workspace_api bindings.
+//! Hermetic ACP E2E: comprehensive coverage of agent→BE `workspace_api` bindings.
 //!
 //! Each test spawns the mock ACP agent with `MOCK_AGENT_BEHAVIOR` that drives
 //! real MCP `tools/call` invocations for the target binding namespace. We assert
@@ -103,6 +103,7 @@ async fn task_bindings_update_status_and_get() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -136,7 +137,7 @@ async fn task_bindings_update_status_and_get() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -155,11 +156,11 @@ async fn task_bindings_update_status_and_get() {
 
     // Update task status and read it back
     let js = format!(
-        r#"
+        r"
         await ws.task.updateStatus('{}', 'test task', 'in-progress');
         const tasks = await ws.note.listTasks('{}');
         return {{ tasks: tasks }};
-        "#,
+        ",
         task_note.id.0, task_note.id.0
     );
 
@@ -244,6 +245,7 @@ async fn comment_bindings_add_and_list() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -276,7 +278,7 @@ async fn comment_bindings_add_and_list() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -294,7 +296,7 @@ async fn comment_bindings_add_and_list() {
     };
 
     let js = format!(
-        r#"
+        r"
         await ws.comment.add('{}', {{
             searchContext: 'Target phrase for comment',
             commentTarget: 'Target phrase',
@@ -303,7 +305,7 @@ async fn comment_bindings_add_and_list() {
         }});
         const threads = await ws.comment.list('{}', {{ includeComments: true }});
         return {{ threads: threads }};
-        "#,
+        ",
         note.id.0, note.id.0
     );
 

@@ -187,6 +187,7 @@ where
     None
 }
 
+#[allow(clippy::similar_names)] // nvm's literal directory layout (versions/<version>)
 fn is_nvm_node_bin_dir(path: &Path) -> bool {
     let Some(version_dir) = path.parent() else {
         return false;
@@ -286,10 +287,10 @@ fn lookup_in_path(name: &str) -> Option<PathBuf> {
 /// resolve, matching provider discovery).
 fn select_path_lookup_line(name: &str, lines: &[&str], is_windows: bool) -> Option<String> {
     if !is_windows {
-        return lines.first().map(|s| s.to_string());
+        return lines.first().map(std::string::ToString::to_string);
     }
     if has_windows_exec_extension(Path::new(name)) {
-        return lines.first().map(|s| s.to_string());
+        return lines.first().map(std::string::ToString::to_string);
     }
     for ext in WINDOWS_EXEC_EXTENSIONS {
         if let Some(line) = lines.iter().find(|line| {
@@ -587,7 +588,10 @@ fn tool_common_paths(name: &str) -> Vec<String> {
 pub(crate) fn tool_availability_op(tools: Option<Vec<String>>) -> Value {
     let names: Vec<String> = match tools {
         Some(t) if !t.is_empty() => t,
-        _ => DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect(),
+        _ => DEFAULT_TOOLS
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
     };
     let mut map = Map::new();
     for name in names {
@@ -669,7 +673,7 @@ pub(crate) fn build_env_json(
     raw_path: &str,
     shell: &str,
     home: &Path,
-    var_names: Vec<String>,
+    var_names: &[String],
 ) -> Value {
     let sep = path_separator();
     let entries: Vec<&str> = raw_path.split(sep).filter(|s| !s.is_empty()).collect();
@@ -701,7 +705,7 @@ pub(crate) fn env_probe() -> Value {
         .collect();
     var_names.sort();
     var_names.dedup();
-    build_env_json(&raw_path, &shell, &home, var_names)
+    build_env_json(&raw_path, &shell, &home, &var_names)
 }
 
 /// Expand `~` / `~/...` to `home` (mirrors the FE `expandPath`). Anything else
@@ -736,9 +740,9 @@ fn has_git_marker(dir: &Path) -> bool {
     let git = dir.join(".git");
     match std::fs::metadata(&git) {
         Ok(meta) if meta.is_dir() => true,
-        Ok(meta) if meta.is_file() => std::fs::read_to_string(&git)
-            .map(|s| s.trim_start().starts_with("gitdir:"))
-            .unwrap_or(false),
+        Ok(meta) if meta.is_file() => {
+            std::fs::read_to_string(&git).is_ok_and(|s| s.trim_start().starts_with("gitdir:"))
+        }
         _ => false,
     }
 }
@@ -885,8 +889,7 @@ pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Val
         let entry_path = entry.path();
         let is_dir = entry
             .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or_else(|_| entry_path.is_dir());
+            .map_or_else(|_| entry_path.is_dir(), |t| t.is_dir());
         let is_git_repo = is_dir && has_git_marker(&entry_path);
         entries.push((name, entry_path, is_dir, is_git_repo));
     }
@@ -914,8 +917,7 @@ pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Val
     Ok(json!({
         "path": target.to_string_lossy(),
         "parent": parent
-            .map(|p| Value::String(p.to_string_lossy().into_owned()))
-            .unwrap_or(Value::Null),
+            .map_or(Value::Null, |p| Value::String(p.to_string_lossy().into_owned())),
         "home": home.to_string_lossy(),
         "entries": entries_json,
         "favorites": favorites_cached(home),
@@ -1409,7 +1411,7 @@ pub(crate) fn find_app_op(name: &str) -> Value {
 /// Catalog id of the platform file manager (Finder / Explorer / Linux FMs).
 const FILE_MANAGER_ID: &str = "finder";
 
-/// Finder's fixed bundle path on macOS — it lives in CoreServices, outside the
+/// Finder's fixed bundle path on macOS — it lives in `CoreServices`, outside the
 /// `/Applications` dirs the bundle probe scans (monorepo#885).
 const MACOS_FINDER_BUNDLE: &str = "/System/Library/CoreServices/Finder.app";
 

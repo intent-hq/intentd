@@ -1,4 +1,4 @@
-//! DoD tests for repo config consumer integrations (workspace.create fallbacks,
+//! `DoD` tests for repo config consumer integrations (workspace.create fallbacks,
 //! script bootstrap, agent instructions).
 
 use std::path::PathBuf;
@@ -149,7 +149,7 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
     TempRepo(repo_path)
 }
 
-/// DoD test (a): workspace.create with repo branchPrefix and no request prefix -> branch carries prefix.
+/// `DoD` test (a): workspace.create with repo branchPrefix and no request prefix -> branch carries prefix.
 #[tokio::test]
 async fn test_workspace_create_uses_repo_branch_prefix() {
     let db = TempDb::new();
@@ -159,7 +159,8 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(ws_root.path().to_path_buf()),
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path())),
     );
 
     // Socket lives in a guarded dir under /tmp so the path stays short
@@ -211,7 +212,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let _ = server.await;
 }
 
-/// DoD test (b): workspace.create with repo setupScript and no request script -> readable
+/// `DoD` test (b): workspace.create with repo setupScript and no request script -> readable
 /// via getSetupScript; a request-supplied script is execute-only and never persisted.
 #[tokio::test]
 async fn test_workspace_create_setup_script_fallback() {
@@ -345,7 +346,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let _ = server.await;
 }
 
-/// DoD test (c): script.list on empty workspace with repo scripts[] -> seeded.
+/// `DoD` test (c): script.list on empty workspace with repo scripts[] -> seeded.
 #[tokio::test]
 async fn test_script_list_bootstrap_from_repo() {
     let db = TempDb::new();
@@ -435,11 +436,13 @@ async fn test_script_list_bootstrap_from_repo() {
     let _ = server.await;
 }
 
-/// DoD test (d): repo instructions reach the composed system prompt.
+/// `DoD` test (d): repo instructions reach the composed system prompt.
 /// This test verifies that when a workspace has a repo config with instructions,
 /// those instructions are included in the agent's system prompt.
 #[tokio::test]
 async fn test_repo_instructions_in_system_prompt() {
+    // Simulate what rules.rs does at lines 381-386
+    use intent_services::repo_config::read_repo_config;
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
@@ -478,8 +481,6 @@ async fn test_repo_instructions_in_system_prompt() {
         create_test_repo_with_config(r#"{"instructions": "Always use TypeScript for new files"}"#);
     let repo_path_buf = repo.0.clone();
 
-    // Simulate what rules.rs does at lines 381-386
-    use intent_services::repo_config::read_repo_config;
     let repo_config = read_repo_config(&repo_path_buf).await;
     assert_eq!(
         repo_config.instructions.as_deref(),
@@ -493,9 +494,10 @@ async fn test_repo_instructions_in_system_prompt() {
 /// Regression test for PR #184 race condition: concurrent `script.list` calls
 /// on an empty workspace with repo config scripts must produce exactly one
 /// set of scripts (no duplicates). The fix uses a per-workspace async lock
-/// (WorkspaceScriptLocks) to serialize bootstrap operations.
+/// (`WorkspaceScriptLocks`) to serialize bootstrap operations.
 #[tokio::test]
 async fn concurrent_script_list_no_duplicates() {
+    use intent_core::WorkspaceCreate;
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
@@ -515,7 +517,6 @@ async fn concurrent_script_list_no_duplicates() {
     );
 
     // Create a workspace with the repo
-    use intent_core::WorkspaceCreate;
     let input: WorkspaceCreate = serde_json::from_value(json!({
         "repositoryPath": repo.0.to_string_lossy(),
         "skipWorktree": true

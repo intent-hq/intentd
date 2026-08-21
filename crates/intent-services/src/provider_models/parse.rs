@@ -449,7 +449,7 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
                             .chain(&group.inferred_levels)
                             .any(|level| level.eq_ignore_ascii_case(effort))
                     })
-                    .map(|effort| effort.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect();
                 push_unique(
                     &mut levels,
@@ -576,7 +576,7 @@ pub(super) fn parse_hf_unsloth_response(body: &str) -> Vec<HfRepo> {
 }
 
 /// Bytes-per-parameter estimate for a Q4-class GGUF quant (the middle of the
-/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to Q4_K_M.
+/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to `Q4_K_M`.
 const BYTES_PER_PARAM_Q4: f64 = 0.6;
 
 /// Fixed headroom (KV cache, context, runtime overhead) added on top of the
@@ -598,6 +598,8 @@ pub(super) fn estimate_model_bytes(params_billion: f64) -> f64 {
 
 /// Whether a model with `params_billion` total parameters is estimated to
 /// fit within [`RAM_FIT_FRACTION`] of `total_ram_bytes`.
+// RAM sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool {
     estimate_model_bytes(params_billion) <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
@@ -608,12 +610,14 @@ pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool
 /// param-count estimate bakes in. Shared with the spawn-time quant-variant
 /// selection ([`crate::unsloth_server`]) so both fit checks apply one
 /// consistent headroom policy.
+// RAM/model sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn gguf_bytes_fit_within_ram(model_bytes: u64, total_ram_bytes: u64) -> bool {
     (model_bytes as f64) + FIT_HEADROOM_BYTES <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
 
 /// Parse the total parameter count (in billions) out of an HF repo id's model
-/// name, tolerating both dense names (`27B`) and MoE names that also carry an
+/// name, tolerating both dense names (`27B`) and `MoE` names that also carry an
 /// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the
 /// active count and is skipped). Returns `None` when no size token is found
 /// (e.g. `grok-2-GGUF`, `Qwen3-Coder-Next-GGUF`) — the catalog treats an
@@ -627,7 +631,7 @@ pub(super) fn parse_param_count_billions(repo_id: &str) -> Option<f64> {
 }
 
 /// Parse one `-`/`_`-delimited name token as a total-parameter size
-/// (`27B`, `0.8B`, `270M`), skipping MoE active-parameter markers (`A3B`).
+/// (`27B`, `0.8B`, `270M`), skipping `MoE` active-parameter markers (`A3B`).
 fn parse_size_token(token: &str) -> Option<f64> {
     let lower = token.to_ascii_lowercase();
     let mut chars = lower.chars();

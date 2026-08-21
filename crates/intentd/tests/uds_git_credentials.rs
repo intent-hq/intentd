@@ -1,7 +1,7 @@
 //! E2E for the daemon-backed git credential helper (monorepo#884 Phase 2):
 //! `intentd git-credential` ↔ `system.gitCredential` over UDS.
 //!
-//! Spawns the REAL `intentd serve` daemon (hermetic data dir, GITHUB_TOKEN in
+//! Spawns the REAL `intentd serve` daemon (hermetic data dir, `GITHUB_TOKEN` in
 //! the daemon env so the Auto token chain resolves deterministically without
 //! touching the developer's secrets/`gh`), then runs the REAL
 //! `intentd git-credential` subcommand end-to-end and asserts:
@@ -81,7 +81,7 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 /// Run `intentd git-credential <operation>` with `input` on stdin against the
-/// daemon in `data_dir`; returns `(exit_ok, stdout)`. GITHUB_TOKEN is
+/// daemon in `data_dir`; returns `(exit_ok, stdout)`. `GITHUB_TOKEN` is
 /// deliberately NOT set in the helper env — the token must come from the
 /// daemon over UDS, never from the helper's own environment.
 fn run_helper(data_dir: &Path, operation: &str, input: &str) -> (bool, String) {
@@ -198,7 +198,7 @@ async fn daemon_down_stays_silent() {
 
 /// Spawn `intentd serve` with the token seeded in the hermetic secrets store
 /// and `tokenSource = "explicit"` (config.toml written before boot), and
-/// **no** GITHUB_TOKEN/GH_TOKEN in the daemon env — the stored token is the
+/// **no** `GITHUB_TOKEN/GH_TOKEN` in the daemon env — the stored token is the
 /// only possible source, so `github.revoke` deleting it must leave the chain
 /// empty.
 fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {

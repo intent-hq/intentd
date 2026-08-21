@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -43,8 +44,10 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
@@ -153,7 +156,7 @@ fn test_tempdir(prefix: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Build a real `Services` API + event bus over a fresh temp SQLite store.
+/// Build a real `Services` API + event bus over a fresh temp `SQLite` store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
 /// since `note.create` mints a fresh `NoteId` by design. `auggie_bin`
@@ -194,7 +197,7 @@ async fn make_services(
         services = services.with_auggie_bin(bin);
     }
     if let Some(cache_dir) = models_cache_dir {
-        services = services.with_models_cache_dir(cache_dir);
+        services = services.with_models_cache_dir(&cache_dir);
     }
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, registry, dir)
@@ -210,7 +213,7 @@ struct Server {
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Server {
@@ -251,7 +254,7 @@ async fn start_with_auggie_and_models_cache(
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
     let ws =
-        WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
+        WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -262,7 +265,7 @@ async fn start_with_auggie_and_models_cache(
         bus,
         store,
         registry,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -300,10 +303,10 @@ fn upgrade_req(target: &str, origin: Option<&str>, bearer: Option<&str>) -> Stri
         "GET {target} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
     );
     if let Some(o) = origin {
-        r.push_str(&format!("Origin: {o}\r\n"));
+        let _ = write!(r, "Origin: {o}\r\n");
     }
     if let Some(b) = bearer {
-        r.push_str(&format!("Authorization: Bearer {b}\r\n"));
+        let _ = write!(r, "Authorization: Bearer {b}\r\n");
     }
     r.push_str("\r\n");
     r
@@ -328,7 +331,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -360,7 +363,7 @@ async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str,
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -388,7 +391,7 @@ async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> 
                     out.push(serde_json::from_str(&text).expect("json"));
                     break;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -476,6 +479,25 @@ async fn wss_client_hello_and_drafts_round_trip() {
 /// wrong-typed `enabled` and an unknown workspace all surface `-32602`.
 #[tokio::test]
 async fn wss_workspace_auto_commit_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
         srv.port,
@@ -503,25 +525,6 @@ async fn wss_workspace_auto_commit_round_trip() {
     // One persistent connection: subscribe first so the `workspace:updated`
     // notification from the toggle below is delivered to this client.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    async fn send_and_wait(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        frame: String,
-        id: i64,
-    ) -> Value {
-        ws.send(Message::Text(frame.into())).await.expect("send");
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(id)) {
-                        return v;
-                    }
-                }
-                Some(Ok(_)) => continue,
-                other => panic!("expected text frame, got {other:?}"),
-            }
-        }
-    }
     let sub = send_and_wait(
         &mut ws,
         format!(
@@ -563,7 +566,7 @@ async fn wss_workspace_auto_commit_round_trip() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -741,7 +744,7 @@ async fn wss_oversized_message_terminates_connection() {
             match ws.next().await {
                 None | Some(Err(_)) => break None,
                 Some(Ok(Message::Close(frame))) => break frame.map(|f| f.code),
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
             }
         }
     })
@@ -763,8 +766,8 @@ async fn wss_oversized_message_terminates_connection() {
     let closed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match ws.next().await {
-                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
-                Some(Ok(_)) => continue,
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
             }
         }
     })
@@ -809,6 +812,7 @@ async fn wss_oversized_message_terminates_connection() {
 #[tokio::test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -937,6 +941,7 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
 #[tokio::test]
 async fn wss_agent_list_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -992,6 +997,225 @@ async fn wss_agent_list_omits_initial_message() {
     srv.ws.stop().await;
 }
 
+/// monorepo#3041 over the real WSS wire (§5.1): `workspace.list` rows omit
+/// `tokenUsage` entirely (absent, never null) and archived rows additionally
+/// omit `agentSummary`, while active rows keep it; the `workspace.subscribe`
+/// seq-0 snapshot rows omit `tokenUsage` the same way; `workspace.get` keeps
+/// both fields for detail reads, archived included.
+#[tokio::test]
+async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
+    use std::collections::BTreeMap;
+
+    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+
+    let srv = start(WsOptions::default()).await;
+
+    // Seed one active and one archived workspace directly through the shared
+    // store, both carrying a persisted `tokenUsage` rollup, each with one
+    // agent session so the list enrichment builds an `agentSummary`.
+    let usage = TokenUsage {
+        by_agent_id: BTreeMap::from([(
+            "agent-slim-a".to_string(),
+            TokenUsageTotals {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_tokens: 5,
+                cache_creation_tokens: 3,
+                thought_tokens: 0,
+                cost: None,
+            },
+        )]),
+        totals: TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 3,
+            thought_tokens: 0,
+            cost: None,
+        },
+        by_model: BTreeMap::new(),
+        last_scan_at: Some(now_iso()),
+    };
+    let ws_active = WorkspaceId::new();
+    let mut active = fixture_workspace(&ws_active);
+    active.token_usage = Some(usage.clone());
+    srv.store
+        .insert_workspace(&active)
+        .await
+        .expect("insert active workspace");
+    let ws_archived = WorkspaceId::new();
+    let mut archived = fixture_workspace(&ws_archived);
+    archived.archived = true;
+    archived.archived_at = Some(now_iso());
+    archived.token_usage = Some(usage);
+    srv.store
+        .insert_workspace(&archived)
+        .await
+        .expect("insert archived workspace");
+
+    let ts = now_iso();
+    let mk_session = |id: &str, ws: &WorkspaceId| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId(id.to_string()),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Slim Agent".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        status: AgentStatus::Idle,
+        is_active: false,
+        system_prompt: None,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+        parent_agent_id: None,
+        specialist: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        messages: vec![],
+        stats: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+    srv.store
+        .insert_agent_session(&mk_session("agent-slim-a", &ws_active))
+        .await
+        .expect("insert active-workspace session");
+    srv.store
+        .insert_agent_session(&mk_session("agent-slim-b", &ws_archived))
+        .await
+        .expect("insert archived-workspace session");
+
+    // workspace.list (includeArchived): tokenUsage absent on every row;
+    // agentSummary absent on the archived row, present on the active one.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{"includeArchived":true}}"#,
+    )
+    .await;
+    let rows = listed["result"]["workspaces"]
+        .as_array()
+        .expect("workspaces array");
+    let row_active = rows
+        .iter()
+        .find(|w| w["id"] == ws_active.0.as_str())
+        .expect("active row");
+    let row_archived = rows
+        .iter()
+        .find(|w| w["id"] == ws_archived.0.as_str())
+        .expect("archived row");
+    assert!(
+        row_active.get("tokenUsage").is_none(),
+        "list rows omit tokenUsage (monorepo#3041): {row_active}"
+    );
+    assert!(
+        row_archived.get("tokenUsage").is_none(),
+        "archived list rows omit tokenUsage: {row_archived}"
+    );
+    assert!(
+        row_active["agentSummary"].is_object(),
+        "active list row keeps agentSummary: {row_active}"
+    );
+    assert!(
+        row_archived.get("agentSummary").is_none(),
+        "archived list rows omit agentSummary (monorepo#3041): {row_archived}"
+    );
+
+    // workspace.get keeps both fields for detail reads — archived included.
+    for ws_id in [&ws_active, &ws_archived] {
+        let got = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{{"workspaceId":"{}"}}}}"#,
+                ws_id.0
+            ),
+        )
+        .await;
+        let ws = &got["result"]["workspace"];
+        assert!(
+            ws["tokenUsage"].is_object(),
+            "workspace.get keeps tokenUsage: {ws}"
+        );
+        assert!(
+            ws["agentSummary"].is_object(),
+            "workspace.get keeps agentSummary: {ws}"
+        );
+    }
+
+    // workspace.subscribe seq-0 snapshot (lite list path, global channel —
+    // archived rows are always included, monorepo#775): rows omit tokenUsage
+    // the same way.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.subscribe","params":{}}"#
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send workspace.subscribe");
+    let mut sub_resp: Option<Value> = None;
+    let mut snap: Option<Value> = None;
+    while sub_resp.is_none() || snap.is_none() {
+        let frame = tokio::time::timeout(Duration::from_secs(10), sub.next())
+            .await
+            .expect("workspace.subscribe frame timed out");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snap = Some(v);
+                } else if v["id"] == 3 {
+                    sub_resp = Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let snap = snap.unwrap();
+    assert_eq!(snap["params"]["kind"], "snapshot", "{snap}");
+    assert_eq!(snap["params"]["seq"], 0, "{snap}");
+    let snap_rows = snap["params"]["snapshot"].as_array().expect("snapshot");
+    for ws_id in [&ws_active, &ws_archived] {
+        let row = snap_rows
+            .iter()
+            .find(|w| w["id"] == ws_id.0.as_str())
+            .expect("seeded workspace in seq-0 snapshot");
+        assert!(
+            row.get("tokenUsage").is_none(),
+            "seq-0 snapshot rows omit tokenUsage (monorepo#3041): {row}"
+        );
+    }
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#564: `agent.sendMessage` to a nonexistent agent id (e.g. a
 /// truncated id) fails closed with `-32602` naming the unknown id — it must
 /// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
@@ -999,6 +1223,7 @@ async fn wss_agent_list_omits_initial_message() {
 #[tokio::test]
 async fn wss_agent_send_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1074,6 +1299,7 @@ async fn wss_agent_send_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_queue_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1141,6 +1367,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `agent.diagnostics` reports real pending-message queue snapshots over the
 /// WSS wire: after `agent.queueMessage`, `diagnostics.queues` carries the
 /// target's queue (drain-order entries with `queuedAt`, content truncated to
@@ -1149,6 +1376,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_diagnostics_reports_queue_snapshots() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1252,6 +1480,9 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
@@ -1271,7 +1502,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let server = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
 
@@ -1384,6 +1615,9 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
@@ -1399,7 +1633,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let server = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
 
@@ -1477,6 +1711,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
 #[tokio::test]
 async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2044,6 +2279,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
 #[tokio::test]
 async fn wss_agent_create_widened_params_round_trip() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2147,7 +2383,27 @@ async fn wss_agent_create_widened_params_round_trip() {
 /// an older message, and rejects missing params with `-32602`.
 #[tokio::test]
 async fn wss_agent_mark_seen_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2197,25 +2453,6 @@ async fn wss_agent_mark_seen_round_trip() {
     // One persistent connection: subscribe first so the `agent:updated`
     // notification from the markSeen below is delivered to this client.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    async fn send_and_wait(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        frame: String,
-        id: i64,
-    ) -> Value {
-        ws.send(Message::Text(frame.into())).await.expect("send");
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(id)) {
-                        return v;
-                    }
-                }
-                Some(Ok(_)) => continue,
-                other => panic!("expected text frame, got {other:?}"),
-            }
-        }
-    }
     let sub = send_and_wait(
         &mut ws,
         format!(
@@ -2256,7 +2493,7 @@ async fn wss_agent_mark_seen_round_trip() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -2323,7 +2560,53 @@ async fn wss_agent_mark_seen_round_trip() {
 /// state) and `agent.get` drops the field.
 #[tokio::test]
 async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    async fn next_event(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        event_type: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == event_type
+                        {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+    }
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2350,51 +2633,6 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
     // One persistent connection: subscribe BEFORE the persists so both
     // event notifications are delivered to this client.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    async fn send_and_wait(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        frame: String,
-        id: i64,
-    ) -> Value {
-        ws.send(Message::Text(frame.into())).await.expect("send");
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(id)) {
-                        return v;
-                    }
-                }
-                Some(Ok(_)) => continue,
-                other => panic!("expected text frame, got {other:?}"),
-            }
-        }
-    }
-    async fn next_event(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        event_type: &str,
-    ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
-                        }
-                    }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => continue,
-                    other => panic!("expected text frame, got {other:?}"),
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
-    }
     let sub = send_and_wait(
         &mut ws,
         format!(
@@ -2513,6 +2751,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
 #[tokio::test]
 async fn wss_agent_session_shape_rpcs_round_trip() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2646,9 +2885,7 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
         .expect("updated_at after append");
     assert!(
         after_updated_at > before_updated_at,
-        "agent_session.updated_at must advance when a message is appended (STAB-19): before={}, after={}",
-        before_updated_at,
-        after_updated_at
+        "agent_session.updated_at must advance when a message is appended (STAB-19): before={before_updated_at}, after={after_updated_at}"
     );
 
     // replaceMessages atomically swaps under fresh seq.
@@ -2789,6 +3026,7 @@ async fn wss_agent_reasoning_effort_round_trip() {
 #[tokio::test]
 async fn wss_agent_delegate_persists_reasoning_effort() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2870,6 +3108,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         Some(dir.path().to_path_buf()),
     )
     .await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3082,6 +3321,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         Some(dir.path().to_path_buf()),
     )
     .await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let created_ws = wss_call(
         srv.port,
@@ -3133,10 +3373,10 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
 
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
-/// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
+/// `cowSupported` mirrors the cached workspaces-root `CoW` probe that fills
 /// `Workspace.cowSupported` (§5.1). The harness injects an existing hermetic
 /// workspaces root, so the probe always runs and the field is present as a
-/// boolean (true on CoW filesystems like APFS, false on e.g. ext4); when the
+/// boolean (true on `CoW` filesystems like APFS, false on e.g. ext4); when the
 /// probe cannot run the field is omitted, never null.
 #[tokio::test]
 async fn wss_system_capabilities_reports_cow_supported() {
@@ -3432,7 +3672,7 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     // Serve UDS on the SAME shared services + bus so the wire result is
     // produced by one router; only the framing differs. The socket lives in
     // the harness TempDir so it is cleaned up with the rest of the fixture.
-    let socket = srv._dir.path().join("intentd-wss.sock");
+    let socket = srv.dir.path().join("intentd-wss.sock");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let (api, bus, sock) = (srv.api.clone(), srv.bus.clone(), socket.clone());
     let uds = tokio::spawn(async move {
@@ -3501,16 +3741,16 @@ async fn wss_models_list_returns_catalog_with_source() {
 
 #[tokio::test]
 async fn wss_stats_get_usage_round_trip_with_seeded_store() {
+    // The current hour bucket is inside both the current month and the
+    // trailing-24h window; a bucket 48h back is outside the 24h window.
+    // Bucket keys are the store's RFC-3339 UTC hour floors.
+    use chrono::{Datelike, Timelike, Utc};
     // stats.getUsage: the global usage-stats read behind the agentic
     // usage-stats cards. Seed two hourly buckets straight into the store,
     // then drive both a "month" and a "24h" read over the real WSS path and
     // assert the documented result shape.
     let srv = start(WsOptions::default()).await;
 
-    // The current hour bucket is inside both the current month and the
-    // trailing-24h window; a bucket 48h back is outside the 24h window.
-    // Bucket keys are the store's RFC-3339 UTC hour floors.
-    use chrono::{Datelike, Timelike, Utc};
     let now = Utc::now();
     let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:00:00Z").to_string();
     let stamp = |t: chrono::DateTime<Utc>, hour: u8| intent_store::LocalStamp {
@@ -3522,7 +3762,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     // Stamp the current bucket with a local hour that DIFFERS from its UTC
     // hour (same date, so month filtering is unaffected): the month view
     // must group by the recorded stamp while the 24h view ignores it (D12).
-    let divergent_hour = (now.hour() as u8 + 5) % 24;
+    let divergent_hour = (u8::try_from(now.hour()).expect("hour < 24") + 5) % 24;
     let delta = intent_store::UsageStatsDelta {
         input_tokens: 100,
         output_tokens: 40,
@@ -3551,7 +3791,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
             &bucket_old,
             "Sonnet 5",
             "codex",
-            Some(&stamp(old, old.hour() as u8)),
+            Some(&stamp(old, u8::try_from(old.hour()).expect("hour < 24"))),
             &intent_store::UsageStatsDelta {
                 input_tokens: 7,
                 runs: 1,
@@ -3659,6 +3899,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
 
 #[tokio::test]
 async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
+    use chrono::{Duration as ChronoDuration, Utc};
     // stats.getRateHistory (§5.39): the global per-minute token-rate history
     // behind the HUD TOK/MIN chart. Seed minute buckets straight into the
     // store — current minute, two minutes back, and one outside a 5-sample
@@ -3666,7 +3907,6 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
     // zero-filled, chronological result shape.
     let srv = start(WsOptions::default()).await;
 
-    use chrono::{Duration as ChronoDuration, Utc};
     let now = Utc::now();
     let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:00Z").to_string();
     srv.store
@@ -3951,11 +4191,7 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    let calls = || {
-        std::fs::read_to_string(&count)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    };
+    let calls = || std::fs::read_to_string(&count).map_or(0, |s| s.lines().count());
 
     // Cold read: the probe runs (and fails) → empty static fallback, legacy
     // shape.
@@ -4016,11 +4252,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
     )
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let calls = || {
-        std::fs::read_to_string(&count)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    };
+    let calls = || std::fs::read_to_string(&count).map_or(0, |s| s.lines().count());
     let last_good = serde_json::json!({
         "version": 2,
         "entries": {
@@ -4468,6 +4700,13 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
+    // Adapters that hold their slot for ~10s before answering the turn, so the
+    // bound is saturated for a wide, non-racy window. The wrapper records one
+    // line per adapter actually launched: the assertions below count it rather
+    // than inferring from the response which branch ran, so a queue timeout
+    // that quietly spawned (or a `-32603` arriving from some unrelated
+    // failure) cannot pass as a bound that held.
+    use std::os::unix::fs::PermissionsExt;
     // The daemon-wide ephemeral-adapter bound over the real wire (§5.32,
     // monorepo#2062). With the bound saturated by parked adapters, a call
     // whose own `timeoutMs` expires while queued comes back as -32603 with
@@ -4481,13 +4720,6 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
         eprintln!("skipping adapter-busy e2e: node not on PATH");
         return;
     }
-    // Adapters that hold their slot for ~10s before answering the turn, so the
-    // bound is saturated for a wide, non-racy window. The wrapper records one
-    // line per adapter actually launched: the assertions below count it rather
-    // than inferring from the response which branch ran, so a queue timeout
-    // that quietly spawned (or a `-32603` arriving from some unrelated
-    // failure) cannot pass as a bound that held.
-    use std::os::unix::fs::PermissionsExt;
     let adapter_dir = test_tempdir("intentd-wss-acp-busy-");
     let spawn_log = adapter_dir.path().join("spawns.log");
     let bin = adapter_dir.path().join("codex-acp");
@@ -4508,8 +4740,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let spawned_count = || -> usize {
         std::fs::read_to_string(&spawn_log)
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0)
+            .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
     };
     let spawned = |what: &str| -> usize {
         let n = spawned_count();
@@ -4965,8 +5196,8 @@ async fn bind_fails_fast_on_occupied_port() {
     // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
     // Bind the hog listener first, keep it open, and use its port for the test
     // to avoid TOCTOU (no free_port() release-then-rebind window).
-    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let base = _hog.local_addr().unwrap().port();
+    let hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = hog.local_addr().unwrap().port();
     let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -4977,7 +5208,7 @@ async fn bind_fails_fast_on_occupied_port() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let err = ws
         .start()
         .await
@@ -5027,7 +5258,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
             Some(Ok(Message::Text(text))) => {
                 break serde_json::from_str::<Value>(&text).expect("json");
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     };
@@ -5041,6 +5272,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
+    const MAX_ATTEMPTS: u32 = 10;
     // Verifies fixed-port restart semantics: a graceful `stop()` fully releases
     // the listen port (it awaits the accept loop) so the SAME listener can
     // immediately rebind it. `free_port()` hands back a port from the kernel's
@@ -5056,7 +5288,6 @@ async fn graceful_shutdown_allows_immediate_restart() {
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
-    const MAX_ATTEMPTS: u32 = 10;
     for _ in 0..MAX_ATTEMPTS {
         let fixed_port = free_port();
         let opts = WsOptions {
@@ -5068,7 +5299,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
             api.clone(),
             bus.clone(),
             &tls,
-            token_store.clone(),
+            &token_store.clone(),
             opts,
             None,
         )
@@ -5091,7 +5322,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
             }
             // stop() released the port but an exogenous bind grabbed it in
             // the stop->restart gap; retry on a fresh port.
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
             Err(e) => panic!("restart failed with non-contention error: {e}"),
         }
     }
@@ -5393,6 +5624,25 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
 /// the returned `Workspace` payload per `skip_serializing_if`).
 #[tokio::test]
 async fn wss_workspace_update_status_image_asset_id_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
     let srv = start(WsOptions::default()).await;
 
     let ws_id = WorkspaceId::new();
@@ -5408,25 +5658,6 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
             .to_string()
     };
-    async fn send_and_wait(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        frame: String,
-        id: i64,
-    ) -> Value {
-        ws.send(Message::Text(frame.into())).await.expect("send");
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(id)) {
-                        return v;
-                    }
-                }
-                Some(Ok(_)) => continue,
-                other => panic!("expected text frame, got {other:?}"),
-            }
-        }
-    }
 
     let sub = send_and_wait(
         &mut ws,
@@ -5482,7 +5713,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -6234,6 +6465,7 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
 /// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
 /// the `includeOlder` parameter fetches pre-boundary commits.
@@ -6295,8 +6527,7 @@ async fn wss_file_tracking_load_commits_bounded() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
-            ws_id
+            r#"{{"jsonrpc":"2.0","id":2,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{ws_id}","limit":50}}}}"#
         ),
     )
     .await;
@@ -6335,8 +6566,7 @@ async fn wss_file_tracking_load_commits_bounded() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
-            ws_id
+            r#"{{"jsonrpc":"2.0","id":3,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{ws_id}","limit":50,"includeOlder":true}}}}"#
         ),
     )
     .await;
@@ -6366,8 +6596,7 @@ async fn wss_file_tracking_load_commits_bounded() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":5,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
-            ws_id_unbounded
+            r#"{{"jsonrpc":"2.0","id":5,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{ws_id_unbounded}","limit":50}}}}"#
         ),
     )
     .await;
@@ -6399,8 +6628,7 @@ async fn wss_file_tracking_load_commits_bounded() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":7,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
-            ws_id_unresolvable
+            r#"{{"jsonrpc":"2.0","id":7,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{ws_id_unresolvable}","limit":50}}}}"#
         ),
     )
     .await;
@@ -6421,8 +6649,7 @@ async fn wss_file_tracking_load_commits_bounded() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":8,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
-            ws_id_unresolvable
+            r#"{{"jsonrpc":"2.0","id":8,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{ws_id_unresolvable}","limit":50,"includeOlder":true}}}}"#
         ),
     )
     .await;
@@ -6438,7 +6665,7 @@ async fn wss_file_tracking_load_commits_bounded() {
 }
 
 /// `git.branchStatus` + `git.getBranches` over WSS — the path-based
-/// BranchSelector seam (§5.6). Drives the happy path (response shape parity
+/// `BranchSelector` seam (§5.6). Drives the happy path (response shape parity
 /// with the UDS coverage), the missing-branchName -32602, the
 /// nonexistent-path -32602, and the unregistered-repo branch listing used by
 /// the workspace-create flow.
@@ -6616,6 +6843,7 @@ async fn wss_git_branch_status_round_trip() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
 /// Path-based like `git.getBranches`: the repo is never registered as a
 /// workspace. Drives the checked-out fast-forward pull (`{ ok: true }`), the
@@ -6795,7 +7023,10 @@ async fn wss_note_version_history_round_trip() {
     let versions = sess[2]["result"].as_array().expect("versions array");
     assert_eq!(versions.len(), 3, "create+setContent+add: {}", sess[2]);
     for (i, entry) in versions.iter().enumerate() {
-        assert_eq!(entry["v"].as_i64(), Some(i as i64 + 1));
+        assert_eq!(
+            entry["v"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 1)
+        );
         assert_eq!(entry["type"], "snapshot");
         // JSON-RPC (FE) note mutations resolve the version author to `user`
         // (reference parity with `notes.service.ts`); the `system` author is
@@ -6901,7 +7132,11 @@ async fn wss_note_set_content_non_ascii_merge_round_trip() {
     .await;
     for (i, resp) in sess.iter().enumerate() {
         assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
-        assert_eq!(resp["id"].as_i64(), Some(i as i64 + 3), "envelope: {resp}");
+        assert_eq!(
+            resp["id"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 3),
+            "envelope: {resp}"
+        );
         assert!(
             resp.get("error").is_none(),
             "all frames must be success envelopes: {resp}"
@@ -7232,6 +7467,7 @@ async fn wss_git_gitlink_status_and_diffs_wire_shape() {
 /// returns `{ assetId, path, url }` and the asset round-trips back through
 /// `note.readAsset`; a missing `data` param is -32602.
 #[tokio::test]
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
 async fn wss_note_save_asset_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -7315,7 +7551,7 @@ async fn wss_host_open_in_editor_reverse_round_trip() {
                     final_response = Some(v);
                 }
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -7538,8 +7774,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
     {
         let init_path =
             std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
@@ -7571,6 +7806,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#958 — the bounded agent read paths over the real WSS transport:
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
@@ -7590,6 +7826,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -8066,7 +8303,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             Some(Ok(Message::Ping(p))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -8223,7 +8460,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
 
 /// `agent.getConversation` / `chat.subscribe` slim projection over the real
 /// WSS wire (§5.5, §7.1): `projection: "slim"` bounds oversized
-/// tool_use/tool_result bodies (additive `inputTruncated`/`outputTruncated`
+/// `tool_use/tool_result` bodies (additive `inputTruncated`/`outputTruncated`
 /// flags, pairing ids intact) and swaps oversized image data for the
 /// write-time thumbnail (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the
 /// seq-0 snapshot of a slim subscription serves the same bounded blocks;
@@ -8235,6 +8472,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -8338,7 +8576,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
         assert_eq!(img_block["dataTruncated"], true, "{label}");
         assert_eq!(img_block["dataIsThumbnail"], true, "{label}");
         assert_eq!(
-            img_block["dataBytes"].as_u64().unwrap() as usize,
+            usize::try_from(img_block["dataBytes"].as_u64().unwrap()).expect("value fits in usize"),
             img_b64.len(),
             "{label}"
         );
@@ -8400,6 +8638,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -8530,6 +8769,7 @@ async fn wss_agent_get_message_block_serves_full_block() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -9191,7 +9431,7 @@ async fn wss_file_place_attachment_round_trip() {
     // everything except config.json) was ensured on the way.
     let gitignore =
         std::fs::read_to_string(root.join(".intent/.gitignore")).expect("gitignore ensured");
-    assert!(gitignore.contains("*"), "gitignore content: {gitignore}");
+    assert!(gitignore.contains('*'), "gitignore content: {gitignore}");
 
     // Same name again → collision-suffixed `trace-2.har`.
     let frame2 = format!(
@@ -9432,7 +9672,7 @@ async fn wss_file_attachment_upload_round_trip() {
     w.worktree_path = Some(root.to_string_lossy().into_owned());
     srv.store.insert_workspace(&w).await.expect("insert ws");
 
-    let payload: Vec<u8> = (0u32..50_000).flat_map(|i| i.to_le_bytes()).collect();
+    let payload: Vec<u8> = (0u32..50_000).flat_map(u32::to_le_bytes).collect();
     let sha = sha256_hex(&payload);
     let mid = payload.len() / 2;
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -9599,6 +9839,7 @@ async fn wss_file_attachment_upload_round_trip() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;
@@ -9734,7 +9975,7 @@ async fn wss_workspace_import_lifecycle() {
             Some(Ok(Message::Text(text))) => {
                 break serde_json::from_str::<Value>(&text).expect("json")
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     };
@@ -9776,7 +10017,7 @@ async fn wss_workspace_import_lifecycle() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub_ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -9803,7 +10044,7 @@ async fn wss_workspace_import_lifecycle() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub_ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -9902,6 +10143,7 @@ async fn wss_workspace_import_lifecycle() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.export.start` / `.read` / `.finalize` / `.abort` (§5.1): the
 /// source-side export lifecycle over the real WSS transport. A subscriber
 /// receives the `workspace:transfer:progress` and `:ready` events (§6.5)
@@ -9944,7 +10186,7 @@ async fn wss_workspace_export_lifecycle() {
             Some(Ok(Message::Text(text))) => {
                 break serde_json::from_str::<Value>(&text).expect("json")
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     };
@@ -9998,7 +10240,7 @@ async fn wss_workspace_export_lifecycle() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub_ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -10117,7 +10359,7 @@ async fn wss_workspace_export_lifecycle() {
                     break;
                 }
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -10140,14 +10382,15 @@ async fn wss_workspace_export_lifecycle() {
                     {
                         return;
                     }
-                    if v["params"]["event"]["type"] == "workspace:transfer:failed" {
-                        panic!("second export failed: {v}");
-                    }
+                    assert!(
+                        v["params"]["event"]["type"] != "workspace:transfer:failed",
+                        "second export failed: {v}"
+                    );
                 }
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub2.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }
@@ -10205,8 +10448,7 @@ async fn wss_workspace_import_commit_materializes_git() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| !s.success())
-        .unwrap_or(true)
+        .map_or(true, |s| !s.success())
     {
         eprintln!("skipping WSS git import E2E: git not available");
         return;
@@ -10233,8 +10475,7 @@ async fn wss_workspace_import_commit_materializes_git() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .is_ok_and(|s| s.success());
             assert!(ok, "git {args:?}");
         };
         git(&["init", "--quiet", "-b", "main"]);
@@ -10336,7 +10577,7 @@ async fn wss_workspace_import_commit_materializes_git() {
     // (PROTOCOL §5.1: the workspace envelope after import transforms).
     let ws_payload = &committed["result"]["workspace"];
     let checkout = srv
-        ._dir
+        .dir
         .path()
         .join("workspaces")
         .join(ws_id)
@@ -10373,7 +10614,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
-/// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
+/// `graceful_shutdown_allows_immediate_restart`). Prefer `base_port: 0` for normal tests.
 fn free_port() -> u16 {
     use std::net::TcpListener;
     TcpListener::bind(("127.0.0.1", 0))
@@ -10508,7 +10749,7 @@ where
                     out.push(serde_json::from_str(&text).expect("json"));
                     break;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 other => panic!("expected text frame, got {other:?}"),
             }
         }

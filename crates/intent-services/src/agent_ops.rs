@@ -7,6 +7,7 @@
 //! ports the auggie CLI model-list parser.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use intent_core::events::{
@@ -49,7 +50,7 @@ const LARGE_CONVERSATION_WARN_BYTES: u64 = 4 * 1024 * 1024;
 const QUEUE_PREVIEW_MAX_CHARS: usize = 200;
 
 /// Maximum length for caller-supplied message IDs to prevent unbounded storage
-/// and DoS via oversized persisted IDs.
+/// and `DoS` via oversized persisted IDs.
 pub(crate) const MAX_MESSAGE_ID_LEN: usize = 256;
 
 use crate::agent_subscriptions::CompletionWatch;
@@ -115,6 +116,8 @@ pub(crate) struct AgentSnapshot {
     pub(crate) pending_attention: Option<String>,
 }
 
+// serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -194,17 +197,16 @@ fn resolve_default_model_from_settings(
 
     // 1. Check provider defaults. With no explicit provider, key the lookup
     // by the settings-derived default (model.default prefix, else
-    // providers.active), bottoming out at the first registered provider.
+    // providers.active); with neither, there is no provider to key on
+    // (monorepo#3044: no positional last resort) and the step is skipped.
     let derived;
-    let provider_key = match provider {
-        Some(p) => p,
-        None => {
-            derived = crate::agent_session::derived_default_provider(&settings)
-                .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-            derived.as_str()
-        }
+    let provider_key = if let Some(p) = provider {
+        Some(p)
+    } else {
+        derived = crate::agent_session::derived_default_provider(&settings);
+        derived.as_deref()
     };
-    if let Some(model) = settings.model.provider_defaults.get(provider_key) {
+    if let Some(model) = provider_key.and_then(|k| settings.model.provider_defaults.get(k)) {
         if !model.is_empty() {
             return Some(model.clone());
         }
@@ -287,19 +289,19 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default (model.default
-    // prefix, else providers.active), bottoming out at the first registered
-    // provider.
+    // prefix, else providers.active). With neither there is no effective
+    // provider (monorepo#3044: no positional last resort) — the
+    // provider-keyed steps below are skipped and ownership guards pass
+    // compound ids through on their own prefix.
     let derived;
-    let effective_provider = intent_providers::provider_config(match provider {
-        Some(p) => p,
-        None => {
-            derived =
-                crate::agent_session::derived_default_provider(&services.effective_settings())
-                    .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-            derived.as_str()
-        }
-    })
-    .id;
+    let effective_provider: Option<&str> = if let Some(p) = provider {
+        Some(intent_providers::provider_config(p).id)
+    } else {
+        derived = crate::agent_session::derived_default_provider(&services.effective_settings());
+        derived
+            .as_deref()
+            .map(|p| intent_providers::provider_config(p).id)
+    };
 
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
@@ -313,7 +315,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
             }
             tracing::debug!(
                 model = m,
-                provider = effective_provider,
+                provider = effective_provider.unwrap_or_default(),
                 specialist = spec_id,
                 "specialist frontmatter model belongs to another provider; ignoring"
             );
@@ -329,7 +331,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
         }
         tracing::warn!(
             model = m,
-            provider = effective_provider,
+            provider = effective_provider.unwrap_or_default(),
             "configured default model belongs to another provider; \
              falling back to the catalog/CLI default"
         );
@@ -340,9 +342,8 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // row is the provider's own by construction, so no ownership guard is
     // needed. Pinning it to session.model freezes the model for the
     // session's lifetime even if the provider later changes its default.
-    if let Some(m) = services
-        .models_catalog
-        .cached_default_model(effective_provider)
+    if let Some(m) =
+        effective_provider.and_then(|p| services.models_catalog.cached_default_model(p))
     {
         return (Some(m), DefaultModelSource::CatalogDefault);
     }
@@ -357,10 +358,13 @@ pub(crate) fn resolve_agent_default_model_with_source(
 /// resolved provider (`agent_create_op` derives `session.provider` from it).
 /// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
 /// evidence rules (cached dynamic catalogs; absence of evidence passes).
+/// With no effective provider at all (monorepo#3044), only a known compound
+/// id passes — it carries its own provider; a bare id has nothing to be
+/// validated against and falls through.
 fn default_model_belongs_to_provider(
     services: &Services,
     provider_param: Option<&str>,
-    effective_provider: &str,
+    effective_provider: Option<&str>,
     model: &str,
 ) -> bool {
     if model.contains(':') {
@@ -369,8 +373,12 @@ fn default_model_belongs_to_provider(
             return false;
         }
         provider_param.is_none()
-            || intent_providers::provider_config(&prefix).id == effective_provider
+            || effective_provider
+                .is_some_and(|ep| intent_providers::provider_config(&prefix).id == ep)
     } else {
+        let Some(effective_provider) = effective_provider else {
+            return false;
+        };
         ensure_bare_model_matches_provider(
             "agent.create",
             &services.models_catalog,
@@ -382,7 +390,7 @@ fn default_model_belongs_to_provider(
 }
 
 /// Reject a provider id that is not in the ACP registry with `-32602`
-/// (InvalidParams). Persisting an unknown provider would make the spawn path
+/// (`InvalidParams`). Persisting an unknown provider would make the spawn path
 /// silently fall back to the default binary; hard-fail at the front door
 /// instead (PROTOCOL §5.5). `method` names the rejecting RPC in the message.
 fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
@@ -396,7 +404,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 }
 
 /// Reject a bare model id that provably belongs to a different provider with
-/// `-32602` (InvalidParams). Persisting the mismatch would make the spawn
+/// `-32602` (`InvalidParams`). Persisting the mismatch would make the spawn
 /// path feed another provider's model id to `provider_id`'s binary
 /// (monorepo#607). Ownership evidence is deterministic and probe-free: the
 /// in-memory last-good `ModelCatalogCache` entries under each provider's
@@ -446,7 +454,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 }
 
 /// Reject a `reasoningEffort` level the resolved model provably does not
-/// support with `-32602` (InvalidParams), naming the valid values. Evidence is
+/// support with `-32602` (`InvalidParams`), naming the valid values. Evidence is
 /// the cached model catalog's `effortLevels` for `model_id`
 /// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
 /// same probe-free, read-only rule as the bare-model ownership guard: with no
@@ -552,11 +560,12 @@ fn resolve_delegate_reasoning_effort(
 }
 
 /// Resolve the provider `agent.delegate` should spawn on when the caller
-/// supplies no explicit `model` (spec Decision D2). The wire has no
-/// `provider` param, so the daemon must derive one itself instead of leaving
-/// `AgentCreateExtra.provider` unset — which would fall through to the
-/// spawn path's positional last resort regardless of the user's actual
-/// configured default.
+/// supplies no explicit `provider` param and no explicit `model` (spec
+/// Decision D2). An explicit `provider` param (PROTOCOL §5.5) short-circuits
+/// this derivation entirely at the call site; without it the daemon must
+/// derive one itself instead of leaving `AgentCreateExtra.provider` unset —
+/// which would fall through to the spawn path's positional last resort
+/// regardless of the user's actual configured default.
 ///
 /// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
 ///    when that is unset — the provider prefix of its compound `model`
@@ -565,14 +574,11 @@ fn resolve_delegate_reasoning_effort(
 /// 2. The settings-derived default (provider of `model.default`, else
 ///    `providers.active` — [`crate::agent_session::derived_default_provider`]),
 ///    with the same known/available requirement.
-/// 3. Neither is set: no resolution is made here (`Ok(None)`) — the
-///    session's `provider` stays unset, exactly like the pre-existing model
-///    resolution's "no configured default" case. `resolve_provider_id`
-///    (`agent_session.rs`) applies the same configured-default precedence at
-///    spawn time, but with no configured default to offer either, that
-///    precedence bottoms out at the first registered provider (neutral
-///    positional last resort) — this residual, no-config case is the one
-///    scenario where the positional fallback still applies.
+/// 3. Neither is set: a clear `-32602` (monorepo#3044) — the former residual
+///    `Ok(None)` left the session's `provider` unset, and spawn-time
+///    resolution bottomed out at the first registered provider (auggie),
+///    silently spawning a binary that may not be installed. Resolution that
+///    falls through entirely now fails loudly at the front door instead.
 fn resolve_delegate_provider(
     services: &Services,
     specialist: Option<&str>,
@@ -603,17 +609,20 @@ fn resolve_delegate_provider(
             ensure_provider_available("agent.delegate", &derived, &settings.providers.paths)?;
             Ok(Some(derived))
         }
-        None => Ok(None),
+        None => Err(crate::agent_session::no_default_provider_error(
+            "agent.delegate",
+        )),
     }
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
 /// the specialist's frontmatter `codingAgent` (or its compound `model`
 /// prefix) when it names a *known* provider, else the settings-derived
-/// default, bottoming out at the first registered provider — but tolerant of
-/// an unknown/unavailable provider instead of erroring, since a preview must
-/// never fail. Used by [`Services::specialist_model_options`] so the
-/// delegate-docs hint names the default each specialist's *own* provider
+/// default — but tolerant of an unknown/unavailable provider instead of
+/// erroring, since a preview must never fail. `None` when nothing resolves
+/// (monorepo#3044: no positional last resort) — the preview then shows the
+/// provider CLI default. Used by [`Services::specialist_model_options`] so
+/// the delegate-docs hint names the default each specialist's *own* provider
 /// override would actually pin, instead of assuming every specialist spawns
 /// on the shared settings-derived provider (a specialist pinned to another
 /// provider previously showed that other provider's fallback/`None`).
@@ -621,7 +630,7 @@ pub(crate) fn resolve_delegate_provider_preview(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
-) -> String {
+) -> Option<String> {
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
         let explicit = specialists_svc
@@ -634,12 +643,11 @@ pub(crate) fn resolve_delegate_provider_preview(
             });
         if let Some(provider_id) = explicit {
             if intent_providers::find_provider(&provider_id).is_some() {
-                return provider_id;
+                return Some(provider_id);
             }
         }
     }
     crate::agent_session::derived_default_provider(&services.effective_settings())
-        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
 
 /// Reject a known provider id that the daemon's own provider discovery
@@ -683,6 +691,9 @@ fn ensure_provider_available(
 /// (write-through persistence; see [`Services::persist_queue_snapshot`]). The
 /// bool fields take `#[serde(default)]` so older payloads missing a later
 /// flag still rehydrate.
+// The independent bool flags ARE the durable payload shape; grouping them
+// would break persisted-payload rehydration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
@@ -849,12 +860,11 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     while let Some(i) = rest.find(start) {
         out.push_str(&rest[..i]);
         let after = &rest[i + start.len()..];
-        match after.find(end) {
-            Some(j) => rest = &after[j + end.len()..],
-            None => {
-                rest = "";
-                break;
-            }
+        if let Some(j) = after.find(end) {
+            rest = &after[j + end.len()..];
+        } else {
+            rest = "";
+            break;
         }
     }
     out.push_str(rest);
@@ -875,7 +885,7 @@ fn strip_group_tags(s: &str) -> String {
                 continue;
             }
         }
-        out.push_str(&rest[..i + 1]);
+        out.push_str(&rest[..=i]);
         rest = &rest[i + 1..];
     }
     out.push_str(rest);
@@ -927,11 +937,10 @@ pub(crate) fn last_response_and_digest_from_blocks(
         }
         let cleaned = clean_response_text(text);
         if !cleaned.is_empty() {
-            let line = cleaned
-                .lines()
-                .rfind(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string())
-                .unwrap_or_else(|| cleaned.chars().take(200).collect());
+            let line = cleaned.lines().rfind(|l| !l.trim().is_empty()).map_or_else(
+                || cleaned.chars().take(200).collect(),
+                |l| l.trim().to_string(),
+            );
             last_response = Some(line);
         }
     }
@@ -1059,7 +1068,7 @@ fn parse_model_line(line: &str) -> Option<(String, String)> {
 /// dynamic discovery succeeded: an empty list labeled `source: "static"` with
 /// a `warning`, never an error. (The former static tier catalog went with the
 /// tier tables — the provider CLI owns model discovery.)
-pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Value {
+pub(crate) fn static_provider_response(provider_id: &str, warning: &str) -> Value {
     json!({
         "providerId": provider_id,
         "models": [],
@@ -1546,7 +1555,7 @@ pub(crate) fn has_question_blocks(content: &Value) -> bool {
 }
 
 /// `messageMetadata.type` marker the FE's question wizard stamps on the
-/// flattened Q:/A: answer message (PROTOCOL §5.5, question hold). The daemon
+/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, question hold). The daemon
 /// keys the pending-questions marker clear on this structured tag plus
 /// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
 pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
@@ -1606,7 +1615,7 @@ fn build_create_metadata(
     if !obj.contains_key("isBackground") {
         obj.insert("isBackground".to_string(), json!(true));
     }
-    let child_depth = parent_depth.map(|d| d + 1).unwrap_or(0);
+    let child_depth = parent_depth.map_or(0, |d| d + 1);
     obj.entry("delegationDepth".to_string())
         .or_insert(json!(child_depth));
     if let Some(caller) = input.caller_agent_id.as_ref() {
@@ -1638,13 +1647,13 @@ fn build_create_metadata(
 /// when empty so pre-widening callers that only inspect `ok`/`agentId`/
 /// `created`/`result` stay wire-compatible.
 fn build_wake_response(
-    agent_id: AgentId,
-    agent_name: String,
+    agent_id: &AgentId,
+    agent_name: &str,
     created: bool,
     action: &str,
-    task_title: String,
-    result: Value,
-    cleaned_up: Vec<AgentId>,
+    task_title: &str,
+    result: &Value,
+    cleaned_up: &[AgentId],
 ) -> Value {
     let mut out = json!({
         "ok": true,
@@ -1726,8 +1735,7 @@ fn last_message_role_and_id(messages: &[AgentMessage]) -> (Option<String>, Optio
         .iter()
         .rev()
         .find(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| (Some(m.role.clone()), Some(m.id.clone())))
-        .unwrap_or((None, None))
+        .map_or((None, None), |m| (Some(m.role.clone()), Some(m.id.clone())))
 }
 
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
@@ -1745,8 +1753,7 @@ fn project_lite_from_projection(
     let (last_response, digest) = projection
         .last_assistant_text_blocks
         .as_deref()
-        .map(last_response_and_digest_from_blocks)
-        .unwrap_or((None, None));
+        .map_or((None, None), last_response_and_digest_from_blocks);
     let last_user = projection
         .last_user_text_blocks
         .as_deref()
@@ -1760,7 +1767,7 @@ fn project_lite_from_projection(
         projection.last_message_role.clone(),
         projection.last_message_id.clone(),
     );
-    lite.last_tool_use = projection.last_tool_use.clone();
+    lite.last_tool_use.clone_from(&projection.last_tool_use);
     lite
 }
 
@@ -1794,8 +1801,7 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
         b.get("type").and_then(Value::as_str) == Some("tool_use")
             && b.get("name")
                 .and_then(Value::as_str)
-                .map(|n| n.trim().is_empty())
-                .unwrap_or(true)
+                .is_none_or(|n| n.trim().is_empty())
     }
     let Some(blocks) = message.content.as_array() else {
         return message;
@@ -1815,8 +1821,7 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
             Some("tool_result") => b
                 .get("tool_use_id")
                 .and_then(Value::as_str)
-                .map(|id| !anonymous_ids.contains(id))
-                .unwrap_or(true),
+                .is_none_or(|id| !anonymous_ids.contains(id)),
             _ => true,
         })
         .cloned()
@@ -1873,7 +1878,7 @@ fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) 
 
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
-    /// the runtime manager's busy set. Only the small busy set reaches SQLite,
+    /// the runtime manager's busy set. Only the small busy set reaches `SQLite`,
     /// and each lookup selects `updated_at` alone.
     pub(crate) async fn agent_list_active_op(&self) -> Result<Value> {
         let Some(manager) = self.agent_manager() else {
@@ -1967,8 +1972,8 @@ impl Services {
     }
 
     /// Drop the cached agent.list message projections for `workspace_id`.
-    /// Call after any successful agent_message write or session create/delete
-    /// in this workspace so the next list reloads from SQLite.
+    /// Call after any successful `agent_message` write or session create/delete
+    /// in this workspace so the next list reloads from `SQLite`.
     pub(crate) fn invalidate_agent_list_cache(&self, workspace_id: &WorkspaceId) {
         self.agent_list_cache.invalidate(&workspace_id.0);
     }
@@ -2240,8 +2245,7 @@ impl Services {
     /// unresolved tool call. `false` when no turn is streaming.
     fn live_turn_has_unresolved_tool(&self, agent_id: &AgentId) -> bool {
         self.live_turn(agent_id)
-            .map(|live| has_unresolved_tool_use(&live.blocks))
-            .unwrap_or(false)
+            .is_some_and(|live| has_unresolved_tool_use(&live.blocks))
     }
 
     /// Turn-liveness for `session` (STAB-125): `(turnInFlight,
@@ -2359,7 +2363,8 @@ impl Services {
         // log is insert-only (appends only extend the tail, so existing row
         // positions never shift — a racing `replace_agent_messages` degrades
         // no worse than an already-stale page token).
-        let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
+        let total = usize::try_from(self.store.count_agent_messages(&agent_id).await?.max(0))
+            .expect("value fits in usize");
         // Seek resolution: `aroundMessageId` / `aroundIndex` win over any
         // token (mutual exclusivity is enforced at the transport boundary);
         // a forward (`prevToken`-minted) cursor is recognized next; otherwise
@@ -2379,14 +2384,16 @@ impl Services {
                 .get_agent_message_index(&agent_id, &mid)
                 .await?
                 .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {mid}")))?;
-            let index = index.max(0) as usize;
+            let index = usize::try_from(index.max(0)).expect("value fits in usize");
             slim_anchor = crate::pagination::BudgetAnchor::Target(index);
             Some(crate::pagination::page_window_around(total, limit, index))
         } else if let Some(idx) = around_index {
             // Ordinal seek: clamp into [0, total - 1] — client estimates are
             // approximate, so an overshooting index lands on the newest page
             // instead of erroring (negatives were rejected at the boundary).
-            let clamped = (idx.max(0) as usize).min(total.saturating_sub(1));
+            let clamped = usize::try_from(idx.max(0))
+                .expect("non-negative")
+                .min(total.saturating_sub(1));
             slim_anchor = crate::pagination::BudgetAnchor::Target(clamped);
             Some(crate::pagination::page_window_around(total, limit, clamped))
         } else {
@@ -2398,16 +2405,19 @@ impl Services {
             }
             w
         };
-        let (start, end, mut next_token, mut prev_token) = match seek_win {
-            Some(w) => (w.start, w.end, w.next_token, Some(w.prev_token)),
-            None => {
-                let w = crate::pagination::page_window(total, limit, page_token.as_deref());
-                (w.start, w.end, w.next_token, None)
-            }
+        let (start, end, mut next_token, mut prev_token) = if let Some(w) = seek_win {
+            (w.start, w.end, w.next_token, Some(w.prev_token))
+        } else {
+            let w = crate::pagination::page_window(total, limit, page_token.as_deref());
+            (w.start, w.end, w.next_token, None)
         };
         let mut page: Vec<AgentMessage> = self
             .store
-            .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
+            .get_agent_messages_page(
+                &agent_id,
+                i64::try_from(start).expect("value fits in i64"),
+                i64::try_from(end - start).expect("value fits in i64"),
+            )
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
@@ -2545,7 +2555,7 @@ impl Services {
         data: Value,
     ) {
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             intent_store::NewEvent {
                 workspace_id: workspace_id.clone(),
                 timestamp: now_iso(),
@@ -2799,14 +2809,14 @@ impl Services {
         // and only when a specialist tier is actually consulted (model
         // resolution, the specialist reasoning-effort rungs, and/or the
         // specialist prompt snapshot below).
-        let spec_wp = match model.is_none() || specialist.is_some() {
-            true => self
-                .store
+        let spec_wp = if model.is_none() || specialist.is_some() {
+            self.store
                 .get_workspace(&workspace_id)
                 .await
                 .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w)),
-            false => None,
+                .and_then(|w| crate::git_ops::worktree_path(&w))
+        } else {
+            None
         };
         let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
@@ -2838,6 +2848,19 @@ impl Services {
         if let Some(p) = provider.as_deref() {
             ensure_known_provider("agent.create", p)?;
         }
+        // monorepo#3044: with no explicit provider, no compound model prefix
+        // (`provider` was just derived from one when present), and no
+        // settings-derived default, no spawn provider could ever resolve for
+        // this session. Fail loudly at the front door — the former behavior
+        // persisted the row and the spawn silently bottomed out at the first
+        // registered provider (auggie), installed or not.
+        let derived_default =
+            crate::agent_session::derived_default_provider(&self.effective_settings());
+        if provider.is_none() && derived_default.is_none() {
+            return Err(crate::agent_session::no_default_provider_error(
+                "agent.create",
+            ));
+        }
         // Also validate the resolved model's compound prefix unconditionally:
         // the spawn path (`resolve_provider_id`) gives the model prefix
         // precedence over session.provider, so a valid explicit provider must
@@ -2852,9 +2875,10 @@ impl Services {
                 // spawn would feed the effective provider another provider's
                 // model id (monorepo#607). The effective provider mirrors
                 // `resolve_provider_id` for a bare model: provider field →
-                // settings-derived default → first registered provider. Bare
-                // ids with no ownership evidence pass — ownership cannot be
-                // proven for model lists that were never fetched.
+                // settings-derived default (guaranteed present by the guard
+                // above). Bare ids with no ownership evidence pass —
+                // ownership cannot be proven for model lists that were never
+                // fetched.
                 //
                 // Only a *client-supplied* mismatch hard-fails. A mismatch in
                 // a derived default (specialist frontmatter / settings chain
@@ -2863,17 +2887,10 @@ impl Services {
                 // param) would reject a model the caller never sent and make
                 // the provider uncreatable until settings change; drop it to
                 // the CLI default instead (session.model stays None).
-                let derived;
-                let effective = match provider.as_deref() {
-                    Some(p) => p,
-                    None => {
-                        derived = crate::agent_session::derived_default_provider(
-                            &self.effective_settings(),
-                        )
-                        .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-                        derived.as_str()
-                    }
-                };
+                let effective = provider
+                    .as_deref()
+                    .or(derived_default.as_deref())
+                    .expect("guarded above: provider or derived default present");
                 match ensure_bare_model_matches_provider(
                     "agent.create",
                     &self.models_catalog,
@@ -2903,15 +2920,16 @@ impl Services {
         // effort and pass it down as a param, so this only fires for callers
         // that did not (`reasoning_effort_decided == false`) — which is also
         // what keeps the specialist rungs ahead of the settings default below.
-        let reasoning_effort = match reasoning_effort_decided {
-            true => reasoning_effort,
-            false => resolve_delegate_reasoning_effort(
+        let reasoning_effort = if reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_delegate_reasoning_effort(
                 self,
                 None,
                 specialist.as_deref(),
                 resolved_model.as_deref(),
                 spec_wp.as_deref(),
-            ),
+            )
         };
         // Validate the requested level (PROTOCOL §5.5) against the *resolved*
         // model's cached `effortLevels`, with the same probe-free,
@@ -2930,13 +2948,10 @@ impl Services {
         // Last rung: the settings default effort, applied only when no rung
         // above decided the effort AND the model itself came from the settings
         // default chain (see `resolve_settings_default_reasoning_effort`).
-        let reasoning_effort = match reasoning_effort.is_some() || reasoning_effort_decided {
-            true => reasoning_effort,
-            false => resolve_settings_default_reasoning_effort(
-                self,
-                model_source,
-                resolved_model.as_deref(),
-            ),
+        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
         };
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
@@ -3074,6 +3089,7 @@ impl Services {
             &self.store,
             session.model.as_deref(),
             session.provider.as_deref(),
+            crate::agent_session::derived_default_provider(&settings).as_deref(),
         )
         .await;
         self.publish_agent_mutation_event(
@@ -3187,18 +3203,21 @@ impl Services {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
             // model has no prefix: session.provider → settings-derived
-            // default → first registered provider): a bare id provably owned
-            // by another provider (cached dynamic catalogs) is the same
-            // misroute vector (monorepo#607).
+            // default): a bare id provably owned by another provider (cached
+            // dynamic catalogs) is the same misroute vector (monorepo#607).
+            // With neither set the session could never spawn — fail loudly
+            // instead of validating against a positional default
+            // (monorepo#3044).
             let derived;
-            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
-                Some(p) => p,
-                None => {
-                    derived =
-                        crate::agent_session::derived_default_provider(&self.effective_settings())
-                            .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-                    derived.as_str()
-                }
+            let effective = if let Some(p) = session.provider.as_deref().filter(|p| !p.is_empty()) {
+                p
+            } else {
+                derived =
+                    crate::agent_session::derived_default_provider(&self.effective_settings())
+                        .ok_or_else(|| {
+                            crate::agent_session::no_default_provider_error("agent.setModel")
+                        })?;
+                derived.as_str()
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
@@ -3324,7 +3343,7 @@ impl Services {
         self.remove_event_subscriptions_for_agent(&agent_id).await;
         if let Some((workspace_id, agent_name)) = session_meta {
             crate::publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 intent_store::NewEvent {
                     workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
@@ -3417,7 +3436,7 @@ impl Services {
             return Ok(existing);
         }
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             crate::agent_delete_scheduled_event(&session_ws, &agent_id, &delete_at),
         )
         .await;
@@ -3452,7 +3471,7 @@ impl Services {
         let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
         if cancelled {
             crate::publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 crate::agent_delete_cancelled_event(&session_ws, &agent_id),
             )
             .await;
@@ -3500,13 +3519,10 @@ impl Services {
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
     /// mutated) so subscribed clients invalidate their cached projection.
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
-        let obj = match changes {
-            Value::Object(m) => m,
-            _ => {
-                return Err(Error::InvalidParams(
-                    "agent.update: `changes` must be an object".to_string(),
-                ))
-            }
+        let Value::Object(obj) = changes else {
+            return Err(Error::InvalidParams(
+                "agent.update: `changes` must be an object".to_string(),
+            ));
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
@@ -3541,7 +3557,7 @@ impl Services {
             }
         }
         let mut mutated_only_name = obj.contains_key("name");
-        for (key, value) in obj.iter() {
+        for (key, value) in &obj {
             if key != "name" {
                 mutated_only_name = false;
             }
@@ -3688,7 +3704,7 @@ impl Services {
         };
         let mut event_data = serde_json::Map::new();
         event_data.insert("agentId".into(), json!(agent_id.0));
-        for (k, v) in obj.iter() {
+        for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
         }
         self.publish_agent_mutation_event(
@@ -3808,6 +3824,12 @@ impl Services {
         agent_id: AgentId,
         messages: Value,
     ) -> Result<Value> {
+        struct Parsed {
+            role: String,
+            content: Value,
+            metadata: Option<Value>,
+            created_at: String,
+        }
         let session = self.store.get_agent_session(&agent_id).await?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
@@ -3818,12 +3840,6 @@ impl Services {
         let raw = messages.as_array().ok_or_else(|| {
             Error::InvalidParams("agent.replaceMessages: `messages` must be an array".to_string())
         })?;
-        struct Parsed {
-            role: String,
-            content: Value,
-            metadata: Option<Value>,
-            created_at: String,
-        }
         let mut parsed: Vec<Parsed> = Vec::with_capacity(raw.len());
         let fallback_ts = now_iso();
         for (i, entry) in raw.iter().enumerate() {
@@ -4030,7 +4046,7 @@ impl Services {
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
-                format!("no dynamic model discovery for provider '{provider_id}'"),
+                &format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
         let version_key = (source.version_key)();
@@ -4057,7 +4073,7 @@ impl Services {
             }
             None => Ok(static_provider_response(
                 &provider_id,
-                resolved
+                &resolved
                     .warning
                     .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
@@ -4377,8 +4393,7 @@ impl Services {
         if let Some(ref id) = message_id {
             if id.len() > MAX_MESSAGE_ID_LEN {
                 return Err(Error::InvalidParams(format!(
-                    "messageId exceeds maximum length of {} bytes",
-                    MAX_MESSAGE_ID_LEN
+                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
                 )));
             }
         }
@@ -4494,7 +4509,7 @@ impl Services {
         }
     }
 
-    /// `agent.sendQueuedMessageNow` (store-only fallback when no AgentManager
+    /// `agent.sendQueuedMessageNow` (store-only fallback when no `AgentManager`
     /// is attached): atomically remove the queued entry named by `message_id`
     /// and persist it to the transcript immediately, preserving the rest of
     /// the queue (PROTOCOL §5.5). Deliberately NOT idempotent (unlike
@@ -4837,20 +4852,17 @@ impl Services {
                 _ => {}
             }
         }
-        match pending {
-            Some(id) => {
-                let id = id.to_string();
-                self.record_pending_questions_marker(workspace_id, agent_id, &id)
+        if let Some(id) = pending {
+            let id = id.to_string();
+            self.record_pending_questions_marker(workspace_id, agent_id, &id)
+                .await;
+        } else {
+            self.clear_pending_questions_marker(workspace_id, agent_id)
+                .await;
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
                     .await;
-            }
-            None => {
-                self.clear_pending_questions_marker(workspace_id, agent_id)
-                    .await;
-                if let Some(manager) = self.agent_manager() {
-                    manager
-                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                        .await;
-                }
             }
         }
         self.maybe_emit_display_status_changed(workspace_id).await;
@@ -5032,6 +5044,13 @@ impl Services {
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
+        // Bounded CAS retry: each iteration re-reads the current marker,
+        // re-applies the monotonicity gate, and attempts a guarded write. A
+        // miss means another writer moved the marker between our read and
+        // write; the loop converges because the marker only ever advances.
+        // The cap is defensive — two racing debounced FE triggers settle in
+        // one retry.
+        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
         let message_id = message_id.trim().to_string();
         if message_id.is_empty() {
             return Err(Error::InvalidParams("messageId is required".to_string()));
@@ -5041,13 +5060,6 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
-        // Bounded CAS retry: each iteration re-reads the current marker,
-        // re-applies the monotonicity gate, and attempts a guarded write. A
-        // miss means another writer moved the marker between our read and
-        // write; the loop converges because the marker only ever advances.
-        // The cap is defensive — two racing debounced FE triggers settle in
-        // one retry.
-        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -5243,17 +5255,17 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {session_id}")));
             }
         }
-        let stats = match fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
-            Some(cli) => cli,
-            None => {
+        let stats =
+            if let Some(cli) = fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
+                cli
+            } else {
                 let (message_count, tool_count) = transcript_counts(&session.messages);
                 SessionStats {
                     credits_used: None,
                     message_count,
                     tool_count,
                 }
-            }
-        };
+            };
         self.cache_and_emit_session_stats(&session, &stats).await;
         Ok(json!({ "stats": stats }))
     }
@@ -5279,7 +5291,7 @@ impl Services {
             return;
         }
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             intent_store::NewEvent {
                 workspace_id: session.workspace_id.clone(),
                 timestamp: now_iso(),
@@ -5341,7 +5353,7 @@ impl Services {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        let report_len = report_text.chars().count() as i64;
+        let report_len = i64::try_from(report_text.chars().count()).expect("value fits in i64");
         // Persist the completion report on the child so `agent.get`/`agent.list`
         // (and `ws.agent.summary`) can re-serve it after restarts.
         let saved_at = now_iso();
@@ -5389,8 +5401,7 @@ impl Services {
                 .store
                 .get_agent_session(&parent)
                 .await
-                .map(|s| s.workspace_id)
-                .unwrap_or_else(|_| workspace_id.clone());
+                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
             // Mark any ungrouped watches whose parent matches this parent as
             // report_delivered, so deliver_completion_to_watches will skip agent:idle
             // for them (suppressing the duplicate wake). Do NOT mark watches for other
@@ -5796,8 +5807,7 @@ impl Services {
                 .store
                 .get_agent_session(parent)
                 .await
-                .map(|s| s.workspace_id)
-                .unwrap_or_else(|_| workspace_id.clone());
+                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
             let wake_text = crate::harness::latest().attention_parent_wake(
                 &session.name,
                 &caller.0,
@@ -5914,6 +5924,48 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // Resolve the child's first message up front so it can be persisted as
+        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // stored it so a wake-up can resume). Source priority mirrors the TS
+        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        // Resolve the child agent's name to match the reference `DelegateTaskTool`
+        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
+        // taskNoteId path uses the note's title. Both truncate to 100 chars
+        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
+        // child inherits the generic `Agent xxxxxx` fallback from
+        // `agent_create_op`, which then leaks into the waiting panel, agent
+        // cards, and `agent:idle` wake reports (NAME-1).
+        fn truncate_agent_name(name: String) -> String {
+            // The reference uses JS `.length` / `.substring(0, 97)`, which
+            // count UTF-16 code units — non-BMP characters (e.g. emoji)
+            // count as 2. Match that to avoid off-by-one divergences on
+            // emoji-heavy task titles (Copilot #84 review).
+            let u16_len = name.encode_utf16().count();
+            if u16_len > 100 {
+                let units: Vec<u16> = name.encode_utf16().take(97).collect();
+                // `substring(0, 97)` can split a surrogate pair; drop a
+                // trailing lone high surrogate so the resulting Rust string
+                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
+                let cutoff = if units
+                    .last()
+                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
+                {
+                    units.len() - 1
+                } else {
+                    units.len()
+                };
+                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
+                truncated.push_str("...");
+                truncated
+            } else {
+                name
+            }
+        }
         // `greedy` was a batch-level conflict override; it is REMOVED. Any
         // supplied value — `true`, `false`, or an explicit `null` — rejects
         // on BOTH forms (the check sits before the batch routing so a
@@ -5946,15 +5998,6 @@ impl Services {
         // the `git_ops` gate and the idle subscriber, never in prompts.
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
-        // Resolve the child's first message up front so it can be persisted as
-        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
-        // stored it so a wake-up can resume). Source priority mirrors the TS
-        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
-        // then the linked task note's content (falling back to its title).
-        fn first_nonempty(s: &str) -> Option<String> {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
         let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
         let mut message = input
             .agent_instructions
@@ -5992,39 +6035,6 @@ impl Services {
                 &title,
                 &note_id.0,
             ));
-        }
-        // Resolve the child agent's name to match the reference `DelegateTaskTool`
-        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
-        // taskNoteId path uses the note's title. Both truncate to 100 chars
-        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
-        // child inherits the generic `Agent xxxxxx` fallback from
-        // `agent_create_op`, which then leaks into the waiting panel, agent
-        // cards, and `agent:idle` wake reports (NAME-1).
-        fn truncate_agent_name(name: String) -> String {
-            // The reference uses JS `.length` / `.substring(0, 97)`, which
-            // count UTF-16 code units — non-BMP characters (e.g. emoji)
-            // count as 2. Match that to avoid off-by-one divergences on
-            // emoji-heavy task titles (Copilot #84 review).
-            let u16_len = name.encode_utf16().count();
-            if u16_len > 100 {
-                let units: Vec<u16> = name.encode_utf16().take(97).collect();
-                // `substring(0, 97)` can split a surrogate pair; drop a
-                // trailing lone high surrogate so the resulting Rust string
-                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
-                let cutoff = if units
-                    .last()
-                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
-                {
-                    units.len() - 1
-                } else {
-                    units.len()
-                };
-                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
-                truncated.push_str("...");
-                truncated
-            } else {
-                name
-            }
         }
         let child_name = task_text_msg
             .or_else(|| task_note.as_ref().and_then(|n| first_nonempty(&n.title)))
@@ -6103,14 +6113,18 @@ impl Services {
                 .unwrap_or(0)
                 + 1
         });
-        // D2: resolve the provider up front when the caller gave no explicit
-        // `model` — the wire has no `provider` param on `agent.delegate`, so
-        // without this the created session's `provider` stays `None` and the
-        // spawn path falls through to the hardcoded default (Auggie),
-        // regardless of the user's actual configured default. A compound
-        // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
-        // provider via `agent_create_op`'s existing derivation, so D2 is
-        // skipped in that case.
+        // D2: resolve the provider up front. Precedence (PROTOCOL §5.5):
+        // explicit `provider` param > compound-`model` prefix > specialist
+        // frontmatter `codingAgent` (or its compound `model` prefix) >
+        // settings-derived default. An explicit `provider` must be known and
+        // available, and a compound explicit `model` naming a DIFFERENT
+        // known provider is a contradiction — both reject with `-32602`
+        // before any side effect (an unknown compound prefix is left to
+        // `agent_create_op`'s unconditional prefix validation). When nothing
+        // resolves at all, `resolve_delegate_provider` fails loudly with
+        // `-32602` (monorepo#3044: no positional last resort); a compound
+        // explicit `model` (e.g. `opencode:kimi-k3`) pins its own provider
+        // via `agent_create_op`'s existing derivation.
         // SECURITY: derive workspace_path from the stored workspace record,
         // never a client-supplied value (same rationale as
         // `agent_create_op`'s model resolution).
@@ -6120,7 +6134,25 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
-        let delegate_provider = if input.model.is_none() {
+        let delegate_provider = if let Some(provider_param) = input.provider.as_deref() {
+            ensure_known_provider("agent.delegate", provider_param)?;
+            ensure_provider_available(
+                "agent.delegate",
+                provider_param,
+                &self.effective_settings().providers.paths,
+            )?;
+            if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
+                let (prefix, _) = intent_providers::parse_compound_model_id(model);
+                if intent_providers::find_provider(&prefix)
+                    .is_some_and(|cfg| cfg.id != provider_param)
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.delegate: model {model} names provider {prefix} but provider is {provider_param}"
+                    )));
+                }
+            }
+            Some(provider_param.to_string())
+        } else if input.model.is_none() {
             resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
             None
@@ -6243,27 +6275,9 @@ impl Services {
                     && ws.repository_path.is_some();
                 let is_standalone_checkout = matches!(
                     ws.checkout_mode,
-                    Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                    Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                 ) && ws.worktree_path.is_some();
                 if is_direct_mode || is_standalone_checkout {
-                    // Same root fallback as `workspace.create` (the intentd
-                    // binary configures the root via INTENTD_WORKSPACES_DIR /
-                    // `workspaces.root` rather than `.with_workspaces_root`).
-                    let root = self
-                        .workspaces_root
-                        .clone()
-                        .unwrap_or_else(crate::default_workspaces_root);
-                    let aid = AgentId::from(agent_id.as_str());
-                    // The CoW clone runs OFF the delegate critical path
-                    // (monorepo#871): on large checkouts it takes tens of
-                    // seconds, which previously blew through the 30s
-                    // `workspace_api` budget and the harness's own MCP client
-                    // timeout. Register the settlement gate BEFORE returning
-                    // so the child's turn worker (`ensure_started`) blocks its
-                    // first ACP spawn until the clone settles — the child
-                    // never spawns against a half-copied sandbox.
-                    let settled = self.begin_sandbox_provisioning(&aid);
-                    effective_isolation = Some("pending");
                     // Drop guard: settles the gate even if provisioning
                     // panics, so the gate map never accumulates stale
                     // entries. Constructed BEFORE the spawn (and moved into
@@ -6285,6 +6299,24 @@ impl Services {
                             self.services.settle_sandbox_provisioning(&self.aid);
                         }
                     }
+                    // Same root fallback as `workspace.create` (the intentd
+                    // binary configures the root via INTENTD_WORKSPACES_DIR /
+                    // `workspaces.root` rather than `.with_workspaces_root`).
+                    let root = self
+                        .workspaces_root
+                        .clone()
+                        .unwrap_or_else(crate::default_workspaces_root);
+                    let aid = AgentId::from(agent_id.as_str());
+                    // The CoW clone runs OFF the delegate critical path
+                    // (monorepo#871): on large checkouts it takes tens of
+                    // seconds, which previously blew through the 30s
+                    // `workspace_api` budget and the harness's own MCP client
+                    // timeout. Register the settlement gate BEFORE returning
+                    // so the child's turn worker (`ensure_started`) blocks its
+                    // first ACP spawn until the clone settles — the child
+                    // never spawns against a half-copied sandbox.
+                    let settled = self.begin_sandbox_provisioning(&aid);
+                    effective_isolation = Some("pending");
                     let guard = SettleGuard {
                         services: self.clone(),
                         aid,
@@ -6324,8 +6356,7 @@ impl Services {
             // (TS `selectIsAgentDeleted`).
             let parent_deleted = parent_session
                 .as_ref()
-                .map(|s| s.status == AgentStatus::Deleted)
-                .unwrap_or(false);
+                .is_some_and(|s| s.status == AgentStatus::Deleted);
             if !parent_deleted {
                 // The watch/group is anchored in the parent's HOME workspace
                 // (where wakes are delivered): for same-workspace delegation
@@ -6334,8 +6365,7 @@ impl Services {
                 // parent session could not be loaded.
                 let parent_home_ws = parent_session
                     .as_ref()
-                    .map(|s| s.workspace_id.clone())
-                    .unwrap_or_else(|| workspace_id.clone());
+                    .map_or_else(|| workspace_id.clone(), |s| s.workspace_id.clone());
                 let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
                 // The scope gate already ran up front (before child creation),
@@ -6613,6 +6643,20 @@ impl Services {
                 "agent.delegate: force is not supported with tasks — occupied tasks classify as skipped (use the single-task form to force a second agent)".to_string(),
             ));
         }
+        // The top-level `provider` is the batch default shared by every entry
+        // that doesn't override it, so validate it up front — before the
+        // classification loop can start any task — rather than surfacing the
+        // same failure as N per-row `error` dispositions after earlier rows
+        // already spawned. Per-entry `provider` overrides stay per-row
+        // (`error` disposition), consistent with the other per-entry options.
+        if let Some(provider_param) = input.provider.as_deref() {
+            ensure_known_provider("agent.delegate", provider_param)?;
+            ensure_provider_available(
+                "agent.delegate",
+                provider_param,
+                &self.effective_settings().providers.paths,
+            )?;
+        }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a
         // rejection is one clear error before any child is created, not N
@@ -6692,6 +6736,9 @@ impl Services {
                         model: opts
                             .and_then(|o| o.model.clone())
                             .or_else(|| input.model.clone()),
+                        provider: opts
+                            .and_then(|o| o.provider.clone())
+                            .or_else(|| input.provider.clone()),
                         reasoning_effort: opts
                             .and_then(|o| o.reasoning_effort.clone())
                             .or_else(|| input.reasoning_effort.clone()),
@@ -6730,10 +6777,8 @@ impl Services {
                         format!("waiting on incomplete dependencies: {}", unmet.join(", "));
                     if !decision_needed.is_empty() {
                         obj.insert("decisionNeeded".into(), json!(decision_needed));
-                        reason.push_str(&format!(
-                            "; dependencies {} are cancelled or missing and will never complete — decision needed",
-                            decision_needed.join(", ")
-                        ));
+                        let _ = write!(reason, "; dependencies {} are cancelled or missing and will never complete — decision needed",
+                            decision_needed.join(", "));
                     }
                     obj.insert("reason".into(), json!(reason));
                 }
@@ -6806,9 +6851,10 @@ impl Services {
         // an unestimated chain is longer.
         let critical_path_minutes = batch::serial_remaining_minutes(&requested, &snaps);
         if let Some(minutes) = critical_path_minutes {
-            unlock_message.push_str(&format!(
+            let _ = write!(
+                unlock_message,
                 " ~{minutes} min of serial work remains on the critical path."
-            ));
+            );
         }
         // Count started relation-less tasks in the human-readable summary
         // (annotation only — nothing about the start decision changed).
@@ -6817,10 +6863,8 @@ impl Services {
             .filter(|id| relations_unknown.contains(*id))
             .count();
         if started_unknown > 0 {
-            unlock_message.push_str(&format!(
-                " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
-                started_ids.len()
-            ));
+            let _ = write!(unlock_message, " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
+                started_ids.len());
         }
 
         let mut unlock_plan = json!({
@@ -6937,7 +6981,7 @@ impl Services {
 
                 // Emit sandbox:cow:created event
                 crate::publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     intent_store::NewEvent {
                         workspace_id: workspace_id.clone(),
                         timestamp: crate::now_iso(),
@@ -7021,8 +7065,7 @@ impl Services {
         let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
         let parent_deleted = parent_session
             .as_ref()
-            .map(|s| s.status == AgentStatus::Deleted)
-            .unwrap_or(false);
+            .is_some_and(|s| s.status == AgentStatus::Deleted);
         if parent_deleted {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
@@ -7083,8 +7126,7 @@ impl Services {
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         let skip = caller_session
             .as_ref()
-            .map(is_delegated_background_task_session)
-            .unwrap_or(false);
+            .is_some_and(is_delegated_background_task_session);
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
@@ -7095,17 +7137,14 @@ impl Services {
         // linkage is read from the caller session's `parent_agent_id`,
         // falling back to the metadata `createdByAgentId` the create/delegate
         // writers populate.
-        let is_child_of_target = caller_session
-            .as_ref()
-            .map(|s| {
-                s.parent_agent_id.as_ref() == Some(&target_agent_id)
-                    || s.metadata
-                        .as_ref()
-                        .and_then(|m| m.get("createdByAgentId"))
-                        .and_then(Value::as_str)
-                        == Some(target_agent_id.0.as_str())
-            })
-            .unwrap_or(false);
+        let is_child_of_target = caller_session.as_ref().is_some_and(|s| {
+            s.parent_agent_id.as_ref() == Some(&target_agent_id)
+                || s.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("createdByAgentId"))
+                    .and_then(Value::as_str)
+                    == Some(target_agent_id.0.as_str())
+        });
         if is_child_of_target {
             tracing::debug!(
                 caller = %caller_agent_id.0,
@@ -7162,7 +7201,7 @@ impl Services {
     }
 
     /// The explicit-registration idle-target guard (monorepo#2972): a
-    /// RuntimeIdle target with NO waiting reason — nothing pending that
+    /// `RuntimeIdle` target with NO waiting reason — nothing pending that
     /// could ever produce a "next completion" — is rejected, because
     /// accepting it either fires an instant synthetic wake replaying the
     /// stale report (settled shape) or leaves a permanently-armed dead
@@ -7249,7 +7288,7 @@ impl Services {
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
     /// cross-workspace targets for non-chief callers, and the idle-target
     /// guard (monorepo#2972, [`Services::check_idle_target_watchable`])
-    /// rejects a RuntimeIdle target with no waiting reason.
+    /// rejects a `RuntimeIdle` target with no waiting reason.
     pub(crate) async fn agent_watch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -7440,8 +7479,7 @@ impl Services {
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         if caller_session
             .as_ref()
-            .map(|s| s.status == AgentStatus::Deleted)
-            .unwrap_or(false)
+            .is_some_and(|s| s.status == AgentStatus::Deleted)
         {
             return Err(Error::InvalidParams(format!(
                 "caller agent {caller_agent_id} is deleted"
@@ -7657,11 +7695,17 @@ impl Services {
             })
             .collect();
 
+        // Batched status projection (intent-hq/monorepo#3018): one `IN`-list
+        // query for every present agent's status, instead of a per-agent
+        // `get_agent_session` loop that hydrated each agent's full message
+        // log just to read `status` — that made the dispatch duration scale
+        // with the watched agents' transcript sizes (the monorepo#958
+        // incident shape) and its statement count with the watch fan-out.
         let mut agent_statuses = serde_json::Map::new();
-        for id in &present {
-            if let Ok(session) = self.store.get_agent_session(id).await {
-                if let Some(word) = agent_status_wire(session.status) {
-                    agent_statuses.insert(id.0.clone(), json!(word));
+        if let Ok(statuses) = self.store.get_agent_statuses(&present).await {
+            for (id, status) in statuses {
+                if let Some(word) = agent_status_wire(status) {
+                    agent_statuses.insert(id.0, json!(word));
                 }
             }
         }
@@ -7829,11 +7873,13 @@ impl Services {
         let agent_id = &session.id;
         // Count-only aggregate: `active_hooks_for_agent` would hydrate every
         // hook row the agent ever owned (code + lastState blobs included).
-        let hooks = self
-            .store
-            .count_active_hooks_by_agent(agent_id)
-            .await
-            .unwrap_or(0) as usize;
+        let hooks = usize::try_from(
+            self.store
+                .count_active_hooks_by_agent(agent_id)
+                .await
+                .unwrap_or(0),
+        )
+        .expect("value fits in usize");
         let agent_watches = self.list_watches_for_parent(agent_id).len();
         // Length-only registry read: `queue_snapshot` materializes each
         // entry's wire JSON (image/file blocks included) just to be counted.
@@ -7842,17 +7888,19 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map_or(0, |q| q.len());
+            .map_or(0, std::vec::Vec::len);
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
         // Delegated children not yet settled: one aggregate statement over
         // the `parent_agent_id` index, unscoped by workspace so a Chief
         // parent's cross-workspace delegates count too — O(this agent's
         // children), never O(workspace sessions). Fails open to 0.
-        let running_sub_agents = self
-            .store
-            .count_unsettled_child_agents(agent_id)
-            .await
-            .unwrap_or(0) as usize;
+        let running_sub_agents = usize::try_from(
+            self.store
+                .count_unsettled_child_agents(agent_id)
+                .await
+                .unwrap_or(0),
+        )
+        .expect("value fits in usize");
         let num_questions_asked = self.pending_question_count(agent_id).await;
         // Per-agent indexed read over this agent's monitor rows; labels only,
         // no snapshot hydration. Fails open to empty.
@@ -8434,8 +8482,10 @@ impl Services {
                         .filter(|e| e["editing"].as_bool() != Some(true))
                         .filter_map(|e| {
                             let queued_at = e["queuedAt"].as_str()?;
-                            let queued_ms =
-                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let queued_ms = i64::try_from(
+                                parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000,
+                            )
+                            .unwrap_or(0);
                             let age = (now_ms - queued_ms).max(0);
                             if age > STALE_QUEUE_ENTRY_AFTER_MS {
                                 Some((e["id"].as_str().unwrap_or_default(), age))
@@ -8449,19 +8499,17 @@ impl Services {
             if stale.is_empty() {
                 continue;
             }
-            let archived = match workspace_archived {
-                Some(v) => v,
-                None => {
-                    let v = !workspace_id.is_chief()
-                        && self
-                            .store
-                            .get_workspace(&workspace_id)
-                            .await
-                            .map(|w| w.archived)
-                            .unwrap_or(false);
-                    workspace_archived = Some(v);
-                    v
-                }
+            let archived = if let Some(v) = workspace_archived {
+                v
+            } else {
+                let v = !workspace_id.is_chief()
+                    && self
+                        .store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .is_ok_and(|w| w.archived);
+                workspace_archived = Some(v);
+                v
             };
             if archived {
                 break;
@@ -8771,7 +8819,7 @@ impl Services {
     /// `Vec::push` append-order means newest is the tail). Shared by
     /// `agent_wake_or_create_op`'s live/resumable scan and the occupancy
     /// guards in `agent_delegate_op` / `assign_agent`. Probe each session:
-    ///   * NotFound / Deleted → stale, queue for cleanup.
+    ///   * `NotFound` / Deleted → stale, queue for cleanup.
     ///   * Poisoned (monorepo#840: Error + session-fatal provider block or
     ///     an identical-failure streak) → NOT resumable: waking it would
     ///     replay the provider-blocked turn ("start a new session" means a
@@ -8779,7 +8827,7 @@ impl Services {
     ///     keeping it as the inheritance source for specialist/model.
     ///     Poisoned ids are ALSO tracked separately: their parked queues
     ///     are migrated onto the wake/create target and the dead session
-    ///     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
+    ///     is GC'd (monorepo#847). `NotFound` / soft-Deleted ids keep the
     ///     cleanup-only behavior.
     ///   * Otherwise → treat as resumable; the newest live session wins.
     ///
@@ -8896,8 +8944,7 @@ impl Services {
         // keeps the fallback-anchor behavior and still registers a watch.
         let caller_deleted = caller_session
             .as_ref()
-            .map(|s| s.status == AgentStatus::Deleted)
-            .unwrap_or(false);
+            .is_some_and(|s| s.status == AgentStatus::Deleted);
         if let Some(session) = caller_session
             .as_ref()
             .filter(|s| s.status != AgentStatus::Deleted)
@@ -8981,13 +9028,13 @@ impl Services {
                 "woke_existing"
             };
             let mut response = build_wake_response(
-                agent_id.clone(),
-                agent_name,
+                &agent_id.clone(),
+                &agent_name,
                 false,
                 action,
-                task_title.clone(),
-                result,
-                cleaned_up,
+                &task_title.clone(),
+                &result,
+                &cleaned_up,
             );
             // SUB-1: auto-subscribe the waking caller to the target's
             // completion (TS `WakeOrCreateTaskAgentTool`). Response text
@@ -9254,13 +9301,13 @@ impl Services {
             )
             .await?;
         let mut response = build_wake_response(
-            agent.clone(),
-            agent_name,
+            &agent.clone(),
+            &agent_name,
             true,
             "created_new",
-            task_title.clone(),
-            result,
-            cleaned_up,
+            &task_title.clone(),
+            &result,
+            &cleaned_up,
         );
         // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
         // created agent's completion, mirroring the woke-existing branch. The
@@ -9282,9 +9329,8 @@ impl Services {
             // The watch is anchored in the caller's HOME workspace (falls
             // back to the call's workspace when the session lookup fails)
             // so a chief caller's wake lands in `__chief__`.
-            let caller_home_ws = caller_session
-                .map(|s| s.workspace_id)
-                .unwrap_or_else(|| workspace_id.clone());
+            let caller_home_ws =
+                caller_session.map_or_else(|| workspace_id.clone(), |s| s.workspace_id);
             let subscription_id = self.register_completion_watch(
                 &caller_home_ws,
                 &workspace_id,
@@ -10123,8 +10169,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map(|q| q.iter().any(|m| !m.editing))
-            .unwrap_or(false)
+            .is_some_and(|q| q.iter().any(|m| !m.editing))
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin
@@ -10135,8 +10180,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map(|q| q.iter().any(|m| !m.editing && m.user_origin))
-            .unwrap_or(false)
+            .is_some_and(|q| q.iter().any(|m| !m.editing && m.user_origin))
     }
 
     /// The `turn_id` of the oldest **ready-to-send** queued message, without
@@ -10163,7 +10207,7 @@ impl Services {
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
-        let had = guard.get(agent_id).map(|q| !q.is_empty()).unwrap_or(false);
+        let had = guard.get(agent_id).is_some_and(|q| !q.is_empty());
         guard.remove(agent_id);
         had
     }
@@ -10250,7 +10294,7 @@ impl Services {
                     .map(|(i, m)| intent_store::AgentQueueRow {
                         id: m.id.clone(),
                         agent_id: agent_id.clone(),
-                        position: i as i64,
+                        position: i64::try_from(i).expect("value fits in i64"),
                         payload: serde_json::to_value(m).unwrap_or(Value::Null),
                         created_at: m.queued_at.clone(),
                         turn_id: m.turn_id.clone(),
@@ -10271,6 +10315,14 @@ impl Services {
     /// `turn_id = id` so every in-memory entry carries a correlation id.
     /// Returns the number of messages actually inserted into the in-memory
     /// map (agents that already hold a live queue are skipped, not counted).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted agent queues fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
         let rows = self.store.load_all_agent_queues().await?;
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
@@ -10279,7 +10331,7 @@ impl Services {
                 Ok(mut message) => {
                     message.editing = false;
                     if message.turn_id.is_empty() {
-                        message.turn_id = message.id.clone();
+                        message.turn_id.clone_from(&message.id);
                     }
                     map.entry(row.agent_id).or_default().push(message);
                 }
@@ -10376,7 +10428,7 @@ impl Services {
                 "queue": queue,
             }),
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// Publish `agent:queue:processing` for a queue entry the drain loop just
@@ -10414,7 +10466,7 @@ impl Services {
             metadata: None,
             data,
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// `agent.wakeOrCreate` wiring for
@@ -10609,9 +10661,9 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
 /// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
 /// Parse an RFC-3339 timestamp into epoch milliseconds, or `0` when malformed.
 fn iso_ms(ts: &str) -> i64 {
-    parse_iso(ts)
-        .map(|dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
-        .unwrap_or(0)
+    parse_iso(ts).map_or(0, |dt| {
+        i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+    })
 }
 
 /// Non-negative age in milliseconds of `ts` relative to `now_ms`.
@@ -10647,9 +10699,10 @@ fn describe_subscription(
     if let Some(group) = delegation_group {
         let group_id = group["groupId"].as_str().unwrap_or_default();
         let expected = group["expectedAgentIds"].as_array().map_or(0, Vec::len);
-        desc.push_str(&format!(
+        let _ = write!(
+            desc,
             ", delegation group {group_id} (await all, {expected} expected)"
-        ));
+        );
     }
     desc
 }
@@ -10858,7 +10911,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let mut file_rows: Vec<Vec<Value>> = Vec::new();
     for m in messages.iter().rev() {
         match m.role.as_str() {
-            "system" => continue,
+            "system" => {}
             "assistant" => {
                 let interrupted = m
                     .metadata
@@ -10871,7 +10924,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     // row and everything before it.
                     break;
                 }
-                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let blocks: &[Value] = m.content.as_array().map_or(&[], Vec::as_slice);
                 let text = crate::agent_session::text_block_strings(blocks).join("");
                 if !text.is_empty() {
                     segments.push(TailSegment::Partial(text));
@@ -10884,7 +10937,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     .and_then(|meta| meta.get("type"))
                     .and_then(Value::as_str)
                     == Some(RESUME_CONTINUATION_METADATA_TYPE);
-                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let blocks: &[Value] = m.content.as_array().map_or(&[], Vec::as_slice);
                 let text = crate::agent_session::text_block_strings(blocks).join("\n");
                 if tagged_continuation || text == LEGACY_RESUME_CONTINUATION_TEXT {
                     // A previous resume's continuation row (metadata-tagged,
@@ -10926,7 +10979,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let file_blocks: Vec<Value> = file_rows.into_iter().flatten().collect();
     let elided = segments.len().saturating_sub(RESUME_RECAP_MAX_SEGMENTS);
     if elided > 0 {
-        segments.drain(1..1 + elided);
+        segments.drain(1..=elided);
     }
     let has_partial = segments
         .iter()
@@ -10938,9 +10991,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
          context).\n\n",
     );
     if elided > 0 {
-        recap.push_str(&format!(
-            "({elided} older interrupted segment(s) elided.)\n\n"
-        ));
+        let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
     }
     for segment in &segments {
         let (label, tag, text) = match segment {
@@ -10956,13 +11007,14 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                 text,
             ),
         };
-        recap.push_str(&format!(
+        let _ = write!(
+            recap,
             "{label}\n<{tag}>\n{}\n</{tag}>\n\n",
             crate::history_xml::escape_xml(&crate::history_xml::truncate_middle_content(
                 text,
                 RESUME_RECAP_SEGMENT_MAX_CHARS,
-            )),
-        ));
+            ))
+        );
     }
     if !has_partial {
         recap.push_str(
@@ -11065,9 +11117,13 @@ impl Services {
     /// parent completion watch when delegated, then deliver a continuation message.
     ///
     /// Claim-then-act semantics prevent concurrent resume races (exactly-one-winner).
-    /// If any post-claim step fails (agent_send_message, session lookup), the row is
+    /// If any post-claim step fails (`agent_send_message`, session lookup), the row is
     /// reset to pending (resolution=NULL) to restore retryability, and the error is
     /// returned loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` if the agent is not in pending interrupted state (or was already resolved); `Error::Internal` if a store operation fails.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
         // Verify the agent is in pending interrupted state (O(1) query)
         let interrupted = self

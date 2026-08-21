@@ -1,6 +1,6 @@
-//! E2E coverage follow-up part 3 — agent_ops services (PR C).
+//! E2E coverage follow-up part 3 — `agent_ops` services (PR C).
 //!
-//! Hermetic Services-level tests exercising agent_ops service methods. Tests cover:
+//! Hermetic Services-level tests exercising `agent_ops` service methods. Tests cover:
 //! agent.subscribe, agent.diagnostics, agent.status, agent.list, agent.readConversation,
 //! agent.summary via in-process Services pattern (not spawned processes).
 //! All tests assert concrete response contracts unconditionally.
@@ -85,6 +85,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -145,7 +146,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -169,6 +170,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
 
 #[tokio::test]
 async fn agent_status_returns_full_metadata() {
+    use intent_core::AgentStatus;
     let (services, ws, ws_root, db) = setup().await;
 
     let agent_val = services
@@ -179,7 +181,7 @@ async fn agent_status_returns_full_metadata() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -195,7 +197,6 @@ async fn agent_status_returns_full_metadata() {
     assert_eq!(result.id, agent_id);
     assert_eq!(result.workspace_id, ws);
     assert_eq!(result.name, "StatusTest");
-    use intent_core::AgentStatus;
     assert_eq!(result.status, AgentStatus::Idle);
     assert!(!result.metadata.is_background);
 
@@ -216,7 +217,7 @@ async fn agent_list_returns_created_agents() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent 1");
@@ -230,7 +231,7 @@ async fn agent_list_returns_created_agents() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent 2");
@@ -261,7 +262,7 @@ async fn agent_read_conversation_returns_messages() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -332,7 +333,7 @@ async fn agent_summary_returns_shape() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

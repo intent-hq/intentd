@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const AGENT_CONFIGS_DIR_NAME: &str = "agent-configs";
 
 /// The agent-configs root for a data dir: `<data_dir>/agent-configs`.
+#[must_use]
 pub fn agent_configs_root(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_CONFIGS_DIR_NAME)
 }
@@ -25,6 +26,10 @@ pub fn agent_configs_root(data_dir: &Path) -> PathBuf {
 /// may carry bridge endpoints and assembled prompts; on other platforms this
 /// is a plain `create_dir_all`. Pre-existing directories are left untouched,
 /// so the call is idempotent across spawns.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if creating the directory chain fails.
 pub fn create_agent_configs_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -40,6 +45,10 @@ pub fn create_agent_configs_dir(dir: &Path) -> std::io::Result<()> {
 /// recovery): files there are per-agent and RAII-deleted on handle drop, so
 /// anything present at daemon startup — before any agent spawns — was leaked
 /// by a previous run that died before drop. A missing directory is a no-op.
+///
+/// # Errors
+///
+/// Returns the first I/O error from listing or removing entries (a missing directory is a no-op success).
 pub fn sweep_agent_configs(dir: &Path) -> std::io::Result<()> {
     if !dir.is_dir() {
         return Ok(());

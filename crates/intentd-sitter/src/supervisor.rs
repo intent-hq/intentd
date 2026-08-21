@@ -21,11 +21,21 @@
 //!    child gracefully (SIGTERM + kill timeout on unix; terminate on
 //!    windows) and respawn the new version with the same args
 //! 5. unexpected child exit (non-zero or signal) → respawn the same version
-//!    forever with exponential backoff; clean exit 0 → sitter exits 0;
-//!    sitter-initiated stops never respawn. Only a `serve` invocation is
-//!    babysat this way: one-shot subcommands (`status`, `stop`, `doctor`,
-//!    `call`, …) legitimately exit non-zero, so they run exactly once and
-//!    their exit status passes through
+//!    with exponential backoff — but not forever:
+//!    [`SupervisorConfig::give_up_after_failures`] consecutive failed
+//!    starts, none of which stayed up for
+//!    [`SupervisorConfig::backoff_reset_after`] (spawn errors count too),
+//!    make the sitter log the failure prominently and exit **0**. Zero is
+//!    load-bearing: launchd's `KeepAlive`/`SuccessfulExit: false` and
+//!    systemd's `Restart=on-failure` both relaunch a non-zero exit, so only
+//!    a clean exit actually stops a daemon that can never start. Any start
+//!    that lasts `backoff_reset_after`, an installed update, and a SIGHUP
+//!    restart each clear the counter alongside the backoff, so healthy and
+//!    transiently-failing daemons are supervised exactly as before. Clean
+//!    exit 0 → sitter exits 0; sitter-initiated stops never respawn. Only a
+//!    `serve` invocation is babysat this way: one-shot subcommands
+//!    (`status`, `stop`, `doctor`, `call`, …) legitimately exit non-zero, so
+//!    they run exactly once and their exit status passes through
 //! 6. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
 //! 7. SIGHUP (unix only, sent by `intentd restart`) stops the child
@@ -79,6 +89,12 @@ pub const BACKOFF_CAP_ENV: &str = "INTENTD_SITTER_BACKOFF_CAP_MS";
 pub const BACKOFF_RESET_ENV: &str = "INTENTD_SITTER_BACKOFF_RESET_MS";
 pub const KILL_TIMEOUT_ENV: &str = "INTENTD_SITTER_KILL_TIMEOUT_MS";
 
+/// Test-only env override (a count, not milliseconds) for
+/// [`SupervisorConfig::give_up_after_failures`]. Production never sets it.
+/// `0` does not disable the give-up: the counter is checked after each
+/// failure, so `0` behaves like `1` — give up on the first failed start.
+pub const GIVE_UP_AFTER_ENV: &str = "INTENTD_SITTER_GIVE_UP_AFTER";
+
 /// Timing knobs for the supervisor loop. Injectable so tests never sleep
 /// for hours; production uses [`SupervisorConfig::default`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +109,10 @@ pub struct SupervisorConfig {
     pub backoff_cap: Duration,
     /// Child uptime after which the backoff resets to `backoff_initial`.
     pub backoff_reset_after: Duration,
+    /// Consecutive failed starts — none of which stayed up for
+    /// `backoff_reset_after` — after which the sitter gives up instead of
+    /// respawning forever. See [`Supervisor::report_give_up`].
+    pub give_up_after_failures: u32,
     /// How long a graceful stop waits before force-killing the child.
     pub kill_timeout: Duration,
 }
@@ -105,6 +125,17 @@ impl Default for SupervisorConfig {
             backoff_initial: Duration::from_secs(1),
             backoff_cap: Duration::from_secs(60),
             backoff_reset_after: Duration::from_secs(5 * 60),
+            // Ten consecutive failures. With the backoff above (1s doubling
+            // to a 60s cap) the tenth start lands ~4 minutes after the
+            // first, which outlasts every transient cause we have seen — a
+            // stale socket or lock left by a hard-killed daemon, a slow
+            // first-boot or resume-from-sleep disk, an upgrade swapping the
+            // binary underneath us — while still stopping a genuinely broken
+            // install fast enough to leave one readable diagnosis instead of
+            // an endless log. Any single start that survives
+            // `backoff_reset_after` clears the count, so a daemon that works
+            // at all can never trip it.
+            give_up_after_failures: 10,
             kill_timeout: Duration::from_secs(30),
         }
     }
@@ -113,6 +144,7 @@ impl Default for SupervisorConfig {
 impl SupervisorConfig {
     /// Defaults with any test-only `INTENTD_SITTER_*_MS` env overrides
     /// applied.
+    #[must_use]
     pub fn from_env() -> Self {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -144,6 +176,9 @@ impl SupervisorConfig {
         if let Some(v) = ms(KILL_TIMEOUT_ENV) {
             config.kill_timeout = v;
         }
+        if let Some(v) = get(GIVE_UP_AFTER_ENV).and_then(|v| v.parse::<u32>().ok()) {
+            config.give_up_after_failures = v;
+        }
         config
     }
 }
@@ -151,16 +186,17 @@ impl SupervisorConfig {
 /// Delay until the next update check: uniformly distributed in
 /// [`min`, `max`) driven by `random` (pure, so tests can assert the
 /// distribution). Degenerate ranges (`max <= min`) collapse to `min`.
+#[must_use]
 pub fn next_check_delay(min: Duration, max: Duration, random: u64) -> Duration {
     let span = max.saturating_sub(min).as_nanos();
     if span == 0 {
         return min;
     }
-    let offset = (random as u128) % span;
+    let offset = u128::from(random) % span;
     min + Duration::from_nanos(u64::try_from(offset).unwrap_or(u64::MAX))
 }
 
-/// A random `u64` from the standard library's randomly-keyed SipHash
+/// A random `u64` from the standard library's randomly-keyed `SipHash`
 /// (no `rand` dependency; jitter does not need cryptographic quality).
 fn random_u64() -> u64 {
     use std::collections::hash_map::RandomState;
@@ -172,6 +208,7 @@ fn random_u64() -> u64 {
 /// Returns the pid only when the file holds one and that process is alive;
 /// a missing, unparsable, or stale (dead pid) file is treated as absent.
 #[cfg(unix)]
+#[must_use]
 pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
     let contents = std::fs::read_to_string(path).ok()?;
     let pid = contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0)?;
@@ -247,6 +284,7 @@ fn effective_channel(startup: ResolvedChannel, config_path: &Path) -> Channel {
 
 /// Build a tokio runtime and drive the supervisor to completion, returning
 /// the sitter's process exit code.
+#[must_use]
 pub fn run(
     paths: SitterPaths,
     channel: ResolvedChannel,
@@ -305,7 +343,7 @@ impl Supervisor {
                 Ok(UpdateOutcome::Installed { version, previous }) => {
                     match previous {
                         Some(previous) => {
-                            eprintln!("intentd-sitter: updated intentd {previous} -> {version}")
+                            eprintln!("intentd-sitter: updated intentd {previous} -> {version}");
                         }
                         None => eprintln!("intentd-sitter: installed intentd {version}"),
                     }
@@ -315,25 +353,20 @@ impl Supervisor {
                 Err(e) => {
                     eprintln!("intentd-sitter: update check failed: {e}");
                     let state = state::load(&self.paths.state_path);
-                    match state
+                    if let Some(version) = state
                         .current_version
                         .filter(|v| self.paths.daemon_binary(v).exists())
                     {
-                        Some(version) => {
-                            eprintln!(
-                                "intentd-sitter: falling back to installed intentd {version}"
-                            );
-                            version
-                        }
-                        None => {
-                            eprintln!(
-                                "intentd-sitter: no intentd daemon is installed for channel {} \
-                                 and the update check failed; cannot start (check network access \
-                                 and retry)",
-                                self.channel.channel
-                            );
-                            return 1;
-                        }
+                        eprintln!("intentd-sitter: falling back to installed intentd {version}");
+                        version
+                    } else {
+                        eprintln!(
+                            "intentd-sitter: no intentd daemon is installed for channel {} \
+                             and the update check failed; cannot start (check network access \
+                             and retry)",
+                            self.channel.channel
+                        );
+                        return 1;
                     }
                 }
             };
@@ -342,32 +375,29 @@ impl Supervisor {
             // One-shot: resolve the installed version with no updater
             // activity (no manifest fetch, no state.json write, no prune).
             let state = state::load(&self.paths.state_path);
-            let version = match state
+            let version = if let Some(version) = state
                 .current_version
                 .filter(|v| self.paths.daemon_binary(v).exists())
             {
-                Some(version) => {
-                    // The channel flag only governs updater behavior, which
-                    // one-shots don't have; surface a mismatch but run anyway.
-                    if state.channel != self.channel.channel {
-                        eprintln!(
-                            "intentd-sitter: note: channel {} requested but the installed \
-                             daemon was installed from channel {}; one-shot commands run \
-                             the installed daemon as-is",
-                            self.channel.channel, state.channel
-                        );
-                    }
-                    version
-                }
-                None => {
+                // The channel flag only governs updater behavior, which
+                // one-shots don't have; surface a mismatch but run anyway.
+                if state.channel != self.channel.channel {
                     eprintln!(
-                        "intentd-sitter: no intentd daemon is installed for channel {}; \
-                         start the daemon first (`intentd serve` or \
-                         `brew services start intentd`) so it gets installed",
-                        self.channel.channel
+                        "intentd-sitter: note: channel {} requested but the installed \
+                         daemon was installed from channel {}; one-shot commands run \
+                         the installed daemon as-is",
+                        self.channel.channel, state.channel
                     );
-                    return 1;
                 }
+                version
+            } else {
+                eprintln!(
+                    "intentd-sitter: no intentd daemon is installed for channel {}; \
+                     start the daemon first (`intentd serve` or \
+                     `brew services start intentd`) so it gets installed",
+                    self.channel.channel
+                );
+                return 1;
             };
             // Never polled: the periodic-check select arm is serve-only.
             (version, Instant::now())
@@ -392,6 +422,9 @@ impl Supervisor {
             None
         };
         let mut backoff = self.config.backoff_initial;
+        // Failed starts since the last one that stayed up (see
+        // `give_up_after_failures`); reset wherever the backoff resets.
+        let mut failures: u32 = 0;
 
         loop {
             let binary = self.paths.daemon_binary(&current_version);
@@ -400,16 +433,29 @@ impl Supervisor {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(e) => {
-                    eprintln!("intentd-sitter: failed to spawn {}: {e}", binary.display());
+                    // "failed to spawn" is part of the install-script log
+                    // contract (see the `what` match in the wait arm below).
+                    let what = format!("failed to spawn {}: {e}", binary.display());
                     if !supervised {
+                        eprintln!("intentd-sitter: {what}");
                         return 1;
                     }
+                    // A binary that cannot be spawned at all (missing,
+                    // truncated, wrong arch) is as permanent as one that
+                    // starts and dies, so it feeds the same counter.
+                    failures += 1;
+                    if failures >= self.config.give_up_after_failures {
+                        self.report_give_up(&what, failures);
+                        return 0;
+                    }
+                    eprintln!("intentd-sitter: {what}");
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
                         BackoffOutcome::Shutdown(code) => return code,
                         #[cfg(unix)]
                         BackoffOutcome::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
                             backoff = self.config.backoff_initial;
+                            failures = 0;
                             continue;
                         }
                         BackoffOutcome::Elapsed => continue,
@@ -422,11 +468,20 @@ impl Supervisor {
             loop {
                 tokio::select! {
                     status = child.wait() => {
-                        match status {
+                        // The failure phrasings built here ("exited
+                        // unexpectedly", "failed waiting on intentd", plus
+                        // "failed to spawn" above) and the give-up banner in
+                        // `report_give_up` are a detection contract with
+                        // scripts/install.sh and scripts/install.ps1: their
+                        // post-timeout diagnosis greps this run's service log
+                        // for these substrings. Reword only in lockstep with
+                        // both scripts and the `install_log_contract_*` tests
+                        // in tests/supervisor_e2e.rs.
+                        let what = match status {
                             Ok(status) if status.success() => return 0,
                             Ok(status) if !supervised => return exit_code(status),
-                            Ok(status) => eprintln!(
-                                "intentd-sitter: intentd {current_version} exited unexpectedly ({}); respawning",
+                            Ok(status) => format!(
+                                "intentd {current_version} exited unexpectedly ({})",
                                 describe_exit(status)
                             ),
                             Err(e) if !supervised => {
@@ -435,25 +490,37 @@ impl Supervisor {
                                 );
                                 return 1;
                             }
-                            Err(e) => eprintln!(
-                                "intentd-sitter: failed waiting on intentd {current_version}: {e}; respawning"
+                            Err(e) => format!(
+                                "failed waiting on intentd {current_version}: {e}"
                             ),
-                        }
+                        };
+                        // A start that lasted `backoff_reset_after` counts as
+                        // a real serve: it clears both the backoff and the
+                        // give-up counter, so a daemon that crashes only
+                        // occasionally keeps being respawned forever.
                         if spawned_at.elapsed() >= self.config.backoff_reset_after {
                             backoff = self.config.backoff_initial;
+                            failures = 0;
                         }
+                        failures += 1;
+                        if failures >= self.config.give_up_after_failures {
+                            self.report_give_up(&what, failures);
+                            return 0;
+                        }
+                        eprintln!("intentd-sitter: {what}; respawning");
                         match self.backoff_sleep(&mut backoff, &mut signals).await {
                             BackoffOutcome::Shutdown(code) => return code,
                             #[cfg(unix)]
                             BackoffOutcome::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
+                                failures = 0;
                             }
                             BackoffOutcome::Elapsed => {}
                         }
                         break; // respawn (possibly a new version after SIGHUP)
                     }
-                    _ = tokio::time::sleep_until(next_check_at), if supervised => {
+                    () = tokio::time::sleep_until(next_check_at), if supervised => {
                         match self.check().await {
                             Ok(UpdateOutcome::Installed { version, previous }) => {
                                 eprintln!(
@@ -464,6 +531,7 @@ impl Supervisor {
                                 self.graceful_stop(&mut child).await;
                                 current_version = version;
                                 backoff = self.config.backoff_initial;
+                                failures = 0;
                                 break; // respawn the new version
                             }
                             Ok(UpdateOutcome::AlreadyCurrent { .. }) => {}
@@ -493,6 +561,7 @@ impl Supervisor {
                                 self.graceful_stop(&mut child).await;
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
+                                failures = 0;
                                 break; // respawn (possibly a new version)
                             }
                             SignalEvent::Shutdown(signal) => signal,
@@ -531,7 +600,7 @@ impl Supervisor {
             .map_err(|e| UpdateError::Io(io::Error::other(e)))?
     }
 
-    /// Pick the next check time in [check_min, check_max) and persist it
+    /// Pick the next check time in [`check_min`, `check_max`) and persist it
     /// (with `last_check_at = now`) so restarts don't reset the clock.
     fn schedule_next_check(&self) -> Instant {
         let delay = next_check_delay(self.config.check_min, self.config.check_max, random_u64());
@@ -563,6 +632,43 @@ impl Supervisor {
         }
     }
 
+    /// Report a permanently failing daemon on the way out of serve mode.
+    ///
+    /// The caller must `return 0` right after: launchd (`KeepAlive` with
+    /// `SuccessfulExit: false`) and systemd (`Restart=on-failure`) both
+    /// relaunch a non-zero exit, so giving up with a failure status would
+    /// only move the respawn loop one level up. A clean exit is what makes
+    /// the service stay down until a human fixes the cause.
+    ///
+    /// The daemon inherits the sitter's stdio, so its own error message is
+    /// already in the same log directly above this banner — point at it
+    /// rather than trying to guess the cause.
+    ///
+    /// "times in a row without ever staying up" is how `scripts/install.sh`
+    /// and `scripts/install.ps1` recognize this banner (the install-script
+    /// log contract; see the wait arm in [`Supervisor::supervise`]): reword
+    /// only in lockstep with both scripts and the `install_log_contract_*`
+    /// tests in `tests/supervisor_e2e.rs`.
+    fn report_give_up(&self, what: &str, failures: u32) {
+        eprintln!("intentd-sitter: {what}");
+        eprintln!(
+            "intentd-sitter: intentd failed {failures} times in a row without ever staying up \
+             for {:?}; this looks permanent, not transient, so the sitter is giving up instead \
+             of respawning it forever",
+            self.config.backoff_reset_after
+        );
+        eprintln!(
+            "intentd-sitter: the daemon's own error is logged above — read it first. A common \
+             cause is a data dir written by a newer intentd (downgrades are unsupported): \
+             install the newer version again, or point INTENTD_DATA_DIR at a different dir"
+        );
+        eprintln!(
+            "intentd-sitter: exiting 0 so the service manager leaves it stopped; once the cause \
+             is fixed, start it again (`intentd serve`, `brew services start intentd`, or \
+             `systemctl --user restart intentd`)"
+        );
+    }
+
     /// Sleep the current backoff delay (doubling it, capped, for next
     /// time), reporting how the sleep ended so the caller can exit on a
     /// shutdown signal or re-resolve the version from `state.json` (and
@@ -572,7 +678,7 @@ impl Supervisor {
         *backoff = backoff.saturating_mul(2).min(self.config.backoff_cap);
         eprintln!("intentd-sitter: respawning intentd in {delay:?}");
         tokio::select! {
-            _ = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
+            () = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
             event = signals.recv() => match event {
                 SignalEvent::Shutdown(signal) => BackoffOutcome::Shutdown(128 + signal),
                 #[cfg(unix)]
@@ -590,7 +696,7 @@ impl Supervisor {
         #[cfg(unix)]
         if let Some(id) = child.id() {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(id as i32),
+                nix::unistd::Pid::from_raw(id.cast_signed()),
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
@@ -686,7 +792,7 @@ fn forward_signal(child: &tokio::process::Child, signal: i32) {
     let Ok(signal) = nix::sys::signal::Signal::try_from(signal) else {
         return;
     };
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id as i32), signal);
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id.cast_signed()), signal);
 }
 
 /// On windows the child shares the sitter's console, so ctrl-c is already
@@ -737,6 +843,7 @@ mod tests {
         assert_eq!(config.backoff_initial, Duration::from_secs(1));
         assert_eq!(config.backoff_cap, Duration::from_secs(60));
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
+        assert_eq!(config.give_up_after_failures, 10);
         assert_eq!(config.kill_timeout, Duration::from_secs(30));
     }
 
@@ -746,8 +853,9 @@ mod tests {
             CHECK_MIN_ENV => Some("100".to_string()),
             CHECK_MAX_ENV => Some("200".to_string()),
             BACKOFF_INITIAL_ENV => Some("not a number".to_string()),
-            BACKOFF_CAP_ENV => Some("".to_string()),
+            BACKOFF_CAP_ENV => Some(String::new()),
             KILL_TIMEOUT_ENV => Some("5000".to_string()),
+            GIVE_UP_AFTER_ENV => Some("3".to_string()),
             _ => None,
         });
         assert_eq!(config.check_min, Duration::from_millis(100));
@@ -755,7 +863,8 @@ mod tests {
         assert_eq!(config.backoff_initial, Duration::from_secs(1));
         assert_eq!(config.backoff_cap, Duration::from_secs(60));
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
-        assert_eq!(config.kill_timeout, Duration::from_millis(5000));
+        assert_eq!(config.give_up_after_failures, 3);
+        assert_eq!(config.kill_timeout, Duration::from_secs(5));
     }
 
     #[test]
@@ -826,10 +935,11 @@ mod tests {
     fn jitter_edge_draws_hit_window_bounds() {
         let (min, max) = (12 * HOUR, 24 * HOUR);
         assert_eq!(next_check_delay(min, max, 0), min);
-        let span_nanos = (max - min).as_nanos() as u64;
+        let span_nanos =
+            u64::try_from(max.checked_sub(min).unwrap().as_nanos()).unwrap_or(u64::MAX);
         assert_eq!(
             next_check_delay(min, max, span_nanos - 1),
-            max - Duration::from_nanos(1)
+            max.checked_sub(Duration::from_nanos(1)).unwrap()
         );
         assert_eq!(next_check_delay(min, max, span_nanos), min);
     }
@@ -856,7 +966,7 @@ mod tests {
         std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
         assert_eq!(
             read_live_pid(&path),
-            Some(nix::unistd::Pid::from_raw(std::process::id() as i32))
+            Some(nix::unistd::Pid::from_raw(std::process::id().cast_signed()))
         );
 
         // A stale pid (spawned and already reaped) is treated as absent.

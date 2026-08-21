@@ -107,6 +107,8 @@ fn side_minutes(s: &str, fallback_unit: Option<Unit>) -> Option<(f64, Option<Uni
     Some((total, last_unit))
 }
 
+// Guarded finite + non-negative; the float→int cast saturates at u64::MAX.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn to_minutes(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0).then(|| (value.round() as u64).min(MAX_EFFORT_MINUTES))
 }
@@ -131,7 +133,7 @@ pub(crate) fn parse_effort_minutes(raw: &str) -> Option<u64> {
         if let Some((left, right)) = s.split_once(separator) {
             let range = side_minutes(right, None).and_then(|(right_minutes, right_unit)| {
                 let (left_minutes, _) = side_minutes(left, right_unit)?;
-                to_minutes((left_minutes + right_minutes) / 2.0)
+                to_minutes(f64::midpoint(left_minutes, right_minutes))
             });
             if range.is_some() {
                 return range;
@@ -144,7 +146,7 @@ pub(crate) fn parse_effort_minutes(raw: &str) -> Option<u64> {
     // Hyphen-joined unit: "90-minute", "1.5-hour" — read the hyphen as a
     // space when the right side is a unit word.
     let (left, right) = s.split_once('-')?;
-    if !right.chars().next().is_some_and(|c| c.is_alphabetic()) {
+    if !right.chars().next().is_some_and(char::is_alphabetic) {
         return None;
     }
     let (minutes, _) = side_minutes(&format!("{left} {right}"), None)?;

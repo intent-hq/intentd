@@ -190,7 +190,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -213,9 +213,8 @@ where
         if remaining.is_zero() {
             return out;
         }
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(x) => x,
-            Err(_) => return out,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return out;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -240,9 +239,8 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
-            None => return out,
-            Some(Err(_)) => return out,
+            Some(Ok(_)) => {}
+            None | Some(Err(_)) => return out,
         }
     }
 }
@@ -307,7 +305,8 @@ async fn boot() -> (Daemon, PathBuf, u16, Arc<ClientConfig>) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

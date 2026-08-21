@@ -541,7 +541,7 @@ fn json_escape_handles_control_characters() {
     // Verify the expected escaping.
     assert_eq!(escaped, r"/tmp/rules\b\f\u0001.md");
     // The escaped value can be embedded in a JSON string.
-    let json = format!(r#"{{"path":"{}"}}"#, escaped);
+    let json = format!(r#"{{"path":"{escaped}"}}"#);
     assert_eq!(json, r#"{"path":"/tmp/rules\b\f\u0001.md"}"#);
 }
 
@@ -575,7 +575,7 @@ impl Drop for EnvGuard {
     }
 }
 
-/// STAB-50: NODE_OPTIONS heap-cap injection for V8-runtime (Node/Electron)
+/// STAB-50: `NODE_OPTIONS` heap-cap injection for V8-runtime (Node/Electron)
 /// providers. All scenarios run inside one test fn because they mutate
 /// process-global env vars — parallel test threads must not race on
 /// `NODE_OPTIONS` / the override seam.
@@ -990,7 +990,7 @@ fn registry_invariants() {
     // ids are unique.
     let ids = all_provider_ids();
     let mut sorted = ids.clone();
-    sorted.sort();
+    sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len());
     // Every provider has a non-empty id / display_name / command.
@@ -1127,7 +1127,7 @@ fn unsloth_endpoint() -> UnslothEndpoint {
         model_id: "unsloth/stub-model-GGUF".to_string(),
         model_display_name: Some("Stub Model".to_string()),
         limit: Some(UnslothModelLimit {
-            context: 262144,
+            context: 262_144,
             output: 8192,
         }),
         compaction_reserved: Some(8192),
@@ -1357,7 +1357,7 @@ fn grok_parses_initialize_models_after_update_banner_preamble() {
                     "currentModelId": "grok-build",
                     "availableModels": [
                         { "modelId": "grok-build", "name": "Grok Build", "description": "Default Grok build model" },
-                        { "modelId": "gpt-5-5", "name": "GPT-5.5", "agentType": "reasoning", "contextWindow": 1048576 }
+                        { "modelId": "gpt-5-5", "name": "GPT-5.5", "agentType": "reasoning", "contextWindow": 1_048_576 }
                     ]
                 }
             }

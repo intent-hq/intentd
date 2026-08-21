@@ -214,7 +214,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -251,7 +251,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -273,9 +273,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => return None,
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(v) => v,
-            Err(_) => return None,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -294,7 +293,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             None | Some(Err(_)) => return None,
         }
     }
@@ -342,7 +341,8 @@ async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConf
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -411,7 +411,7 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         .as_array()
         .and_then(|arr| arr.iter().find(|w| w["id"] == ws_id))
         .and_then(|w| w["lastActivity"].as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     // Second subscription on `agent:*`: turn completion is observed via
     // `agent:stream:end`, which a `workspace:*` subscription never receives.
@@ -497,9 +497,7 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         let new_dt = DateTime::parse_from_rfc3339(new_activity).expect("parse new lastActivity");
         assert!(
             new_dt > init_dt,
-            "lastActivity did not advance: {} -> {}",
-            init,
-            new_activity
+            "lastActivity did not advance: {init} -> {new_activity}"
         );
     }
 
@@ -546,7 +544,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

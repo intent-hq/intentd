@@ -6,7 +6,7 @@
 //! active hook owns one tokio task; schedules persist to the `hook` table
 //! and rehydrate at boot ([`Services::rehydrate_hooks`]).
 //!
-//! Scripts evaluate in QuickJS via `intent_js::eval` with the exact same
+//! Scripts evaluate in `QuickJS` via `intent_js::eval` with the exact same
 //! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs —
 //! gated by the same `[agentFeatures]` toggles (e.g. no `ws.host.exec` when
 //! `agentFeatures.hostExec` is off; with all defaults on the environment is
@@ -180,7 +180,7 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
     if hook.state == HookState::Running {
         return (
             next_run_at_iso(hook.delay_ms),
-            Duration::from_millis(hook.delay_ms.max(0) as u64),
+            Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()),
         );
     }
     match hook
@@ -192,12 +192,14 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
             let remaining = persisted - now;
             (
                 raw.to_string(),
-                Duration::from_millis(remaining.whole_milliseconds().max(0) as u64),
+                Duration::from_millis(
+                    u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
+                ),
             )
         }
         _ => (
             next_run_at_iso(hook.delay_ms),
-            Duration::from_millis(hook.delay_ms.max(0) as u64),
+            Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()),
         ),
     }
 }
@@ -223,7 +225,9 @@ fn time_to_expiry(expires_at: Option<&str>, skew_ms: i64) -> Option<Duration> {
     };
     let remaining = deadline - OffsetDateTime::now_utc() - time::Duration::milliseconds(skew_ms);
     Some(if remaining.is_positive() {
-        Duration::from_millis(remaining.whole_milliseconds().max(0) as u64)
+        Duration::from_millis(
+            u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
+        )
     } else {
         Duration::ZERO
     })
@@ -235,7 +239,7 @@ fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
     time_to_expiry(expires_at, skew_ms) == Some(Duration::ZERO)
 }
 
-/// Evaluate one hook script in QuickJS with the `ws.*` environment gated by
+/// Evaluate one hook script in `QuickJS` with the `ws.*` environment gated by
 /// the same `[agentFeatures]` toggles as the `workspace_api` tool (prelude
 /// pruning + dispatch deny; all-defaults is byte-identical to the ungated
 /// environment) and interpret its return value against the script contract.
@@ -276,8 +280,10 @@ async fn run_hook_script(
         .last_state
         .as_deref()
         .filter(|s| serde_json::from_str::<Value>(s).is_ok())
-        .map(|s| format!("JSON.parse({})", Value::String(s.to_string())))
-        .unwrap_or_else(|| "null".to_string());
+        .map_or_else(
+            || "null".to_string(),
+            |s| format!("JSON.parse({})", Value::String(s.to_string())),
+        );
     let full_code = format!(
         "{prelude}\n\
          const __hook_logs = [];\n\
@@ -339,7 +345,7 @@ async fn run_hook_script(
                     logs,
                     state: StateUpdate::Keep,
                 },
-                Some("v") => parse_outcome(v.get("__v").cloned().unwrap_or(Value::Null), logs),
+                Some("v") => parse_outcome(&v.get("__v").cloned().unwrap_or(Value::Null), logs),
                 Some("e") => RunOutcome::Failed {
                     error: v
                         .get("__v")
@@ -365,9 +371,9 @@ async fn run_hook_script(
 
 /// Interpret the script's returned value: only `{ dispatch: true }` fires a
 /// dispatch; everything else (including `null` and non-objects) re-runs.
-fn parse_outcome(v: Value, logs: Option<String>) -> RunOutcome {
+fn parse_outcome(v: &Value, logs: Option<String>) -> RunOutcome {
     let mut logs = logs;
-    let state = parse_state(&v, &mut logs);
+    let state = parse_state(v, &mut logs);
     if v.get("dispatch").and_then(Value::as_bool) == Some(true) {
         let message = v
             .get("message")
@@ -994,6 +1000,10 @@ impl Services {
     /// NOT cancel or skip active rows (decided semantics: the toggle only
     /// rejects NEW schedules; existing hooks run to their terminal
     /// state/TTL). Returns the number of resumed hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted hooks or an owner status lookup fails.
     pub async fn rehydrate_hooks(&self) -> Result<usize> {
         let hooks = self.store.load_active_hooks().await?;
         let mut resumed = 0;
@@ -1004,9 +1014,8 @@ impl Services {
             // Prune hooks whose owner no longer exists (deleted agents keep
             // their session row with status `deleted`).
             let owner_gone = match self.store.get_agent_session_status(&hook.agent_id).await {
-                Ok(AgentStatus::Deleted) => true,
+                Ok(AgentStatus::Deleted) | Err(Error::NotFound(_)) => true,
                 Ok(_) => false,
-                Err(Error::NotFound(_)) => true,
                 Err(e) => return Err(e),
             };
             if owner_gone {
@@ -1068,7 +1077,7 @@ impl Services {
     /// run already in flight at expiry completes normally). The task
     /// deregisters itself from [`Services::hook_tasks`] on every exit path.
     fn spawn_hook_task(&self, hook: Hook) {
-        self.spawn_hook_task_with_initial_delay(hook, None)
+        self.spawn_hook_task_with_initial_delay(hook, None);
     }
 
     /// [`Services::spawn_hook_task`] with an explicit first-iteration sleep:
@@ -1086,7 +1095,7 @@ impl Services {
             loop {
                 let delay = initial_delay
                     .take()
-                    .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0) as u64));
+                    .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
                 // Race the inter-run sleep against the time to `expiresAt`
                 // (deadline-free legacy rows never take the expiry arm).
                 let to_expiry =
@@ -1098,8 +1107,8 @@ impl Services {
                     }
                 };
                 tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = expiry => {
+                    () = tokio::time::sleep(delay) => {}
+                    () = expiry => {
                         services.expire_hook(&mut hook).await;
                         break;
                     }
@@ -1151,8 +1160,7 @@ impl Services {
         // stop silently if this hook is no longer active.
         match self.store.get_hook(&hook.hook_id).await {
             Ok(h) if matches!(h.state, HookState::Scheduled | HookState::Running) => {}
-            Ok(_) => return Ok(false),
-            Err(Error::NotFound(_)) => return Ok(false),
+            Ok(_) | Err(Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),
         }
         self.store
@@ -1315,7 +1323,7 @@ impl Services {
                     self.store
                         .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                         .await?;
-                    hook.last_logs = logs.clone();
+                    hook.last_logs.clone_from(logs);
                 }
                 // Persist the error before the terminal state so a reader
                 // that observes `evicted` always sees `lastError`.
@@ -1573,7 +1581,7 @@ impl Services {
             metadata: None,
             data,
         };
-        publish_event(&self.event_bus, event).await;
+        publish_event(self.event_bus.as_ref(), event).await;
     }
 }
 
@@ -3205,6 +3213,36 @@ mod tests {
         }
     }
 
+    /// Deterministic pin for the verbatim-preservation contract: when the
+    /// persisted deadline is earlier than a fresh `now + delayMs` countdown,
+    /// [`resumed_next_run`] returns the persisted string VERBATIM (no
+    /// reparse/reformat drift) with the remaining time to it. The
+    /// integration test below can only observe this best-effort — under
+    /// load the due run may fire before the row is read
+    /// (intent-hq/monorepo#3055).
+    #[test]
+    fn resumed_next_run_preserves_earlier_deadline_verbatim() {
+        let (ws, owner) = (WorkspaceId::new(), AgentId::from("agent-hooks"));
+        // 60s out: comfortably earlier than the fresh 10-minute cadence, and
+        // wide enough that the remaining-delay bounds below hold under any
+        // realistic scheduler stall between building the row and the call.
+        let due_at = next_run_at_iso(60_000);
+        let hook = countdown_row(
+            &ws,
+            &owner,
+            "verbatim",
+            Some(due_at.clone()),
+            next_run_at_iso(MAX_HOOK_TTL_MS),
+        );
+        let (next_run_at, initial_delay) = resumed_next_run(&hook);
+        assert_eq!(next_run_at, due_at, "persisted deadline kept verbatim");
+        assert!(
+            initial_delay > Duration::from_secs(30) && initial_delay <= Duration::from_secs(60),
+            "remaining time to the persisted deadline — neither an immediate \
+             run nor a fresh cadence: {initial_delay:?}"
+        );
+    }
+
     /// A restart must not push a hook's countdown back: rehydration resumes
     /// with the EARLIER of the persisted `nextRunAt` and a fresh
     /// `now + delayMs` countdown (intent-hq/monorepo#2856), so a
@@ -3225,13 +3263,24 @@ mod tests {
         );
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
-        // The persisted countdown survives the restart verbatim...
+        // The persisted countdown survives the restart verbatim... unless
+        // the due run already fired under load (`update_hook_run` replaces
+        // `next_run_at` atomically with the `run_count` bump), which itself
+        // proves the near deadline was honored. The verbatim min semantics
+        // are pinned by `resumed_next_run_preserves_earlier_deadline_verbatim`.
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
-        assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        if stored.run_count == 1 {
+            assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        }
         // ...and the run fires on it, nowhere near the 10-minute cadence a
         // reset countdown would impose (the poll deadline is 10s).
-        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
-        assert_eq!(ran.state, HookState::Scheduled);
+        // `run_count` persists before the Running→Scheduled state write, so
+        // wait on both — a `run_count`-only poll can legally observe the row
+        // mid-run as `Running` (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
     }
 
@@ -3250,8 +3299,12 @@ mod tests {
         );
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
-        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
-        assert_eq!(ran.state, HookState::Scheduled);
+        // Wait on state too — `run_count` persists before the
+        // Running→Scheduled write (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
     }
 
@@ -3876,7 +3929,7 @@ mod tests {
         let expires =
             OffsetDateTime::parse(hook.expires_at.as_deref().expect("expires_at"), &Rfc3339)
                 .expect("expires_at");
-        (expires - created).whole_milliseconds() as i64
+        i64::try_from((expires - created).whole_milliseconds()).expect("ttl fits in i64")
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 //! with (e.g. "intentd", "clippy", "submodule"). Pure functions only: no
 //! file, store, or network access.
 //!
-//! Candidates are identifier-shaped tokens (camelCase, snake_case,
+//! Candidates are identifier-shaped tokens (camelCase, `snake_case`,
 //! kebab-case, dotted, digit-bearing, ALL-CAPS acronyms) and plain or
 //! capitalized words that are absent from — or rare in — the embedded
 //! English frequency list. URLs, emails, hex strings, UUIDs, and pure
@@ -133,6 +133,9 @@ impl TermStats {
 /// Deterministic for identical input. At most `max_terms` terms; each term
 /// is 3..=[`MAX_KEYTERM_CHARS`] chars; no case-insensitive duplicates (the
 /// most frequent spelling wins).
+#[must_use]
+// Term/source counts are far below 2^53: loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub fn extract_vocabulary(sources: &[(SourceKind, &str)], max_terms: usize) -> Vec<String> {
     if max_terms == 0 {
         return Vec::new();
@@ -251,12 +254,11 @@ fn strip_link_targets(line: &str) -> String {
     while let Some(i) = rest.find("](") {
         out.push_str(&rest[..=i]);
         let after = &rest[i + 2..];
-        match after.find(')') {
-            Some(j) => rest = &after[j + 1..],
-            None => {
-                rest = "";
-                break;
-            }
+        if let Some(j) = after.find(')') {
+            rest = &after[j + 1..];
+        } else {
+            rest = "";
+            break;
         }
     }
     out.push_str(rest);
@@ -403,6 +405,8 @@ fn flush_segment(cur: &mut String, segs: &mut Vec<String>) {
 
 /// Dictation-usefulness factor: penalizes overlong tokens, separator-heavy
 /// path-like tokens, and vowel-less (unpronounceable) strings.
+// Token lengths are far below 2^53: loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 fn usefulness(spelling: &str) -> f64 {
     let n = spelling.chars().count();
     let mut factor = 1.0;
@@ -429,6 +433,7 @@ fn usefulness(spelling: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn extract(sources: &[(SourceKind, &str)]) -> Vec<String> {
         extract_vocabulary(sources, 100)
@@ -573,10 +578,10 @@ mod tests {
 
     #[test]
     fn caps_at_max_terms() {
-        let text: String = (0..20)
-            .map(|i| format!("zzterm{i:02}x "))
-            .collect::<Vec<_>>()
-            .join("");
+        let text = (0..20).fold(String::new(), |mut s, i| {
+            let _ = write!(s, "zzterm{i:02}x ");
+            s
+        });
         let out = extract_vocabulary(&[(SourceKind::Plain, &text)], 5);
         assert_eq!(out.len(), 5);
     }

@@ -3,7 +3,7 @@
 //! After a pull that updates a submodule gitlink, the submodule worktree must
 //! be synced to match the new commit. This module provides the bounded shell-out
 //! pattern for `git submodule update --init --recursive`, following the same
-//! approach as `fetch.rs` (timeout + kill, GIT_TERMINAL_PROMPT=0, piped stderr).
+//! approach as `fetch.rs` (timeout + kill, `GIT_TERMINAL_PROMPT=0`, piped stderr).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -108,6 +108,10 @@ pub(crate) fn has_submodules(worktree_path: &Path) -> bool {
 ///   removal or add that HEAD does not yet reflect;
 /// - [`Repository::submodules`] (`.gitmodules` + config) — the backstop for a
 ///   submodule registered but not yet committed anywhere.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn submodule_paths(repo: &Repository) -> Result<std::collections::BTreeSet<String>> {
     let mut paths = std::collections::BTreeSet::new();
     let commit_mode = i32::from(FileMode::Commit);
@@ -156,7 +160,7 @@ const MAX_SUBMODULE_NESTING: u32 = 10;
 /// set, every path relative to `worktree_path` with forward-slash
 /// separators (`sub`, `sub/inner`, …). [`submodule_paths`] reads a single
 /// repository, so a nested submodule is invisible to a caller holding only
-/// the superproject; the CoW orphan cleanup needs the full set to see a
+/// the superproject; the `CoW` orphan cleanup needs the full set to see a
 /// nested work tree orphaned by a reset that moved its parent off the
 /// revision registering it. A submodule that is unpopulated (or otherwise
 /// cannot be opened) still contributes its own path, just nothing beneath
@@ -203,6 +207,7 @@ fn collect_nested_paths(
 /// `git init` on macOS/Windows filesystems). Callers pass the result to
 /// [`submodule_containing`]/[`to_repo_relative`] so the gitlink guard compares
 /// paths the same way the filesystem — and therefore `index.add_path` — does.
+#[must_use]
 pub fn ignores_case(repo: &Repository) -> bool {
     repo.config()
         .and_then(|c| c.get_bool("core.ignorecase"))
@@ -239,7 +244,7 @@ fn strip_prefix_components(
     let mut want = meaningful_components(prefix);
     loop {
         match (want.next(), rest.peek()) {
-            (None, _) => return Some(rest.map(|c| c.as_os_str()).collect()),
+            (None, _) => return Some(rest.map(std::path::Component::as_os_str).collect()),
             (Some(_), None) => return None,
             (Some(w), Some(t)) => {
                 let eq = if ignore_case {
@@ -266,6 +271,7 @@ fn strip_prefix_components(
 /// spelling (`SUB/a.txt` for submodule `sub`) resolves to the same file on
 /// disk, so a byte-exact comparison would let it past the guard and
 /// `index.add_path` would flatten the `160000` gitlink into a tree.
+#[must_use]
 pub fn submodule_containing<'a>(
     submodules: &'a std::collections::BTreeSet<String>,
     rel_path: &str,
@@ -347,6 +353,7 @@ pub(crate) fn reject_submodule_internal_paths(repo: &Repository, paths: &[String
 /// Lexical noise (`./`, doubled separators) is *not* rewritten here — it is
 /// folded where it matters, in [`submodule_containing`]'s component-wise match
 /// — so the returned string keeps the caller's spelling for error messages.
+#[must_use]
 pub fn to_repo_relative(workdir: Option<&Path>, raw: &str, ignore_case: bool) -> String {
     let p = Path::new(raw);
     if !p.is_absolute() {
@@ -418,7 +425,7 @@ mod tests {
     }
 
     fn submodules(paths: &[&str]) -> std::collections::BTreeSet<String> {
-        paths.iter().map(|p| p.to_string()).collect()
+        paths.iter().map(std::string::ToString::to_string).collect()
     }
 
     /// A path strictly inside a submodule matches; the gitlink path itself

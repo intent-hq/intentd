@@ -261,7 +261,7 @@ impl Services {
     ///   (`group_id` adopted) — group settlement accounting REQUIRES the
     ///   grouped watch to exist, so the group always wins a collision (this
     ///   is the footer duplicate-wake bug: an ungrouped watch coexisting
-    ///   with after_all membership double-woke the parent).
+    ///   with `after_all` membership double-woke the parent).
     /// - An ungrouped request against an existing grouped watch is a no-op
     ///   (the group already provides the wake path).
     /// - `wake_on_attention` is strengthen-only: an explicit `agent.watch`
@@ -367,7 +367,7 @@ impl Services {
             .collect()
     }
 
-    /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt):
+    /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKPyt`):
     /// atomically find a live ungrouped (immediate-mode) watch for the given
     /// caller→target pair and, while still holding the registry lock,
     /// refresh its stored `parent_agent_name` to `new_parent_name`. Returns
@@ -386,7 +386,7 @@ impl Services {
     ///
     /// `new_parent_name` is `None` when the caller's current display name
     /// could not be resolved (e.g. `store.get_agent_session` failed under
-    /// contention, Copilot #104 thread PRRT_kwDOS9Wxuc6QKWuU): the reuse
+    /// contention, Copilot #104 thread `PRRT_kwDOS9Wxuc6QKWuU`): the reuse
     /// still proceeds, but the existing stored name is left intact rather
     /// than overwritten with an empty placeholder that would degrade
     /// `agent.getSubscriptions` / `describe_subscription` output.
@@ -1253,6 +1253,14 @@ impl Services {
     /// already watched in memory is pruned — so duplicate rows persisted by
     /// a pre-invariant daemon are coalesced onto the single strongest watch
     /// on upgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if listing the persisted completion watches fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
         let mut persisted = self.store.list_completion_watches().await?;
         // Strongest-first: grouped (0) < ungrouped (1), with the store's
@@ -1263,6 +1271,11 @@ impl Services {
         let mut loaded = 0usize;
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
         for p in persisted {
+            enum LoadOutcome {
+                Loaded(AgentId, WorkspaceId),
+                AlreadyInMemory,
+                DuplicatePair,
+            }
             // Prune when either endpoint is gone: no wake could fire (child
             // deleted watches are handled by reconciliation below instead,
             // since a deleted child IS a completion signal for the parent).
@@ -1296,11 +1309,6 @@ impl Services {
                     let _ = self.store.delete_completion_watch(&p.id).await;
                     continue;
                 }
-            }
-            enum LoadOutcome {
-                Loaded(AgentId, WorkspaceId),
-                AlreadyInMemory,
-                DuplicatePair,
             }
             let outcome = {
                 let mut guard = self
@@ -1360,7 +1368,7 @@ impl Services {
     }
 
     /// Whether an agent session row exists and is not `Deleted`. Store errors
-    /// other than NotFound are treated as live (conservative: never prune a
+    /// other than `NotFound` are treated as live (conservative: never prune a
     /// watch on a transient store error).
     pub(crate) async fn agent_is_live(&self, agent_id: &AgentId) -> bool {
         match self.store.get_agent_session(agent_id).await {
@@ -1562,14 +1570,14 @@ impl Services {
     }
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
-    /// Idempotent: skips groups already present in memory (by group_id).
+    /// Idempotent: skips groups already present in memory (by `group_id`).
     /// `workspace_id` selects which persisted groups to load (the group's
     /// anchor — the parent's home workspace); the loaded groups land in the
     /// daemon-global registry.
     ///
     /// STAB-108 FIX: Reconciles each rehydrated group against current agent state.
     /// If an expected child is already idle/completed (or deleted/missing), records
-    /// its completion using the persisted completion_report, then fires ready groups.
+    /// its completion using the persisted `completion_report`, then fires ready groups.
     pub(crate) async fn rehydrate_delegation_groups(
         &self,
         workspace_id: &WorkspaceId,
@@ -1611,9 +1619,9 @@ impl Services {
     }
 
     /// STAB-108: Reconcile a delegation group against current agent state after rehydration.
-    /// For each expected child not already in completed_agent_ids or deleted_agent_ids,
+    /// For each expected child not already in `completed_agent_ids` or `deleted_agent_ids`,
     /// check if the agent session is idle/completed (or deleted/missing). If so, record
-    /// its completion using the persisted completion_report.
+    /// its completion using the persisted `completion_report`.
     async fn reconcile_group_on_rehydration(&self, group_id: &str) {
         // Get the list of agents to check (expected but not yet recorded as
         // complete/deleted) plus the group's anchor workspace, used as the
@@ -1906,7 +1914,7 @@ impl Services {
     /// DURABLE-BEFORE-OBSERVABLE helper: if `agent_id` is in a delegation group,
     /// record its completion BEFORE the idle event is published. This ensures the
     /// persisted state is correct if the daemon is killed immediately after the
-    /// event becomes observable. Called from the agent_session worker loop right
+    /// event becomes observable. Called from the `agent_session` worker loop right
     /// before publishing `agent:idle`.
     pub(crate) async fn record_group_completion_pre_publish(
         &self,
@@ -2307,7 +2315,7 @@ mod tests {
 
     /// Store + Services + workspace with a top-level parent (`agent-parent`)
     /// and its delegated child (`agent-child`). The temp workspaces root
-    /// keeps the cowSupported probe hermetic (mirrors the hook_manager test
+    /// keeps the cowSupported probe hermetic (mirrors the `hook_manager` test
     /// setup).
     async fn setup() -> (TempDb, tempfile::TempDir, Services, WorkspaceId) {
         let tmp = TempDb::new();

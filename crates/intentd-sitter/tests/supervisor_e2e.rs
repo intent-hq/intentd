@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,7 +26,7 @@ use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::{
     BACKOFF_CAP_ENV, BACKOFF_INITIAL_ENV, BACKOFF_RESET_ENV, CHECK_MAX_ENV, CHECK_MIN_ENV,
-    KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
+    GIVE_UP_AFTER_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
 };
 
 const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
@@ -43,7 +44,7 @@ const FAKE_DAEMON_LOG: &str = "FAKE_DAEMON_LOG";
 /// sharply `crash_respawn_backs_off_exponentially`, whose backed-off child can
 /// miss its spawn budget under load). Holding this guard for each such test's
 /// duration keeps only one live supervisor loop running at a time. Mirrors the
-/// `CHILD_SPAWN_SERIAL` (provider_models) and `WATCHER_TEST_SERIAL`
+/// `CHILD_SPAWN_SERIAL` (`provider_models`) and `WATCHER_TEST_SERIAL`
 /// (events/mod.rs) precedents. The brief one-shot tests (`doctor`, `restart`
 /// without a live sitter, single-shot `serve`) spawn once and finish, so they
 /// stay parallel. `unwrap_or_else(into_inner)` recovers from a poisoned lock so
@@ -86,7 +87,7 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            Ok(_) if header != "\r\n" && !header.is_empty() => {}
             _ => break,
         }
     }
@@ -127,8 +128,10 @@ fn dead_url() -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// `.tar.xz` with `intentd-<triple>/intentd` (mode 0755) — the cargo-dist
@@ -215,6 +218,17 @@ fn long_running_script(version: &str) -> String {
 /// Fake daemon: log one line and crash with `code`.
 fn crash_script(code: i32) -> String {
     format!("#!/bin/sh\necho run >> \"${FAKE_DAEMON_LOG}\"\nexit {code}\n")
+}
+
+/// Fake daemon: log one line, stay up `secs`, then crash with `code` — a
+/// daemon that serves for a while and dies, not one that can never start.
+fn long_lived_crash_script(secs: &str, code: i32) -> String {
+    format!(
+        "#!/bin/sh\n\
+         echo run >> \"${FAKE_DAEMON_LOG}\"\n\
+         sleep {secs}\n\
+         exit {code}\n"
+    )
 }
 
 /// Sitter command wired to a temp data dir, a manifest base URL, and the
@@ -382,7 +396,9 @@ fn no_network_and_nothing_installed_exits_nonzero() {
 
 #[test]
 fn update_mid_run_swaps_binary_and_preserves_args() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -443,7 +459,9 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
 
 #[test]
 fn config_channel_switch_applies_at_next_periodic_check() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -509,7 +527,9 @@ fn config_channel_switch_applies_at_next_periodic_check() {
 
 #[test]
 fn flag_pinned_channel_ignores_config_switch_mid_run() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -575,7 +595,9 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
 
 #[test]
 fn crash_respawn_backs_off_exponentially() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(7));
@@ -584,10 +606,15 @@ fn crash_respawn_backs_off_exponentially() {
         .env(BACKOFF_INITIAL_ENV, "50")
         .env(BACKOFF_CAP_ENV, "400")
         .env(BACKOFF_RESET_ENV, "60000")
+        // This test measures the backoff curve, not the give-up threshold:
+        // raise the threshold out of reach so the loop runs for the whole
+        // window (`permanent_startup_failure_gives_up_and_exits_zero` owns
+        // the give-up behaviour).
+        .env(GIVE_UP_AFTER_ENV, "10000")
         .arg("serve")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(5000));
+    thread::sleep(Duration::from_secs(5));
     send_signal(&sitter, "TERM");
     let status = wait_exit(&mut sitter, Duration::from_secs(10));
     assert_ne!(
@@ -621,9 +648,243 @@ fn crash_respawn_backs_off_exponentially() {
     assert!(stderr.contains("respawning intentd in"), "stderr: {stderr}");
 }
 
+/// The bug this guards: a daemon that can never start (e.g. its data dir was
+/// written by a newer intentd) used to be respawned forever, so the service
+/// burned CPU and the user saw nothing but a timeout. After
+/// `give_up_after_failures` failed starts the sitter must stop — with exit
+/// **0**, because launchd (`KeepAlive`/`SuccessfulExit: false`) and systemd
+/// (`Restart=on-failure`) both relaunch a non-zero exit.
+#[test]
+fn permanent_startup_failure_gives_up_and_exits_zero() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(9));
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        // No start can ever reach this uptime, so nothing resets the count.
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "4")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+
+    // Nothing signals the sitter: it must exit on its own.
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "giving up must exit 0 or the service manager relaunches the crash loop"
+    );
+
+    let runs = read_or_empty(&daemon_log_path(dir.path()))
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 4, "must stop at the give-up threshold, not before it");
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("intentd 0.1.0 exited unexpectedly (exit code 9)"),
+        "the daemon's actual failure must be logged: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed 4 times in a row")
+            && stderr.contains("giving up instead of respawning it forever"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The other half of the contract: a daemon that keeps serving for a while
+/// before dying is transiently, not permanently, broken — every start that
+/// outlives `backoff_reset_after` clears the counter, so it is respawned
+/// forever exactly as before.
+#[test]
+fn crashes_after_a_healthy_run_never_trip_the_give_up() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Up for ~500ms (well past the 200ms reset window), then exit 1.
+    preinstall(&paths, "0.1.0", &long_lived_crash_script("0.5", 1));
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "200")
+        .env(GIVE_UP_AFTER_ENV, "4")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+
+    // Six runs is past the threshold of 4: without the reset the sitter
+    // would already have given up and this would time out.
+    wait_until(
+        "six respawns of the long-lived daemon",
+        Duration::from_secs(30),
+        || {
+            read_or_empty(&daemon_log_path(dir.path()))
+                .lines()
+                .filter(|line| *line == "run")
+                .count()
+                >= 6
+        },
+    );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must still be supervising a daemon that keeps recovering"
+    );
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        !stderr.contains("giving up"),
+        "a recovering daemon must never trigger give-up: {stderr}"
+    );
+
+    send_signal(&sitter, "TERM");
+    wait_exit(&mut sitter, Duration::from_secs(10));
+}
+
+/// The log lines `scripts/install.sh` and `scripts/install.ps1` grep for in
+/// their post-timeout diagnosis: the give-up banner plus the failure
+/// phrasings the serve loop emits. This is a prose contract, not a
+/// machine-readable marker — the sitter binary and both install scripts ship
+/// from the same `sitter-latest` release and the installer replaces the
+/// sitter before (re)starting the service, so the emitter and the matchers
+/// can never skew in version; these tests are what keeps the sides in
+/// lockstep. Rewording a sitter line (or a script pattern) without updating
+/// the other side fails here instead of silently degrading the installers
+/// back to the misleading "may still be downloading" warning.
+const INSTALL_LOG_CONTRACT: [&str; 4] = [
+    "times in a row without ever staying up",
+    "exited unexpectedly",
+    "failed to spawn",
+    "failed waiting on intentd",
+];
+
+/// Both install scripts and the supervisor source must carry every contract
+/// substring. Substring presence in `supervisor.rs` is the only pin for the
+/// "failed waiting on intentd" arm, which no test can trigger (it needs
+/// `child.wait()` itself to fail); the other three are additionally proven
+/// emitted, verbatim, by the two behavioral tests below.
+#[test]
+fn install_log_contract_scripts_and_supervisor_match() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sources = [
+        (root.join("src/supervisor.rs"), "//"),
+        (root.join("../../scripts/install.sh"), "#"),
+        (root.join("../../scripts/install.ps1"), "#"),
+    ];
+    for (path, comment_prefix) in &sources {
+        let content =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // Comment lines also quote the contract substrings (the lockstep
+        // pointers in supervisor.rs and both scripts), so scan only code
+        // lines: rewording a real emission or grep pattern must fail here
+        // even while a comment still carries the old text.
+        let code = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(comment_prefix))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in INSTALL_LOG_CONTRACT {
+            assert!(
+                code.contains(needle),
+                "{} lost the install log-contract substring {needle:?} from its \
+                 code (comment lines are ignored); sitter lines and \
+                 install-script patterns must change in lockstep",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A permanently-crashing daemon must produce the "exited unexpectedly"
+/// respawn line and the give-up banner carrying the contract substrings
+/// verbatim — this is what pins the actually-emitted text, not just the
+/// source.
+#[test]
+fn install_log_contract_crash_loop_lines_are_emitted_verbatim() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(3));
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "2")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    for needle in [
+        "exited unexpectedly",
+        "times in a row without ever staying up",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "install.sh/install.ps1 grep for {needle:?}, which the sitter no \
+             longer emits — update both scripts and INSTALL_LOG_CONTRACT in \
+             lockstep; stderr: {stderr}"
+        );
+    }
+}
+
+/// Same pin for the spawn-failure arm: a binary that exists but cannot be
+/// executed must produce the "failed to spawn" line verbatim.
+#[test]
+fn install_log_contract_spawn_failure_line_is_emitted_verbatim() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Preinstall, then strip the exec bit: the binary exists (so nothing
+    // tries to download a replacement) but cannot be spawned.
+    preinstall(&paths, "0.1.0", &crash_script(3));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = paths.daemon_binary("0.1.0");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "1")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("failed to spawn"),
+        "install.sh/install.ps1 grep for \"failed to spawn\", which the sitter \
+         no longer emits — update both scripts and INSTALL_LOG_CONTRACT in \
+         lockstep; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn sighup_during_crash_backoff_respawns_the_state_json_version() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     // 0.1.0 crash-loops; a 30s backoff (never elapsing within the test)
@@ -895,7 +1156,9 @@ fn run_one_shot(data_dir: &Path, base_url: &str, args: &[&str]) -> std::process:
 
 #[test]
 fn restart_command_respawns_state_version_without_exiting_sitter() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -1051,7 +1314,9 @@ fn double_dash_restart_forwards_verbatim_to_the_daemon() {
 
 #[test]
 fn sitter_initiated_stop_does_not_respawn() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));

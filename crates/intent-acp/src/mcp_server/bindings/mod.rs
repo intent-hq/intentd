@@ -51,7 +51,7 @@ pub fn prelude() -> String {
 
 /// Feature-aware prelude: namespaces disabled in `[agentFeatures]` are
 /// omitted entirely, so agent code touching them fails with a clear
-/// `ws.<ns> is undefined` TypeError. With every toggle on — the default —
+/// `ws.<ns> is undefined` `TypeError`. With every toggle on — the default —
 /// nothing is omitted.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     prelude_for_bridge(features, false)
@@ -63,6 +63,7 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 /// drift). Mirrors `WorkspaceMcpServer::effective_agent_features`; used by
 /// the background hook scheduler for hooks owned by background/delegated
 /// sessions.
+#[must_use]
 pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
     let forced;
     let features = if is_sub_agent && features.structured_questions {
@@ -130,7 +131,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
-    caller_agent_id: &Option<AgentId>,
+    caller_agent_id: Option<&AgentId>,
     turn_attachments: Option<&Arc<TurnAttachmentRegistry>>,
     features: &AgentFeaturesSettings,
     is_sub_agent: bool,
@@ -141,17 +142,17 @@ pub(crate) async fn try_dispatch(
         return help::dispatch(workspace_id, features, is_sub_agent, rest, args).map(Some);
     }
     if let Some(rest) = method.strip_prefix("workspace.") {
-        return workspace::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return workspace::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("note.") {
-        return note::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return note::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("task.") {
-        return task::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return task::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
@@ -171,7 +172,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("pr.") {
-        return pr::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return pr::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
@@ -181,17 +182,17 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("agent.") {
-        return agent::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return agent::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("event.") {
-        return event::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return event::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("git.") {
-        return git::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return git::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
@@ -201,7 +202,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("hook.") {
-        return hook::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return hook::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
@@ -216,7 +217,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("file.") {
-        return file::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
+        return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
@@ -224,7 +225,7 @@ pub(crate) async fn try_dispatch(
         return app::try_dispatch(
             api,
             workspace_id,
-            caller_agent_id.as_ref(),
+            caller_agent_id,
             turn_attachments,
             rest,
             args,
@@ -301,6 +302,8 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
 /// Convert a [`intent_core::Error`] into the JS-visible error text used
 /// throughout these bindings (the trait's `Display` impl already renders the
 /// message content the reference builders threw).
+// By-value so it slots point-free into `map_err(map_err)` in every binding.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }

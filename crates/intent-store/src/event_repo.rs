@@ -2,9 +2,9 @@
 //!
 //! The log is append-only: this module exposes [`Store::insert_event`] and a
 //! set of query methods, but deliberately **no** update or delete path. Ids are
-//! minted as UUIDv7 so they sort by creation time. `actor` and `data` are stored
+//! minted as `UUIDv7` so they sort by creation time. `actor` and `data` are stored
 //! as JSON (`actor` / `data_json` columns), round-tripping the full TS/iOS wire
-//! shape; filters over them use SQLite's `json_extract`.
+//! shape; filters over them use `SQLite`'s `json_extract`.
 
 use intent_core::{ActorType, Error, Event, EventActor, Result, WorkspaceId};
 use sqlx::sqlite::SqliteRow;
@@ -23,7 +23,7 @@ const EVENT_COLUMNS: &str = "id, workspace_id, timestamp, event_type, actor, ses
 pub(crate) const RETENTION_DELETE_CHUNK: i64 = 1000;
 
 /// Input to [`Store::insert_event`]: an event without its id. The repository
-/// mints a UUIDv7 `id` and returns the persisted [`Event`].
+/// mints a `UUIDv7` `id` and returns the persisted [`Event`].
 #[derive(Debug, Clone)]
 pub struct NewEvent {
     pub workspace_id: WorkspaceId,
@@ -61,7 +61,11 @@ pub struct EventQuery {
 }
 
 impl Store {
-    /// Append an event to the log, minting a UUIDv7 id, and return it.
+    /// Append an event to the log, minting a `UUIDv7` id, and return it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
         let id = Uuid::now_v7().to_string();
         let actor_json = serde_json::to_string(&ev.actor)
@@ -104,8 +108,12 @@ impl Store {
     }
 
     /// Batch-insert multiple events in a single transaction, preserving order.
-    /// Each event gets a freshly minted UUIDv7 id. Returns the persisted events
+    /// Each event gets a freshly minted `UUIDv7` id. Returns the persisted events
     /// in insertion order. Empty input returns an empty vec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
         if events.is_empty() {
             return Ok(Vec::new());
@@ -197,6 +205,10 @@ impl Store {
     }
 
     /// Run a filtered event query (newest-first). See [`EventQuery`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {EVENT_COLUMNS} FROM event WHERE 1=1"));
@@ -236,7 +248,7 @@ impl Store {
                     // always end in `:`): fall back to a case-sensitive
                     // substr comparison, correct but not index-served.
                     qb.push(" AND substr(event_type, 1, ")
-                        .push_bind(prefix.chars().count() as i64)
+                        .push_bind(i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX))
                         .push(") = ")
                         .push_bind(prefix.clone());
                 }
@@ -302,6 +314,10 @@ impl Store {
     /// [`Store::delete_events_by_type_range_before`]) so no single write
     /// transaction holds the pool for long. Idempotent — a re-run with the same
     /// cutoff removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
         // High-volume event families eligible for retention sweep:
         // - agent:stream:* — streaming chunks
@@ -362,6 +378,10 @@ impl Store {
     /// persisted `agent:tool:call` rows beyond bounded recent windows —
     /// conversation replay uses `agent_message`, and live streaming synthesizes
     /// tool blocks from the in-memory bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
         self.delete_exact_type_before(intent_core::events::AGENT_TOOL_CALL, cutoff)
             .await
@@ -377,7 +397,7 @@ impl Store {
     /// Chunked delete of an `event_type` prefix family older than `cutoff`.
     /// Uses a half-open range (`event_type >= prefix AND event_type < upper`)
     /// instead of `LIKE` so the BINARY-collated `idx_event_type_time` index
-    /// serves the predicate (SQLite's default case-insensitive LIKE cannot use
+    /// serves the predicate (`SQLite`'s default case-insensitive LIKE cannot use
     /// a BINARY index).
     async fn delete_type_prefix_before(&self, prefix: &str, cutoff: &str) -> Result<u64> {
         let upper = prefix_upper_bound(prefix).expect("ascii retention prefix");
@@ -450,6 +470,10 @@ impl Store {
     }
 
     /// Most-recent events for a workspace regardless of type (newest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
     pub async fn events_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -464,6 +488,10 @@ impl Store {
     }
 
     /// Most-recent events of a single `event_type` for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
     pub async fn events_by_type(
         &self,
         workspace_id: &WorkspaceId,

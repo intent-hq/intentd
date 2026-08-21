@@ -69,8 +69,8 @@ pub(crate) async fn compute_and_store(
         .await?;
 
     Ok(Some(DiffSummary {
-        additions: fd.additions as i64,
-        deletions: fd.deletions as i64,
+        additions: i64::try_from(fd.additions).expect("value fits in i64"),
+        deletions: i64::try_from(fd.deletions).expect("value fits in i64"),
         old_blob_sha: fd.old_blob,
         new_blob_sha: fd.new_blob,
         is_binary: fd.is_binary,

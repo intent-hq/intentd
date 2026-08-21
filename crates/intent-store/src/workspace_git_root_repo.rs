@@ -67,7 +67,7 @@ fn root_from_row(r: &SqliteRow) -> Result<WorkspaceGitRoot> {
         pr_number: r
             .try_get::<Option<i64>, _>("pr_number")
             .map_err(err)?
-            .map(|n| n as u64),
+            .map(i64::cast_unsigned),
         pr_url: get_opt("pr_url")?,
         pr_status,
         pull_requests: pull_requests_from_db(get_opt("pull_requests")?)?,
@@ -97,6 +97,10 @@ impl Store {
     /// `false` when an existing row was merged. The flag is decided inside
     /// the same serialized write transaction as the insert-or-merge itself,
     /// so concurrent registrations of one path observe exactly one insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_workspace_git_root(
         &self,
         root: &WorkspaceGitRoot,
@@ -115,80 +119,75 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("find workspace git root failed: {e}")))?;
-            let (merged, inserted) = match existing {
-                Some(row) => {
-                    let mut current = root_from_row(&row)?;
-                    for id in &root.registered_by_agent_ids {
-                        if !current.registered_by_agent_ids.contains(id) {
-                            current.registered_by_agent_ids.push(id.clone());
-                        }
+            let (merged, inserted) = if let Some(row) = existing {
+                let mut current = root_from_row(&row)?;
+                for id in &root.registered_by_agent_ids {
+                    if !current.registered_by_agent_ids.contains(id) {
+                        current.registered_by_agent_ids.push(id.clone());
                     }
-                    if root.repo_owner.is_some() {
-                        current.repo_owner = root.repo_owner.clone();
+                }
+                if root.repo_owner.is_some() {
+                    current.repo_owner = root.repo_owner.clone();
+                }
+                if root.repo_name.is_some() {
+                    current.repo_name = root.repo_name.clone();
+                }
+                if current.source == WorkspaceGitRootSource::Auto
+                    && root.source == WorkspaceGitRootSource::Agent
+                {
+                    current.source = WorkspaceGitRootSource::Agent;
+                }
+                current.updated_at = root.updated_at.clone();
+                sqlx::query(
+                    "UPDATE workspace_git_root SET registered_by_agent_ids = ?, \
+                     repo_owner = ?, repo_name = ?, source = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(agent_ids_to_db(&current.registered_by_agent_ids)?)
+                .bind(&current.repo_owner)
+                .bind(&current.repo_name)
+                .bind(enum_to_db(&current.source)?)
+                .bind(&current.updated_at)
+                .bind(&current.id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("merge workspace git root failed: {e}")))?;
+                (current, false)
+            } else {
+                let mut fresh = root.clone();
+                let mut seen: Vec<AgentId> = Vec::new();
+                fresh.registered_by_agent_ids.retain(|id| {
+                    if seen.contains(id) {
+                        false
+                    } else {
+                        seen.push(id.clone());
+                        true
                     }
-                    if root.repo_name.is_some() {
-                        current.repo_name = root.repo_name.clone();
-                    }
-                    if current.source == WorkspaceGitRootSource::Auto
-                        && root.source == WorkspaceGitRootSource::Agent
-                    {
-                        current.source = WorkspaceGitRootSource::Agent;
-                    }
-                    current.updated_at = root.updated_at.clone();
-                    sqlx::query(
-                        "UPDATE workspace_git_root SET registered_by_agent_ids = ?, \
-                         repo_owner = ?, repo_name = ?, source = ?, updated_at = ? WHERE id = ?",
-                    )
-                    .bind(agent_ids_to_db(&current.registered_by_agent_ids)?)
-                    .bind(&current.repo_owner)
-                    .bind(&current.repo_name)
-                    .bind(enum_to_db(&current.source)?)
-                    .bind(&current.updated_at)
-                    .bind(&current.id.0)
+                });
+                let sql = format!(
+                    "INSERT INTO workspace_git_root ({COLUMNS}) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                );
+                sqlx::query(&sql)
+                    .bind(&fresh.id.0)
+                    .bind(&fresh.workspace_id.0)
+                    .bind(&fresh.path)
+                    .bind(enum_to_db(&fresh.source)?)
+                    .bind(&fresh.repo_owner)
+                    .bind(&fresh.repo_name)
+                    .bind(agent_ids_to_db(&fresh.registered_by_agent_ids)?)
+                    .bind(&fresh.registered_commit_sha)
+                    .bind(fresh.pr_number.map(u64::cast_signed))
+                    .bind(&fresh.pr_url)
+                    .bind(fresh.pr_status.map(|s| enum_to_db(&s)).transpose()?)
+                    .bind(pull_requests_to_db(fresh.pull_requests.as_ref())?)
+                    .bind(&fresh.created_at)
+                    .bind(&fresh.updated_at)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| {
-                        Error::Internal(format!("merge workspace git root failed: {e}"))
+                        Error::Internal(format!("insert workspace git root failed: {e}"))
                     })?;
-                    (current, false)
-                }
-                None => {
-                    let mut fresh = root.clone();
-                    let mut seen: Vec<AgentId> = Vec::new();
-                    fresh.registered_by_agent_ids.retain(|id| {
-                        if seen.contains(id) {
-                            false
-                        } else {
-                            seen.push(id.clone());
-                            true
-                        }
-                    });
-                    let sql = format!(
-                        "INSERT INTO workspace_git_root ({COLUMNS}) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    );
-                    sqlx::query(&sql)
-                        .bind(&fresh.id.0)
-                        .bind(&fresh.workspace_id.0)
-                        .bind(&fresh.path)
-                        .bind(enum_to_db(&fresh.source)?)
-                        .bind(&fresh.repo_owner)
-                        .bind(&fresh.repo_name)
-                        .bind(agent_ids_to_db(&fresh.registered_by_agent_ids)?)
-                        .bind(&fresh.registered_commit_sha)
-                        .bind(fresh.pr_number.map(|n| n as i64))
-                        .bind(&fresh.pr_url)
-                        .bind(fresh.pr_status.map(|s| enum_to_db(&s)).transpose()?)
-                        .bind(pull_requests_to_db(fresh.pull_requests.as_ref())?)
-                        .bind(&fresh.created_at)
-                        .bind(&fresh.updated_at)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            Error::Internal(format!("insert workspace git root failed: {e}"))
-                        })?;
-                    (fresh, true)
-                }
+                (fresh, true)
             };
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("upsert workspace git root commit failed: {e}"))
@@ -199,6 +198,10 @@ impl Store {
     }
 
     /// Fetch a single git root by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace_git_root(
         &self,
         id: &WorkspaceGitRootId,
@@ -216,6 +219,10 @@ impl Store {
     }
 
     /// The git root registered for `(workspace_id, path)`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_workspace_git_root_by_path(
         &self,
         workspace_id: &WorkspaceId,
@@ -233,6 +240,10 @@ impl Store {
     }
 
     /// Every git root registered for a workspace, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots(
         &self,
         workspace_id: &WorkspaceId,
@@ -255,6 +266,10 @@ impl Store {
     /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
     /// owning workspace being live, so cost is O(PR-bearing roots of returned
     /// workspaces) and a large archive never inflates the hot list paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots_with_prs(
         &self,
         include_archived: bool,
@@ -278,6 +293,10 @@ impl Store {
     }
 
     /// Delete a git root by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
         let res = sqlx::query("DELETE FROM workspace_git_root WHERE id = ?")
             .bind(&id.0)
@@ -295,12 +314,16 @@ impl Store {
     /// in-memory entity — the scoped write the background PR-discovery sweep
     /// uses (mirrors [`Store::update_workspace_pr_linkage`]). `NotFound` when
     /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace_git_root SET pr_number = ?, pr_url = ?, pr_status = ?, \
              pull_requests = ?, updated_at = ? WHERE id = ?",
         )
-        .bind(root.pr_number.map(|n| n as i64))
+        .bind(root.pr_number.map(u64::cast_signed))
         .bind(&root.pr_url)
         .bind(root.pr_status.map(|s| enum_to_db(&s)).transpose()?)
         .bind(pull_requests_to_db(root.pull_requests.as_ref())?)
@@ -321,6 +344,10 @@ impl Store {
     /// `IS NULL` guard enforces the never-overwrite contract at the SQL
     /// level; a row that already carries a value returns `false` untouched.
     /// `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn backfill_workspace_git_root_commit_sha(
         &self,
         id: &WorkspaceGitRootId,

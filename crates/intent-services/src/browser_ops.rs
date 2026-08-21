@@ -64,6 +64,10 @@ pub struct BrowserExecArgs {
 /// invariants the daemon can check without touching the FE:
 ///   * `actions` is present, an array, and non-empty (`-32602` otherwise);
 ///   * `tabId` / `agentId` / `workspaceId`, when supplied, are strings.
+///
+/// # Errors
+///
+/// Returns an invalid-params `BrowserExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<BrowserExecArgs, BrowserExecError> {
     let actions = match params.get("actions") {
         Some(Value::Array(a)) => a.clone(),
@@ -97,6 +101,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<BrowserExecArgs, Browse
 /// Build the params object the daemon dispatches on the FE-served reverse
 /// intent (`browser.exec`). Optional envelope fields are omitted when absent
 /// so the wire payload stays minimal.
+#[must_use]
 pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
     let mut out = Map::new();
     out.insert("actions".to_string(), Value::Array(args.actions.clone()));
@@ -124,7 +129,11 @@ pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
 /// `-32603` so the caller sees the FE's context. Missing / malformed `results`
 /// also surfaces as `-32603` — the daemon cannot invent a shape it did not
 /// receive.
-pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
+///
+/// # Errors
+///
+/// Returns an internal `BrowserExecError` when the frontend response is not an object, reports failure, or carries no results.
+pub fn shape_result(fe_response: &Value) -> Result<Value, BrowserExecError> {
     let obj = fe_response.as_object().ok_or_else(|| {
         BrowserExecError::internal("browser.exec: frontend returned a non-object response")
     })?;
@@ -154,6 +163,60 @@ pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
         1 => Ok(single_result_payload(&results[0])),
         _ => Ok(json!({ "results": results })),
     }
+}
+
+/// Reshape the FE envelope for the **agent-JS surface** (`ws.browser.exec`,
+/// WSAPI-6). Same shaping as [`shape_result`] with one deliberate difference:
+/// a `success: false` envelope that still carries a non-empty `results` array
+/// is returned as data, not collapsed into a top-level error
+/// (intent-hq/monorepo#3042). The FE emits structured per-action failures —
+/// `{ action, success: false, errorCode: "not-owner" | "already-claimed",
+/// ownerAgentId, error }` — and the browser docs promise agents these surface
+/// inside the per-action envelope, "never as a top-level failure"; flattening
+/// them into thrown prose loses `errorCode` / `ownerAgentId`, which agents
+/// need to react (claim the tab, name the owner).
+///
+/// `requested_actions` is the size of the *request* batch, not the reply: the
+/// FE aborts a batch on the first failing action and returns the partial
+/// `results` collected so far, so a 3-action batch failing at action 1 comes
+/// back with one result. Shaping by reply arity would hand a multi-action
+/// caller an unpredictable shape (bare envelope vs `results[]` depending on
+/// where the batch failed); keying on the request keeps the contract stable —
+/// single-action requests yield the lone action envelope (structured failure
+/// intact), multi-action requests yield the FE envelope
+/// (`success: false` / `results` / `error`, with `results` possibly shorter
+/// than the request on abort). A failure envelope *without* per-action
+/// results (transport/CDP-level breakage) still surfaces as `-32603` — there
+/// is no structure to preserve.
+///
+/// The wire `browser.exec` client path keeps [`shape_result`] unchanged
+/// (PROTOCOL §5.14 maps envelope failure to `-32603`).
+///
+/// # Errors
+///
+/// Returns an internal `BrowserExecError` when the frontend response is not an object, reports failure without results, or carries no results.
+pub fn shape_agent_result(
+    fe_response: &Value,
+    requested_actions: usize,
+) -> Result<Value, BrowserExecError> {
+    if let Some(obj) = fe_response.as_object() {
+        if obj.get("success").and_then(Value::as_bool) == Some(false) {
+            if let Some(results) = obj.get("results").and_then(Value::as_array) {
+                if !results.is_empty() {
+                    return if requested_actions == 1 {
+                        Ok(single_result_payload(&results[0]))
+                    } else {
+                        Ok(json!({
+                            "success": false,
+                            "results": results,
+                            "error": obj.get("error").cloned().unwrap_or(Value::Null),
+                        }))
+                    };
+                }
+            }
+        }
+    }
+    shape_result(fe_response)
 }
 
 /// Build the wire payload for the single-action case: pass the FE's action

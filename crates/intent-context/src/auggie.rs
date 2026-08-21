@@ -50,12 +50,14 @@ pub struct AuggieContextEngine {
 
 impl AuggieContextEngine {
     /// Construct an engine that discovers auggie lazily. Never fails (§8.3).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Construct with a known binary path (a user-configured path, or tests),
     /// pre-seeding the discovery cache.
+    #[must_use]
     pub fn with_path(path: PathBuf) -> Self {
         Self {
             cached_path: Mutex::new(Some(path)),
@@ -165,22 +167,21 @@ async fn run_auggie(
         }
     }
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|e| ContextError::Spawn(e.to_string()))?,
-        Err(_) => {
-            // Kill the whole process group (pgid == pid via `process_group`);
-            // the dropped `wait_with_output` future's `kill_on_drop` covers
-            // the direct child on non-unix.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            return Err(ContextError::Timeout);
+    let output = if let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await {
+        result.map_err(|e| ContextError::Spawn(e.to_string()))?
+    } else {
+        // Kill the whole process group (pgid == pid via `process_group`);
+        // the dropped `wait_with_output` future's `kill_on_drop` covers
+        // the direct child on non-unix.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
         }
+        #[cfg(not(unix))]
+        let _ = pid;
+        return Err(ContextError::Timeout);
     };
 
     Ok(CommandOutput {
@@ -305,7 +306,7 @@ mod tests {
     /// budget itself is now widened to 5s for runner-agnostic headroom, but this
     /// guard keeps only one such spawn running at a time). Holding this
     /// guard for each child-spawning test's duration keeps only one such spawn
-    /// running at a time. Mirrors the `CHILD_SPAWN_SERIAL` (provider_models) and
+    /// running at a time. Mirrors the `CHILD_SPAWN_SERIAL` (`provider_models`) and
     /// `WATCHER_TEST_SERIAL` (events/mod.rs) precedents. `unwrap_or_else(
     /// into_inner)` recovers from a poisoned lock so one panicking test does not
     /// cascade into the rest.
@@ -371,8 +372,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn availability_available_via_fake_binary() {
-        let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
+        let _serial = CHILD_SPAWN_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("avail");
         let bin = dir.path().join("auggie");
         std::fs::write(&bin, "#!/bin/sh\necho 'auggie 2.5.1'\n").unwrap();
@@ -395,8 +398,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_auggie_timeout_group_kills_grandchildren() {
-        let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
+        let _serial = CHILD_SPAWN_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("groupkill");
         let bin = dir.path().join("auggie");
         let pidfile = dir.path().join("grandchild.pid");

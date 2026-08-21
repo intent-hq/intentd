@@ -180,7 +180,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -200,13 +200,12 @@ fn pid_dead(pid: i32) -> bool {
             .args(["-o", "state=", "-p"])
             .arg(pid.to_string())
             .output()
-            .map(|o| {
+            .is_ok_and(|o| {
                 !o.status.success()
                     || String::from_utf8_lossy(&o.stdout)
                         .trim_start()
                         .starts_with('Z')
-            })
-            .unwrap_or(false),
+            }),
     }
 }
 
@@ -233,7 +232,8 @@ async fn await_straggler_pid(pidfile: &Path) -> i32 {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "straggler pid never written to {pidfile:?}"
+            "straggler pid never written to {}",
+            pidfile.display()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -326,7 +326,8 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 

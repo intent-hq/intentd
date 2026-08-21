@@ -2,7 +2,7 @@
 //!
 //! One method: [`VoiceEngine::transcribe`] takes decoded audio bytes plus the
 //! merged transcription context and returns the transcript text. Providers
-//! (ElevenLabs Scribe, OpenAI) implement this over multipart HTTP; tests
+//! (`ElevenLabs` Scribe, `OpenAI`) implement this over multipart HTTP; tests
 //! inject stubs.
 
 use async_trait::async_trait;
@@ -20,11 +20,11 @@ pub struct TranscribeRequest {
     /// Optional ISO language hint (e.g. `en`).
     pub language: Option<String>,
     /// Merged keyterm vocabulary (static base ⊕ request), deduped and capped
-    /// per [`crate::context`]. ElevenLabs sends these as `keyterms`; OpenAI
+    /// per [`crate::context`]. `ElevenLabs` sends these as `keyterms`; `OpenAI`
     /// folds them into the composed `prompt`.
     pub keyterms: Vec<String>,
-    /// Composed OpenAI `prompt` (style hint + vocabulary + request prompt).
-    /// Ignored by ElevenLabs.
+    /// Composed `OpenAI` `prompt` (style hint + vocabulary + request prompt).
+    /// Ignored by `ElevenLabs`.
     pub prompt: Option<String>,
 }
 

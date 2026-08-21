@@ -12,7 +12,7 @@
 //!
 //! The test drives an ADVERSARIAL scenario: a remote WSS client attempts to:
 //! a) call `server.rotateToken` (fast-path) → expect -32001
-//! b) disable `server.wsApi.enabled` (slow-path, spawned) → expect InvalidParams error
+//! b) disable `server.wsApi.enabled` (slow-path, spawned) → expect `InvalidParams` error
 //!
 //! Both must refuse, proving the origin context survives into spawned tasks.
 
@@ -220,7 +220,7 @@ async fn wss_rpc(
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -230,7 +230,8 @@ async fn boot(data_dir: &Path) -> (u16, String) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

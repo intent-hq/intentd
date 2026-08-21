@@ -18,6 +18,10 @@ use crate::map_git_err;
 use crate::status::current_branch;
 
 /// List branches for the repository at `repo_path`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn get_branches(repo_path: &Path, include_remote: bool) -> Result<GitBranches> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let current = current_branch(&repo);
@@ -44,6 +48,10 @@ pub fn get_branches(repo_path: &Path, include_remote: bool) -> Result<GitBranche
 /// queried name), and whether the working tree has any uncommitted changes
 /// (staged, unstaged, or untracked — matching the legacy
 /// `git status --porcelain` semantics). Local-only: no fetch is performed.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn branch_status(repo_path: &Path, branch_name: &str) -> Result<GitBranchStatus> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let current = current_branch(&repo);
@@ -79,7 +87,10 @@ fn ahead_behind_vs_origin(repo: &Repository, branch_name: &str) -> (i64, i64) {
         return (0, 0);
     };
     match repo.graph_ahead_behind(local, upstream) {
-        Ok((a, b)) => (a as i64, b as i64),
+        Ok((a, b)) => (
+            i64::try_from(a).expect("value fits in i64"),
+            i64::try_from(b).expect("value fits in i64"),
+        ),
         Err(_) => (0, 0),
     }
 }
@@ -104,6 +115,10 @@ fn has_any_changes(repo: &Repository) -> Result<bool> {
 /// reference's collision handling when auto-naming workspace branches.
 /// Remote-tracking names are compared by their short name (`origin/foo` ⇒
 /// `foo`) so a branch that only exists on the remote still forces a suffix.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or the branch list cannot be read.
 pub fn ensure_unique_branch_name(repo_path: &Path, desired: &str) -> Result<String> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let taken = existing_branch_names(&repo)?;
@@ -123,6 +138,10 @@ pub fn ensure_unique_branch_name(repo_path: &Path, desired: &str) -> Result<Stri
 /// Force-delete a local branch (`git branch -D` parity). Used by the
 /// `workspace.delete` cleanup after its worktree is removed; the caller owns
 /// the guard deciding *whether* the branch may be deleted.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the branch does not exist or the deletion fails.
 pub fn delete_local_branch(repo_path: &Path, branch: &str) -> Result<()> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let mut b = repo
@@ -135,6 +154,10 @@ pub fn delete_local_branch(repo_path: &Path, branch: &str) -> Result<()> {
 /// (`git branch <name>` / `git checkout -b <name>` parity). Errors when the
 /// branch already exists or `HEAD` is unborn. Ports
 /// `gitService.createBranch`.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `branch_name` is empty; `Error::Internal` if the branch already exists, `HEAD` is unborn, or another libgit2 operation fails.
 pub fn create_branch(repo_path: &Path, branch_name: &str, checkout: bool) -> Result<()> {
     if branch_name.is_empty() {
         return Err(Error::InvalidParams(
@@ -164,6 +187,10 @@ pub fn create_branch(repo_path: &Path, branch_name: &str, checkout: bool) -> Res
 /// Used by the `isNewRepo` create arm, which works directly in the
 /// repository folder (no worktree) but must still honor a caller-supplied
 /// `baseRef` (`provision_worktree` parity).
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `branch_name` is empty; [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::Internal` if the branch already exists or the checkout fails.
 pub fn create_branch_at(repo_path: &Path, branch_name: &str, base_ref: &str) -> Result<()> {
     if branch_name.is_empty() {
         return Err(Error::InvalidParams(
@@ -189,6 +216,10 @@ pub fn create_branch_at(repo_path: &Path, branch_name: &str, base_ref: &str) -> 
 
 /// Check out an existing local branch (`git checkout <name>` parity). Errors
 /// when the branch is missing. Ports `gitService.checkoutBranch`.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `branch_name` is empty; `Error::Internal` if the branch is missing or the checkout fails.
 pub fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
     if branch_name.is_empty() {
         return Err(Error::InvalidParams(
@@ -207,6 +238,10 @@ pub fn checkout_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
 /// old branch is missing or the new name is already in use. Ports
 /// `gitService.renameBranch`; the FE's format validation (`git
 /// check-ref-format`) and `-32602` wire-policy live in `intent-services`.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `new_name` is empty; `Error::Internal` if the old branch is missing or the new name is already in use.
 pub fn rename_branch(repo_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
     if new_name.is_empty() {
         return Err(Error::InvalidParams(
@@ -269,6 +304,10 @@ fn local_branches(repo: &Repository) -> Result<Vec<String>> {
 /// real initial branch name; only a detached HEAD (not symbolic) errors.
 /// Backs the propose-time empty-branch default for chief workspace-create
 /// proposals (monorepo#761).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened, or when neither `origin/HEAD` nor a symbolic `HEAD` yields a branch name (detached `HEAD`).
 pub fn repo_default_branch(repo_path: &Path) -> Result<String> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {

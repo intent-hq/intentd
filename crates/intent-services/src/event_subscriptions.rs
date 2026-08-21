@@ -246,7 +246,7 @@ impl Services {
             let mut guard = self
                 .event_subscriptions
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ids: Vec<String> = guard
                 .iter()
                 .filter(|(_, e)| &e.record.workspace_id == workspace_id)
@@ -329,7 +329,9 @@ impl Services {
                 Vec::new()
             },
             workspace_id: Some(record.workspace_id.0.clone()),
-            batch_window: Some(Duration::from_millis(record.batch_window_ms as u64)),
+            batch_window: Some(Duration::from_millis(
+                record.batch_window_ms.cast_unsigned(),
+            )),
             // Match-time guard (monorepo#1229): agent-owned subscriptions —
             // including rehydrated rows persisted before the subscribe-time
             // guard existed — never match agent events or `chat:stream:delta`.
@@ -371,6 +373,14 @@ impl Services {
     /// row by design), and load the rest into the registry, spawning each
     /// one's delivery task. Idempotent: subscriptions already present in
     /// memory (by id) are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if listing the persisted event subscriptions fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn heal_event_subscriptions_on_startup(&self) -> intent_core::Result<usize> {
         let persisted = self.store.list_event_subscriptions().await?;
         let mut loaded = 0usize;
@@ -437,7 +447,7 @@ impl Services {
 fn normalize_batch_window_ms(batch_window: Option<i64>) -> i64 {
     match batch_window {
         Some(ms) if ms > 0 => ms,
-        _ => events::DEFAULT_BATCH_WINDOW.as_millis() as i64,
+        _ => i64::try_from(events::DEFAULT_BATCH_WINDOW.as_millis()).unwrap_or(i64::MAX),
     }
 }
 

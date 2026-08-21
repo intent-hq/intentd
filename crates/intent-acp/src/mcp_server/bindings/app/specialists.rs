@@ -11,7 +11,7 @@ use std::sync::Arc;
 use intent_core::{WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.specialists = {
@@ -19,7 +19,7 @@ pub(crate) const PRELUDE: &str = r#"
         get: (id) => host({ method: 'app.specialists.get', args: { id } }),
         propose: (input) => host({ method: 'app.specialists.propose', args: input }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -106,11 +106,12 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 
     // RFC3986 percent-encode the id portion for URI path segment use
     let encoded_id = super::proposal::percent_encode_path_segment(id);
-    format!("intent-proposal://{}/{}", kind, encoded_id)
+    format!("intent-proposal://{kind}/{encoded_id}")
 }
 
 /// Return a proposal with dual text+resource content items.
-fn proposal_result(proposal: Value) -> Result<Value, String> {
+#[allow(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
+fn proposal_result(proposal: &Value) -> Result<Value, String> {
     // Build resource name from preview.title
     let name = proposal
         .get("preview")
@@ -130,7 +131,7 @@ fn proposal_result(proposal: Value) -> Result<Value, String> {
     let resource_item = json!({
         "type": "resource",
         "resource": {
-            "uri": proposal_resource_uri(&proposal),
+            "uri": proposal_resource_uri(proposal),
             "name": name,
             "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
             "text": serde_json::to_string(&proposal).unwrap_or_else(|_| "{}".to_string())
@@ -196,7 +197,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         .get("prompt")
         .or_else(|| payload.get("behaviorPrompt"))
         .and_then(Value::as_str)
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     // For edit/delete, validate specialist exists
     let current = if operation == "edit" || operation == "delete" {
@@ -209,9 +210,9 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             .await
             .map_err(|e| {
                 if e.to_string().contains("not found") {
-                    format!("Specialist not found: {}", specialist_id)
+                    format!("Specialist not found: {specialist_id}")
                 } else {
-                    format!("specialist.get failed: {}", e)
+                    format!("specialist.get failed: {e}")
                 }
             })?;
 
@@ -351,7 +352,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         }
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 #[cfg(test)]
@@ -418,7 +419,7 @@ mod tests {
                             "isCustomized": false
                         }
                     })),
-                    _ => Err(Error::NotFound(format!("Specialist not found: {}", id))),
+                    _ => Err(Error::NotFound(format!("Specialist not found: {id}"))),
                 }
             })
         }

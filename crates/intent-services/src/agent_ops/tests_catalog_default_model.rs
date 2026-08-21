@@ -35,6 +35,12 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
+    // monorepo#3044: creation requires a resolvable provider (no positional
+    // fallback) — seed the effective default provider explicitly; the tests
+    // here exercise the MODEL rungs, which sit below it.
+    registry
+        .apply(&[("providers.active".into(), json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(
@@ -241,11 +247,11 @@ async fn catalog_default_model_suppresses_the_settings_default_effort() {
 /// (`resolvedModel`), so the preview matches what a no-model create pins.
 #[tokio::test]
 async fn specialist_preview_reports_the_catalog_default() {
+    use intent_core::WorkspaceApi;
     let (_t, svc, _ws, spec_dir, _cfg) = setup().await;
     seed_catalog_with_default(&svc);
     write_specialist(spec_dir.path(), "plain", "");
 
-    use intent_core::WorkspaceApi;
     let listed = svc.specialist_list(None, None).await.expect("list");
     let specs = listed["specialists"].as_array().expect("specialists");
     let plain = specs

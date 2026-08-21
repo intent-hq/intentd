@@ -38,7 +38,7 @@ use crate::system_actor;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Grace period between SIGTERM and SIGKILL when reaping a timed-out clone,
-/// mirroring `host_exec`'s TERM_GRACE so the whole process group (git-remote-
+/// mirroring `host_exec`'s `TERM_GRACE` so the whole process group (git-remote-
 /// https / git-fetch-pack / git-index-pack) settles before we escalate.
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
@@ -93,10 +93,7 @@ pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
         Some((_, rest)) => rest,
         None => trimmed,
     };
-    let path = match after_scheme.split_once(['/', ':']) {
-        Some((_host, rest)) => rest,
-        None => return None,
-    };
+    let (_host, path) = after_scheme.split_once(['/', ':'])?;
     let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.len() < 2 {
         return None;
@@ -290,10 +287,10 @@ fn classified(detail: &str) -> Option<CloneErrorCategory> {
 /// environment. Factored out of [`run_clone`] so tests can assert the
 /// secret-safety invariants directly — the token (when usable) is offered via
 /// the shared [`intent_git::auth::scoped_credential_env`] builder: a
-/// github.com-scoped helper carried in `GIT_CONFIG_PARAMETERS` (appended after
-/// `inherited_config_parameters` so existing setups keep winning) whose config
-/// string carries no token bytes, with the value travelling through
-/// [`intent_git::auth::TOKEN_ENV`] only (monorepo#825, monorepo#884).
+/// github.com-scoped helper carried in `GIT_CONFIG_PARAMETERS` (ordered ahead
+/// of the configured helpers, which stay reachable behind it — monorepo#3059)
+/// whose config string carries no token bytes, with the value travelling
+/// through [`intent_git::auth::TOKEN_ENV`] only (monorepo#825, monorepo#884).
 fn build_clone_command(
     url: &str,
     target_path: &Path,
@@ -347,7 +344,7 @@ impl ProgressSink {
                 .await;
             }
             ProgressSink::Create(reporter) => {
-                reporter.clone_progress(phase, percent, message).await
+                reporter.clone_progress(phase, percent, message).await;
             }
         }
     }
@@ -435,17 +432,14 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             });
         }
     };
-    let stderr = match child.stderr.take() {
-        Some(s) => s,
-        None => {
-            let _ = child.kill().await;
-            let msg = "git stderr not piped".to_string();
-            sink.done(false, Some(&msg), None).await;
-            return Err(CloneFailure {
-                category: None,
-                detail: msg,
-            });
-        }
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        let msg = "git stderr not piped".to_string();
+        sink.done(false, Some(&msg), None).await;
+        return Err(CloneFailure {
+            category: None,
+            detail: msg,
+        });
     };
 
     let sink_reader = sink.clone();
@@ -465,8 +459,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
         Ok(Ok(status)) => {
             let msg = match tail_error {
-                Some(t) if !t.is_empty() => format!("git clone failed ({}): {}", status, t),
-                _ => format!("git clone failed ({})", status),
+                Some(t) if !t.is_empty() => format!("git clone failed ({status}): {t}"),
+                _ => format!("git clone failed ({status})"),
             };
             let redacted = redact_credentials(&msg);
             let category = classified(&redacted);
@@ -526,7 +520,7 @@ async fn reap_child_group(child: &mut tokio::process::Child) {
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Parse `git clone --progress` stderr line-by-line and publish one
@@ -546,9 +540,8 @@ where
         // Git emits carriage-returned progress; split on either \r or \n so we
         // observe each in-place update, not just terminal lines.
         let n = match read_until_any(&mut reader, b"\r\n", &mut buf).await {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
-            Err(_) => break,
         };
         let text = String::from_utf8_lossy(&buf[..n]);
         for (phase, percent, message) in parser.parse(&text) {
@@ -628,15 +621,12 @@ where
             if available.is_empty() {
                 return Ok(total);
             }
-            match available.iter().position(|b| delims.contains(b)) {
-                Some(i) => {
-                    out.extend_from_slice(&available[..=i]);
-                    (true, i + 1)
-                }
-                None => {
-                    out.extend_from_slice(available);
-                    (false, available.len())
-                }
+            if let Some(i) = available.iter().position(|b| delims.contains(b)) {
+                out.extend_from_slice(&available[..=i]);
+                (true, i + 1)
+            } else {
+                out.extend_from_slice(available);
+                (false, available.len())
             }
         };
         reader.consume(used);
@@ -773,7 +763,8 @@ impl SubmoduleAwareParser {
         if let Some(slice) = self.slice.take() {
             self.base = Self::capped_top(slice);
         }
-        let remaining = (self.registered.saturating_sub(self.started) + 1) as u32;
+        let remaining =
+            u32::try_from(self.registered.saturating_sub(self.started) + 1).unwrap_or(u32::MAX);
         let width = (100 - self.base) / remaining;
         self.slice = Some((self.base, self.base + width));
     }
@@ -1453,7 +1444,7 @@ mod tests {
             .expect("GIT_CONFIG_PARAMETERS must be set");
         assert!(
             params.starts_with("'foo.bar=baz' "),
-            "inherited entries keep precedence: {params}"
+            "inherited entries are preserved verbatim: {params}"
         );
         assert!(params.contains("credential.https://github.com.helper="));
     }

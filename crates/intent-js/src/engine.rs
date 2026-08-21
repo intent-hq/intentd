@@ -36,20 +36,24 @@ enum RunErr {
     Engine(String),
 }
 
-/// Evaluate a snippet of user JavaScript inside a fresh QuickJS context.
+/// Evaluate a snippet of user JavaScript inside a fresh `QuickJS` context.
 ///
 /// User `code` is wrapped as `(async () => { <code> })()`, its resolved value
 /// is JSON-serialized inside the runtime, and the result is returned as a
 /// [`serde_json::Value`]. `undefined` maps to `Value::Null`.
 ///
 /// A wall-clock budget from `opts.timeout` is enforced by:
-///   1. A QuickJS interrupt handler that raises an uncatchable exception once
+///   1. A `QuickJS` interrupt handler that raises an uncatchable exception once
 ///      the deadline is reached — kills hot loops that never yield.
 ///   2. An outer [`tokio::time::timeout`] with a small safety margin — bounds
 ///      pending `await`s whose futures otherwise never resolve.
 ///
 /// Every call builds a fresh [`AsyncRuntime`] and [`AsyncContext`], so no
 /// state leaks between calls.
+///
+/// # Errors
+///
+/// Returns a [`JsError`] when the runtime cannot be built, the script throws, the result cannot be serialized, or the timeout budget is exhausted.
 pub async fn eval(
     code: &str,
     opts: &EvalOptions,
@@ -81,8 +85,7 @@ pub async fn eval(
             let out: Result<serde_json::Value, RunErr> = ctx
                 .async_with(async |ctx| {
                     if let Some(h) = host_for_bind {
-                        bind_host(ctx.clone(), h)
-                            .map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
+                        bind_host(&ctx, h).map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
                     }
                     run_user_code(ctx, &code_owned).await
                 })
@@ -123,7 +126,7 @@ fn stringify_js_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn bind_host<'js>(ctx: rquickjs::Ctx<'js>, host: HostFn) -> rquickjs::Result<()> {
+fn bind_host(ctx: &rquickjs::Ctx<'_>, host: HostFn) -> rquickjs::Result<()> {
     let host_arc = host;
     let host_raw = Function::new(
         ctx.clone(),

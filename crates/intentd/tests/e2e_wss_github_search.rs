@@ -177,6 +177,7 @@ fn sample_issue() -> Issue {
 /// Branch listings record the `(prefix, cursor)` pair the engine saw so the
 /// `github.branches.list` `prefix` threading is assertable end-to-end.
 #[derive(Default)]
+#[allow(clippy::struct_field_names)] // fields mirror the recorded query kinds
 struct RecordingForge {
     pr_queries: Mutex<Vec<PrQuery>>,
     issue_queries: Mutex<Vec<IssueQuery>>,
@@ -387,7 +388,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
     Fixture {

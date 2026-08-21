@@ -183,6 +183,7 @@ pub(crate) fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
 /// cost-only report never zeroes a fallback session's counters
 /// ([`intent_core::token_usage_reported`] keeps the store-side hydration
 /// decision in lockstep).
+#[must_use]
 pub fn agent_token_tally(
     agent_id: &str,
     model: Option<&str>,
@@ -215,7 +216,7 @@ pub fn agent_token_tally(
 }
 
 /// Lightweight token tally from extracted usage data (finding F2: avoid full
-/// AgentSession hydration). Takes an agent_id, model, and the message content
+/// `AgentSession` hydration). Takes an `agent_id`, model, and the message content
 /// JSON list (usage metadata is embedded in each content block).
 pub(crate) fn agent_token_tally_from_contents(
     agent_id: &str,
@@ -269,6 +270,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::many_single_char_names)] // params mirror the totals() field initials
     fn totals_with_thoughts(i: u64, o: u64, r: u64, c: u64, t: u64) -> TokenUsageTotals {
         TokenUsageTotals {
             thought_tokens: t,

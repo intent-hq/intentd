@@ -13,7 +13,7 @@
 //!
 //! [`WorkspaceApi`]: intent_core::WorkspaceApi
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -47,11 +47,10 @@ const DEFAULT_TERM: &str = "xterm-256color";
 fn ensure_terminal_term(env: &mut Vec<(String, String)>, inherited_term: Option<&str>) {
     match env.iter_mut().rev().find(|(name, _)| name == "TERM") {
         Some((_, value)) if value.is_empty() => *value = DEFAULT_TERM.to_string(),
-        Some(_) => {}
         None if inherited_term.is_none_or(str::is_empty) => {
             env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
         }
-        None => {}
+        Some(_) | None => {}
     }
 }
 
@@ -93,7 +92,20 @@ pub(crate) async fn create(
         None => (default_shell(), true),
     };
     let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
-    let mut spawn_env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
+    // Resolved before the credential env, which discovers the helpers already
+    // configured *in the spawn directory* so they stay reachable behind
+    // intentd's (monorepo#3059).
+    let spawn_cwd = match cwd {
+        Some(cwd) => Some(PathBuf::from(cwd)),
+        None => match store.as_ref() {
+            Some(store) => default_cwd(store, &workspace_id, None).await,
+            None => None,
+        },
+    };
+    let mut spawn_env = overlay_credential_env(
+        git_credential_env(settings.as_deref(), spawn_cwd.as_deref()),
+        user_env,
+    );
     let inherited_term = std::env::var("TERM").ok();
     ensure_terminal_term(&mut spawn_env, inherited_term.as_deref());
     let mut spec = terminal_spawn_spec_for(
@@ -104,13 +116,7 @@ pub(crate) async fn create(
         spawn_env,
     );
     spec.size = PtySize { rows, cols };
-    spec.cwd = match cwd {
-        Some(cwd) => Some(PathBuf::from(cwd)),
-        None => match store.as_ref() {
-            Some(store) => default_cwd(store, &workspace_id, None).await,
-            None => None,
-        },
-    };
+    spec.cwd = spawn_cwd;
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -188,11 +194,19 @@ async fn default_cwd(
 /// `GITHUB_TOKEN`/`GH_TOKEN`). Building the pairs never fails or blocks the
 /// spawn: an unresolvable daemon binary path simply yields no pairs (logged
 /// at debug).
-pub(crate) fn git_credential_env(settings: Option<&SettingsRegistry>) -> Vec<(String, String)> {
+///
+/// `cwd` is the directory the terminal is spawned in, and must be the one the
+/// spawn actually uses: the helpers already configured there are re-added
+/// behind intentd's, so a repository-local one stays reachable
+/// (monorepo#3059).
+pub(crate) fn git_credential_env(
+    settings: Option<&SettingsRegistry>,
+    cwd: Option<&Path>,
+) -> Vec<(String, String)> {
     if !expose_git_credential(settings) {
         return Vec::new();
     }
-    credential_pairs()
+    credential_pairs(cwd)
 }
 
 /// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
@@ -215,12 +229,12 @@ pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool
 /// so overwriting the variable without re-appending would drop inherited
 /// entries). The helper path is the running daemon's own binary
 /// (`current_exe`); an unresolvable path yields no pairs (logged at debug).
-fn credential_pairs() -> Vec<(String, String)> {
+fn credential_pairs(cwd: Option<&Path>) -> Vec<(String, String)> {
     let Some(intentd) = crate::daemon_exe_path() else {
         return Vec::new();
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-    intent_git::auth::daemon_helper_env(&intentd, inherited.as_deref())
+    intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref())
 }
 
 /// Layer caller-supplied env over the injected credential pairs: a key the
@@ -290,6 +304,7 @@ pub(crate) fn get_buffer(
 /// `isExecutingCommand` is the child's liveness (the spawned process is the
 /// running command). `daemon_boot_id` is the daemon's per-process boot id, so
 /// clients can tell which daemon lifetime a (possibly empty) list belongs to.
+#[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
 pub(crate) fn list(
     pty: &PtyHost,
     workspace_id: &WorkspaceId,
@@ -306,7 +321,7 @@ pub(crate) fn list(
                 .as_ref()
                 .and_then(|i| i.name.as_deref())
                 .unwrap_or("Terminal");
-            let is_executing = info.as_ref().map(|i| i.alive).unwrap_or(false);
+            let is_executing = info.as_ref().is_some_and(|i| i.alive);
             let value = json!({
                 "id": id_str,
                 "name": name,
@@ -332,7 +347,7 @@ pub(crate) fn read_output(
     terminal_id: &str,
     max_lines: Option<i64>,
     paginate: bool,
-    page_token: Option<String>,
+    page_token: Option<&String>,
 ) -> Result<Value> {
     let id = PtyId::parse(terminal_id)
         .ok_or_else(|| Error::Internal(format!("Terminal not found: {terminal_id}")))?;
@@ -356,7 +371,7 @@ pub(crate) fn read_output(
         return Ok(crate::pagination::paginate_text_lines(
             &strip_ansi(&raw),
             max_lines,
-            page_token.as_deref(),
+            page_token.map(std::string::String::as_str),
         ));
     }
 
@@ -366,17 +381,14 @@ pub(crate) fn read_output(
 
     let clean = strip_ansi(&raw);
     let lines: Vec<&str> = clean.split('\n').collect();
-    let max_line_count = max_lines.unwrap_or(200).clamp(1, 10000) as usize;
+    let max_line_count =
+        usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
     let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
         lines[lines.len() - max_line_count..].to_vec()
     } else {
         lines.clone()
     };
-    while output_lines
-        .last()
-        .map(|l| l.trim().is_empty())
-        .unwrap_or(false)
-    {
+    while output_lines.last().is_some_and(|l| l.trim().is_empty()) {
         output_lines.pop();
     }
 
@@ -469,38 +481,42 @@ pub(crate) fn spawn_output_stream(
     pty_id: PtyId,
     terminal_id: String,
 ) {
-    let attachment = match pty.attach(pty_id) {
-        Ok(a) => a,
-        Err(_) => return,
+    let Ok(attachment) = pty.attach(pty_id) else {
+        return;
     };
     tokio::spawn(async move {
         let mut live = attachment.live;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
         if !attachment.backlog.is_empty() {
-            emit_data(&bus, &workspace_id, &terminal_id, &attachment.backlog);
+            emit_data(
+                bus.as_ref(),
+                &workspace_id,
+                &terminal_id,
+                &attachment.backlog,
+            );
         }
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(&bus, &workspace_id, &terminal_id, &chunk),
-                    Err(RecvError::Lagged(_)) => continue,
+                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, &chunk),
+                    Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
                     Err(RecvError::Closed) => break,
                 },
-                _ = tokio::time::sleep(EXIT_POLL) => {
+                () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
-                        drain_pending(&mut live, &bus, &workspace_id, &terminal_id);
+                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id);
                         break;
                     }
                 }
             }
         }
         let exit = pty.try_exit(pty_id).ok().flatten();
-        emit_exit(&bus, &workspace_id, &terminal_id, exit).await;
+        emit_exit(bus.as_ref(), &workspace_id, &terminal_id, exit).await;
     });
 }
 
@@ -508,15 +524,15 @@ pub(crate) fn spawn_output_stream(
 /// child has exited so trailing output still streams before `terminal:exit`).
 fn drain_pending(
     live: &mut tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     terminal_id: &str,
 ) {
     loop {
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
-            Err(TryRecvError::Lagged(_)) => continue,
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Lagged(_)) => {}
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
 }
@@ -525,17 +541,17 @@ fn drain_pending(
 ///
 /// Transient (broadcast-only, never persisted — same path as
 /// `chat:stream:delta`): PTY output is high-volume and must not serialize
-/// behind a durable SQLite commit per chunk, which throttled paste echo to one
+/// behind a durable `SQLite` commit per chunk, which throttled paste echo to one
 /// chunk per writer-batch window. Scrollback replay reads the PTY host ring
 /// buffer via `terminal.getBuffer`, so nothing consumes persisted
 /// `terminal:data` rows. Ordering vs `terminal:exit` is preserved: the stream
 /// task broadcasts every chunk synchronously before it awaits the durable
 /// `emit_exit`, so exit can never overtake data.
-fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
+fn emit_data(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
     let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
     publish_event_transient(
         bus,
-        terminal_event(
+        &terminal_event(
             ws,
             TERMINAL_DATA,
             json!({ "terminalId": terminal_id, "chunk": chunk }),
@@ -546,7 +562,7 @@ fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes:
 /// Publish a self-sufficient `terminal:exit` event (durable, emitted after the
 /// stream task has broadcast every `terminal:data` chunk).
 async fn emit_exit(
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     ws: &WorkspaceId,
     terminal_id: &str,
     exit: Option<PtyExit>,
@@ -619,7 +635,7 @@ impl TerminalHost for PtyTerminalHost {
         let settings = self.settings.clone();
         let terminal_requires_shell = self.terminal_requires_shell;
         Box::pin(async move {
-            let credential = git_credential_env(settings.as_deref());
+            let credential = git_credential_env(settings.as_deref(), params.cwd.as_deref());
             let (command, args) = if terminal_requires_shell {
                 shell_true_invocation(&params.command, &params.args)
             } else {
@@ -638,7 +654,9 @@ impl TerminalHost for PtyTerminalHost {
             {
                 spec.scrollback_bytes = limit;
             }
-            let pty_id = pty.spawn(spec).map_err(acp_err)?;
+            let pty_id = pty
+                .spawn(spec)
+                .map_err(|e: intent_core::Error| acp_err(&e))?;
             Ok(pty_id.to_string())
         })
     }
@@ -647,8 +665,14 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         Box::pin(async move {
             let id = acp_resolve(&terminal_id)?;
-            let limit = pty.scrollback(id).map_err(acp_err)?;
-            let exit = pty.try_exit(id).ok().flatten().map(to_exit_info);
+            let limit = pty
+                .scrollback(id)
+                .map_err(|e: intent_core::Error| acp_err(&e))?;
+            let exit = pty
+                .try_exit(id)
+                .ok()
+                .flatten()
+                .map(|exit: PtyExit| to_exit_info(&exit));
             Ok(TerminalOutputInfo {
                 output: String::from_utf8_lossy(&limit).into_owned(),
                 truncated: false,
@@ -661,8 +685,11 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         Box::pin(async move {
             let id = acp_resolve(&terminal_id)?;
-            let exit = pty.wait(id).await.map_err(acp_err)?;
-            Ok(to_exit_info(exit))
+            let exit = pty
+                .wait(id)
+                .await
+                .map_err(|e: intent_core::Error| acp_err(&e))?;
+            Ok(to_exit_info(&exit))
         })
     }
 
@@ -686,7 +713,7 @@ impl TerminalHost for PtyTerminalHost {
 }
 
 /// Map a host error into an ACP terminal error.
-fn acp_err(e: Error) -> AcpError {
+fn acp_err(e: &Error) -> AcpError {
     AcpError::Terminal(e.to_string())
 }
 
@@ -698,7 +725,7 @@ fn acp_resolve(terminal_id: &str) -> AcpResult<PtyId> {
 
 /// Convert a host [`PtyExit`] into the ACP exit shape (`signal` is unavailable
 /// through the host abstraction).
-fn to_exit_info(exit: PtyExit) -> TerminalExitInfo {
+fn to_exit_info(exit: &PtyExit) -> TerminalExitInfo {
     TerminalExitInfo {
         exit_code: Some(exit.exit_code),
         signal: None,
@@ -724,7 +751,7 @@ mod tests {
     /// takes to surface, never how long a passing run waits.
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
 
-    /// A temp SQLite path cleaned up on drop (mirrors `events::bus_tests`).
+    /// A temp `SQLite` path cleaned up on drop (mirrors `events::bus_tests`).
     struct TempDb {
         path: PathBuf,
     }
@@ -860,9 +887,8 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !contains_sub(&acc, needle) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, sub.recv()).await {
                 Ok(Some(batch)) => {
@@ -1010,9 +1036,9 @@ mod tests {
     /// yield no pairs.
     #[test]
     fn git_credential_env_respects_gate() {
-        assert!(git_credential_env(None).is_empty());
+        assert!(git_credential_env(None, None).is_empty());
         let (off, _guard) = registry_with_expose(Some(false));
-        assert!(git_credential_env(Some(&off)).is_empty());
+        assert!(git_credential_env(Some(&off), None).is_empty());
     }
 
     /// Gate on ⇒ exactly the single daemon-backed helper pair: the
@@ -1021,7 +1047,7 @@ mod tests {
     /// child environment (monorepo#884 Phase 2.2).
     #[test]
     fn credential_pairs_are_helper_only_without_token_env() {
-        let pairs = credential_pairs();
+        let pairs = credential_pairs(None);
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec![intent_git::auth::GIT_CONFIG_PARAMETERS_ENV]);
         assert!(
@@ -1882,7 +1908,7 @@ mod tests {
 
         let token = page1["nextToken"].as_str().unwrap().to_string();
         let page2 =
-            read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(token)).unwrap();
+            read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(&token)).unwrap();
         assert!(!page2["items"].as_array().unwrap().is_empty());
 
         kill(pty.as_ref(), &id).await.unwrap();
@@ -1890,7 +1916,7 @@ mod tests {
 
     // ---- ACP `PtyTerminalHost` adapter ----
 
-    /// ACP terminal create → output → wait_for_exit happy path.
+    /// ACP terminal create → output → `wait_for_exit` happy path.
     ///
     /// Load-independent (monorepo#573): the child prints the marker and then
     /// stays alive (`exec cat`) until the test has *observed* the output, so

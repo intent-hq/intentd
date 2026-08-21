@@ -16,7 +16,7 @@ use intent_core::{Error, Result};
 use crate::map_git_err;
 
 /// Gitlink (submodule pin) tree-entry mode.
-const MODE_GITLINK: u32 = 0o160000;
+const MODE_GITLINK: u32 = 0o160_000;
 
 /// Read `file_path` at `refname` from the repository at `worktree_path`.
 ///
@@ -27,6 +27,10 @@ const MODE_GITLINK: u32 = 0o160000;
 /// pin) or a `040000` tree — yields the typed [`Error::NotAFile`] instead of
 /// content (monorepo#1739): a gitlink's id is a commit in the **submodule's**
 /// odb, so there is no blob to read here.
+///
+/// # Errors
+///
+/// Returns [`Error::NotAFile`] if the path resolves to a gitlink or tree entry; `Error::Internal` if another libgit2 operation fails.
 pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result<String> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let rel = relative_path(worktree_path, file_path);
@@ -56,7 +60,7 @@ pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result
     };
     // A gitlink's to_object() would fail (the pin commit is not in this odb),
     // so route on the tree-entry mode before dereferencing.
-    let mode = entry.filemode() as u32;
+    let mode = entry.filemode().cast_unsigned();
     if mode == MODE_GITLINK {
         return Err(not_a_file(&rel, mode));
     }

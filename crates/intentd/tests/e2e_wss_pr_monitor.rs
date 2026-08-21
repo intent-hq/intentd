@@ -551,7 +551,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
     Fixture {
@@ -1606,7 +1606,7 @@ async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_
         s.checks = vec![
             ("build".into(), CheckState::Pending, true),
             ("lint".into(), CheckState::Pending, false),
-        ]
+        ];
     });
     let monitor = fx
         .services

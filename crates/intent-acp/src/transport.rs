@@ -130,14 +130,13 @@ impl StderrLogSink {
     /// error) the line is dropped — capture is best-effort by design.
     fn send_line(&mut self, line: &str) {
         match self.tx.try_send(line.to_string()) {
-            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !self.drop_warned {
                     self.drop_warned = true;
                     tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }
@@ -252,10 +251,10 @@ fn truncate_middle(s: &str, max: usize) -> String {
 /// see [`PendingEntryGuard`]) still advances the watermark. This is
 /// client-side bookkeeping only; nothing changes on the wire.
 fn dispatch(
-    value: Value,
+    value: &Value,
     pending: &PendingMap,
-    requests: &Option<mpsc::UnboundedSender<IncomingRequest>>,
-    notifications: &Option<mpsc::UnboundedSender<IncomingNotification>>,
+    requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
+    notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
     response_seq: &AtomicU64,
     response_notify: &Notify,
     client_request_seq: &AtomicU64,
@@ -328,6 +327,10 @@ pub struct Connection {
 
 impl Connection {
     /// Wire up the writer/reader/stderr tasks around a child's piped stdio.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn new<W, R>(
         stdin: W,
         stdout: R,
@@ -375,10 +378,10 @@ impl Connection {
                 }
                 match serde_json::from_str::<Value>(&line) {
                     Ok(value) => dispatch(
-                        value,
+                        &value,
                         &pending_reader,
-                        &requests,
-                        &notifications,
+                        requests.as_ref(),
+                        notifications.as_ref(),
                         &seq_reader,
                         &notify_reader,
                         &client_req_seq_reader,
@@ -450,12 +453,24 @@ impl Connection {
     }
 
     /// Send a request and await its response with the default timeout (§6.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails; [`AcpError::Rpc`] if the agent answers with a JSON-RPC error; [`AcpError::Timeout`] if no response arrives in time.
     pub async fn request(&self, method: &str, params: Value) -> AcpResult<Value> {
         self.request_timeout(method, params, DEFAULT_REQUEST_TIMEOUT)
             .await
     }
 
     /// Send a request and await its response with an explicit timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails; [`AcpError::Rpc`] if the agent answers with a JSON-RPC error; [`AcpError::Timeout`] if no response arrives in time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn request_timeout(
         &self,
         method: &str,
@@ -544,6 +559,10 @@ impl Connection {
     }
 
     /// Send a notification (no id, no response).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn notify(&self, method: &str, params: Value) -> AcpResult<()> {
         let line = encode_message(None, method, &params)?;
         self.writer_tx
@@ -553,6 +572,10 @@ impl Connection {
     }
 
     /// Send a successful response to an agent→client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn respond_result(&self, id: Value, result: Value) -> AcpResult<()> {
         let msg = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
         let line = format!("{}\n", serde_json::to_string(&msg)?);
@@ -563,6 +586,10 @@ impl Connection {
     }
 
     /// Send an error response to an agent→client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn respond_error(&self, id: Value, error: JsonRpcError) -> AcpResult<()> {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
@@ -577,6 +604,10 @@ impl Connection {
     }
 
     /// Recent stderr lines captured from the agent (newest last).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn recent_stderr(&self) -> Vec<String> {
         self.stderr.lock().unwrap().recent()
     }
@@ -644,7 +675,7 @@ mod watermark_tests {
             Box::pin(conn.request_timeout("session/prompt", json!({}), Duration::from_secs(60)));
         tokio::select! {
             _ = &mut fut => panic!("request must still be pending"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         drop(fut);
         assert!(!conn.has_pending_requests(), "drop guard removed the entry");
@@ -705,7 +736,7 @@ mod watermark_tests {
             Box::pin(conn.request_timeout("session/ping", json!({}), Duration::from_secs(60)));
         tokio::select! {
             _ = &mut fut => panic!("request must still be pending"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         assert!(conn.has_pending_requests(), "in-flight request: pending");
 

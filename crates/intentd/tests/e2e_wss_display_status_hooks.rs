@@ -73,7 +73,7 @@ impl Drop for Daemon {
         if std::thread::panicking() {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -223,7 +223,7 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -233,9 +233,8 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
 /// deadline, asserting the notification envelope; `None` on deadline.
 async fn wss_event_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> Option<Value> {
     loop {
-        let next = match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -248,7 +247,7 @@ async fn wss_event_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> Opti
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -273,7 +272,7 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace.
+/// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -423,7 +422,8 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -497,12 +497,11 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let mut demoted = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(promoted && hook_id.is_some() && waiting_raised && idle && demoted) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!(
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: promoted={promoted} hook_id={hook_id:?} \
                  waiting_raised={waiting_raised} idle={idle} demoted={demoted}"
-            ),
+            )
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
@@ -589,12 +588,11 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let mut wake_idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(hook_cancelled && waiting_dropped && wake_idle) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!(
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: hook_cancelled={hook_cancelled} \
                  waiting_dropped={waiting_dropped} wake_idle={wake_idle}"
-            ),
+            )
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {

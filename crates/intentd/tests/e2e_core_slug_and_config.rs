@@ -1,7 +1,7 @@
 //! E2E tests exercising intent-core slug generation and config paths.
 //!
-//! Calls Services directly to exercise slug generation (extract_local_slug,
-//! generate_workspace_slug) and config parsing WITHOUT spawning a daemon.
+//! Calls Services directly to exercise slug generation (`extract_local_slug`,
+//! `generate_workspace_slug`) and config parsing WITHOUT spawning a daemon.
 
 mod common;
 
@@ -19,8 +19,11 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 async fn workspace_id_derived_from_initial_agent_prompt() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
     let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws_root).expect("create ws root");
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone()).with_workspaces_root(ws_root.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root));
 
     // Workspace create with an initialAgent prompt that should extract to "auth-fix"
     let result = services
@@ -55,7 +58,7 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
 }
 
 /// Create a workspace with no prompt and verify the ID is a random slug
-/// (adjective-animal from generate_workspace_slug).
+/// (adjective-animal from `generate_workspace_slug`).
 #[tokio::test]
 async fn workspace_id_random_slug_when_no_prompt() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
@@ -79,11 +82,10 @@ async fn workspace_id_random_slug_when_no_prompt() {
     let ws_id = result.workspace.id.0.as_str();
     // Verify it's a valid slug shape: word-word
     let parts: Vec<&str> = ws_id.split('-').collect();
-    assert_eq!(parts.len(), 2, "random slug should be word-word: {}", ws_id);
+    assert_eq!(parts.len(), 2, "random slug should be word-word: {ws_id}");
     assert!(
         intent_core::slug::is_workspace_slug(ws_id),
-        "random slug should be recognized as a workspace slug: {}",
-        ws_id
+        "random slug should be recognized as a workspace slug: {ws_id}"
     );
 
     // Clean up (drop store/services before removing SQLite files)
@@ -95,13 +97,13 @@ async fn workspace_id_random_slug_when_no_prompt() {
     let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-/// Verify Config::resolve parses env vars and fills defaults.
+/// Verify `Config::resolve` parses env vars and fills defaults.
 #[tokio::test]
 async fn config_resolve_fills_defaults() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
     let tmp_cfg = tmp_dir.join("nonexistent-config.toml");
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
     std::env::set_var("INTENTD_CONFIG", &tmp_cfg);
 
@@ -116,11 +118,11 @@ async fn config_resolve_fills_defaults() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    drop(_guard);
+    drop(guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Verify Config::resolve reads idle_reap_minutes from config.toml.
+/// Verify `Config::resolve` reads `idle_reap_minutes` from config.toml.
 #[tokio::test]
 async fn config_resolve_reads_idle_reap_from_file() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
@@ -129,14 +131,14 @@ async fn config_resolve_reads_idle_reap_from_file() {
     let cfg_path = tmp_dir.join("config.toml");
     std::fs::write(
         &cfg_path,
-        r#"
+        r"
 [agents]
 idleReapMinutes = 50
-"#,
+",
     )
     .expect("write config");
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
     std::env::set_var("INTENTD_CONFIG", &cfg_path);
 
@@ -145,6 +147,6 @@ idleReapMinutes = 50
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    drop(_guard);
+    drop(guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

@@ -191,7 +191,7 @@ pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
         Ok(oid) => Ok(Some(oid.to_string())),
         Err(e) => {
             if let Ok(tree) = repo.find_tree(orig_index_tree) {
-                let restored = index.read_tree(&tree).and_then(|_| index.write());
+                let restored = index.read_tree(&tree).and_then(|()| index.write());
                 if let Err(re) = restored {
                     tracing::warn!(
                         path = %repo_path.display(),
@@ -213,9 +213,8 @@ pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
 pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
     let repo = git2::Repository::open(repo_path)
         .map_err(|e| Error::Internal(format!("open repo for WIP unwind failed: {e}")))?;
-    let head_commit = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
-        Some(c) => c,
-        None => return Ok(false),
+    let Some(head_commit) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
+        return Ok(false);
     };
     let message = head_commit.message().unwrap_or("").to_string();
     if !message.starts_with(TRANSFER_WIP_SENTINEL) {
@@ -259,6 +258,10 @@ pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
 /// This is blocking work (git2 I/O plus `git` child processes); async callers
 /// must run it via `spawn_blocking`, like the plan op does for
 /// `estimate_bundle_bytes`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the workspace has no worktree, the staging directory cannot be created, or building the bundle fails.
 pub fn create_transfer_bundle(
     ws: &Workspace,
     sandboxes: &[Sandbox],
@@ -393,8 +396,7 @@ fn build_bundle(
             sb_repo
                 .head()
                 .ok()
-                .map(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
-                .unwrap_or(false)
+                .is_some_and(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
         };
         // The WIP commit lands on HEAD's branch while the bundler fetches
         // `sb.branch` — so only snapshot when HEAD is on `sb.branch`;
@@ -498,7 +500,7 @@ fn resolve_base_commit(repo: &git2::Repository, ws: &Workspace) -> Option<git2::
 
 /// Fetch `src_ref` from a local repository into `dst_ref` of the worktree
 /// repo. Shells out with an explicit full refspec and tag auto-follow
-/// disabled, for the same reason as the sandbox merge path: CoW clones carry
+/// disabled, for the same reason as the sandbox merge path: `CoW` clones carry
 /// non-commit refs (`refs/intent/blobs/*`, `refs/stash`) that libgit2's local
 /// transport trips over.
 fn fetch_local_ref(worktree: &Path, from_repo: &Path, src_ref: &str, dst_ref: &str) -> Result<()> {
@@ -637,7 +639,7 @@ mod tests {
         sha
     }
 
-    /// Status entries as (path, staged, wt_modified, untracked) tuples,
+    /// Status entries as (path, staged, `wt_modified`, untracked) tuples,
     /// sorted, for exact before/after comparisons.
     fn status_fingerprint(repo_path: &Path) -> Vec<(String, bool, bool, bool)> {
         let repo = git2::Repository::open(repo_path).unwrap();
@@ -766,7 +768,11 @@ mod tests {
         );
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter_map(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .map(std::string::ToString::to_string)
+            })
             .collect()
     }
 
@@ -1387,7 +1393,7 @@ mod tests {
 
     /// A tracked submodule staged for removal while its checkout remains on
     /// disk (`INDEX_DELETED` + `WT_NEW`) is real dirt: the staged deletion
-    /// must travel in the WIP commit, while add_all still skips re-adding the
+    /// must travel in the WIP commit, while `add_all` still skips re-adding the
     /// on-disk checkout (which would fail or undo the removal).
     #[test]
     fn staged_submodule_removal_still_counts_as_dirty() {

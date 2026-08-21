@@ -28,6 +28,10 @@ const COLUMNS: &str = "id, workspace_id, file_name, mime_type, size, uploaded_at
 
 impl Store {
     /// Insert an attachment-registry row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_attachment(&self, a: &AttachmentRecord) -> Result<()> {
         let sql = format!("INSERT INTO attachments ({COLUMNS}) VALUES (?,?,?,?,?,?,?)");
         sqlx::query(&sql)
@@ -45,6 +49,10 @@ impl Store {
     }
 
     /// Load one attachment by id. `Error::NotFound` when no row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the attachment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_attachment(&self, id: &str) -> Result<AttachmentRecord> {
         let sql = format!("SELECT {COLUMNS} FROM attachments WHERE id = ?");
         let row = sqlx::query(&sql)
@@ -58,6 +66,10 @@ impl Store {
 
     /// All attachment rows for one workspace, ordered by id (stable manifest
     /// ordering for the transfer pipeline).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_attachments(
         &self,
         workspace_id: &WorkspaceId,

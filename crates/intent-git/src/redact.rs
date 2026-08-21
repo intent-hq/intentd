@@ -11,6 +11,7 @@
 /// Two passes: an authority pass anchored on `://`, then a scheme-less pass
 /// masking bare `user[:pass]@host` fragments — a front-truncated stderr tail
 /// or an scp-like remote carries no `://` anchor to find (monorepo#836).
+#[must_use]
 pub fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -51,8 +52,7 @@ fn redact_bare_userinfo(text: &str) -> String {
         // The userinfo starts after the last delimiter before the `@`.
         let start = before
             .rfind([' ', '\t', '\r', '\n', '/', '\'', '"'])
-            .map(|i| i + 1)
-            .unwrap_or(0);
+            .map_or(0, |i| i + 1);
         out.push_str(&before[..start]);
         if start < at {
             out.push_str("***");

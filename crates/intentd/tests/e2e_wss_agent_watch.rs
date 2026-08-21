@@ -252,7 +252,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -276,7 +276,7 @@ async fn wss_event_opt_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> 
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -399,7 +399,8 @@ async fn boot_daemon(
     let status = tokio::time::timeout_at(budget.step(60), common::await_wss_status(&socket))
         .await
         .expect("daemon wss status not ready within budget");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -595,14 +596,14 @@ async fn await_watch_count(
 /// other agent's `agent:message` and `agent:tool:call`.
 #[tokio::test]
 async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
+    const SETUP_SUBS: &str = "WATCH1_SETUP_SUBS";
+    const TARGET_GO: &str = "WATCH1_TARGET_GO";
     let Some(script) = gate("WSS agent-subscribe policy E2E") else {
         return;
     };
     let budget = Budget::start();
 
-    const SETUP_SUBS: &str = "WATCH1_SETUP_SUBS";
-    const TARGET_GO: &str = "WATCH1_TARGET_GO";
-    let subs_js = r#"
+    let subs_js = r"
         const out = [];
         try { await ws.event.subscribe(['agent:message']); out.push('msgGuard=missing'); }
         catch (e) { out.push('msgGuard=' + (e.message.includes('ws.agent.watch') ? 'watch' : 'other')); }
@@ -615,7 +616,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
         out.push('starDelta=' + sub.eventTypes.includes('chat:stream:delta'));
         out.push('starFile=' + sub.eventTypes.includes('file:*'));
         return out.join(' ');
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -786,18 +787,18 @@ const DISCUSS_REASON: &str = "WATCH2 need a coordinator decision";
 
 /// The mock behavior shared by every WATCH-2 arm.
 fn watch_lifecycle_behavior() -> String {
-    let watch_js = r#"
+    let watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'WatchTarget');
         const r = await ws.agent.watch(t.id);
         return 'watched=' + r.ok + ' watchTarget=' + r.agentId;
-    "#;
-    let unwatch_js = r#"
+    ";
+    let unwatch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'WatchTarget');
         const r = await ws.agent.unwatch(t.id);
         return 'unwatched=' + r.removed;
-    "#;
+    ";
     let blocker_js = format!(
         "return await ws.agent.reportBlocker({});",
         json!(BLOCKER_REASON)
@@ -1236,27 +1237,26 @@ async fn wake_row_count(
 /// receives exactly ONE completion wake for Middle.
 #[tokio::test]
 async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
+    const COORD_GO: &str = "WATCH3_COORD_GO";
+    const MIDDLE_GO: &str = "WATCH3_MIDDLE_GO";
+    const LEAF_GO: &str = "WATCH3_LEAF_GO";
     let Some(script) = gate("WSS agent-waiting deferral E2E") else {
         return;
     };
     let budget = Budget::start();
 
-    const COORD_GO: &str = "WATCH3_COORD_GO";
-    const MIDDLE_GO: &str = "WATCH3_MIDDLE_GO";
-    const LEAF_GO: &str = "WATCH3_LEAF_GO";
-
-    let coord_watch_js = r#"
+    let coord_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'DeferMiddle');
         const r = await ws.agent.watch(t.id);
         return 'coordWatched=' + r.ok;
-    "#;
-    let middle_watch_js = r#"
+    ";
+    let middle_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'DeferLeaf');
         const r = await ws.agent.watch(t.id);
         return 'midWatched=' + r.ok;
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -1412,27 +1412,26 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
 /// delivers exactly once.
 #[tokio::test]
 async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
+    const MIDDLE_GO: &str = "WATCH4_MIDDLE_GO";
+    const REARM_GO: &str = "WATCH4_REARM_GO";
+    const LEAF_GO: &str = "WATCH4_LEAF_GO";
     let Some(script) = gate("WSS agent-waiting re-arm deferral E2E") else {
         return;
     };
     let budget = Budget::start();
 
-    const MIDDLE_GO: &str = "WATCH4_MIDDLE_GO";
-    const REARM_GO: &str = "WATCH4_REARM_GO";
-    const LEAF_GO: &str = "WATCH4_LEAF_GO";
-
-    let middle_watch_js = r#"
+    let middle_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'RearmLeaf');
         const r = await ws.agent.watch(t.id);
         return 'midWatched=' + r.ok;
-    "#;
-    let rearm_js = r#"
+    ";
+    let rearm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'RearmMiddle');
         const r = await ws.agent.watch(t.id);
         return 'rearmed=' + r.ok;
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -1622,34 +1621,33 @@ async fn await_agent_id_by_name(
 /// (no wake, ever).
 #[tokio::test]
 async fn agent_watch_rearm_adoption_after_report_fires_next_completion_over_wss() {
-    let Some(script) = gate("WSS re-arm adoption after report E2E") else {
-        return;
-    };
-    let budget = Budget::start();
-
     const SPAWN_GO: &str = "WATCH5_SPAWN_GO";
     const CHILD_GO: &str = "WATCH5_CHILD_GO";
     const REARM_GO: &str = "WATCH5_REARM_GO";
     const LEAF_GO: &str = "WATCH5_LEAF_GO";
     const REPORT: &str = "WATCH5_REPORT leaf watch armed; waiting on it";
+    let Some(script) = gate("WSS re-arm adoption after report E2E") else {
+        return;
+    };
+    let budget = Budget::start();
 
     let spawn_js = format!(
         "const r = await ws.agent.create('AdoptChild', '{CHILD_GO} do your work', \
          {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
     );
-    let child_watch_js = r#"
+    let child_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'AdoptLeaf');
         const r = await ws.agent.watch(t.id);
         return 'leafWatched=' + r.ok;
-    "#;
+    ";
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
-    let rearm_js = r#"
+    let rearm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'AdoptChild');
         const r = await ws.agent.watch(t.id);
         return 'rearmed=' + r.ok;
-    "#;
+    ";
     // Wake-ack rules FIRST: every wake turn (report wake, hook/completion
     // wakes) must ack, never re-run a marker rule off replayed history.
     let behavior = json!({
@@ -1837,28 +1835,27 @@ async fn agent_watch_rearm_adoption_after_report_fires_next_completion_over_wss(
 /// parent transcript carried the identical report twice in one cycle.
 #[tokio::test]
 async fn report_wake_then_rearm_suppresses_same_cycle_completion_over_wss() {
-    let Some(script) = gate("WSS same-cycle report dedup E2E") else {
-        return;
-    };
-    let budget = Budget::start();
-
     const SPAWN_GO: &str = "WATCH7_SPAWN_GO";
     const CHILD_GO: &str = "WATCH7_CHILD_GO";
     const REARM_GO: &str = "WATCH7_REARM_GO";
     const CHILD2_GO: &str = "WATCH7_CHILD2_GO";
     const REPORT: &str = "WATCH7_REPORT shipped the thing";
+    let Some(script) = gate("WSS same-cycle report dedup E2E") else {
+        return;
+    };
+    let budget = Budget::start();
 
     let spawn_js = format!(
         "const r = await ws.agent.create('DedupChild', '{CHILD_GO} do your work', \
          {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
     );
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
-    let rearm_js = r#"
+    let rearm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'DedupChild');
         const r = await ws.agent.watch(t.id);
         return 'rearmed=' + r.ok;
-    "#;
+    ";
     // Wake-ack rule FIRST: the report wake and any completion wake ack,
     // never re-run a marker rule off replayed history. The child's reporting
     // rule parks a silent tail AFTER the report tool call and BEFORE the
@@ -2035,15 +2032,14 @@ async fn report_wake_then_rearm_suppresses_same_cycle_completion_over_wss() {
 /// exactly once, without the stale report.
 #[tokio::test]
 async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
-    let Some(script) = gate("WSS hook-waiting registration deferral E2E") else {
-        return;
-    };
-    let budget = Budget::start();
-
     const SPAWN_GO: &str = "WATCH6_SPAWN_GO";
     const CHILD_GO: &str = "WATCH6_CHILD_GO";
     const ARM_GO: &str = "WATCH6_ARM_GO";
     const REPORT: &str = "WATCH6_REPORT PR ready; hook stays armed for late comments";
+    let Some(script) = gate("WSS hook-waiting registration deferral E2E") else {
+        return;
+    };
+    let budget = Budget::start();
 
     let spawn_js = format!(
         "const r = await ws.agent.create('HookChild', '{CHILD_GO} do your work', \
@@ -2061,12 +2057,12 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
         )
     );
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
-    let arm_js = r#"
+    let arm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'HookChild');
         const r = await ws.agent.watch(t.id);
         return 'armed=' + r.ok;
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[Background hook", "response": "hook wake handled" },
@@ -2294,11 +2290,12 @@ async fn wake_rows_serialized(
         .expect("messages array")
         .iter()
         .filter(|m| m["role"] == "user")
-        .map(|m| m.to_string())
+        .map(std::string::ToString::to_string)
         .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect()
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2528: the immediate `agent.reportToParent` wake over the real
 /// transport says "reported" (a report is not necessarily a completion) and
 /// discloses the watch disarm exactly when the call flips the parent's
@@ -2316,17 +2313,16 @@ async fn wake_rows_serialized(
 /// adoption test above.)
 #[tokio::test]
 async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss() {
-    let Some(script) = gate("WSS report-wake disclosure E2E") else {
-        return;
-    };
-    let budget = Budget::start();
-
     const SPAWN_GO: &str = "WATCH7_SPAWN_GO";
     const CHILD_GO: &str = "WATCH7_CHILD_GO";
     const CHILD_AGAIN: &str = "WATCH7_CHILD_AGAIN";
     const REPORT1: &str = "WATCH7_REPORT_ONE first slice landed";
     const REPORT2: &str = "WATCH7_REPORT_TWO second slice landed";
     const REPORT3: &str = "WATCH7_REPORT_THREE post-retirement progress";
+    let Some(script) = gate("WSS report-wake disclosure E2E") else {
+        return;
+    };
+    let budget = Budget::start();
 
     let spawn_js = format!(
         "const r = await ws.agent.create('DiscloseChild', '{CHILD_GO} do your work', \

@@ -31,7 +31,7 @@ use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
 
-/// SQLite db inside an RAII temp dir: the dir sweep (on drop, including on
+/// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
 /// panic) also covers `-wal`/`-shm` sidecars, and a background task that
 /// lazily reopens a pool connection after drop cannot recreate the file at
 /// the TMPDIR root. Set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir.
@@ -1249,8 +1249,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = evict_event.expect("eviction event published");
@@ -1344,8 +1344,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = queue_event.expect("queue event published");
@@ -1380,8 +1380,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = resume_event.expect("resume event published");
@@ -1432,7 +1432,7 @@ fn mock_handle() -> AgentHandle {
         connection,
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
-        _child: None,
+        child: None,
         child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
@@ -1481,7 +1481,7 @@ async fn manager_tracks_lookup_stop_and_shuts_down() {
 /// (the live-turn slot) as an `assistant` row tagged with the FE
 /// terminal-message convention (`metadata.interrupted = true` +
 /// `stopReason = "interrupted"`) — reusing the turn's minted message id so
-/// block ids match what streamed — alongside the interrupted_agent row. A busy
+/// block ids match what streamed — alongside the `interrupted_agent` row. A busy
 /// agent with no live-turn slot gets only the interrupted row (no phantom
 /// assistant message).
 #[tokio::test]
@@ -1605,6 +1605,150 @@ async fn evict_idle_older_than_evicts_only_stale_idle() {
     assert!(!reg.is_registered(&old));
     assert!(reg.is_registered(&fresh), "within-TTL idle kept");
     assert!(reg.is_registered(&active), "active process kept");
+}
+
+/// monorepo#3040 — the TTL idle sweep was the ONE eviction path that emitted
+/// no `agent:process:evicted`, so an FE chat session bound to the reaped agent
+/// had no signal it was gone. The sweep must fire the registry event callback
+/// with the additive reason `"idle-ttl"` for every process it evicts.
+#[tokio::test]
+async fn ttl_eviction_emits_evicted_event_with_idle_ttl_reason() {
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+    let reg = ProcessRegistry::new(8).with_event_fn(event_fn);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (stale, fresh) = (AgentId::from("stale"), AgentId::from("fresh"));
+    reg.register(stale.clone(), recording_kill(stale.clone(), log.clone()));
+    reg.register(fresh.clone(), recording_kill(fresh.clone(), log.clone()));
+    reg.set_last_active(&stale, 1);
+    reg.set_last_active(&fresh, super::now_ms());
+
+    let evicted = reg
+        .evict_idle_older_than(Duration::from_secs(60), |_| true, |_| {})
+        .await;
+    assert_eq!(evicted, 1);
+
+    // The callback future is spawned; give it a bounded window to record.
+    let mut recorded = Vec::new();
+    for _ in 0..50 {
+        recorded = events.lock().unwrap().clone();
+        if !recorded.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        recorded,
+        vec![(
+            stale.clone(),
+            "agent:process:evicted".to_string(),
+            "idle-ttl".to_string()
+        )],
+        "the TTL sweep emits agent:process:evicted with reason idle-ttl for the stale process only"
+    );
+}
+
+/// Regression for monorepo#3040 — a send to an agent the TTL sweep just
+/// reaped must NOT be silently dropped. The reap only kills the child process
+/// (the session row survives), so `send_message` must take the auto-restore
+/// path: claim the turn slot, persist the user row, and start a turn worker
+/// (which respawns the child on demand). The eviction itself must be
+/// observable on the event bus as `agent:process:evicted` with reason
+/// `idle-ttl` so a bound FE session can react.
+#[tokio::test]
+async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
+    use intent_core::events::AGENT_PROCESS_EVICTED;
+
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-send");
+    let id = AgentId::from("a-reap-send");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    mgr.registry().set_last_active(&id, 1);
+
+    let mut filter = SubscriptionFilter {
+        event_types: vec![AGENT_PROCESS_EVICTED.to_string()],
+        ..Default::default()
+    };
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.contains(&id), "the reap dropped the child handle");
+    assert!(
+        mgr.services.store.get_agent_session(&id).await.is_ok(),
+        "the reap keeps the session row (only the process dies)"
+    );
+
+    // The eviction is observable: agent:process:evicted with reason idle-ttl.
+    let mut evict_event = None;
+    for _ in 0..50 {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(batch)) => {
+                if let Some(ev) = batch
+                    .into_iter()
+                    .find(|ev| ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == id.0)
+                {
+                    evict_event = Some(ev);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    let ev = evict_event.expect("TTL reap publishes agent:process:evicted");
+    assert_eq!(ev.data["reason"], "idle-ttl", "TTL sweep eviction reason");
+
+    // A user send to the reaped agent restores: the RPC succeeds, the user
+    // row is persisted (nothing silently dropped), and `queued == false`
+    // proves `try_begin` won the turn slot (restore path engaged) — the
+    // spawned worker respawns the child on demand. No `is_busy` assertion
+    // here: the worker's spawn attempt fails in this env and releases the
+    // slot, so reading it after the send races that release (#1356 review).
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "are you still there?".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("send to a reaped agent must not error");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "the reap claim is released, so the send starts a turn: {result}"
+    );
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.to_string().contains("are you still there?")),
+        "the post-reap send's user row is persisted, not dropped"
+    );
 }
 
 /// monorepo#2104 (#1161 review) — a live-turn slot that outlived its turn must
@@ -2136,7 +2280,7 @@ fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::Join
     let child = cmd.spawn().expect("spawn sleeper child");
     let pid = child.id().expect("live child has a pid");
     let mut handle = mock_handle();
-    handle._child = Some(child);
+    handle.child = Some(child);
     handle.child_pid = Some(pid);
     mgr.handles.lock().unwrap().insert(id.clone(), handle);
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
@@ -2160,7 +2304,7 @@ async fn child_exit_watcher_reaps_idle_agent_on_external_kill() {
     assert!(mgr.contains(&id));
     assert!(mgr.registry().is_registered(&id));
 
-    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("external SIGKILL");
+    kill(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL).expect("external SIGKILL");
 
     let fired = timeout(Duration::from_secs(5), watcher)
         .await
@@ -2286,7 +2430,7 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
 
     // Kill ONLY the leader, then reap it via `try_wait` — same-group
     // grandchild survives and `Child::id()` reads `None` afterwards.
-    kill(Pid::from_raw(spawn_pid as i32), Signal::SIGKILL).expect("kill leader");
+    kill(Pid::from_raw(spawn_pid.cast_signed()), Signal::SIGKILL).expect("kill leader");
     let mut reaped = false;
     for _ in 0..100 {
         if child.try_wait().expect("try_wait ok").is_some() {
@@ -2336,7 +2480,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         let child = cmd.spawn().expect("spawn slow child");
         let pid = child.id().expect("live child has a pid");
         let mut handle = mock_handle();
-        handle._child = Some(child);
+        handle.child = Some(child);
         handle.child_pid = Some(pid);
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
@@ -2359,7 +2503,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     // The children ignored SIGTERM, so the full shared grace must have
     // elapsed (proves the window ran once, not that children died early).
     assert!(
-        elapsed >= grace - Duration::from_millis(500),
+        elapsed >= grace.checked_sub(Duration::from_millis(500)).unwrap(),
         "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
     );
     // Per-agent `stop()` semantics applied to every agent in the batch.
@@ -2456,7 +2600,7 @@ fn pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     matches!(
-        kill(Pid::from_raw(pid as i32), None),
+        kill(Pid::from_raw(pid.cast_signed()), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
 }
@@ -2618,7 +2762,7 @@ type MockCallLog = Arc<Mutex<Vec<(String, Value)>>>;
 
 /// The `availableModes` list a mock agent advertises in its `session/new` /
 /// `session/load` response. Defaults to a set that includes `bypassPermissions`
-/// so tests exercising the "set_mode was attempted" assertions keep working;
+/// so tests exercising the "`set_mode` was attempted" assertions keep working;
 /// tests can substitute a bypass-free set (e.g. `default`+`ask`, matching
 /// auggie today) to exercise the skip path.
 #[derive(Clone)]
@@ -2732,7 +2876,7 @@ fn track_mock_agent_with_log(
     load_cap: bool,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(
+    let (handle, ()) = track_mock_agent_inner(
         mgr,
         id,
         load_cap,
@@ -2752,7 +2896,7 @@ fn track_mock_agent_with_log_modes(
     modes: MockModes,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
+    let (handle, ()) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
     (handle, log)
 }
 
@@ -2782,7 +2926,7 @@ fn track_mock_agent_inner(
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -2859,7 +3003,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": MGR_ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -2899,7 +3042,7 @@ fn track_mock_agent_prompt_rpc_error(
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -3102,7 +3245,10 @@ async fn seed_agent_with_task_graph(
         model: None,
         reasoning_effort: None,
         effort_levels: None,
-        provider: None,
+        // Pinned explicitly: seeded sessions predate monorepo#3044, when a
+        // `None` provider still resolved positionally to auggie; resolution
+        // now fails loudly with no provider and no configured default.
+        provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
         status: AgentStatus::Pending,
@@ -4330,7 +4476,7 @@ async fn terminal_failure_persists_error_before_publishing_events() {
 /// Teardown paths that abort the turn worker can land between the streaming
 /// path's terminal-error stash and the terminal-failure handler's take
 /// (monorepo#2050): the orphaned entry describes the aborted turn, so a LATER
-/// failure must not consume it (its streak / stop_reason would mis-describe
+/// failure must not consume it (its streak / `stop_reason` would mis-describe
 /// the new failure). Every worker-abort path — stop/detach, interrupt, retry,
 /// delete — must discard the slot.
 #[tokio::test]
@@ -4512,14 +4658,15 @@ async fn set_session_provider(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
 }
 
 /// Slug-shaped workspace title on an agent's first turn → the naming instruction
-/// is prepended as a `<system>` block naming the daemon MCP tool as the default
-/// provider (auggie) surfaces it (`set_workspace_title_workspace-mcp`), not the
-/// FE `workspace_api` surface.
+/// is prepended as a `<system>` block naming the daemon MCP tool as the
+/// session's provider (auggie) surfaces it (`set_workspace_title_workspace-mcp`),
+/// not the FE `workspace_api` surface.
 #[tokio::test]
 async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
     let (_tmp, mgr) = manager().await;
     let (ws, id) = (WorkspaceId::from("ws-slug"), AgentId::from("a-slug"));
     seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    set_session_provider(&mgr, &ws, &id, "auggie").await;
     // Persist the current user turn so `build_turn_prompt` sees the "first
     // turn" shape (one user message, zero assistant messages).
     mgr.services
@@ -4564,6 +4711,7 @@ async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
     let (_tmp, mgr) = manager().await;
     let (ws, id) = (WorkspaceId::from("ws-empty"), AgentId::from("a-empty"));
     seed_agent_with_title(&mgr, &ws, &id, "").await;
+    set_session_provider(&mgr, &ws, &id, "auggie").await;
     mgr.services
         .store
         .append_agent_message(
@@ -4823,7 +4971,7 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
 /// ALSO emits `agent:idle` when the agent has no queued ready-to-send messages.
 /// This fixes the bug where a parent that re-messages via agent.send after a
 /// child settles registers a completion watch that never fires (the aborted
-/// worker never reaches run_prompt_turn's idle-emit path). When the agent DOES
+/// worker never reaches `run_prompt_turn`'s idle-emit path). When the agent DOES
 /// have queued messages, idle is suppressed (the agent will resume immediately).
 #[tokio::test]
 async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
@@ -4943,6 +5091,162 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
         !types.contains(&"agent:idle"),
         "STAB-28: interrupt suppresses agent:idle when queue has ready-to-send (got {types:?})"
     );
+}
+
+/// A WEDGED transport (intent-hq/monorepo#3039): the child stopped draining
+/// its stdin — e.g. after ingesting a multi-MB tool result — so the writer
+/// task is blocked mid-`write_all` on the full pipe and the outbound writer
+/// channel is saturated. `Connection::notify` then awaits channel capacity
+/// forever. Returns the connection plus the KEPT far-end duplex halves
+/// (dropping them would error the writes instead of blocking, turning the
+/// wedge into a plain transport-closed).
+async fn wedged_connection() -> (
+    Arc<Connection>,
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+) {
+    // Tiny stdin pipe the far end never reads: the FIRST oversized line
+    // blocks the writer task mid-write_all.
+    let (client_w, agent_r) = tokio::io::duplex(64);
+    let (agent_w, client_r) = tokio::io::duplex(64);
+    let conn = Arc::new(Connection::new(
+        client_w,
+        client_r,
+        None,
+        ConnectionHooks::default(),
+    ));
+    // Saturate the writer channel (capacity 256): one line wedges the writer
+    // task, 256 more fill the channel, the rest park awaiting capacity.
+    let payload = json!({ "pad": "x".repeat(256) });
+    for _ in 0..300 {
+        let conn = Arc::clone(&conn);
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            let _ = conn.notify("wedge/fill", payload).await;
+        });
+    }
+    // The channel is full once a fresh notify no longer completes promptly.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let conn = Arc::clone(&conn);
+            let payload = payload.clone();
+            let probe = tokio::spawn(async move {
+                let _ = conn.notify("wedge/probe", payload).await;
+            });
+            if timeout(Duration::from_millis(100), probe).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("writer channel saturates");
+    // Confirm the saturation with a longer window: under heavy scheduling
+    // starvation the 100ms probe above could break early on a send that
+    // merely wasn't polled in time (residual capacity), and the tests would
+    // then fail on a confusing downstream assert. A fresh notify still
+    // pending after 500ms fails loudly HERE instead.
+    let confirm_conn = Arc::clone(&conn);
+    let confirm_payload = payload.clone();
+    let confirm = tokio::spawn(async move {
+        let _ = confirm_conn.notify("wedge/confirm", confirm_payload).await;
+    });
+    assert!(
+        timeout(Duration::from_millis(500), confirm).await.is_err(),
+        "saturation loop broke early: the confirming notify still found channel capacity"
+    );
+    (conn, agent_r, agent_w)
+}
+
+/// intent-hq/monorepo#3039: `agent.stop` against a WEDGED transport must not
+/// hang. Before the fix, `interrupt` awaited `session/cancel`'s unbounded
+/// channel send forever — Stop never reached the terminal emits, the FE spun
+/// on "Thinking", and the idle sweep later reaped the agent silently. Now the
+/// cancel enqueue is time-bounded: on timeout the child is torn down and the
+/// terminal `agent:stream:end` + `agent:idle` still reach the bus.
+#[tokio::test]
+async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-wedged"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (conn, _agent_r, _agent_w) = wedged_connection().await;
+    let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+    mgr.handles.lock().unwrap().insert(
+        id.clone(),
+        AgentHandle {
+            connection: conn,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "auggie".to_string(),
+            thought_level: None,
+            wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_listener: None,
+        },
+    );
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    // A live `acpSessionId` keeps the stop on the keep-alive interrupt path
+    // (the one that sends `session/cancel` over the wedged wire).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-wedged")
+        .await
+        .unwrap();
+    // Claim the in-flight slot: the incident agent was mid-turn.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The stop must settle within the bounded cancel window (+ margin), not
+    // hang forever on the wedged writer channel.
+    let found = timeout(Duration::from_secs(10), mgr.interrupt(&id))
+        .await
+        .expect("interrupt returns despite the wedged transport (monorepo#3039)");
+    assert!(found, "interrupt finds the live agent");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "wedged-transport stop still emits the terminal stream:end (got {types:?})"
+    );
+    assert!(
+        types.contains(&"agent:idle"),
+        "wedged-transport stop still emits agent:idle so completion watches fire (got {types:?})"
+    );
+    // The undeliverable cancel voided the keep-alive contract: the wedged
+    // child was torn down instead of being left for the silent idle reap.
+    assert!(
+        !mgr.contains(&id),
+        "wedged child handle is removed (not resumable)"
+    );
+    assert!(!mgr.is_busy(&id), "busy slot released");
+}
+
+/// intent-hq/monorepo#3039 (idle-timeout half): the warn-and-continue path's
+/// `session/cancel` settle against a WEDGED transport must report "not
+/// settled" within the bounded window instead of hanging the turn worker —
+/// the caller then tears the child down and the warning turn spawns fresh.
+#[tokio::test]
+async fn cancel_and_settle_idle_prompt_times_out_on_wedged_transport() {
+    let (conn, _agent_r, _agent_w) = wedged_connection().await;
+    let id = AgentId::from("a-wedged-settle");
+    let settled = timeout(
+        Duration::from_secs(10),
+        super::cancel_and_settle_idle_prompt(&conn, &id, "acp-wedged"),
+    )
+    .await
+    .expect("settle returns despite the wedged transport (monorepo#3039)");
+    assert!(!settled, "a wedged child is reported as unsettleable");
 }
 
 /// `priority: "interrupt"` delivery to a BUSY agent preempts the turn
@@ -8484,7 +8788,7 @@ async fn agent_retry_response_carries_redriven_turn_id() {
     );
 }
 
-/// monorepo#840: an ORDINARY Error session (no fatal stop_reason, no streak)
+/// monorepo#840: an ORDINARY Error session (no fatal `stop_reason`, no streak)
 /// is NOT quarantined — `send_message` still redrives it (the documented
 /// fresh-message recovery path). Guard against over-blocking. Uses the
 /// `mock` provider without `MOCK_AGENT_SCRIPT_PATH` so the redriven spawn
@@ -8602,7 +8906,7 @@ async fn retry_arms_force_recreate_for_poisoned_session() {
 }
 
 /// monorepo#940 guard: `agent.retry` of an ORDINARY Error session (no fatal
-/// stop_reason, no streak) must NOT arm `force_recreate` — the redrive keeps
+/// `stop_reason`, no streak) must NOT arm `force_recreate` — the redrive keeps
 /// today's `session/load` resume behavior exactly.
 #[tokio::test]
 async fn retry_does_not_arm_force_recreate_for_ordinary_error() {
@@ -8639,7 +8943,7 @@ async fn retry_does_not_arm_force_recreate_for_ordinary_error() {
 
 /// monorepo#940 ordering: the poisoned check in `agent_retry` must read the
 /// identical-failure streak BEFORE `clear_failure_streak` wipes it — a
-/// streak-poisoned session (no fatal stop_reason) still arms
+/// streak-poisoned session (no fatal `stop_reason`) still arms
 /// `force_recreate`, and the streak is cleared afterwards as before.
 #[tokio::test]
 async fn retry_poison_check_reads_streak_before_clear() {
@@ -8767,8 +9071,8 @@ async fn terminal_failure_event_omits_session_corrupted_for_ordinary_error() {
 
 /// A terminal failure appends a durable system-role transcript notice with a
 /// single text block carrying the error text and `meta.kind = "turn-failure"`
-/// (the InterruptionNotice shape), and emits `agent:message` (role=system)
-/// for it. Persisting the error status/stop_reason must not depend on the
+/// (the `InterruptionNotice` shape), and emits `agent:message` (role=system)
+/// for it. Persisting the error `status/stop_reason` must not depend on the
 /// notice (best-effort append).
 #[tokio::test]
 async fn terminal_failure_appends_turn_failure_transcript_notice() {
@@ -9019,7 +9323,7 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
 }
 
 /// monorepo#564 regression: `send_message` to a nonexistent agent id (e.g. a
-/// truncated id) must fail closed with InvalidParams naming the id — NOT
+/// truncated id) must fail closed with `InvalidParams` naming the id — NOT
 /// claim the slot, NOT queue a phantom message, NOT persist a transcript row.
 #[tokio::test]
 async fn send_message_rejects_unknown_agent() {
@@ -9375,7 +9679,7 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
 /// undeliverable queue instead of skipping silently — before the fix the
 /// status-gate `Err` arm returned with the in-memory entries intact, leaving
 /// a permanently wedged queue (every future kick re-skips or re-fails the
-/// `agent_message.agent_id` FK, SQLite 787).
+/// `agent_message.agent_id` FK, `SQLite` 787).
 #[tokio::test]
 async fn drain_against_vanished_session_drops_queue() {
     let (_tmp, mgr) = manager().await;
@@ -10333,7 +10637,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
 /// back-to-back silent timeouts (each answered with a warning turn), the NEXT
 /// timeout takes the terminal path — exactly one `agent:failed` (emitted by
 /// the worker, since `run_prompt_turn` suppressed it), Error park with the
-/// idle-timeout stop_reason, and a requeue for `agent.retry`. The mock parks
+/// idle-timeout `stop_reason`, and a requeue for `agent.retry`. The mock parks
 /// EVERY prompt ("of silence" matches the warning text too), so no turn ever
 /// produces intervening activity.
 #[tokio::test]
@@ -10713,18 +11017,36 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 
 // --- resolve_spawn ------------------------------------------------------------
 
-/// A bare session with no `provider`/`model` resolves to the default ACP
-/// provider (auggie), no model, and the temp dir as cwd (no workspace path).
+/// Regression (monorepo#3044): a bare session with no `provider`/`model` and
+/// no settings-derived default fails loudly instead of silently spawning the
+/// positional first registered provider (auggie), which may not be installed.
 #[tokio::test]
-async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
+async fn resolve_spawn_without_provider_or_default_fails_loudly() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
+    let Err(err) = resolve_spawn(&session, None, &settings, None) else {
+        panic!("no provider, no model, no configured default must not resolve")
+    };
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m)
+            if m.contains("no default provider/model is configured")),
+        "loud no-default error, got: {err:?}"
+    );
+}
+
+/// A bare session with no `provider`/`model` resolves via the settings-derived
+/// default (`providers.active`), no model, and the temp dir as cwd (no
+/// workspace path).
+#[tokio::test]
+async fn resolve_spawn_uses_configured_default_and_temp_cwd() {
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    settings.providers.active = Some("mock".to_string());
+    let session = session_with_specialist(None);
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/mock-agent.js")]);
     let resolved = resolve_spawn(&session, None, &settings, None).expect("default resolves");
-    assert_eq!(resolved.provider.id, intent_providers::first_provider_id());
+    assert_eq!(resolved.provider.id, "mock");
     assert!(resolved.model.is_none(), "no model selected");
-    assert!(resolved.extra_env.is_empty());
     assert_eq!(resolved.cwd, std::env::temp_dir());
-    // provider_binary may or may not be resolved depending on what's installed
 }
 
 /// A persisted effective-model display name (legacy pre-monorepo#1534 row,
@@ -10852,7 +11174,8 @@ async fn resolve_spawn_session_provider_fallback_for_bare_model() {
 #[tokio::test]
 async fn resolve_spawn_prefers_existing_workspace_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
-    let session = session_with_specialist(None);
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
     let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&ws_dir).unwrap();
     let mut workspace = intent_core::Workspace {
@@ -10923,7 +11246,8 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
 #[tokio::test]
 async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let settings = intent_core::settings_file::SettingsFile::default();
-    let session = session_with_specialist(None);
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
     let chief = intent_core::chief_workspace();
 
     // Fresh (not-yet-created) chief cwd root → created on demand and used.
@@ -10966,7 +11290,8 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
 #[tokio::test]
 async fn resolve_spawn_falls_back_to_repository_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
-    let session = session_with_specialist(None);
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
     let repo_dir = std::env::temp_dir().join(format!("intentd-rs-repo-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&repo_dir).unwrap();
     let mut workspace = intent_core::Workspace {
@@ -11520,10 +11845,7 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     let stray_id = NoteId::new();
     let stray = Note {
         id: stray_id.clone(),
-        content: format!(
-            "![x](workspace-asset://other-ws/{asset})\n",
-            asset = asset_id
-        ),
+        content: format!("![x](workspace-asset://other-ws/{asset_id})\n"),
         ..note.clone()
     };
     let mut stray = stray;
@@ -11587,7 +11909,7 @@ mod merge_user_mcp_servers_tests {
         )
     }
 
-    fn write_servers(secrets: &InMemorySecretStore, servers: serde_json::Value) {
+    fn write_servers(secrets: &InMemorySecretStore, servers: &serde_json::Value) {
         secrets
             .store("mcp.servers", &serde_json::to_string(&servers).unwrap())
             .expect("write mcp.servers");
@@ -11598,7 +11920,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
+            &json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
                                  "command": "node", "enabled": true } }),
         );
         mgr.services
@@ -11608,7 +11930,7 @@ mod merge_user_mcp_servers_tests {
             .unwrap();
         let mut out = NormalizedMcpServers::new();
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
-        assert!(out.is_empty(), "gate off → nothing merged: {:?}", out);
+        assert!(out.is_empty(), "gate off → nothing merged: {out:?}");
     }
 
     #[tokio::test]
@@ -11616,7 +11938,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-1": {
                     "id": "srv-1", "name": "my-tool", "transport": "stdio",
                     "command": "node", "args": ["srv.js"], "enabled": true,
@@ -11642,7 +11964,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-off": { "id": "srv-off", "name": "off", "transport": "stdio",
                               "command": "node", "enabled": false },
                 "srv-glo": { "id": "srv-glo", "name": "glo", "transport": "stdio",
@@ -11669,7 +11991,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-remote": {
                     "id": "srv-remote", "name": "remote", "transport": "http",
                     "url": "https://example.test/mcp", "enabled": true
@@ -11709,7 +12031,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-remote": {
                     "id": "srv-remote", "name": "remote", "transport": "sse",
                     "url": "https://example.test/sse", "enabled": true,
@@ -11745,7 +12067,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-x": { "id": "srv-x", "name": "workspace-mcp", "transport": "stdio",
                              "command": "evil", "enabled": true }
             }),
@@ -11756,7 +12078,7 @@ mod merge_user_mcp_servers_tests {
             NormalizedMcpServer::Stdio {
                 command: "bridge".into(),
                 args: vec![],
-                env: Default::default(),
+                env: std::collections::BTreeMap::default(),
             },
         );
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
@@ -11777,7 +12099,7 @@ mod merge_user_mcp_servers_tests {
     }
 
     /// The opencode env config carries the same `workspace-mcp` bridge entry
-    /// (in OpenCode `mcp` block shape) that the auggie `--mcp-config` path
+    /// (in `OpenCode` `mcp` block shape) that the auggie `--mcp-config` path
     /// generates, pointing at the same bridge endpoint. The bridge exe is
     /// pinned to a space-free absolute path so the expectation does not
     /// depend on whether the host checkout path contains whitespace
@@ -12690,7 +13012,7 @@ mod flush_batch_id_tests {
             queued_msg("first", &queued_at, false),
             queued_msg("second", &queued_at, false),
         ];
-        for e in entries.iter_mut() {
+        for e in &mut entries {
             super::super::annotate_dequeue_wait(e);
         }
         super::super::stamp_flush_batch_id(&mut entries);
@@ -12733,7 +13055,7 @@ mod flush_batch_id_tests {
             queued_msg("waited", &iso_secs_ago(60), false),
             queued_msg("instant hop", &intent_core::now_iso(), false),
         ];
-        for e in entries.iter_mut() {
+        for e in &mut entries {
             super::super::annotate_dequeue_wait(e);
         }
         assert_eq!(
@@ -13000,7 +13322,7 @@ mod harness_wake_tests {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -13694,7 +14016,7 @@ mod model_change_notice_tests {
             reasoning_effort: None,
             cwd: std::env::temp_dir(),
             provider_binary: None,
-            extra_env: Default::default(),
+            extra_env: std::collections::BTreeMap::default(),
             npx_fallback_binary: None,
             npx_fallback_package: None,
             unsloth_endpoint: None,
@@ -13901,7 +14223,7 @@ mod question_hold_gates {
     use crate::agent_manager::TurnOptions;
     use intent_core::MessageOrigin;
 
-    /// The same trailing-question-block shape as the agent_ops tests.
+    /// The same trailing-question-block shape as the `agent_ops` tests.
     fn question_blocks() -> Value {
         json!([
             { "type": "text", "text": "I have a clarifying question." },

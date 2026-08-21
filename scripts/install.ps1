@@ -179,14 +179,26 @@ if ($serviceMode -eq 'yes') {
     # Per-user Scheduled Task at logon: no admin rights needed, and -Force
     # makes re-runs update the existing task instead of duplicating it.
     $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
+    # Windows service log source: a Scheduled Task discards its action's
+    # stderr, so every action wraps through cmd and appends stderr to a log
+    # file - the analog of the LaunchAgent's StandardErrorPath install.sh
+    # uses on macOS. The post-timeout diagnosis below reads this run's slice
+    # of it to tell a permanent failure from a slow first download.
+    $logDir = Join-Path $env:LOCALAPPDATA 'intentd'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $logFile = Join-Path $logDir 'intentd.err.log'
     # Carry a custom data dir into the task so it serves the same data dir the
     # install-time CLI used. A task action cannot set environment variables, so
-    # wrap through cmd (the quotes survive & and spaces in the path).
+    # wrap through cmd (the quotes survive & and spaces in the path). cmd binds
+    # a redirection to a single command, so it trails the serve command in the
+    # set && form; in the plain form it leads instead, so the /c payload does
+    # not start with a quote (cmd strips a leading quote pair).
     $action = if ($env:INTENTD_DATA_DIR) {
         New-ScheduledTaskAction -Execute $env:ComSpec `
-            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve')
+            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve 2>>"' + $logFile + '"')
     } else {
-        New-ScheduledTaskAction -Execute $dest -Argument 'serve'
+        New-ScheduledTaskAction -Execute $env:ComSpec `
+            -Argument ('/d /c 2>>"' + $logFile + '" "' + $dest + '" serve')
     }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     # S4U logon: the task runs as this user with the profile loaded but outside
@@ -209,6 +221,11 @@ if ($serviceMode -eq 'yes') {
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings `
         -Description 'Intent backend daemon (intentd)' -Force | Out-Null
+    # Record where the log ends before this start, so the failure diagnosis
+    # below never quotes a previous run's crash (mirrors install.sh's
+    # note_log_start). A byte offset: the tail below slices raw bytes.
+    $logOffset = 0
+    if (Test-Path $logFile) { $logOffset = (Get-Item $logFile).Length }
     Start-ScheduledTask -TaskName $taskName
     Write-Host "install.ps1: scheduled task '$taskName' registered (runs at logon) and started"
 
@@ -224,7 +241,84 @@ if ($serviceMode -eq 'yes') {
     if ($up) {
         Write-Host "install.ps1: daemon is up - 'intentd status' responds"
     } else {
-        Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
+        # Timing out is three different things. The sitter reports a daemon
+        # that starts and dies on the service log, so this run's slice says
+        # whether it has already given up (service stopped for good), is still
+        # respawning a daemon that cannot start (it only gives up minutes
+        # after this 60s wait, so this is the common case), or nothing crashed
+        # at all and the first download is merely slow. Only the last of the
+        # three is a warning. The substrings matched below are the sitter's
+        # own log lines - a detection contract with
+        # crates/intentd-sitter/src/supervisor.rs and install.sh, pinned by
+        # the install_log_contract_* tests in
+        # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in
+        # lockstep.
+        # An explicit on/off auto-resume answer is applied only after this
+        # check passes, so a failure here drops it - say so instead of
+        # dropping it silently.
+        $autoResumeNote = ''
+        if (@('on', 'off') -contains $autoResume) {
+            $autoResumeNote = "`nYour auto-resume choice ('$autoResume') was not applied; once the daemon is up, apply it with:`n  intentd settings agents.resumeInterruptedOnStart $autoResume"
+        }
+        # This run's slice of the service log, bounded to 40 lines. Empty when
+        # there is nothing to read; a file shorter than the noted offset was
+        # rotated or replaced, so read it whole. The offset is a byte count
+        # taken before decoding, so the first line can start mid-word; the
+        # lines that matter come after it. The log is append-only and never
+        # rotated, so seek with [long] offsets (it can exceed 2 GiB) and read
+        # at most a 256 KiB tail instead of loading the whole file — only the
+        # last 40 lines are quoted anyway. A failed read is reported as its
+        # own warning below, never passed off as an empty log.
+        $logOut = ''
+        $logReadFailed = $false
+        try {
+            if (Test-Path $logFile) {
+                $stream = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                try {
+                    $length = [long]$stream.Length
+                    $sliceFrom = if ($length -lt [long]$logOffset) { [long]0 } else { [long]$logOffset }
+                    $maxTailBytes = [long]262144
+                    if (($length - $sliceFrom) -gt $maxTailBytes) { $sliceFrom = $length - $maxTailBytes }
+                    $null = $stream.Seek($sliceFrom, [System.IO.SeekOrigin]::Begin)
+                    $buffer = New-Object byte[] ([int]($length - $sliceFrom))
+                    $read = 0
+                    while ($read -lt $buffer.Length) {
+                        $n = $stream.Read($buffer, $read, $buffer.Length - $read)
+                        if ($n -le 0) { break }
+                        $read += $n
+                    }
+                    $slice = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read).TrimEnd()
+                    if ($slice) {
+                        $lines = @($slice -split "`r?`n")
+                        if ($lines.Count -gt 40) { $lines = $lines[($lines.Count - 40)..($lines.Count - 1)] }
+                        $logOut = $lines -join "`n"
+                    }
+                } finally {
+                    $stream.Dispose()
+                }
+            }
+        } catch {
+            $logOut = ''
+            $logReadFailed = $true
+        }
+        $restartHint = "Start-ScheduledTask -TaskName $taskName"
+        if ($logOut.Contains('times in a row without ever staying up')) {
+            Write-Host "install.ps1: the service's output for this start (from ${logFile}):"
+            foreach ($line in ($logOut -split "`n")) { Write-Host "  | $line" }
+            throw ("install.ps1: the daemon could not start and the sitter has given up - the service is stopped.`nFix the cause reported above, then start it again with:`n  $restartHint$autoResumeNote")
+        } elseif ($logOut.Contains('exited unexpectedly') -or $logOut.Contains('failed to spawn') -or $logOut.Contains('failed waiting on intentd')) {
+            Write-Host "install.ps1: the service's output for this start (from ${logFile}):"
+            foreach ($line in ($logOut -split "`n")) { Write-Host "  | $line" }
+            throw ("install.ps1: the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.`nFix the cause reported above, then start it again with:`n  $restartHint$autoResumeNote")
+        } elseif ($logReadFailed) {
+            # A read failure is not an empty log: without the slice the three
+            # cases above are indistinguishable, so say so instead of guessing
+            # "still downloading".
+            Write-Warning "install.ps1: daemon did not respond within 60s and the service log could not be read ($logFile) - cannot tell whether it is still downloading or crashing; check later with: intentd status"
+        } else {
+            Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
+        }
     }
     # 'auto' is the daemon default — nothing to write. A failure is a warning,
     # not a fatal install error: the setting can be changed later with the

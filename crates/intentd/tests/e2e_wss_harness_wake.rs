@@ -42,7 +42,7 @@ use uuid::Uuid;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 /// The three unsolicited chunk texts the mock emits on wake — one
-/// `session/update` agent_message_chunk per trigger-file line.
+/// `session/update` `agent_message_chunk` per trigger-file line.
 const WAKE_LINES: [&str; 3] = [
     "[compaction] context window compacted. ",
     "Background task finished: ",
@@ -60,7 +60,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -208,7 +208,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -232,7 +232,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -355,7 +355,8 @@ async fn wake_setup(script: &str, behavior: &str) -> WakeSetup {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -639,17 +640,7 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
         match event["type"].as_str() {
             Some("chat:stream:delta") => {
                 let data = serde_json::to_string(&event["data"]).unwrap_or_default();
-                if !saw_wake_end {
-                    assert_eq!(
-                        event["data"]["messageId"].as_str(),
-                        Some(wake_message_id.as_str()),
-                        "pre-end chunks belong to the wake turn: {frame}"
-                    );
-                    assert!(
-                        !data.contains("racing turn response"),
-                        "racing response must not interleave with the wake turn: {frame}"
-                    );
-                } else {
+                if saw_wake_end {
                     let mid = event["data"]["messageId"]
                         .as_str()
                         .expect("racing chunk messageId")
@@ -660,23 +651,33 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
                     );
                     racing_message_id = Some(mid);
                     racing_text.push_str(&data);
-                }
-            }
-            Some("agent:stream:end") => {
-                if !saw_wake_end {
+                } else {
                     assert_eq!(
                         event["data"]["messageId"].as_str(),
                         Some(wake_message_id.as_str()),
-                        "wake turn's terminal stream:end carries its messageId: {frame}"
+                        "pre-end chunks belong to the wake turn: {frame}"
                     );
-                    saw_wake_end = true;
-                } else {
+                    assert!(
+                        !data.contains("racing turn response"),
+                        "racing response must not interleave with the wake turn: {frame}"
+                    );
+                }
+            }
+            Some("agent:stream:end") => {
+                if saw_wake_end {
                     assert_eq!(
                         event["data"]["messageId"].as_str(),
                         racing_message_id.as_deref(),
                         "racing turn's stream:end carries its own messageId: {frame}"
                     );
                     saw_racing_end = true;
+                } else {
+                    assert_eq!(
+                        event["data"]["messageId"].as_str(),
+                        Some(wake_message_id.as_str()),
+                        "wake turn's terminal stream:end carries its messageId: {frame}"
+                    );
+                    saw_wake_end = true;
                 }
             }
             Some("agent:idle") => {

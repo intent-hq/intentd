@@ -185,7 +185,7 @@ async fn wss_rpc(ws: &mut common::TlsWs, id: i64, method: &str, params: Value) -
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -195,9 +195,8 @@ async fn wss_rpc(ws: &mut common::TlsWs, id: i64, method: &str, params: Value) -
 /// asserting the notification envelope; `None` on deadline.
 async fn wss_event_until(ws: &mut common::TlsWs, deadline: tokio::time::Instant) -> Option<Value> {
     loop {
-        let next = match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -210,7 +209,7 @@ async fn wss_event_until(ws: &mut common::TlsWs, deadline: tokio::time::Instant)
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -261,7 +260,8 @@ async fn wss_serves_rpcs_and_streams_workspace_created_during_first_boot_import(
     // Resolve the live WSS port + fingerprint over UDS, then connect a real
     // pinned TLS WebSocket (bearer token in the query string).
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"].as_u64().expect("bound port") as u16;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("bound port"))
+        .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

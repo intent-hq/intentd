@@ -5,7 +5,7 @@
 //! injection when enabled via `rtk.enabled` setting.
 //!
 //! Mirrors `cloudlands-fe/src/features/agent/main/rtk-detector.ts` including
-//! its exclusion lists (RTK_INTERNAL_COMMANDS and CONFLICTING_COMMANDS).
+//! its exclusion lists (`RTK_INTERNAL_COMMANDS` and `CONFLICTING_COMMANDS`).
 
 use std::process::Command;
 use std::sync::mpsc;
@@ -53,7 +53,9 @@ static CACHED_STATUS: Mutex<Option<RtkStatus>> = Mutex::new(None);
 /// Results are cached — only runs detection once per daemon process.
 pub(crate) fn detect_rtk() -> RtkStatus {
     // Best-effort feature gate: if mutex is poisoned, clear it and re-detect
-    let mut cache = CACHED_STATUS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = CACHED_STATUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(ref status) = *cache {
         return status.clone();
     }
@@ -134,7 +136,7 @@ pub(crate) fn parse_rtk_help(output: &str) -> Vec<String> {
 
         // End of commands section on blank line or new section header
         if in_commands
-            && (trimmed.is_empty() || trimmed.chars().next().is_some_and(|c| c.is_uppercase()))
+            && (trimmed.is_empty() || trimmed.chars().next().is_some_and(char::is_uppercase))
         {
             if !subcommands.is_empty() {
                 break;
@@ -144,7 +146,7 @@ pub(crate) fn parse_rtk_help(output: &str) -> Vec<String> {
 
         if in_commands {
             // Command lines start with 2+ spaces (mirrors rtk-detector.ts regex ^\s{2,})
-            if line.len() >= 2 && line.chars().take(2).all(|c| c.is_whitespace()) {
+            if line.len() >= 2 && line.chars().take(2).all(char::is_whitespace) {
                 if let Some(cmd) = line.split_whitespace().next() {
                     if !is_excluded(cmd) {
                         subcommands.push(cmd.to_string());

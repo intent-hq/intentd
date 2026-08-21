@@ -94,8 +94,7 @@ fn wake_resume_self_heal_debounce() -> Duration {
     std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+        .map_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE, Duration::from_millis)
 }
 
 /// Query surface the turn driver uses to decide whether a failed turn's active
@@ -422,29 +421,26 @@ impl Transcript {
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
-                match self.tool_result_index.get(&tc.tool_call_id) {
-                    Some(&ri) => {
-                        result_index = Some(ri);
-                        if let Some(obj) = self.blocks[ri].as_object_mut() {
-                            obj.insert("output".to_string(), output.clone());
-                            obj.insert("is_error".to_string(), Value::Bool(is_error));
-                        }
+                if let Some(&ri) = self.tool_result_index.get(&tc.tool_call_id) {
+                    result_index = Some(ri);
+                    if let Some(obj) = self.blocks[ri].as_object_mut() {
+                        obj.insert("output".to_string(), output.clone());
+                        obj.insert("is_error".to_string(), Value::Bool(is_error));
                     }
-                    None => {
-                        self.flush_text();
-                        let rindex = self.blocks.len();
-                        let rid = self.block_id(rindex);
-                        self.blocks.push(json!({
-                            "type": "tool_result",
-                            "id": rid,
-                            "tool_use_id": tc.tool_call_id,
-                            "output": output,
-                            "is_error": is_error,
-                        }));
-                        self.tool_result_index
-                            .insert(tc.tool_call_id.clone(), rindex);
-                        result_index = Some(rindex);
-                    }
+                } else {
+                    self.flush_text();
+                    let rindex = self.blocks.len();
+                    let rid = self.block_id(rindex);
+                    self.blocks.push(json!({
+                        "type": "tool_result",
+                        "id": rid,
+                        "tool_use_id": tc.tool_call_id,
+                        "output": output,
+                        "is_error": is_error,
+                    }));
+                    self.tool_result_index
+                        .insert(tc.tool_call_id.clone(), rindex);
+                    result_index = Some(rindex);
                 }
                 // §7.1: attach the standalone resource block(s) so the FE can
                 // render them directly (the items also stay in
@@ -470,29 +466,26 @@ impl Transcript {
                         // on re-completion); batch extras append. A claim
                         // consumes its registry batch, so extras cannot
                         // re-attach on a re-completion echo.
-                        match (i == 0)
+                        if let Some(&pi) = (i == 0)
                             .then(|| self.proposal_index.get(&tc.tool_call_id))
                             .flatten()
                         {
-                            Some(&pi) => {
-                                let id = self.block_id(pi);
-                                self.blocks[pi] =
-                                    crate::tool_block::build_proposal_resource_block(&id, &item);
-                                proposal_indices.push(pi);
+                            let id = self.block_id(pi);
+                            self.blocks[pi] =
+                                crate::tool_block::build_proposal_resource_block(&id, &item);
+                            proposal_indices.push(pi);
+                        } else {
+                            self.flush_text();
+                            let pindex = self.blocks.len();
+                            let pid = self.block_id(pindex);
+                            self.blocks
+                                .push(crate::tool_block::build_proposal_resource_block(
+                                    &pid, &item,
+                                ));
+                            if i == 0 {
+                                self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                             }
-                            None => {
-                                self.flush_text();
-                                let pindex = self.blocks.len();
-                                let pid = self.block_id(pindex);
-                                self.blocks
-                                    .push(crate::tool_block::build_proposal_resource_block(
-                                        &pid, &item,
-                                    ));
-                                if i == 0 {
-                                    self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
-                                }
-                                proposal_indices.push(pindex);
-                            }
+                            proposal_indices.push(pindex);
                         }
                     }
                 }
@@ -913,8 +906,8 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// step instead of being trusted (an unknown `model.default` prefix must not
 /// shadow a perfectly valid `providers.active`). `None` when neither yields
 /// a registered provider — no provider carries a hardcoded default
-/// designation, so callers fall through to [`resolve_provider_id`]'s neutral
-/// positional last resort (the first registered provider).
+/// designation, and there is no positional last resort (monorepo#3044):
+/// resolution that falls through entirely fails loudly at the caller.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
@@ -938,35 +931,49 @@ pub(crate) fn derived_default_provider(
 /// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
 /// yields a non-empty provider) → `provider` field → `configured_default` (the
 /// settings-derived default — see [`derived_default_provider`] — when the
-/// caller has one to offer) → the first registered provider (a neutral
-/// positional last resort; no provider carries a default designation).
-/// Malformed compound ids like `:sonnet` yield an empty prefix and fall
-/// through to the provider field / configured default / last resort. This
-/// ensures `_meta` injection, spawn args, and all provider-keyed logic use a
-/// consistent provider id.
+/// caller has one to offer). Malformed compound ids like `:sonnet` yield an
+/// empty prefix and fall through to the provider field / configured default.
+/// This ensures `_meta` injection, spawn args, and all provider-keyed logic
+/// use a consistent provider id.
 ///
-/// `configured_default` deliberately sits ABOVE the positional last resort
-/// (spec Decision D2): a session with no persisted `provider` (e.g. an older
-/// row, or a creation path that never resolved one) should still prefer the
-/// user's actual configured default. Callers without settings access (e.g.
-/// usage-stats attribution) pass `None`, bottoming out at the first
-/// registered provider for that narrower use.
+/// `None` when nothing resolves (monorepo#3044): the former positional last
+/// resort (the first registered provider, auggie) silently spawned a binary
+/// that may not be installed. Spawn-adjacent callers surface
+/// [`no_default_provider_error`] instead; stats-attribution callers (which
+/// pass `configured_default: None`) fall to their existing `"unknown"` tail.
 pub(crate) fn resolve_provider_id(
     model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
-) -> String {
+) -> Option<String> {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
         .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .or_else(|| {
+            provider
+                .filter(|p| !p.is_empty())
+                .map(std::string::ToString::to_string)
+        })
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
-                .map(|p| p.to_string())
+                .map(std::string::ToString::to_string)
         })
-        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
+}
+
+/// The loud `-32602`-style error for provider resolution that falls through
+/// entirely (monorepo#3044): no explicit provider/model, no session provider,
+/// and no settings-derived default. Mirrors the resolved-but-unavailable
+/// error style (`ensure_provider_available`) so clients can surface it
+/// directly. `context` names the failing operation (e.g. `agent.delegate`).
+pub(crate) fn no_default_provider_error(context: &str) -> Error {
+    Error::InvalidParams(format!(
+        "{context}: no default provider/model is configured — no explicit \
+         provider or model was given and neither providers.active nor a \
+         compound model.default is set. Choose a provider in Settings > \
+         Agents, or pass an explicit provider/model."
+    ))
 }
 
 /// Resolve the effective model a provider is actually running from the
@@ -1231,7 +1238,7 @@ impl Services {
     pub(crate) fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone(), silent_tail_ms);
     }
 
@@ -1241,7 +1248,7 @@ impl Services {
     pub(crate) fn last_turn_silent_tail(&self, agent_id: &AgentId) -> Option<u64> {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .copied()
     }
@@ -1251,7 +1258,7 @@ impl Services {
     pub(crate) fn clear_turn_silent_tail(&self, agent_id: &AgentId) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1264,7 +1271,7 @@ impl Services {
         let mut map = self
             .truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = map.entry(agent_id.clone()).or_insert(0);
         *count += 1;
         *count
@@ -1278,7 +1285,7 @@ impl Services {
     pub(crate) fn clear_truncation_redrives(&self, agent_id: &AgentId) {
         self.truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1291,7 +1298,7 @@ impl Services {
     pub(crate) fn arm_truncation_redrive(&self, agent_id: &AgentId) {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone());
     }
 
@@ -1303,7 +1310,7 @@ impl Services {
     pub(crate) fn take_truncation_redrive(&self, agent_id: &AgentId) -> bool {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id)
     }
 
@@ -1567,7 +1574,7 @@ impl Services {
     /// flush owns releasing it. If the worker already persisted the full turn,
     /// the append collides on the UNIQUE id and is logged at debug (benign —
     /// the full row won; the stale slot, if any, is cleared). Errors are logged
-    /// and swallowed: this must never block shutdown or the interrupted_agent
+    /// and swallowed: this must never block shutdown or the `interrupted_agent`
     /// row insert. On a genuine store error the slot is deliberately KEPT (pin
     /// and all) as the only remaining copy of the content.
     ///
@@ -1840,13 +1847,16 @@ impl Services {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → configured default → default), then build
-        // provider-specific _meta.
+        // prefix → provider field → configured default), then build
+        // provider-specific _meta. Reached only after a successful spawn (which
+        // resolved the same inputs), so a fall-through here is a settings race —
+        // fail loudly rather than fabricating a positional default (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/new"))?;
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1904,12 +1914,14 @@ impl Services {
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection (recreate path sends
-        // the same prompt as new/load).
+        // the same prompt as new/load). Same loud fall-through as
+        // [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/new"))?;
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1977,12 +1989,14 @@ impl Services {
             return Ok(None);
         }
         // Resolve provider using the same precedence as spawn path, then build
-        // provider-specific _meta for system-prompt injection.
+        // provider-specific _meta for system-prompt injection. Same loud
+        // fall-through as [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/load"))?;
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -2080,9 +2094,9 @@ impl Services {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => continue, // a straggler arrived → keep draining
-                Ok(None) => break,       // channel closed
-                Err(_) => break,         // quiet for the settle window → done
+                Ok(Some(_)) => {} // a straggler arrived → keep draining
+                Ok(None) | Err(_) => break, // channel closed
+                                   // quiet for the settle window → done
             }
         }
     }
@@ -2095,6 +2109,9 @@ impl Services {
     /// present; bare callers (tests, harness paths) may pass `None` and the
     /// field is omitted.
     #[allow(clippy::too_many_arguments)]
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.
     pub async fn run_prompt_turn(
         &self,
         conn: &Connection,
@@ -2226,7 +2243,7 @@ impl Services {
                         agent = %agent_id,
                         error = %e,
                         attempt = fetch_retry_attempt,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
                     );
                     tokio::time::sleep(delay).await;
@@ -3037,7 +3054,9 @@ impl Services {
             if elapsed >= settle {
                 break;
             }
-            let tick = (settle - elapsed).min(std::time::Duration::from_millis(50));
+            let tick = settle
+                .saturating_sub(elapsed)
+                .min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(tick, notifications.recv()).await {
                 Ok(Some(note)) => {
                     updates_applied |= self
@@ -3331,7 +3350,7 @@ impl Services {
                 prev.as_ref(),
                 &token_usage::snapshot_from_turn_usage(u),
             ),
-            _ => Default::default(),
+            _ => intent_core::TokenUsageTotals::default(),
         };
         let delta = intent_store::UsageStatsDelta {
             input_tokens: tokens.input_tokens,
@@ -3339,9 +3358,9 @@ impl Services {
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
             thought_tokens: tokens.thought_tokens,
-            runs: run_completed as u64,
+            runs: u64::from(run_completed),
             longest_run_ms: if run_completed {
-                turn_duration.as_millis() as u64
+                u64::try_from(turn_duration.as_millis()).unwrap_or(u64::MAX)
             } else {
                 0
             },
@@ -3356,9 +3375,11 @@ impl Services {
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         // Stats attribution only: no configured-default upgrade here (unlike
         // the spawn-adjacent call sites above), matching the pre-existing
-        // `usage_stats.rs` helpers this mirrors — out of scope for D2.
-        let provider_id =
-            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None));
+        // `usage_stats.rs` helpers this mirrors — out of scope for D2. An
+        // unresolvable provider falls to the `"unknown"` stats tail.
+        let provider_id = prev_readable
+            .then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None))
+            .flatten();
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),
@@ -3426,20 +3447,17 @@ impl Services {
                 // thought↔text switch or a non-text block starts a new one.
                 // Thought chunks flush as `thinking` blocks (Zed's model) and
                 // ride the same `chat:stream:delta` shape.
-                let (block_index, block_type) = match &text {
-                    Some(t) => {
-                        let index = transcript.push_chunk(t, thought);
-                        let block_type = if thought { "thinking" } else { "text" };
-                        (index, block_type.to_string())
-                    }
-                    None => {
-                        let block_type = content
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        (transcript.push_block(content.clone()), block_type)
-                    }
+                let (block_index, block_type) = if let Some(t) = &text {
+                    let index = transcript.push_chunk(t, thought);
+                    let block_type = if thought { "thinking" } else { "text" };
+                    (index, block_type.to_string())
+                } else {
+                    let block_type = content
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (transcript.push_block(content.clone()), block_type)
                 };
                 // Internal chat-channel delta (§7.1): the full content-bearing
                 // payload the per-agent `chat.subscribe` forwarder accumulates
@@ -3513,7 +3531,7 @@ impl Services {
                     self.turn_attachments
                         .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
                         .iter()
-                        .map(|a| a.resource_item())
+                        .map(intent_core::TurnAttachment::resource_item)
                         .collect()
                 } else {
                     Vec::new()
@@ -3723,9 +3741,9 @@ impl Services {
         // only); persist all other agent events (stream:status, stream:end,
         // tool:call, lifecycle, etc.) for durable audit trail.
         if event_type == CHAT_STREAM_DELTA || event_type == AGENT_STREAM_ACTIVITY {
-            crate::publish_event_transient(&self.event_bus, event);
+            crate::publish_event_transient(self.event_bus.as_ref(), &event);
         } else {
-            crate::publish_event(&self.event_bus, event).await;
+            crate::publish_event(self.event_bus.as_ref(), event).await;
         }
     }
 
