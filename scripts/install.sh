@@ -63,9 +63,86 @@ cleanup() {
   if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi
 }
 
+# Lines of service log quoted when the daemon never came up: enough to carry
+# the daemon's own error (it inherits the sitter's stdio, so its message sits
+# directly above the sitter's respawn lines) without dumping an unbounded log.
+log_tail_lines=40
+
+# Where this run's service output lands, plus how to bound it to this run so a
+# diagnosis never quotes a previous run's crash. Set by note_log_start.
+log_desc=""
+log_file=""
+log_offset=0
+log_unit=""
+log_since=""
+restart_hint=""
+
+# Record where the service log ends before the service gets a chance to write
+# to it, and how to restart it once a human has fixed the cause.
+#
+# macOS: the LaunchAgent's StandardErrorPath, built from the same $HOME the
+# plist writer interpolates (the label does not affect the log path).
+# Linux: the unit sets no StandardError, so output goes to the journal.
+note_log_start() {
+  if [ "$os" = "Darwin" ]; then
+    log_file="$HOME/Library/Logs/intentd.err.log"
+    log_desc="$log_file"
+    # Guarded: an unopenable file makes the *shell* report the failed
+    # redirect, which `wc 2>/dev/null` cannot suppress — and a first install
+    # has no log yet, so that would be noise on the happy path.
+    log_offset=0
+    if [ -r "$log_file" ]; then
+      # The pipeline's status is tr's, so a failed wc surfaces as empty
+      # output, not a failed command: check the value, not the status.
+      log_offset=$(wc -c <"$log_file" | tr -d '[:space:]')
+      [ -n "$log_offset" ] || log_offset=0
+    fi
+    restart_hint="launchctl kickstart -k gui/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}"
+  else
+    log_unit=${INTENTD_SERVICE_NAME:-intentd}
+    log_desc="journalctl --user -u $log_unit"
+    # Second granularity may pull in the last second of an earlier run; that
+    # is close enough to keep the diagnosis about this start.
+    log_since=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || log_since=""
+    restart_hint="systemctl --user restart $log_unit"
+  fi
+}
+
+# Echo this run's service output, bounded to $log_tail_lines lines. Echoes
+# nothing when there is nothing to read: the log may not exist yet, be empty
+# or unreadable, or — on a Linux box without systemd — there may be no journal.
+service_log_tail() {
+  if [ -n "$log_file" ]; then
+    [ -r "$log_file" ] || return 0
+    size=$(wc -c <"$log_file" 2>/dev/null | tr -d '[:space:]') || size=""
+    # A rotated or replaced log invalidates the offset; read it whole.
+    if [ -z "$size" ] || [ "$size" -lt "$log_offset" ]; then
+      log_offset=0
+    fi
+    # The offset is a byte count, so the first line can start mid-word when
+    # the service was already writing as we took it; the lines that matter
+    # come after it.
+    tail -c "+$((log_offset + 1))" "$log_file" 2>/dev/null | tail -n "$log_tail_lines"
+  elif [ -n "$log_unit" ] && command -v journalctl >/dev/null 2>&1; then
+    if [ -n "$log_since" ]; then
+      journalctl --user -u "$log_unit" --since "$log_since" -n "$log_tail_lines" --no-pager 2>/dev/null || true
+    else
+      journalctl --user -u "$log_unit" -n "$log_tail_lines" --no-pager 2>/dev/null || true
+    fi
+  fi
+}
+
+# Quote the captured log on stderr, ahead of the error that explains it (both
+# on stderr so the two cannot interleave out of order).
+report_daemon_log() {
+  printf '%s\n' "install.sh: the service's output for this start (from $log_desc):" >&2
+  printf '%s\n' "$1" | sed 's/^/  | /' >&2
+}
+
 # Poll `intentd status` until the daemon answers. First service start can be
 # slow: the sitter downloads the real daemon before serving.
 verify_daemon() {
+  note_log_start
   info "waiting for the daemon to respond (first start downloads the daemon binary)..."
   waited=0
   while [ "$waited" -lt 60 ]; do
@@ -76,6 +153,26 @@ verify_daemon() {
     sleep 2
     waited=$((waited + 2))
   done
+
+  # Timing out is three different things. The sitter reports a daemon that
+  # starts and dies on the service's stderr, so this run's log says whether it
+  # has already given up (service stopped for good), is still respawning a
+  # daemon that cannot start (it only gives up minutes after this 60s wait, so
+  # this is the common case), or nothing crashed at all and the first download
+  # is merely slow. Only the last of the three is a warning.
+  log_out=$(service_log_tail)
+  case "$log_out" in
+    *"times in a row without ever staying up"*)
+      report_daemon_log "$log_out"
+      fail "the daemon could not start and the sitter has given up — the service is stopped.
+Fix the cause reported above, then start it again with:
+  $restart_hint" ;;
+    *"exited unexpectedly"* | *"failed to spawn"* | *"failed waiting on intentd"*)
+      report_daemon_log "$log_out"
+      fail "the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.
+Fix the cause reported above, then start it again with:
+  $restart_hint" ;;
+  esac
   warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
 }
 
