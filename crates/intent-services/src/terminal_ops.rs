@@ -13,7 +13,7 @@
 //!
 //! [`WorkspaceApi`]: intent_core::WorkspaceApi
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -93,7 +93,20 @@ pub(crate) async fn create(
         None => (default_shell(), true),
     };
     let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
-    let mut spawn_env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
+    // Resolved before the credential env, which discovers the helpers already
+    // configured *in the spawn directory* so they stay reachable behind
+    // intentd's (monorepo#3059).
+    let spawn_cwd = match cwd {
+        Some(cwd) => Some(PathBuf::from(cwd)),
+        None => match store.as_ref() {
+            Some(store) => default_cwd(store, &workspace_id, None).await,
+            None => None,
+        },
+    };
+    let mut spawn_env = overlay_credential_env(
+        git_credential_env(settings.as_deref(), spawn_cwd.as_deref()),
+        user_env,
+    );
     let inherited_term = std::env::var("TERM").ok();
     ensure_terminal_term(&mut spawn_env, inherited_term.as_deref());
     let mut spec = terminal_spawn_spec_for(
@@ -104,13 +117,7 @@ pub(crate) async fn create(
         spawn_env,
     );
     spec.size = PtySize { rows, cols };
-    spec.cwd = match cwd {
-        Some(cwd) => Some(PathBuf::from(cwd)),
-        None => match store.as_ref() {
-            Some(store) => default_cwd(store, &workspace_id, None).await,
-            None => None,
-        },
-    };
+    spec.cwd = spawn_cwd;
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -188,11 +195,19 @@ async fn default_cwd(
 /// `GITHUB_TOKEN`/`GH_TOKEN`). Building the pairs never fails or blocks the
 /// spawn: an unresolvable daemon binary path simply yields no pairs (logged
 /// at debug).
-pub(crate) fn git_credential_env(settings: Option<&SettingsRegistry>) -> Vec<(String, String)> {
+///
+/// `cwd` is the directory the terminal is spawned in, and must be the one the
+/// spawn actually uses: the helpers already configured there are re-added
+/// behind intentd's, so a repository-local one stays reachable
+/// (monorepo#3059).
+pub(crate) fn git_credential_env(
+    settings: Option<&SettingsRegistry>,
+    cwd: Option<&Path>,
+) -> Vec<(String, String)> {
     if !expose_git_credential(settings) {
         return Vec::new();
     }
-    credential_pairs()
+    credential_pairs(cwd)
 }
 
 /// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
@@ -215,12 +230,12 @@ pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool
 /// so overwriting the variable without re-appending would drop inherited
 /// entries). The helper path is the running daemon's own binary
 /// (`current_exe`); an unresolvable path yields no pairs (logged at debug).
-fn credential_pairs() -> Vec<(String, String)> {
+fn credential_pairs(cwd: Option<&Path>) -> Vec<(String, String)> {
     let Some(intentd) = crate::daemon_exe_path() else {
         return Vec::new();
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-    intent_git::auth::daemon_helper_env(&intentd, inherited.as_deref())
+    intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref())
 }
 
 /// Layer caller-supplied env over the injected credential pairs: a key the
@@ -619,7 +634,7 @@ impl TerminalHost for PtyTerminalHost {
         let settings = self.settings.clone();
         let terminal_requires_shell = self.terminal_requires_shell;
         Box::pin(async move {
-            let credential = git_credential_env(settings.as_deref());
+            let credential = git_credential_env(settings.as_deref(), params.cwd.as_deref());
             let (command, args) = if terminal_requires_shell {
                 shell_true_invocation(&params.command, &params.args)
             } else {
@@ -1010,9 +1025,9 @@ mod tests {
     /// yield no pairs.
     #[test]
     fn git_credential_env_respects_gate() {
-        assert!(git_credential_env(None).is_empty());
+        assert!(git_credential_env(None, None).is_empty());
         let (off, _guard) = registry_with_expose(Some(false));
-        assert!(git_credential_env(Some(&off)).is_empty());
+        assert!(git_credential_env(Some(&off), None).is_empty());
     }
 
     /// Gate on ⇒ exactly the single daemon-backed helper pair: the
@@ -1021,7 +1036,7 @@ mod tests {
     /// child environment (monorepo#884 Phase 2.2).
     #[test]
     fn credential_pairs_are_helper_only_without_token_env() {
-        let pairs = credential_pairs();
+        let pairs = credential_pairs(None);
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec![intent_git::auth::GIT_CONFIG_PARAMETERS_ENV]);
         assert!(

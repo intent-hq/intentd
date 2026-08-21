@@ -49,6 +49,12 @@ const GITHUB_HELPER_KEY: &str = "credential.https://github.com.helper";
 /// documented behaviour — `credential.c` clears the accumulated string list).
 /// Keyed to the same scope as the intentd entries, so helpers for every other
 /// host are left exactly as configured.
+///
+/// It clears the list for *every* HTTPS github.com request, so it also drops
+/// what a path-scoped key such as
+/// `credential.https://github.com/intent-hq.helper` contributed to the ones it
+/// covers — which is why [`github_helpers_from_config_list`] re-adds those
+/// under their own keys rather than folding them into this one.
 const GITHUB_HELPER_RESET: &str = "credential.https://github.com.helper=";
 
 /// The `git -c` config entry offering the resolved token as a github.com-scoped
@@ -100,19 +106,20 @@ pub(crate) fn token_helper_entries(
 /// whenever it has no credential to offer (wrong host, gate off, daemon down,
 /// no token), which is what keeps those fallbacks reachable.
 ///
-/// `fallbacks` is the list git would consult without this injection (see
-/// [`discover_github_helpers`]). `None` means the list could not be
-/// determined, and then no reset is emitted and `entry` is simply appended as
-/// before: losing precedence is far cheaper than clearing a list we cannot
-/// restore.
+/// `fallbacks` are the `key=value` entries re-adding what git would consult
+/// without this injection (see [`discover_github_helpers`]), in the order it
+/// would consult them. `None` means the list could not be determined, and
+/// then no reset is emitted and `entry` is simply appended as before: losing
+/// precedence is far cheaper than clearing a list we cannot restore.
 fn github_helper_entries(entry: String, fallbacks: Option<&[String]>) -> Vec<String> {
     let Some(fallbacks) = fallbacks else {
         return vec![entry];
     };
-    // Our own helper value, so an entry an outer agent shell already injected
-    // (visible through the inherited parameters) is not re-added behind us.
-    let seen_head = entry.strip_prefix(GITHUB_HELPER_RESET).unwrap_or_default();
-    let mut seen: Vec<&str> = vec![seen_head];
+    // Our own entry, so one an outer agent shell already injected (visible
+    // through the inherited parameters) is not re-added behind us. Compared
+    // whole, key included: the same helper value under a narrower key is a
+    // different scope, not a duplicate.
+    let mut seen: Vec<&str> = vec![entry.as_str()];
     let mut entries = vec![GITHUB_HELPER_RESET.to_string(), entry.clone()];
     for fallback in fallbacks {
         // Duplicates would only grow the list on every nesting level; a helper
@@ -121,21 +128,26 @@ fn github_helper_entries(entry: String, fallbacks: Option<&[String]>) -> Vec<Str
             continue;
         }
         seen.push(fallback);
-        entries.push(format!("{GITHUB_HELPER_KEY}={fallback}"));
+        entries.push(fallback.clone());
     }
     entries
 }
 
-/// Ask git which credential helpers it would consult for `https://github.com`,
-/// in the order it would consult them, as the child about to be spawned will
-/// see them: `git config --list` reports entries in config order, and
-/// `inherited_config_parameters` is applied so an entry an outer agent shell
-/// already injected is visible rather than re-added as a duplicate.
+/// Ask git which credential helpers it would consult for an HTTPS
+/// `github.com` remote, and return them as the ordered `key=value` config
+/// entries that re-add them behind intentd's helper, as the child about to be
+/// spawned will see them: `git config --list` reports entries in config
+/// order, and `inherited_config_parameters` is applied so an entry an outer
+/// agent shell already injected is visible rather than re-added as a
+/// duplicate.
 ///
 /// `cwd` is the directory the lookup runs in, so a repository-local helper is
 /// included; `None` runs at the filesystem root, reading the system, global
-/// and environment scopes only. Returns `None` when git could not be run or
-/// exited non-zero — an *unknown* list, which callers must not reset.
+/// and environment scopes only — right only where the child git genuinely has
+/// no repository, such as the `clone` path, whose target does not exist yet
+/// (and `git clone` does not read config from a repository that happens to
+/// surround its cwd). Returns `None` when git could not be run or exited
+/// non-zero — an *unknown* list, which callers must not reset.
 pub fn discover_github_helpers(
     cwd: Option<&Path>,
     inherited_config_parameters: Option<&str>,
@@ -167,10 +179,12 @@ pub fn discover_github_helpers(
 }
 
 /// Fold `git config --list -z` output (`key\nvalue\0` records, or a bare
-/// `key\0` for a valueless entry, in config order) into the credential-helper
-/// list git would consult for `https://github.com`: every applicable entry in
-/// order, with an empty value clearing what came before — the same reset
-/// semantics [`GITHUB_HELPER_RESET`] relies on.
+/// `key\0` for a valueless entry, in config order) into the ordered
+/// `key=value` config entries that re-add, behind intentd's helper, every
+/// credential helper git would otherwise consult for an HTTPS `github.com`
+/// remote. Entries are returned ready to emit, because the key each one must
+/// be re-added under depends on how widely it applies (see
+/// [`GithubHelperScope`]).
 fn github_helpers_from_config_list(list: &str) -> Vec<String> {
     let mut helpers: Vec<String> = Vec::new();
     for record in list.split('\0') {
@@ -178,52 +192,96 @@ fn github_helpers_from_config_list(list: &str) -> Vec<String> {
         let Some((key, value)) = record.split_once('\n') else {
             continue;
         };
-        if !credential_key_targets_github(key) {
-            continue;
-        }
-        if value.is_empty() {
-            helpers.clear();
-        } else {
-            helpers.push(value.to_string());
+        match github_helper_key_scope(key) {
+            GithubHelperScope::Unrelated => continue,
+            GithubHelperScope::EveryGithubRequest => {
+                if value.is_empty() {
+                    // A reset on a key covering *every* github.com request
+                    // clears the whole accumulated list for those requests —
+                    // the path-scoped entries collected below included, since
+                    // each of those requests matches this key too.
+                    helpers.clear();
+                } else {
+                    // Re-added under our own key: it applies to every
+                    // github.com request either way, and the reset is scoped
+                    // there, so nothing outside github.com HTTPS is touched.
+                    helpers.push(format!("{GITHUB_HELPER_KEY}={value}"));
+                }
+            }
+            // Re-added verbatim under its own key, empty values included:
+            // which requests it applies to — and, when empty, which ones it
+            // resets — depends on the remote URL git is resolving, which is
+            // not known at spawn time. Re-emitting the key unchanged lets git
+            // re-evaluate it against the real URL, reproducing its narrower
+            // scope exactly instead of approximating it here. Order relative
+            // to the entries above is preserved, and order is what decides
+            // precedence within the emitted list.
+            GithubHelperScope::SomeGithubRequests => helpers.push(format!("{key}={value}")),
         }
     }
     helpers
 }
 
-/// Whether `key` is a credential-helper key git applies to a bare
-/// `https://github.com` request: either the unscoped `credential.helper`, or a
-/// `credential.<url>.helper` whose url matches the way git's urlmatch does for
-/// that request — scheme `https` or absent (a pattern without a scheme matches
-/// any protocol), host `github.com` case-insensitively, the default port
-/// optional, and no path or userinfo (the request carries neither, and both
-/// must match exactly). `http://…`, `https://*.github.com`,
-/// `https://github.com/owner` and other hosts correctly do not match: git
-/// would not consult those helpers for this request either.
-fn credential_key_targets_github(key: &str) -> bool {
+/// How a config key relates to the HTTPS `github.com` credential requests
+/// [`GITHUB_HELPER_RESET`] clears the helper list for.
+enum GithubHelperScope {
+    /// Not a credential-helper key git would consult for any such request.
+    Unrelated,
+    /// Applies to every one of them: the unscoped `credential.helper`, or a
+    /// `credential.<url>.helper` whose url carries no path.
+    EveryGithubRequest,
+    /// Applies to some of them: a `credential.<url>.helper` whose url carries
+    /// a path, e.g. `credential.https://github.com/intent-hq.helper`, which
+    /// git applies to a remote under that path. Git matches credential config
+    /// against the full remote URL *before* it drops the path, so these are
+    /// consulted whatever `credential.useHttpPath` says — the setting governs
+    /// only what git then hands the helper.
+    SomeGithubRequests,
+}
+
+/// Classify `key` the way git's urlmatch would for an HTTPS `github.com`
+/// remote: scheme `https` or absent (a pattern without a scheme matches any
+/// protocol), host `github.com` case-insensitively, the default port
+/// optional, and no userinfo (the request carries none, and it must match
+/// exactly). `http://…`, `https://*.github.com` and other hosts are
+/// [`GithubHelperScope::Unrelated`]: git would not consult those helpers for
+/// such a request either.
+fn github_helper_key_scope(key: &str) -> GithubHelperScope {
     let Some(rest) = key.strip_prefix("credential.") else {
-        return false;
+        return GithubHelperScope::Unrelated;
     };
     if rest == "helper" {
-        return true;
+        return GithubHelperScope::EveryGithubRequest;
     }
     let Some(pattern) = rest.strip_suffix(".helper") else {
-        return false;
+        return GithubHelperScope::Unrelated;
     };
-    let authority = match pattern.split_once("://") {
+    let pattern = match pattern.split_once("://") {
         Some((scheme, rest)) => {
             if !scheme.eq_ignore_ascii_case("https") {
-                return false;
+                return GithubHelperScope::Unrelated;
             }
             rest
         }
         None => pattern,
     };
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
-    if authority.contains('/') || authority.contains('@') {
-        return false;
+    // A bare trailing slash is an empty path, which constrains nothing.
+    let (authority, path) = match pattern.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (pattern, ""),
+    };
+    if authority.contains('@') {
+        return GithubHelperScope::Unrelated;
     }
     let host = authority.strip_suffix(":443").unwrap_or(authority);
-    host.eq_ignore_ascii_case("github.com")
+    if !host.eq_ignore_ascii_case("github.com") {
+        return GithubHelperScope::Unrelated;
+    }
+    if path.is_empty() {
+        GithubHelperScope::EveryGithubRequest
+    } else {
+        GithubHelperScope::SomeGithubRequests
+    }
 }
 
 /// Join `entries` — sq-quoted the way git's `sq_dequote` parser expects — onto
@@ -265,6 +323,11 @@ pub const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
 /// value never contains token bytes; the token travels only under
 /// [`TOKEN_ENV`]. Returns no pairs when the token is unusable (see
 /// [`usable_token`]), leaving the child env untouched.
+///
+/// Discovery runs with no `cwd`: this builds the env for the `clone` path,
+/// whose child git has no repository to read local config from — the target
+/// does not exist yet, and `git clone` ignores any repository surrounding its
+/// cwd. There is therefore no repository-local helper for the reset to drop.
 pub fn scoped_credential_env(
     token: Option<&str>,
     inherited_config_parameters: Option<&str>,
@@ -307,13 +370,19 @@ pub(crate) fn daemon_helper_config(intentd_path: &str) -> String {
 /// `inherited_config_parameters` so the caller's pre-existing value is never
 /// dropped. Unlike [`scoped_credential_env`] there is no token pair at all: no
 /// token bytes ever enter the child environment.
+///
+/// `cwd` is the directory the child is spawned in — the workspace worktree for
+/// an agent or terminal — so a repository-local helper configured there is
+/// discovered and re-added. Passing `None` where the child does have a
+/// repository would let the reset clear that helper without restoring it.
 pub fn daemon_helper_env(
     intentd_path: &str,
+    cwd: Option<&Path>,
     inherited_config_parameters: Option<&str>,
 ) -> Vec<(String, String)> {
     let entries = github_helper_entries(
         daemon_helper_config(intentd_path),
-        discover_github_helpers(None, inherited_config_parameters).as_deref(),
+        discover_github_helpers(cwd, inherited_config_parameters).as_deref(),
     );
     vec![(
         GIT_CONFIG_PARAMETERS_ENV.to_string(),
@@ -811,7 +880,7 @@ mod tests {
     #[test]
     fn daemon_helper_env_builds_parseable_helper() {
         for path in ["/usr/local/bin/intentd", "/Apps/In tent'd/bin/intentd"] {
-            let pairs = daemon_helper_env(path, None);
+            let pairs = daemon_helper_env(path, None, None);
             assert_eq!(pairs.len(), 1, "single env pair — no token pair");
             let (key, params) = &pairs[0];
             assert_eq!(key, GIT_CONFIG_PARAMETERS_ENV);
@@ -832,7 +901,7 @@ mod tests {
     /// config still applies; blank inherited values are treated as absent.
     #[test]
     fn daemon_helper_env_appends_to_inherited_parameters() {
-        let pairs = daemon_helper_env("/usr/local/bin/intentd", Some("'foo.bar=baz'"));
+        let pairs = daemon_helper_env("/usr/local/bin/intentd", None, Some("'foo.bar=baz'"));
         let params = &pairs[0].1;
         assert!(
             params.starts_with("'foo.bar=baz' '"),
@@ -846,7 +915,7 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "baz");
 
-        let pairs = daemon_helper_env("/usr/local/bin/intentd", Some("   "));
+        let pairs = daemon_helper_env("/usr/local/bin/intentd", None, Some("   "));
         assert!(
             pairs[0].1.starts_with('\''),
             "no leading junk: {}",
@@ -890,13 +959,17 @@ mod tests {
         assert_eq!(argv, "git-credential\nget\n");
     }
 
-    /// The key matcher reproduces git's urlmatch verdicts for a bare
-    /// `https://github.com` credential request — each case below was checked
-    /// against real `git credential fill` (monorepo#3059). Over-matching would
-    /// hand another host's helper a github.com request; under-matching would
-    /// drop a helper the user configured, since the reset clears the list.
+    /// The key matcher reproduces git's urlmatch verdicts for an HTTPS
+    /// `github.com` credential request — each case below was checked against
+    /// real `git credential fill` (monorepo#3059). Over-matching would hand
+    /// another host's helper a github.com request; under-matching would drop a
+    /// helper the user configured, since the reset clears the list.
+    ///
+    /// The path-scoped split matters because the reset clears the list for
+    /// every github.com request, path-scoped contributions included: such a
+    /// key is re-added under its own scope, not folded into ours.
     #[test]
-    fn credential_key_targets_github_matches_gits_urlmatch() {
+    fn github_helper_key_scope_matches_gits_urlmatch() {
         for key in [
             "credential.helper",
             "credential.https://github.com.helper",
@@ -905,19 +978,41 @@ mod tests {
             "credential.https://github.com:443.helper",
             "credential.HTTPS://GitHub.com.helper",
         ] {
-            assert!(credential_key_targets_github(key), "must match: {key}");
+            assert!(
+                matches!(
+                    github_helper_key_scope(key),
+                    GithubHelperScope::EveryGithubRequest
+                ),
+                "must apply to every github.com request: {key}"
+            );
+        }
+        for key in [
+            "credential.https://github.com/intent-hq.helper",
+            "credential.https://github.com/intent-hq/intentd.git.helper",
+            "credential.github.com/intent-hq.helper",
+            "credential.https://github.com:443/intent-hq.helper",
+        ] {
+            assert!(
+                matches!(
+                    github_helper_key_scope(key),
+                    GithubHelperScope::SomeGithubRequests
+                ),
+                "must apply to the github.com requests under its path: {key}"
+            );
         }
         for key in [
             "credential.http://github.com.helper",
             "credential.https://*.github.com.helper",
-            "credential.https://github.com/intent-hq.helper",
             "credential.https://gitlab.com.helper",
             "credential.https://github.com.username",
             "credential.https://alice@github.com.helper",
             "credential.useHttpPath",
             "url.https://github.com.insteadOf",
         ] {
-            assert!(!credential_key_targets_github(key), "must not match: {key}");
+            assert!(
+                matches!(github_helper_key_scope(key), GithubHelperScope::Unrelated),
+                "must not match: {key}"
+            );
         }
     }
 
@@ -935,7 +1030,10 @@ mod tests {
         );
         assert_eq!(
             github_helpers_from_config_list(list),
-            vec!["osxkeychain", "!gh auth git-credential"]
+            vec![
+                format!("{GITHUB_HELPER_KEY}=osxkeychain"),
+                format!("{GITHUB_HELPER_KEY}=!gh auth git-credential"),
+            ]
         );
 
         // An empty value clears everything accumulated so far, including
@@ -945,8 +1043,46 @@ mod tests {
             "credential.helper\n\0",
             "credential.https://github.com.helper\nstore\0",
         );
-        assert_eq!(github_helpers_from_config_list(list), vec!["store"]);
+        assert_eq!(
+            github_helpers_from_config_list(list),
+            vec![format!("{GITHUB_HELPER_KEY}=store")]
+        );
         assert!(github_helpers_from_config_list("").is_empty());
+    }
+
+    /// A path-scoped helper is re-added **under its own key**, in config order
+    /// among the rest (monorepo#3059 review): the reset clears the list for
+    /// every github.com request, so folding it into our own key was not an
+    /// option — that would widen a helper the user scoped to one owner into
+    /// one consulted for all of github.com. Empty values are re-emitted too,
+    /// so git re-applies the user's reset against the real remote URL.
+    #[test]
+    fn github_helpers_from_config_list_preserves_path_scoped_keys() {
+        let list = concat!(
+            "credential.https://github.com/intent-hq.helper\norg-helper\0",
+            "credential.helper\nosxkeychain\0",
+            "credential.https://github.com/other.helper\n\0",
+        );
+        assert_eq!(
+            github_helpers_from_config_list(list),
+            vec![
+                "credential.https://github.com/intent-hq.helper=org-helper".to_string(),
+                format!("{GITHUB_HELPER_KEY}=osxkeychain"),
+                "credential.https://github.com/other.helper=".to_string(),
+            ]
+        );
+
+        // A reset on a key covering every github.com request clears the
+        // path-scoped entries too: each of those requests matches it as well.
+        let list = concat!(
+            "credential.https://github.com/intent-hq.helper\norg-helper\0",
+            "credential.helper\n\0",
+            "credential.helper\nosxkeychain\0",
+        );
+        assert_eq!(
+            github_helpers_from_config_list(list),
+            vec![format!("{GITHUB_HELPER_KEY}=osxkeychain")]
+        );
     }
 
     /// The composed entries put intentd first and re-add the discovered
@@ -956,12 +1092,14 @@ mod tests {
     #[test]
     fn github_helper_entries_puts_intentd_first_and_keeps_fallbacks() {
         let entry = daemon_helper_config("/usr/local/bin/intentd");
-        let own_value = entry.strip_prefix(GITHUB_HELPER_RESET).unwrap().to_string();
         let fallbacks = vec![
-            own_value,
-            "osxkeychain".to_string(),
-            "!gh auth git-credential".to_string(),
-            "osxkeychain".to_string(),
+            entry.clone(),
+            format!("{GITHUB_HELPER_KEY}=osxkeychain"),
+            format!("{GITHUB_HELPER_KEY}=!gh auth git-credential"),
+            format!("{GITHUB_HELPER_KEY}=osxkeychain"),
+            // Same helper value, narrower scope: a different entry, not a
+            // duplicate, so it must survive the de-duplication above.
+            "credential.https://github.com/intent-hq.helper=osxkeychain".to_string(),
         ];
         assert_eq!(
             github_helper_entries(entry.clone(), Some(&fallbacks)),
@@ -970,6 +1108,7 @@ mod tests {
                 entry,
                 format!("{GITHUB_HELPER_KEY}=osxkeychain"),
                 format!("{GITHUB_HELPER_KEY}=!gh auth git-credential"),
+                "credential.https://github.com/intent-hq.helper=osxkeychain".to_string(),
             ]
         );
     }
@@ -1011,6 +1150,10 @@ mod tests {
         for (key, value) in [
             ("credential.helper", "local-generic"),
             ("credential.https://github.com.helper", "local-scoped"),
+            (
+                "credential.https://github.com/intent-hq.helper",
+                "local-org",
+            ),
             ("credential.https://gitlab.com.helper", "other-host"),
         ] {
             assert!(Command::new("git")
@@ -1023,11 +1166,17 @@ mod tests {
 
         let helpers = discover_github_helpers(Some(&repo), None).expect("git must be runnable");
         assert!(
-            helpers.ends_with(&["local-generic".to_string(), "local-scoped".to_string()]),
+            helpers.ends_with(&[
+                format!("{GITHUB_HELPER_KEY}=local-generic"),
+                format!("{GITHUB_HELPER_KEY}=local-scoped"),
+                // Kept under its own key, so re-adding it does not widen a
+                // one-owner helper into an all-of-github.com one.
+                "credential.https://github.com/intent-hq.helper=local-org".to_string(),
+            ]),
             "repo-local helpers, in config order, at the end: {helpers:?}"
         );
         assert!(
-            !helpers.iter().any(|h| h == "other-host"),
+            !helpers.iter().any(|h| h.ends_with("other-host")),
             "another host's helper must not be re-added for github.com: {helpers:?}"
         );
 
@@ -1036,7 +1185,10 @@ mod tests {
         let inherited = config_parameters(None, &["credential.helper=inherited".to_string()]);
         let helpers =
             discover_github_helpers(Some(&repo), Some(&inherited)).expect("git must be runnable");
-        assert_eq!(helpers.last().map(String::as_str), Some("inherited"));
+        assert_eq!(
+            helpers.last().map(String::as_str),
+            Some(format!("{GITHUB_HELPER_KEY}=inherited").as_str())
+        );
     }
 
     /// The defect this ordering exists to fix (monorepo#3059), driven through
@@ -1063,7 +1215,7 @@ mod tests {
         );
         let global = dir.global_config(&stale);
         let entry = daemon_helper_config(&intentd.to_string_lossy());
-        let fallbacks = vec![stale.to_string_lossy().to_string()];
+        let fallbacks = vec![format!("{GITHUB_HELPER_KEY}={}", stale.to_string_lossy())];
 
         let before = config_parameters(None, &github_helper_entries(entry.clone(), None));
         assert_eq!(
@@ -1100,7 +1252,10 @@ mod tests {
             None,
             &github_helper_entries(
                 daemon_helper_config(&silent.to_string_lossy()),
-                Some(&[configured.to_string_lossy().to_string()]),
+                Some(&[format!(
+                    "{GITHUB_HELPER_KEY}={}",
+                    configured.to_string_lossy()
+                )]),
             ),
         );
         assert_eq!(
@@ -1110,13 +1265,125 @@ mod tests {
         );
     }
 
+    /// [`fill_github_credential`] for a bare `https://github.com` request.
+    #[cfg(unix)]
+    fn fill_github_password(global: &std::path::Path, params: &str) -> Option<String> {
+        fill_github_credential(global, params, None)
+    }
+
+    /// The daemon-helper env discovers in the directory the child is spawned
+    /// in, not at the filesystem root (monorepo#3059 review): its agent and
+    /// terminal consumers launch shells in a workspace worktree, so a
+    /// repository-local helper configured there is one the github.com-wide
+    /// reset would otherwise clear without re-adding.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_helper_env_discovers_in_the_spawn_cwd() {
+        let dir = Scratch::new("spawncwd");
+        let repo = dir.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init")
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "credential.helper",
+                "repo-local-helper"
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git config")
+            .success());
+
+        let params = |cwd| {
+            let pairs = daemon_helper_env("/usr/local/bin/intentd", cwd, None);
+            assert_eq!(pairs.len(), 1);
+            pairs[0].1.clone()
+        };
+        assert!(
+            helper_values_via_git(&params(Some(&repo)))
+                .iter()
+                .any(|v| v == "repo-local-helper"),
+            "the worktree's own helper must be re-added behind intentd's"
+        );
+        assert!(
+            !helper_values_via_git(&params(None))
+                .iter()
+                .any(|v| v == "repo-local-helper"),
+            "discovering at the root cannot see it — which is why cwd is passed"
+        );
+    }
+
+    /// A path-scoped helper — `credential.https://github.com/intent-hq.helper`
+    /// — is consulted for a remote under that path, so the github.com-wide
+    /// reset drops it and it has to be re-added (monorepo#3059 review).
+    ///
+    /// The `Some(&[])` half is the defect verbatim: the reset with the
+    /// path-scoped helper not re-added leaves that remote with no fallback at
+    /// all once intentd declines. The re-add restores it — under its own key,
+    /// so it stays scoped to `intent-hq` and is *not* consulted for another
+    /// owner's remote, which folding it into the github.com-wide key would
+    /// have done.
+    #[cfg(unix)]
+    #[test]
+    fn path_scoped_helper_still_answers_when_the_daemon_helper_declines() {
+        let dir = Scratch::new("pathscoped");
+        let org = dir.stub("org", "printf 'username=alice\\npassword=org-pat\\n'\n");
+        // Exactly what `intentd git-credential` does with nothing to offer.
+        let silent = dir.stub("intentd", "exit 0\n");
+        let global = dir.0.join("gitconfig");
+        std::fs::write(
+            &global,
+            format!(
+                "[credential \"https://github.com/intent-hq\"]\n\thelper = {}\n",
+                org.display()
+            ),
+        )
+        .expect("write gitconfig");
+        let entry = daemon_helper_config(&silent.to_string_lossy());
+        let fallback = format!(
+            "credential.https://github.com/intent-hq.helper={}",
+            org.to_string_lossy()
+        );
+
+        let dropped = config_parameters(None, &github_helper_entries(entry.clone(), Some(&[])));
+        assert_eq!(
+            fill_github_credential(&global, &dropped, Some("intent-hq/intentd.git")),
+            None,
+            "the github.com-wide reset does clear a path-scoped helper — the bug"
+        );
+
+        let restored = config_parameters(None, &github_helper_entries(entry, Some(&[fallback])));
+        assert_eq!(
+            fill_github_credential(&global, &restored, Some("intent-hq/intentd.git")),
+            Some("org-pat".to_string()),
+            "a path-scoped helper must stay reachable behind intentd's"
+        );
+        assert_eq!(
+            fill_github_credential(&global, &restored, Some("other-org/repo.git")),
+            None,
+            "re-adding it must not widen it beyond the path the user scoped it to"
+        );
+    }
+
     /// Resolve a github.com credential through real git with `global` as the
     /// only config file and `params` as the command-line scope, returning the
-    /// password git settled on. Hermetic: the system gitconfig (the very file
+    /// password git settled on. `path` is the remote's path when the request
+    /// is for a specific repository, which is what path-scoped credential
+    /// config matches against. Hermetic: the system gitconfig (the very file
     /// that ships `credential.helper = osxkeychain`) is excluded, and prompts
     /// are disabled so an unanswered request fails instead of blocking.
     #[cfg(unix)]
-    fn fill_github_password(global: &std::path::Path, params: &str) -> Option<String> {
+    fn fill_github_credential(
+        global: &std::path::Path,
+        params: &str,
+        path: Option<&str>,
+    ) -> Option<String> {
         use std::io::Write;
         let mut child = Command::new("git")
             .args(["credential", "fill"])
@@ -1129,11 +1396,15 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("git must be runnable");
+        let request = match path {
+            Some(path) => format!("url=https://github.com/{path}\n\n"),
+            None => "protocol=https\nhost=github.com\n\n".to_string(),
+        };
         child
             .stdin
             .take()
             .unwrap()
-            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .write_all(request.as_bytes())
             .unwrap();
         let out = child.wait_with_output().expect("git credential fill");
         String::from_utf8_lossy(&out.stdout)
