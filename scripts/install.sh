@@ -284,6 +284,25 @@ pin_channel() {
   fi
 }
 
+# Report the just-installed binary's version by probing it with
+# --sitter-version. A probe FAILURE (the binary won't run: wrong arch,
+# missing libs, a bad env making it bail) is surfaced as a warning quoting
+# the probe's output — it must never be conflated with the probe succeeding
+# without printing a version, which stays the quiet no-version report.
+# Non-fatal by design: the binary is installed either way, and later steps
+# (pin_channel, service verification) fail hard on a binary that can't run.
+report_installed_version() {
+  if version=$("$install_dir/intentd" --sitter-version 2>&1); then
+    if [ -n "$version" ]; then
+      info "installed $version to $install_dir/intentd"
+    else
+      info "installed intentd to $install_dir/intentd"
+    fi
+  else
+    warn "installed intentd to $install_dir/intentd, but probing it with --sitter-version failed: ${version:-no output}"
+  fi
+}
+
 setup_service_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
@@ -475,11 +494,12 @@ main() {
       validate_channel "$channel"
     fi
   fi
-  # Every intentd call below inherits this environment, and the sitter parses
-  # INTENTD_CHANNEL case-sensitively (and lets the flag lose to it only when no
-  # flag is given). Re-export the normalized, effective value so a `--channel`
-  # flag is not undercut by a stale env var, and so a case-insensitive spelling
-  # this script accepts cannot make the sitter reject its own environment.
+  # Every intentd call below inherits this environment. The current sitter
+  # parses INTENTD_CHANNEL case-insensitively (and lets the flag lose to it
+  # only when no flag is given), but re-exporting the normalized, effective
+  # value stays as defense in depth: it keeps a `--channel` flag from being
+  # undercut by a stale env var, and protects sitters that predate the
+  # case-insensitive parse from rejecting their own environment.
   if [ -n "$channel" ]; then
     INTENTD_CHANNEL="$channel"
     export INTENTD_CHANNEL
@@ -580,12 +600,7 @@ main() {
     || fail "cannot install to $install_dir/intentd"
   staged=""
 
-  version=$("$install_dir/intentd" --sitter-version 2>/dev/null) || version=""
-  if [ -n "$version" ]; then
-    info "installed $version to $install_dir/intentd"
-  else
-    info "installed intentd to $install_dir/intentd"
-  fi
+  report_installed_version
 
   case ":$PATH:" in
     *":$install_dir:"*) ;;

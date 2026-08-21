@@ -30,12 +30,16 @@ pub enum Channel {
 }
 
 impl Channel {
+    /// Case-insensitive, matching the installer's validation: `BeTa` from
+    /// the env or a flag must select the same channel `beta` does (the
+    /// installer once exported `INTENTD_CHANNEL` unnormalized, and the
+    /// case-sensitive parse here made every child `intentd` call fail).
     fn parse(s: &str) -> Result<Self, CliError> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "stable" => Ok(Channel::Stable),
             "beta" => Ok(Channel::Beta),
             "alpha" => Ok(Channel::Alpha),
-            other => Err(CliError::InvalidChannel(other.to_string())),
+            _ => Err(CliError::InvalidChannel(s.to_string())),
         }
     }
 }
@@ -320,6 +324,41 @@ mod tests {
     #[test]
     fn empty_env_is_unset() {
         assert_eq!(parse(&[], Some("")).unwrap().channel, None);
+    }
+
+    #[test]
+    fn channel_env_is_case_insensitive() {
+        // The installer validates channel values case-insensitively; an
+        // env spelling like `BeTa` must select the same channel `beta` does
+        // instead of failing every child `intentd` call.
+        assert_eq!(
+            parse(&[], Some("BeTa")).unwrap().channel,
+            resolved(Channel::Beta, ChannelOrigin::Env)
+        );
+        assert_eq!(
+            parse(&[], Some("STABLE")).unwrap().channel,
+            resolved(Channel::Stable, ChannelOrigin::Env)
+        );
+    }
+
+    #[test]
+    fn channel_flag_is_case_insensitive() {
+        assert_eq!(
+            parse(&["--sitter-channel", "Alpha"], None).unwrap().channel,
+            resolved(Channel::Alpha, ChannelOrigin::Flag)
+        );
+        assert_eq!(
+            parse(&["--sitter-channel=BETA"], None).unwrap().channel,
+            resolved(Channel::Beta, ChannelOrigin::Flag)
+        );
+    }
+
+    #[test]
+    fn invalid_channel_error_preserves_original_spelling() {
+        assert_eq!(
+            parse(&[], Some("NiGhTlY")),
+            Err(CliError::InvalidChannel("NiGhTlY".to_string()))
+        );
     }
 
     #[test]
