@@ -136,6 +136,9 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrRefreshOutcome {
     /// Not eligible (remote/archived workspace, no repo, or no branch).
+    /// Git-root refreshes still run the repo-scoped stale-pool heal on a
+    /// branchless root ([`refresh_stale_pool_entries`]), upgrading to
+    /// `Updated` when it changed the pool.
     Skipped,
     /// Eligible but nothing changed (linked PR snapshot identical; or no
     /// matching PR found during discovery).
@@ -329,6 +332,73 @@ pub(crate) fn upsert_pr_info(
     items.retain(|p| p.number != info.number);
     items.insert(first, info.clone());
     true
+}
+
+/// Cap on stale `pull_requests` re-fetches per git root per sweep
+/// (monorepo#3127). Bounds the forge calls added by
+/// [`refresh_stale_pool_entries`] so a long PR history stays within the
+/// sweep's per-root `PR_REFRESH_FETCH_TIMEOUT` budget; entries beyond the
+/// cap converge over successive sweeps (oldest-updated first).
+pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
+
+/// Heal persisted staleness in a `pull_requests` list by re-fetching entries
+/// against the forge and upserting their fresh snapshots (monorepo#3127).
+/// Sweep-time work only — never attach this to an RPC read path (see the
+/// RPC cost contract).
+///
+/// Every non-Merged entry (Open, Draft, AND Closed) is a candidate: Merged
+/// is the only irreversible forge state — a Closed PR can be reopened, and
+/// the list PR pool merge is deliberately one-way (a terminal entry is never
+/// downgraded by a candidate), so only this authoritative re-fetch can move
+/// a persisted Closed entry back to Open. `exclude` names PR numbers already
+/// fetched fresh this pass (the linked / just-discovered PR). At most
+/// [`MAX_STALE_POOL_REFETCHES`] entries are re-fetched per call, oldest
+/// `updatedAt` first (unparseable timestamps sort oldest, ties by number);
+/// fail-soft per entry — a forge error logs and keeps the persisted
+/// snapshot, and each re-fetch is bounded by `per_entry_timeout` so one
+/// hung connection (monorepo#1988 lineage) can never eat the caller's whole
+/// per-root budget and starve the linked-PR delta persist that follows the
+/// heal. Returns whether the list changed.
+pub(crate) async fn refresh_stale_pool_entries(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    list: &mut Option<Vec<PullRequestInfo>>,
+    exclude: &[u64],
+    per_entry_timeout: std::time::Duration,
+) -> bool {
+    let Some(items) = list.as_deref() else {
+        return false;
+    };
+    let mut candidates: Vec<(Option<OffsetDateTime>, u64)> = items
+        .iter()
+        .filter(|p| p.status != PullRequestStatus::Merged && !exclude.contains(&p.number))
+        .map(|p| (parse_iso(&p.updated_at), p.number))
+        .collect();
+    candidates.sort();
+    candidates.truncate(MAX_STALE_POOL_REFETCHES);
+    let mut changed = false;
+    for (_, number) in candidates {
+        match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
+            Ok(Ok(pr)) => {
+                changed |= upsert_pr_info(list, &build_pr_info(&pr));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    pr_number = number,
+                    error = %e,
+                    "stale PR pool re-fetch failed; keeping persisted snapshot"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pr_number = number,
+                    timeout = ?per_entry_timeout,
+                    "stale PR pool re-fetch timed out; keeping persisted snapshot"
+                );
+            }
+        }
+    }
+    changed
 }
 
 /// Derive the persisted [`PullRequestStatus`] from a forge PR (draft wins over

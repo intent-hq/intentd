@@ -3177,9 +3177,18 @@ impl Services {
     /// (unlinking only on a positive branch mismatch), a linked PR fetched
     /// as merged/closed stays recorded in `pull_requests` and triggers
     /// discovery of a newer open PR on the same branch, and an unlinked
-    /// root discovers an open PR by branch. Persists via the scoped
-    /// `update_workspace_git_root_pr` and emits `gitRoot:updated` only on
-    /// change.
+    /// root discovers an open PR by branch.
+    ///
+    /// After the linkage handling, heals persisted staleness in the root's
+    /// `pull_requests` list (monorepo#3127): a bounded number of non-Merged
+    /// entries are re-fetched per sweep, oldest-updated first, and their
+    /// fresh status upserted ([`pr_ops::refresh_stale_pool_entries`]) —
+    /// fail-soft per entry, so one forge error never aborts the root
+    /// refresh. This is sweep-time work bounded by the caller's
+    /// [`PR_REFRESH_FETCH_TIMEOUT`] wrap, never RPC-time.
+    ///
+    /// Persists via the scoped `update_workspace_git_root_pr` and emits
+    /// `gitRoot:updated` once, only on change.
     async fn refresh_git_root_pr(
         &self,
         mut root: intent_core::WorkspaceGitRoot,
@@ -3201,116 +3210,143 @@ impl Services {
         .ok()
         .flatten()
         .unwrap_or_default();
-        if let Some(number) = root.pr_number {
+        let mut changed = false;
+        // PR numbers fetched fresh this pass (linked / just-discovered);
+        // the stale-pool heal below skips them.
+        let mut fetched_fresh: Vec<u64> = Vec::new();
+        let mut outcome = if let Some(number) = root.pr_number {
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            fetched_fresh.push(number);
             // Clear a stale link only on a positive mismatch against the
             // root's current branch; an unreadable HEAD (empty branch)
-            // never unlinks.
+            // never unlinks. The fetched snapshot still refreshes an
+            // existing pool entry in place (it's authoritative and already
+            // paid for) — but never appends, so an off-branch PR doesn't
+            // join the pool just by having been linked.
             if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
+                if root
+                    .pull_requests
+                    .as_deref()
+                    .is_some_and(|items| items.iter().any(|p| p.number == number))
+                {
+                    // `changed` is set unconditionally below (the unlink
+                    // itself persists), so the upsert's flag is redundant.
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &pr_ops::build_pr_info(&pr));
+                }
                 root.pr_number = None;
                 root.pr_url = None;
                 root.pr_status = None;
-                root.updated_at = now_iso();
-                self.store.update_workspace_git_root_pr(&root).await?;
-                publish_event(
-                    self.event_bus.as_ref(),
-                    git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                )
-                .await;
-                return Ok(PrRefreshOutcome::Unlinked);
-            }
-            let info = pr_ops::build_pr_info(&pr);
-            let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
-            // A merged/closed linked PR stays recorded in `pull_requests`
-            // but no longer blocks discovery: relink to a newer open PR on
-            // the same branch. A discovery failure degrades to the plain
-            // update path below so the status delta is never lost.
-            if matches!(
-                info.status,
-                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-            ) && !branch.is_empty()
-            {
-                let discovered = match pr_ops::discover_matching_open_pr(
-                    sc.as_ref(),
-                    &repo_ref,
-                    &branch,
-                    None,
-                    Some(number),
-                )
-                .await
+                changed = true;
+                PrRefreshOutcome::Unlinked
+            } else {
+                let info = pr_ops::build_pr_info(&pr);
+                changed |= pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                // A merged/closed linked PR stays recorded in `pull_requests`
+                // but no longer blocks discovery: relink to a newer open PR on
+                // the same branch. A discovery failure degrades to the plain
+                // update path below so the status delta is never lost.
+                let mut relinked = false;
+                if matches!(
+                    info.status,
+                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+                ) && !branch.is_empty()
                 {
-                    Ok(found) => found,
-                    Err(e) => {
-                        tracing::warn!(
-                            git_root = %root.id.as_str(),
-                            error = %e,
-                            "git root refresh: relink discovery failed, persisting status only"
-                        );
-                        None
-                    }
-                };
-                if let Some(open_pr) = discovered {
-                    let open_info = pr_ops::build_pr_info(&open_pr);
-                    pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
-                    root.pr_number = Some(open_pr.number);
-                    root.pr_url = Some(open_pr.url.clone());
-                    root.pr_status = Some(open_info.status);
-                    root.updated_at = now_iso();
-                    self.store.update_workspace_git_root_pr(&root).await?;
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    let discovered = match pr_ops::discover_matching_open_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &branch,
+                        None,
+                        Some(number),
                     )
-                    .await;
-                    return Ok(PrRefreshOutcome::Linked);
+                    .await
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            tracing::warn!(
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root refresh: relink discovery failed, persisting status only"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(open_pr) = discovered {
+                        fetched_fresh.push(open_pr.number);
+                        let open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                        root.pr_number = Some(open_pr.number);
+                        root.pr_url = Some(open_pr.url.clone());
+                        root.pr_status = Some(open_info.status);
+                        changed = true;
+                        relinked = true;
+                    }
+                }
+                if relinked {
+                    PrRefreshOutcome::Linked
+                } else {
+                    if root.pr_status != Some(info.status)
+                        || root.pr_url.as_deref() != Some(pr.url.as_str())
+                    {
+                        root.pr_status = Some(info.status);
+                        root.pr_url = Some(pr.url.clone());
+                        changed = true;
+                    }
+                    PrRefreshOutcome::Unchanged
                 }
             }
-            let changed = list_changed
-                || root.pr_status != Some(info.status)
-                || root.pr_url.as_deref() != Some(pr.url.as_str());
-            if !changed {
-                return Ok(PrRefreshOutcome::Unchanged);
-            }
-            root.pr_status = Some(info.status);
-            root.pr_url = Some(pr.url.clone());
-            root.updated_at = now_iso();
-            self.store.update_workspace_git_root_pr(&root).await?;
-            publish_event(
-                self.event_bus.as_ref(),
-                git_root_changed_event(GIT_ROOT_UPDATED, &root),
-            )
-            .await;
-            Ok(PrRefreshOutcome::Updated)
+        } else if branch.is_empty() {
+            PrRefreshOutcome::Skipped
         } else {
-            if branch.is_empty() {
-                return Ok(PrRefreshOutcome::Skipped);
-            }
             let found =
                 pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
                     .await
                     .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
+                    fetched_fresh.push(pr.number);
                     let info = pr_ops::build_pr_info(&pr);
                     pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
                     root.pr_number = Some(pr.number);
                     root.pr_url = Some(pr.url.clone());
                     root.pr_status = Some(info.status);
-                    root.updated_at = now_iso();
-                    self.store.update_workspace_git_root_pr(&root).await?;
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                    )
-                    .await;
-                    Ok(PrRefreshOutcome::Linked)
+                    changed = true;
+                    PrRefreshOutcome::Linked
                 }
-                None => Ok(PrRefreshOutcome::Unchanged),
+                None => PrRefreshOutcome::Unchanged,
             }
+        };
+        // Each heal re-fetch gets a tenth of the per-root budget: the five
+        // capped entries can consume at most half of it, so a hung pool
+        // fetch (monorepo#1988 lineage) can never starve the linked-PR
+        // delta persist below out of the caller's PR_REFRESH_FETCH_TIMEOUT.
+        changed |= pr_ops::refresh_stale_pool_entries(
+            sc.as_ref(),
+            &repo_ref,
+            &mut root.pull_requests,
+            &fetched_fresh,
+            self.pr_refresh_fetch_timeout / 10,
+        )
+        .await;
+        if !changed {
+            return Ok(outcome);
         }
+        if matches!(
+            outcome,
+            PrRefreshOutcome::Unchanged | PrRefreshOutcome::Skipped
+        ) {
+            outcome = PrRefreshOutcome::Updated;
+        }
+        root.updated_at = now_iso();
+        self.store.update_workspace_git_root_pr(&root).await?;
+        publish_event(
+            self.event_bus.as_ref(),
+            git_root_changed_event(GIT_ROOT_UPDATED, &root),
+        )
+        .await;
+        Ok(outcome)
     }
 
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
