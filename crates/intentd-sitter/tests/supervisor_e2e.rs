@@ -750,6 +750,136 @@ fn crashes_after_a_healthy_run_never_trip_the_give_up() {
     wait_exit(&mut sitter, Duration::from_secs(10));
 }
 
+/// The log lines `scripts/install.sh` and `scripts/install.ps1` grep for in
+/// their post-timeout diagnosis: the give-up banner plus the failure
+/// phrasings the serve loop emits. This is a prose contract, not a
+/// machine-readable marker — the sitter binary and both install scripts ship
+/// from the same `sitter-latest` release and the installer replaces the
+/// sitter before (re)starting the service, so the emitter and the matchers
+/// can never skew in version; these tests are what keeps the sides in
+/// lockstep. Rewording a sitter line (or a script pattern) without updating
+/// the other side fails here instead of silently degrading the installers
+/// back to the misleading "may still be downloading" warning.
+const INSTALL_LOG_CONTRACT: [&str; 4] = [
+    "times in a row without ever staying up",
+    "exited unexpectedly",
+    "failed to spawn",
+    "failed waiting on intentd",
+];
+
+/// Both install scripts and the supervisor source must carry every contract
+/// substring. Substring presence in `supervisor.rs` is the only pin for the
+/// "failed waiting on intentd" arm, which no test can trigger (it needs
+/// `child.wait()` itself to fail); the other three are additionally proven
+/// emitted, verbatim, by the two behavioral tests below.
+#[test]
+fn install_log_contract_scripts_and_supervisor_match() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sources = [
+        (root.join("src/supervisor.rs"), "//"),
+        (root.join("../../scripts/install.sh"), "#"),
+        (root.join("../../scripts/install.ps1"), "#"),
+    ];
+    for (path, comment_prefix) in &sources {
+        let content =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // Comment lines also quote the contract substrings (the lockstep
+        // pointers in supervisor.rs and both scripts), so scan only code
+        // lines: rewording a real emission or grep pattern must fail here
+        // even while a comment still carries the old text.
+        let code = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(comment_prefix))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in INSTALL_LOG_CONTRACT {
+            assert!(
+                code.contains(needle),
+                "{} lost the install log-contract substring {needle:?} from its \
+                 code (comment lines are ignored); sitter lines and \
+                 install-script patterns must change in lockstep",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A permanently-crashing daemon must produce the "exited unexpectedly"
+/// respawn line and the give-up banner carrying the contract substrings
+/// verbatim — this is what pins the actually-emitted text, not just the
+/// source.
+#[test]
+fn install_log_contract_crash_loop_lines_are_emitted_verbatim() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(3));
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "2")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    for needle in [
+        "exited unexpectedly",
+        "times in a row without ever staying up",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "install.sh/install.ps1 grep for {needle:?}, which the sitter no \
+             longer emits — update both scripts and INSTALL_LOG_CONTRACT in \
+             lockstep; stderr: {stderr}"
+        );
+    }
+}
+
+/// Same pin for the spawn-failure arm: a binary that exists but cannot be
+/// executed must produce the "failed to spawn" line verbatim.
+#[test]
+fn install_log_contract_spawn_failure_line_is_emitted_verbatim() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Preinstall, then strip the exec bit: the binary exists (so nothing
+    // tries to download a replacement) but cannot be spawned.
+    preinstall(&paths, "0.1.0", &crash_script(3));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = paths.daemon_binary("0.1.0");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "1")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("failed to spawn"),
+        "install.sh/install.ps1 grep for \"failed to spawn\", which the sitter \
+         no longer emits — update both scripts and INSTALL_LOG_CONTRACT in \
+         lockstep; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn sighup_during_crash_backoff_respawns_the_state_json_version() {
     let _serial = SERVE_LOOP_SERIAL

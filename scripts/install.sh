@@ -186,6 +186,10 @@ verify_daemon() {
 Your auto-resume choice ('$auto_resume') was not applied; once the daemon is up, apply it with:
   intentd settings agents.resumeInterruptedOnStart $auto_resume" ;;
   esac
+  # The substrings matched below are the sitter's own log lines — a detection
+  # contract with crates/intentd-sitter/src/supervisor.rs and install.ps1,
+  # pinned by the install_log_contract_* tests in
+  # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in lockstep.
   log_out=$(service_log_tail)
   case "$log_out" in
     *"times in a row without ever staying up"*)
