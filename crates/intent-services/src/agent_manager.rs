@@ -307,6 +307,18 @@ fn is_cancel_transport_closed(e: &intent_acp::AcpError) -> bool {
     matches!(e, intent_acp::AcpError::Transport(_))
 }
 
+/// Upper bound on ENQUEUEING a `session/cancel` frame onto the transport's
+/// outbound channel (intent-hq/monorepo#3039). `Connection::notify` awaits
+/// channel capacity with no bound of its own; on a WEDGED transport — the
+/// child stopped draining its stdin (e.g. after ingesting a multi-MB tool
+/// result), so the writer task is blocked mid-`write_all` on the full pipe
+/// and the outbound channel is full — that await never completes. Both
+/// cancel sites (the keep-alive interrupt and the idle-timeout settle) must
+/// therefore time-bound the call, or the stop/turn-worker wedges with the
+/// busy slot held and NO terminal event ever reaches the FE. Cancel-safe to
+/// abandon: a timed-out `mpsc` send enqueues nothing.
+const SESSION_CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Settle a hung `session/prompt` after the idle timeout WITHOUT killing the
 /// child: send `session/cancel` so the agent resolves/abandons the hung turn
 /// server-side (its in-flight prompt already had its client-side pending-map
@@ -317,18 +329,27 @@ fn is_cancel_transport_closed(e: &intent_acp::AcpError) -> bool {
 ///
 /// Returns whether the cancel was delivered: `false` when the transport is
 /// already closed (the child died — the expected race, tolerated exactly like
-/// [`is_cancel_transport_closed`] in the interrupt path, logged at DEBUG) or
-/// on any other wire error (logged at WARN). Best-effort by design: a `false`
-/// tells the caller the child is likely not settleable and a respawn path is
-/// more appropriate than a warn-and-continue turn.
+/// [`is_cancel_transport_closed`] in the interrupt path, logged at DEBUG), on
+/// any other wire error (logged at WARN), or when the enqueue itself did not
+/// complete within [`SESSION_CANCEL_WRITE_TIMEOUT`] (a WEDGED transport,
+/// intent-hq/monorepo#3039 — an unbounded await here hung the turn worker
+/// forever with the busy slot held and no terminal event, while the process
+/// registry already read idle). Best-effort by design: a `false` tells the
+/// caller the child is likely not settleable and a respawn path is more
+/// appropriate than a warn-and-continue turn.
 async fn cancel_and_settle_idle_prompt(
     conn: &Connection,
     agent_id: &AgentId,
     acp_session_id: &str,
 ) -> bool {
-    match intent_acp::session::cancel(conn, acp_session_id).await {
-        Ok(()) => true,
-        Err(e) if is_cancel_transport_closed(&e) => {
+    match tokio::time::timeout(
+        SESSION_CANCEL_WRITE_TIMEOUT,
+        intent_acp::session::cancel(conn, acp_session_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) if is_cancel_transport_closed(&e) => {
             tracing::debug!(
                 agent = %agent_id,
                 error = %e,
@@ -336,8 +357,16 @@ async fn cancel_and_settle_idle_prompt(
             );
             false
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(agent = %agent_id, error = %e, "idle-prompt settle: session/cancel failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                agent = %agent_id,
+                timeout = ?SESSION_CANCEL_WRITE_TIMEOUT,
+                "idle-prompt settle: session/cancel undeliverable (transport wedged) — treating the child as unsettleable (monorepo#3039)"
+            );
             false
         }
     }
@@ -3909,14 +3938,37 @@ impl AgentManager {
         }
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
-        // best-effort — a wire error never blocks the stop.
-        if let Err(e) = intent_acp::session::cancel(&conn, &acp_session_id).await {
-            if is_cancel_transport_closed(&e) {
+        // best-effort — a wire error never blocks the stop. Time-bounded
+        // (intent-hq/monorepo#3039): on a WEDGED transport (child stopped
+        // draining stdin, writer task blocked, outbound channel full) the
+        // unbounded `notify` await hung this method forever — Stop never
+        // reached the terminal emits below and the FE spun on "Thinking"
+        // until the idle sweep silently reaped the agent. A child that
+        // cannot even accept the cancel frame is not resumable, so the
+        // keep-alive contract is void: tear it down and proceed to the
+        // terminal events.
+        match tokio::time::timeout(
+            SESSION_CANCEL_WRITE_TIMEOUT,
+            intent_acp::session::cancel(&conn, &acp_session_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if is_cancel_transport_closed(&e) => {
                 // Child already dead — expected race when cancelling a dead
                 // turn; the run_turn branch surfaces the real failure.
                 tracing::debug!(agent = %agent_id, error = %e, "session/cancel skipped: transport already closed");
-            } else {
+            }
+            Ok(Err(e)) => {
                 tracing::warn!(agent = %agent_id, error = %e, "session/cancel failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    timeout = ?SESSION_CANCEL_WRITE_TIMEOUT,
+                    "session/cancel undeliverable (transport wedged) — killing the child so the stop settles (monorepo#3039)"
+                );
+                self.kill_child_only(agent_id).await;
             }
         }
         // STAB-124: the cancelled child echoes `tool_call_update`s for the
