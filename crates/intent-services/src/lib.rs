@@ -1646,11 +1646,11 @@ impl Services {
             Some(ws.updated_at.as_str()),
             Some(ws.created_at.as_str()),
         ]);
-        if let Ok(notes) = self.store.list_notes(&ws.id).await {
-            for note in &notes {
-                activity_max =
-                    latest_activity_candidate(&[activity_max.as_deref(), Some(&note.updated_at)]);
-            }
+        // Aggregate read (monorepo#3058): only the newest note `updated_at`
+        // matters here, so never hydrate note bodies to fold timestamps.
+        if let Ok(max_note) = self.store.max_note_updated_at(&ws.id).await {
+            activity_max =
+                latest_activity_candidate(&[activity_max.as_deref(), max_note.as_deref()]);
         }
         // Finding F1: message-free session read for hot paths. Only `updated_at`
         // matters for lastActivity derivation, so skip message hydration.
@@ -1837,24 +1837,34 @@ impl Services {
             Some(ws.updated_at.as_str()),
             Some(ws.created_at.as_str()),
         ]);
-        if let Ok(notes) = self.store.list_notes(&ws.id).await {
-            for note in &notes {
-                activity_max =
-                    latest_activity_candidate(&[activity_max.as_deref(), Some(&note.updated_at)]);
-            }
-            ws.task_stats = Some(compute_task_stats(&notes));
+        // Bounded note reads (monorepo#3058): the old shape hydrated every
+        // note body (`list_notes`) per workspace just to fold `updated_at`
+        // and count task stats, so list latency scaled with total stored
+        // note bytes. Split into the index-backed MAX aggregate plus the
+        // counting query (`cheap_task_stats`, `compute_task_stats` parity —
+        // reads only the spec's content for the linked-id filter).
+        if let Ok(max_note) = self.store.max_note_updated_at(&ws.id).await {
+            activity_max =
+                latest_activity_candidate(&[activity_max.as_deref(), max_note.as_deref()]);
         }
+        // A stats-read failure degrades to absent taskStats + displayStatus,
+        // matching the old list_notes-failure behavior.
+        ws.task_stats = self.cheap_task_stats(&ws.id).await.ok();
         // Finding F1: message-free session read for hot paths. `build_agent_summary`
         // only needs session metadata (id, name, status, specialist, updated_at),
-        // never message bodies, so skip hydration.
-        if let Ok(sessions) = self.store.list_agent_session_summaries(&ws.id).await {
-            for session in &sessions {
+        // never message bodies, so skip hydration. The summaries are kept
+        // alive past this fold and handed to the displayStatus derivation
+        // below so the attention probe reuses them instead of re-issuing the
+        // same per-workspace query (monorepo#3058).
+        let sessions = self.store.list_agent_session_summaries(&ws.id).await.ok();
+        if let Some(sessions) = &sessions {
+            for session in sessions {
                 activity_max = latest_activity_candidate(&[
                     activity_max.as_deref(),
                     Some(&session.updated_at),
                 ]);
             }
-            ws.agent_summary = Some(build_agent_summary(&sessions));
+            ws.agent_summary = Some(build_agent_summary(sessions));
         }
         // diffSummary: omitted on list/get/subscription re-reads (see method docs).
         ws.diff_summary = None;
@@ -1871,7 +1881,7 @@ impl Services {
         // Derived "current cycle" display status over the active/latest PR
         // and the taskStats computed above; never persisted. See
         // [`Services::enrich_display_status`] (workspace_status module).
-        self.enrich_display_status(ws).await;
+        self.enrich_display_status(ws, sessions.as_deref()).await;
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -12969,7 +12979,7 @@ impl WorkspaceApi for Services {
                 // Same derivation + baseline seeding as the enriched path
                 // (see [`Services::enrich_display_status`]).
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
-                this.enrich_display_status(ws).await;
+                this.enrich_display_status(ws, None).await;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later

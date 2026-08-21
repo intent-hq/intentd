@@ -78,6 +78,32 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
+    /// Newest `updated_at` across a workspace's notes, or `None` when the
+    /// workspace has none — the note half of the `lastActivity` derivation
+    /// (`enrich_workspace_aggregates` / `derive_last_activity`) as a single
+    /// aggregate answered from the covering
+    /// `idx_note_workspace_updated_at(workspace_id, updated_at)` index, so
+    /// the hot list/get emit paths never hydrate note bodies just to fold
+    /// timestamps (monorepo#3058).
+    ///
+    /// `MAX` here is a lexicographic TEXT max: it assumes uniform
+    /// daemon-written RFC3339 UTC strings (`now_iso()`), where lexicographic
+    /// order ≈ chronological order. Sub-second skew is possible when
+    /// fractional-second precision varies within the same second (a bare
+    /// `..:00Z` sorts above `..:00.5Z`) — acceptable for `lastActivity`,
+    /// which is a sidebar sort/label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the underlying query fails.
+    pub async fn max_note_updated_at(&self, workspace_id: &WorkspaceId) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT MAX(updated_at) FROM note WHERE workspace_id = ?")
+            .bind(&workspace_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("max note updated_at failed: {e}")))
+    }
+
     /// List every note across all workspaces, oldest first. Backs the global
     /// `search.notes` adapter (PROTOCOL §5.15), which has no `workspaceId`.
     ///

@@ -100,7 +100,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101
         ]
     );
     assert_eq!(
@@ -110,7 +110,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101
         ]
     );
 }
@@ -756,6 +756,93 @@ async fn note_round_trip() {
 
     let fetched = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(fetched.id, note.id);
+}
+
+/// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per
+/// workspace as a single aggregate — `None` for a workspace with no notes,
+/// the max across notes otherwise, matching what folding hydrated
+/// `list_notes` rows would produce. Backs the `lastActivity` derivation on
+/// the hot list/get emit paths without note-body hydration.
+#[tokio::test]
+async fn max_note_updated_at_matches_list_notes_fold() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // No notes: the aggregate reads None (SQL MAX over zero rows is NULL).
+    assert_eq!(
+        store.max_note_updated_at(&ws_id).await.expect("empty max"),
+        None
+    );
+
+    let mk_note = |id: &str, updated_at: &str| Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: id.to_string(),
+        content: "body".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: updated_at.to_string(),
+        rev: 0,
+        updated_at: updated_at.to_string(),
+    };
+    for (id, ts) in [
+        ("n-old", "2026-01-01T00:00:00Z"),
+        ("n-new", "2026-03-01T00:00:00Z"),
+        ("n-mid", "2026-02-01T00:00:00Z"),
+    ] {
+        store.insert_note(&mk_note(id, ts)).await.expect("insert");
+    }
+
+    let max = store.max_note_updated_at(&ws_id).await.expect("max");
+    assert_eq!(max.as_deref(), Some("2026-03-01T00:00:00Z"));
+
+    // Parity with the old fold over hydrated rows.
+    let notes = store.list_notes(&ws_id).await.expect("list");
+    let folded = notes.iter().map(|n| n.updated_at.as_str()).max();
+    assert_eq!(max.as_deref(), folded);
+
+    // Scoped per workspace: another workspace's notes never leak in.
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .expect("insert other ws");
+    assert_eq!(
+        store.max_note_updated_at(&other).await.expect("other max"),
+        None
+    );
+
+    // The aggregate must be answered from the covering
+    // idx_note_workspace_updated_at index — never by visiting note rows
+    // (whose bodies can be large), or the O(notes) read this replaces
+    // silently returns (monorepo#3058).
+    let details: Vec<String> =
+        sqlx::query("EXPLAIN QUERY PLAN SELECT MAX(updated_at) FROM note WHERE workspace_id = ?")
+            .bind(&ws_id.0)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("COVERING INDEX idx_note_workspace_updated_at")),
+        "aggregate must use the covering index, plan: {details:?}"
+    );
 }
 
 #[tokio::test]
