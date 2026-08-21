@@ -261,17 +261,16 @@ async fn delegate_specialist_coding_agent_unavailable_errors_instead_of_auggie()
     );
 }
 
-/// Nothing configured (no specialist `codingAgent`, no `providers.active`):
-/// `agent.delegate` still succeeds and leaves `provider` unset, exactly the
-/// pre-existing "no configured default" model-resolution behavior — this is
-/// NOT the "unavailable" error case (D2 step 3's `Ok(None)` branch), and
-/// must not regress the large existing test suite that delegates without
-/// ever configuring a default provider.
+/// Nothing configured (no specialist `codingAgent`, no `providers.active`,
+/// no compound `model.default`): `agent.delegate` fails loudly with the
+/// clear no-default `-32602` (monorepo#3044) — the former residual behavior
+/// left `provider` unset and the spawn silently bottomed out at the
+/// positional first registered provider (auggie), installed or not.
 #[tokio::test]
-async fn delegate_with_nothing_configured_leaves_provider_unset() {
+async fn delegate_with_nothing_configured_fails_loudly() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
 
-    let resp = svc
+    let err = svc
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
@@ -281,15 +280,12 @@ async fn delegate_with_nothing_configured_leaves_provider_unset() {
             None,
         )
         .await
-        .expect("delegate succeeds with nothing configured");
-    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        .expect_err("delegate with nothing configured must fail loudly");
     assert!(
-        resp.get("provider").is_none(),
-        "delegate result omits `provider` when the session has none (never null): {resp}"
+        matches!(&err, intent_core::Error::InvalidParams(m)
+            if m.contains("no default provider/model is configured")),
+        "clear no-default error, got: {err:?}"
     );
-
-    let got = svc.agent_get_op(agent_id, None).await.expect("get");
-    assert_eq!(got.provider, None, "no configured default to resolve to");
 }
 
 /// An explicit `model` param (even a bare, non-compound one) opts out of D2

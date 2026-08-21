@@ -4410,6 +4410,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Default-provider self-heal (monorepo#3044), invoked by the transport
+    /// after a `host.providerDiscovery` pass with the registry-ordered ids of
+    /// the providers discovery reported as installed. When no default
+    /// provider is derivable from settings and at least one installed
+    /// provider exists, the implementation persists the first installed
+    /// provider as `providers.active` (and, when a cached model catalog
+    /// exists for it, its default model as a compound `model.default`).
+    /// Idempotent, and never overwrites an existing settings value. Returns
+    /// `{ healed: boolean, ... }`. Default: no-op (read-only wirings).
+    fn settings_heal_default_provider(
+        &self,
+        installed_provider_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = installed_provider_ids;
+        Box::pin(async { Ok(serde_json::json!({ "healed": false })) })
+    }
+
     /// `system.capabilities`: machine-level capabilities independent of any
     /// workspace — `{ cowSupported?: boolean }` (PROTOCOL §5.7). `cowSupported`
     /// reports the `CoW` probe of the workspaces root (`true`/`false` for a

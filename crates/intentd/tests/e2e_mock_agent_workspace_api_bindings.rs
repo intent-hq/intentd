@@ -103,6 +103,7 @@ async fn task_bindings_update_status_and_get() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -244,6 +245,7 @@ async fn comment_bindings_add_and_list() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();

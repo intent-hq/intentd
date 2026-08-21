@@ -132,6 +132,7 @@ async fn boot(
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
         Services::new(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
