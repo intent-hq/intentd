@@ -1705,7 +1705,7 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
                 }
             }
             Ok(None) => break,
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
     let ev = evict_event.expect("TTL reap publishes agent:process:evicted");
