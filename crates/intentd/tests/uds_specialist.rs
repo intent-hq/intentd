@@ -644,7 +644,9 @@ fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
 
 #[tokio::test]
 async fn specialist_resolution_preview() {
-    let h = start().await;
+    // monorepo#3044: the preview's "default provider" context derives from
+    // settings only (no positional fallback), so pin auggie explicitly.
+    let h = start_with_settings("[providers]\nactive = \"auggie\"\n").await;
     // Pinned frontmatter model — bare ids are provider-agnostic while no
     // cached catalog disproves ownership (cold caches in this harness).
     write_specialist_frontmatter(&h.user_dir, "pinner", "model: \"opus4.5\"");
@@ -758,7 +760,7 @@ async fn specialist_resolution_preview() {
 #[tokio::test]
 async fn specialist_resolution_preview_inherits_settings() {
     let h = start_with_settings(
-        "[model]\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
+        "[providers]\nactive = \"auggie\"\n\n[model]\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",
     )
     .await;
     // No frontmatter model config → settings chain decides.

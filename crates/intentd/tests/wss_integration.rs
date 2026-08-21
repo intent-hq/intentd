@@ -812,6 +812,7 @@ async fn wss_oversized_message_terminates_connection() {
 #[tokio::test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -940,6 +941,7 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
 #[tokio::test]
 async fn wss_agent_list_omits_initial_message() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1221,6 +1223,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
 #[tokio::test]
 async fn wss_agent_send_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1296,6 +1299,7 @@ async fn wss_agent_send_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_queue_message_rejects_unknown_agent() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1371,6 +1375,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
 #[tokio::test]
 async fn wss_agent_diagnostics_reports_queue_snapshots() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1474,6 +1479,9 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
@@ -1606,6 +1614,9 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
@@ -1699,6 +1710,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
 #[tokio::test]
 async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2266,6 +2278,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
 #[tokio::test]
 async fn wss_agent_create_widened_params_round_trip() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2370,6 +2383,7 @@ async fn wss_agent_create_widened_params_round_trip() {
 #[tokio::test]
 async fn wss_agent_mark_seen_round_trip() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2546,6 +2560,7 @@ async fn wss_agent_mark_seen_round_trip() {
 #[tokio::test]
 async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -2735,6 +2750,7 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
 #[tokio::test]
 async fn wss_agent_session_shape_rpcs_round_trip() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3009,6 +3025,7 @@ async fn wss_agent_reasoning_effort_round_trip() {
 #[tokio::test]
 async fn wss_agent_delegate_persists_reasoning_effort() {
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3090,6 +3107,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         Some(dir.path().to_path_buf()),
     )
     .await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -3302,6 +3320,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         Some(dir.path().to_path_buf()),
     )
     .await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let created_ws = wss_call(
         srv.port,
@@ -7795,6 +7814,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -8440,6 +8460,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -8605,6 +8626,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -8735,6 +8757,7 @@ async fn wss_agent_get_message_block_serves_full_block() {
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),

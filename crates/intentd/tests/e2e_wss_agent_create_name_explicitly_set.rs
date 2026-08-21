@@ -63,6 +63,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
+    common::seed_default_provider(data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)

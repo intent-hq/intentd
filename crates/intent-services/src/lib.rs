@@ -1208,7 +1208,7 @@ impl Services {
                         self,
                         Some(id),
                         workspace_path,
-                        Some(&provider),
+                        provider.as_deref(),
                     ),
                     options,
                 })
@@ -6779,19 +6779,23 @@ fn nonempty_owned(s: Option<String>) -> Option<String> {
 /// optional `provider` param): a supplied id must be a registered provider
 /// (unknown → `-32602` via `InvalidParams`); absent/empty defaults to the
 /// settings-derived default provider (provider of `model.default`, else
-/// `providers.active`), bottoming out at the first registered provider.
-fn specialist_preview_provider(services: &Services, provider: Option<String>) -> Result<String> {
+/// `providers.active`). `None` when neither is set (monorepo#3044: no
+/// positional last resort) — the preview decoration is skipped and clients
+/// render "Provider default".
+fn specialist_preview_provider(
+    services: &Services,
+    provider: Option<String>,
+) -> Result<Option<String>> {
     match nonempty_owned(provider) {
         Some(p) => {
             if intent_providers::find_provider(&p).is_none() {
                 return Err(Error::InvalidParams(format!("unknown provider: {p}")));
             }
-            Ok(p)
+            Ok(Some(p))
         }
-        None => Ok(
-            agent_session::derived_default_provider(&services.effective_settings())
-                .unwrap_or_else(|| intent_providers::first_provider_id().to_string()),
-        ),
+        None => Ok(agent_session::derived_default_provider(
+            &services.effective_settings(),
+        )),
     }
 }
 
@@ -11014,6 +11018,81 @@ impl Services {
         }
         publish_event(&self.event_bus, settings_changed_event(applied)).await;
     }
+
+    /// Default-provider settings self-heal (monorepo#3044). When no default
+    /// provider is derivable from settings
+    /// ([`agent_session::derived_default_provider`] returns `None`) and
+    /// discovery reported at least one installed registered provider,
+    /// persist the first one (registry order) as `providers.active`, plus —
+    /// when its cached model catalog names a default (or any) model — that
+    /// model as a compound `model.default`. Per-key no-overwrite guard: a
+    /// key with ANY existing raw value (even an unregistered one) is never
+    /// written; with a derivable default the whole heal is a no-op, making
+    /// it idempotent across restarts and repeated discovery calls. Writes go
+    /// through the same `settings.update` path clients use, so
+    /// `settings:changed` is emitted and every store/hook rule applies. The
+    /// model rung is cache-only ([`ModelCatalogCache`]) — never a probe.
+    pub async fn heal_default_provider_settings(
+        &self,
+        installed_provider_ids: &[String],
+    ) -> Result<serde_json::Value> {
+        let settings = self.effective_settings();
+        if agent_session::derived_default_provider(&settings).is_some() {
+            return Ok(serde_json::json!({ "healed": false, "reason": "already-configured" }));
+        }
+        let Some(provider) = installed_provider_ids
+            .iter()
+            .map(|s| s.trim())
+            .find(|id| intent_providers::find_provider(id).is_some())
+            .map(|id| intent_providers::provider_config(id).id)
+        else {
+            return Ok(serde_json::json!({ "healed": false, "reason": "no-installed-provider" }));
+        };
+        let mut changes = Vec::new();
+        if settings
+            .providers
+            .active
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty())
+        {
+            changes.push(serde_json::json!({ "path": "providers.active", "value": provider }));
+        }
+        let mut healed_model = None;
+        if settings
+            .model
+            .default
+            .as_deref()
+            .is_none_or(|v| v.trim().is_empty())
+        {
+            if let Some(m) = self.models_catalog.cached_default_or_first_model(provider) {
+                // Catalog row ids may already be compound (`provider:model`).
+                let compound = if m.contains(':') {
+                    m
+                } else {
+                    format!("{provider}:{m}")
+                };
+                changes.push(serde_json::json!({ "path": "model.default", "value": compound }));
+                healed_model = Some(compound);
+            }
+        }
+        if changes.is_empty() {
+            // Both keys hold raw values that just don't resolve to a
+            // registered provider — never overwrite them (no-overwrite rule).
+            return Ok(serde_json::json!({ "healed": false, "reason": "values-already-set" }));
+        }
+        self.settings_update(serde_json::Value::Array(changes))
+            .await?;
+        tracing::info!(
+            provider,
+            model = healed_model.as_deref().unwrap_or("<none>"),
+            "self-healed unset default provider settings from provider discovery"
+        );
+        Ok(serde_json::json!({
+            "healed": true,
+            "provider": provider,
+            "model": healed_model,
+        }))
+    }
 }
 
 impl WorkspaceApi for Services {
@@ -11269,6 +11348,16 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn settings_heal_default_provider(
+        &self,
+        installed_provider_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.heal_default_provider_settings(&installed_provider_ids)
+                .await
+        })
+    }
+
     fn system_capabilities(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // Machine-level capabilities (PROTOCOL §5.7). `cowSupported` reuses
@@ -11390,12 +11479,14 @@ impl WorkspaceApi for Services {
             let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().list(ws_path)?;
-            if let Some(specs) = result
-                .get_mut("specialists")
-                .and_then(serde_json::Value::as_array_mut)
-            {
+            if let (Some(provider), Some(specs)) = (
+                provider.as_deref(),
+                result
+                    .get_mut("specialists")
+                    .and_then(serde_json::Value::as_array_mut),
+            ) {
                 for def in specs {
-                    decorate_specialist_resolved(self, def, ws_path, &provider);
+                    decorate_specialist_resolved(self, def, ws_path, provider);
                 }
             }
             Ok(result)
@@ -11412,8 +11503,9 @@ impl WorkspaceApi for Services {
             let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().get(&id, ws_path)?;
-            if let Some(def) = result.get_mut("specialist") {
-                decorate_specialist_resolved(self, def, ws_path, &provider);
+            if let (Some(provider), Some(def)) = (provider.as_deref(), result.get_mut("specialist"))
+            {
+                decorate_specialist_resolved(self, def, ws_path, provider);
             }
             Ok(result)
         })

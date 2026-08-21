@@ -342,6 +342,24 @@ pub(crate) async fn handle(
             .unwrap_or_else(|_| {
                 json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
             });
+            // Default-provider self-heal (monorepo#3044): with the discovery
+            // verdicts in hand, backfill unset default provider/model
+            // settings from the installed set. Idempotent and no-overwrite;
+            // best-effort — a heal failure never fails the discovery RPC.
+            let installed: Vec<String> = result["providers"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|p| p["installed"].as_bool() == Some(true))
+                        .filter_map(|p| p["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !installed.is_empty() {
+                if let Err(e) = api.settings_heal_default_provider(installed).await {
+                    tracing::warn!(error = %e, "default-provider settings self-heal failed");
+                }
+            }
             success_frame(id_echo, result)
         }
         HostMethod::ProviderAuthStatus => {
