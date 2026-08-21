@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.34] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- *(services)* Re-fetch stale non-Merged PR pool entries during the git-root sweep ([#1390](https://github.com/intent-hq/intentd/pull/1390))
+
+
 ## [0.7.33] - 2026-08-21
 
 ### 🐛 Bug Fixes
