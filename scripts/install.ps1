@@ -264,20 +264,44 @@ if ($serviceMode -eq 'yes') {
         # there is nothing to read; a file shorter than the noted offset was
         # rotated or replaced, so read it whole. The offset is a byte count
         # taken before decoding, so the first line can start mid-word; the
-        # lines that matter come after it.
+        # lines that matter come after it. The log is append-only and never
+        # rotated, so seek with [long] offsets (it can exceed 2 GiB) and read
+        # at most a 256 KiB tail instead of loading the whole file — only the
+        # last 40 lines are quoted anyway. A failed read is reported as its
+        # own warning below, never passed off as an empty log.
         $logOut = ''
+        $logReadFailed = $false
         try {
             if (Test-Path $logFile) {
-                $bytes = [System.IO.File]::ReadAllBytes($logFile)
-                $sliceFrom = if ($bytes.Length -lt $logOffset) { 0 } else { [int]$logOffset }
-                $slice = [System.Text.Encoding]::UTF8.GetString($bytes, $sliceFrom, $bytes.Length - $sliceFrom).TrimEnd()
-                if ($slice) {
-                    $lines = @($slice -split "`r?`n")
-                    if ($lines.Count -gt 40) { $lines = $lines[($lines.Count - 40)..($lines.Count - 1)] }
-                    $logOut = $lines -join "`n"
+                $stream = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                try {
+                    $length = [long]$stream.Length
+                    $sliceFrom = if ($length -lt [long]$logOffset) { [long]0 } else { [long]$logOffset }
+                    $maxTailBytes = [long]262144
+                    if (($length - $sliceFrom) -gt $maxTailBytes) { $sliceFrom = $length - $maxTailBytes }
+                    $null = $stream.Seek($sliceFrom, [System.IO.SeekOrigin]::Begin)
+                    $buffer = New-Object byte[] ([int]($length - $sliceFrom))
+                    $read = 0
+                    while ($read -lt $buffer.Length) {
+                        $n = $stream.Read($buffer, $read, $buffer.Length - $read)
+                        if ($n -le 0) { break }
+                        $read += $n
+                    }
+                    $slice = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read).TrimEnd()
+                    if ($slice) {
+                        $lines = @($slice -split "`r?`n")
+                        if ($lines.Count -gt 40) { $lines = $lines[($lines.Count - 40)..($lines.Count - 1)] }
+                        $logOut = $lines -join "`n"
+                    }
+                } finally {
+                    $stream.Dispose()
                 }
             }
-        } catch { $logOut = '' }
+        } catch {
+            $logOut = ''
+            $logReadFailed = $true
+        }
         $restartHint = "Start-ScheduledTask -TaskName $taskName"
         if ($logOut.Contains('times in a row without ever staying up')) {
             Write-Host "install.ps1: the service's output for this start (from ${logFile}):"
@@ -287,6 +311,11 @@ if ($serviceMode -eq 'yes') {
             Write-Host "install.ps1: the service's output for this start (from ${logFile}):"
             foreach ($line in ($logOut -split "`n")) { Write-Host "  | $line" }
             throw ("install.ps1: the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.`nFix the cause reported above, then start it again with:`n  $restartHint$autoResumeNote")
+        } elseif ($logReadFailed) {
+            # A read failure is not an empty log: without the slice the three
+            # cases above are indistinguishable, so say so instead of guessing
+            # "still downloading".
+            Write-Warning "install.ps1: daemon did not respond within 60s and the service log could not be read ($logFile) - cannot tell whether it is still downloading or crashing; check later with: intentd status"
         } else {
             Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
         }

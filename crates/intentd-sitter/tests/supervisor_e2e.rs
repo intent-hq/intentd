@@ -776,18 +776,28 @@ const INSTALL_LOG_CONTRACT: [&str; 4] = [
 fn install_log_contract_scripts_and_supervisor_match() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let sources = [
-        root.join("src/supervisor.rs"),
-        root.join("../../scripts/install.sh"),
-        root.join("../../scripts/install.ps1"),
+        (root.join("src/supervisor.rs"), "//"),
+        (root.join("../../scripts/install.sh"), "#"),
+        (root.join("../../scripts/install.ps1"), "#"),
     ];
-    for path in &sources {
+    for (path, comment_prefix) in &sources {
         let content =
             fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // Comment lines also quote the contract substrings (the lockstep
+        // pointers in supervisor.rs and both scripts), so scan only code
+        // lines: rewording a real emission or grep pattern must fail here
+        // even while a comment still carries the old text.
+        let code = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(comment_prefix))
+            .collect::<Vec<_>>()
+            .join("\n");
         for needle in INSTALL_LOG_CONTRACT {
             assert!(
-                content.contains(needle),
-                "{} lost the install log-contract substring {needle:?}; \
-                 sitter lines and install-script patterns must change in lockstep",
+                code.contains(needle),
+                "{} lost the install log-contract substring {needle:?} from its \
+                 code (comment lines are ignored); sitter lines and \
+                 install-script patterns must change in lockstep",
                 path.display()
             );
         }
