@@ -29581,6 +29581,46 @@ mod default_provider_self_heal {
         assert_eq!(result["model"], "auggie:fable-5", "{result}");
     }
 
+    /// A cached row id with a FOREIGN compound prefix (`grok:foo` in the
+    /// auggie catalog) is not an ownership claim (monorepo#607) — persisting
+    /// it would let the prefix override the healed `providers.active`. The
+    /// provider is healed alone; a self-prefixed row is kept as-is.
+    #[tokio::test]
+    async fn foreign_prefixed_catalog_row_heals_provider_only() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "grok:foo", "name": "Foreign", "isDefault": true })],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+
+        // A self-prefixed row id IS trusted and kept verbatim.
+        let (_tmp2, svc2) = setup().await;
+        svc2.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "auggie:sonnet5", "isDefault": true })],
+        );
+        let result = svc2
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+    }
+
     /// Cold catalog cache (no models known) ⇒ the provider is persisted
     /// alone; `model.default` stays unset.
     #[tokio::test]

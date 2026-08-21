@@ -11065,14 +11065,20 @@ impl Services {
             .is_none_or(|v| v.trim().is_empty())
         {
             if let Some(m) = self.models_catalog.cached_default_or_first_model(provider) {
-                // Catalog row ids may already be compound (`provider:model`).
-                let compound = if m.contains(':') {
-                    m
-                } else {
-                    format!("{provider}:{m}")
+                // Catalog row ids may already be compound (`provider:model`),
+                // but only a prefix naming the owning provider is trusted — a
+                // foreign-prefixed row is not an ownership claim
+                // (monorepo#607) and persisting it would let its prefix
+                // override the just-healed `providers.active`.
+                let compound = match m.split_once(':') {
+                    Some((prefix, _)) if prefix == provider => Some(m),
+                    Some(_) => None,
+                    None => Some(format!("{provider}:{m}")),
                 };
-                changes.push(serde_json::json!({ "path": "model.default", "value": compound }));
-                healed_model = Some(compound);
+                if let Some(compound) = compound {
+                    changes.push(serde_json::json!({ "path": "model.default", "value": compound }));
+                    healed_model = Some(compound);
+                }
             }
         }
         if changes.is_empty() {
