@@ -280,6 +280,25 @@ pin_channel() {
   fi
 }
 
+# Report the just-installed binary's version by probing it with
+# --sitter-version. A probe FAILURE (the binary won't run: wrong arch,
+# missing libs, a bad env making it bail) is surfaced as a warning quoting
+# the probe's output — it must never be conflated with the probe succeeding
+# without printing a version, which stays the quiet no-version report.
+# Non-fatal by design: the binary is installed either way, and later steps
+# (pin_channel, service verification) fail hard on a binary that can't run.
+report_installed_version() {
+  if version=$("$install_dir/intentd" --sitter-version 2>&1); then
+    if [ -n "$version" ]; then
+      info "installed $version to $install_dir/intentd"
+    else
+      info "installed intentd to $install_dir/intentd"
+    fi
+  else
+    warn "installed intentd to $install_dir/intentd, but probing it with --sitter-version failed: ${version:-no output}"
+  fi
+}
+
 setup_service_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
@@ -576,12 +595,7 @@ main() {
     || fail "cannot install to $install_dir/intentd"
   staged=""
 
-  version=$("$install_dir/intentd" --sitter-version 2>/dev/null) || version=""
-  if [ -n "$version" ]; then
-    info "installed $version to $install_dir/intentd"
-  else
-    info "installed intentd to $install_dir/intentd"
-  fi
+  report_installed_version
 
   case ":$PATH:" in
     *":$install_dir:"*) ;;
