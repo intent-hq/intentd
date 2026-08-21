@@ -100,7 +100,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101
         ]
     );
     assert_eq!(
@@ -110,7 +110,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101
         ]
     );
 }
@@ -822,6 +822,26 @@ async fn max_note_updated_at_matches_list_notes_fold() {
     assert_eq!(
         store.max_note_updated_at(&other).await.expect("other max"),
         None
+    );
+
+    // The aggregate must be answered from the covering
+    // idx_note_workspace_updated_at index — never by visiting note rows
+    // (whose bodies can be large), or the O(notes) read this replaces
+    // silently returns (monorepo#3058).
+    let details: Vec<String> =
+        sqlx::query("EXPLAIN QUERY PLAN SELECT MAX(updated_at) FROM note WHERE workspace_id = ?")
+            .bind(&ws_id.0)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("COVERING INDEX idx_note_workspace_updated_at")),
+        "aggregate must use the covering index, plan: {details:?}"
     );
 }
 
