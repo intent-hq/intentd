@@ -142,7 +142,8 @@ a dedupe hit never changes the reused tab's visibility — use `showTab`.
 All of this works even when the workspace is not currently visible in the app: the
 operations succeed and apply their effects to the persisted layout state, and
 `showTab { focus: true }` / `focusTab` / `openTab { visible: true }` skip the actual
-UI focus attempt, carrying a workspace-not-visible warning in the action result.
+UI focus attempt, carrying a workspace-not-visible `warning` string in the action
+result.
 
 ## Opening Local HTML Files
 

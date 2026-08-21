@@ -107,7 +107,8 @@ workspace's layout so it is correct when the user next opens the workspace. When
 workspace is not currently visible in the UI, no actual UI focus/activation is
 attempted: `showTab { focus: true }`, `focusTab`, and `openTab { visible: true }`
 succeed, apply their state effects, skip the UI focus attempt, and the action result
-carries a warning that the workspace is not visible so no UI focus was attempted.
+carries an additive `warning` string stating that the workspace is not visible so no
+UI focus was attempted (the field is absent when the workspace is visible).
 
 ## Basic Actions
 - `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, and visibility info
