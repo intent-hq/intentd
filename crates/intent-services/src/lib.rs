@@ -1910,12 +1910,22 @@ impl Services {
     /// O(PR-bearing rows) regardless of workspace count). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
-    /// PRs, then git-root PRs, then monitor-derived entries. A row with
-    /// nothing to merge is left untouched (a `None` stays omitted on the
-    /// wire, and an empty git-root list contributes nothing rather than
-    /// materializing `[]`); a store read failure degrades to serving the
-    /// base rows. `include_archived` mirrors the list call's flag so the
-    /// bulk reads never pay for archived workspaces the list won't return.
+    /// PRs, then git-root PRs, then monitor-derived entries. One exception
+    /// to first-wins: a lower-priority duplicate whose status sits higher
+    /// on the lifecycle ladder (open/draft < closed < merged) upgrades the
+    /// present entry's `status` + `updatedAt` + `isDraft` in place, so a
+    /// stale git-root/workspace entry can never shadow a monitor that
+    /// already saw the PR merge (intent-hq/monorepo#3127). Status only ever
+    /// moves up the ladder: `merged` is irreversible so it wins over
+    /// everything (including a stale `closed`), while `closed` — the
+    /// snapshotless completed-monitor fallback among others — never
+    /// downgrades a `merged` verdict, and reopened-after-close is left to
+    /// the sweep re-fetch. A row with nothing to merge is left untouched (a `None`
+    /// stays omitted on the wire, and an empty git-root list contributes
+    /// nothing rather than materializing `[]`); a store read failure
+    /// degrades to serving the base rows. `include_archived` mirrors the
+    /// list call's flag so the bulk reads never pay for archived workspaces
+    /// the list won't return.
     pub(crate) async fn merge_external_pull_requests(
         &self,
         list: &mut [Workspace],
@@ -1969,14 +1979,34 @@ impl Services {
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
+        // Lifecycle-ladder rank: status only ever moves up (open/draft <
+        // closed < merged) — merged is irreversible, closed must never
+        // overwrite it (see the doc comment).
+        let status_rank = |s: intent_core::PullRequestStatus| match s {
+            intent_core::PullRequestStatus::Merged => 2,
+            intent_core::PullRequestStatus::Closed => 1,
+            intent_core::PullRequestStatus::Open | intent_core::PullRequestStatus::Draft => 0,
+        };
         for ws in list.iter_mut() {
             let Some(candidates) = extras.remove(ws.id.as_str()) else {
                 continue;
             };
             let merged = ws.pull_requests.get_or_insert_with(Vec::new);
             for info in candidates {
-                if !merged.iter().any(|p| p.url == info.url) {
-                    merged.push(info);
+                match merged.iter_mut().find(|p| p.url == info.url) {
+                    None => merged.push(info),
+                    // Status-ladder upgrade: identity/fields keep the
+                    // higher-priority entry, but a lower-priority source
+                    // whose status ranks higher wins the lifecycle fields —
+                    // `isDraft` moves with `status` so an upgraded entry
+                    // never reads merged/closed while still claiming draft.
+                    Some(present) => {
+                        if status_rank(info.status) > status_rank(present.status) {
+                            present.status = info.status;
+                            present.updated_at = info.updated_at;
+                            present.is_draft = info.is_draft;
+                        }
+                    }
                 }
             }
         }
