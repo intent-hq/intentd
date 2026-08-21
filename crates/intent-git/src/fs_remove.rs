@@ -46,6 +46,10 @@ const MAX_REMOVAL_THREADS: usize = 6;
 ///    removes the root's files, the emptied root itself, and anything phase
 ///    1 could not remove, and is the sole source of the returned error, so
 ///    error semantics match the serial original.
+///
+/// # Errors
+///
+/// Returns the first I/O error from listing or removing entries (a missing `path` is a no-op success).
 pub fn remove_dir_all_parallel(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),

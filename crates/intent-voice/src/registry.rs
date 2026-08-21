@@ -75,6 +75,10 @@ impl VoiceRegistry {
     /// [`Error::NotConfigured`] when no key is available. Async because the
     /// secrets-store lookup runs on the blocking pool with a bounded timeout
     /// (see [`token::resolve`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConfigured`] when no API key is available; propagates engine-construction failures.
     pub async fn from_settings(settings: &VoiceSettings) -> Result<Arc<dyn VoiceEngine>> {
         let key = resolve_key(settings).await?;
         let base_url = settings.api_base_url.as_deref();

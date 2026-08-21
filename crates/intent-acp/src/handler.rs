@@ -103,6 +103,10 @@ impl ClientRequestHandler {
     }
 
     /// Dispatch one incoming request and answer it over `conn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when sending the response (or error response) over `conn` fails; handler-level failures are answered as JSON-RPC errors.
     pub async fn serve(&self, conn: &Connection, req: IncomingRequest) -> AcpResult<()> {
         let IncomingRequest { id, method, params } = req;
         match method.as_str() {

@@ -27,6 +27,10 @@ const MODE_GITLINK: u32 = 0o160_000;
 /// pin) or a `040000` tree — yields the typed [`Error::NotAFile`] instead of
 /// content (monorepo#1739): a gitlink's id is a commit in the **submodule's**
 /// odb, so there is no blob to read here.
+///
+/// # Errors
+///
+/// Returns [`Error::NotAFile`] if the path resolves to a gitlink or tree entry; `Error::Internal` if another libgit2 operation fails.
 pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result<String> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let rel = relative_path(worktree_path, file_path);

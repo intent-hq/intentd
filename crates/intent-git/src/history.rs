@@ -38,6 +38,10 @@ pub struct CommitRecord {
 
 /// Read up to `limit` commits of first-parent, non-merge history from `HEAD`,
 /// newest first. An empty repository (unborn `HEAD`) yields an empty list.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> {
     history_since(worktree_path, None, limit, true)
 }
@@ -48,6 +52,10 @@ pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> 
 /// to the full `HEAD` history. With `include_files = false` the per-commit tree
 /// diff is skipped entirely — `files` is `None` — which keeps the walk cheap for
 /// callers that only need commit metadata (e.g. `accept-changes.getStatus`).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the revwalk fails or another libgit2 operation fails.
 pub fn history_since(
     worktree_path: &Path,
     base_ref: Option<&str>,
@@ -245,6 +253,14 @@ pub struct CommitDetails {
 /// the first parent. A root commit (no parent) diffs against the empty tree, so
 /// every file appears as additions. An unresolvable hash returns
 /// [`Error::NotFound`].
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] if `commit_hash` does not resolve to a commit; `Error::Internal` if another libgit2 operation fails.
+///
+/// # Panics
+///
+/// Panics if a diff delta reported by libgit2 cannot be re-fetched by index (an internal libgit2 invariant violation).
 pub fn commit_details(worktree_path: &Path, commit_hash: &str) -> Result<CommitDetails> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let obj = repo
@@ -306,6 +322,10 @@ pub fn commit_details(worktree_path: &Path, commit_hash: &str) -> Result<CommitD
 ///
 /// This is the boundary for `file-tracking.loadCommits` so the Changes panel
 /// only shows workspace-owned commits (`boundary..HEAD`).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn resolve_workspace_boundary(
     worktree_path: &Path,
     base_ref: Option<&str>,
@@ -372,6 +392,10 @@ fn resolve_workspace_boundary_inner(
 /// `include_files = false` the per-commit tree diff is skipped entirely —
 /// `files` is `None` — keeping the walk O(commits) cheap for list payloads;
 /// clients fetch per-file data on demand via `git.commitDetails`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the revwalk fails or another libgit2 operation fails.
 pub fn history_bounded(
     worktree_path: &Path,
     boundary_sha: Option<&str>,

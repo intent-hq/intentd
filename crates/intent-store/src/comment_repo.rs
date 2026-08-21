@@ -119,6 +119,10 @@ impl Store {
     /// per-workspace column plus the composite FK to `note(id, workspace_id)`).
     /// The wire-facing [`Comment`] itself carries no `workspace_id`, so the
     /// caller supplies it explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding the comment JSON or the insert fails.
     pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
         self.insert_comment_with_extras(workspace_id, c, &Map::new())
             .await
@@ -129,6 +133,10 @@ impl Store {
     /// unknown source fields are preserved instead of dropped) — into the
     /// `extra_json` blob. On key collision the comment's own fields win.
     /// Unknown keys in `extra_json` are ignored when the row is read back.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_comment_with_extras(
         &self,
         workspace_id: &WorkspaceId,
@@ -170,6 +178,10 @@ impl Store {
     /// post-rewrite note `rev` so the caller can echo the authoritative
     /// value. `NotFound` if the note row is absent; nothing persists on any
     /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
     pub async fn update_note_with_comment(&self, note: &Note, c: &Comment) -> Result<i64> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
         let task_json = note
@@ -281,6 +293,10 @@ impl Store {
     }
 
     /// Fetch a single comment by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the comment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_comment(&self, id: &str) -> Result<Comment> {
         let sql = format!("SELECT {COMMENT_COLUMNS} FROM comment WHERE id = ?");
         let row = sqlx::query(&sql)
@@ -303,6 +319,10 @@ impl Store {
     /// unknown/legacy keys already present on the row (preserved by
     /// [`Store::insert_comment_with_extras`]) are carried over, so updates
     /// never silently drop imported legacy data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
@@ -368,6 +388,10 @@ impl Store {
 
     /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
     /// `NotFound` if the row is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
         let res = sqlx::query("DELETE FROM comment WHERE id = ? AND workspace_id = ?")
             .bind(id)
@@ -382,6 +406,10 @@ impl Store {
     }
 
     /// List a note's comments, ordered by creation time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_comments(&self, note_id: &NoteId) -> Result<Vec<Comment>> {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM comment WHERE note_id = ? ORDER BY created_at, id"
@@ -399,6 +427,10 @@ impl Store {
     /// result set must use this variant so a cross-workspace bare-id probe
     /// cannot match a comment belonging to a different workspace's note that
     /// happens to share the same `note_id` (e.g. the well-known `spec` id).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_comments_in_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -435,6 +467,10 @@ impl Store {
     /// workspace B cannot resolve a thread owned by workspace A. Returns the
     /// number of rows updated (0 when the thread does not exist in that
     /// workspace).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_thread_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -456,6 +492,10 @@ impl Store {
     }
 
     /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no comments share `thread_id`; `Error::Internal` if the database query fails.
     pub async fn get_thread(&self, thread_id: &str) -> Result<CommentThread> {
         let comments = self.list_thread_comments(thread_id).await?;
         if comments.is_empty() {

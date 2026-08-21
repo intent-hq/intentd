@@ -74,6 +74,10 @@ fn build_matcher(query: &str, opts: &SearchOpts) -> Result<RegexMatcher> {
 /// Run a gitignore-aware content search rooted at `root`. Honors `opts.globs`
 /// (path globs), `opts.maxResults` (sets `truncated` when exceeded), and the
 /// `cancel` token (stops early, best-effort).
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if the query regex or a path glob is invalid; `Error::Internal` if the walk fails.
 pub fn search_in_files(
     root: &Path,
     query: &str,

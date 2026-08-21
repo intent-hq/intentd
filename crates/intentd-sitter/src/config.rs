@@ -91,6 +91,10 @@ pub fn load_channel(path: &Path) -> Option<Channel> {
 /// Persist `channel` as the config pin (creating parent directories),
 /// rewriting the whole file via a temp file + rename so a crash never
 /// leaves a truncated `config.toml`.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if creating parent directories, writing the temp file, or the rename fails.
 pub fn save_channel(path: &Path, channel: Channel) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

@@ -52,6 +52,10 @@ pub trait TokenStore: Send + Sync {
     /// Return the stored token, or `None` if unset/unavailable.
     fn load_token(&self) -> Option<String>;
     /// Persist the token, replacing any existing value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token cannot be persisted to the backing store.
     fn store_token(&self, token: &str) -> Result<()>;
 }
 
@@ -161,6 +165,10 @@ impl AsyncTokenStore {
     /// Read the token, returning `None` on absent / timeout / backing-error.
     /// Concurrent callers are coalesced into a single `spawn_blocking`; a cached
     /// result is served without touching the backing store until it expires.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn load_token(&self) -> Option<String> {
         let action = {
             let mut state = self.state.lock().unwrap();
@@ -206,6 +214,14 @@ impl AsyncTokenStore {
     /// off the async runtime with a bounded timeout, then refreshes the cache
     /// so subsequent loads observe the new value without re-hitting the
     /// backing store. Timeouts / backing errors surface as [`Error::Internal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the backing-store write fails or times out.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn store_token(&self, token: &str) -> Result<()> {
         let inner = self.inner.clone();
         let value_owned = token.to_string();
@@ -345,6 +361,10 @@ enum LoadAction {
 
 /// Generate a new random token (32 bytes hex = 64 chars), persist it, and
 /// return it. Port of `generateToken`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if generating random bytes or persisting the token fails.
 pub async fn generate_token(store: &AsyncTokenStore) -> Result<String> {
     let token = random_hex_token()?;
     store.store_token(&token).await?;
@@ -354,6 +374,10 @@ pub async fn generate_token(store: &AsyncTokenStore) -> Result<String> {
 
 /// Return the persisted token, creating and persisting one only when missing.
 /// Port of `getOrCreateToken` / `ensureWebSocketApiToken`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if a missing token cannot be generated and persisted.
 pub async fn get_or_create_token(store: &AsyncTokenStore) -> Result<String> {
     match store.load_token().await {
         Some(existing) if !existing.is_empty() => Ok(existing),

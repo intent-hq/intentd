@@ -21,6 +21,10 @@ impl Store {
     /// `upsertScript`: an existing id is fully replaced). The replace resets
     /// the `was_running` marker to its default (cleared) — an upserted
     /// definition starts a fresh runtime life.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_script(&self, s: &Script) -> Result<()> {
         let sql = format!(
             "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -51,6 +55,10 @@ impl Store {
     /// per-dispatch statement budget with one INSERT per repo-config script).
     /// Chunked to stay under the bundled `SQLite`'s `SQLITE_MAX_VARIABLE_NUMBER`
     /// (32766 since 3.32).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
         // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
         // row and chunk math cannot drift if the persisted set changes.
@@ -97,6 +105,10 @@ impl Store {
 
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether
     /// a row was actually removed; deleting an unknown id is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_script(&self, id: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM script WHERE id = ?")
             .bind(id)
@@ -108,6 +120,10 @@ impl Store {
 
     /// List every persisted script definition (all workspaces), oldest first —
     /// the boot-time hydration read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
         let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at");
         let rows = sqlx::query(&sql)
@@ -123,6 +139,10 @@ impl Store {
     /// `workspace_id` — the runtime registry permits the same client-supplied
     /// id in separate workspaces, so an id-only write could mark a row owned
     /// by another workspace. Unknown ids are a no-op, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_script_was_running(
         &self,
         workspace_id: &str,
@@ -143,6 +163,10 @@ impl Store {
     /// marker — the boot-time hydration read behind the `previouslyRunning`
     /// runtime field. Workspace-qualified because the same client-supplied id
     /// may exist in separate workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_was_running_script_ids(&self) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query("SELECT workspace_id, id FROM script WHERE was_running = 1")
             .fetch_all(self.read_pool())

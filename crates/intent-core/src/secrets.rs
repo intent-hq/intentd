@@ -82,11 +82,19 @@ impl FileSecretStore {
     /// Return the stored secret for `account`: `Ok(Some(value))` if present,
     /// `Ok(None)` if confirmed absent (missing file or key not in map), or
     /// `Err` if the backing file is unreadable or corrupt (IO/parse failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the backing file is unreadable or corrupt.
     pub fn load(&self, account: &str) -> Result<Option<String>> {
         self.read_map_strict().map(|mut map| map.remove(account))
     }
 
     /// Persist `value` for `account`, replacing any existing secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if creating the secrets directory, serializing, or writing the file fails.
     pub fn store(&self, account: &str, value: &str) -> Result<()> {
         let mut map = self.read_map();
         map.insert(account.to_string(), value.to_string());
@@ -95,6 +103,10 @@ impl FileSecretStore {
 
     /// Delete the secret for `account`; absence is an idempotent success (and
     /// does not rewrite the file).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if rewriting the secrets file fails.
     pub fn delete(&self, account: &str) -> Result<()> {
         let mut map = self.read_map();
         if map.remove(account).is_none() {

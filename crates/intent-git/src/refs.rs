@@ -40,6 +40,10 @@ pub fn canonicalise_base_ref(raw: &str) -> String {
 /// `git rev-parse <refish>`: resolve `refish` to its 40-char object SHA. Accepts
 /// anything libgit2 resolves (`HEAD`, a branch name, a remote-tracking ref, a
 /// partial or full SHA).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `refish` cannot be resolved or the repository cannot be opened.
 pub fn rev_parse(worktree_path: &Path, refish: &str) -> Result<String> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let object = repo.revparse_single(refish).map_err(map_git_err)?;
@@ -49,6 +53,10 @@ pub fn rev_parse(worktree_path: &Path, refish: &str) -> Result<String> {
 /// `git merge-base --is-ancestor <ancestor_ref> <head_ref>`: whether `ancestor_ref`
 /// is an ancestor of `head_ref`. A commit is its own ancestor (matching git's
 /// exit-status semantics).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if either ref cannot be resolved or the ancestry check fails.
 pub fn is_ancestor(worktree_path: &Path, ancestor_ref: &str, head_ref: &str) -> Result<bool> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let ancestor = repo.revparse_single(ancestor_ref).map_err(map_git_err)?;

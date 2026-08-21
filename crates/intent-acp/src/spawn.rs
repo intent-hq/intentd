@@ -284,6 +284,10 @@ impl SpawnedAgent {
     /// init). Descendants that escaped into their OWN process groups survive
     /// the `killpg`, so they are snapshotted before the kill and swept
     /// afterwards ([`crate::descendant_sweep`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first I/O error from the kill or the wait; a child that already exited is tolerated.
     pub async fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         let descendants = match self.child.id() {
@@ -320,6 +324,10 @@ impl SpawnedAgent {
 }
 
 /// Spawn the provider and wire up its [`Connection`] (§6.2 + §6.3).
+///
+/// # Errors
+///
+/// Returns [`AcpError::Spawn`] if the provider process cannot be started or its stdio pipes cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let mut cmd = build_command(opts);
     let command_name = opts.provider_binary.map_or_else(

@@ -31,6 +31,10 @@ pub struct PersistedDelegationGroup {
 
 impl Store {
     /// Insert or replace a `delegation_group` row (upsert).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_delegation_group(&self, g: &PersistedDelegationGroup) -> Result<()> {
         let expected_json = serde_json::to_string(&g.expected_agent_ids)
             .map_err(|e| Error::Internal(format!("encode expected_agent_ids: {e}")))?;
@@ -80,6 +84,10 @@ impl Store {
     }
 
     /// Load all undelivered `delegation_group` rows for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_undelivered_groups(
         &self,
         workspace_id: &WorkspaceId,
@@ -102,6 +110,10 @@ impl Store {
     }
 
     /// Delete a `delegation_group` row (called on delivery).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_delegation_group(&self, group_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM delegation_group WHERE group_id = ?")
             .bind(group_id)
@@ -113,6 +125,10 @@ impl Store {
 
     /// STAB-108: Get distinct workspace IDs that have undelivered delegation groups.
     /// Used for startup rehydration sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
         let rows =
             sqlx::query("SELECT DISTINCT workspace_id FROM delegation_group WHERE delivered = 0")

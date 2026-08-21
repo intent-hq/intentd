@@ -300,6 +300,14 @@ impl PtyHost {
     /// retries (monorepo#653), up to ~0.8s worst-case before giving up. Async
     /// callers that cannot tolerate that on a runtime thread should wrap the
     /// call in `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if `openpty` keeps failing after the bounded retries or spawning the child fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn spawn(&self, spec: SpawnSpec) -> Result<PtyId> {
         let pair = openpty_with_retry(spec.size.to_portable())?;
 
@@ -389,6 +397,14 @@ impl PtyHost {
     /// Attach a new subscriber: capture recent scrollback to back-fill, then a
     /// live receiver for subsequent output. The snapshot and subscription are
     /// taken under one lock so no chunk is lost or duplicated across the seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn attach(&self, id: PtyId) -> Result<Attachment> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
@@ -400,6 +416,14 @@ impl PtyHost {
 
     /// Snapshot the PTY's current scrollback for replay (`terminal.getBuffer` /
     /// ACP `terminal/output`), without subscribing to live output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn scrollback(&self, id: PtyId) -> Result<Vec<u8>> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
@@ -407,12 +431,20 @@ impl PtyHost {
     }
 
     /// The PTY child's process id, if the platform reported one at spawn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn pid(&self, id: PtyId) -> Option<u32> {
         self.sessions.lock().unwrap().get(&id).and_then(|s| s.pid)
     }
 
     /// The child's exit status if it has already exited, else `None`. Latches
     /// the status so it stays observable after the stream closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
     pub fn try_exit(&self, id: PtyId) -> Result<Option<PtyExit>> {
         let session = self.get(id)?;
         Ok(observe_exit(&session))
@@ -426,6 +458,10 @@ impl PtyHost {
     /// scrollback (monorepo#587 makes that output eventually-complete rather
     /// than lost). Callers reading scrollback right after `wait()` should poll
     /// briefly rather than assume it is final.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
     pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
         let session = self.get(id)?;
         loop {
@@ -438,6 +474,14 @@ impl PtyHost {
 
     /// Write input to the PTY master. The per-PTY writer mutex serializes
     /// concurrent writers so each write lands as one contiguous chunk (§12.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the write or flush fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn write(&self, id: PtyId, data: &[u8]) -> Result<()> {
         let session = self.get(id)?;
         let mut writer = session.writer.lock().unwrap();
@@ -447,6 +491,14 @@ impl PtyHost {
     }
 
     /// Resize the PTY's visible area.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the master is already torn down or the resize fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn resize(&self, id: PtyId, size: PtySize) -> Result<()> {
         let session = self.get(id)?;
         let guard = session.master.lock().unwrap();
@@ -457,6 +509,10 @@ impl PtyHost {
     }
 
     /// Deliver a signal to the PTY's process group (SIGINT/Ctrl-C, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the session has no process id or delivering the signal fails.
     pub fn signal(&self, id: PtyId, sig: PtySignal) -> Result<()> {
         let session = self.get(id)?;
         #[cfg(unix)]
@@ -476,6 +532,10 @@ impl PtyHost {
     }
 
     /// Whether the PTY exists and its child has not yet exited.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn is_alive(&self, id: PtyId) -> bool {
         match self.sessions.lock().unwrap().get(&id).cloned() {
             Some(session) => matches!(session.child.lock().unwrap().try_wait(), Ok(None)),
@@ -486,6 +546,10 @@ impl PtyHost {
     /// Metadata for one tracked PTY (`terminal.list` / `terminal.readOutput`):
     /// its `scope`, display name, working directory, and whether its child is
     /// still running. `None` when the id is unknown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn info(&self, id: PtyId) -> Option<PtyInfo> {
         let session = self.sessions.lock().unwrap().get(&id).cloned()?;
         let alive = matches!(session.child.lock().unwrap().try_wait(), Ok(None));
@@ -498,12 +562,20 @@ impl PtyHost {
     }
 
     /// Number of PTYs currently tracked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn count(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
 
     /// The live, list-visible PTYs currently tracked under `scope`. Hidden and
     /// exited sessions remain addressable for output and explicit release.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn list_scope(&self, scope: &str) -> Vec<PtyId> {
         self.sessions
             .lock()
@@ -515,6 +587,10 @@ impl PtyHost {
     }
 
     /// Kill one PTY and reap its whole process group. Returns whether it existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn kill(&self, id: PtyId) -> bool {
         let session = self.sessions.lock().unwrap().remove(&id);
         match session {
@@ -580,6 +656,10 @@ impl PtyHost {
     /// `terminal.create` already in flight on an accepted connection when the
     /// listener stops) either registers before the drain and is reaped by it,
     /// or observes the latch and is refused with its child reaped in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn kill_all(&self) -> usize {
         self.closed.store(true, Ordering::SeqCst);
         let victims: Vec<Arc<PtySession>> = {

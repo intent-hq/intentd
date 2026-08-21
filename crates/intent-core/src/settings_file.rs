@@ -874,6 +874,10 @@ impl SettingsFile {
     /// [`LEGACY_SETTINGS_PATHS`]), wrong types, and bad enum values are
     /// rejected; the error message names the offending key path (camelCase,
     /// dotted) plus the TOML line/column context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the TOML fails to parse, contains unknown keys or wrong types, or fails semantic validation.
     pub fn parse_str(text: &str) -> Result<Self> {
         let de = toml::de::Deserializer::parse(text).map_err(|e| {
             let detail = e.to_string();
@@ -898,6 +902,10 @@ impl SettingsFile {
     /// before the strict parse and returned in the legacy map (dotted wire
     /// path → JSON value) so the caller can import them into `SQLite` and strip
     /// the file. Every **other** unknown key is still a hard error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` under the same conditions as [`SettingsFile::parse_str`], with the legacy paths tolerated.
     pub fn parse_str_with_legacy(text: &str) -> Result<(Self, LegacySettings)> {
         let raw: toml::Table = text.parse().map_err(|e: toml::de::Error| {
             Error::InvalidInput(format!("invalid config.toml: {e}"))
@@ -936,6 +944,10 @@ impl SettingsFile {
 
     /// Range/semantic checks the type system cannot express. Errors name the
     /// offending key with its dotted camelCase path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` naming the offending key when a value is out of range.
     pub fn validate(&self) -> Result<()> {
         fn bad(key: &str, msg: String) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
@@ -1040,6 +1052,10 @@ impl SettingsFile {
     /// [`LEGACY_SETTINGS_PATHS`] (tolerated so a daemon upgrade can boot and
     /// import them; see [`SettingsFile::load_or_init_with_legacy`]) — any
     /// other malformed content is an error, never silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the file is malformed; `Error::Internal` if reading it or writing the default template fails.
     pub fn load_or_init(path: &Path) -> Result<Self> {
         Self::load_or_init_with_legacy(path).map(|(file, _)| file)
     }
@@ -1047,6 +1063,10 @@ impl SettingsFile {
     /// Like [`SettingsFile::load_or_init`], but also return the captured
     /// legacy values (dotted wire path → JSON value; empty when the file has
     /// none) so the composition root can run the one-time import-and-strip.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the file is malformed; `Error::Internal` if reading it or writing the default template fails.
     pub fn load_or_init_with_legacy(path: &Path) -> Result<(Self, LegacySettings)> {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse_str_with_legacy(&text).map_err(|e| match e {

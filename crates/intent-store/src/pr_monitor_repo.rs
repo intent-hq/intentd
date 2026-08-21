@@ -98,6 +98,10 @@ impl Store {
     /// the `idx_pr_monitor_identity` unique index rejects the row — a
     /// concurrent register already created an ACTIVE monitor for the same
     /// `(agent, repo, PR)` triple; the caller re-arms that row instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the insert fails for any reason other than the unique-index rejection (which returns `Ok(false)`).
     pub async fn insert_pr_monitor(&self, m: &PrMonitor) -> Result<bool> {
         let sql = format!(
             "INSERT INTO pr_monitor ({COLUMNS}) \
@@ -137,6 +141,10 @@ impl Store {
     }
 
     /// Get a PR monitor by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the PR monitor does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<PrMonitor> {
         let sql = format!("SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id = ?");
         let row = sqlx::query(&sql)
@@ -155,6 +163,10 @@ impl Store {
 
     /// The ACTIVE monitor an agent already owns for `(owner, name, number)`,
     /// if any — the idempotent re-register lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_active_pr_monitor(
         &self,
         agent_id: &AgentId,
@@ -179,6 +191,10 @@ impl Store {
 
     /// List every monitor owned by an agent, oldest first (all states — the
     /// caller filters).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pr_monitors_by_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? ORDER BY created_at");
@@ -193,6 +209,10 @@ impl Store {
     }
 
     /// List every monitor in a workspace, oldest first (all states).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_pr_monitors_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -214,6 +234,10 @@ impl Store {
     /// that only care about active rows (idle-visibility's
     /// `waitingOnPrMonitors`), so cost is O(active monitors) rather than
     /// O(all monitor history for the agent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_active_pr_monitors_by_agent(
         &self,
         agent_id: &AgentId,
@@ -238,6 +262,10 @@ impl Store {
     /// SQL-filtered counterpart to [`Store::list_pr_monitors_by_workspace`]
     /// for `agent.list`/`agent.diagnostics`, so cost is O(active monitors in
     /// the workspace) rather than O(all monitor history in the workspace).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_active_pr_monitors_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -265,6 +293,10 @@ impl Store {
     /// semantics). Completed rows are retained indefinitely, so the bound
     /// keeps this hot-path read O(active monitors) instead of O(all monitor
     /// history in the workspace); cancelled rows are excluded entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_display_status_pr_monitors_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -291,6 +323,10 @@ impl Store {
 
     /// Every `active` monitor across all workspaces, oldest first — the poll
     /// loop's per-tick read and the boot rehydration read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at");
@@ -311,6 +347,10 @@ impl Store {
     /// per-workspace view ([`Services::pr_monitors_for_workspace`]). Unless
     /// `include_archived`, rows owned by archived workspaces are filtered in
     /// SQL so cost tracks the workspaces the list call actually returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_non_cancelled_pr_monitors(
         &self,
         include_archived: bool,
@@ -337,6 +377,10 @@ impl Store {
     /// `active`, so the update is guarded on it; returns `false` when the row
     /// is absent or already terminal (a concurrent cancel/complete won) so
     /// the caller can skip its side effects instead of resurrecting the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_pr_monitor_state(
         &self,
         monitor_id: &PrMonitorId,
@@ -369,6 +413,10 @@ impl Store {
     /// read). Returns `false` when the guard fails — a concurrent
     /// flush/cancel/re-register/poll moved the row, and the caller must
     /// discard its stale image (skip emits) rather than clobber.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_pr_monitor_poll(
         &self,
         monitor_id: &PrMonitorId,

@@ -108,6 +108,10 @@ fn login_client(base_uri: &str) -> Result<octocrab::Octocrab> {
 /// client id, e.g. [`intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID`])
 /// and the given `scopes`.
 /// Returns the user-facing codes plus the opaque poll handle.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if `client_id` is empty; propagates HTTP/deserialization failures from the code request.
 pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorization, DeviceFlow)> {
     start_at(DEFAULT_LOGIN_BASE_URI, client_id, scopes).await
 }
@@ -116,6 +120,10 @@ pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorizat
 /// integration tests drive the full connect → poll → authorized path against
 /// a local mock of `/login/device/code` + `/login/oauth/access_token` without
 /// touching github.com. Production callers use [`start`].
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if `client_id` is empty; propagates HTTP/deserialization failures from the code request.
 pub async fn start_at(
     base_uri: &str,
     client_id: &str,
@@ -157,6 +165,10 @@ impl DeviceFlow {
     /// Poll the token endpoint once. On [`PollStatus::Authorized`] the access
     /// token has already been persisted to the secret store under
     /// `sourceControl.github.token` — it is never returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token request fails, the grant is denied or expired, or persisting the token to the secret store fails.
     pub async fn poll_once(&mut self) -> Result<PollStatus> {
         // GitHub's device-token endpoint reports pending/slow_down/expired/
         // denied as an `error` code in an HTTP 200 body. octocrab's

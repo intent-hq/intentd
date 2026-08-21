@@ -172,6 +172,10 @@ impl WsApiServer {
     /// Build a listener from the shared API + event bus, the M5.1 self-signed
     /// certificate, and the M5.2 token store. Fails only if the cert/key PEM
     /// cannot be parsed into a rustls server config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key PEM cannot be parsed into a rustls server config.
     pub fn new(
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
@@ -254,6 +258,10 @@ impl WsApiServer {
     /// daemon. Every accepted connection registers with `reverse_registry` so
     /// agent-initiated reverse RPCs (`browser.exec`, PROTOCOL §5.14/§12.4)
     /// see the union of both listeners' clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key PEM cannot be parsed into a rustls server config.
     pub fn new_with_reverse(
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
@@ -296,6 +304,10 @@ impl WsApiServer {
 
     /// Install server pairing info provider on the inner state. Uses the same
     /// `Arc::get_mut` pattern as `install_registry`. Called from composition root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (called after `start` published clones).
     pub fn install_pairing_info(
         &mut self,
         server_pairing_info: Arc<dyn crate::server::ServerPairingInfo>,
@@ -306,6 +318,10 @@ impl WsApiServer {
     }
 
     /// Start the listener, returning the bound port (single-flight).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if binding the listener fails.
     pub async fn start(&self) -> std::io::Result<u16> {
         self.inner.start().await
     }
@@ -321,6 +337,10 @@ impl WsApiServer {
     }
 
     /// The number of currently-connected WebSocket clients (the `/health` count).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the client-set mutex is poisoned (a prior panic while holding the lock).
     pub fn client_count(&self) -> usize {
         self.inner
             .clients

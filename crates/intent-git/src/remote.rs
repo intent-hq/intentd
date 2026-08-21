@@ -34,6 +34,10 @@ pub enum RemoteBranch {
 /// between "branch missing → local-only" and "remote unreachable → error".
 /// `token` is an optional caller-resolved GitHub token used as the final
 /// credential-chain step for HTTPS github.com remotes (see [`crate::auth`]).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the remote is missing or the ls-remote fails.
 pub fn ls_remote_has_branch(
     worktree_path: &Path,
     remote: &str,
@@ -59,6 +63,10 @@ pub fn ls_remote_has_branch(
 }
 
 /// The `origin` remote URL, or `None` when the workspace has no `origin`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn origin_url(worktree_path: &Path) -> Result<Option<String>> {
     remote_url(worktree_path, "origin")
 }
@@ -67,6 +75,10 @@ pub fn origin_url(worktree_path: &Path) -> Result<Option<String>> {
 /// remote (or the remote's URL is not valid UTF-8). Ports the FE
 /// `git-tracking:get-remote-url` handler / `getRemoteUrl` helper (which shells
 /// `git -C <path> config --get remote.<name>.url` and folds missing to null).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn remote_url(worktree_path: &Path, remote: &str) -> Result<Option<String>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let url = match repo.find_remote(remote) {
@@ -78,6 +90,10 @@ pub fn remote_url(worktree_path: &Path, remote: &str) -> Result<Option<String>> 
 
 /// Whether the local tracking ref `refs/remotes/<remote>/<branch>` exists — the
 /// `isPushed` signal (the branch has been pushed at least once).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn remote_tracking_exists(worktree_path: &Path, remote: &str, branch: &str) -> Result<bool> {
     if branch.is_empty() {
         return Ok(false);
@@ -91,6 +107,10 @@ pub fn remote_tracking_exists(worktree_path: &Path, remote: &str, branch: &str) 
 /// Ahead/behind commit counts of the current `HEAD` vs `base_ref` (the trunk),
 /// as `(ahead_of_trunk, behind_trunk)`. Returns `(0, 0)` when either ref cannot
 /// be resolved (e.g. trunk not present locally) — the TS `|| 0` fallback.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `base_ref` or `HEAD` cannot be resolved or the ahead/behind computation fails.
 pub fn ahead_behind(worktree_path: &Path, base_ref: &str) -> Result<(i64, i64)> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
@@ -107,6 +127,10 @@ pub fn ahead_behind(worktree_path: &Path, base_ref: &str) -> Result<(i64, i64)> 
 
 /// Retarget an existing remote at `url` (`git remote set-url` parity). Errors
 /// when the repository cannot be opened or the remote does not exist.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn set_remote_url(worktree_path: &Path, remote: &str, url: &str) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     repo.remote_set_url(remote, url).map_err(map_git_err)
@@ -116,6 +140,10 @@ pub fn set_remote_url(worktree_path: &Path, remote: &str, url: &str) -> Result<(
 /// `worktree_path` first when it is not already one (ports the TS `addRemote`
 /// auto-init: `git init -b main`, configure identity, an initial empty commit,
 /// then rename to `desired_branch`). Errors if `origin` already exists.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn add_origin(worktree_path: &Path, url: &str, desired_branch: &str) -> Result<()> {
     let repo = match Repository::open(worktree_path) {
         Ok(repo) => repo,

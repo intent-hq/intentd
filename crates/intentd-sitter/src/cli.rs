@@ -159,6 +159,10 @@ impl SitterArgs {
     ///
     /// A bare `--` ends sitter-flag scanning: it and everything after it are
     /// forwarded verbatim, even args that look like `--sitter-*`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CliError`] for an unknown `--sitter-*` flag, a missing channel value, or an invalid channel name.
     pub fn parse_from<I, T>(args: I, env_channel: Option<OsString>) -> Result<Self, CliError>
     where
         I: IntoIterator<Item = T>,

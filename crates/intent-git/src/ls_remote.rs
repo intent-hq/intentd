@@ -76,6 +76,10 @@ fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
 /// URL — a token rotated mid-flight only affects that one shared read,
 /// which retires immediately — so this cannot swap credentials across
 /// users.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `git` cannot be spawned, the ls-remote fails or times out, or the shared flight is abandoned.
 pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
     let owned_url = url.to_string();
     let token = token.map(str::to_owned);

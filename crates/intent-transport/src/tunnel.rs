@@ -215,6 +215,14 @@ impl Frame {
     /// Decode one wire frame. Rejects short buffers, unknown opcodes, wrong
     /// `OPEN` payload sizes, payloads on payload-less opcodes, and non-UTF-8
     /// `OPEN_ERR` messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FrameError`] for short buffers, unknown opcodes, wrong `OPEN` payload sizes, payloads on payload-less opcodes, or non-UTF-8 `OPEN_ERR` messages.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: the header slice converted into the stream-id array is always exactly 4 bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         if bytes.len() < HEADER_LEN {
             return Err(FrameError::TooShort);
