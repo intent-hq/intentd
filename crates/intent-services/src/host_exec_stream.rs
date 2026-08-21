@@ -265,11 +265,10 @@ pub async fn start_stream(
     };
 
     let request_id = request_id.unwrap_or_else(mint_request_id);
-    let workspace_id = common
-        .workspace_id
-        .as_deref()
-        .map(WorkspaceId::from)
-        .unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+    let workspace_id = common.workspace_id.as_deref().map_or_else(
+        || WorkspaceId::from_string(String::new()),
+        WorkspaceId::from,
+    );
 
     // Spawn with piped stdin so follow-up writes reach the child.
     let mut cmd = build_command(&common, cwd_resolved.as_deref());
@@ -358,7 +357,7 @@ pub async fn start_stream(
             cancel_token,
             timeout_ms,
         )
-        .await
+        .await;
     });
 
     Ok(request_id)
@@ -431,9 +430,8 @@ async fn run_wait_loop(
         // Poll every 100ms so a cancel / timeout is observed promptly without
         // burning a task on a tight loop.
         let poll = Duration::from_millis(100);
-        match tokio::time::timeout(poll, child.wait()).await {
-            Ok(status) => break status,
-            Err(_) => continue,
+        if let Ok(status) = tokio::time::timeout(poll, child.wait()).await {
+            break status;
         }
     };
 
@@ -442,9 +440,12 @@ async fn run_wait_loop(
     let exit_code = status
         .as_ref()
         .ok()
-        .and_then(|s| s.code())
+        .and_then(std::process::ExitStatus::code)
         .map(|c| c as i64);
-    let ok = matches!(status.as_ref().ok().map(|s| s.success()), Some(true));
+    let ok = matches!(
+        status.as_ref().ok().map(std::process::ExitStatus::success),
+        Some(true)
+    );
 
     let mut data = json!({
         "requestId": &request_id,

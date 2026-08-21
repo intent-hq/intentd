@@ -233,7 +233,7 @@ pub async fn prompt(
                     usage: response.usage,
                 });
             }
-            _ = tokio::time::sleep(poll_interval) => {
+            () = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());
                 if idle >= idle_window {
                     // Early return drops req_fut; its pending-map entry is
@@ -357,7 +357,7 @@ pub struct MappedToolCall {
 /// no canonical `WorkspaceEvent` and nothing else to accumulate
 /// (plan/mode/commands/…) (§6.6). `usage_update` maps only when it
 /// carries a `cost` object (§5.23).
-pub fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
+pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             let (content, text) = map_content(&chunk.content);

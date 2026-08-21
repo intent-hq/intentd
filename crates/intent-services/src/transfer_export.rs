@@ -28,6 +28,7 @@
 //! the workspace has a repository — `git/repo.bundle` + `git/refs.json` (the
 //! [`TransferRefsManifest`]).
 
+use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -643,10 +644,10 @@ impl Services {
             match unwound {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind failed")
+                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind failed");
                 }
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind task failed")
+                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind task failed");
                 }
             }
         }
@@ -877,11 +878,10 @@ fn write_archive(
         hasher.update(&buf[..n]);
         size_bytes += n as u64;
     }
-    let sha256: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let sha256: String = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     Ok((archive_path, size_bytes, sha256))
 }
 
@@ -1089,11 +1089,10 @@ mod tests {
         assert_eq!(archive.len() as u64, size);
         let mut hasher = sha2::Sha256::new();
         hasher.update(&archive);
-        let actual: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let actual: String = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         assert_eq!(actual, sha);
 
         // Idempotent re-read: same seq, same bytes.

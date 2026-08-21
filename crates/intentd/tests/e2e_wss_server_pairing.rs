@@ -207,7 +207,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -314,13 +314,68 @@ async fn pairing_get_info_over_uds() {
     assert_eq!(result["version"].as_u64().unwrap(), 1);
     assert!(result["hosts"].is_array());
 
-    // The uri field is consistent with the component fields
+    // Fresh config (no server.bindAddress): the listener binds the loopback
+    // default (monorepo#2900), so the payload advertises exactly that host.
     let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
+    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
+
+    // The uri field is consistent with the component fields
     let expected_uri = format!(
         "intent://pair?v=1&host={}&port={port}&fp={fp}&token={TOKEN}",
         hosts.join(",")
     );
     assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn pairing_get_info_explicit_wide_bind_honored() {
+    let data_dir = temp_data_dir();
+    // Persist an explicit wide bind BEFORE boot: the loopback default only
+    // governs unset configs — an intentional 0.0.0.0 keeps the historical
+    // behavior (bind all interfaces, advertise enumerated local IPs).
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"0.0.0.0\"\n",
+    )
+    .expect("seed config.toml with wide bindAddress");
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir).await;
+    let socket = data_dir.join("intentd.sock");
+
+    // The WSS listener still answers on loopback (0.0.0.0 covers it): the
+    // TLS + auth connect in `boot()` above already proved that. The pairing
+    // payload enumerates local IPs for a wide bind, never the loopback-only
+    // host list. On machines with no non-loopback IPv4 the enumeration is
+    // empty and pairing errors instead — accept both outcomes so the test is
+    // not networking-dependent.
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    if let Some(result) = response.get("result").filter(|r| !r.is_null()) {
+        let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
+        assert!(
+            !hosts.is_empty(),
+            "wide bind advertises local IPs: {result}"
+        );
+        assert!(
+            !hosts.contains(&"127.0.0.1".to_string()),
+            "wide bind must not advertise loopback: {hosts:?}"
+        );
+        assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+        assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
+    } else {
+        let error = &response["error"];
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("no non-loopback IPv4"),
+            "unexpected pairing.getInfo error: {error}"
+        );
+    }
 
     daemon.child.kill().ok();
 }
@@ -484,7 +539,7 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => return Some(text),
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 _ => return None,
             }
         }
@@ -506,7 +561,7 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     let status: Value = loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => break serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     };

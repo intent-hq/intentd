@@ -18,7 +18,7 @@ fn ev(
         event_type: event_type.to_string(),
         actor: EventActor {
             actor_type,
-            id: actor_id.map(|s| s.to_string()),
+            id: actor_id.map(std::string::ToString::to_string),
             name: actor_id.map(|s| format!("name-{s}")),
             ..Default::default()
         },

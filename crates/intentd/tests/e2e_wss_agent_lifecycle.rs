@@ -228,7 +228,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -253,7 +253,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -301,7 +301,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -327,7 +327,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -4893,7 +4893,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -4921,7 +4921,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             None | Some(Err(_)) => return None,
         }
     }
@@ -5358,7 +5358,7 @@ async fn terminal_create_env_over_wss() {
             Some(Ok(Message::Ping(p))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -5519,7 +5519,7 @@ async fn terminal_data_many_chunks_transient_over_wss() {
             Some(Ok(Message::Ping(p))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -6053,8 +6053,7 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
                 assert!(evt["data"]["queue"].is_array(), "queue array present");
                 if evt["data"]["queue"]
                     .as_array()
-                    .map(|q| !q.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(|q| !q.is_empty())
                 {
                     saw_queue_updated_enqueue = true;
                 }
@@ -6219,8 +6218,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
                 // The queue drains to empty once the first turn completes.
                 if evt["data"]["queue"]
                     .as_array()
-                    .map(|q| q.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(std::vec::Vec::is_empty)
                 {
                     saw_queue_drain = true;
                 }
@@ -7618,8 +7616,7 @@ fn seed_local_repo(prefix: &str) -> Option<PathBuf> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     };
     if !run(&["init", "--quiet"]) {
         return None;
@@ -13812,5 +13809,170 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
     assert!(
         !preview.contains("Let me think."),
         "thought text stays out of lastAgentResponse: {listed}"
+    );
+}
+
+/// TTL idle-sweep eviction is observable on the real wire and a follow-up
+/// send auto-restores (monorepo#3040): drive one mock turn to idle, let the
+/// sub-second `INTENTD_IDLE_REAP_MS` sweep reap the child, and assert the
+/// `agent:process:evicted` notification lands on a live `events.subscribe`
+/// channel with the §6.7 self-sufficient payload — `agentId`, `used`, `cap`,
+/// and the additive reason `"idle-ttl"`. Then send a second message to the
+/// reaped agent and assert the RPC succeeds and the turn streams to a normal
+/// `agent:stream:end` (lazy respawn), with both user rows persisted — the
+/// send was restored, not silently dropped.
+#[tokio::test]
+async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
+    let Some(script) = gate("WSS TTL-reap eviction E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "hello from mock" }).to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        // Sub-second TTL + sweep (test-only seam; §13.1) so the eviction is
+        // observable without a ≥30s wait.
+        ("INTENTD_IDLE_REAP_MS", "800"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE any turn so the eviction notification
+    // cannot be missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Reap", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "turn one" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "first sendMessage ok: {sent}");
+
+    // First turn completes (stream:end), the child goes idle, and the TTL
+    // sweep evicts it: the wire carries `agent:process:evicted` with the
+    // additive `"idle-ttl"` reason and the §6.7 self-sufficient payload.
+    let mut ends = 0u32;
+    let mut evicted_frame: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while evicted_frame.is_none() {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("agent:process:evicted reached the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("no agent:failed during reap: {ev}"),
+            Some("agent:stream:end") => ends += 1,
+            Some("agent:process:evicted") => evicted_frame = Some(frame.clone()),
+            _ => {}
+        }
+    }
+    assert_eq!(ends, 1, "the first turn completed before the eviction");
+    let evicted = &evicted_frame.expect("evicted frame")["params"]["event"];
+    let data = &evicted["data"];
+    assert_eq!(
+        data["reason"], "idle-ttl",
+        "TTL sweep evictions carry the idle-ttl reason: {evicted}"
+    );
+    assert_eq!(data["agentId"].as_str(), Some(agent_id.as_str()));
+    assert!(data["used"].is_u64(), "used is numeric: {evicted}");
+    assert!(data["cap"].is_u64(), "cap is numeric: {evicted}");
+
+    // A send to the reaped agent restores instead of silently dropping: the
+    // RPC succeeds and the turn streams to a normal terminal stream:end on a
+    // lazily respawned child.
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "turn two" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "post-reap sendMessage ok: {sent2}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("post-reap turn reached stream:end on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("post-reap send must not fail: {ev}"),
+            Some("agent:stream:end") => break,
+            _ => {}
+        }
+    }
+
+    // Both user rows persisted — nothing was silently dropped.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("turn one"))
+            && user_texts.iter().any(|t| t.contains("turn two")),
+        "both user rows persisted across the reap: {conv}"
+    );
+    let assistant_rows = messages.iter().filter(|m| m["role"] == "assistant").count();
+    assert_eq!(
+        assistant_rows, 2,
+        "both turns produced assistant replies: {conv}"
     );
 }

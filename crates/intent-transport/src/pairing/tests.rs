@@ -39,6 +39,7 @@ impl TokenStore for MemoryStore {
 /// Mock pairing info provider for tests.
 struct MockPairingInfo {
     port: Option<u16>,
+    bind_address: Option<std::net::IpAddr>,
     data_dir: PathBuf,
     token_store: crate::AsyncTokenStore,
 }
@@ -46,7 +47,8 @@ struct MockPairingInfo {
 impl ServerPairingInfo for MockPairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let port = self.port;
-        Box::pin(async move { PairingSnapshot { port } })
+        let bind_address = self.bind_address;
+        Box::pin(async move { PairingSnapshot { port, bind_address } })
     }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
@@ -57,6 +59,15 @@ impl ServerPairingInfo for MockPairingInfo {
 }
 
 fn provider(port: Option<u16>, dir: &str, token: &str) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
+    provider_with_bind(port, None, dir, token)
+}
+
+fn provider_with_bind(
+    port: Option<u16>,
+    bind_address: Option<std::net::IpAddr>,
+    dir: &str,
+    token: &str,
+) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -67,6 +78,7 @@ fn provider(port: Option<u16>, dir: &str, token: &str) -> (Arc<dyn ServerPairing
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with(token)));
     let p: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port,
+        bind_address,
         data_dir: tmpdir.clone(),
         token_store: store,
     });
@@ -184,5 +196,28 @@ async fn handle_get_info_no_tcp_listener_errors() {
     // Machine-readable discriminator so `intentd pair` stops matching on
     // prose (monorepo#1822).
     assert_eq!(parsed["error"]["data"]["code"], "listener-down");
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+#[tokio::test]
+async fn handle_get_info_specific_bind_advertises_only_that_host() {
+    // A listener bound to a specific address (loopback here) is reachable
+    // only there, so the payload must advertise exactly that host — never
+    // LAN IPs the listener does not answer on (monorepo#2900).
+    let token = "abababababababababababababababababababababababababababababababab";
+    let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let (provider, tmpdir) =
+        provider_with_bind(Some(5181), Some(bind), "pairing_bind_loopback", token);
+    let req = PairingRequest {
+        id_present: true,
+        id_echo: json!(1),
+    };
+    let resp = handle(req, &provider, true).await.unwrap();
+    let parsed: Value = serde_json::from_str(&resp).unwrap();
+    let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
+    assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
+    let fp = parsed["result"]["fingerprint"].as_str().unwrap();
+    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token);
+    assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
     let _ = std::fs::remove_dir_all(&tmpdir);
 }

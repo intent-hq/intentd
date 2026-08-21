@@ -214,7 +214,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -238,7 +238,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -556,4 +556,293 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
             .contains(GATED_TASK_NOTE_ID),
         "no unblocked enumeration persisted in metadata: {metadata}"
     );
+}
+
+// --- Verifier-flip flow (flipped-completion wake triggers) ---------------
+//
+// The standard coordinator flow the flipped-trigger feature exists for:
+// an implementor child's task ends `review_required` via reportToParent,
+// then a verifier-shaped child (no linked task of its own) flips that task
+// `complete` and settles. The VERIFIER's completion wake must attribute the
+// flip as an `unblockedTriggerTasks` trigger and carry the delivery-time
+// "Tasks now unblocked" section naming the task that depended on it.
+
+const VF_PARENT_GO: &str = "UNBLK_VF_PARENT_GO";
+const VF_IMPLEMENTOR_MARK: &str = "UNBLK_VF_IMPLEMENTOR_TURN";
+const VF_SPAWN_MARK: &str = "UNBLK_VF_SPAWN_VERIFIER";
+const VF_VERIFIER_MARK: &str = "UNBLK_VF_VERIFIER_TURN";
+
+/// Drive the verifier-flip flow over the real transport and return the
+/// parent's transcript messages once every parent turn has settled:
+/// delegate implementor (idle 1) → report wake spawns the verifier (idle 2)
+/// → verifier flips the implementor's task `complete`, idles, and its
+/// completion wake reaches the parent (idle 3). The daemon handle is
+/// returned so a failing assertion still dumps `daemon.log` on drop.
+async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemon, Vec<Value>) {
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_and_task_notes(&data_dir).await;
+
+    if taskgraph_enabled {
+        std::fs::write(
+            data_dir.join("config.toml"),
+            "[agentFeatures]\ntaskGraph = true\n",
+        )
+        .expect("seed config.toml with agentFeatures.taskGraph");
+    }
+
+    let delegate_js = format!(
+        "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
+        json!(CHILD_TASK_NOTE_ID),
+        json!(VF_IMPLEMENTOR_MARK),
+    );
+    // The implementor reports (its linked task -> review_required); the
+    // report text carries the marker the parent's spawn rule keys on.
+    let report_js = format!(
+        "return await ws.agent.reportToParent({});",
+        json!(format!(
+            "implementor finished; please verify {VF_SPAWN_MARK}"
+        )),
+    );
+    // The verifier is a plain child with NO linked task note.
+    let spawn_js = format!(
+        "return await ws.agent.create('Verifier', {}, {{ model: 'mock:default' }});",
+        json!(VF_VERIFIER_MARK),
+    );
+    // The verifier flips the IMPLEMENTOR's task complete — an OTHER-task
+    // flip recorded on the verifier's session, stamped on its wake.
+    let flip_js = format!(
+        "return await ws.task.updateNoteStatus({}, 'complete');",
+        json!(CHILD_TASK_NOTE_ID),
+    );
+    // First matching rule wins, so the specific markers precede the generic
+    // "[WORKSPACE EVENTS]" fallback that both parent wakes also contain.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": VF_IMPLEMENTOR_MARK,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_js, "summary": "implementor reports to parent" },
+                },
+                "response": "implementor reported for review",
+            },
+            {
+                "ifPromptContains": VF_VERIFIER_MARK,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": flip_js, "summary": "verifier flips the task complete" },
+                },
+                "response": "verifier flipped the task complete",
+            },
+            {
+                "ifPromptContains": VF_SPAWN_MARK,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "parent spawns the verifier" },
+                },
+                "response": "parent spawned the verifier",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the wake",
+            },
+            {
+                "ifPromptContains": VF_PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "delegate implementor" },
+                },
+                "response": "parent delegated",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no events are missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": VF_PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Three parent turns: delegate, report-wake (spawns verifier), and the
+    // verifier's completion wake.
+    let mut parent_idles = 0u32;
+    for _ in 0..400 {
+        let frame = wss_event(&mut sub, 90).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(parent_id) {
+            parent_idles += 1;
+            if parent_idles >= 3 {
+                break;
+            }
+        }
+    }
+    assert!(
+        parent_idles >= 3,
+        "parent idled after the delegate, spawn-verifier, and wake turns"
+    );
+
+    let conv = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.getConversation",
+        json!({ "agentId": &parent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array").clone();
+    (daemon, messages)
+}
+
+fn blocks_text(message: &Value) -> String {
+    serde_json::to_string(&message["contentBlocks"]).unwrap_or_default()
+}
+
+/// Spec acceptance: a taskGraph-enabled parent's wake for the VERIFIER (whose
+/// own linked task is absent — it flipped ANOTHER agent's task `complete`)
+/// carries the "Tasks now unblocked" section naming the task that depended on
+/// the flipped one, with the flip stamped as the wake's trigger.
+#[tokio::test]
+async fn verifier_flip_surfaces_unblocked_section_on_parent_wake() {
+    let Some(script) = gate("WSS verifier-flip unblocked-hints E2E") else {
+        return;
+    };
+    let (_daemon, messages) = run_verifier_flip_flow(&script, true).await;
+
+    // The implementor's report wake fired first — its task was only
+    // `review_required` there, so it must NOT carry the section.
+    let report_wake = messages
+        .iter()
+        .find(|m| blocks_text(m).contains("reported. Report:"))
+        .expect("implementor report wake present in parent transcript");
+    assert!(
+        !blocks_text(report_wake).contains("Tasks now unblocked"),
+        "report wake carries no section while the task is review_required: {}",
+        blocks_text(report_wake)
+    );
+
+    // The verifier's completion wake carries the delivery-time section naming
+    // the task that depended on the flipped one.
+    let wake = messages
+        .iter()
+        .find(|m| blocks_text(m).contains("Tasks now unblocked by this completion:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "verifier completion wake carries the unblocked section; transcript: {}",
+                serde_json::to_string_pretty(&messages).unwrap_or_default()
+            )
+        });
+    let wake_text = blocks_text(wake);
+    assert!(
+        wake_text.contains("Child agent Verifier"),
+        "the section rides the VERIFIER's wake: {wake_text}"
+    );
+    assert!(
+        wake_text.contains(&format!(
+            "[{GATED_TASK_TITLE}](intent://local/task/{GATED_TASK_NOTE_ID}) (deps satisfied)"
+        )),
+        "section names the dependent task with link + reason: {wake_text}"
+    );
+
+    // Metadata: the flip is the enqueue-time trigger stamp — the flipped
+    // task's id, never the unblocked enumeration.
+    let metadata = &wake["metadata"];
+    assert_eq!(
+        metadata["type"],
+        json!("event_notification"),
+        "wake metadata: {metadata}"
+    );
+    assert_eq!(
+        metadata["unblockedTriggerTasks"][0]["taskNoteId"],
+        json!(CHILD_TASK_NOTE_ID),
+        "trigger stamp names the flipped task: {metadata}"
+    );
+    assert!(
+        !serde_json::to_string(metadata)
+            .unwrap()
+            .contains(GATED_TASK_NOTE_ID),
+        "no unblocked enumeration persisted in metadata: {metadata}"
+    );
+}
+
+/// Gate check (monorepo#2445): the same verifier-flip flow with taskGraph
+/// DISABLED delivers the verifier's completion wake — trigger stamp included,
+/// since recording/stamping is unconditional — but renders NO section.
+#[tokio::test]
+async fn verifier_flip_renders_no_section_when_taskgraph_disabled() {
+    let Some(script) = gate("WSS verifier-flip taskGraph-disabled E2E") else {
+        return;
+    };
+    let (_daemon, messages) = run_verifier_flip_flow(&script, false).await;
+
+    // The verifier's completion wake was delivered with the flip stamped.
+    let wake = messages
+        .iter()
+        .find(|m| {
+            blocks_text(m).contains("Child agent Verifier") && blocks_text(m).contains("completed")
+        })
+        .expect("verifier completion wake present in parent transcript");
+    assert_eq!(
+        wake["metadata"]["unblockedTriggerTasks"][0]["taskNoteId"],
+        json!(CHILD_TASK_NOTE_ID),
+        "trigger stamp is unconditional: {}",
+        wake["metadata"]
+    );
+
+    // But no message in the transcript renders the gated section.
+    for m in &messages {
+        assert!(
+            !blocks_text(m).contains("Tasks now unblocked"),
+            "no unblocked section with taskGraph disabled: {}",
+            blocks_text(m)
+        );
+    }
 }

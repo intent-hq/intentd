@@ -120,7 +120,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

@@ -20,7 +20,7 @@ async fn activity_tracker_idle_measurement() {
     // Wait 100ms
     sleep(Duration::from_millis(100)).await;
     let idle1 = tracker.idle_ms();
-    assert!(idle1 >= 100, "idle after 100ms: {}", idle1);
+    assert!(idle1 >= 100, "idle after 100ms: {idle1}");
 
     // Touch and reset
     tracker.touch();
@@ -29,7 +29,7 @@ async fn activity_tracker_idle_measurement() {
     // Wait another 100ms
     sleep(Duration::from_millis(100)).await;
     let idle2 = tracker.idle_ms();
-    assert!(idle2 >= 100, "idle after touch+100ms: {}", idle2);
+    assert!(idle2 >= 100, "idle after touch+100ms: {idle2}");
 }
 
 /// Idle time resets on activity, not measured from start.
@@ -50,7 +50,7 @@ async fn idle_resets_on_touch() {
     // Wait another 100ms - idle is from last touch, not from start
     sleep(Duration::from_millis(100)).await;
     let idle = tracker.idle_ms();
-    assert!(idle >= 100, "idle after touch: {}", idle);
+    assert!(idle >= 100, "idle after touch: {idle}");
 }
 
 /// Simulates a turn with periodic activity that would exceed the old 1h limit.

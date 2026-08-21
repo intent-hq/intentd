@@ -42,7 +42,7 @@ const GH_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Terminal outcome of one sync attempt (log/test surface only — never wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhSyncOutcome {
+pub(crate) enum GhSyncOutcome {
     /// `gh auth login --with-token` succeeded.
     Synced,
     /// No stored token to sync (nothing in `sourceControl.github.token`).
@@ -58,7 +58,7 @@ pub enum GhSyncOutcome {
 /// Terminal outcome of one revoke-side logout attempt (log/test surface only
 /// — never wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhLogoutOutcome {
+pub(crate) enum GhLogoutOutcome {
     /// `gh auth logout` succeeded — gh held exactly the revoked token.
     LoggedOut,
     /// No revoked token was captured (nothing was stored) — nothing to match.
@@ -258,8 +258,7 @@ impl GhCli for SystemGhCli {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 
     fn login_with_token(&self, gh: &Path, token: &SecretString) -> bool {
@@ -282,7 +281,7 @@ impl GhCli for SystemGhCli {
             }
             // Dropping the handle closes stdin so `gh` sees EOF.
         }
-        child.wait().map(|s| s.success()).unwrap_or(false)
+        child.wait().is_ok_and(|s| s.success())
     }
 
     fn active_login(&self, gh: &Path) -> Option<String> {
@@ -335,8 +334,7 @@ impl GhCli for SystemGhCli {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 }
 
@@ -390,8 +388,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]

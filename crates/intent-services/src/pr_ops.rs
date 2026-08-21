@@ -152,7 +152,7 @@ pub enum PrRefreshOutcome {
 impl PrRefreshOutcome {
     /// The lowercase wire form of the outcome for the `pr.refresh` result
     /// (PROTOCOL §5.7 extension).
-    pub fn as_wire_str(self) -> &'static str {
+    pub(crate) fn as_wire_str(self) -> &'static str {
         match self {
             PrRefreshOutcome::Skipped => "skipped",
             PrRefreshOutcome::Unchanged => "unchanged",
@@ -844,7 +844,8 @@ pub(crate) fn merge_requirements(
 /// failing review-thread read reports zero unresolved threads. Only
 /// [`SourceControl::get_pr`] is load-bearing, so a partially-visible forge
 /// still yields a usable checklist.
-pub async fn fetch_merge_requirements(
+#[cfg(test)]
+pub(crate) async fn fetch_merge_requirements(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,

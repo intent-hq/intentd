@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
 use intent_services::EventBus;
+#[cfg(any(windows, test))]
 use sha2::{Digest, Sha256};
 
 use crate::control::SystemControl;
@@ -61,7 +62,8 @@ use crate::reverse::ReverseChannel;
 /// The caller must pass an ABSOLUTE path (the Windows listener resolves via
 /// `std::path::absolute` first); this function only normalizes separators and
 /// case so it compiles and is unit-tested on every platform.
-pub fn derive_pipe_name(resolved_socket_path: &str) -> String {
+#[cfg(any(windows, test))]
+pub(crate) fn derive_pipe_name(resolved_socket_path: &str) -> String {
     let normalized = resolved_socket_path.replace('/', "\\").to_lowercase();
     let digest = Sha256::digest(normalized.as_bytes());
     format!(r"\\.\pipe\intentd-{}", hex::encode(&digest[..8]))
@@ -169,7 +171,7 @@ where
                     Err(e) => tracing::warn!(error = %e, "uds accept failed"),
                 }
             }
-            _ = &mut shutdown => break,
+            () = &mut shutdown => break,
         }
     }
 

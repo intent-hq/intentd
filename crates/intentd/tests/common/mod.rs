@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 #[cfg(unix)]
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -84,7 +85,6 @@ pub fn test_tempdir(prefix: &str) -> tempfile::TempDir {
 /// root. Use with `"/tmp"` when the dir must stay short enough for a UDS
 /// socket path (macOS caps them at ~104 bytes; `temp_dir()` resolves to a
 /// long `/var/folders/...` path).
-#[allow(dead_code)]
 pub fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
     let mut dir = tempfile::Builder::new()
         .prefix(prefix)
@@ -283,7 +283,7 @@ async fn await_wss_status_impl(socket: &Path, log_path: Option<&Path>) -> serde_
 /// it additionally dumps the log tail on timeout (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped(socket: &Path) {
-    await_wss_stopped_impl(socket, None).await
+    await_wss_stopped_impl(socket, None).await;
 }
 
 /// [`await_wss_stopped`] variant that also surfaces the tail of the daemon
@@ -291,7 +291,7 @@ pub async fn await_wss_stopped(socket: &Path) {
 /// attributable from the failure output alone (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped_logged(socket: &Path, log_path: &Path) {
-    await_wss_stopped_impl(socket, Some(log_path)).await
+    await_wss_stopped_impl(socket, Some(log_path)).await;
 }
 
 #[cfg(unix)]
@@ -375,9 +375,7 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
-        "\n[server.wsApi]\nenabled = true\nport = {port}\n"
-    ));
+    let _ = write!(text, "\n[server.wsApi]\nenabled = true\nport = {port}\n");
     std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
 }
 
@@ -390,7 +388,6 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
 /// this on every daemon boot). Panics if an `[agents]` table exists WITHOUT
 /// the pin — silently skipping would only surface as a flake on headless
 /// runners.
-#[allow(dead_code)]
 pub fn disable_resume_on_start(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");

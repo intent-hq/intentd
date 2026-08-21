@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 
 /// Every provider `host.providerAuthStatus` can probe, in response order.
-pub const AUTH_PROBE_PROVIDERS: &[&str] = &[
+pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "auggie",
     "claude-code",
     "codex",
@@ -282,9 +282,10 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
 /// matching spawn resolution. Today every probe-able provider owns its own
 /// primary (only unsloth remaps, and unsloth is not probe-able).
 fn override_key(provider_id: &'static str) -> &'static str {
-    intent_providers::find_provider(provider_id)
-        .map(|cfg| cfg.primary_binary_provider_id())
-        .unwrap_or(provider_id)
+    intent_providers::find_provider(provider_id).map_or(
+        provider_id,
+        intent_providers::ProviderConfig::primary_binary_provider_id,
+    )
 }
 
 /// checkAuggie-parity validation for auggie's threaded override
@@ -331,7 +332,7 @@ fn resolve_probe_binary(
             if let Some(p) = override_path.and_then(resolve_auggie_override) {
                 return Some(p.into_os_string());
             }
-            return crate::auggie_discovery::find_auggie().map(|p| p.into_os_string());
+            return crate::auggie_discovery::find_auggie().map(std::path::PathBuf::into_os_string);
         }
         "claude-code" => "claude",
         "codex" => "codex",
@@ -348,7 +349,7 @@ fn resolve_probe_binary(
         command,
         override_path.filter(|_| override_applies),
     )
-    .map(|p| p.into_os_string())
+    .map(std::path::PathBuf::into_os_string)
 }
 
 /// Per-provider auth-status cache: last outcome + fetch instant, plus a

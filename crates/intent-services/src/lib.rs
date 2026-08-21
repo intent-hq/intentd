@@ -36,12 +36,12 @@ use intent_core::{
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
-    TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
-    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
+    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
+    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRootId, WorkspaceId,
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
@@ -55,6 +55,7 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod attachment_upload;
+mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;
@@ -101,7 +102,7 @@ mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
 pub mod provider_auth;
-pub mod provider_catalog;
+pub(crate) mod provider_catalog;
 pub mod provider_models;
 pub mod repo_config;
 mod rtk;
@@ -112,7 +113,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
-pub mod stack_sample;
+pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
@@ -120,7 +121,7 @@ mod transfer;
 mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
-pub mod transfer_materialize;
+pub(crate) mod transfer_materialize;
 #[cfg(test)]
 mod transfer_roundtrip;
 mod unsloth_server;
@@ -136,17 +137,15 @@ mod v1_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
-pub use mcp_servers::McpHub;
-pub use sandbox_ops::ProvisionOutcome;
+pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
     max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
     migrate_quick_action_settings, InMemorySecretStore, SecretStore,
 };
-pub use settings_registry::{
-    SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
-};
-pub use terminal_ops::PtyTerminalHost;
+pub use settings_registry::{SettingOrigin, SettingsRegistry};
+pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
+pub(crate) use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
 /// canonical resolver (`find_auggie`, managed binary, enhanced PATH) without
@@ -174,10 +173,9 @@ pub use events::{
     Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
-pub use pr_ops::{
-    fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
-    MergeRequirementsChecks, MergeRequirementsThreads, PrRefreshOutcome,
-};
+pub use pr_ops::PrRefreshOutcome;
+#[cfg(test)]
+pub(crate) use pr_ops::{fetch_merge_requirements, MergeRequirements};
 
 /// Statuses that the FE treats as in-flight (its `isActiveAgentThread`
 /// selector returns `true` for these). After a daemon crash the runtime
@@ -936,7 +934,8 @@ impl Services {
     /// Pin the PR-monitor poll cadence, bypassing the live
     /// `prMonitor.pollSeconds` setting (test wiring). Values below the floor
     /// are clamped when read.
-    pub fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_poll_seconds = Some(seconds);
         self
     }
@@ -950,7 +949,8 @@ impl Services {
     }
 
     /// Override the per-agent active-monitor cap.
-    pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
         self.pr_monitors_max_per_agent = cap;
         self
     }
@@ -1016,8 +1016,7 @@ impl Services {
     pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
         self.hook_clock_skew
             .as_ref()
-            .map(|s| s.load(std::sync::atomic::Ordering::SeqCst))
-            .unwrap_or(0)
+            .map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the
@@ -1084,7 +1083,7 @@ impl Services {
 
     /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
     /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
+    pub(crate) fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
         self.effective_settings().agents.flush_queued_messages
     }
 
@@ -1785,8 +1784,7 @@ impl Services {
         if let Ok(mut map) = self.last_activity_debouncers.lock() {
             let should_insert = map
                 .get(&workspace_id)
-                .map(|(existing_gen, _)| gen > *existing_gen)
-                .unwrap_or(true);
+                .is_none_or(|(existing_gen, _)| gen > *existing_gen);
 
             if should_insert {
                 if let Some((_, old_handle)) =
@@ -1865,8 +1863,95 @@ impl Services {
     /// other note bodies — and matches [`compute_task_stats`] semantics
     /// exactly. Wired into `list_workspaces_lite` so the workspace.subscribe
     /// seq-0 snapshot is self-sufficient for client status rendering.
-    pub async fn cheap_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
+    pub(crate) async fn cheap_task_stats(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceTaskStats> {
         self.store.count_task_stats(workspace_id).await
+    }
+
+    /// Merge externally known PRs into each list row's `pullRequests` for the
+    /// `workspace.list` / `workspace.subscribe` seq-0 emit paths: PRs
+    /// persisted on the workspace's secondary git roots
+    /// (`workspace_git_root.pull_requests`, monorepo#2053) and PRs known to
+    /// agent PR monitors (active + completed; cancelled excluded — the same
+    /// pool the FE builds after opening a workspace, PROTOCOL §6.9). Purely
+    /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
+    /// stays daemon-owned, and no forge calls are made (rung 1 of the
+    /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
+    /// O(PR-bearing rows) regardless of workspace count). Dedup is by PR
+    /// `url` — the one field every source carries that stays unambiguous
+    /// across repos — first-wins in source-priority order: workspace's own
+    /// PRs, then git-root PRs, then monitor-derived entries. A row with
+    /// nothing to merge is left untouched (a `None` stays omitted on the
+    /// wire, and an empty git-root list contributes nothing rather than
+    /// materializing `[]`); a store read failure degrades to serving the
+    /// base rows. `include_archived` mirrors the list call's flag so the
+    /// bulk reads never pay for archived workspaces the list won't return.
+    pub(crate) async fn merge_external_pull_requests(
+        &self,
+        list: &mut [Workspace],
+        include_archived: bool,
+    ) {
+        use std::collections::HashMap;
+        let roots = match self
+            .store
+            .list_workspace_git_roots_with_prs(include_archived)
+            .await
+        {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
+                Vec::new()
+            }
+        };
+        let monitors = match self
+            .store
+            .load_non_cancelled_pr_monitors(include_archived)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(error = %e, "workspace.list: pr monitor read failed; skipping");
+                Vec::new()
+            }
+        };
+        if roots.is_empty() && monitors.is_empty() {
+            return;
+        }
+        // Group externally sourced PRs per workspace, git-root entries before
+        // monitor-derived ones so the first-wins dedup below encodes the
+        // source priority. Empty lists are skipped so they can't flip an
+        // omitted workspace `pullRequests` into `[]`.
+        let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
+        for root in &roots {
+            if let Some(prs) = &root.pull_requests {
+                if prs.is_empty() {
+                    continue;
+                }
+                extras
+                    .entry(root.workspace_id.0.clone())
+                    .or_default()
+                    .extend(prs.iter().cloned());
+            }
+        }
+        for monitor in &monitors {
+            extras
+                .entry(monitor.workspace_id.0.clone())
+                .or_default()
+                .push(pr_monitor::pr_monitor_pr_info(monitor));
+        }
+        for ws in list.iter_mut() {
+            let Some(candidates) = extras.remove(ws.id.as_str()) else {
+                continue;
+            };
+            let merged = ws.pull_requests.get_or_insert_with(Vec::new);
+            for info in candidates {
+                if !merged.iter().any(|p| p.url == info.url) {
+                    merged.push(info);
+                }
+            }
+        }
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -1946,9 +2031,9 @@ impl Services {
                     continue;
                 }
                 let missing_owner = ws.repository_owner.is_none()
-                    || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+                    || ws.repository_owner.as_deref().is_some_and(str::is_empty);
                 let missing_name = ws.repository_name.is_none()
-                    || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+                    || ws.repository_name.as_deref().is_some_and(str::is_empty);
                 if (missing_owner || missing_name)
                     && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
                 {
@@ -2006,9 +2091,9 @@ impl Services {
 
         // Only fill fields that are still missing in the currently persisted state.
         let missing_owner = ws.repository_owner.is_none()
-            || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+            || ws.repository_owner.as_deref().is_some_and(str::is_empty);
         let missing_name = ws.repository_name.is_none()
-            || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+            || ws.repository_name.as_deref().is_some_and(str::is_empty);
 
         if missing_owner {
             ws.repository_owner = Some(owner.clone());
@@ -2112,10 +2197,7 @@ impl Services {
         };
         // A never-provisioned directory can never yield a value, so don't
         // arm a walk (it would fail and leave `refreshing` forever-true).
-        let is_dir = tokio::fs::metadata(&dir)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+        let is_dir = tokio::fs::metadata(&dir).await.is_ok_and(|m| m.is_dir());
         if !is_dir {
             return Ok(serde_json::json!({ "refreshing": false }));
         }
@@ -2248,8 +2330,7 @@ impl Services {
             let should_emit = {
                 let gen_valid = if let Ok(map) = debouncers.lock() {
                     map.get(&ws_id)
-                        .map(|(current_gen, _)| *current_gen == gen)
-                        .unwrap_or(false)
+                        .is_some_and(|(current_gen, _)| *current_gen == gen)
                 } else {
                     false
                 };
@@ -2295,8 +2376,7 @@ impl Services {
         if let Ok(mut map) = self.idle_debouncers.lock() {
             let should_insert = map
                 .get(&workspace_id)
-                .map(|(existing_gen, _)| gen > *existing_gen)
-                .unwrap_or(true);
+                .is_none_or(|(existing_gen, _)| gen > *existing_gen);
 
             if should_insert {
                 if let Some((_, old_handle)) =
@@ -2481,8 +2561,7 @@ impl Services {
             // `acpSessionId` and immutable `provider` invariants (§9.5) are
             // untouched because those columns are not written here.
             let stop_reason = format!(
-                "daemon restarted while the agent was responding (previous status: {})",
-                prev_str
+                "daemon restarted while the agent was responding (previous status: {prev_str})"
             );
             self.store
                 .set_agent_session_status(
@@ -2661,7 +2740,8 @@ impl Services {
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
     /// the timeout-fallback path completes in milliseconds.
-    pub fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self
     }
@@ -2741,7 +2821,7 @@ impl Services {
         tokio::task::spawn_blocking(move || intent_git::refs::rev_parse(&dir, "HEAD"))
             .await
             .ok()
-            .and_then(|r| r.ok())
+            .and_then(std::result::Result::ok)
     }
 
     /// Persist (insert-or-merge) a workspace git root and emit the matching
@@ -2756,7 +2836,7 @@ impl Services {
     /// (the store upsert never touches the column). Returns the stored row.
     /// Callers (the `ws.git.registerRoot` MCP binding, submodule
     /// auto-detection) validate the path before reaching this.
-    pub async fn register_git_root(
+    pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
     ) -> Result<intent_core::WorkspaceGitRoot> {
@@ -2773,7 +2853,7 @@ impl Services {
     /// Delete a workspace git root and emit `gitRoot:unregistered`
     /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
     /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
-    pub async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
+    pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
         publish_event(
@@ -2864,7 +2944,7 @@ impl Services {
                 })
                 .await
                 .ok()
-                .and_then(|r| r.ok())
+                .and_then(std::result::Result::ok)
                 .flatten()
                 .and_then(|url| Self::parse_github_owner_repo(&url))
                 .map_or((None, None), |(o, n)| (Some(o), Some(n)));
@@ -3510,7 +3590,10 @@ impl Services {
     /// only usage metadata (not full message logs) when a scan does run. As a
     /// reconciler it never clobbers a fresher live snapshot with an all-zero
     /// tally (see [`Services::recompute_workspace_token_usage`]).
-    pub async fn scan_workspace_token_usage(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+    pub(crate) async fn scan_workspace_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
         // Cheap change detection: skip when the watermark is unchanged (finding F2).
         let current_watermark = self
             .store
@@ -3891,8 +3974,7 @@ impl Services {
             .lock()
             .expect("agent failure streak registry poisoned")
             .get(agent_id)
-            .map(|(_, n)| *n)
-            .unwrap_or(0)
+            .map_or(0, |(_, n)| *n)
     }
 
     /// Whether `session` is provably poisoned (monorepo#840): parked in
@@ -4377,6 +4459,29 @@ impl Services {
         }
     }
 
+    /// Take (consume) the agent's recorded flipped completions as trigger
+    /// `(workspace_id, task_note_id)` pairs for wake stamping. Consuming at
+    /// the stamp point guarantees a flip is attributed as an
+    /// `unblockedTriggerTasks` trigger at most once — a later completion
+    /// cycle can never re-attribute a stale flip. Best-effort: a store
+    /// failure is logged and the wake proceeds without flip triggers.
+    pub(crate) async fn take_flipped_completion_triggers(
+        &self,
+        agent_id: &AgentId,
+    ) -> Vec<(String, String)> {
+        match self.store.take_agent_flipped_completions(agent_id).await {
+            Ok(pairs) => pairs.into_iter().map(|(ws, n)| (ws.0, n.0)).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "take agent flipped completions failed; wake proceeds without flip triggers"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Wake every parent whose watch matches child_id, then drop that watch:
     /// every ungrouped watch is deliver-once-and-retire. group_id = Some
     /// watches defer to the AS-4 delegation-group fan-in and are left
@@ -4755,6 +4860,14 @@ impl Services {
                 }
             })
             .or(failure_identity.as_deref());
+        // Flipped-completion triggers (consumed on stamp): the child's
+        // recorded flips of OTHER task notes join the trigger set alongside
+        // its own linked task. Taken LAZILY at the first stamp point that
+        // needs them — never up front — so a pass that skips every delivery
+        // (deferral, report_delivered retirement, replay dedup) leaves the
+        // rows for the wake that actually stamps them; one take is shared by
+        // every watch in this pass so multiple watchers stamp the same set.
+        let mut taken_flip_triggers: Option<Vec<(String, String)>> = None;
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4803,23 +4916,36 @@ impl Services {
                         .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
                 });
                 // Record-time trigger capture (intent-hq/monorepo#2044): a
-                // task-linked child's `agent:idle` stamps its linked task
-                // onto the RECORDED event, so the aggregated wake keeps the
-                // trigger even if the child session is deleted before the
-                // group settles (`try_fire_group` reads the stamp first and
-                // only falls back to a live session lookup).
-                let trigger = child_session.as_ref().and_then(|s| {
-                    (event.event_type == AGENT_IDLE)
-                        .then(|| {
-                            s.task_note_id
-                                .clone()
-                                .map(|n| (s.workspace_id.0.clone(), n.0))
-                        })
-                        .flatten()
-                });
+                // settled child's `agent:idle` stamps its linked task plus
+                // its recorded flipped completions (consumed here) onto the
+                // RECORDED event, so the aggregated wake keeps the triggers
+                // even if the child session is deleted before the group
+                // settles (`try_fire_group` reads the stamp first and only
+                // falls back to a live session lookup).
+                let mut triggers: Vec<(String, String)> = Vec::new();
+                if event.event_type == AGENT_IDLE {
+                    if let Some(s) = child_session.as_ref() {
+                        if let Some(n) = &s.task_note_id {
+                            triggers.push((s.workspace_id.0.clone(), n.0.clone()));
+                        }
+                    }
+                    let flips = match &taken_flip_triggers {
+                        Some(f) => f.clone(),
+                        None => {
+                            let f = self.take_flipped_completion_triggers(child_id).await;
+                            taken_flip_triggers = Some(f.clone());
+                            f
+                        }
+                    };
+                    for pair in flips {
+                        if !triggers.contains(&pair) {
+                            triggers.push(pair);
+                        }
+                    }
+                }
                 let report = child_session.and_then(|s| s.completion_report);
                 let group_annotated;
-                let event = if attention.is_some() || trigger.is_some() {
+                let event = if attention.is_some() || !triggers.is_empty() {
                     let mut e = event.clone();
                     if let Some((kind, reason)) = &attention {
                         agent_subscriptions::annotate_attention_request(
@@ -4828,13 +4954,10 @@ impl Services {
                             Some(reason),
                         );
                     }
-                    if let Some((ws, task)) = &trigger {
-                        crate::agent_ops::ready_delta::stamp_event_trigger_task(
-                            &mut e.data,
-                            ws,
-                            task,
-                        );
-                    }
+                    crate::agent_ops::ready_delta::stamp_event_trigger_tasks(
+                        &mut e.data,
+                        &triggers,
+                    );
                     group_annotated = e;
                     &group_annotated
                 } else {
@@ -5096,7 +5219,27 @@ impl Services {
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
-            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
+            // Join the child's recorded flipped completions (consumed at
+            // this first stamp) into the trigger set alongside its own
+            // linked task — a genuine `agent:idle` completion only; failure
+            // and deletion wakes never attribute triggers.
+            let mut stamped_triggers = trigger_tasks.clone();
+            if event.event_type == AGENT_IDLE && !interim_idle {
+                let flips = match &taken_flip_triggers {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = self.take_flipped_completion_triggers(child_id).await;
+                        taken_flip_triggers = Some(f.clone());
+                        f
+                    }
+                };
+                for pair in flips {
+                    if !stamped_triggers.contains(&pair) {
+                        stamped_triggers.push(pair);
+                    }
+                }
+            }
+            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &stamped_triggers);
             if let Err(e) = self
                 .deliver_parent_wake(
                     &parent_ws,
@@ -5208,13 +5351,18 @@ impl Services {
             );
         }
         let wake = format_group_wake(&group);
-        let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
+        let event_refs: Vec<&Event> = group
+            .raw_events
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
         let mut metadata = build_event_notification_metadata(&event_refs);
         // Enqueue-time trigger record (intent-hq/monorepo#2044), aggregated
         // form: every group member that settled via a genuine `agent:idle`
-        // completion and has a linked task note contributes its task id.
-        // Only the triggering facts are stamped — the unblocked enumeration
-        // is computed fresh at delivery/render time. Prefer the record-time
+        // completion contributes its record-time trigger stamp — its linked
+        // task plus any flipped completions consumed when it settled. Only
+        // the triggering facts are stamped — the unblocked enumeration is
+        // computed fresh at delivery/render time. Prefer the record-time
         // stamp on the raw event (captured when the child settled, so it
         // survives the child's deletion before group settlement); the live
         // session lookup is a fallback for events recorded before the stamp
@@ -5224,8 +5372,9 @@ impl Services {
             if event.event_type != AGENT_IDLE {
                 continue;
             }
-            if let Some(pair) = crate::agent_ops::ready_delta::event_trigger_task(&event.data) {
-                trigger_tasks.push(pair);
+            let stamped = crate::agent_ops::ready_delta::event_trigger_tasks(&event.data);
+            if !stamped.is_empty() {
+                trigger_tasks.extend(stamped);
                 continue;
             }
             let Some(child) = completion_event_child_id(event) else {
@@ -6213,7 +6362,12 @@ async fn reanchor_note_comments(
                     note_ops::RecoveryOutcome::Recovered(new_md) => {
                         current = new_md;
                     }
-                    note_ops::RecoveryOutcome::Failed(_) => {
+                    note_ops::RecoveryOutcome::Failed(reason) => {
+                        tracing::debug!(
+                            comment_id = %comment.id,
+                            reason,
+                            "partial-anchor recovery failed; orphaning comment"
+                        );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
                         let mut updated = comment.clone();
@@ -6294,7 +6448,7 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
         let ms =
             parse_iso(c).and_then(|dt| i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok());
         if let Some(ms) = ms {
-            if best.as_ref().map(|(b, _)| ms > *b).unwrap_or(true) {
+            if best.as_ref().is_none_or(|(b, _)| ms > *b) {
                 best = Some((ms, c.to_string()));
             }
         }
@@ -6430,7 +6584,7 @@ impl Services {
             }
             if let Ok(mut map) = services.line_attribution_debouncers.lock() {
                 let existing = map.get(&(ws.clone(), nid.clone()));
-                if existing.map(|h| h.is_finished()).unwrap_or(false) {
+                if existing.is_some_and(tokio::task::AbortHandle::is_finished) {
                     map.remove(&(ws, nid));
                 }
             }
@@ -6743,7 +6897,7 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
         if id == "spec" {
             continue;
         }
-        if note.parent_id.as_ref().map(|p| p.as_str()) != Some("spec") {
+        if note.parent_id.as_ref().map(intent_core::NoteId::as_str) != Some("spec") {
             continue;
         }
         if has_links && !linked.contains(id) {
@@ -6753,7 +6907,7 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
             continue;
         }
         match task.status {
-            TaskStatus::Cancelled => continue,
+            TaskStatus::Cancelled => {}
             TaskStatus::Complete => {
                 stats.total += 1;
                 stats.completed += 1;
@@ -6923,14 +7077,17 @@ fn find_dependency_cycle(
             n.metadata.task.as_ref().map(|t| {
                 (
                     n.id.as_str(),
-                    t.depends_on.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+                    t.depends_on
+                        .iter()
+                        .map(intent_core::NoteId::as_str)
+                        .collect::<Vec<_>>(),
                 )
             })
         })
         .collect();
     graph.insert(
         source.as_str(),
-        new_deps.iter().map(|d| d.as_str()).collect(),
+        new_deps.iter().map(intent_core::NoteId::as_str).collect(),
     );
 
     let target = source.as_str();
@@ -7160,6 +7317,52 @@ fn apply_status_transition(task: &mut TaskMetadata, status: TaskStatus, now: &st
     }
 }
 
+/// Record/remove the caller agent's flipped-completion pairs when a task-note
+/// status write crosses the `complete` boundary. Recording requires an agent
+/// caller and skips the agent's own linked task note (its completion is
+/// already stamped as a wake trigger separately); a transition back out of
+/// `complete` removes the pair for every recording agent — the flip is stale
+/// regardless of who reverted it. Best-effort: failures are logged, never
+/// surfaced to the status write.
+async fn track_flipped_completion_boundary(
+    store: &Store,
+    caller_agent_id: Option<&AgentId>,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    was_complete: bool,
+    is_complete: bool,
+    now: &str,
+) {
+    if !was_complete && is_complete {
+        let Some(agent_id) = caller_agent_id else {
+            return;
+        };
+        match store.get_agent_session(agent_id).await {
+            // The agent's own linked task note is excluded.
+            Ok(session) if session.task_note_id.as_ref() == Some(note_id) => {}
+            Ok(_) => {
+                if let Err(e) = store
+                    .record_agent_flipped_completion(agent_id, workspace_id, note_id, now)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id.0, note = %note_id.0, error = %e, "record agent flipped completion failed");
+                }
+            }
+            // No session (e.g. deleted) → nothing to record against.
+            Err(e) => {
+                tracing::warn!(agent = %agent_id.0, error = %e, "flipped-completion caller session lookup failed");
+            }
+        }
+    } else if was_complete && !is_complete {
+        if let Err(e) = store
+            .remove_agent_flipped_completions_for_task(workspace_id, note_id)
+            .await
+        {
+            tracing::warn!(note = %note_id.0, error = %e, "remove agent flipped completions failed");
+        }
+    }
+}
+
 /// Build a fresh task-note metadata with the markAsTask enrichment timestamps.
 fn fresh_task_metadata(status: TaskStatus, now: &str, peer_order: Option<i64>) -> TaskMetadata {
     let mut task = TaskMetadata {
@@ -7242,8 +7445,7 @@ fn checkout_parent_is_workspace_dir(checkout: &str, workspace_id: &WorkspaceId) 
     Path::new(checkout)
         .parent()
         .and_then(Path::file_name)
-        .map(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
-        .unwrap_or(false)
+        .is_some_and(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
 }
 
 /// Derive a repository display name from a local `repositoryPath` basename,
@@ -7308,8 +7510,7 @@ fn workspace_dir_candidates(
         .filter(|parent| {
             parent
                 .file_name()
-                .map(|n| n == std::ffi::OsStr::new(id.as_str()))
-                .unwrap_or(false)
+                .is_some_and(|n| n == std::ffi::OsStr::new(id.as_str()))
         })
     {
         dirs.push(parent.to_path_buf());
@@ -7339,8 +7540,7 @@ fn default_workspaces_root() -> PathBuf {
     }
     assert_hermetic_root_absent();
     std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("intent")
         .join("workspaces")
 }
@@ -7350,7 +7550,7 @@ fn default_workspaces_root() -> PathBuf {
 /// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
 /// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
 /// `$HOME` default would panic — else the same root the service layer uses.
-pub fn try_default_workspaces_root() -> Option<PathBuf> {
+pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -7359,8 +7559,7 @@ pub fn try_default_workspaces_root() -> Option<PathBuf> {
     }
     Some(
         std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, PathBuf::from)
             .join("intent")
             .join("workspaces"),
     )
@@ -7550,8 +7749,7 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
         match e.file_type() {
             Ok(t) if t.is_dir() => true,
             Ok(t) if t.is_file() => std::fs::read_to_string(e.path())
-                .map(|s| s.trim_start().starts_with("gitdir:"))
-                .unwrap_or(false),
+                .is_ok_and(|s| s.trim_start().starts_with("gitdir:")),
             _ => false,
         }
     });
@@ -8357,7 +8555,7 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
             .as_ref()
             .is_some_and(|t| !is_terminal_task_status(t.status))
         {
-            let parent = n.parent_id.as_ref().map(|p| p.as_str());
+            let parent = n.parent_id.as_ref().map(intent_core::NoteId::as_str);
             children.entry(parent).or_default().push(n);
         }
     }
@@ -8412,22 +8610,18 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     flattened
         .into_iter()
         .filter(|n| {
-            all_children
-                .get(n.id.as_str())
-                .map(|kids| {
-                    kids.iter().all(|c| {
-                        c.metadata
-                            .task
-                            .as_ref()
-                            .map(|t| t.status == TaskStatus::Complete)
-                            .unwrap_or(true)
-                    })
+            all_children.get(n.id.as_str()).is_none_or(|kids| {
+                kids.iter().all(|c| {
+                    c.metadata
+                        .task
+                        .as_ref()
+                        .is_none_or(|t| t.status == TaskStatus::Complete)
                 })
-                .unwrap_or(true)
-                && n.metadata
-                    .task
-                    .as_ref()
-                    .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
+            }) && n
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
         })
         .map(|n| n.id.0.clone())
         .collect()
@@ -8590,12 +8784,7 @@ fn bounded_needle_snippet(s: &str) -> String {
     // more than EDGE chars.
     let head_end = s.char_indices().nth(EDGE).map(|(i, _)| i);
     // Byte offset of the EDGE-th char from the end.
-    let tail_start = s
-        .char_indices()
-        .rev()
-        .nth(EDGE - 1)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let tail_start = s.char_indices().rev().nth(EDGE - 1).map_or(0, |(i, _)| i);
     match head_end {
         Some(head_end) if head_end < tail_start => {
             format!("{}…{}", &s[..head_end], &s[tail_start..])
@@ -9529,7 +9718,7 @@ fn search_done_event(
 /// Maximum merge attempts the background sweep will make per sandbox before
 /// leaving it `merge_pending` for manual handling (`sandbox.cow.merge` /
 /// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
-pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
+pub(crate) const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 
 /// Outcome tally for one [`Services::sweep_merge_pending_sandboxes`] pass,
 /// used by the daemon's periodic loop for logging and by unit tests.
@@ -9590,8 +9779,7 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
         ws.worktree_path
             .as_deref()
             .and_then(|p| std::fs::canonicalize(p).ok())
-            .map(|p| p == canon_target)
-            .unwrap_or(false)
+            .is_some_and(|p| p == canon_target)
     })
 }
 
@@ -9645,7 +9833,7 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .data
         .get("agentId")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .or_else(|| event.actor.id.clone())
 }
 
@@ -10378,14 +10566,14 @@ impl Services {
                 // edges, so checking each edge alone is equivalent to
                 // checking the combined list.
                 let checked = validate_relation_ids(self_id, &edge, &all, "dependsOn")
-                    .and_then(|_| match find_dependency_cycle(self_id, &edge, &all) {
+                    .and_then(|()| match find_dependency_cycle(self_id, &edge, &all) {
                         Some(cycle) => Err(Error::Internal(format!(
                             "dependsOn would create a cycle: {}",
                             cycle.join(" -> ")
                         ))),
                         None => Ok(()),
                     })
-                    .and_then(|_| ensure_no_tree_relative_dependency(self_id, &edge, &all));
+                    .and_then(|()| ensure_no_tree_relative_dependency(self_id, &edge, &all));
                 match checked {
                     Ok(()) => deps.push(dep),
                     Err(e) => warnings.push(format!(
@@ -10629,7 +10817,8 @@ impl Services {
 
     /// Apply server runtime control hooks after `settings.update` persists
     /// `server.wsApi.*` changes (§5.12): `server.wsApi.enabled` starts/stops the
-    /// WSS listener; `server.wsApi.port` restarts it when running.
+    /// WSS listener; `server.wsApi.port` / `server.bindAddress` restart it when
+    /// running (the start path re-reads both persisted values).
     /// Returns an error if the operation fails (e.g., TCP client trying to disable
     /// the WSS listener, or listener start failure), allowing the caller to rollback.
     ///
@@ -10670,7 +10859,9 @@ impl Services {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 match path {
                     "server.wsApi.port" => {
-                        if let Some(new_port) = change.get("value").and_then(|v| v.as_f64()) {
+                        if let Some(new_port) =
+                            change.get("value").and_then(serde_json::Value::as_f64)
+                        {
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -10688,7 +10879,7 @@ impl Services {
                                         port = port,
                                         "server.wsApi.port → {}: failed to restart WSS listener", port
                                     );
-                                    Error::Internal(format!("failed to restart WSS listener on port {}: {}", port, e))
+                                    Error::Internal(format!("failed to restart WSS listener on port {port}: {e}"))
                                 })?;
                                 tracing::info!(
                                     port = bound_port,
@@ -10705,8 +10896,46 @@ impl Services {
                             }
                         }
                     }
+                    "server.bindAddress" => {
+                        if let Some(addr) = change.get("value").and_then(|v| v.as_str()) {
+                            // Check if listener is running
+                            if control.ws_listener_port().await.is_some() {
+                                // Listener is running: restart it on the new
+                                // bind address (start re-reads the persisted
+                                // value)
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarting WSS listener",
+                                    addr
+                                );
+                                control.stop_ws_listener().await;
+                                control.start_ws_listener().await.map_err(|e| {
+                                    tracing::error!(
+                                        error = ?e,
+                                        bind_address = addr,
+                                        "server.bindAddress → {}: failed to restart WSS listener", addr
+                                    );
+                                    Error::Internal(format!("failed to restart WSS listener on {addr}: {e}"))
+                                })?;
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: restarted WSS listener",
+                                    addr
+                                );
+                            } else {
+                                // Listener is not running: persisting the value is enough
+                                tracing::info!(
+                                    bind_address = addr,
+                                    "server.bindAddress → {}: persisted (listener not running)",
+                                    addr
+                                );
+                            }
+                        }
+                    }
                     "server.wsApi.enabled" => {
-                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
+                        if let Some(enabled) =
+                            change.get("value").and_then(serde_json::Value::as_bool)
+                        {
                             if enabled {
                                 // Attempt to start the listener
                                 let port = control.start_ws_listener().await.map_err(|e| {
@@ -10714,7 +10943,7 @@ impl Services {
                                         error = ?e,
                                         "server.wsApi.enabled → true: failed to start WSS listener"
                                     );
-                                    Error::Internal(format!("failed to start WSS listener: {}", e))
+                                    Error::Internal(format!("failed to start WSS listener: {e}"))
                                 })?;
                                 tracing::info!(
                                     port,
@@ -10888,6 +11117,11 @@ impl WorkspaceApi for Services {
                 // when server.wsApi.enabled changes, restart it when
                 // server.wsApi.port changes while running.
                 if let Some(control) = self.server_control.get() {
+                    // Remember whether the listener was up before the hooks so a
+                    // failed batch (e.g. a restart-on-new-value hook that stopped
+                    // the listener and then failed to start it) can put it back
+                    // up after the persistence rollback.
+                    let listener_was_running = control.ws_listener_port().await.is_some();
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
@@ -10985,6 +11219,25 @@ impl WorkspaceApi for Services {
                                     "settings.update compensating hook application failed during rollback"
                                 );
                                 // Log but don't fail — the persistence rollback succeeded
+                            }
+                        }
+
+                        // A restart-on-new-value hook (port / bindAddress) stops the
+                        // listener before starting it, so a start failure leaves it
+                        // down even though the compensating hooks saw nothing to
+                        // restart. The persisted values are rolled back by now and
+                        // start re-reads them, so bring the listener back up if it
+                        // was running when the batch began.
+                        if listener_was_running && control.ws_listener_port().await.is_none() {
+                            match control.start_ws_listener().await {
+                                Ok(port) => tracing::info!(
+                                    port,
+                                    "settings.update rollback: restarted WSS listener on prior settings"
+                                ),
+                                Err(restart_err) => tracing::error!(
+                                    error = ?restart_err,
+                                    "settings.update rollback: failed to restart WSS listener on prior settings"
+                                ),
                             }
                         }
 
@@ -12470,11 +12723,37 @@ impl WorkspaceApi for Services {
                     ),
                 }
             }
+            // List-frame slimming (monorepo#3041), following the v4.2
+            // `diskUsage` precedent — optional fields simply never present on
+            // list rows, no wire-shape change. Applied after the join-merge so
+            // the guarantee also covers base rows served on the panic
+            // degradation path above (a base row still carries its persisted
+            // `tokenUsage`):
+            // - `tokenUsage` is detail-only (clients read it via
+            //   `workspace.getTokenUsage` + the tokenUsage-changed event,
+            //   never off list rows) and dominated large frames (~26% of a
+            //   real 180-workspace payload).
+            // - `agentSummary` on ARCHIVED rows: archived workspaces render
+            //   no HUD/coverflow agent cards, yet their accumulated sessions
+            //   made archived rows the bulk of the aggregate (~65% of
+            //   agentSummary bytes measured). Active rows keep the full
+            //   summary; `workspace.get` keeps both fields for detail reads.
+            for ws in &mut list {
+                ws.token_usage = None;
+                if ws.archived {
+                    ws.agent_summary = None;
+                }
+            }
             tracing::debug!(
                 workspaces = count,
                 total_ms = started.elapsed().as_millis() as u64,
                 "workspace.list: aggregate enrichment"
             );
+            // Emit-path PR merge: fold git-root + monitor PRs into each
+            // row's `pullRequests` (after enrichment so displayStatus
+            // derivation still sees only the persisted workspace PRs).
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             // Background backfill: active workspaces with repository_path but missing
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
@@ -12508,6 +12787,9 @@ impl WorkspaceApi for Services {
                 ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
                 ws.agent_summary = None;
                 ws.diff_summary = None;
+                // Detail-only on the wire (monorepo#3041): list rows never
+                // carry `tokenUsage` — same rationale as the full list path.
+                ws.token_usage = None;
                 ws.cow_supported = cow_supported;
                 // Keep PR fields if already on the row (cheap, already stored);
                 // do not fetch/refresh them here.
@@ -12519,6 +12801,11 @@ impl WorkspaceApi for Services {
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
                 this.enrich_display_status(ws).await;
             }
+            // Emit-path PR merge, same as the full list path: the seq-0
+            // snapshot must carry the same `pullRequests` a later
+            // `workspace.list` would.
+            this.merge_external_pull_requests(&mut list, include_archived)
+                .await;
             Ok(list)
         })
     }
@@ -12799,9 +13086,7 @@ impl WorkspaceApi for Services {
                             let explicit_clone_path = input
                                 .clone_path
                                 .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .is_some();
+                                .map(str::trim).as_ref().is_some_and(|s| !s.is_empty());
                             // Hydration also requires that a checkout will
                             // actually be provisioned below: remote /
                             // `skipWorktree` / caller-supplied `worktreePath`
@@ -12812,7 +13097,7 @@ impl WorkspaceApi for Services {
                                 && input
                                     .worktree_path
                                     .as_deref()
-                                    .is_none_or(|p| p.is_empty());
+                                    .is_none_or(str::is_empty);
                             let cache_owner_repo = if explicit_clone_path
                                 || !provisions_checkout
                             {
@@ -13017,8 +13302,7 @@ impl WorkspaceApi for Services {
                             if target.as_os_str().is_empty()
                                 || target
                                     .file_name()
-                                    .map(|n| n.is_empty())
-                                    .unwrap_or(true)
+                                    .is_none_or(std::ffi::OsStr::is_empty)
                             {
                                 return Err(Error::CloneFailed {
                                     category: intent_core::CloneErrorCategory::PathInvalid,
@@ -13118,9 +13402,7 @@ impl WorkspaceApi for Services {
                         && input
                             .github_url
                             .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .is_none()
+                            .map(str::trim).as_ref().is_none_or(|s| s.is_empty())
                     {
                         // Half-initialized recovery (#962 review): a mid-init
                         // failure can leave `.git` without a resolvable HEAD,
@@ -13161,7 +13443,7 @@ impl WorkspaceApi for Services {
                     // Apply derived owner when caller left it blank.
                     if input
                         .repository_owner
-                        .as_deref().is_none_or(|o| o.is_empty())
+                        .as_deref().is_none_or(str::is_empty)
                     {
                         if let Some((owner, _)) = origin_derived.as_ref() {
                             input.repository_owner = Some(owner.clone());
@@ -13171,7 +13453,7 @@ impl WorkspaceApi for Services {
                     // basename when origin remote is missing/unparseable.
                     if input
                         .repository_name
-                        .as_deref().is_none_or(|n| n.is_empty())
+                        .as_deref().is_none_or(str::is_empty)
                     {
                         if let Some((_, name)) = origin_derived {
                             input.repository_name = Some(name);
@@ -13192,7 +13474,7 @@ impl WorkspaceApi for Services {
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
                     let branch_auto_generated =
-                        input.branch.as_deref().is_none_or(|b| b.is_empty());
+                        input.branch.as_deref().is_none_or(str::is_empty);
                     let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
                         Some(explicit) => explicit,
                         None => {
@@ -13420,7 +13702,7 @@ impl WorkspaceApi for Services {
                                     intent_core::CheckoutMode::Cow => {
                                         reporter
                                             .milestone("cow-copy", 88, "Copying repository...")
-                                            .await
+                                            .await;
                                     }
                                     _ => {
                                         reporter
@@ -13429,7 +13711,7 @@ impl WorkspaceApi for Services {
                                                 88,
                                                 "Checking out repository...",
                                             )
-                                            .await
+                                            .await;
                                     }
                                 }
                             }
@@ -13619,12 +13901,12 @@ impl WorkspaceApi for Services {
                                                     Some(base) => {
                                                         intent_git::branches::create_branch_at(
                                                             &repo, &branch, base,
-                                                        )?
+                                                        )?;
                                                     }
                                                     None => {
                                                         intent_git::branches::create_branch(
                                                             &repo, &branch, true,
-                                                        )?
+                                                        )?;
                                                     }
                                                 }
                                             }
@@ -13750,7 +14032,7 @@ impl WorkspaceApi for Services {
                                                     30,
                                                     "Copying repository (CoW)...",
                                                 )
-                                                .await
+                                                .await;
                                         }
                                         _ => {
                                             reporter
@@ -13759,7 +14041,7 @@ impl WorkspaceApi for Services {
                                                     30,
                                                     "Creating linked worktree...",
                                                 )
-                                                .await
+                                                .await;
                                         }
                                     }
                                 }
@@ -14779,23 +15061,23 @@ impl WorkspaceApi for Services {
                 // outweighs propagating a mutex-poison panic.
                 live_turns
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 last_turn_silent_tails
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 truncation_redrives
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 pending_truncation_redrive
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 agent_queues
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
             }
             // Sweep the deleted workspace out of the daemon-global
@@ -14808,7 +15090,7 @@ impl WorkspaceApi for Services {
             {
                 let mut registry = agent_subscriptions
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 registry
                     .subscriptions
                     .retain(|s| s.parent_workspace_id != id);
@@ -14881,7 +15163,7 @@ impl WorkspaceApi for Services {
             let leaked: Vec<(String, WorkspaceId, AgentId)> = {
                 let mut registry = agent_subscriptions
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut leaked = Vec::new();
                 registry.subscriptions.retain(|s| {
                     if s.child_workspace_id == id {
@@ -15047,8 +15329,7 @@ impl WorkspaceApi for Services {
                     // worktree path (the old worktree is now orphaned).
                     let skip_worktree = recreated
                         .as_ref()
-                        .map(|r| r.worktree_path == ws_cleanup.worktree_path)
-                        .unwrap_or(false);
+                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
                     if !skip_worktree {
                         let repo_dir = ws_cleanup
                             .repository_path
@@ -15136,7 +15417,7 @@ impl WorkspaceApi for Services {
                                         .await;
                                     if let Some(trash) = trash {
                                         let removal = tokio::task::spawn_blocking(move || {
-                                            cleanup_detached_worktree(&trash)
+                                            cleanup_detached_worktree(&trash);
                                         })
                                         .await;
                                         if let Err(e) = removal {
@@ -16386,8 +16667,7 @@ impl WorkspaceApi for Services {
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_millis() as u64);
                     return Ok(SetupScript {
                         script: script_str,
                         project_type: None,
@@ -17641,16 +17921,24 @@ impl WorkspaceApi for Services {
             store.update_note_versioned(&note, expected_version).await?;
             // Mirror `notes.service.ts`: emit only when the status actually changed.
             if previous_status != new_status {
+                // A complete-boundary crossing records/removes the caller's
+                // flipped-completion pair (later stamped as a wake trigger).
+                track_flipped_completion_boundary(
+                    &store,
+                    caller_agent_id.as_ref(),
+                    &note.workspace_id,
+                    &note.id,
+                    previous_status == TaskStatus::Complete,
+                    new_status == TaskStatus::Complete,
+                    &now,
+                )
+                .await;
                 // LC-1: agent-attributed changes carry provenance — resolve the
                 // caller's display name best-effort for the agent actor.
-                let agent = match caller_agent_id {
+                let agent = match &caller_agent_id {
                     Some(agent_id) => Some((
                         agent_id.0.clone(),
-                        store
-                            .get_agent_session(&agent_id)
-                            .await
-                            .ok()
-                            .map(|s| s.name),
+                        store.get_agent_session(agent_id).await.ok().map(|s| s.name),
                     )),
                     None => None,
                 };
@@ -17873,8 +18161,7 @@ impl WorkspaceApi for Services {
                         .metadata
                         .task
                         .as_ref()
-                        .map(|t| status_word(t.status))
-                        .unwrap_or("unknown")
+                        .map_or("unknown", |t| status_word(t.status))
                         .to_string(),
                 })
                 .collect();
@@ -17985,6 +18272,19 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now.clone();
             store.update_note(&note).await?;
+            // A markAsTask that crosses the complete boundary records/removes
+            // the caller's flipped-completion pair, exactly like
+            // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
+            track_flipped_completion_boundary(
+                &store,
+                caller_agent_id.as_ref(),
+                &note.workspace_id,
+                &note.id,
+                previous_status == Some(TaskStatus::Complete),
+                new_status == TaskStatus::Complete,
+                &now,
+            )
+            .await;
             let agent = resolve_event_agent(&store, caller_agent_id.as_ref()).await;
             // The note's metadata changed, so subscribers need to refetch it
             // (§6.5) — without this a task-ness flip is invisible until the
@@ -19415,7 +19715,7 @@ impl WorkspaceApi for Services {
                 tokio::task::spawn_blocking(move || intent_git::remote::origin_url(&origin_dir))
                     .await
                     .ok()
-                    .and_then(|r| r.ok())
+                    .and_then(std::result::Result::ok)
                     .flatten()
                     .and_then(|url| Self::parse_github_owner_repo(&url))
                     .map_or((None, None), |(o, n)| (Some(o), Some(n)));
@@ -19540,18 +19840,18 @@ impl WorkspaceApi for Services {
                     Ok(content) => {
                         // Strip `gitdir:` prefix (tolerant of varied whitespace), quotes, and trim.
                         let trimmed = content.trim();
-                        let gitdir = trimmed
-                            .strip_prefix("gitdir:")
-                            .map(|s| s.trim())
-                            .map(|s| {
-                                // If quoted, strip the quotes.
-                                if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
-                                    &s[1..s.len() - 1]
-                                } else {
-                                    s
-                                }
-                            })
-                            .unwrap_or(trimmed);
+                        let gitdir =
+                            trimmed
+                                .strip_prefix("gitdir:")
+                                .map(str::trim)
+                                .map_or(trimmed, |s| {
+                                    // If quoted, strip the quotes.
+                                    if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                                        &s[1..s.len() - 1]
+                                    } else {
+                                        s
+                                    }
+                                });
                         // Resolve relative gitdir paths against the worktree directory.
                         let gitdir_path = if std::path::Path::new(gitdir).is_relative() {
                             path.join(gitdir)
@@ -20777,7 +21077,7 @@ impl WorkspaceApi for Services {
                         // so host.status never runs (seen as bulk permit held
                         // 5-40s with "nothing else" making progress).
                         let started = std::time::Instant::now();
-                        let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+                        let path_count = paths.as_ref().map_or(0, std::vec::Vec::len);
                         let walk_worktree = worktree.clone();
                         let walk_paths = paths.clone();
                         let walk_commit = commit_hash.clone();
@@ -20844,17 +21144,14 @@ impl WorkspaceApi for Services {
                             staged,
                             "git.diffs: coalesced into identical in-flight walk"
                         );
-                        match rx.wait_for(|slot| slot.is_some()).await {
-                            Ok(slot) => {
-                                return match slot.clone().expect("wait_for guarantees Some") {
-                                    Ok(shared) => Ok((*shared).clone()),
-                                    Err(msg) => Err(Error::Internal(msg)),
-                                };
-                            }
-                            // The leader vanished without publishing
-                            // (cancelled RPC / panicked walk): retry — the
-                            // next join elects a new leader.
-                            Err(_) => continue,
+                        // On `Err` the leader vanished without publishing
+                        // (cancelled RPC / panicked walk): retry — the next
+                        // join elects a new leader.
+                        if let Ok(slot) = rx.wait_for(std::option::Option::is_some).await {
+                            return match slot.clone().expect("wait_for guarantees Some") {
+                                Ok(shared) => Ok((*shared).clone()),
+                                Err(msg) => Err(Error::Internal(msg)),
+                            };
                         }
                     }
                 }
@@ -23116,11 +23413,7 @@ impl WorkspaceApi for Services {
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
             let is_configured = match pr_ops::resolve_source_control(injected).await {
-                Ok(sc) => sc
-                    .check_auth()
-                    .await
-                    .map(|s| s.authenticated)
-                    .unwrap_or(false),
+                Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
                 Err(_) => false,
             };
             let slot = state.lock().await;
@@ -24123,10 +24416,14 @@ impl WorkspaceApi for Services {
     /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
-    /// shaping stays in [`browser_ops`] (byte-for-byte parity with the FE
-    /// tool); failure modes surface as `Error::Internal` with the underlying
-    /// reason so the MCP caller can distinguish "no client connected" from a
-    /// proxy-side failure. An empty `actions` batch is rejected with
+    /// shaping stays in [`browser_ops`], via the agent-surface variant
+    /// [`browser_ops::shape_agent_result`]: structured per-action failures
+    /// (`not-owner` / `already-claimed`) are preserved as data instead of
+    /// flattening into a top-level error (intent-hq/monorepo#3042).
+    /// Remaining failure modes surface as `Error::Internal` with the
+    /// underlying reason so the MCP caller can distinguish "no client
+    /// connected" from a proxy-side failure. An empty `actions` batch is
+    /// rejected with
     /// `Error::InvalidParams` (JSON-RPC `-32602`) before any dispatch — the
     /// FE tool has no meaningful behavior on an empty batch and the
     /// client-triggered path already enforces the same guard. When no
@@ -24150,6 +24447,10 @@ impl WorkspaceApi for Services {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
+            // Shape by *request* arity: the FE aborts a batch on the first
+            // failing action, so the reply's results count can be shorter
+            // than the batch (see `shape_agent_result`).
+            let requested_actions = actions.len();
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
@@ -24169,7 +24470,8 @@ impl WorkspaceApi for Services {
                             Error::Internal(format!("browser.exec: {message}"))
                         }
                     })?;
-            browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
+            browser_ops::shape_agent_result(response, requested_actions)
+                .map_err(|e| Error::Internal(e.message))
         })
     }
 
@@ -24485,20 +24787,6 @@ impl Services {
         sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
     }
 
-    /// Discard a sandbox: remove the directory and database record.
-    pub async fn discard_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) -> Result<()> {
-        sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
-    }
-
-    /// Garbage-collect orphaned sandboxes (startup GC).
-    pub async fn gc_orphaned_sandboxes(&self) -> Result<()> {
-        sandbox_ops::gc_orphaned_sandboxes(&self.store).await
-    }
-
     /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).
     /// Called by the delegate op BEFORE it returns, so the child's turn
     /// worker observes the gate before its first spawn attempt. The returned
@@ -24622,17 +24910,14 @@ impl Services {
                         workspace_id = %workspace_id.as_str(),
                         "accept-changes.getStatus: coalesced into identical in-flight build"
                     );
-                    match rx.wait_for(|slot| slot.is_some()).await {
-                        Ok(slot) => {
-                            return match slot.clone().expect("wait_for guarantees Some") {
-                                Ok(shared) => Ok((*shared).clone()),
-                                Err(msg) => Err(Error::Internal(msg)),
-                            };
-                        }
-                        // The leader vanished without publishing (cancelled
-                        // RPC / panicked build): retry — the next join elects
-                        // a new leader.
-                        Err(_) => continue,
+                    // On `Err` the leader vanished without publishing
+                    // (cancelled RPC / panicked build): retry — the next join
+                    // elects a new leader.
+                    if let Ok(slot) = rx.wait_for(std::option::Option::is_some).await {
+                        return match slot.clone().expect("wait_for guarantees Some") {
+                            Ok(shared) => Ok((*shared).clone()),
+                            Err(msg) => Err(Error::Internal(msg)),
+                        };
                     }
                 }
             }
@@ -24735,7 +25020,7 @@ impl Services {
                 // serving the pre-mutation snapshot until the TTL.
                 let succeeded = matches!(
                     &outcome,
-                    Ok(v) if v.get("success").and_then(|s| s.as_bool()) == Some(true)
+                    Ok(v) if v.get("success").and_then(serde_json::Value::as_bool) == Some(true)
                 );
                 if !succeeded {
                     self.git_status_cache.invalidate(&worktree);
@@ -25406,9 +25691,7 @@ impl Services {
             ));
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         if has_remote {
             let token = self.ac_git_token(worktree).await;
             let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
@@ -25483,9 +25766,7 @@ impl Services {
             ));
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         let trunk_ref = if has_remote {
             format!("origin/{trunk}")
         } else {
@@ -25498,8 +25779,7 @@ impl Services {
 
         let has_conflicts =
             intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
-                .map(|m| m.has_conflicts)
-                .unwrap_or(false);
+                .is_ok_and(|m| m.has_conflicts);
         if has_conflicts {
             return Err(ac_step_failure(
                 steps.clone(),
@@ -25608,9 +25888,7 @@ impl Services {
             }
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         let token = if has_remote {
             self.ac_git_token(worktree).await
         } else {
@@ -25730,8 +26008,7 @@ impl Services {
         if !can_fast_forward {
             let fresh_conflicts =
                 intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
-                    .map(|m| m.has_conflicts)
-                    .unwrap_or(false);
+                    .is_ok_and(|m| m.has_conflicts);
             if fresh_conflicts {
                 return Err(ac_step_failure(
                     steps.clone(),
@@ -26018,7 +26295,7 @@ fn json_opt_str(value: Option<&serde_json::Value>) -> Option<String> {
 fn json_opt_bool(options: Option<&serde_json::Value>, key: &str) -> bool {
     options
         .and_then(|o| o.get(key))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -26157,8 +26434,8 @@ async fn record_agent_file_mutation(
         commit_hash: None,
         old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
         new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-        additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-        deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+        additions: summary.as_ref().map_or(0, |s| s.additions),
+        deletions: summary.as_ref().map_or(0, |s| s.deletions),
     };
     let (lines_added, lines_deleted) = match crate::file_tracking::track_change(store, change).await
     {
@@ -26260,22 +26537,22 @@ mod specialists;
 mod ac_status_singleflight;
 mod accept_changes;
 pub mod diffs;
-pub mod file_tracking;
+pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
-pub mod usage_rate;
-pub mod usage_stats;
-pub mod usage_stats_read;
-pub mod session_stats {}
+pub(crate) mod usage_rate;
+pub(crate) mod usage_stats;
+pub(crate) mod usage_stats_read;
+pub(crate) mod session_stats {}
 
 /// Worktree setup-script detection and template generation (PROTOCOL §5.25).
 /// Ports the reference `setup-scripts.ipc.ts` detection + template logic, with
 /// the package-manager-specific `ProjectType` collapsed to the coarse protocol
 /// enum (`node`/`python`/`go`/`rust`/`ruby`).
-pub mod setup_scripts {
+pub(crate) mod setup_scripts {
     use std::path::Path;
 
     use intent_core::{now_epoch_ms, ProjectType, SetupScript, SetupScriptGeneratedBy};
@@ -26283,7 +26560,7 @@ pub mod setup_scripts {
     /// Wrap a hand-authored script body into a `SetupScript` stamped
     /// `generatedBy: "user"` with a fresh `updatedAt` (used by create/update and
     /// `saveSetupScript`).
-    pub fn user_script(script: String) -> SetupScript {
+    pub(crate) fn user_script(script: String) -> SetupScript {
         SetupScript {
             script,
             project_type: None,
@@ -26320,7 +26597,7 @@ pub mod setup_scripts {
     /// type, mirroring the reference per-type templates (env-file copy from
     /// `$MAIN_CHECKOUT` + dependency install). The generic fallback copies common
     /// config files only.
-    pub fn template_for(project_type: Option<ProjectType>) -> String {
+    pub(crate) fn template_for(project_type: Option<ProjectType>) -> String {
         const HEADER: &str = "#!/usr/bin/env bash\nset -euo pipefail\n# Available variables: \
             $MAIN_CHECKOUT, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH\n\n";
         const COPY_ENV: &str = "# Copy environment files from the main checkout\n\
@@ -26467,7 +26744,8 @@ fn extract_markdown_image_urls(content: &str) -> Vec<String> {
 /// settings access (the transport's host.providerDiscovery arm) should use
 /// [`discover_providers_with_npx_overrides`] so `installed` matches what the
 /// spawn path would actually resolve (monorepo#1065).
-pub fn discover_providers_with_npx() -> serde_json::Value {
+#[cfg(test)]
+pub(crate) fn discover_providers_with_npx() -> serde_json::Value {
     discover_providers_with_npx_overrides(&std::collections::HashMap::new())
 }
 

@@ -8,17 +8,18 @@
 //! the long-lived bearer token (Decision 4), so remote (TCP) callers get a
 //! -32001 auth error regardless of the `--mode` locality flag.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use crate::events::{error_frame, error_frame_with_data, success_frame};
-use crate::server::{collect_local_ips, ServerPairingInfo};
+use crate::server::{pairing_hosts, ServerPairingInfo};
 use intent_core::{Error, Result};
 
 /// Version of the `intent://pair` payload format (the `v` query parameter and
 /// the `version` field of the `pairing.getInfo` result).
-pub const PAIRING_PAYLOAD_VERSION: u32 = 1;
+pub(crate) const PAIRING_PAYLOAD_VERSION: u32 = 1;
 
 /// Build the pairing payload URI:
 /// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>`.
@@ -28,7 +29,12 @@ pub const PAIRING_PAYLOAD_VERSION: u32 = 1;
 /// through unchanged, but a token injected via `INTENTD_AUTH_TOKEN` may contain
 /// reserved characters (`&`, `=`, `%`, …) that would otherwise make the query
 /// string ambiguous.
-pub fn build_pairing_uri(hosts: &[String], port: u16, fingerprint: &str, token: &str) -> String {
+pub(crate) fn build_pairing_uri(
+    hosts: &[String],
+    port: u16,
+    fingerprint: &str,
+    token: &str,
+) -> String {
     let hosts = hosts
         .iter()
         .map(|h| encode_query_value(h))
@@ -48,9 +54,11 @@ fn encode_query_value(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -132,7 +140,9 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    let hosts = collect_local_ips();
+    // Bind-aware hosts: a specific bind (loopback included) advertises exactly
+    // that address; only an unspecified/unknown bind enumerates local IPs.
+    let hosts = pairing_hosts(&snapshot);
     if hosts.is_empty() {
         return Err(Error::Unsupported(
             "no non-loopback IPv4 address found — connect this machine to a network before pairing"

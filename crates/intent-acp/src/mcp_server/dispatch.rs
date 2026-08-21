@@ -128,8 +128,7 @@ pub(super) fn default_workspace_api_timeout() -> Duration {
 fn workspace_api_timeout_from(raw: Option<&str>) -> Duration {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(WORKSPACE_API_TIMEOUT)
+        .map_or(WORKSPACE_API_TIMEOUT, Duration::from_millis)
 }
 
 /// Default for `workspaceApi.maxOutputChars` — mirrors the settings-catalog
@@ -344,8 +343,7 @@ impl WorkspaceMcpServer {
                 .get("value")
                 .and_then(Value::as_f64)
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+                .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| n as usize),
             Err(_) => DEFAULT_MAX_OUTPUT_CHARS,
         };
         (toon_output, max_chars)
@@ -358,7 +356,8 @@ impl WorkspaceMcpServer {
     /// inside the git tree — and a short redirect message (total size, limit,
     /// absolute path, head preview, inspection hints) is returned instead.
     /// When the redirect cannot be written (e.g. no resolvable workspace
-    /// directory) the untruncated output is returned — the tool call never
+    /// directory) a truncated head — never more than `max_chars` of the
+    /// output — is returned instead (monorepo#3038); the tool call never
     /// fails because of the redirect.
     async fn finalize_workspace_api_output(
         &self,
@@ -389,9 +388,17 @@ impl WorkspaceMcpServer {
             Err(reason) => {
                 tracing::warn!(
                     "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
-                     could not be redirected to a file ({reason}); returning it untruncated"
+                     could not be redirected to a file ({reason}); returning truncated head"
                 );
-                workspace_api_success(&text)
+                let head: String = text.chars().take(max_chars).collect();
+                workspace_api_success(&format!(
+                    "Output too large: {total_chars} characters (limit: {max_chars}). \
+                     The full output could NOT be written to a file ({reason}), so \
+                     everything past the first {max_chars} characters was dropped. \
+                     Re-run the call with a narrower query (filter, project fewer \
+                     fields, or page the results) to see the rest.\n\n\
+                     First {max_chars} characters:\n{head}"
+                ))
             }
         }
     }
@@ -602,59 +609,7 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
     batch
 }
 
-/// Build the `HostFn` bridging JS `host({ method, args })` calls back into
-/// the shared `WorkspaceApi`. Every namespace lives in `super::bindings`;
-/// unknown methods surface as a JS-visible error frame. `caller_agent_id`
-/// is forwarded to bindings that attribute their calls back to the spawning
-/// agent (e.g. `workspace.setAgentName`, `git.commit`,
-/// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
-/// `turn_attachments` is forwarded to bindings that register attachments
-/// mid-dispatch (`ws.app.question.ask`).
-///
-/// `pub` (re-exported as `intent_acp::make_workspace_host`) so callers that
-/// evaluate `ws.*` scripts outside a live MCP tool call — the background hook
-/// scheduler in `intent-services` — reuse the exact same host environment.
-/// All `[agentFeatures]` toggles are treated as on; feature-gated callers use
-/// [`make_workspace_host_for`].
-pub fn make_workspace_host(
-    api: Arc<dyn WorkspaceApi>,
-    workspace_id: WorkspaceId,
-    caller_agent_id: Option<AgentId>,
-    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
-) -> HostFn {
-    make_workspace_host_for(
-        api,
-        workspace_id,
-        caller_agent_id,
-        turn_attachments,
-        AgentFeaturesSettings::default(),
-    )
-}
-
-/// Feature-aware variant of [`make_workspace_host`]: frames whose method is
-/// gated by a disabled `[agentFeatures]` toggle are denied with an explicit
-/// "disabled in settings" error before reaching the bindings (defense in
-/// depth behind the description/prelude pruning — a raw `host({...})` call
-/// cannot bypass the gate). Treats the caller as top-level; sub-agent
-/// bridges use [`make_workspace_host_for_bridge`].
-pub fn make_workspace_host_for(
-    api: Arc<dyn WorkspaceApi>,
-    workspace_id: WorkspaceId,
-    caller_agent_id: Option<AgentId>,
-    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
-    agent_features: AgentFeaturesSettings,
-) -> HostFn {
-    make_workspace_host_for_bridge(
-        api,
-        workspace_id,
-        caller_agent_id,
-        turn_attachments,
-        agent_features,
-        false,
-    )
-}
-
-/// [`make_workspace_host_for`] plus the sub-agent flag: `app.question.*`
+/// `HostFn` factory plus the sub-agent flag: `app.question.*`
 /// frames from a sub-agent caller are denied with the explicit
 /// top-level-only redirect error before the feature-gate check, so a raw
 /// `host({...})` call cannot bypass the description/prelude pruning and the

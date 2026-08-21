@@ -94,8 +94,7 @@ fn wake_resume_self_heal_debounce() -> Duration {
     std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+        .map_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE, Duration::from_millis)
 }
 
 /// Query surface the turn driver uses to decide whether a failed turn's active
@@ -127,13 +126,32 @@ fn transport_closed_error(err: &AcpError) -> bool {
     }
 }
 
+/// Max in-place `session/prompt` retries after a transient provider-fetch
+/// failure (intent-hq/monorepo#3007) — 3 attempts total before the error
+/// surfaces through the existing terminal-failure path. Only output-free
+/// attempts are retried (nothing streamed, nothing persisted), so the retried
+/// unit is provably idempotent.
+const MAX_TRANSIENT_PROMPT_FETCH_RETRIES: u32 = 2;
+
+/// Base delay for the exponential backoff between transient-fetch retries
+/// (doubling per attempt: 1s, 2s). Overridable via
+/// `INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS` (test seam).
+fn transient_prompt_retry_base_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    1000
+}
+
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
 /// (persisted on `AgentSession`) plus the modes the provider advertised in the
 /// same response, so the caller can pick a permissive `session/set_mode` target
 /// only from `availableModes` rather than blindly asking for a mode the agent
 /// never offered.
 #[derive(Debug, Clone)]
-pub struct AcpSessionOpened {
+pub(crate) struct AcpSessionOpened {
     /// The canonical `acpSessionId` to drive future turns.
     pub session_id: String,
     /// The modes the provider advertised in `session/new` / `session/load`, if
@@ -156,7 +174,7 @@ pub struct AcpSessionOpened {
 /// `reasoning_effort` for codex-acp), so discovery keys on the CATEGORY and
 /// carries the adapter's own id for the `session/set_config_option` call.
 #[derive(Debug, Clone)]
-pub struct ThoughtLevelOption {
+pub(crate) struct ThoughtLevelOption {
     /// The adapter's config id, sent as `configId`.
     pub config_id: String,
     /// The value the adapter reported as current at session open — the
@@ -177,7 +195,7 @@ impl ThoughtLevelOption {
     /// sentinel (claude-agent-acp lists it alongside the real levels; it is a
     /// clear-selection affordance, not a level). `None` when nothing remains —
     /// the persisted column stays NULL rather than `Some(empty)`.
-    pub fn surfaced_levels(&self) -> Option<Vec<String>> {
+    pub(crate) fn surfaced_levels(&self) -> Option<Vec<String>> {
         let levels: Vec<String> = self
             .values
             .iter()
@@ -941,11 +959,15 @@ pub(crate) fn resolve_provider_id(
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
         .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .or_else(|| {
+            provider
+                .filter(|p| !p.is_empty())
+                .map(std::string::ToString::to_string)
+        })
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
-                .map(|p| p.to_string())
+                .map(std::string::ToString::to_string)
         })
         .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
@@ -1146,7 +1168,8 @@ impl Services {
     /// Test seam: [`set_live_turn`](Self::set_live_turn) with the final text
     /// block marked CLOSED (e.g. flushed by a tool call, no new text since) —
     /// the live preview derivation must not clip it.
-    pub fn set_live_turn_closed_final_block(
+    #[cfg(test)]
+    pub(crate) fn set_live_turn_closed_final_block(
         &self,
         agent_id: &AgentId,
         message_id: &str,
@@ -1211,7 +1234,7 @@ impl Services {
     pub(crate) fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone(), silent_tail_ms);
     }
 
@@ -1221,7 +1244,7 @@ impl Services {
     pub(crate) fn last_turn_silent_tail(&self, agent_id: &AgentId) -> Option<u64> {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .copied()
     }
@@ -1231,7 +1254,7 @@ impl Services {
     pub(crate) fn clear_turn_silent_tail(&self, agent_id: &AgentId) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1244,7 +1267,7 @@ impl Services {
         let mut map = self
             .truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = map.entry(agent_id.clone()).or_insert(0);
         *count += 1;
         *count
@@ -1258,7 +1281,7 @@ impl Services {
     pub(crate) fn clear_truncation_redrives(&self, agent_id: &AgentId) {
         self.truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1271,7 +1294,7 @@ impl Services {
     pub(crate) fn arm_truncation_redrive(&self, agent_id: &AgentId) {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone());
     }
 
@@ -1283,7 +1306,7 @@ impl Services {
     pub(crate) fn take_truncation_redrive(&self, agent_id: &AgentId) -> bool {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id)
     }
 
@@ -1806,7 +1829,7 @@ impl Services {
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to
     /// pick a permissive `session/set_mode` target from `availableModes`).
-    pub async fn open_acp_session(
+    pub(crate) async fn open_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
@@ -1870,7 +1893,7 @@ impl Services {
     /// reused instead of being clobbered. Returns the canonical `acpSessionId`
     /// with modes only when the freshly-opened session won the CAS — otherwise
     /// the modes belong to some other session and callers must not act on them.
-    pub async fn recreate_acp_session(
+    pub(crate) async fn recreate_acp_session(
         &self,
         conn: &Connection,
         agent_id: &AgentId,
@@ -1940,7 +1963,7 @@ impl Services {
     /// when one was stored and the agent advertised the `loadSession` capability.
     /// Returns the resumed id plus the modes the provider advertised in
     /// `session/load`, or `None` when resume is not possible (§6.5).
-    pub async fn resume_acp_session(
+    pub(crate) async fn resume_acp_session(
         &self,
         conn: &Connection,
         init: &InitializeResponse,
@@ -2060,9 +2083,9 @@ impl Services {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => continue, // a straggler arrived → keep draining
-                Ok(None) => break,       // channel closed
-                Err(_) => break,         // quiet for the settle window → done
+                Ok(Some(_)) => {}  // a straggler arrived → keep draining
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // quiet for the settle window → done
             }
         }
     }
@@ -2109,8 +2132,6 @@ impl Services {
         .await;
         // Activity tracker for idle-based timeout: reset on every notification.
         let activity = session::ActivityTracker::new();
-        let prompt_fut = session::prompt(conn, acp_session_id, prompt, &activity);
-        tokio::pin!(prompt_fut);
         let mut closed = false;
         // Whether ANY `session/update` for this turn was applied — an input to
         // the silent-redrive eligibility below (monorepo#764): once the
@@ -2122,19 +2143,120 @@ impl Services {
         // return false from `route_notification` but still reset the idle
         // timer). Input to the idle-timeout streamed-activity marker below.
         let mut any_update_received = false;
+        // Bounded in-place retry for transient provider-fetch failures
+        // (intent-hq/monorepo#3007): a `-32603` wrapping a connect-level
+        // fetch fault (EPIPE/ECONNRESET/ECONNREFUSED/timeout) or an explicit
+        // provider `apiStatus: unavailable`/`overloaded` payload is routine
+        // network weather, not a terminal turn failure. The prompt is
+        // re-dispatched on the SAME live connection with exponential backoff,
+        // but ONLY while the attempt is provably output-free (no
+        // `session/update` received at all), side-effect-free (no
+        // agent→client request — `fs/write_text_file`, `terminal/*`,
+        // `session/request_permission` — forwarded since the turn started,
+        // per the connection's client-request watermark) and the
+        // notification channel is still open — nothing was streamed,
+        // persisted, or emitted, so the retried unit is idempotent. Once
+        // anything streamed or side-effected, or once the budget is spent,
+        // the error falls through to the existing classification below
+        // (terminal / silent redrive / sleep-resume) unchanged. Genuinely
+        // terminal errors (auth, invalid request, model-not-found, 4xx)
+        // never classify transient and fail fast.
+        //
+        // Two boundary notes:
+        // - Bridge-side idempotency is assumed, not proven: the guard proves
+        //   the DAEMON attempt was output-free, but whether the provider
+        //   bridge (codex-acp / auggie) already appended the user prompt to
+        //   its session history before the failed fetch is bridge-internal.
+        //   Accepted risk: worst case the retried prompt duplicates the user
+        //   message in provider-side context (never in daemon-persisted
+        //   transcript), which is strictly better than killing the turn.
+        // - No cancel race with the backoff sleep: a user stop is delivered
+        //   by `AgentManager::interrupt`/`stop` aborting this turn worker
+        //   (`worker.abort()`), which drops this whole future — sleep, loop,
+        //   and all — so a retry can never re-dispatch after a stop.
+        let mut fetch_retry_attempt: u32 = 0;
+        // Agent→client request watermark at turn start: any bump means a
+        // client-served handler may have side-effected on behalf of this
+        // turn, so the attempt is no longer provably idempotent.
+        let client_request_watermark = conn.client_request_seq();
         let result = loop {
-            tokio::select! {
-                res = &mut prompt_fut => break res,
-                maybe = notifications.recv(), if !closed => match maybe {
-                    Some(note) => {
+            let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
+            tokio::pin!(prompt_fut);
+            let attempt_result = loop {
+                tokio::select! {
+                    res = &mut prompt_fut => break res,
+                    maybe = notifications.recv(), if !closed => match maybe {
+                        Some(note) => {
+                            activity.touch();
+                            any_update_received = true;
+                            updates_applied |= self
+                                .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                                .await;
+                        }
+                        None => closed = true,
+                    },
+                }
+            };
+            // Drain updates buffered before this attempt settled BEFORE the
+            // retry decision: `prompt_fut` can win the `select!` with streamed
+            // notes still sitting in the channel, and a retry armed on a
+            // stale `any_update_received = false` would re-dispatch a prompt
+            // that did produce output (duplicating it). The post-loop drain
+            // below still runs for the final attempt; draining twice is
+            // harmless (`try_recv` on an empty channel is a no-op).
+            if attempt_result.is_err() {
+                while let Ok(note) = notifications.try_recv() {
+                    activity.touch();
+                    any_update_received = true;
+                    updates_applied |= self
+                        .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                        .await;
+                }
+            }
+            match &attempt_result {
+                Err(e)
+                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                        && !closed
+                        && !any_update_received
+                        && conn.client_request_seq() == client_request_watermark
+                        && intent_acp::is_transient_provider_fetch_failure(e) =>
+                {
+                    fetch_retry_attempt += 1;
+                    let delay = Duration::from_millis(
+                        transient_prompt_retry_base_ms() << (fetch_retry_attempt - 1),
+                    );
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        attempt = fetch_retry_attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
+                    );
+                    tokio::time::sleep(delay).await;
+                    // Re-drain after the backoff: a straggling update (or a
+                    // channel close) can land DURING the sleep, and
+                    // re-dispatching without observing it would duplicate
+                    // output the provider already streamed. If the recheck
+                    // flips any guard, fall through to classification with
+                    // this attempt's error instead of retrying.
+                    while let Ok(note) = notifications.try_recv() {
                         activity.touch();
                         any_update_received = true;
                         updates_applied |= self
                             .route_notification(&note, agent_id, workspace_id, &mut transcript)
                             .await;
                     }
-                    None => closed = true,
-                },
+                    if any_update_received || conn.client_request_seq() != client_request_watermark
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            attempt = fetch_retry_attempt,
+                            "output arrived during retry backoff — abandoning retry (monorepo#3007)"
+                        );
+                        break attempt_result;
+                    }
+                }
+                _ => break attempt_result,
             }
         };
         // Drain updates buffered before the prompt response resolved. Each
@@ -3212,7 +3334,7 @@ impl Services {
                 prev.as_ref(),
                 &token_usage::snapshot_from_turn_usage(u),
             ),
-            _ => Default::default(),
+            _ => intent_core::TokenUsageTotals::default(),
         };
         let delta = intent_store::UsageStatsDelta {
             input_tokens: tokens.input_tokens,
@@ -3394,7 +3516,7 @@ impl Services {
                     self.turn_attachments
                         .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
                         .iter()
-                        .map(|a| a.resource_item())
+                        .map(intent_core::TurnAttachment::resource_item)
                         .collect()
                 } else {
                     Vec::new()

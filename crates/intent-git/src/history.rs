@@ -340,7 +340,7 @@ fn resolve_workspace_boundary_inner(
     // Try merge-base first (rebase-resilient)
     if let Some(base_ref) = base_ref {
         // Try origin/<base_ref> first, then <base_ref>
-        for ref_name in [format!("origin/{}", base_ref), base_ref.to_string()] {
+        for ref_name in [format!("origin/{base_ref}"), base_ref.to_string()] {
             if let Ok(obj) = repo.revparse_single(&ref_name) {
                 if let Ok(base_oid) = repo.merge_base(head_oid, obj.id()) {
                     return Ok(Some(base_oid.to_string()));

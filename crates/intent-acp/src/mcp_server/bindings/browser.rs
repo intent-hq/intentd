@@ -22,13 +22,13 @@ const OVERVIEW_DOC: &str = include_str!("browser_docs/overview.md");
 const CAPTURE_DOC: &str = include_str!("browser_docs/capture.md");
 const EXAMPLES_DOC: &str = include_str!("browser_docs/examples.md");
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.browser = {
         exec: (actions, tabId) => host({ method: 'browser.exec', args: { actions, tabId } }),
         docs: (topic) => host({ method: 'browser.docs', args: { topic } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

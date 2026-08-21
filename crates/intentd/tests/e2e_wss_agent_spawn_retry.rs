@@ -44,7 +44,7 @@ impl Drop for Daemon {
         // Print daemon log for debugging
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -73,7 +73,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .stderr(Stdio::from(log));
     eprintln!("[spawn_serve] setting env vars:");
     for (k, v) in env {
-        eprintln!("  {}={}", k, v);
+        eprintln!("  {k}={v}");
         cmd.env(k, v);
     }
     cmd.spawn().expect("spawn intentd serve")
@@ -196,7 +196,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -220,7 +220,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

@@ -115,8 +115,7 @@ fn dequeue_wait_annotation_min_ms() -> i128 {
     std::env::var("INTENTD_DEQUEUE_WAIT_MIN_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(i128::from)
-        .unwrap_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS)
+        .map_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS, i128::from)
 }
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
@@ -185,6 +184,54 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
                 queued_at = %msg.queued_at,
                 "dequeue-wait queueInfo stamp skipped: messageMetadata is not an object"
             );
+        }
+    }
+}
+
+/// Batch-flush grouping stamp: when a flush delivers two or more entries as
+/// ONE combined turn ([`prepare_flush_turn`]), every drained entry's
+/// `messageMetadata` gains the same freshly minted `queueInfo.batchId`
+/// (uuid, PROTOCOL §5.5), so clients can group the N persisted user rows.
+/// Must run AFTER [`annotate_dequeue_wait`]: this stamp creates `queueInfo`
+/// when absent, and the wait stamp never overwrites an existing one. The
+/// stamp is additive — an entry whose wait fell below the annotation
+/// threshold gets a `queueInfo` carrying only `batchId`, and an entry that
+/// already carries `queueInfo` keeps its `queuedAt` / `waitedMs` (and any
+/// prior `batchId`: a mid-flush persist failure requeues already-stamped
+/// entries, and keeping the first batch's id groups the retry's rows with
+/// the rows the first attempt already persisted). Same skips as the wait
+/// stamp: `persisted: true` requeues (row already durable, never rewritten)
+/// and a non-object `messageMetadata` are left alone. Single-entry drains
+/// never stamp — there is nothing to group.
+fn stamp_flush_batch_id(entries: &mut [QueuedMessage]) {
+    if entries.len() < 2 {
+        return;
+    }
+    let batch_id = Value::String(Uuid::new_v4().to_string());
+    for msg in entries.iter_mut() {
+        if msg.persisted {
+            continue;
+        }
+        let metadata = msg.message_metadata.get_or_insert_with(|| json!({}));
+        let Value::Object(map) = metadata else {
+            tracing::warn!(
+                id = %msg.id,
+                "flush batchId stamp skipped: messageMetadata is not an object"
+            );
+            continue;
+        };
+        match map.entry("queueInfo").or_insert_with(|| json!({})) {
+            Value::Object(queue_info) => {
+                queue_info
+                    .entry("batchId")
+                    .or_insert_with(|| batch_id.clone());
+            }
+            _ => {
+                tracing::warn!(
+                    id = %msg.id,
+                    "flush batchId stamp skipped: queueInfo is not an object"
+                );
+            }
         }
     }
 }
@@ -528,31 +575,36 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Async callback that tears down one process when the registry evicts/reaps it
 /// (the Rust analog of the TS `ProcessEntry.kill`). The manager wires this to
 /// drop the agent's [`AgentHandle`], killing the child and aborting its tasks.
-pub type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+pub(crate) type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Async callback for process-cap lifecycle events (queueing/resuming/eviction).
 /// Invoked by the registry when a spawn queues, resumes, or an idle process is
 /// evicted; the manager wires this to log + publish workspace events. The final
-/// parameter is the machine-readable `reason` — [`REASON_SLOTS`] or
-/// [`REASON_MEMORY_BUDGET`] — naming which admission constraint drove the event
-/// (monorepo#2063).
-pub type ProcessEventFn =
+/// parameter is the machine-readable `reason` — [`REASON_SLOTS`],
+/// [`REASON_MEMORY_BUDGET`], or [`REASON_IDLE_TTL`] — naming which constraint
+/// drove the event (monorepo#2063, monorepo#3040).
+pub(crate) type ProcessEventFn =
     Arc<dyn Fn(&AgentId, &str, usize, usize, &str) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// `reason` value for `agent:process:*` events driven by the concurrency slot
 /// cap (all slots active / a slot freed).
-pub const REASON_SLOTS: &str = "slots";
+pub(crate) const REASON_SLOTS: &str = "slots";
 
 /// `reason` value for `agent:process:*` events driven by the aggregate memory
 /// budget (monorepo#2063).
-pub const REASON_MEMORY_BUDGET: &str = "memory-budget";
+pub(crate) const REASON_MEMORY_BUDGET: &str = "memory-budget";
+
+/// `reason` value for `agent:process:evicted` events driven by the TTL idle
+/// sweep (monorepo#3040): the process sat idle past `agents.idleReapMinutes`.
+/// Unlike the other two reasons this never labels a queue/resume — the sweep
+/// only evicts.
+pub(crate) const REASON_IDLE_TTL: &str = "idle-ttl";
 
 struct ProcessEntry {
     last_active_ms: u64,
@@ -784,8 +836,8 @@ impl BusEventSink {
             commit_hash: None,
             old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
             new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-            additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-            deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+            additions: summary.as_ref().map_or(0, |s| s.additions),
+            deletions: summary.as_ref().map_or(0, |s| s.deletions),
         };
         let attributed_agent = change.agent_id.clone();
         let (lines_added, lines_deleted) =
@@ -996,7 +1048,7 @@ impl ProcessRegistry {
     /// Chainable builder; returns `Self` so the manager can wire this after
     /// construction. The callback signature is
     /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
-    pub fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
+    pub(crate) fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
         self
     }
@@ -1012,7 +1064,8 @@ impl ProcessRegistry {
     }
 
     /// Whether `agent_id` is currently registered.
-    pub fn is_registered(&self, agent_id: &AgentId) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_registered(&self, agent_id: &AgentId) -> bool {
         self.inner.lock().unwrap().entries.contains_key(agent_id)
     }
 
@@ -1063,7 +1116,7 @@ impl ProcessRegistry {
     }
 
     /// Mark a process as actively streaming (never evicted while active).
-    pub fn mark_active(&self, agent_id: &AgentId) {
+    pub(crate) fn mark_active(&self, agent_id: &AgentId) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.get_mut(agent_id) {
             entry.is_active = true;
@@ -1074,7 +1127,7 @@ impl ProcessRegistry {
     /// Mark a process idle (eligible for eviction) and wake a queued spawn so it
     /// can take the freed slot immediately. When a waiter is resumed, logs + emits
     /// `agent:process:resumed` via the event callback.
-    pub fn mark_idle(&self, agent_id: &AgentId) {
+    pub(crate) fn mark_idle(&self, agent_id: &AgentId) {
         let resumed_agent = {
             let mut inner = self.inner.lock().unwrap();
             let existed = match inner.entries.get_mut(agent_id) {
@@ -1231,7 +1284,7 @@ impl ProcessRegistry {
     ///
     /// An unregistered agent admits immediately too — its child must spawn,
     /// and `create_agent`'s [`Self::acquire`] is that path's gate.
-    pub async fn acquire_turn_start(&self, agent_id: &AgentId) {
+    pub(crate) async fn acquire_turn_start(&self, agent_id: &AgentId) {
         loop {
             enum Action {
                 Admit,
@@ -1332,13 +1385,17 @@ impl ProcessRegistry {
             .unwrap()
             .entries
             .get(agent_id)
-            .map(|e| e.is_active)
-            .unwrap_or(false)
+            .is_some_and(|e| e.is_active)
     }
 
     /// Evict idle processes in LRU order (the idle-reap hook; full
     /// timer/memory-pressure triggering is M5). Returns the number evicted.
-    pub async fn evict_idle(&self, max: Option<usize>) -> usize {
+    ///
+    /// Emits no `agent:process:evicted` — currently caller-less in
+    /// production; add the emit (with an appropriate reason) before wiring a
+    /// production caller, or its evictions are invisible to clients
+    /// (the monorepo#3040 gap).
+    pub(crate) async fn evict_idle(&self, max: Option<usize>) -> usize {
         let max = max.unwrap_or(usize::MAX);
         let mut evicted = 0;
         while evicted < max {
@@ -1374,7 +1431,7 @@ impl ProcessRegistry {
     /// daemon restart. The reap loop task is the only production caller and
     /// is aborted only at shutdown; a future caller must not wrap this in a
     /// timeout/select that can drop it mid-kill.
-    pub async fn evict_idle_older_than<C, R>(
+    pub(crate) async fn evict_idle_older_than<C, R>(
         &self,
         ttl: Duration,
         try_claim: C,
@@ -1410,6 +1467,29 @@ impl ProcessRegistry {
                 release(&id);
                 continue;
             }
+            // Observable eviction (monorepo#3040): the TTL sweep was the one
+            // eviction path that emitted nothing, so an FE chat session bound
+            // to the reaped agent had no signal it was gone. Log + emit
+            // `agent:process:evicted` with reason `idle-ttl`, mirroring the
+            // slot-cap and budget eviction paths.
+            let used = self.size();
+            tracing::info!(
+                evicted = %id,
+                used = used,
+                cap = self.cap,
+                reason = REASON_IDLE_TTL,
+                "process registry: idle process evicted (TTL sweep)"
+            );
+            if let Some(ref f) = self.event_fn {
+                let fut = f(
+                    &id,
+                    "agent:process:evicted",
+                    used,
+                    self.cap,
+                    REASON_IDLE_TTL,
+                );
+                tokio::spawn(fut);
+            }
             kill().await;
             self.deregister(&id);
             release(&id);
@@ -1440,7 +1520,7 @@ impl ProcessRegistry {
     /// contract as [`Self::evict_idle_older_than`], including the
     /// re-validation before each kill and the NOT-cancellation-safe caveat —
     /// dropping this future at the `kill().await` leaks the held claim.
-    pub async fn evict_while_over_budget<C, R>(&self, try_claim: C, release: R) -> usize
+    pub(crate) async fn evict_while_over_budget<C, R>(&self, try_claim: C, release: R) -> usize
     where
         C: Fn(&AgentId) -> bool,
         R: Fn(&AgentId),
@@ -1726,7 +1806,7 @@ type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
 /// it — after which the rows are gone and a spawn attempt fails `NotFound`
 /// on its own store read.
 #[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
-pub struct TeardownFence {
+pub(crate) struct TeardownFence {
     stopping: Arc<Mutex<HashSet<AgentId>>>,
     ids: Vec<AgentId>,
 }
@@ -1735,7 +1815,10 @@ impl Drop for TeardownFence {
     fn drop(&mut self) {
         // Poison recovery mirrors the delete-path sweeps: unfencing is the
         // last chance to keep the set from leaking these ids forever.
-        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stopping = self
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in &self.ids {
             stopping.remove(id);
         }
@@ -2053,7 +2136,7 @@ impl AgentManager {
     /// Per-agent subtree memory attribution from the installed probe
     /// (monorepo#2063 A2), or an empty map when no probe is wired (tests /
     /// bare wiring) or no sample has landed yet.
-    pub fn agent_memory_samples(&self) -> HashMap<AgentId, u64> {
+    pub(crate) fn agent_memory_samples(&self) -> HashMap<AgentId, u64> {
         self.tree_probe
             .get()
             .map(|p| p.agent_samples())
@@ -2096,13 +2179,13 @@ impl AgentManager {
     /// Resolve an outstanding interactive permission prompt (`agent.respondPermission`,
     /// PROTOCOL §8): deliver `outcome` to the blocked client handler. Returns
     /// `false` when no such prompt is outstanding (already answered or timed out).
-    pub fn respond_permission(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
+    pub(crate) fn respond_permission(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
         self.permissions.resolve(request_id, outcome)
     }
 
     /// Snapshot every outstanding permission prompt (`agent.pendingPermissions`,
     /// PROTOCOL §8), for a (re)connecting client to recover what awaits an answer.
-    pub fn pending_permissions(&self) -> Vec<PermissionRequestData> {
+    pub(crate) fn pending_permissions(&self) -> Vec<PermissionRequestData> {
         self.permissions.pending()
     }
 
@@ -2123,7 +2206,7 @@ impl AgentManager {
 
     /// Number of currently-tracked agents spawned with the given provider id
     /// (e.g. `"unsloth"`), for `unsloth.status`'s `attachedAgentCount`.
-    pub fn count_agents_with_provider(&self, provider_id: &str) -> usize {
+    pub(crate) fn count_agents_with_provider(&self, provider_id: &str) -> usize {
         self.handles
             .lock()
             .unwrap()
@@ -2134,7 +2217,7 @@ impl AgentManager {
 
     /// The daemon-owned singleton Unsloth server manager, for the
     /// `unsloth.status` / `unsloth.stop` RPCs.
-    pub fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerManager> {
+    pub(crate) fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerManager> {
         &self.unsloth
     }
 
@@ -2353,7 +2436,7 @@ impl AgentManager {
             auth_error_patterns: opts
                 .provider
                 .auth_error_patterns
-                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .map(|p| p.iter().map(std::string::ToString::to_string).collect())
                 .unwrap_or_default(),
             // STAB-53: capture the child's stderr under
             // `<agent-logs>/<agent-id>/<YYYY-MM-DD>.log` so a child that dies
@@ -2426,7 +2509,7 @@ impl AgentManager {
             _rules_config: rules_config,
             _pi_extension: pi_extension,
             session_mcp_servers,
-            spawned_model: opts.model.map(|s| s.to_string()),
+            spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
@@ -3474,9 +3557,9 @@ impl AgentManager {
         // appends trail it (the `model_changed` system notice lands after the
         // user row and before this render); with no user row fall back to
         // dropping the last message.
-        let prior = match messages.iter().rposition(|m| m.role == "user") {
+        let prior: &[_] = match messages.iter().rposition(|m| m.role == "user") {
             Some(idx) => &messages[..idx],
-            None => messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]),
+            None => messages.split_last().map_or(&[], |(_, rest)| rest),
         };
         if prior.is_empty() {
             return content.to_string();
@@ -3560,7 +3643,7 @@ impl AgentManager {
     /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
     /// child that would outlive its deleted session as a ghost process.
     #[must_use = "hold the fence until the swept agents' session rows are deleted"]
-    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+    pub(crate) async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
         // Arm the fence BEFORE the first detach: from here on, every lazy
         // spawn for a swept agent is refused (`ensure_started` fast-fail +
         // the `create_agent` install fence), so no replacement child can
@@ -4111,8 +4194,7 @@ impl AgentManager {
         let had_output = self
             .services
             .live_turn(agent_id)
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|live| !live.blocks.is_empty());
         let redelivery = if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
             self.derive_stop_redelivery(agent_id, None).await
         } else {
@@ -4129,7 +4211,7 @@ impl AgentManager {
 
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
     /// `agent.sendMessage` to decide queue-vs-stream).
-    pub fn is_busy(&self, agent_id: &AgentId) -> bool {
+    pub(crate) fn is_busy(&self, agent_id: &AgentId) -> bool {
         self.busy.lock().unwrap().contains(agent_id)
     }
 
@@ -4143,7 +4225,7 @@ impl AgentManager {
     /// while holding the `busy` lock. That makes a claim/release visible
     /// atomically from this snapshot's perspective: a busy agent always has
     /// its `agent_ws` entry.
-    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+    pub(crate) fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
         let busy = self.busy.lock().unwrap();
         let agent_ws = self.agent_ws.lock().unwrap();
         let mut active = busy
@@ -5296,7 +5378,7 @@ impl AgentManager {
     /// redriven — the explicit "send now" is a user action, same spirit as
     /// the documented fresh-`agent.sendMessage` recovery path (the STAB-52
     /// drain gate does not apply here by design).
-    pub async fn send_queued_message_now(
+    pub(crate) async fn send_queued_message_now(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
@@ -5611,7 +5693,7 @@ impl AgentManager {
     ///   back to the hard `stop` kill. Preemption is skipped instead and the
     ///   message queues keep-alive behind the starting turn (`queued: true`),
     ///   draining right after it — the agent is never killed.
-    pub async fn interrupt_send_message(
+    pub(crate) async fn interrupt_send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
@@ -5722,8 +5804,7 @@ impl AgentManager {
         let has_output = self
             .services
             .live_turn(agent_id)
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|live| !live.blocks.is_empty());
 
         // Sender attribution for the interrupted row / `stream:end` payload:
         // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
@@ -6515,6 +6596,31 @@ impl AgentManager {
                 tracing::warn!(agent_id = %agent_id, "cached agent child is dead; respawning before turn");
                 self.kill_child_only(agent_id).await;
             }
+        }
+        // auggie version gate (monorepo#1045): before a fresh child spawns,
+        // pick a version-compatible auggie by probing `--version` down the
+        // discovery-precedence candidate list and selecting the first new
+        // enough for the launch flags (`--acp/--allow-indexing/--model/
+        // --remove-tool`, which require auggie
+        // `AUGGIE_CLI_MIN_VERSION`+). A stale nvm auggie earlier on the
+        // daemon's minimal PATH is skipped rather than launched with flags it
+        // does not understand; if none qualify, fail fast with a clear,
+        // actionable error instead of a cryptic "Unknown arguments" spawn.
+        // Only for a fresh spawn (a reused live child already runs the binary
+        // it was spawned with) and never for the npx-fallback path. The probe
+        // is blocking (subprocess, ≤3s per candidate), so it runs off the
+        // runtime.
+        if resolved.provider.id == "auggie"
+            && resolved.provider_binary.is_some()
+            && !self.contains(agent_id)
+        {
+            let explicit = auggie_explicit_path_setting(&settings);
+            let selected = tokio::task::spawn_blocking(move || {
+                crate::auggie_cli::select_auggie_for_spawn(explicit.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
+            resolved.provider_binary = Some(selected);
         }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
         // spawns, make sure the daemon-managed Unsloth server is running and
@@ -7831,7 +7937,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
     spawn_opts.npx_fallback_package = opts.npx_fallback_package;
     spawn_opts.extra_env = opts.extra_env.clone();
-    spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
+    spawn_opts.tools_to_remove.clone_from(&opts.tools_to_remove);
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
@@ -7872,6 +7978,24 @@ fn read_provider_path_setting(
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Explicit auggie path for the version-gated spawn selector:
+/// `context.auggiePath` wins over `providers.paths["auggie"]`, matching the
+/// transport-host precedence (`configured_auggie_path` /
+/// `resolve_auggie_override`). The gate's fail-fast error recommends
+/// `context.auggiePath`, so the spawn path must honor it.
+fn auggie_explicit_path_setting(
+    settings: &intent_core::settings_file::SettingsFile,
+) -> Option<String> {
+    settings
+        .context
+        .auggie_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| read_provider_path_setting(settings, "auggie"))
 }
 
 /// Background turn worker: drive the current message to completion, then drain
@@ -8322,7 +8446,7 @@ async fn run_message_worker(
                                     log.display()
                                 ),
                                 None => {
-                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally")
+                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
                                 }
                             }
                             handle_terminal_turn_failure(
@@ -8353,7 +8477,7 @@ async fn run_message_worker(
                         log.display()
                     ),
                     None => {
-                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries")
+                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
                     }
                 }
                 handle_terminal_spawn_failure(
@@ -8629,7 +8753,7 @@ async fn run_message_worker(
                 .redeliver_completion_after_queue_mutation(&agent_id)
                 .await;
             break 'outer;
-        };
+        }
         if mgr.try_begin_outcome(&agent_id, &workspace_id, false).await == TryBeginOutcome::Started
         {
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
@@ -8920,7 +9044,9 @@ enum FlushPrep {
 /// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
 /// correlate with the single `agent:queue:processing`/`agent:stream:*`
 /// lifecycle (monorepo#1022 turn-correlation contract). Queue entries keep
-/// their own `turn_id`s (ids/messageMetadata/queueInfo are untouched).
+/// their own `turn_id`s and ids; the only metadata mutation beyond the
+/// single-drain annotations is the shared `queueInfo.batchId` grouping stamp
+/// ([`stamp_flush_batch_id`]) on every entry of the batch.
 ///
 /// Returns [`FlushPrep::Turn`] with the wire-only combined prompt
 /// ([`flush_combined_prompt`]) and merged [`TurnOptions`]: attachments and
@@ -8954,11 +9080,15 @@ async fn prepare_flush_turn(
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
     let mut stale_flags = Vec::with_capacity(entries.len());
-    for entry in entries.iter_mut() {
+    for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
         stale_flags.push(stale);
     }
+    // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
+    // when absent; the wait stamp never overwrites an existing one): every
+    // row persisted by this flush shares one fresh batchId.
+    stamp_flush_batch_id(&mut entries);
     // Delivery-time unblocked hints (monorepo#2044): all completion wakes in
     // this batch coalesce into ONE fresh delta, appended to the last
     // trigger-carrying entry. Runs before the row persists (same placement
@@ -9547,7 +9677,7 @@ pub(crate) async fn persist_terminal_error_status_via_services(
         )
         .await
     {
-        Ok(_) => true,
+        Ok(()) => true,
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
             false
@@ -11334,7 +11464,7 @@ mod dead_child_respawn_tests {
             ConnectionHooks::default(),
         ));
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
-        let child_pid = child.as_ref().and_then(|c| c.id());
+        let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         let handle = AgentHandle {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
@@ -12432,6 +12562,67 @@ mod provider_path_override_tests {
             resolved.provider_binary.as_deref(),
             Some(opencode_stub.as_path())
         );
+    }
+}
+
+#[cfg(test)]
+mod auggie_explicit_path_tests {
+    //! Precedence for the auggie spawn selector's explicit path:
+    //! `context.auggiePath` wins over `providers.paths["auggie"]` (transport
+    //! parity — the gate's fail-fast error recommends `context.auggiePath`).
+
+    use super::*;
+
+    fn settings(
+        context_path: Option<&str>,
+        providers_path: Option<&str>,
+    ) -> intent_core::settings_file::SettingsFile {
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.context.auggie_path = context_path.map(str::to_string);
+        if let Some(p) = providers_path {
+            settings
+                .providers
+                .paths
+                .insert("auggie".to_string(), p.to_string());
+        }
+        settings
+    }
+
+    #[test]
+    fn context_auggie_path_wins_over_providers_paths() {
+        let s = settings(Some("/from/context/auggie"), Some("/from/providers/auggie"));
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/context/auggie")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_providers_paths_when_context_unset() {
+        let s = settings(None, Some("/from/providers/auggie"));
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/providers/auggie")
+        );
+    }
+
+    #[test]
+    fn blank_context_path_falls_back_and_value_is_trimmed() {
+        let s = settings(Some("   "), Some("/from/providers/auggie"));
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/providers/auggie")
+        );
+        let s = settings(Some("  /from/context/auggie  "), None);
+        assert_eq!(
+            auggie_explicit_path_setting(&s).as_deref(),
+            Some("/from/context/auggie")
+        );
+    }
+
+    #[test]
+    fn none_when_neither_is_set() {
+        assert_eq!(auggie_explicit_path_setting(&settings(None, None)), None);
     }
 }
 

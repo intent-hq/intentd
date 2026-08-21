@@ -156,6 +156,7 @@ fn env_to_value(env: &EnvMap) -> Value {
     Value::Object(m)
 }
 
+#[cfg(test)]
 fn pairs_array(map: &BTreeMap<String, String>) -> Value {
     Value::Array(
         map.iter()
@@ -194,7 +195,8 @@ pub fn to_opencode_mcp_config(normalized: &NormalizedMcpServers) -> Value {
 }
 
 /// Convert to the Claude Code `.mcp.json` format (port of `toClaudeMcpJson`).
-pub fn to_claude_mcp_json(normalized: &NormalizedMcpServers) -> Value {
+#[cfg(test)]
+pub(crate) fn to_claude_mcp_json(normalized: &NormalizedMcpServers) -> Value {
     let mut servers = Map::new();
     for (name, server) in normalized {
         let entry = match server {
@@ -242,7 +244,8 @@ pub fn to_auggie_mcp_config(normalized: &NormalizedMcpServers) -> Value {
 /// Convert to the ACP `session/new` `mcpServers` array (port of
 /// `toAcpMcpServers`). `env`/`headers` become `{ name, value }` arrays; absent
 /// values use empty arrays as the ACP Zod schema requires.
-pub fn to_acp_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<Value> {
+#[cfg(test)]
+pub(crate) fn to_acp_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<Value> {
     let mut servers = Vec::new();
     for (name, server) in normalized {
         match server {
@@ -253,16 +256,17 @@ pub fn to_acp_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<Value> {
                 "env": pairs_array(env),
             })),
             NormalizedMcpServer::Http { url, headers } => {
-                servers.push(acp_remote(name, "http", url, headers))
+                servers.push(acp_remote(name, "http", url, headers));
             }
             NormalizedMcpServer::Sse { url, headers } => {
-                servers.push(acp_remote(name, "sse", url, headers))
+                servers.push(acp_remote(name, "sse", url, headers));
             }
         }
     }
     servers
 }
 
+#[cfg(test)]
 fn acp_remote(
     name: &str,
     kind: &str,
@@ -323,23 +327,27 @@ fn header_pairs(headers: &Option<BTreeMap<String, String>>) -> Vec<HttpHeader> {
 
 /// A single Codex `-c key=value` config override.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexConfigOverride {
+#[cfg(test)]
+pub(crate) struct CodexConfigOverride {
     /// The dotted config key (e.g. `mcp_servers.foo.command`).
     pub key: String,
     /// The TOML-encoded value literal.
     pub toml_value: String,
 }
 
+#[cfg(test)]
 fn toml_string_literal(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
 
+#[cfg(test)]
 fn toml_string_array_literal(values: &[String]) -> String {
     let parts: Vec<String> = values.iter().map(|v| toml_string_literal(v)).collect();
     format!("[{}]", parts.join(", "))
 }
 
+#[cfg(test)]
 fn toml_inline_table_literal(map: &EnvMap) -> String {
     if map.is_empty() {
         return "{}".to_string();
@@ -362,7 +370,10 @@ fn toml_inline_table_literal(map: &EnvMap) -> String {
 }
 
 /// Convert to Codex `-c key=value` overrides (port of `toCodexMcpOverrides`).
-pub fn to_codex_mcp_overrides(normalized: &NormalizedMcpServers) -> Vec<CodexConfigOverride> {
+#[cfg(test)]
+pub(crate) fn to_codex_mcp_overrides(
+    normalized: &NormalizedMcpServers,
+) -> Vec<CodexConfigOverride> {
     let mut overrides = Vec::new();
     let mut push = |key: String, toml_value: String| {
         overrides.push(CodexConfigOverride { key, toml_value });

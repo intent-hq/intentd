@@ -1249,8 +1249,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = evict_event.expect("eviction event published");
@@ -1344,8 +1344,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = queue_event.expect("queue event published");
@@ -1380,8 +1380,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = resume_event.expect("resume event published");
@@ -1605,6 +1605,150 @@ async fn evict_idle_older_than_evicts_only_stale_idle() {
     assert!(!reg.is_registered(&old));
     assert!(reg.is_registered(&fresh), "within-TTL idle kept");
     assert!(reg.is_registered(&active), "active process kept");
+}
+
+/// monorepo#3040 — the TTL idle sweep was the ONE eviction path that emitted
+/// no `agent:process:evicted`, so an FE chat session bound to the reaped agent
+/// had no signal it was gone. The sweep must fire the registry event callback
+/// with the additive reason `"idle-ttl"` for every process it evicts.
+#[tokio::test]
+async fn ttl_eviction_emits_evicted_event_with_idle_ttl_reason() {
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+    let reg = ProcessRegistry::new(8).with_event_fn(event_fn);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (stale, fresh) = (AgentId::from("stale"), AgentId::from("fresh"));
+    reg.register(stale.clone(), recording_kill(stale.clone(), log.clone()));
+    reg.register(fresh.clone(), recording_kill(fresh.clone(), log.clone()));
+    reg.set_last_active(&stale, 1);
+    reg.set_last_active(&fresh, super::now_ms());
+
+    let evicted = reg
+        .evict_idle_older_than(Duration::from_secs(60), |_| true, |_| {})
+        .await;
+    assert_eq!(evicted, 1);
+
+    // The callback future is spawned; give it a bounded window to record.
+    let mut recorded = Vec::new();
+    for _ in 0..50 {
+        recorded = events.lock().unwrap().clone();
+        if !recorded.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        recorded,
+        vec![(
+            stale.clone(),
+            "agent:process:evicted".to_string(),
+            "idle-ttl".to_string()
+        )],
+        "the TTL sweep emits agent:process:evicted with reason idle-ttl for the stale process only"
+    );
+}
+
+/// Regression for monorepo#3040 — a send to an agent the TTL sweep just
+/// reaped must NOT be silently dropped. The reap only kills the child process
+/// (the session row survives), so `send_message` must take the auto-restore
+/// path: claim the turn slot, persist the user row, and start a turn worker
+/// (which respawns the child on demand). The eviction itself must be
+/// observable on the event bus as `agent:process:evicted` with reason
+/// `idle-ttl` so a bound FE session can react.
+#[tokio::test]
+async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
+    use intent_core::events::AGENT_PROCESS_EVICTED;
+
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-send");
+    let id = AgentId::from("a-reap-send");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    mgr.registry().set_last_active(&id, 1);
+
+    let mut filter = SubscriptionFilter {
+        event_types: vec![AGENT_PROCESS_EVICTED.to_string()],
+        ..Default::default()
+    };
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.contains(&id), "the reap dropped the child handle");
+    assert!(
+        mgr.services.store.get_agent_session(&id).await.is_ok(),
+        "the reap keeps the session row (only the process dies)"
+    );
+
+    // The eviction is observable: agent:process:evicted with reason idle-ttl.
+    let mut evict_event = None;
+    for _ in 0..50 {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(batch)) => {
+                if let Some(ev) = batch
+                    .into_iter()
+                    .find(|ev| ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == id.0)
+                {
+                    evict_event = Some(ev);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    let ev = evict_event.expect("TTL reap publishes agent:process:evicted");
+    assert_eq!(ev.data["reason"], "idle-ttl", "TTL sweep eviction reason");
+
+    // A user send to the reaped agent restores: the RPC succeeds, the user
+    // row is persisted (nothing silently dropped), and `queued == false`
+    // proves `try_begin` won the turn slot (restore path engaged) — the
+    // spawned worker respawns the child on demand. No `is_busy` assertion
+    // here: the worker's spawn attempt fails in this env and releases the
+    // slot, so reading it after the send races that release (#1356 review).
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "are you still there?".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("send to a reaped agent must not error");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "the reap claim is released, so the send starts a turn: {result}"
+    );
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.to_string().contains("are you still there?")),
+        "the post-reap send's user row is persisted, not dropped"
+    );
 }
 
 /// monorepo#2104 (#1161 review) — a live-turn slot that outlived its turn must
@@ -2732,7 +2876,7 @@ fn track_mock_agent_with_log(
     load_cap: bool,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(
+    let (handle, ()) = track_mock_agent_inner(
         mgr,
         id,
         load_cap,
@@ -2752,7 +2896,7 @@ fn track_mock_agent_with_log_modes(
     modes: MockModes,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
+    let (handle, ()) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
     (handle, log)
 }
 
@@ -11520,10 +11664,7 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     let stray_id = NoteId::new();
     let stray = Note {
         id: stray_id.clone(),
-        content: format!(
-            "![x](workspace-asset://other-ws/{asset})\n",
-            asset = asset_id
-        ),
+        content: format!("![x](workspace-asset://other-ws/{asset_id})\n"),
         ..note.clone()
     };
     let mut stray = stray;
@@ -11550,7 +11691,7 @@ mod merge_user_mcp_servers_tests {
     use intent_acp::{NormalizedMcpServer, NormalizedMcpServers};
     use serde_json::json;
 
-    use super::{manager, TempDb};
+    use super::TempDb;
     use crate::agent_manager::AgentManager;
     use crate::agent_manager::BusEventSink;
     use crate::events::EventBus;
@@ -11608,7 +11749,7 @@ mod merge_user_mcp_servers_tests {
             .unwrap();
         let mut out = NormalizedMcpServers::new();
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
-        assert!(out.is_empty(), "gate off → nothing merged: {:?}", out);
+        assert!(out.is_empty(), "gate off → nothing merged: {out:?}");
     }
 
     #[tokio::test]
@@ -11756,7 +11897,7 @@ mod merge_user_mcp_servers_tests {
             NormalizedMcpServer::Stdio {
                 command: "bridge".into(),
                 args: vec![],
-                env: Default::default(),
+                env: std::collections::BTreeMap::default(),
             },
         );
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
@@ -11896,12 +12037,6 @@ mod merge_user_mcp_servers_tests {
             Some(inherited.as_str()),
             "baseline PATH only — no injected override"
         );
-    }
-
-    // Prevent dead-code warnings for `manager` when this module compiles alone.
-    #[allow(dead_code)]
-    async fn _use_manager() {
-        let _ = manager().await;
     }
 }
 
@@ -12672,6 +12807,152 @@ mod dequeue_wait_tests {
         assert_eq!(
             text, "direct hello",
             "immediate deliveries carry no dequeue-wait note"
+        );
+    }
+}
+
+/// Batch-flush grouping stamp: [`super::stamp_flush_batch_id`] mints ONE
+/// fresh `queueInfo.batchId` per multi-entry flush and stamps it on every
+/// drained entry — including sub-threshold-wait entries that carry no other
+/// queueInfo — without ever overwriting existing queueInfo fields, skipping
+/// `persisted: true` requeues, and never stamping a single-entry drain.
+#[cfg(test)]
+mod flush_batch_id_tests {
+    use super::dequeue_wait_tests::{iso_secs_ago, queued_msg};
+    use super::*;
+
+    #[test]
+    fn flush_stamps_one_shared_batch_id_on_all_entries() {
+        // Both entries waited past the annotation threshold, so the wait
+        // stamp runs first (as in prepare_flush_turn) and batchId lands
+        // NEXT TO queuedAt/waitedMs inside the same queueInfo object.
+        let queued_at = iso_secs_ago(60);
+        let mut entries = vec![
+            queued_msg("first", &queued_at, false),
+            queued_msg("second", &queued_at, false),
+        ];
+        for e in &mut entries {
+            super::super::annotate_dequeue_wait(e);
+        }
+        super::super::stamp_flush_batch_id(&mut entries);
+        let info = |i: usize| entries[i].message_metadata.as_ref().unwrap()["queueInfo"].clone();
+        let batch_id = info(0)["batchId"]
+            .as_str()
+            .expect("batchId is a string")
+            .to_string();
+        assert!(!batch_id.is_empty(), "batchId is non-empty");
+        assert_eq!(
+            info(1)["batchId"].as_str(),
+            Some(batch_id.as_str()),
+            "every entry of the batch shares ONE batchId"
+        );
+        for i in [0, 1] {
+            assert!(
+                info(i)["queuedAt"].as_str().is_some() && info(i)["waitedMs"].as_u64().is_some(),
+                "wait-stamp fields ride alongside batchId: {}",
+                info(i)
+            );
+        }
+    }
+
+    #[test]
+    fn single_entry_drain_gets_no_batch_id() {
+        let mut entries = vec![queued_msg("solo", &iso_secs_ago(60), false)];
+        super::super::stamp_flush_batch_id(&mut entries);
+        assert_eq!(
+            entries[0].message_metadata, None,
+            "nothing to group — a single-entry drain is never stamped"
+        );
+    }
+
+    #[test]
+    fn sub_threshold_entry_in_batch_gets_batch_id_only() {
+        // One entry drains sub-threshold (no wait note, no queuedAt/waitedMs
+        // — monorepo#2353): it still gets the grouping stamp, as a queueInfo
+        // carrying ONLY batchId.
+        let mut entries = vec![
+            queued_msg("waited", &iso_secs_ago(60), false),
+            queued_msg("instant hop", &intent_core::now_iso(), false),
+        ];
+        for e in &mut entries {
+            super::super::annotate_dequeue_wait(e);
+        }
+        assert_eq!(
+            entries[1].message_metadata, None,
+            "precondition: sub-threshold wait stamped no queueInfo"
+        );
+        super::super::stamp_flush_batch_id(&mut entries);
+        let sub = &entries[1].message_metadata.as_ref().unwrap()["queueInfo"];
+        assert!(sub["batchId"].as_str().is_some(), "batchId stamped: {sub}");
+        assert_eq!(
+            sub.as_object().unwrap().len(),
+            1,
+            "sub-threshold queueInfo carries ONLY batchId: {sub}"
+        );
+        assert_eq!(
+            sub["batchId"],
+            entries[0].message_metadata.as_ref().unwrap()["queueInfo"]["batchId"],
+            "sub-threshold entry shares the batch's id"
+        );
+    }
+
+    #[test]
+    fn existing_queue_info_fields_are_never_overwritten() {
+        // A requeued entry carrying its first-delivery queueInfo keeps
+        // queuedAt/waitedMs untouched — batchId is purely additive.
+        let mut entries = vec![
+            queued_msg("fresh", &iso_secs_ago(60), false),
+            queued_msg("requeued", &iso_secs_ago(60), false),
+        ];
+        entries[1].message_metadata = Some(json!({
+            "queueInfo": { "queuedAt": "2026-01-01T00:00:00Z", "waitedMs": 42 }
+        }));
+        super::super::stamp_flush_batch_id(&mut entries);
+        let info = &entries[1].message_metadata.as_ref().unwrap()["queueInfo"];
+        assert_eq!(info["queuedAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(info["waitedMs"], 42);
+        assert!(
+            info["batchId"].as_str().is_some(),
+            "batchId added alongside the kept fields: {info}"
+        );
+    }
+
+    #[test]
+    fn pre_existing_batch_id_is_kept() {
+        // A mid-flush persist failure requeues entries already stamped;
+        // keeping the first batch's id groups the retry's rows with the rows
+        // the first attempt already persisted.
+        let mut entries = vec![
+            queued_msg("retried", &iso_secs_ago(60), false),
+            queued_msg("fresh", &iso_secs_ago(60), false),
+        ];
+        entries[0].message_metadata = Some(json!({ "queueInfo": { "batchId": "batch-orig" } }));
+        super::super::stamp_flush_batch_id(&mut entries);
+        assert_eq!(
+            entries[0].message_metadata.as_ref().unwrap()["queueInfo"]["batchId"],
+            "batch-orig",
+            "an already-stamped entry keeps its first batch's id"
+        );
+    }
+
+    #[test]
+    fn persisted_entries_are_never_stamped() {
+        // The persisted entry's transcript row is already durable and never
+        // rewritten; the fresh entry in the same flush is still stamped.
+        let mut entries = vec![
+            queued_msg("already durable", &iso_secs_ago(60), true),
+            queued_msg("fresh", &iso_secs_ago(60), false),
+        ];
+        super::super::stamp_flush_batch_id(&mut entries);
+        assert_eq!(
+            entries[0].message_metadata, None,
+            "persisted requeues are never stamped"
+        );
+        assert!(
+            entries[1].message_metadata.as_ref().unwrap()["queueInfo"]["batchId"]
+                .as_str()
+                .is_some(),
+            "the batch's fresh entries are still stamped"
         );
     }
 }
@@ -13554,7 +13835,7 @@ mod model_change_notice_tests {
             reasoning_effort: None,
             cwd: std::env::temp_dir(),
             provider_binary: None,
-            extra_env: Default::default(),
+            extra_env: std::collections::BTreeMap::default(),
             npx_fallback_binary: None,
             npx_fallback_package: None,
             unsloth_endpoint: None,

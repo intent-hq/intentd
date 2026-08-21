@@ -122,7 +122,7 @@ const UNSLOTH_INSTALL_HINT: &str =
 /// transitions the user should notice (e.g. a model switch restarting the
 /// server out from under live agents).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusLevel {
+pub(crate) enum StatusLevel {
     Info,
     Warning,
 }
@@ -141,7 +141,7 @@ impl StatusLevel {
 /// ("starting server", "downloading/loading model…") plus a severity the
 /// caller surfaces to the user (e.g. as `agent:stream:status` events with
 /// the matching `level`).
-pub type StatusCallback = dyn Fn(StatusLevel, String) + Send + Sync;
+pub(crate) type StatusCallback = dyn Fn(StatusLevel, String) + Send + Sync;
 
 /// The error for a missing `unsloth` binary (graceful degradation: the
 /// provider is unavailable with a clear install message). `InvalidInput`
@@ -218,7 +218,7 @@ pub(crate) fn run_model_arg(repo_id: &str, quant: &str) -> String {
 fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Full-precision GGUF export tags. Valid files in unsloth repos, but never
@@ -350,7 +350,7 @@ pub(crate) fn best_fitting_quant(
 /// RPC. Constructed by [`UnslothServerManager::status_snapshot`]; `None`
 /// from that method means no server is running.
 #[derive(Debug, Clone)]
-pub struct UnslothStatus {
+pub(crate) struct UnslothStatus {
     /// Full HF repo id currently served (or being started).
     pub repo_id: String,
     /// Port the server actually listens on — may differ from the configured
@@ -559,7 +559,7 @@ impl ManagedServer {
 
     /// OS pid of the owned child; `None` for an adopted server.
     fn pid(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|c| c.id())
+        self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
     /// Snapshot the retained output tail as one newline-joined string. Waits
@@ -642,7 +642,7 @@ impl Default for UnslothConfig {
 /// on the [`crate::agent_manager::AgentManager`]; the async mutex serializes
 /// concurrent unsloth-agent spawns so exactly one start/restart runs at a
 /// time (the second spawner reuses the endpoint the first one produced).
-pub struct UnslothServerManager {
+pub(crate) struct UnslothServerManager {
     state: TokioMutex<Option<ManagedServer>>,
     config: UnslothConfig,
     /// Quant variants already selected this daemon lifetime, keyed by repo
@@ -740,7 +740,7 @@ impl UnslothServerManager {
     /// (`unsloth` spawns `llama-server` as a child holding the model
     /// weights) — best-effort: a sampling failure yields zeros rather than
     /// failing the whole snapshot.
-    pub async fn status_snapshot(&self) -> Option<UnslothStatus> {
+    pub(crate) async fn status_snapshot(&self) -> Option<UnslothStatus> {
         let identity = lock_ignore_poison(&self.identity).clone()?;
         if let Some(pid) = identity.pid {
             if !pid_is_alive(pid) {
@@ -1995,7 +1995,7 @@ mod tests {
         assert_eq!(
             ep.limit,
             Some(UnslothModelLimit {
-                context: 262144,
+                context: 262_144,
                 output: 8192
             })
         );
@@ -2142,9 +2142,7 @@ mod tests {
             let config = GENERATED_CONFIG_FIXTURE
                 .replace("127.0.0.1:8888", &format!("127.0.0.1:{port}"))
                 .replace('\'', "");
-            let run = run_behavior
-                .map(str::to_string)
-                .unwrap_or_else(|| "sleep 300".to_string());
+            let run = run_behavior.map_or_else(|| "sleep 300".to_string(), str::to_string);
             let script = format!(
                 "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) {run} ;;\n  start) mkdir -p '{cfg}' && cat > '{cfg}/opencode.json' <<'EOF'\n{config}\nEOF\n  ;;\nesac\n",
                 log = log.display(),
@@ -2411,7 +2409,7 @@ mod tests {
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             mgr.ensure_endpoint(REPO, None, 2, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("cold start");
@@ -2432,7 +2430,7 @@ mod tests {
             let m3 = messages.clone();
             let ep = mgr
                 .ensure_endpoint(other, None, 2, &move |lvl, m| {
-                    m3.lock().unwrap().push((lvl, m))
+                    m3.lock().unwrap().push((lvl, m));
                 })
                 .await
                 .expect("switch");
@@ -2487,7 +2485,7 @@ mod tests {
             let m2 = messages.clone();
             let other = "unsloth/other-model-GGUF";
             mgr.ensure_endpoint(other, None, 0, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("switch");
@@ -2529,7 +2527,7 @@ mod tests {
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             mgr.ensure_endpoint(REPO, None, 1, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("dead-child respawn");

@@ -69,7 +69,7 @@ pub trait SentryEngine: Send + Sync {
 
 /// REST-backed [`SentryEngine`] over [`SentryClient`].
 #[derive(Debug)]
-pub struct SentryEngineImpl {
+pub(crate) struct SentryEngineImpl {
     client: SentryClient,
 }
 
@@ -301,8 +301,7 @@ pub(crate) fn looks_like_short_id(s: &str) -> bool {
     if !prefix
         .chars()
         .next()
-        .map(|c| c.is_ascii_uppercase())
-        .unwrap_or(false)
+        .is_some_and(|c| c.is_ascii_uppercase())
     {
         return false;
     }

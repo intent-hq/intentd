@@ -550,7 +550,8 @@ impl PtyHost {
 
     /// Kill every PTY under `scope` (session/workspace teardown). Returns the
     /// number reaped. No process-group orphans are left behind.
-    pub async fn kill_scope(&self, scope: &str) -> usize {
+    #[cfg(test)]
+    pub(crate) async fn kill_scope(&self, scope: &str) -> usize {
         let victims: Vec<Arc<PtySession>> = {
             let mut sessions = self.sessions.lock().unwrap();
             let ids: Vec<PtyId> = sessions
@@ -615,7 +616,7 @@ impl PtyHost {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .is_none_or(|h| h.is_finished())
+                .is_none_or(std::thread::JoinHandle::is_finished)
         })
     }
 
@@ -702,7 +703,7 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: Arc<Mutex<Fanout>>) {
                 guard.scrollback.push(&chunk);
                 let _ = guard.tx.send(chunk);
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
@@ -858,7 +859,7 @@ mod tests {
             };
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
                 Err(_) => break,
             }
@@ -883,7 +884,7 @@ mod tests {
             };
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
                 Err(_) => break,
             }

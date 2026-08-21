@@ -1,6 +1,6 @@
 [package]
 name = "intent-sentry"
-version = "0.7.22"
+version = "0.7.28"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "SentryEngine + DTOs for the sentry.* surface (REST over reqwest)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.7.22" }
+intent-core = { path = "../intent-core", version = "0.7.28" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,3 +20,6 @@ async-trait = "0.1"
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

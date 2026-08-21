@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::{map_err, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.crossWorkspace = {
         listSiblings: () => host({ method: 'crossWorkspace.listSiblings', args: {} }),
@@ -23,7 +23,7 @@ pub(crate) const PRELUDE: &str = r#"
         listNotes: (targetWorkspaceId) =>
             host({ method: 'crossWorkspace.listNotes', args: { targetWorkspaceId } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

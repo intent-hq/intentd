@@ -18,7 +18,7 @@ const REPO_CONFIG_FILENAME: &str = "config.json";
 
 /// Repo-relative path of the config file (`.intent/config.json`), as sent to
 /// a forge contents API by `github.repoConfig.get`.
-pub const REPO_CONFIG_REL_PATH: &str = ".intent/config.json";
+pub(crate) const REPO_CONFIG_REL_PATH: &str = ".intent/config.json";
 
 /// Default `.gitignore` content for `.intent/` (FE `REPO_INTENT_GITIGNORE`).
 /// Excludes everything except `config.json` and the `.gitignore` itself.
@@ -30,12 +30,12 @@ const REPO_INTENT_GITIGNORE: &str = "# Intent workspace config directory
 ";
 
 /// Get the path to the `.intent` directory for a repository.
-pub fn get_intent_dir_path(repo_path: &Path) -> PathBuf {
+pub(crate) fn get_intent_dir_path(repo_path: &Path) -> PathBuf {
     repo_path.join(REPO_INTENT_DIR)
 }
 
 /// Get the path to the `config.json` file for a repository.
-pub fn get_config_file_path(repo_path: &Path) -> PathBuf {
+pub(crate) fn get_config_file_path(repo_path: &Path) -> PathBuf {
     repo_path.join(REPO_INTENT_DIR).join(REPO_CONFIG_FILENAME)
 }
 
@@ -61,7 +61,7 @@ pub async fn read_repo_config(repo_path: &Path) -> RepoConfig {
 /// non-object JSON, and schema mismatches all yield the empty default (never
 /// an error). `source` labels warn logs (a repo path or `owner/repo@ref`).
 /// Shared by the local read above and the remote `github.repoConfig.get`.
-pub fn parse_repo_config_tolerant(content: &str, source: &str) -> RepoConfig {
+pub(crate) fn parse_repo_config_tolerant(content: &str, source: &str) -> RepoConfig {
     match serde_json::from_str::<Value>(content) {
         Ok(value) => {
             // Validate it's an object (not an array or primitive)
@@ -88,14 +88,14 @@ pub fn parse_repo_config_tolerant(content: &str, source: &str) -> RepoConfig {
 /// Write the repo config to `.intent/config.json`.
 /// Creates the `.intent/` directory and `.gitignore` if they don't exist.
 /// Preserves unknown keys by merging with the existing file.
-pub async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> Result<()> {
+pub(crate) async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> Result<()> {
     let intent_dir = get_intent_dir_path(repo_path);
     let config_path = get_config_file_path(repo_path);
     let gitignore_path = intent_dir.join(".gitignore");
 
     // Ensure .intent directory exists
     tokio::fs::create_dir_all(&intent_dir).await.map_err(|e| {
-        intent_core::Error::Internal(format!("Failed to create .intent directory: {}", e))
+        intent_core::Error::Internal(format!("Failed to create .intent directory: {e}"))
     })?;
 
     // Ensure .gitignore exists (never overwrite)
@@ -103,7 +103,7 @@ pub async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> Result<(
         tokio::fs::write(&gitignore_path, REPO_INTENT_GITIGNORE)
             .await
             .map_err(|e| {
-                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {}", e))
+                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {e}"))
             })?;
         tracing::info!("Created .intent/.gitignore at {:?}", gitignore_path);
     }
@@ -126,7 +126,7 @@ pub async fn write_repo_config(repo_path: &Path, config: RepoConfig) -> Result<(
 /// round-trip both ways (preserved when absent, settable/clearable when present).
 /// Creates the `.intent/` directory and `.gitignore` if they don't exist.
 /// Returns the merged config as written.
-pub async fn merge_repo_config(
+pub(crate) async fn merge_repo_config(
     repo_path: &Path,
     patch: serde_json::Map<String, Value>,
 ) -> Result<RepoConfig> {
@@ -142,7 +142,7 @@ pub async fn merge_repo_config(
     }
 
     let config: RepoConfig = serde_json::from_value(Value::Object(merged))
-        .map_err(|e| intent_core::Error::InvalidParams(format!("invalid config: {}", e)))?;
+        .map_err(|e| intent_core::Error::InvalidParams(format!("invalid config: {e}")))?;
 
     let config_path = get_config_file_path(repo_path);
     write_config_file(&config_path, &config).await?;
@@ -171,13 +171,13 @@ async fn read_raw_config_object(repo_path: &Path) -> serde_json::Map<String, Val
 /// and write it to `config_path`.
 async fn write_config_file(config_path: &Path, config: &RepoConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config).map_err(|e| {
-        intent_core::Error::Internal(format!("Failed to serialize repo config: {}", e))
+        intent_core::Error::Internal(format!("Failed to serialize repo config: {e}"))
     })?;
-    let content_with_newline = format!("{}\n", content);
+    let content_with_newline = format!("{content}\n");
 
     tokio::fs::write(config_path, content_with_newline)
         .await
-        .map_err(|e| intent_core::Error::Internal(format!("Failed to write repo config: {}", e)))?;
+        .map_err(|e| intent_core::Error::Internal(format!("Failed to write repo config: {e}")))?;
 
     tracing::info!("Wrote repo config at {:?}", config_path);
     Ok(())
@@ -185,19 +185,19 @@ async fn write_config_file(config_path: &Path, config: &RepoConfig) -> Result<()
 
 /// Ensure the `.intent/` directory exists with a proper `.gitignore`.
 /// Call this when initializing a workspace from a repo that doesn't have one yet.
-pub async fn ensure_intent_dir(repo_path: &Path) -> Result<()> {
+pub(crate) async fn ensure_intent_dir(repo_path: &Path) -> Result<()> {
     let intent_dir = get_intent_dir_path(repo_path);
     let gitignore_path = intent_dir.join(".gitignore");
 
     tokio::fs::create_dir_all(&intent_dir).await.map_err(|e| {
-        intent_core::Error::Internal(format!("Failed to create .intent directory: {}", e))
+        intent_core::Error::Internal(format!("Failed to create .intent directory: {e}"))
     })?;
 
     if !gitignore_path.exists() {
         tokio::fs::write(&gitignore_path, REPO_INTENT_GITIGNORE)
             .await
             .map_err(|e| {
-                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {}", e))
+                intent_core::Error::Internal(format!("Failed to write .intent/.gitignore: {e}"))
             })?;
         tracing::info!("Initialized .intent directory at {:?}", gitignore_path);
     }

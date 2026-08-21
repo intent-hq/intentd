@@ -1001,9 +1001,9 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "server.bindAddress",
             "Bind address",
-            "Address the TCP listener binds",
+            "Address the TCP listener binds; 0.0.0.0 exposes it on every interface, including untrusted networks",
             "server",
-            Some("0.0.0.0"),
+            Some("127.0.0.1"),
         ),
         number(
             "server.port",
@@ -1058,7 +1058,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Daemon-wide cap on outstanding slow-path RPCs across every connection; over-limit requests are rejected with -32011 \"Server overloaded\" (0 = unlimited; changes apply on daemon restart)",
             "server",
             Some(0.0),
-            Some(100000.0),
+            Some(100_000.0),
             256.0,
         ),
         // --- Group B: source control ----------------------------------------

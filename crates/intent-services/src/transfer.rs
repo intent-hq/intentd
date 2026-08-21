@@ -206,7 +206,7 @@ impl Services {
                     file_ops::resolve_attachment_source(&root, &r.stored_path)
                         .ok()
                         .and_then(|p| std::fs::metadata(p).ok())
-                        .filter(|m| m.is_file())
+                        .filter(std::fs::Metadata::is_file)
                         .map(|m| m.len())
                 };
                 TransferAttachment {
@@ -270,8 +270,7 @@ fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}"))
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if exists {
             // Push the unambiguous form: a worktree path or `-`-prefixed name
             // matching the short branch name would otherwise break rev-list.

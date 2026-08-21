@@ -1069,7 +1069,7 @@ async fn script_list_returns_array() {
 #[tokio::test]
 async fn script_create_forwards_positional_signature() {
     let (srv, api) = server();
-    let code = r#"
+    let code = r"
         return await ws.script.create('dev', 'pnpm dev', 'service', {
             cwd: 'app',
             env: { PORT: '3000' },
@@ -1077,7 +1077,7 @@ async fn script_create_forwards_positional_signature() {
             autoStart: true,
             scriptId: 's-1',
         });
-    "#;
+    ";
     let resp = call(&srv, code).await;
     assert_eq!(resp["result"]["isError"], json!(false));
     let calls = api.script_create_calls.lock().unwrap();

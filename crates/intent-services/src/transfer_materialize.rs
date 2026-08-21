@@ -19,10 +19,8 @@ use crate::transfer_git::{run_git, unwind_wip, TransferRefsManifest};
 
 /// One sandbox as re-provisioned on the target.
 #[derive(Debug, Clone)]
-pub struct MaterializedSandbox {
+pub(crate) struct MaterializedSandbox {
     pub agent_id: String,
-    /// The sandbox branch (`sb/<agentId>`), checked out in the directory.
-    pub branch: String,
     /// Target-side sandbox directory
     /// (`<workspaces_root>/<wsId>/sandboxes/<agentId>/<repo-slug>`).
     pub path: PathBuf,
@@ -31,14 +29,12 @@ pub struct MaterializedSandbox {
 /// Result of a successful materialization: the target-side paths the caller
 /// writes back onto the imported rows (see [`MaterializedGit::apply`]).
 #[derive(Debug, Clone)]
-pub struct MaterializedGit {
+pub(crate) struct MaterializedGit {
     /// The workspace checkout (`<workspaces_root>/<wsId>/<repo-slug>`),
     /// standalone (`CheckoutMode::Direct`) with no remotes configured — the
     /// bundle was the only source and its staging path must not leak into
     /// the repo config.
     pub checkout_dir: PathBuf,
-    /// Display name used for the checkout's `<repo-slug>` folder naming.
-    pub repo_name: String,
     /// Branch the checkout is on — the bundled `workspace_branch`, which is
     /// whatever HEAD pointed at when the bundle was built and may differ
     /// from the imported row's `branch`; [`MaterializedGit::apply`] rewrites
@@ -53,6 +49,8 @@ pub struct MaterializedGit {
     /// Agent ids of sandbox rows that had no branch in the bundle (skipped
     /// at bundle time — missing directory or unbundlable branch). Nothing
     /// was provisioned for them; [`MaterializedGit::apply`] drops their rows.
+    /// Set by materialization; read by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub skipped_agent_ids: Vec<String>,
 }
 
@@ -71,9 +69,9 @@ impl MaterializedGit {
         ws.repository_path = Some(checkout);
         ws.worktree_path = None;
         ws.checkout_mode = Some(CheckoutMode::Direct);
-        ws.branch = self.workspace_branch.clone();
+        ws.branch.clone_from(&self.workspace_branch);
         if ws.base_commit_sha.is_none() {
-            ws.base_commit_sha = self.base_sha.clone();
+            ws.base_commit_sha.clone_from(&self.base_sha);
         }
         sandboxes.retain_mut(|sb| {
             match self.sandboxes.iter().find(|m| m.agent_id == sb.agent_id.0) {
@@ -94,7 +92,7 @@ impl MaterializedGit {
 /// (intent-hq/monorepo#2227; supersedes the earlier transfer-spec decision
 /// to register on target — the `repo.list` sync would sweep such a row
 /// right back out).
-pub async fn materialize_workspace_git(
+pub(crate) async fn materialize_workspace_git(
     bundle_path: PathBuf,
     refs: TransferRefsManifest,
     ws: Workspace,
@@ -116,8 +114,7 @@ fn created_paths(out: &MaterializedGit) -> Vec<PathBuf> {
         .chain(out.sandboxes.iter().map(|s| {
             s.path
                 .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| s.path.clone())
+                .map_or_else(|| s.path.clone(), Path::to_path_buf)
         }))
         .collect()
 }
@@ -127,7 +124,7 @@ fn created_paths(out: &MaterializedGit) -> Vec<PathBuf> {
 /// restoring the target exactly as found so the staged import can be
 /// retried or aborted. Best-effort — the commit error being unwound takes
 /// precedence.
-pub fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
+pub(crate) fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
     rollback_created(&created_paths(out), ws_dir);
 }
 
@@ -145,7 +142,7 @@ pub fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
 ///
 /// On failure every directory this call created is removed — the target is
 /// restored exactly as found (no half-materialized workspace).
-pub fn materialize_workspace_git_blocking(
+pub(crate) fn materialize_workspace_git_blocking(
     bundle_path: &Path,
     refs: &TransferRefsManifest,
     ws: &Workspace,
@@ -311,7 +308,6 @@ fn materialize_inner(
         )?;
         materialized.push(MaterializedSandbox {
             agent_id: sb.agent_id.0.clone(),
-            branch: entry.branch.clone(),
             path: sandbox_path,
         });
     }
@@ -326,7 +322,6 @@ fn materialize_inner(
 
     Ok(MaterializedGit {
         checkout_dir,
-        repo_name,
         workspace_branch: refs.workspace_branch.clone(),
         base_sha: refs.base_sha.clone(),
         sandboxes: materialized,
@@ -649,7 +644,7 @@ mod tests {
         let repo = git2::Repository::open(repo_path).unwrap();
         let remotes = repo.remotes().unwrap();
         let mut names = Vec::new();
-        for name in remotes.iter() {
+        for name in &remotes {
             if let Ok(Some(n)) = name {
                 names.push(n.to_string());
             }

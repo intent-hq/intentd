@@ -49,38 +49,49 @@ pub(crate) fn stamp_trigger_tasks(metadata: &mut serde_json::Value, triggers: &[
     }
 }
 
-/// Event-data key naming a settled group member's linked task note — a
-/// single `{ "workspaceId", "taskNoteId" }` object stamped at group RECORD
-/// time (when the child settles), so the aggregated wake's trigger set does
-/// not depend on the child session still existing when the group fires: a
+/// Event-data key naming a settled group member's trigger tasks — an array
+/// of `{ "workspaceId", "taskNoteId" }` objects (the child's linked task
+/// plus any flipped completions it recorded) stamped at group RECORD time
+/// (when the child settles), so the aggregated wake's trigger set does not
+/// depend on the child session still existing when the group fires: a
 /// task-linked child deleted between its settlement and group settlement
-/// keeps its trigger. Persisted with the group's `raw_events`, so it also
-/// survives daemon restarts.
+/// keeps its triggers. Persisted with the group's `raw_events`, so it also
+/// survives daemon restarts. Events stamped before the plural upgrade carry
+/// a single object under the same key; the reader accepts both shapes.
 pub(crate) const EVENT_TRIGGER_TASK_KEY: &str = "unblockedTriggerTask";
 
-/// Stamp a settled child's linked task onto its recorded group event data
-/// under [`EVENT_TRIGGER_TASK_KEY`]. No-op for non-object data.
-pub(crate) fn stamp_event_trigger_task(
-    data: &mut serde_json::Value,
-    workspace_id: &str,
-    task_note_id: &str,
-) {
+/// Stamp a settled child's trigger `(workspace_id, task_note_id)` pairs
+/// onto its recorded group event data under [`EVENT_TRIGGER_TASK_KEY`].
+/// No-op for an empty pair set or non-object data.
+pub(crate) fn stamp_event_trigger_tasks(data: &mut serde_json::Value, pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        return;
+    }
     if let Some(obj) = data.as_object_mut() {
-        obj.insert(
-            EVENT_TRIGGER_TASK_KEY.to_string(),
-            json!({ "workspaceId": workspace_id, "taskNoteId": task_note_id }),
-        );
+        let arr: Vec<serde_json::Value> = pairs
+            .iter()
+            .map(|(ws, id)| json!({ "workspaceId": ws, "taskNoteId": id }))
+            .collect();
+        obj.insert(EVENT_TRIGGER_TASK_KEY.to_string(), json!(arr));
     }
 }
 
-/// Read a recorded group event's [`EVENT_TRIGGER_TASK_KEY`] stamp back as a
-/// `(workspace_id, task_note_id)` pair.
-pub(crate) fn event_trigger_task(data: &serde_json::Value) -> Option<(String, String)> {
-    let t = data.get(EVENT_TRIGGER_TASK_KEY)?;
-    Some((
-        t.get("workspaceId")?.as_str()?.to_string(),
-        t.get("taskNoteId")?.as_str()?.to_string(),
-    ))
+/// Read a recorded group event's [`EVENT_TRIGGER_TASK_KEY`] stamp back as
+/// `(workspace_id, task_note_id)` pairs. Accepts both the array shape and
+/// the legacy single-object shape (pre-upgrade persisted events); malformed
+/// entries are skipped. Empty means no stamp.
+pub(crate) fn event_trigger_tasks(data: &serde_json::Value) -> Vec<(String, String)> {
+    let pair_of = |t: &serde_json::Value| -> Option<(String, String)> {
+        Some((
+            t.get("workspaceId")?.as_str()?.to_string(),
+            t.get("taskNoteId")?.as_str()?.to_string(),
+        ))
+    };
+    match data.get(EVENT_TRIGGER_TASK_KEY) {
+        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(pair_of).collect(),
+        Some(t) => pair_of(t).into_iter().collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Whether a queued message's metadata carries any stamped trigger tasks.
@@ -202,7 +213,7 @@ pub(crate) fn ready_set_delta(
 ) -> Vec<UnblockedTask> {
     let triggers: HashSet<&str> = trigger_completions
         .iter()
-        .map(|id| id.as_str())
+        .map(std::string::String::as_str)
         .filter(|id| snaps.get(*id).map(|s| s.status) == Some(TaskStatus::Complete))
         .collect();
     if triggers.is_empty() {
@@ -269,8 +280,11 @@ mod tests {
     fn snap(status: TaskStatus, deps: &[&str], conflicts: &[&str]) -> BatchTaskSnap {
         BatchTaskSnap {
             status,
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            conflicts_with: conflicts.iter().map(|s| s.to_string()).collect(),
+            depends_on: deps.iter().map(std::string::ToString::to_string).collect(),
+            conflicts_with: conflicts
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             live_agent: None,
             effort_minutes: None,
         }
@@ -282,7 +296,7 @@ mod tests {
     }
 
     fn ids(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(std::string::ToString::to_string).collect()
     }
 
     fn titles(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -515,19 +529,49 @@ mod tests {
 
     #[test]
     fn event_trigger_task_stamp_round_trips_and_fails_soft() {
+        // Multi-pair array shape round-trips in order.
         let mut data = json!({ "agentId": "agent-1" });
-        stamp_event_trigger_task(&mut data, "ws-1", "t-a");
-        assert_eq!(
-            event_trigger_task(&data),
-            Some(("ws-1".to_string(), "t-a".to_string()))
+        stamp_event_trigger_tasks(
+            &mut data,
+            &[("ws-1".into(), "t-a".into()), ("ws-1".into(), "t-b".into())],
         );
-        assert_eq!(event_trigger_task(&json!({})), None);
         assert_eq!(
-            event_trigger_task(&json!({ EVENT_TRIGGER_TASK_KEY: "not-an-object" })),
-            None
+            event_trigger_tasks(&data),
+            vec![
+                ("ws-1".to_string(), "t-a".to_string()),
+                ("ws-1".to_string(), "t-b".to_string()),
+            ]
         );
+        // Legacy single-object shape (pre-upgrade persisted events) reads back.
+        let legacy = json!({
+            EVENT_TRIGGER_TASK_KEY: { "workspaceId": "ws-1", "taskNoteId": "t-old" }
+        });
+        assert_eq!(
+            event_trigger_tasks(&legacy),
+            vec![("ws-1".to_string(), "t-old".to_string())]
+        );
+        assert!(event_trigger_tasks(&json!({})).is_empty());
+        assert!(
+            event_trigger_tasks(&json!({ EVENT_TRIGGER_TASK_KEY: "not-an-object" })).is_empty()
+        );
+        // Malformed array entries are skipped.
+        let malformed = json!({
+            EVENT_TRIGGER_TASK_KEY: [
+                { "workspaceId": "ws-1" },
+                "scalar",
+                { "workspaceId": "ws-1", "taskNoteId": "t-ok" },
+            ]
+        });
+        assert_eq!(
+            event_trigger_tasks(&malformed),
+            vec![("ws-1".to_string(), "t-ok".to_string())]
+        );
+        // Empty pair set and non-object data are no-ops.
+        let mut untouched = json!({ "agentId": "agent-1" });
+        stamp_event_trigger_tasks(&mut untouched, &[]);
+        assert!(untouched.get(EVENT_TRIGGER_TASK_KEY).is_none());
         let mut non_object = json!("scalar");
-        stamp_event_trigger_task(&mut non_object, "ws-1", "t-a");
+        stamp_event_trigger_tasks(&mut non_object, &[("ws-1".into(), "t-a".into())]);
         assert_eq!(non_object, json!("scalar"));
     }
 

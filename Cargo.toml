@@ -9,16 +9,75 @@ repository = "https://github.com/intent-hq/intentd"
 homepage = "https://github.com/intent-hq/intentd"
 license = "Apache-2.0"
 
+# Pedantic ratchet: `clippy::pedantic` is enabled workspace-wide at `warn` (enforced by
+# the `-D warnings` gate). Every lint below currently fires somewhere in the workspace
+# and is explicitly allowed so the gate stays green. TEMPORARY(burndown) allows are
+# removed one by one as their findings are fixed; PERMANENT allows stay, with rationale.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# PERMANENT: splitting hundreds of long functions is a risky mass refactor, not a warnings pass.
+too_many_lines = "allow"
+# PERMANENT: fixing means boxing futures broadly; a perf/architecture decision, out of scope.
+large_futures = "allow"
+# TEMPORARY(burndown): the allows below are removed as their findings are fixed.
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+cast_possible_truncation = "allow"
+must_use_candidate = "allow"
+cast_possible_wrap = "allow"
+items_after_statements = "allow"
+needless_pass_by_value = "allow"
+single_match_else = "allow"
+cast_sign_loss = "allow"
+manual_let_else = "allow"
+missing_panics_doc = "allow"
+cast_lossless = "allow"
+used_underscore_binding = "allow"
+similar_names = "allow"
+match_same_arms = "allow"
+unnested_or_patterns = "allow"
+return_self_not_must_use = "allow"
+ref_option = "allow"
+cast_precision_loss = "allow"
+unnecessary_wraps = "allow"
+manual_assert = "allow"
+option_option = "allow"
+duration_suboptimal_units = "allow"
+borrow_as_ptr = "allow"
+struct_excessive_bools = "allow"
+if_not_else = "allow"
+unused_async = "allow"
+trivially_copy_pass_by_ref = "allow"
+float_cmp = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+missing_fields_in_debug = "allow"
+unused_self = "allow"
+match_wildcard_for_single_variants = "allow"
+implicit_hasher = "allow"
+match_bool = "allow"
+unchecked_time_subtraction = "allow"
+struct_field_names = "allow"
+unnecessary_debug_formatting = "allow"
+match_wild_err_arm = "allow"
+elidable_lifetime_names = "allow"
+many_single_char_names = "allow"
+fn_params_excessive_bools = "allow"
+wildcard_imports = "allow"
+ptr_as_ptr = "allow"
+ref_as_ptr = "allow"
+inconsistent_struct_constructor = "allow"
+doc_link_with_quotes = "allow"
+ip_constant = "allow"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["ws"] }
 # Consumed from the intent-hq fork's `deflate` branch (RFC 7692 permessage-deflate,
 # enabled via the fork's default features). The fork's tokio-tungstenite pulls the
 # intent-hq tungstenite fork transitively, so the whole graph resolves to the forks.
 # Cargo.lock pins the exact revs. Do NOT request `deflate` explicitly here: it exists
 # only on the fork, and `cargo package` resolves the sanitized manifest against
 # crates.io, where 0.30.0 lacks it (intent-hq/monorepo#2112).
-tokio-tungstenite = { git = "https://github.com/intent-hq/tokio-tungstenite", branch = "deflate", version = "0.30.0", features = ["connect", "handshake"] }
+tokio-tungstenite = { git = "https://github.com/intent-hq/tokio-tungstenite-fork", branch = "deflate", version = "0.30.0", features = ["connect", "handshake"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = "0.14"
@@ -48,6 +107,14 @@ portable-pty = "0.9"
 grep = "0.4"
 ignore = "0.4"
 globset = "0.4"
+
+# The fork's tokio-tungstenite manifest still names the tungstenite fork by its
+# pre-rename URL (intent-hq/tungstenite-rs); this redirect makes cargo fetch the
+# renamed repo explicitly instead of relying on GitHub's rename redirect
+# (intent-hq/monorepo#2942). The patch key is only a source identifier — cargo
+# never fetches it over the network.
+[patch."https://github.com/intent-hq/tungstenite-rs"]
+tungstenite = { git = "https://github.com/intent-hq/tungstenite-rs-fork", branch = "deflate" }
 
 [profile.dev]
 debug = "line-tables-only"

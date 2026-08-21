@@ -305,19 +305,20 @@ async fn import_agents(store: &Store, dir: &Path, summary: &mut ImportSummary) {
                 // update runs after, rewriting `updated_at` back to the
                 // exported value (import fidelity, PR #928 review).
                 let attn = match &session.attention_request_kind {
-                    Some(kind) => store
-                        .set_attention_request(
-                            &session.workspace_id,
-                            &session.id,
-                            kind,
-                            session.attention_request_reason.as_deref().unwrap_or(""),
-                            session
-                                .attention_request_timestamp
-                                .as_deref()
-                                .unwrap_or(&session.updated_at),
-                        )
-                        .await
-                        .map(|_| ()),
+                    Some(kind) => {
+                        store
+                            .set_attention_request(
+                                &session.workspace_id,
+                                &session.id,
+                                kind,
+                                session.attention_request_reason.as_deref().unwrap_or(""),
+                                session
+                                    .attention_request_timestamp
+                                    .as_deref()
+                                    .unwrap_or(&session.updated_at),
+                            )
+                            .await
+                    }
                     None => store
                         .clear_attention_request(
                             &session.workspace_id,

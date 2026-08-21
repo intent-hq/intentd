@@ -14,10 +14,10 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 
 /// Default Sentry REST base URL (`SENTRY_API_BASE_URL` in the FE).
-pub const SENTRY_API_BASE_URL: &str = "https://sentry.io/api/0";
+pub(crate) const SENTRY_API_BASE_URL: &str = "https://sentry.io/api/0";
 
 /// Thin REST transport over `reqwest`.
-pub struct SentryClient {
+pub(crate) struct SentryClient {
     http: reqwest::Client,
     /// Secret API token. Never logged, printed, or surfaced via `Debug`.
     token: String,
@@ -65,14 +65,18 @@ impl SentryClient {
     /// Execute `GET {base}{path}?<params>` and return the parsed JSON body.
     /// `params` is a slice of `(name, value)` pairs which reqwest
     /// percent-encodes for us.
-    pub async fn get_with_query(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
+    pub(crate) async fn get_with_query(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Value> {
         Ok(self.get_with_query_paged(path, params).await?.0)
     }
 
     /// Execute `GET {base}{path}?<params>` and return the parsed JSON body
     /// plus the next-page cursor from the response `Link` header (`None` when
     /// no further page exists). Used by the cursor-paginated issue reads.
-    pub async fn get_with_query_paged(
+    pub(crate) async fn get_with_query_paged(
         &self,
         path: &str,
         params: &[(&str, &str)],
@@ -115,7 +119,7 @@ impl SentryClient {
     /// Execute `PUT {base}{path}` with `body` as JSON and return the parsed
     /// JSON response. Used for the P2 write mutations (`resolveIssue`,
     /// `ignoreIssue`, `assignIssue`).
-    pub async fn put_json(&self, path: &str, body: Value) -> Result<Value> {
+    pub(crate) async fn put_json(&self, path: &str, body: Value) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
             .http

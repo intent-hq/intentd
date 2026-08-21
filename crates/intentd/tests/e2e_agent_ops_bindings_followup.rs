@@ -107,7 +107,7 @@ async fn agent_send_message_persists_without_manager() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create target");
@@ -186,7 +186,7 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create assigned agent");
@@ -237,7 +237,7 @@ async fn agent_cancel_subscriptions_idempotent() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -335,7 +335,7 @@ async fn agent_get_subscriptions_returns_empty_for_new_agent() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

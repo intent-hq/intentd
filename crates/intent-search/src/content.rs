@@ -97,7 +97,7 @@ pub fn search_in_files(
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();
@@ -145,18 +145,12 @@ impl Sink for ContentSink<'_> {
             }
         }
         let line_bytes = first_line(mat.bytes());
-        let col = self
-            .matcher
-            .find(line_bytes)
-            .ok()
-            .flatten()
-            .map(|m| {
-                String::from_utf8_lossy(&line_bytes[..m.start()])
-                    .chars()
-                    .count()
-                    + 1
-            })
-            .unwrap_or(1);
+        let col = self.matcher.find(line_bytes).ok().flatten().map_or(1, |m| {
+            String::from_utf8_lossy(&line_bytes[..m.start()])
+                .chars()
+                .count()
+                + 1
+        });
         self.matches.push(SearchMatch {
             file: self.file.to_string(),
             line: mat.line_number().unwrap_or(0),

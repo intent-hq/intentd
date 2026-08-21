@@ -7,10 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{
-    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
-    CHIEF_WORKSPACE_ID,
-};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -382,12 +379,6 @@ pub fn chief_workspace() -> Workspace {
     }
 }
 
-/// Whether the given workspace id is the reserved [`CHIEF_WORKSPACE_ID`].
-#[inline]
-pub fn is_chief_workspace(id: &WorkspaceId) -> bool {
-    id.0 == CHIEF_WORKSPACE_ID
-}
-
 /// A monetary cost figure attached to a token tally (PROTOCOL §5.23), sourced
 /// from the ACP `usage_update` session notification's `cost` object. `amount`
 /// is the cumulative spend and `currency` an ISO 4217 code (e.g. `"USD"`).
@@ -464,7 +455,7 @@ impl TokenUsageTotals {
     /// no token report at all. A persisted session snapshot in that state is a
     /// cost-only report (§5.23) and MUST NOT suppress the per-message token
     /// fallback for a provider that never sends an end-of-turn token report.
-    pub fn counters_are_zero(&self) -> bool {
+    pub(crate) fn counters_are_zero(&self) -> bool {
         self.input_tokens == 0
             && self.output_tokens == 0
             && self.cache_read_tokens == 0
@@ -2292,9 +2283,7 @@ pub fn slim_body_size(body: &serde_json::Value) -> usize {
         serde_json::Value::String(s) => s.len(),
         other => {
             let mut sink = CountingSink(0);
-            serde_json::to_writer(&mut sink, other)
-                .map(|()| sink.0)
-                .unwrap_or(0)
+            serde_json::to_writer(&mut sink, other).map_or(0, |()| sink.0)
         }
     }
 }
@@ -2484,7 +2473,7 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 /// classify the workspace's coordinator. No schema migration — the flag rides
 /// the existing free-form `metadata` column and survives daemon restarts.
 /// Read back by [`AgentSession::is_initial_agent`].
-pub const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
+pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY

@@ -90,7 +90,7 @@ impl GitStatusCache {
     /// Mark the cached status for `worktree` stale: the next read rescans.
     /// Also advances the generation, so a scan already in flight cannot store
     /// the pre-change snapshot it is about to produce.
-    pub fn invalidate(&self, worktree: &Path) {
+    pub(crate) fn invalidate(&self, worktree: &Path) {
         let key = git_status_singleflight::status_key(worktree);
         // `get_mut`, not `entry().or_default()`: with no slot there is nothing
         // cached and no in-flight store to guard against — `get` creates the
@@ -220,17 +220,14 @@ impl GitStatusCache {
                         worktree = %key.display(),
                         "git status: coalesced into in-flight worktree scan"
                     );
-                    match rx.wait_for(|slot| slot.is_some()).await {
-                        Ok(slot) => {
-                            return match slot.clone().expect("wait_for guarantees Some") {
-                                Ok(shared) => Ok(shared),
-                                Err(msg) => Err(Error::Internal(msg)),
-                            };
-                        }
-                        // The leader vanished without publishing (cancelled
-                        // RPC / panicked scan): retry — the next join elects a
-                        // new leader.
-                        Err(_) => continue,
+                    // On `Err` the leader vanished without publishing
+                    // (cancelled RPC / panicked scan): retry — the next join
+                    // elects a new leader.
+                    if let Ok(slot) = rx.wait_for(std::option::Option::is_some).await {
+                        return match slot.clone().expect("wait_for guarantees Some") {
+                            Ok(shared) => Ok(shared),
+                            Err(msg) => Err(Error::Internal(msg)),
+                        };
                     }
                 }
             }

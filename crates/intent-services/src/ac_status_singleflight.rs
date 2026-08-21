@@ -79,8 +79,7 @@ impl AcStatusSingleFlight {
             .lock()
             .unwrap()
             .get(key)
-            .map(|tx| tx.receiver_count())
-            .unwrap_or(0)
+            .map_or(0, |tx| tx.receiver_count())
     }
 }
 
@@ -130,7 +129,10 @@ mod tests {
             panic!("second joiner must follow");
         };
         guard.finish(Ok(Arc::new(serde_json::json!({ "branch": "feature/x" }))));
-        let slot = rx.wait_for(|s| s.is_some()).await.expect("published");
+        let slot = rx
+            .wait_for(std::option::Option::is_some)
+            .await
+            .expect("published");
         let shared = slot.clone().unwrap().expect("ok result");
         assert_eq!(*shared, serde_json::json!({ "branch": "feature/x" }));
         drop(slot);
@@ -168,7 +170,10 @@ mod tests {
             panic!("second joiner must follow");
         };
         guard.finish(Err("boom".to_string()));
-        let slot = rx.wait_for(|s| s.is_some()).await.expect("published");
+        let slot = rx
+            .wait_for(std::option::Option::is_some)
+            .await
+            .expect("published");
         assert_eq!(slot.clone().unwrap().unwrap_err(), "boom");
         drop(slot);
         assert!(matches!(flights.join(&ws), Join::Leader(_)), "retried");
@@ -187,7 +192,10 @@ mod tests {
             panic!("second joiner must follow");
         };
         drop(guard);
-        assert!(rx.wait_for(|s| s.is_some()).await.is_err(), "closed");
+        assert!(
+            rx.wait_for(std::option::Option::is_some).await.is_err(),
+            "closed"
+        );
         assert!(matches!(flights.join(&ws), Join::Leader(_)));
     }
 

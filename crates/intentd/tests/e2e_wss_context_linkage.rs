@@ -114,7 +114,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             Err(_) => panic!("wss_rpc read timeout id={id} method={method}"),
             other => panic!("unexpected ws frame: {other:?}"),
         }
@@ -142,7 +142,7 @@ async fn next_event(ws: &mut PlainWs) -> Value {
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             Err(_) => panic!("next_event read timeout"),
             other => panic!("unexpected ws frame: {other:?}"),
         }

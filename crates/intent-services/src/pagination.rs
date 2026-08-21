@@ -22,9 +22,9 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 /// Default page size when the client omits `limit`.
-pub const DEFAULT_PAGE_LIMIT: usize = 50;
+pub(crate) const DEFAULT_PAGE_LIMIT: usize = 50;
 /// Hard server-side cap on page size.
-pub const MAX_PAGE_LIMIT: usize = 200;
+pub(crate) const MAX_PAGE_LIMIT: usize = 200;
 
 /// Clamp a client-supplied `limit` into the contract range. `None` yields the
 /// default (50); zero/negative clamp up to 1; values over the cap clamp down to
@@ -72,8 +72,7 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
     let end = token
         .and_then(decode_token)
         .and_then(|v| v.get("b").and_then(Value::as_u64))
-        .map(|b| (b as usize).min(len))
-        .unwrap_or(len);
+        .map_or(len, |b| (b as usize).min(len));
     let start = end.saturating_sub(limit);
     let next_token = if start > 0 {
         Some(encode_token(&json!({ "b": start })))
@@ -96,7 +95,7 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
 /// cursors index from the oldest end, so both are append-stable (Q13), and
 /// both are opaque base64 on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeekPageWindow {
+pub(crate) struct SeekPageWindow {
     pub start: usize,
     pub end: usize,
     pub next_token: Option<String>,
@@ -120,7 +119,7 @@ fn seek_window(len: usize, start: usize, end: usize) -> SeekPageWindow {
 /// target and the rest to the target and newer rows, clamped at either edge so
 /// the page stays full whenever `len >= limit`; the target index is always
 /// inside `start..end` (given `index < len`).
-pub fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekPageWindow {
+pub(crate) fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekPageWindow {
     let limit = clamp_limit(limit);
     let start = index.min(len).saturating_sub(limit / 2);
     let end = (start + limit).min(len);
@@ -132,7 +131,11 @@ pub fn page_window_around(len: usize, limit: Option<i64>, index: usize) -> SeekP
 /// minted by a seek page's `prev_token`. Returns `None` for backward or
 /// malformed tokens, which callers fall through to the [`page_window`]
 /// contract — so pre-existing backward tokens keep byte-identical behavior.
-pub fn forward_page_window(len: usize, limit: Option<i64>, token: &str) -> Option<SeekPageWindow> {
+pub(crate) fn forward_page_window(
+    len: usize,
+    limit: Option<i64>,
+    token: &str,
+) -> Option<SeekPageWindow> {
     let f = decode_token(token)?.get("f").and_then(Value::as_u64)? as usize;
     let limit = clamp_limit(limit);
     let start = f.min(len);
@@ -244,7 +247,7 @@ pub fn remint_backward_token(start: usize) -> Option<String> {
 /// page's effective end: `{"f": end}` while newer rows remain. Same cursor
 /// shape as [`seek_window`], so the resumed page picks up exactly at the
 /// first excluded (newer) row.
-pub fn remint_forward_token(end: usize, len: usize) -> Option<String> {
+pub(crate) fn remint_forward_token(end: usize, len: usize) -> Option<String> {
     (end < len).then(|| encode_token(&json!({ "f": end })))
 }
 
@@ -267,9 +270,7 @@ pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
         }
     }
     let mut sink = CountingSink(0);
-    serde_json::to_writer(&mut sink, row)
-        .map(|()| sink.0)
-        .unwrap_or(0)
+    serde_json::to_writer(&mut sink, row).map_or(0, |()| sink.0)
 }
 
 /// A page of items plus the opaque token for the next (older) page.
@@ -282,7 +283,11 @@ pub struct Page<T> {
 /// Paginate a chronological (oldest→newest) slice into a newest→oldest page.
 /// Items within the returned page are ordered newest-first; `next_token` follows
 /// the contract in [`page_window`].
-pub fn paginate_slice<T: Clone>(source: &[T], limit: Option<i64>, token: Option<&str>) -> Page<T> {
+pub(crate) fn paginate_slice<T: Clone>(
+    source: &[T],
+    limit: Option<i64>,
+    token: Option<&str>,
+) -> Page<T> {
     let win = page_window(source.len(), limit, token);
     let items = source[win.start..win.end].iter().rev().cloned().collect();
     Page {
@@ -296,9 +301,9 @@ pub fn paginate_slice<T: Clone>(source: &[T], limit: Option<i64>, token: Option<
 /// historical-output reads. Trailing blank lines are trimmed (mirroring the
 /// legacy formatted reads) before paging; the per-page size follows the standard
 /// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
-pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
+pub(crate) fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
     let mut lines: Vec<&str> = text.split('\n').collect();
-    while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
     let page = paginate_slice(&lines, limit, token);
@@ -318,18 +323,17 @@ pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) 
 /// not append-stable against inserts at the newest end — appropriate for
 /// time-windowed event queries and immutable commit history, where the live
 /// tail is read separately (Q13).
-pub fn offset_token(next_offset: usize) -> String {
+pub(crate) fn offset_token(next_offset: usize) -> String {
     encode_token(&json!({ "o": next_offset }))
 }
 
 /// Decode an offset-style continuation token into its offset. A missing or
 /// malformed token starts from offset 0 (the newest page).
-pub fn parse_offset(token: Option<&str>) -> usize {
+pub(crate) fn parse_offset(token: Option<&str>) -> usize {
     token
         .and_then(decode_token)
         .and_then(|v| v.get("o").and_then(Value::as_u64))
-        .map(|n| n as usize)
-        .unwrap_or(0)
+        .map_or(0, |n| n as usize)
 }
 
 #[cfg(test)]

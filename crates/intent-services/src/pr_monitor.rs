@@ -32,13 +32,14 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
-    Result, WorkspaceId,
+    PullRequestInfo, PullRequestStatus, Result, WorkspaceId,
 };
 use intent_sourcecontrol::{RepoRef, SourceControl};
 use intent_store::{NewEvent, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
 use crate::pr_ops::{self, MergeRequirements};
+use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 use intent_core::config::{MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_POLL_SECONDS};
@@ -130,7 +131,7 @@ impl SharedPrSnapshot {
             head_sha: self.head_sha.clone(),
             conversation_count: self
                 .conversation_count
-                .unwrap_or_else(|| previous.map(|p| p.conversation_count).unwrap_or(0)),
+                .unwrap_or_else(|| previous.map_or(0, |p| p.conversation_count)),
             review_comment_count: self.review_comment_count,
             requirements: self.requirements.clone(),
         }
@@ -224,6 +225,59 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
     crate::harness::latest().pr_monitor_label(&m.repo_owner, &m.repo_name, m.pr_number)
 }
 
+/// Fold a workspace's monitor rows into the displayStatus PR signals
+/// (§6.5): an ACTIVE row whose persisted `last_snapshot` shows the PR
+/// open/draft raises `open` — and `ready` when the snapshot says mergeable
+/// and not draft (the same mapping as a linked open PR) — while the LATEST
+/// (most recently updated) COMPLETED row raises `merged` when its final
+/// snapshot shows `merged` — matching linked-PR step-6 "latest" semantics,
+/// so an older merged monitor never shadows a newer closed-unmerged one.
+/// A row with no snapshot or an unparseable blob contributes nothing
+/// (never fails the derivation), and cancelled rows are excluded by the
+/// caller's SQL filter (which also bounds completed rows to the latest
+/// one). An ACTIVE row already showing a terminal snapshot (a poll
+/// observed the merge but lost its guarded terminalize write) contributes
+/// nothing — the next tick re-detects and completes it.
+pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignals {
+    let mut signals = MonitorPrSignals::default();
+    let mut latest_completed: Option<&PrMonitor> = None;
+    for m in monitors {
+        match m.state {
+            PrMonitorState::Active => {
+                let Some(snapshot) = m
+                    .last_snapshot
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+                else {
+                    continue;
+                };
+                let req = &snapshot.requirements;
+                if matches!(req.state.as_str(), "open" | "draft") {
+                    signals.open = true;
+                    if req.mergeable == Some(true) && !req.is_draft {
+                        signals.ready = true;
+                    }
+                }
+            }
+            PrMonitorState::Completed => {
+                if latest_completed.is_none_or(|prev| m.updated_at > prev.updated_at) {
+                    latest_completed = Some(m);
+                }
+            }
+            PrMonitorState::Cancelled => {}
+        }
+    }
+    if let Some(m) = latest_completed {
+        let merged = m
+            .last_snapshot
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+            .is_some_and(|s| s.requirements.state == "merged");
+        signals.merged = merged;
+    }
+    signals
+}
+
 /// Light metadata for one ACTIVE PR monitor — the idle-visibility
 /// `waitingOnPrMonitors` entry shape: `{ monitorId, repo, prNumber, title? }`.
 /// `title` is read off the persisted baseline snapshot (absent until the
@@ -245,6 +299,60 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
         v["title"] = Value::String(title);
     }
     v
+}
+
+/// Synthesize a [`PullRequestInfo`] from a monitor row — the monitor-derived
+/// entry the `workspace.list` / `workspace.subscribe` seq-0 PR merge appends
+/// when no persisted source already carries the PR. Everything is read off
+/// the persisted row (the snapshot column is parsed, never re-fetched).
+/// Mirrors the FE's `mergeMonitoredPRs` fallbacks: URL/title synthesized from
+/// the repo identity when the monitor has no snapshot yet, and status
+/// resolved as snapshot state → draft flag → `completed` ⇒ closed (terminal
+/// covers both merged and closed; don't falsely claim merged) → open.
+pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
+    let snapshot: Option<PrMonitorSnapshot> = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let status = match snapshot.as_ref().map(|s| s.requirements.state.as_str()) {
+        Some("merged") => PullRequestStatus::Merged,
+        Some("closed") => PullRequestStatus::Closed,
+        Some("draft") => PullRequestStatus::Draft,
+        _ if snapshot.as_ref().is_some_and(|s| s.requirements.is_draft) => PullRequestStatus::Draft,
+        _ if m.state == PrMonitorState::Completed => PullRequestStatus::Closed,
+        _ => PullRequestStatus::Open,
+    };
+    let url = snapshot.as_ref().map_or_else(
+        || {
+            format!(
+                "https://github.com/{}/{}/pull/{}",
+                m.repo_owner, m.repo_name, m.pr_number
+            )
+        },
+        |s| s.url.clone(),
+    );
+    let title = snapshot.as_ref().map_or_else(
+        || format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number),
+        |s| s.title.clone(),
+    );
+    PullRequestInfo {
+        id: m.pr_number.to_string(),
+        number: m.pr_number as u64,
+        url,
+        title,
+        status,
+        // Monitor-row timestamps stand in for the PR's own (the snapshot
+        // does not carry them), mirroring the FE merge.
+        created_at: m.created_at.clone(),
+        updated_at: m.updated_at.clone(),
+        base_ref: None,
+        head_ref: None,
+        head_sha: snapshot.as_ref().and_then(|s| s.head_sha.clone()),
+        author: None,
+        mergeable: snapshot.as_ref().and_then(|s| s.requirements.mergeable),
+        mergeable_state: None,
+        is_draft: snapshot.as_ref().map(|s| s.requirements.is_draft),
+    }
 }
 
 /// The `messageMetadata` payload attached to every PR-monitor wake delivery
@@ -486,9 +594,9 @@ impl Services {
         })?;
         self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, None)
             .await;
-        // A newly persisted active monitor can promote the derived
-        // displayStatus to `in_progress` (§6.5) and raise the orthogonal
-        // `waiting` flag (§5.1).
+        // A newly persisted active monitor on an open PR can move the
+        // derived displayStatus to `pr_open`/`pr_ready` (§6.5) and raise
+        // the orthogonal `waiting` flag (§5.1).
         self.maybe_emit_display_status_changed(workspace_id).await;
         self.maybe_emit_waiting_changed(workspace_id).await;
         Ok((monitor, snapshot.requirements))
@@ -537,7 +645,7 @@ impl Services {
     /// Monitors owned by an agent, oldest first. Cancelled rows are excluded
     /// (they are removed from the UI); completed rows are retained so merged
     /// PRs stay visible.
-    pub async fn pr_monitors_for_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
+    pub(crate) async fn pr_monitors_for_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
         Ok(self
             .store
             .list_pr_monitors_by_agent(agent_id)
@@ -549,7 +657,7 @@ impl Services {
 
     /// Monitors in a workspace, oldest first, with the same cancelled-row
     /// exclusion as the per-agent view.
-    pub async fn pr_monitors_for_workspace(
+    pub(crate) async fn pr_monitors_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<PrMonitor>> {
@@ -565,11 +673,12 @@ impl Services {
     /// Whether the workspace owns any ACTIVE PR monitor — a
     /// `Workspace.waiting` signal (§5.1, via
     /// [`Services::workspace_is_waiting`]): an idle agent still watching a
-    /// PR via a monitor reads as waiting, without promoting the
-    /// `displayStatus` rollup. SQL-filtered to active rows so the hot
-    /// list/get enrichment cost is O(active monitors), never O(all monitor
-    /// history in the workspace). Best-effort: a store read failure is
-    /// logged and fails open to `false` (mirrors
+    /// PR via a monitor reads as waiting. (The monitored PR's own state
+    /// separately feeds the displayStatus PR rungs via
+    /// [`Services::workspace_monitor_pr_signals`].) SQL-filtered to active
+    /// rows so the hot list/get enrichment cost is O(active monitors),
+    /// never O(all monitor history in the workspace). Best-effort: a store
+    /// read failure is logged and fails open to `false` (mirrors
     /// [`Services::workspace_has_active_hooks`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_active_pr_monitors(
@@ -589,6 +698,39 @@ impl Services {
                     "active-pr-monitors displayStatus lookup failed; reads as none"
                 );
                 false
+            }
+        }
+    }
+
+    /// Probe the workspace's agent-monitored PRs for the displayStatus PR
+    /// rungs (§6.5, [`MonitorPrSignals`]): ACTIVE monitors whose persisted
+    /// `last_snapshot` shows the PR open/draft raise `open` (and `ready`
+    /// when the snapshot says mergeable and not draft); the LATEST COMPLETED
+    /// monitor raises `merged` when its final snapshot shows the PR merged.
+    /// Purely snapshot-derived — no forge calls — and SQL-bounded to active
+    /// rows plus the single most recently updated completed row, so the cost
+    /// stays O(active monitors) even though completed rows are retained
+    /// indefinitely. Best-effort: a store read failure is logged and reads
+    /// as no signals (mirrors
+    /// [`Services::workspace_has_active_pr_monitors`]) so list/get emission
+    /// is never wedged and PR stages are never fabricated.
+    pub(crate) async fn workspace_monitor_pr_signals(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> MonitorPrSignals {
+        match self
+            .store
+            .list_display_status_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => fold_monitor_pr_signals(&monitors),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "monitor-pr displayStatus lookup failed; reads as no signals"
+                );
+                MonitorPrSignals::default()
             }
         }
     }
@@ -681,15 +823,16 @@ impl Services {
         match wake_notice {
             Some(notice) => {
                 self.wake_pr_monitor_owner(&monitor, notice, "cancelled")
-                    .await
+                    .await;
             }
             None => {
                 self.resettle_owner_after_pr_monitor_terminal(&monitor)
-                    .await
+                    .await;
             }
         }
-        // The last active monitor settling can demote the derived
-        // displayStatus (§6.5) and drop the `waiting` flag (§5.1) —
+        // A cancelled monitor's open-PR signal lapses — the derived
+        // displayStatus can drop off `pr_open`/`pr_ready` (§6.5) — and the
+        // last active monitor settling drops the `waiting` flag (§5.1);
         // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&monitor.workspace_id)
             .await;
@@ -747,7 +890,7 @@ impl Services {
     /// Deliver a monitor's pending consolidated wake right now, bypassing the
     /// remaining debounce window, and reset the debounce state. A no-op
     /// (`Ok(false)`) when nothing is pending.
-    pub async fn pr_monitor_flush(
+    pub(crate) async fn pr_monitor_flush(
         &self,
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
@@ -774,7 +917,7 @@ impl Services {
     /// re-poll finds nothing changed vs. the emit baseline. A forge fetch
     /// failure records `lastError` (like a sweep poll) and propagates the
     /// error.
-    pub async fn pr_monitor_check_and_flush(
+    pub(crate) async fn pr_monitor_check_and_flush(
         &self,
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
@@ -976,8 +1119,7 @@ impl Services {
         // the EMIT baseline instead, so the two diffs serve distinct roles.
         let poll_activity = previous
             .as_ref()
-            .map(|prev| !diff_snapshots(prev, &fresh).is_empty())
-            .unwrap_or(false);
+            .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -1220,8 +1362,10 @@ impl Services {
             .baseline_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
-            .map(|base| diff_snapshots(&base, snapshot))
-            .unwrap_or_else(|| monitor.pending_changes.clone());
+            .map_or_else(
+                || monitor.pending_changes.clone(),
+                |base| diff_snapshots(&base, snapshot),
+            );
         let message = render_terminal_wake(monitor, &changes, snapshot);
         let now = now_iso();
         if !self
@@ -1266,9 +1410,10 @@ impl Services {
             .await;
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
-        // The last active monitor settling can demote the derived
-        // displayStatus (§6.5) and drop the `waiting` flag (§5.1) —
-        // best-effort, transition-only emission.
+        // Completion flips the monitor's PR signal from open to merged, so
+        // the derived displayStatus can transition (e.g. `pr_open` →
+        // `pr_merged`, §6.5), and the last active monitor settling drops
+        // the `waiting` flag (§5.1) — best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&completed.workspace_id)
             .await;
         self.maybe_emit_waiting_changed(&completed.workspace_id)
@@ -1373,8 +1518,9 @@ impl Services {
                 monitor.updated_at = now;
                 self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
                     .await;
-                // The last active monitor settling can demote the derived
-                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
+                // The cancelled monitor's open-PR signal lapses (§6.5) and
+                // the last active monitor settling drops the `waiting`
+                // flag (§5.1).
                 self.maybe_emit_display_status_changed(&monitor.workspace_id)
                     .await;
                 self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
@@ -4002,15 +4148,15 @@ mod tests {
         }
     }
 
-    /// An ACTIVE PR monitor sets the orthogonal `waiting` flag on the
-    /// list/get enrichment path without promoting the derived
-    /// `displayStatus` — the base rollup (`complete` here: every task done)
-    /// is served as-is, proving the flag coexists with `complete`; the flag
-    /// drops once the monitor settles. Mirrors
-    /// `active_hook_sets_waiting_without_promoting_display_status` in
-    /// `hook_manager.rs`.
+    /// An ACTIVE PR monitor on an open PR both sets the orthogonal
+    /// `waiting` flag on the list/get enrichment path AND feeds the PR
+    /// rungs of the derived `displayStatus`: with every task done the
+    /// rollup reads `pr_ready` (the stub PR is open + mergeable, not
+    /// draft) instead of falling through to `complete`. Cancelling the
+    /// monitor lapses both — the flag drops and the rollup returns to the
+    /// base `complete`.
     #[tokio::test]
-    async fn active_pr_monitor_sets_waiting_without_promoting_display_status() {
+    async fn active_pr_monitor_sets_waiting_and_feeds_the_pr_rungs() {
         let (_db, _root, svc, _forge, ws, owner) = setup().await;
         svc.store()
             .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
@@ -4026,12 +4172,12 @@ mod tests {
         );
         assert_eq!(
             row.display_status,
-            Some(intent_core::WorkspaceDisplayStatus::Complete),
-            "an active monitor never promotes the displayStatus rollup"
+            Some(intent_core::WorkspaceDisplayStatus::PrReady),
+            "an active monitor on an open mergeable PR reads pr_ready"
         );
 
-        // Settle the monitor: the waiting flag lapses; the rollup is
-        // unchanged.
+        // Settle the monitor: the waiting flag lapses and the rollup
+        // returns to the base `complete`.
         svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
             .await
             .expect("cancel");
@@ -4041,6 +4187,150 @@ mod tests {
         assert_eq!(
             row.display_status,
             Some(intent_core::WorkspaceDisplayStatus::Complete),
+            "a cancelled monitor's open-PR signal lapses"
+        );
+    }
+
+    /// The snapshot→signal fold: active open/draft rows raise `open` (and
+    /// `ready` only when mergeable + not draft), completed merged rows
+    /// raise `merged`, and rows with no/unparseable snapshots, non-merged
+    /// completed rows, or active rows already showing a terminal snapshot
+    /// contribute nothing.
+    #[test]
+    fn fold_monitor_pr_signals_maps_rows_to_signals() {
+        let ws = WorkspaceId::new();
+        let owner = AgentId::from("agent-fold");
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mk = |state: PrMonitorState, snap: Option<String>| PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state,
+            last_snapshot: snap,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        };
+        let snap = |f: fn(&mut PrMonitorSnapshot)| {
+            let mut s = snapshot(|_| {});
+            f(&mut s);
+            Some(serde_json::to_string(&s).unwrap())
+        };
+
+        // Active + open + mergeable + not draft → open and ready.
+        let ready = mk(PrMonitorState::Active, snap(|_| {}));
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&ready)),
+            MonitorPrSignals {
+                open: true,
+                ready: true,
+                merged: false
+            }
+        );
+        // Draft, or not mergeable → open only.
+        let draft = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                s.requirements.state = "draft".into();
+                s.requirements.is_draft = true;
+            }),
+        );
+        let unmergeable = mk(
+            PrMonitorState::Active,
+            snap(|s| s.requirements.mergeable = Some(false)),
+        );
+        for m in [&draft, &unmergeable] {
+            assert_eq!(
+                fold_monitor_pr_signals(std::slice::from_ref(m)),
+                MonitorPrSignals {
+                    open: true,
+                    ready: false,
+                    merged: false
+                }
+            );
+        }
+        // Completed + merged → merged; completed + closed → nothing.
+        let merged = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "merged".into()),
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(std::slice::from_ref(&merged)),
+            MonitorPrSignals {
+                open: false,
+                ready: false,
+                merged: true
+            }
+        );
+        let closed = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "closed".into()),
+        );
+        // An active row already showing a terminal snapshot (lost the
+        // terminalize write) contributes nothing either.
+        let active_terminal = mk(
+            PrMonitorState::Active,
+            snap(|s| s.requirements.state = "merged".into()),
+        );
+        let no_snapshot = mk(PrMonitorState::Active, None);
+        let bad_blob = mk(PrMonitorState::Active, Some("{not json".into()));
+        assert_eq!(
+            fold_monitor_pr_signals(&[closed, active_terminal, no_snapshot, bad_blob]),
+            MonitorPrSignals::default()
+        );
+        // Signals aggregate across rows.
+        assert_eq!(
+            fold_monitor_pr_signals(&[ready, merged.clone()]),
+            MonitorPrSignals {
+                open: true,
+                ready: true,
+                merged: true
+            }
+        );
+        // Latest-completed semantics (linked-PR step 6): an older merged
+        // monitor never shadows a newer closed-unmerged one — only the most
+        // recently updated completed row decides `merged`.
+        let mut newer_closed = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "closed".into()),
+        );
+        newer_closed.updated_at = "2026-01-02T00:00:00Z".into();
+        assert_eq!(
+            fold_monitor_pr_signals(&[merged.clone(), newer_closed.clone()]),
+            MonitorPrSignals::default(),
+            "newer closed-unmerged monitor wins over an older merged one"
+        );
+        // Order-independent: the fold picks the latest by updated_at, not
+        // by slice position.
+        assert_eq!(
+            fold_monitor_pr_signals(&[newer_closed, merged.clone()]),
+            MonitorPrSignals::default()
+        );
+        // And the reverse: a newer merged monitor after an older closed one.
+        let mut newer_merged = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "merged".into()),
+        );
+        newer_merged.updated_at = "2026-01-03T00:00:00Z".into();
+        let older_closed = mk(
+            PrMonitorState::Completed,
+            snap(|s| s.requirements.state = "closed".into()),
+        );
+        assert_eq!(
+            fold_monitor_pr_signals(&[older_closed, newer_merged]),
+            MonitorPrSignals {
+                open: false,
+                ready: false,
+                merged: true
+            }
         );
     }
 
@@ -4128,13 +4418,13 @@ mod tests {
             .collect()
     }
 
-    /// Monitor lifecycle transitions no longer move the derived
-    /// `displayStatus` (the wait signal is the orthogonal `waiting` flag):
-    /// neither register nor cancel emits `workspace:displayStatus-changed` —
-    /// mirroring `hook_transitions_never_emit_display_status_changed` in
-    /// `hook_manager.rs`.
+    /// Monitor lifecycle transitions move the derived `displayStatus`
+    /// through the PR rungs (§6.5): registering on an open mergeable PR
+    /// emits the `pr_ready` promotion, a no-op recompute stays silent, and
+    /// cancelling emits the demotion back to the base rollup (`idle` here:
+    /// no tasks, no linked PR).
     #[tokio::test]
-    async fn monitor_transitions_never_emit_display_status_changed() {
+    async fn monitor_transitions_emit_display_status_through_the_pr_rungs() {
         let (_db, _root, svc, _forge, ws, owner) = setup().await;
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
@@ -4142,22 +4432,34 @@ mod tests {
 
         let monitor = register(&svc, &ws, &owner).await;
         assert!(svc.workspace_is_waiting(&ws).await);
-        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["pr_ready".to_string()],
+            "an active monitor on an open mergeable PR promotes to pr_ready"
+        );
 
         // Re-running the recompute without a transition emits nothing.
         svc.maybe_emit_display_status_changed(&ws).await;
-        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["pr_ready".to_string()]
+        );
 
         svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
             .await
             .expect("cancel");
         assert!(!svc.workspace_is_waiting(&ws).await);
-        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["pr_ready".to_string(), "idle".to_string()],
+            "a cancelled monitor's open-PR signal lapses back to the base rollup"
+        );
     }
 
-    /// The poll loop's terminal completion (merged PR) and a rehydration
-    /// cancel of an owner-gone monitor both drop the waiting flag without
-    /// any displayStatus transition.
+    /// The poll loop's terminal completion (merged PR) drops the waiting
+    /// flag and transitions the derived displayStatus from the open-PR rung
+    /// to `pr_merged`; a rehydration cancel of an owner-gone monitor drops
+    /// the flag while the completed monitor's merged signal persists.
     #[tokio::test]
     async fn completion_and_rehydration_cancel_drop_the_waiting_flag() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -4169,8 +4471,14 @@ mod tests {
         forge.edit(|s| s.pr_state = PrState::Merged);
         svc.poll_pr_monitors().await;
         assert!(!svc.workspace_is_waiting(&ws).await);
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["pr_ready".to_string(), "pr_merged".to_string()],
+            "completion transitions the derivation to pr_merged"
+        );
 
-        // Rehydration cancel (owner gone) drops the flag too.
+        // Rehydration cancel (owner gone) drops the flag too; the completed
+        // monitor's merged signal keeps the rollup at pr_merged.
         svc.pr_monitor_register(&ws, &owner, "o", "r", 7)
             .await
             .expect("register");
@@ -4181,7 +4489,10 @@ mod tests {
             .expect("delete owner");
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
         assert!(!svc.workspace_is_waiting(&ws).await);
-        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["pr_ready".to_string(), "pr_merged".to_string()]
+        );
     }
 
     /// Persisted `workspace:waiting-changed` payload flags for a workspace,
@@ -4327,11 +4638,16 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // Monitor lifecycle never moves the displayStatus rollup: no
-        // transition emitted across register/complete/register/archive; the
-        // wait flag simply dropped with the sweep.
+        // The lifecycle walked the PR rungs: register promoted to
+        // `pr_ready`, completion flipped to `pr_merged`, the re-register
+        // promoted again, and the archive sweep's cancel lapsed the open
+        // signal back to `pr_merged` (the completed monitor's merged signal
+        // persists). The wait flag dropped with the sweep.
         assert!(!svc.workspace_is_waiting(&ws).await);
-        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["pr_ready", "pr_merged", "pr_ready", "pr_merged"]
+        );
     }
 
     #[tokio::test]

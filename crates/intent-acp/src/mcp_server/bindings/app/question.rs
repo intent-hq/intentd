@@ -35,14 +35,14 @@ use intent_core::{
 };
 use serde_json::{json, Map, Value};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.question = {
         // spec: { header, question, options: [{ label, description? }], explanation?, multiSelect? }
         ask: (spec) => host({ method: 'app.question.ask', args: { question: spec } }),
     };
-"#;
+";
 
 /// MCP resource MIME type for questions (FE renders these as QuestionCards).
 pub const QUESTION_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.question+json";

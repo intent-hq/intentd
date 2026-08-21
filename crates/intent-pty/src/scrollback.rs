@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 /// Default scrollback budget per PTY (512 KiB), matching the terminal byte
 /// buffer cap in `MainProcessTerminalManager.ts`.
-pub const DEFAULT_SCROLLBACK_BYTES: usize = 512 * 1024;
+pub(crate) const DEFAULT_SCROLLBACK_BYTES: usize = 512 * 1024;
 
 /// A bounded byte ring buffer holding the most recent PTY output.
 #[derive(Debug)]
@@ -66,7 +66,8 @@ impl Scrollback {
     }
 
     /// Configured retention budget in bytes.
-    pub fn capacity_bytes(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn capacity_bytes(&self) -> usize {
         self.max_bytes
     }
 

@@ -261,7 +261,7 @@ impl Store {
                     // can reject a client-supplied `commentId` collision with
                     // InvalidParams even when the race beats a pre-check.
                     if e.as_database_error()
-                        .is_some_and(|d| d.is_unique_violation())
+                        .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
                     {
                         Error::InvalidInput(format!("comment {} already exists", c.id))
                     } else {
@@ -418,7 +418,7 @@ impl Store {
     }
 
     /// List the comments in one thread, ordered by creation time.
-    pub async fn list_thread_comments(&self, thread_id: &str) -> Result<Vec<Comment>> {
+    pub(crate) async fn list_thread_comments(&self, thread_id: &str) -> Result<Vec<Comment>> {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM comment WHERE thread_id = ? ORDER BY created_at, id"
         );

@@ -29,7 +29,7 @@ const SLOWEST_SUBTREES_LOGGED: usize = 5;
 /// Phase timings and clone statistics for one CoW checkout provisioning, so a
 /// slow `workspace.create`/`workspace.duplicate` is attributable from logs.
 #[derive(Debug, Default)]
-pub struct CowProvisionTimings {
+pub(crate) struct CowProvisionTimings {
     /// Wall-clock duration of the whole provisioning call.
     pub total: Duration,
     /// Duration of the CoW clone itself.
@@ -137,7 +137,7 @@ pub fn provision_cow_checkout(
 
 /// [`provision_cow_checkout`] returning the phase timings alongside the SHA
 /// (the public entry point logs them; tests assert on them directly).
-pub fn provision_cow_checkout_timed(
+pub(crate) fn provision_cow_checkout_timed(
     repo_path: &Path,
     checkout_path: &Path,
     branch: &str,
@@ -203,10 +203,10 @@ pub fn provision_cow_checkout_timed(
                         error = %e,
                         "provision_cow_checkout: cannot read pre-reset submodule paths; skipping orphan cleanup"
                     );
-                    Default::default()
+                    std::collections::BTreeSet::default()
                 })
         } else {
-            Default::default()
+            std::collections::BTreeSet::default()
         };
         let checkout_started = Instant::now();
         let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;

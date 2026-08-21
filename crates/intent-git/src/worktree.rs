@@ -54,7 +54,8 @@ impl WorktreeLocks {
 
 /// Create a linked worktree named `name` at `worktree_path` for the repository at
 /// `repo_path` (wraps `git worktree add`). The repository must have a commit.
-pub fn create_worktree(repo_path: &Path, name: &str, worktree_path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn create_worktree(repo_path: &Path, name: &str, worktree_path: &Path) -> Result<()> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     repo.worktree(name, worktree_path, None)
         .map_err(map_git_err)?;
@@ -147,8 +148,7 @@ fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     // is in use by another worktree (including the main working tree).
     if msg.contains("already checked out") {
         Error::InvalidParams(format!(
-            "branch '{}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree",
-            branch
+            "branch '{branch}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree"
         ))
     } else {
         map_git_err(e)
@@ -200,7 +200,8 @@ pub fn worktree_branch(worktree_path: &Path) -> Option<String> {
 /// by [`remove_detached_worktree`] (recursive removal) — so callers that hold
 /// a per-repo lock can run the phases separately and keep the expensive
 /// recursive delete outside the lock.
-pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     if let Some(trash) = detach_worktree(repo_path, worktree_path)? {
         remove_detached_worktree(&trash)?;
     }
@@ -291,9 +292,7 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
             // Trash-candidate collision (`EEXIST` / `ENOTEMPTY`; the latter has
             // no stable `ErrorKind` on our MSRV, so probe the candidate): retry
             // with a fresh nonce.
-            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {
-                continue;
-            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {}
             Err(e) => {
                 tracing::debug!(
                     error = %e,
@@ -315,18 +314,17 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
 /// `<wt>.deleting-<nonce>` in the same parent directory, so the rename never
 /// crosses filesystems.
 fn detached_trash_path(worktree_path: &Path) -> PathBuf {
-    let name = worktree_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "worktree".to_string());
+    let name = worktree_path.file_name().map_or_else(
+        || "worktree".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let parent = worktree_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     for attempt in 0u32.. {
         let candidate = parent.join(format!("{name}.deleting-{nonce:x}-{attempt}"));
         if !candidate.exists() {

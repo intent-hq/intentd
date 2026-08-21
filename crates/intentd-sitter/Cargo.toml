@@ -43,3 +43,6 @@ tempfile = "3"
 
 [target."cfg(windows)".dependencies]
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

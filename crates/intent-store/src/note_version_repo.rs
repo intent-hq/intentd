@@ -13,7 +13,7 @@ use sqlx::Row;
 use crate::Store;
 
 /// Prune-on-append cap, mirroring the FE `VERSION_CONFIG.MAX_VERSIONS`.
-pub const MAX_NOTE_VERSIONS: i64 = 50;
+pub(crate) const MAX_NOTE_VERSIONS: i64 = 50;
 
 impl Store {
     /// Append a full-snapshot version of `note` (its *current* content) and

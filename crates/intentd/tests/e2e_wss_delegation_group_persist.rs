@@ -323,7 +323,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -347,7 +347,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -709,7 +709,7 @@ async fn baseline_plus_aggregated_wake() {
         .await
         .expect("open store for inspection");
     let groups = store
-        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
+        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.clone()))
         .await
         .expect("list undelivered groups");
     assert_eq!(groups.len(), 1, "exactly one delegation group persisted");
@@ -792,7 +792,7 @@ async fn baseline_plus_aggregated_wake() {
         store
             .insert_interrupted_agent(
                 &AgentId(child2_id.clone()),
-                &WorkspaceId(ws_id.to_string()),
+                &WorkspaceId(ws_id.clone()),
                 "active",
                 &now_iso(),
             )
@@ -848,11 +848,11 @@ async fn baseline_plus_aggregated_wake() {
         match ev["type"].as_str() {
             Some("agent:stream:activity") => {
                 wake_chunks += 1;
-                eprintln!("  parent stream:activity (wake_chunks={})", wake_chunks);
+                eprintln!("  parent stream:activity (wake_chunks={wake_chunks})");
             }
             Some("agent:stream:end") => {
                 wake_ends += 1;
-                eprintln!("  parent stream:end (wake_ends={})", wake_ends);
+                eprintln!("  parent stream:end (wake_ends={wake_ends})");
             }
             Some("agent:idle") => {
                 parent_idle_again = true;
@@ -891,20 +891,16 @@ async fn baseline_plus_aggregated_wake() {
     let wake = wakes[0];
     assert!(
         wake.contains(REPORT_A),
-        "wake must contain child1 report ({}): wake={}",
-        REPORT_A,
-        wake
+        "wake must contain child1 report ({REPORT_A}): wake={wake}"
     );
     assert!(
         wake.contains(REPORT_B),
-        "wake must contain child2 report ({}): wake={}",
-        REPORT_B,
-        wake
+        "wake must contain child2 report ({REPORT_B}): wake={wake}"
     );
     eprintln!("✓ Aggregated wake delivered successfully post-restart!");
     eprintln!("✓ Exactly ONE wake fired after both children settled (pre+post restart)");
-    eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_A);
-    eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_B);
+    eprintln!("✓ Wake payload contains BOTH child reports: {REPORT_A}");
+    eprintln!("✓ Wake payload contains BOTH child reports: {REPORT_B}");
     eprintln!("✓ STAB-108: conservative reconciliation predicate prevented premature group firing");
     eprintln!("✓ STAB-108: startup rehydration sweep loaded the undelivered group");
     eprintln!(

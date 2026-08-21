@@ -40,7 +40,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -216,7 +216,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -617,16 +617,15 @@ async fn setup_script_executes_on_create() {
         r#"#!/bin/sh
 set -e
 # Write env vars to a file in the worktree (hermetic, not /tmp)
-	while [ ! -f "${{WORKTREE_PATH}}/.setup-release-{}" ]; do
+	while [ ! -f "${{WORKTREE_PATH}}/.setup-release-{test_run_id}" ]; do
 	  sleep 0.1
 	done
-echo "MAIN_CHECKOUT=${{MAIN_CHECKOUT}}" > "${{WORKTREE_PATH}}/setup-env-{}.txt"
-echo "WORKTREE_PATH=${{WORKTREE_PATH}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
-echo "BRANCH_NAME=${{BRANCH_NAME}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
-echo "SOURCE_BRANCH=${{SOURCE_BRANCH}}" >> "${{WORKTREE_PATH}}/setup-env-{}.txt"
-touch "${{WORKTREE_PATH}}/.setup-ran-{}"
-"#,
-        test_run_id, test_run_id, test_run_id, test_run_id, test_run_id, test_run_id
+echo "MAIN_CHECKOUT=${{MAIN_CHECKOUT}}" > "${{WORKTREE_PATH}}/setup-env-{test_run_id}.txt"
+echo "WORKTREE_PATH=${{WORKTREE_PATH}}" >> "${{WORKTREE_PATH}}/setup-env-{test_run_id}.txt"
+echo "BRANCH_NAME=${{BRANCH_NAME}}" >> "${{WORKTREE_PATH}}/setup-env-{test_run_id}.txt"
+echo "SOURCE_BRANCH=${{SOURCE_BRANCH}}" >> "${{WORKTREE_PATH}}/setup-env-{test_run_id}.txt"
+touch "${{WORKTREE_PATH}}/.setup-ran-{test_run_id}"
+"#
     );
 
     let create_resp = wss_rpc(
@@ -665,7 +664,7 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
         .expect("terminal id")
         .to_string();
     std::fs::write(
-        PathBuf::from(workspace_path).join(format!(".setup-release-{}", test_run_id)),
+        PathBuf::from(workspace_path).join(format!(".setup-release-{test_run_id}")),
         "",
     )
     .expect("release setup script");
@@ -673,7 +672,7 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
     // Poll for the marker file (script execution is fire-and-forget, may take a moment).
     // The marker appearing also proves the explicit param took precedence over the
     // committed repo-config script ("pnpm install") — exactly one script executes.
-    let marker_path = PathBuf::from(workspace_path).join(format!(".setup-ran-{}", test_run_id));
+    let marker_path = PathBuf::from(workspace_path).join(format!(".setup-ran-{test_run_id}"));
     let mut found = false;
     for _ in 0..100 {
         if marker_path.exists() {
@@ -695,15 +694,14 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
     );
 
     // Verify env vars were set correctly
-    let env_file_path =
-        PathBuf::from(workspace_path).join(format!("setup-env-{}.txt", test_run_id));
+    let env_file_path = PathBuf::from(workspace_path).join(format!("setup-env-{test_run_id}.txt"));
     let env_content = std::fs::read_to_string(&env_file_path).expect("read env test file");
     assert!(
         env_content.contains("MAIN_CHECKOUT="),
         "MAIN_CHECKOUT should be set"
     );
     assert!(
-        env_content.contains(&format!("WORKTREE_PATH={}", workspace_path)),
+        env_content.contains(&format!("WORKTREE_PATH={workspace_path}")),
         "WORKTREE_PATH should match workspace path"
     );
     assert!(
@@ -729,13 +727,12 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
     let failing_run_id = Uuid::new_v4().simple().to_string();
     let failing_script = format!(
         r#"#!/bin/sh
-while [ ! -f "${{WORKTREE_PATH}}/.setup-fail-release-{}" ]; do
+while [ ! -f "${{WORKTREE_PATH}}/.setup-fail-release-{failing_run_id}" ]; do
   sleep 0.1
 done
-touch "${{WORKTREE_PATH}}/.setup-fail-ran-{}"
+touch "${{WORKTREE_PATH}}/.setup-fail-ran-{failing_run_id}"
 exit 1
-"#,
-        failing_run_id, failing_run_id
+"#
     );
     let create_resp2 = wss_rpc(
         &mut wss,
@@ -772,12 +769,12 @@ exit 1
         .expect("terminal id")
         .to_string();
     std::fs::write(
-        PathBuf::from(workspace_path2).join(format!(".setup-fail-release-{}", failing_run_id)),
+        PathBuf::from(workspace_path2).join(format!(".setup-fail-release-{failing_run_id}")),
         "",
     )
     .expect("release failing setup script");
     let failed_marker_path =
-        PathBuf::from(workspace_path2).join(format!(".setup-fail-ran-{}", failing_run_id));
+        PathBuf::from(workspace_path2).join(format!(".setup-fail-ran-{failing_run_id}"));
     let mut failed_marker_found = false;
     for _ in 0..100 {
         if failed_marker_path.exists() {
@@ -810,9 +807,8 @@ exit 1
     let bare_run_id = Uuid::new_v4().simple().to_string();
     let bare_script = format!(
         r#"#!/bin/sh
-touch "${{WORKTREE_PATH}}/.setup-bare-ran-{}"
-"#,
-        bare_run_id
+touch "${{WORKTREE_PATH}}/.setup-bare-ran-{bare_run_id}"
+"#
     );
     let create_resp_bare = wss_rpc(
         &mut wss,
@@ -831,7 +827,7 @@ touch "${{WORKTREE_PATH}}/.setup-bare-ran-{}"
         .as_str()
         .expect("worktreePath should be set");
     let bare_marker_path =
-        PathBuf::from(bare_workspace_path).join(format!(".setup-bare-ran-{}", bare_run_id));
+        PathBuf::from(bare_workspace_path).join(format!(".setup-bare-ran-{bare_run_id}"));
     let mut bare_marker_found = false;
     for _ in 0..100 {
         if bare_marker_path.exists() {
@@ -856,9 +852,8 @@ touch "${{WORKTREE_PATH}}/.setup-bare-ran-{}"
     let skip_marker_id = Uuid::new_v4().simple().to_string();
     let skip_script = format!(
         r#"#!/bin/sh
-touch "${{MAIN_CHECKOUT}}/.should-not-run-{}"
-"#,
-        skip_marker_id
+touch "${{MAIN_CHECKOUT}}/.should-not-run-{skip_marker_id}"
+"#
     );
 
     let create_resp3 = wss_rpc(
@@ -891,7 +886,7 @@ touch "${{MAIN_CHECKOUT}}/.should-not-run-{}"
 
     // skipWorktree has no worktree, so WORKTREE_PATH would be empty; the script uses
     // MAIN_CHECKOUT instead (repo path). Assert marker does not appear under repo.
-    let skip_marker_path = repo_path.join(format!(".should-not-run-{}", skip_marker_id));
+    let skip_marker_path = repo_path.join(format!(".should-not-run-{skip_marker_id}"));
     assert!(
         !skip_marker_path.exists(),
         "skipWorktree should not execute setup script (marker not found under repo)"

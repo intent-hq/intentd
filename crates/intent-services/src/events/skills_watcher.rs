@@ -34,7 +34,7 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// daemon, so they do not scale with the workspace count. The three project
 /// tiers per workspace no longer own streams at all: they ride the shared
 /// workspace-root stream via [`watch_tiers`].
-pub struct SkillsWatcher {
+pub(crate) struct SkillsWatcher {
     hub: Arc<SharedWatchHub>,
     _user_watchers: Vec<RootWatch>,
     workspace_watchers: Mutex<HashMap<WorkspaceId, TierWatch>>,
@@ -89,7 +89,7 @@ impl SkillsWatcher {
     /// path first so events from the new watches (including the promotion
     /// catch-up for tier roots created later) are attributable, then the
     /// project-tier roots are watched. Re-registering replaces the watches.
-    pub fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self
             .raw_tx
             .send(SkillsMsg::Add(workspace_id.clone(), workspace_path.clone()));
@@ -113,7 +113,7 @@ impl SkillsWatcher {
 
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watches and drop any pending flush so it stops emitting.
-    pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn remove_workspace(&self, workspace_id: &WorkspaceId) {
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.remove(workspace_id);
         }
@@ -128,7 +128,7 @@ impl SkillsWatcher {
     /// calls `format_skills_catalog_for_prompt`) before publishing the delta,
     /// so the cache can absorb an archive-window edit before the resume flush
     /// runs and silently swallow the catch-up event.
-    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn pause_workspace(&self, workspace_id: &WorkspaceId) {
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.remove(workspace_id);
         }
@@ -153,7 +153,7 @@ impl SkillsWatcher {
     /// schedule one catch-up flush compared against the fingerprint retained
     /// by [`Self::pause_workspace`], so an unchanged tree emits nothing and an
     /// edit made while suspended emits exactly once.
-    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self.raw_tx.send(SkillsMsg::Resume(
             workspace_id.clone(),
             workspace_path.clone(),
@@ -327,7 +327,7 @@ async fn debounce_loop(
                     return;
                 }
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
             }
         }
@@ -528,7 +528,7 @@ mod tests {
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("dyn-ws");
         let ws_id = WorkspaceId::from("ws-skills-dyn");
@@ -587,7 +587,7 @@ mod tests {
     async fn resume_catch_up_survives_a_discovery_cache_refresh_while_suspended() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("pause-ws");
         let ws_id = WorkspaceId::from("ws-skills-pause");

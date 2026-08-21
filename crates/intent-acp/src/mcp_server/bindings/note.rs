@@ -6,6 +6,7 @@
 //! `note.create`, `note.list`) — re-shapes the value to match the reference
 //! `ws-note-api.ts` return objects agents already consume.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use intent_core::{
@@ -16,7 +17,7 @@ use serde_json::{json, Value};
 
 use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.note = {
         read: (id) => host({ method: 'note.read', args: { id } }),
@@ -35,7 +36,7 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'note.updateMetadata', args: { id, ...(options || {}) } }),
         delete: (id) => host({ method: 'note.delete', args: { id } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -82,21 +83,22 @@ async fn read(
             if idx > 0 {
                 rendered.push('\n');
             }
-            rendered.push_str(&format!("{:>4} | {line}", idx + 1));
+            let _ = write!(rendered, "{:>4} | {line}", idx + 1);
         }
     }
     if let Some(task) = note.metadata.task.as_ref() {
         rendered.push_str("\n\n--- Task Metadata ---\n");
-        rendered.push_str(&format!(
+        let _ = write!(
+            rendered,
             "Status: {}",
             serde_json::to_string(&task.status)
                 .unwrap_or_default()
                 .trim_matches('"')
-        ));
+        );
         if !task.acceptance_criteria.is_empty() {
             rendered.push_str("\nAcceptance Criteria:\n");
             for c in &task.acceptance_criteria {
-                rendered.push_str(&format!("  - {c}\n"));
+                let _ = writeln!(rendered, "  - {c}");
             }
             rendered.pop();
         }
@@ -106,13 +108,13 @@ async fn read(
                 .iter()
                 .map(|a| a.as_str().to_string())
                 .collect();
-            rendered.push_str(&format!("\nAssigned Agents: {}", ids.join(", ")));
+            let _ = write!(rendered, "\nAssigned Agents: {}", ids.join(", "));
         }
         if let Some(e) = &task.estimated_effort {
-            rendered.push_str(&format!("\nEstimated Effort: {e}"));
+            let _ = write!(rendered, "\nEstimated Effort: {e}");
         }
         if let Some(r) = &task.blocked_reason {
-            rendered.push_str(&format!("\nBlocked Reason: {r}"));
+            let _ = write!(rendered, "\nBlocked Reason: {r}");
         }
     }
     let mut out = json!({

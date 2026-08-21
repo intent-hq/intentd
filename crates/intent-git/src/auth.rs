@@ -42,7 +42,7 @@ pub const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
 /// `"$INTENT_GIT_GITHUB_TOKEN"` expansion (no token bytes in the string
 /// itself). `|| exit 0` keeps the helper silent-but-successful for the
 /// `store`/`erase` ops git may also invoke.
-pub fn token_helper_config() -> String {
+pub(crate) fn token_helper_config() -> String {
     format!(
         "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username={TOKEN_USERNAME}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
     )
@@ -88,7 +88,7 @@ pub fn scoped_credential_env(
 /// `sh -c` with the operation appended, so `intentd_path` is sh-quoted to
 /// survive spaces and quotes in the install path. No token bytes anywhere:
 /// the helper fetches the credential from the daemon over UDS on demand.
-pub fn daemon_helper_config(intentd_path: &str) -> String {
+pub(crate) fn daemon_helper_config(intentd_path: &str) -> String {
     format!(
         "credential.https://github.com.helper=!{} git-credential",
         sh_quote(intentd_path)
@@ -178,7 +178,7 @@ pub fn is_https_github_url(url: &str) -> bool {
 /// same "no usable token" rule. The token value is never logged.
 pub fn usable_token(token: Option<&str>) -> Option<&str> {
     let token = token?.trim();
-    if token.is_empty() || token.chars().any(|c| c.is_control()) {
+    if token.is_empty() || token.chars().any(char::is_control) {
         return None;
     }
     Some(token)

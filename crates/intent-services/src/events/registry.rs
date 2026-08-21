@@ -318,7 +318,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
     ev.data
         .get("changes")
         .and_then(|c| c.get("archived"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
 }
 
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
@@ -351,7 +351,7 @@ async fn lifecycle_loop(
                     Some(batch) => batch,
                     None => return,
                 },
-                _ = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     let now = Instant::now();
                     let expired: Vec<WorkspaceId> = pending
                         .iter()
@@ -822,7 +822,7 @@ mod tests {
     async fn boot_time_workspace_is_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("boot");
         let ws = test_workspace("ws-boot", &root.path);
@@ -842,7 +842,7 @@ mod tests {
     async fn workspace_created_after_start_gains_watching_and_deletion_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
@@ -892,7 +892,7 @@ mod tests {
     async fn created_workspace_defers_watching_until_setup_completes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
@@ -940,7 +940,7 @@ mod tests {
     async fn no_script_completion_starts_watching_promptly() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
@@ -972,7 +972,7 @@ mod tests {
     async fn backstop_starts_watchers_when_setup_completion_never_arrives() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
@@ -1001,7 +1001,7 @@ mod tests {
     async fn delete_while_pending_discards_the_deferred_start() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
@@ -1039,7 +1039,7 @@ mod tests {
     async fn workspace_opened_resolves_path_via_services() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("opened");
         let ws = test_workspace("ws-opened", &root.path);
@@ -1081,7 +1081,7 @@ mod tests {
     async fn workspaces_sharing_a_consolidated_root_receive_only_their_own_file_events() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         // Sibling roots under one parent: the hub groups them onto a single
         // shared stream.
@@ -1134,7 +1134,7 @@ mod tests {
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _sub) = bus_and_sub().await;
         let parent = TempDir::new("count");
         let workspaces: Vec<_> = (0..8)
@@ -1168,7 +1168,7 @@ mod tests {
     async fn archiving_one_workspace_leaves_its_shared_stream_co_tenant_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let parent = TempDir::new("shared-archive");
         let root_a = parent.path.join("ws-a");
@@ -1224,7 +1224,7 @@ mod tests {
     async fn archived_workspace_stops_watching_and_unarchive_resumes_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("archived");
         let ws = test_workspace("ws-archived", &root.path);
@@ -1343,7 +1343,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1499,7 +1499,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1583,7 +1583,7 @@ mod tests {
     async fn unrelated_workspace_update_leaves_watching_intact() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("updated");
         let ws = test_workspace("ws-updated", &root.path);
@@ -1619,7 +1619,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1680,7 +1680,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],

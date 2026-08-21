@@ -27,7 +27,7 @@ const VALID_TASK_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.task = {
         updateStatus: (noteId, taskText, status) =>
@@ -52,7 +52,7 @@ pub(crate) const PRELUDE: &str = r#"
         assignAgent: (noteId, agentId, force) =>
             host({ method: 'task.assignAgent', args: { noteId, agentId, force } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -63,7 +63,7 @@ pub(crate) async fn dispatch(
 ) -> Result<Value, String> {
     match method {
         "updateStatus" => update_status(api, ws, args).await,
-        "updateNoteStatus" => update_note_status(api, ws, args).await,
+        "updateNoteStatus" => update_note_status(api, ws, caller_agent_id, args).await,
         "update" => update(api, ws, args).await,
         "getMyTask" => get_my_task(api, ws, args).await,
         "markAsTask" => mark_as_task(api, ws, caller_agent_id, args).await,
@@ -98,6 +98,7 @@ async fn update_status(
 async fn update_note_status(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let note_id = req_str(args, "noteId").map_err(|_| "Note ID is required".to_string())?;
@@ -114,7 +115,7 @@ async fn update_note_status(
             NoteId::from_string(&note_id),
             status,
             None,
-            None,
+            caller_agent_id.cloned(),
         )
         .await
         .map_err(map_err)?;

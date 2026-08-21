@@ -39,7 +39,7 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// does not scale with the workspace count. The project tier per workspace no
 /// longer owns a stream at all: it rides the shared workspace-root stream via
 /// [`watch_tiers`].
-pub struct SpecialistsWatcher {
+pub(crate) struct SpecialistsWatcher {
     hub: Arc<SharedWatchHub>,
     _user_watchers: Vec<RootWatch>,
     workspace_watchers: Mutex<HashMap<WorkspaceId, TierWatch>>,
@@ -104,7 +104,7 @@ impl SpecialistsWatcher {
     /// path first (and primes the fingerprint so pre-existing specialists do
     /// not emit a spurious event), then the project tier is watched.
     /// Re-registering replaces the watch.
-    pub fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self.raw_tx.send(SpecialistsMsg::Add(
             workspace_id.clone(),
             workspace_path.clone(),
@@ -129,7 +129,7 @@ impl SpecialistsWatcher {
 
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watch and drop any pending flush so it stops emitting.
-    pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn remove_workspace(&self, workspace_id: &WorkspaceId) {
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.remove(workspace_id);
         }
@@ -141,7 +141,7 @@ impl SpecialistsWatcher {
     /// Suspend a workspace (archive): tear down its project-tier watch but
     /// KEEP the fingerprint, so the [`Self::resume_workspace`] catch-up can
     /// tell whether the set changed while the workspace was unwatched.
-    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn pause_workspace(&self, workspace_id: &WorkspaceId) {
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.remove(workspace_id);
         }
@@ -157,7 +157,7 @@ impl SpecialistsWatcher {
     /// happened in this process: a workspace archived before daemon start is
     /// never seeded (boot lists unarchived workspaces only), so its resume has
     /// no baseline and emits one benign event.
-    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
         let _ = self.raw_tx.send(SpecialistsMsg::Resume(
             workspace_id.clone(),
             workspace_path.clone(),
@@ -323,7 +323,7 @@ async fn debounce_loop(
                     return;
                 }
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 flush_due(&bus, &workspace_paths, &user_dir, &mut fingerprints, &mut pending).await;
             }
         }
@@ -515,7 +515,7 @@ mod tests {
     async fn tier_directory_deletion_emits_event() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("rmdir-user");
         let ws = TempDir::new("rmdir-ws");
@@ -554,7 +554,7 @@ mod tests {
     async fn missing_root_promotes_on_creation_and_detects_changes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("late-user");
         let ws = TempDir::new("late-ws");
@@ -605,7 +605,7 @@ mod tests {
     async fn project_tier_burst_debounces_to_one_event() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("debounce-user");
         let ws = TempDir::new("debounce-ws");
@@ -649,7 +649,7 @@ mod tests {
     async fn user_tier_change_fans_out_to_all_workspaces() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("fanout-user");
         let ws1 = TempDir::new("fanout-ws1");
@@ -690,7 +690,7 @@ mod tests {
     async fn unchanged_set_emits_nothing() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("noop-user");
         let ws = TempDir::new("noop-ws");
@@ -744,7 +744,7 @@ mod tests {
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("dyn-user");
         let ws = TempDir::new("dyn-ws");
@@ -816,7 +816,7 @@ mod tests {
     async fn pause_retains_fingerprint_so_resume_only_emits_on_real_change() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("pause-user");
         let ws = TempDir::new("pause-ws");

@@ -13,6 +13,7 @@
 //! test helpers. The delegation preamble is already byte-pinned by
 //! `agent_ops::tests::delegate_appends_task_note_preamble_to_first_message`.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,7 +31,10 @@ use crate::Services;
 fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Minimal workspace row for store-backed goldens.
@@ -368,7 +372,6 @@ fn golden_group_wake_header() {
         expected_agent_ids: vec![child_a.clone(), child_b.clone()],
         completed_agent_ids: vec![child_a.clone(), child_b.clone()],
         deleted_agent_ids: vec![],
-        subscription_id: None,
         sealed: true,
         delivered: false,
         event_summaries: vec![

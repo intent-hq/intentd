@@ -50,7 +50,7 @@ fn data_opt(ev: &Event, key: &str) -> Option<Value> {
 
 /// Project a `file:changed` event into a [`FileActivity`] with the combined
 /// `"type:name"` actor (workspace summary `recentFiles`).
-pub fn file_activity_combined(ev: &Event) -> FileActivity {
+pub(crate) fn file_activity_combined(ev: &Event) -> FileActivity {
     FileActivity {
         path: data_str(ev, "path"),
         relative_path: data_str(ev, "relativePath"),
@@ -63,7 +63,7 @@ pub fn file_activity_combined(ev: &Event) -> FileActivity {
 }
 
 /// Project a `file:changed` event with the bare actor name (`getAgentFiles`).
-pub fn file_activity_named(ev: &Event) -> FileActivity {
+pub(crate) fn file_activity_named(ev: &Event) -> FileActivity {
     FileActivity {
         path: data_str(ev, "path"),
         relative_path: data_str(ev, "relativePath"),
@@ -79,7 +79,7 @@ pub fn file_activity_named(ev: &Event) -> FileActivity {
 /// order (`getAgentActivity`). Events lacking an `actor.id` are skipped;
 /// `lastActive` ends at the last-iterated event's timestamp and `filesModified`
 /// is de-duplicated in insertion order — both faithful to the TS.
-pub fn aggregate_agent_activity(events: &[Event]) -> Vec<AgentActivity> {
+pub(crate) fn aggregate_agent_activity(events: &[Event]) -> Vec<AgentActivity> {
     let mut order: Vec<String> = Vec::new();
     let mut map: HashMap<String, AgentActivity> = HashMap::new();
     for ev in events {
@@ -99,7 +99,7 @@ pub fn aggregate_agent_activity(events: &[Event]) -> Vec<AgentActivity> {
             }
         });
         entry.event_count += 1;
-        entry.last_active = ev.timestamp.clone();
+        entry.last_active.clone_from(&ev.timestamp);
         if ev.event_type == AGENT_TOOL_CALL {
             entry.tool_calls += 1;
             if let Some(files) = ev.data.get("filesModified").and_then(Value::as_array) {
@@ -126,7 +126,10 @@ pub fn aggregate_agent_activity(events: &[Event]) -> Vec<AgentActivity> {
 /// (`getWorkspaceSummary`): the first five `file:changed` rows, per-agent
 /// activity (agent-typed subset), the events-per-minute rate, and the top five
 /// most-changed files (count desc, ties by first appearance).
-pub fn build_workspace_summary(all_events: &[Event], minutes_ago: i64) -> WorkspaceEventSummary {
+pub(crate) fn build_workspace_summary(
+    all_events: &[Event],
+    minutes_ago: i64,
+) -> WorkspaceEventSummary {
     let file_events: Vec<&Event> = all_events
         .iter()
         .filter(|e| e.event_type == FILE_CHANGED)

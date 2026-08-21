@@ -198,7 +198,7 @@ async fn dropped_request_future_cleans_pending_map_entry() {
     // Drive the future far enough to write the request and insert the entry.
     tokio::select! {
         _ = &mut fut => panic!("request must still be pending"),
-        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
     assert_eq!(conn.pending_len(), 1, "in-flight request is correlated");
     drop(fut);
@@ -1616,14 +1616,14 @@ mod mcp_tests {
                         workspace_id,
                         title: input.title,
                         content: input.content.unwrap_or_default(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 0,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6144,13 +6144,13 @@ mod wsapi3_bindings_tests {
             workspace_id: ws.clone(),
             title: format!("title-{id}"),
             content: "line one\nline two\n![alt](workspace-asset://ws/asset-1)".to_string(),
-            content_type: Default::default(),
+            content_type: intent_core::ContentType::default(),
             tags: vec!["a".to_string()],
             is_pinned: false,
             is_archived: false,
             is_default: false,
             parent_id: None,
-            visibility: Default::default(),
+            visibility: intent_core::NoteVisibility::default(),
             metadata: NoteMetadata { task },
             created_at: "2026-01-01T00:00:00Z".to_string(),
             rev: 1,
@@ -6209,14 +6209,14 @@ mod wsapi3_bindings_tests {
                         workspace_id: ws.clone(),
                         title: "First".to_string(),
                         content: String::new(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: vec!["red".to_string()],
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6226,14 +6226,14 @@ mod wsapi3_bindings_tests {
                         workspace_id: ws,
                         title: "Second".to_string(),
                         content: String::new(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: vec!["blue".to_string()],
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6262,14 +6262,14 @@ mod wsapi3_bindings_tests {
                         workspace_id,
                         title: input.title,
                         content: input.content.unwrap_or_default(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6769,10 +6769,10 @@ mod wsapi3_bindings_tests {
                         kind: CommentType::Comment,
                         content: "root".to_string(),
                         author: "Agent".to_string(),
-                        author_type: Default::default(),
-                        status: Default::default(),
+                        author_type: intent_core::AuthorType::default(),
+                        status: intent_core::CommentStatus::default(),
                         parent_id: None,
-                        anchor: Default::default(),
+                        anchor: Option::default(),
                         anchor_text: None,
                         anchor_context: None,
                         suggestion_diff: None,
@@ -6819,10 +6819,10 @@ mod wsapi3_bindings_tests {
                         kind: CommentType::Comment,
                         content: comment,
                         author: "Agent".to_string(),
-                        author_type: Default::default(),
-                        status: Default::default(),
+                        author_type: intent_core::AuthorType::default(),
+                        status: intent_core::CommentStatus::default(),
                         parent_id: None,
-                        anchor: Default::default(),
+                        anchor: Option::default(),
                         anchor_text: None,
                         anchor_context: None,
                         suggestion_diff: None,
@@ -7494,14 +7494,14 @@ mod wsapi3_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            r#"
+            r"
             const [a, b, c] = await Promise.all([
                 ws.note.list(),
                 ws.note.listTasks('n-1'),
                 ws.task.getMyTask('task-1'),
             ]);
             return { listLen: a.length, taskRows: b.length, taskTitle: c.title };
-            "#,
+            ",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7541,6 +7541,11 @@ mod wsapi6_bindings_tests {
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
+        /// When set, `browser_exec` shapes this raw FE envelope through the
+        /// real `intent_services::browser_ops::shape_agent_result` — the same
+        /// seam the production `Services::browser_exec` uses — so the JS
+        /// dispatch tests exercise real shaping instead of canned replies.
+        browser_exec_fe_envelope: Mutex<Option<Value>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -7644,10 +7649,18 @@ mod wsapi6_bindings_tests {
                 tab_id,
                 agent_id.map(|a| a.as_str().to_string()),
             ));
+            let fe_envelope = self.browser_exec_fe_envelope.lock().unwrap().clone();
             // Reference parity: a single-action batch yields the sole action's
             // envelope; multi-action yields `{ results: [...] }`. The fake
             // stands in for what the reverse channel would have returned.
             Box::pin(async move {
+                if let Some(envelope) = fe_envelope {
+                    return intent_services::browser_ops::shape_agent_result(
+                        envelope,
+                        actions.len(),
+                    )
+                    .map_err(|e| intent_core::Error::Internal(e.message));
+                }
                 if actions.len() == 1 {
                     Ok(json!({
                         "action": "listTabs",
@@ -7879,7 +7892,7 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server_with_caller("agent-77");
         let resp = call(
             &srv,
-            r#"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');"#,
+            r"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7903,10 +7916,10 @@ mod wsapi6_bindings_tests {
         let (srv, _api) = server();
         let resp = call(
             &srv,
-            r#"return await ws.browser.exec([
+            r"return await ws.browser.exec([
                 { action: 'listTabs' },
                 { action: 'screenshot' }
-            ]);"#,
+            ]);",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7914,6 +7927,130 @@ mod wsapi6_bindings_tests {
         // Multi-action batch → { results: [...] } passthrough from the fake
         // reverse channel; matches transport `shape_result` behaviour.
         assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    }
+
+    // Regression (monorepo#3042): structured per-action ownership errors
+    // (not-owner / already-claimed) must reach the JS caller as data —
+    // `errorCode` / `ownerAgentId` readable from the returned object — not
+    // flattened into a thrown prose error.
+    #[tokio::test]
+    async fn browser_exec_single_action_ownership_failure_is_structured_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": null,
+                "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r"
+            const r = await ws.browser.exec([{ action: 'resizeTab', tabId: 'tab-9', width: 375 }]);
+            return { code: r.errorCode, owner: r.ownerAgentId, ok: r.success };
+            ",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!(Value::Null));
+        assert_eq!(v["ok"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_multi_action_partial_failure_is_structured_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "1 of 2 actions failed",
+            "results": [
+                { "action": "listTabs", "success": true, "result": [] },
+                {
+                    "action": "claimTab",
+                    "success": false,
+                    "errorCode": "already-claimed",
+                    "ownerAgentId": "agent-42",
+                    "error": "Tab tab-3 is owned by agent agent-42"
+                }
+            ],
+        }));
+        let resp = call(
+            &srv,
+            r"
+            const r = await ws.browser.exec([
+                { action: 'listTabs' },
+                { action: 'claimTab', tabId: 'tab-3', width: 1280 }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, code: failed.errorCode, owner: failed.ownerAgentId };
+            ",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["code"], json!("already-claimed"));
+        assert_eq!(v["owner"], json!("agent-42"));
+    }
+
+    // The FE aborts a batch on the first failing action, so the reply's
+    // partial `results` can be shorter than the request. A multi-action JS
+    // caller must still receive the `{ success, results, error }` envelope
+    // (never a bare action envelope), so `r.results.find(...)` always works.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r"
+            const r = await ws.browser.exec([
+                { action: 'resizeTab', tabId: 'tab-9', width: 375 },
+                { action: 'screenshot' },
+                { action: 'listTabs' }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, count: r.results.length, code: failed.errorCode, owner: failed.ownerAgentId };
+            ",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["count"], json!(1));
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!("agent-7"));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_failure_without_results_still_throws_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "CDP not attached",
+        }));
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'listTabs' }]);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("CDP not attached"));
     }
 
     #[tokio::test]
@@ -8605,7 +8742,9 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
-        assert!(v.get("subscriptionId").map(|v| v.is_null()).unwrap_or(true));
+        assert!(v
+            .get("subscriptionId")
+            .is_none_or(serde_json::Value::is_null));
         assert!(api.watch_sender_calls.lock().unwrap().is_empty());
     }
 
@@ -9124,7 +9263,8 @@ mod wsapi4_bindings_tests {
 /// `workspaceApi.maxOutputChars` knobs read live per invocation. Covers TOON
 /// on/off, under/over-limit, the oversized-output redirect into the
 /// workspace folder's `tool-outputs/` directory (a SIBLING of the repo
-/// checkout), unlimited (`0`), and the unresolvable-workspace-dir fallback.
+/// checkout), unlimited (`0`), and the unresolvable-workspace-dir inline
+/// truncation fallback.
 #[cfg(test)]
 mod workspace_api_output_limit_tests {
     use std::path::PathBuf;
@@ -9380,14 +9520,28 @@ mod workspace_api_output_limit_tests {
     }
 
     #[tokio::test]
-    async fn unresolvable_workspace_dir_falls_back_to_untruncated_output() {
+    async fn unresolvable_workspace_dir_truncates_output_inline() {
         // No on-disk checkout path: the redirect cannot be written, so the
-        // full body comes back untruncated and the call still succeeds.
+        // body comes back TRUNCATED inline — never the full payload
+        // (monorepo#3038) — and the call still succeeds.
         let srv = server(None, false, 50);
         let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
         let text = tool_text(&resp);
-        assert!(!text.contains("Output too large:"));
-        let v: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(v["data"].as_str().unwrap().len(), 200);
+
+        // The notice carries total size, limit, and the redirect-failure
+        // reason.
+        let full = serde_json::to_string_pretty(&json!({ "data": "x".repeat(200) })).unwrap();
+        let total = full.chars().count();
+        assert!(text.contains(&format!("Output too large: {total} characters (limit: 50)")));
+        assert!(text.contains("could NOT be written to a file"));
+        assert!(text.contains("workspace has no on-disk checkout path"));
+
+        // The head is the first `max_chars` characters of the output, and
+        // the message never carries more of the output than that.
+        let head: String = full.chars().take(50).collect();
+        assert!(text.contains(&head));
+        let head_plus_one: String = full.chars().take(51).collect();
+        assert!(!text.contains(&head_plus_one));
+        assert!(text.chars().count() < 500, "message must stay bounded");
     }
 }

@@ -22,29 +22,33 @@ pub fn parse_compound_model_id(compound: &str) -> (String, String) {
 }
 
 /// Create a compound model id from provider + model. Port of `createCompoundModelId`.
-pub fn create_compound_model_id(provider_id: &str, model_id: &str) -> String {
+#[cfg(test)]
+pub(crate) fn create_compound_model_id(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}:{model_id}")
 }
 
 /// Whether a model (bare or compound) targets `target_provider_id`. Port of
 /// `isModelValidForProvider`.
-pub fn is_model_valid_for_provider(model: &str, target_provider_id: &str) -> bool {
+#[cfg(test)]
+pub(crate) fn is_model_valid_for_provider(model: &str, target_provider_id: &str) -> bool {
     parse_compound_model_id(model).0 == target_provider_id
 }
 
 /// Normalize a model id for fuzzy comparison: lowercase, strip a leading
 /// `claude-` brand prefix, and drop all non-alphanumeric characters.
+#[cfg(test)]
 fn normalize_for_fuzzy_match(id: &str) -> String {
     let lower = id.to_lowercase();
     let stripped = lower.strip_prefix("claude-").unwrap_or(&lower);
     stripped
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .collect()
 }
 
 /// Apply the shared fuzzy-match rules (exact CI, normalized exact, normalized
 /// longest-prefix) of `candidate` against `pool`, returning the matched entry.
+#[cfg(test)]
 fn fuzzy_pick<'a>(candidate: &str, pool: &[&'a str]) -> Option<&'a str> {
     let normalized = normalize_for_fuzzy_match(candidate);
     if normalized.is_empty() {
@@ -69,11 +73,12 @@ fn fuzzy_pick<'a>(candidate: &str, pool: &[&'a str]) -> Option<&'a str> {
 /// Fuzzy-match a candidate against an explicit pool of model ids (typically the
 /// provider's live CLI list). Returns the matched bare pool entry. Port of
 /// `fuzzyMatchModelInPool`.
-pub fn fuzzy_match_model_in_pool(candidate: &str, pool: &[&str]) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn fuzzy_match_model_in_pool(candidate: &str, pool: &[&str]) -> Option<String> {
     if candidate.is_empty() || pool.is_empty() {
         return None;
     }
-    fuzzy_pick(candidate, pool).map(|m| m.to_string())
+    fuzzy_pick(candidate, pool).map(std::string::ToString::to_string)
 }
 
 /// Parse a Codex model id into its base model and optional reasoning effort.
@@ -81,7 +86,7 @@ pub fn fuzzy_match_model_in_pool(candidate: &str, pool: &[&str]) -> Option<Strin
 /// A `{base}/{effort}` id (e.g. `gpt-5.3-codex/high`) splits on the first `/`;
 /// a bare id has no effort. Port of `parseCodexReasoningEffort`
 /// (`open-ai-codex-models.ts`).
-pub fn parse_codex_reasoning_effort(model_id: &str) -> (String, Option<String>) {
+pub(crate) fn parse_codex_reasoning_effort(model_id: &str) -> (String, Option<String>) {
     match model_id.split_once('/') {
         Some((base, effort)) => (base.to_string(), Some(effort.to_string())),
         None => (model_id.to_string(), None),
@@ -90,14 +95,15 @@ pub fn parse_codex_reasoning_effort(model_id: &str) -> (String, Option<String>) 
 
 /// Walk `preference_list` in order and return the first id present in
 /// `available_values`. Port of `resolvePreferredModel`.
-pub fn resolve_preferred_model(
+#[cfg(test)]
+pub(crate) fn resolve_preferred_model(
     preference_list: &[&str],
     available_values: &[&str],
 ) -> Option<String> {
     preference_list
         .iter()
         .find(|p| available_values.contains(p))
-        .map(|p| p.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// One model advertised by the Grok CLI. Port of `GrokAcpModel`.
@@ -114,7 +120,7 @@ pub struct GrokModel {
 /// Models + current-model extracted from a Grok ACP `initialize`/`session/new`
 /// result or a JSON `grok models` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct GrokParsedModels {
+pub(crate) struct GrokParsedModels {
     /// Deduplicated model list, in advertised order.
     pub models: Vec<GrokModel>,
     /// The currently-selected model id, when advertised.
@@ -238,8 +244,7 @@ fn grok_models_from_value(value: &Value) -> Vec<GrokModel> {
         ]
         .iter()
         .find_map(|v| v.and_then(Value::as_array))
-        .map(|v| v.as_slice())
-        .unwrap_or(&[])
+        .map_or(&[], std::vec::Vec::as_slice)
     };
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -257,7 +262,7 @@ fn grok_models_from_value(value: &Value) -> Vec<GrokModel> {
 
 /// Parse the model list + current model out of a Grok ACP `initialize` (or
 /// `session/new`) result. Port of `parseGrokInitializeModels`.
-pub fn parse_grok_initialize_models(result: &Value) -> GrokParsedModels {
+pub(crate) fn parse_grok_initialize_models(result: &Value) -> GrokParsedModels {
     // Explicit JSON nulls fall through like the TS nullish-coalescing chain
     // (`res?.modelState ?? res?.models ?? res`).
     let model_state = result
@@ -269,7 +274,7 @@ pub fn parse_grok_initialize_models(result: &Value) -> GrokParsedModels {
         .get("currentModelId")
         .and_then(Value::as_str)
         .or_else(|| result.get("currentModelId").and_then(Value::as_str))
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     GrokParsedModels {
         models: grok_models_from_value(model_state),
         current_model_id,
@@ -279,7 +284,8 @@ pub fn parse_grok_initialize_models(result: &Value) -> GrokParsedModels {
 /// Find the JSON-RPC response with id `response_id` in raw `grok agent stdio`
 /// stdout (tolerating non-JSON preamble lines like update banners) and parse
 /// its models. Port of `parseGrokInitializeResponseFromStdout`.
-pub fn parse_grok_initialize_response_from_stdout(
+#[cfg(test)]
+pub(crate) fn parse_grok_initialize_response_from_stdout(
     stdout: &str,
     response_id: i64,
 ) -> Option<GrokParsedModels> {

@@ -23,7 +23,7 @@ use time::{Duration, OffsetDateTime};
 
 /// One validated `stats.getUsage` period (`period` + `key` wire params).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsagePeriod {
+pub(crate) enum UsagePeriod {
     /// One local-time calendar month (`period: "month"`, `key: "YYYY-MM"`).
     Month { year: i32, month: u8 },
     /// One local-time calendar year (`period: "year"`, `key: "YYYY"`).
@@ -35,7 +35,7 @@ pub enum UsagePeriod {
 /// Parse the wire `period` / `key` pair into a [`UsagePeriod`]. `key` is
 /// required for `"month"` / `"year"` and ignored for `"24h"`; anything
 /// malformed is `InvalidParams` (router surfaces `-32602`).
-pub fn parse_period(period: &str, key: Option<&str>) -> Result<UsagePeriod> {
+pub(crate) fn parse_period(period: &str, key: Option<&str>) -> Result<UsagePeriod> {
     match period {
         "24h" => Ok(UsagePeriod::Last24h),
         "month" => {
@@ -170,7 +170,7 @@ fn floor_to_hour(t: OffsetDateTime) -> OffsetDateTime {
 /// (24 entries), `byMonth` (12 entries, the period's local year; zeroed for
 /// 24h), and `availablePeriods` computed over ALL rows regardless of the
 /// requested period. Empty periods return zeroed shapes, never an error.
-pub fn aggregate_usage(
+pub(crate) fn aggregate_usage(
     rows: &[UsageStatsRow],
     period: UsagePeriod,
     tz_offset_minutes: i64,
