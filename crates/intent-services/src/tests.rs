@@ -10338,6 +10338,9 @@ mod pr {
         /// PR number whose `get_pr` pends forever (hung-connection
         /// regression, intent-hq/monorepo#1988 lineage).
         hang_get_pr: Option<u64>,
+        /// PR numbers `get_pr` was called with, in call order (sweep
+        /// stale-pool heal tests assert cap + ordering).
+        seen_get_pr: std::sync::Mutex<Vec<u64>>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -10498,6 +10501,7 @@ mod pr {
             })
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            self.seen_get_pr.lock().unwrap().push(number);
             if self.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
                 std::future::pending::<()>().await;
@@ -10506,6 +10510,8 @@ mod pr {
                 return Err(ScError::NotFound("no such PR".into()));
             }
             let mut pr = sample_pr();
+            pr.number = number;
+            pr.url = format!("https://github.com/o/r/pull/{number}");
             if self.merged_linked {
                 pr.state = PrState::Merged;
             }
@@ -13027,6 +13033,213 @@ mod pr {
         let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
         assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
         assert!(list.iter().any(|p| p.number == 77));
+    }
+
+    /// Build a persisted `pull_requests` entry shaped exactly like
+    /// `build_pr_info(StubForge::get_pr(number))` (so an identical re-fetch
+    /// is a no-op), with the status/updatedAt under test.
+    fn pool_entry(
+        number: u64,
+        status: intent_core::PullRequestStatus,
+        updated_at: &str,
+    ) -> intent_core::PullRequestInfo {
+        let mut pr = sample_pr();
+        pr.number = number;
+        pr.url = format!("https://github.com/o/r/pull/{number}");
+        let mut info = crate::pr_ops::build_pr_info(&pr);
+        info.status = status;
+        info.updated_at = updated_at.into();
+        info
+    }
+
+    /// The sweep-time pool heal (monorepo#3127): a persisted entry still
+    /// recorded Open whose PR the forge reports merged is corrected to
+    /// Merged by the next sweep, emitting `gitRoot:updated`.
+    #[tokio::test]
+    async fn sweep_pool_heal_corrects_stale_open_entry_to_merged() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Open,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // No monitor, no link: only the sweep's pool heal can see the merge.
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 43);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// Reopen handling: Merged is the only irreversible state, so a
+    /// persisted Closed entry is re-fetched too — the forge now reporting
+    /// the PR open moves the entry back to Open (`gitRoot:updated`).
+    #[tokio::test]
+    async fn pool_heal_reopens_persisted_closed_entry() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// The heal re-fetches at most `MAX_STALE_POOL_REFETCHES` entries per
+    /// sweep, oldest `updatedAt` first, and never re-fetches Merged entries.
+    #[tokio::test]
+    async fn pool_heal_caps_refetches_oldest_updated_first() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        // Entry number n carries updatedAt day 8-n, so recency order is the
+        // reverse of number order: the oldest five are 7, 6, 5, 4, 3.
+        let mut entries: Vec<intent_core::PullRequestInfo> = (1..=7)
+            .map(|n| {
+                pool_entry(
+                    n,
+                    intent_core::PullRequestStatus::Closed,
+                    &format!("2026-01-{:02}T00:00:00Z", 8 - n),
+                )
+            })
+            .collect();
+        entries.push(pool_entry(
+            99,
+            intent_core::PullRequestStatus::Merged,
+            "2020-01-01T00:00:00Z",
+        ));
+        root.pull_requests = Some(entries);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc = Arc::new(StubForge::default());
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = svc.refresh_git_root_pr(root, &sc_dyn).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        assert_eq!(
+            *sc.seen_get_pr.lock().unwrap(),
+            vec![7, 6, 5, 4, 3],
+            "cap of 5, oldest first, Merged #99 never re-fetched"
+        );
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        for n in [3u64, 4, 5, 6, 7] {
+            let entry = list.iter().find(|p| p.number == n).unwrap();
+            assert_eq!(entry.status, intent_core::PullRequestStatus::Open);
+        }
+        for n in [1u64, 2] {
+            let entry = list.iter().find(|p| p.number == n).unwrap();
+            assert_eq!(entry.status, intent_core::PullRequestStatus::Closed);
+        }
+        let merged = list.iter().find(|p| p.number == 99).unwrap();
+        assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
+    }
+
+    /// A forge error on one entry is fail-soft: the entry keeps its
+    /// persisted snapshot, the rest of the heal proceeds, and the root
+    /// refresh still succeeds.
+    #[tokio::test]
+    async fn pool_heal_tolerates_per_entry_fetch_error() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![
+            pool_entry(
+                43,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-01T00:00:00Z",
+            ),
+            pool_entry(
+                44,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-02T00:00:00Z",
+            ),
+        ]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            missing_pr: Some(43),
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        let failed = list.iter().find(|p| p.number == 43).unwrap();
+        assert_eq!(failed.status, intent_core::PullRequestStatus::Closed);
+        let healed = list.iter().find(|p| p.number == 44).unwrap();
+        assert_eq!(healed.status, intent_core::PullRequestStatus::Open);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// Re-fetched entries whose snapshots are unchanged persist nothing and
+    /// emit no `gitRoot:updated`.
+    #[tokio::test]
+    async fn pool_heal_unchanged_entries_emit_no_event() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        // Identical to what the stub's `get_pr(43)` snapshot builds.
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Open,
+            "",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unchanged);
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 0);
     }
 }
 
