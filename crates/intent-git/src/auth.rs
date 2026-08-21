@@ -193,7 +193,7 @@ fn github_helpers_from_config_list(list: &str) -> Vec<String> {
             continue;
         };
         match github_helper_key_scope(key) {
-            GithubHelperScope::Unrelated => continue,
+            GithubHelperScope::Unrelated => {}
             GithubHelperScope::EveryGithubRequest => {
                 if value.is_empty() {
                     // A reset on a key covering *every* github.com request
@@ -803,7 +803,7 @@ mod tests {
         let expected_value = expected.strip_prefix(GITHUB_HELPER_RESET).unwrap();
         assert_eq!(
             &values[..2],
-            &["".to_string(), expected_value.to_string()],
+            &[String::new(), expected_value.to_string()],
             "reset then the token helper, ahead of any fallbacks: {values:?}"
         );
     }
@@ -890,7 +890,7 @@ mod tests {
             let expected_value = expected.strip_prefix(GITHUB_HELPER_RESET).unwrap();
             assert_eq!(
                 &values[..2],
-                &["".to_string(), expected_value.to_string()],
+                &[String::new(), expected_value.to_string()],
                 "reset then the daemon helper, ahead of any fallbacks; path {path:?}"
             );
         }
