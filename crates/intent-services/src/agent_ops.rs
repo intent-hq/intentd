@@ -1546,7 +1546,7 @@ pub(crate) fn has_question_blocks(content: &Value) -> bool {
 }
 
 /// `messageMetadata.type` marker the FE's question wizard stamps on the
-/// flattened `<<Q:/A>>:` answer message (PROTOCOL §5.5, question hold). The daemon
+/// flattened `Q:`/`A:` answer message (PROTOCOL §5.5, question hold). The daemon
 /// keys the pending-questions marker clear on this structured tag plus
 /// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
 pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";

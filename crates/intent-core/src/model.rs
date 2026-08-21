@@ -243,7 +243,7 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
     /// Whether `CoW` isolation is supported on this machine. Computed as:
-    /// `cow_probe(workspacesRoot`, workspacesRoot) Supported — a machine
+    /// `cow_probe(workspacesRoot, workspacesRoot)` Supported — a machine
     /// capability of the workspaces root's filesystem, independent of the
     /// workspace or checkout mode. Used by the FE to gate the Copy-on-Write
     /// opt-in toggle.
