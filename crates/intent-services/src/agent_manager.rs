@@ -3943,10 +3943,15 @@ impl AgentManager {
         // draining stdin, writer task blocked, outbound channel full) the
         // unbounded `notify` await hung this method forever — Stop never
         // reached the terminal emits below and the FE spun on "Thinking"
-        // until the idle sweep silently reaped the agent. A child that
-        // cannot even accept the cancel frame is not resumable, so the
-        // keep-alive contract is void: tear it down and proceed to the
-        // terminal events.
+        // until the idle sweep silently reaped the agent. A child process
+        // that cannot even accept the cancel frame cannot be kept alive, so
+        // the in-place keep-alive contract is void: tear the CHILD down
+        // (`kill_child_only` preserves the persisted `acpSessionId`, so the
+        // AGENT stays resumable via respawn + `session/load`) and proceed to
+        // the terminal events. After that teardown the STAB-124 drain and
+        // `mark_idle` below no-op (handle removed, registry deregistered) —
+        // fine, a killed child leaves no stragglers to drain and nothing for
+        // the idle sweep to hold.
         match tokio::time::timeout(
             SESSION_CANCEL_WRITE_TIMEOUT,
             intent_acp::session::cancel(&conn, &acp_session_id),

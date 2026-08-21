@@ -5142,6 +5142,20 @@ async fn wedged_connection() -> (
     })
     .await
     .expect("writer channel saturates");
+    // Confirm the saturation with a longer window: under heavy scheduling
+    // starvation the 100ms probe above could break early on a send that
+    // merely wasn't polled in time (residual capacity), and the tests would
+    // then fail on a confusing downstream assert. A fresh notify still
+    // pending after 500ms fails loudly HERE instead.
+    let confirm_conn = Arc::clone(&conn);
+    let confirm_payload = payload.clone();
+    let confirm = tokio::spawn(async move {
+        let _ = confirm_conn.notify("wedge/confirm", confirm_payload).await;
+    });
+    assert!(
+        timeout(Duration::from_millis(500), confirm).await.is_err(),
+        "saturation loop broke early: the confirming notify still found channel capacity"
+    );
     (conn, agent_r, agent_w)
 }
 
