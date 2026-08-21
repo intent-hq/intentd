@@ -13,9 +13,11 @@
 # The base of the aggregated range is persisted in the body as an invisible
 # `<!-- notes-base: X.Y.Z -->` marker. When the range is empty (idempotent
 # re-promotion where previous == promoted, or a promoted version older than
-# the previous stable), the marker from the current channel-stable body is
-# used to rebuild the full aggregate instead of collapsing it to a single
-# section; with no usable marker (legacy body) the body is left untouched.
+# the previous stable) — or when the previous version is unknown but the
+# current body carries a marker (re-promotion with an unreadable
+# stable.json) — the marker is used to rebuild the full aggregate instead of
+# collapsing it to a single section; with no usable marker (legacy body) an
+# empty range leaves the body untouched.
 #
 # This script is best-effort by design: callers (promote-stable.yml) run it
 # fail-soft so a notes failure never blocks a promotion. Requires: gh
@@ -57,23 +59,50 @@ collect_range() {
   done < <(sort -Vru <<<"$all_versions")
 }
 
-versions=()
-notes_base=""
-if [[ -z "$PREV" ]]; then
-  # First promotion (or unreadable previous stable.json): no range to span,
-  # just the promoted version's body.
-  versions=("$PROMOTED")
-else
-  # Enumerate published (non-draft) releases with plain vX.Y.Z tags. The
-  # prerelease flag is deliberately not a filter: every tagged release is
-  # published as a Pre-release (beta) and only loses the flag once promoted,
-  # so filtering on it would shrink the range to already-promoted versions.
-  all_versions=$(gh release list --repo "$REPO" --limit 1000 \
+# list_versions: enumerate published (non-draft) releases with plain vX.Y.Z
+# tags. The prerelease flag is deliberately not a filter: every tagged
+# release is published as a Pre-release (beta) and only loses the flag once
+# promoted, so filtering on it would shrink the range to already-promoted
+# versions.
+list_versions() {
+  gh release list --repo "$REPO" --limit 1000 \
     --json tagName,isDraft \
     --jq '.[] | select(.isDraft | not) | .tagName
           | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-          | ltrimstr("v")')
+          | ltrimstr("v")'
+}
 
+# marker_base: print the notes-base marker version from the current
+# channel-stable body (empty when absent). Tolerates a trailing CR in case
+# the body was ever hand-edited into CRLF line endings.
+marker_base() {
+  gh release view channel-stable --repo "$REPO" --json body --jq '.body // ""' \
+    | sed -n 's/^<!-- notes-base: \([0-9.]*\) -->\r\{0,1\}$/\1/p' | head -n1
+}
+
+versions=()
+notes_base=""
+if [[ -z "$PREV" ]]; then
+  # Previous stable unknown. Only a true first promotion (no marker in the
+  # current body) may write just the promoted version's section: a
+  # re-promotion with an unreadable stable.json would otherwise clobber the
+  # existing aggregate, so with a marker present, rebuild from it — and if
+  # that range is empty too, leave the body untouched.
+  base=$(marker_base || true)
+  if [[ "$base" =~ $semver_re ]]; then
+    echo "previous stable unknown; rebuilding from notes-base marker $base" >&2
+    all_versions=$(list_versions)
+    mapfile -t versions < <(collect_range "$base")
+    notes_base="$base"
+    if [[ ${#versions[@]} -eq 0 ]]; then
+      echo "no versions to aggregate; leaving channel-stable notes untouched" >&2
+      exit 0
+    fi
+  else
+    versions=("$PROMOTED")
+  fi
+else
+  all_versions=$(list_versions)
   mapfile -t versions < <(collect_range "$PREV")
   notes_base="$PREV"
 
@@ -82,8 +111,7 @@ else
   # marker persisted in the current channel-stable body instead of
   # collapsing it to a single section.
   if [[ ${#versions[@]} -eq 0 ]]; then
-    current_body=$(gh release view channel-stable --repo "$REPO" --json body --jq '.body // ""')
-    base=$(sed -n 's/^<!-- notes-base: \([0-9.]*\) -->$/\1/p' <<<"$current_body" | head -n1)
+    base=$(marker_base || true)
     if [[ "$base" =~ $semver_re ]]; then
       echo "no versions in ($PREV, $PROMOTED]; rebuilding from notes-base marker $base" >&2
       mapfile -t versions < <(collect_range "$base")

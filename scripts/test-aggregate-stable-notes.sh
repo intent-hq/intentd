@@ -106,4 +106,20 @@ assert_contains "$tmp/out/s6.md" "## v0.7.30" s6
 assert_not_contains "$tmp/out/s6.md" "## v0.7.31" s6
 assert_contains "$tmp/out/s6.md" "<!-- notes-base: 0.7.29 -->" s6
 
+echo "scenario 7: unknown previous stable + marker rebuilds instead of clobbering"
+export STUB_EDIT_OUT="$tmp/out/s7.md"
+"$script" 0.7.31 >/dev/null 2>&1
+cmp -s "$tmp/out/s2.md" "$tmp/out/s7.md" || fail "s7: rebuilt body differs from the original aggregate"
+
+echo "scenario 8: unknown previous stable + marker with empty range leaves the body untouched"
+export STUB_EDIT_OUT="$tmp/out/s8.md"
+"$script" 0.7.29 >/dev/null 2>&1
+[[ ! -e "$tmp/out/s8.md" ]] || fail "s8: expected no release edit"
+
+echo "scenario 9: CRLF body still matches the marker on re-promotion"
+sed 's/$/\r/' "$tmp/current-body.md" >"$tmp/crlf-body.md"
+export STUB_CURRENT_BODY="$tmp/crlf-body.md" STUB_EDIT_OUT="$tmp/out/s9.md"
+"$script" 0.7.31 0.7.31 >/dev/null 2>&1
+cmp -s "$tmp/out/s2.md" "$tmp/out/s9.md" || fail "s9: rebuilt body differs from the original aggregate"
+
 echo "OK: all scenarios passed"
