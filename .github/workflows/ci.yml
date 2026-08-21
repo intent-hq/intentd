@@ -131,15 +131,23 @@ jobs:
       # slots share one /raid CI-scratch volume, and the per-slot persistent
       # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
       # can fill it — a full volume kills jobs mid-run with ENOSPC. If free
-      # space is below the job's threshold, self-prune stale per-slot
-      # ci-target dirs first (mtime older than 2 days, oldest first, never
-      # this job's own dir, never anything outside /raid/ci-target — shared
-      # caches like ~/.cargo and ~/.rustup are untouched), then fail with an
-      # actionable message if space is still short. Thresholds: 10 GiB here
-      # (small target dir with debuginfo off), 30 GiB for the instrumented
-      # coverage jobs. Exact no-op on burst runners (step skipped).
-      # tinybox-prune.yml does the routine scheduled pruning; this is only
-      # the emergency backstop.
+      # space is below the job's threshold, self-prune in two tiers: first
+      # stale per-slot ci-target dirs (mtime older than 2 days, oldest
+      # first), then — a heavy CI day fills /raid with dirs too fresh for
+      # any age window (the 2026-08-20/08-21 exhaustions: 0 GiB free, every
+      # dir <2 days old, so the stale pass freed nothing and could only
+      # fail) — LRU-evict idle dirs regardless of age until this job's need
+      # is met, the same policy as tinybox-prune.yml's LRU pass and the
+      # emergency purge that recovered both incidents (intentd run
+      # 32447747968). Rails in both tiers: never anything outside
+      # /raid/ci-target (shared caches like ~/.cargo and ~/.rustup are
+      # untouched), never a dir this job may use, and recursive-mtime
+      # freshness/activity checks so a live job's dir is never deleted.
+      # Fails with an actionable message if space is still short.
+      # Thresholds: 10 GiB here (small target dir with debuginfo off),
+      # 30 GiB for the instrumented coverage jobs. Exact no-op on burst
+      # runners (step skipped). tinybox-prune.yml does the routine
+      # scheduled pruning; this is only the emergency backstop.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -165,9 +173,32 @@ jobs:
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          # Escalation tier: under heavy churn everything on the volume can
+          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
+          # stale pass nothing to prune — LRU-evict idle ci-target dirs
+          # (oldest dir mtime first) until this job's need is met.
+          # Concurrent preflights on other slots are safe: target dirs are
+          # warm caches (eviction costs a rebuild, not correctness), a live
+          # job's dir is protected by the recursive 15-minute activity
+          # check (a running job touches its target dir continuously), the
+          # own-slot skip covers every dir this slot may use, and `|| true`
+          # on rm tolerates another slot's preflight racing us to the same
+          # candidate.
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
+              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
+              echo "evicting: $dir"
+              rm -rf -- "$dir" || true
+              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
@@ -473,9 +504,32 @@ jobs:
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          # Escalation tier: under heavy churn everything on the volume can
+          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
+          # stale pass nothing to prune — LRU-evict idle ci-target dirs
+          # (oldest dir mtime first) until this job's need is met.
+          # Concurrent preflights on other slots are safe: target dirs are
+          # warm caches (eviction costs a rebuild, not correctness), a live
+          # job's dir is protected by the recursive 15-minute activity
+          # check (a running job touches its target dir continuously), the
+          # own-slot skip covers every dir this slot may use, and `|| true`
+          # on rm tolerates another slot's preflight racing us to the same
+          # candidate.
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
+              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
+              echo "evicting: $dir"
+              rm -rf -- "$dir" || true
+              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
@@ -630,9 +684,32 @@ jobs:
             rm -rf -- "$dir"
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          # Escalation tier: under heavy churn everything on the volume can
+          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
+          # stale pass nothing to prune — LRU-evict idle ci-target dirs
+          # (oldest dir mtime first) until this job's need is met.
+          # Concurrent preflights on other slots are safe: target dirs are
+          # warm caches (eviction costs a rebuild, not correctness), a live
+          # job's dir is protected by the recursive 15-minute activity
+          # check (a running job touches its target dir continuously), the
+          # own-slot skip covers every dir this slot may use, and `|| true`
+          # on rm tolerates another slot's preflight racing us to the same
+          # candidate.
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            while IFS= read -r entry; do
+              dir="${entry#* }"
+              case "$dir" in "/raid/ci-target/"?*) ;; *) continue ;; esac
+              case "$dir" in */"$RUNNER_NAME"/*) echo "skipping (own slot): $dir"; continue ;; esac
+              [ -n "$(find "$dir" -mmin -15 -print -quit 2>/dev/null || true)" ] && { echo "skipping (active <15min): $dir"; continue; }
+              echo "evicting: $dir"
+              rm -rf -- "$dir" || true
+              [ "$(free_gib)" -ge "$NEED_GIB" ] && break
+            done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+          fi
           free="$(free_gib)"
           if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale CI dirs — manual cleanup needed, see intent-hq/monorepo#1253."
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.

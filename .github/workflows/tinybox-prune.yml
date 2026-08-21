@@ -37,14 +37,27 @@
 # so warm slots are evicted last. Target dirs are warm caches only, so an
 # LRU eviction costs a rebuild, not correctness. Every deletion (or
 # dry-run candidate) is echoed. ci.yml's fail-fast preflight is the
-# emergency backstop between these daily runs. The run log doubles as a
-# disk report (df + per-entry size/age table). No sudo anywhere.
+# emergency backstop between these scheduled runs — since the
+# 2026-08-20/08-21 exhaustions (monorepo#1253: /raid hit 0 GiB free with
+# every dir too fresh for the preflight's stale-only pass, which could
+# then only fail the job) it carries the same LRU eviction as an
+# escalation tier, targeting just the job's own need, so jobs self-heal
+# a wedged disk instead of failing. The run log doubles as a disk report
+# (df + per-entry size/age table). No sudo anywhere.
 name: Tinybox prune
 
 on:
   schedule:
-    # Daily at 11:30 UTC ≈ 03:30/04:30 Pacific — a quiet hour for the box.
+    # Twice daily: 11:30 UTC ≈ 03:30/04:30 Pacific is a quiet hour for the
+    # box; 23:30 UTC is not, but the prune is safe during activity
+    # (concurrency-guarded, own-slot skip, recursive freshness/activity
+    # checks), and one run per day cannot hold the comfort target — the
+    # 2026-08-20/08-21 exhaustions (monorepo#1253) re-consumed the full
+    # 100 GiB within ~17 h of a prune (~395 CI runs), so the second run
+    # halves the window in which per-job preflights must LRU-evict on
+    # their own.
     - cron: "30 11 * * *"
+    - cron: "30 23 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
