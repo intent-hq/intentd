@@ -9,7 +9,7 @@
 //! or even `$HOME`).
 //!
 //! Watch registration itself never runs on the caller's thread: the OS-level
-//! `notify` call can block indefinitely (macOS FSEvents,
+//! `notify` call can block indefinitely (macOS `FSEvents`,
 //! intent-hq/monorepo#1572), which stalled daemon startup before the UDS
 //! socket was bound. Every registration is therefore performed on a detached
 //! OS thread — not the blocking pool, which the runtime waits for on shutdown
@@ -89,7 +89,7 @@ impl RootWatch {
 /// `*.md`).
 ///
 /// Registration is always deferred to a spawned task, so a `notify` backend
-/// that blocks on registration (macOS FSEvents, intent-hq/monorepo#1572)
+/// that blocks on registration (macOS `FSEvents`, intent-hq/monorepo#1572)
 /// cannot stall the caller. A registration failure is logged, not returned.
 pub(super) fn watch_root(
     root: PathBuf,
@@ -539,7 +539,7 @@ mod tests {
     }
 
     /// Regression (intent-hq/monorepo#1572): OS watch registration can park
-    /// indefinitely (macOS FSEvents), so `watch_root` must return without
+    /// indefinitely (macOS `FSEvents`), so `watch_root` must return without
     /// performing it — the watch is established from a spawned task instead.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]

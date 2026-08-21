@@ -1,5 +1,5 @@
 //! Legacy workspace import — migrate per-directory Intent workspaces
-//! (`<root>/<id>/.workspace/workspace.json`) into intentd's SQLite store.
+//! (`<root>/<id>/.workspace/workspace.json`) into intentd's `SQLite` store.
 //!
 //! Legacy roots scanned by default: `~/intent/workspaces`, `~/intent`,
 //! `~/.workspaces`. Only directories carrying `.workspace/workspace.json` are

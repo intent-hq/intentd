@@ -5,8 +5,8 @@
 //! `data.progressId`, and the daemon normalizes progress across the whole
 //! provisioning pipeline to a single 0–100 scale — the network/cache phases
 //! map into 0–85 and the local provisioning tail (checkout / worktree /
-//! CoW copy / finalizing) fills 85–100. Provisioning paths that historically
-//! streamed nothing (linked worktree, CoW checkout, direct/isNewRepo) emit
+//! `CoW` copy / finalizing) fills 85–100. Provisioning paths that historically
+//! streamed nothing (linked worktree, `CoW` checkout, direct/isNewRepo) emit
 //! coarse milestone frames through the same reporter.
 //!
 //! [`CreateProgress`] owns the invariants: the reported percent never

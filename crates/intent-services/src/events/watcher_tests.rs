@@ -1,4 +1,4 @@
-//! Integration test for [`FileWatcher`] over a real temp directory + SQLite
+//! Integration test for [`FileWatcher`] over a real temp directory + `SQLite`
 //! store: writing/removing a file under the watched root publishes debounced
 //! `file:*` events (create → `file:created`, delete → `file:deleted`, modify →
 //! `file:changed`) whose payload matches the TS `FileChangedEvent` shape.

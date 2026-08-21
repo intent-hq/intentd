@@ -592,7 +592,7 @@ impl Services {
     /// `worktree_path` cleared, `checkout_mode` → direct, `branch` → the
     /// bundled branch, `base_commit_sha` backfill, sandbox path rewrites,
     /// dropping sandbox rows whose branch is absent from the bundle) are
-    /// written back onto the JSON rows, so the apply()'d versions are what
+    /// written back onto the JSON rows, so the `apply()`'d versions are what
     /// land in the store. An error fails the commit: materialization is
     /// all-or-nothing on disk, no rows have been inserted, and the staging
     /// session survives for retry or abort. Returns the materialization
@@ -1196,7 +1196,7 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **workspace**: `worktree_path`, `repository_path`, and `path` are
 ///   rewritten under `<target_root>/<workspaceId>/`; PR linkage columns are
 ///   kept (monitors re-poll).
-/// - **agent_session**: `acp_session_id` / `backend_session_id` nulled (no
+/// - **`agent_session`**: `acp_session_id` / `backend_session_id` nulled (no
 ///   stale resume, ACP sessions are process-local), `is_active` forced 0;
 ///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
 ///   a stop reason, and each such agent gains an `interrupted_agent` row
@@ -1204,7 +1204,7 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
-/// - **interrupted_agent**: exported pending rows are kept; synthesized rows
+/// - **`interrupted_agent`**: exported pending rows are kept; synthesized rows
 ///   for newly-interrupted agents are added unless the agent already has one.
 fn transform_rows(
     rows: Vec<(String, Vec<serde_json::Value>)>,
@@ -2082,10 +2082,10 @@ mod tests {
     /// diverges from the branch HEAD actually pointed at when the bundle was
     /// built (`feature`) — the bundle wins. Commit must materialize the
     /// checkout and sandbox on disk, rewrite the stored workspace row
-    /// (repository_path → checkout, worktree_path cleared, checkout_mode
-    /// direct, branch → the bundled branch, base_commit_sha backfilled),
+    /// (`repository_path` → checkout, `worktree_path` cleared, `checkout_mode`
+    /// direct, branch → the bundled branch, `base_commit_sha` backfilled),
     /// rewrite the stored sandbox path, and drop the bundle-less sandbox
-    /// row — WITHOUT registering the workspace-owned checkout in known_repo
+    /// row — WITHOUT registering the workspace-owned checkout in `known_repo`
     /// (intent-hq/monorepo#2227).
     #[tokio::test]
     async fn import_commit_materializes_git() {

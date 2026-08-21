@@ -10,12 +10,12 @@
 //!
 //! The mock advertises `loadSession`, records every session establishment
 //! (one `{ method, sessionId, pid }` JSON line per `session/new` /
-//! `session/load`) to MOCK_AGENT_SESSION_LOG, and fails prompts ONLY on
+//! `session/load`) to `MOCK_AGENT_SESSION_LOG`, and fails prompts ONLY on
 //! load-established sessions. Sequence proven on the wire:
-//! turn 1 `session/new` + prompt OK → idle child SIGKILLed out-of-band →
+//! turn 1 `session/new` + prompt OK → idle child `SIGKILLed` out-of-band →
 //! turn 2 respawn resumes via `session/load`, prompt rejected (poisoned) →
 //! `agent.retry` → fresh `session/new`, prompt OK. Session log must read
-//! exactly ["new", "load", "new"] — a second "load" is the #940 regression.
+//! exactly `["new", "load", "new"]` — a second "load" is the #940 regression.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 

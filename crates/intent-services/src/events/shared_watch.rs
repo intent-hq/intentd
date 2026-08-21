@@ -1,4 +1,4 @@
-//! Shared FSEvents streams + in-process demux.
+//! Shared `FSEvents` streams + in-process demux.
 //!
 //! Every watcher family used to own its own `notify` watcher, and each
 //! `RecommendedWatcher` is one OS-level stream (on macOS: one
@@ -443,7 +443,7 @@ fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::m
 /// is the whole contract that keeps demuxed workspaces isolated.
 ///
 /// The cheap `starts_with` pass runs first and is the only one needed in
-/// practice: the roots are canonicalized at subscribe time and FSEvents reports
+/// practice: the roots are canonicalized at subscribe time and `FSEvents` reports
 /// canonical paths. Resolution (a symlinked root, or a deleted path that cannot
 /// be canonicalized directly) is attempted only for the paths that no sink
 /// matched raw, so a busy stream costs no filesystem syscalls per event. Doing

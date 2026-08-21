@@ -1,4 +1,4 @@
-//! WSS e2e for the FirstTurnPrepend system-prompt fallback (§18.1).
+//! WSS e2e for the `FirstTurnPrepend` system-prompt fallback (§18.1).
 //!
 //! The `mock` provider is registered with
 //! `InjectionMechanism::FirstTurnPrepend` (like cortex): it has no native
@@ -12,7 +12,7 @@
 //!   `<specialist_role>` section) BEFORE the role reminder and user content.
 //! * Turn 2 (same session) does NOT repeat the block.
 //!
-//! SessionMeta note: the `_meta` mechanism (claude-code) is keyed off the
+//! `SessionMeta` note: the `_meta` mechanism (claude-code) is keyed off the
 //! provider ID in `build_session_meta`, and the mock provider cannot be
 //! spawned under that ID (spawn resolution and binary lookup are
 //! provider-ID-keyed). The `_meta` payload shapes are covered by the unit
@@ -290,7 +290,7 @@ fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
         .collect()
 }
 
-/// Pre-seed the daemon's SQLite store with a workspace (the daemon opens the
+/// Pre-seed the daemon's `SQLite` store with a workspace (the daemon opens the
 /// same data dir on launch).
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
@@ -350,7 +350,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
     ws.0
 }
 
-/// FirstTurnPrepend over the real WSS transport: a specialist agent on the
+/// `FirstTurnPrepend` over the real WSS transport: a specialist agent on the
 /// `mock` provider (registered `InjectionMechanism::FirstTurnPrepend`) must
 /// receive the assembled system prompt — `<system>`-wrapped, including the
 /// `<specialist_role>` section — prepended to the FIRST prompt of its fresh

@@ -20,10 +20,10 @@ use crate::token;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceProvider {
-    /// ElevenLabs Scribe (`scribe_v2`) — the default.
+    /// `ElevenLabs` Scribe (`scribe_v2`) — the default.
     #[default]
     ElevenLabs,
-    /// OpenAI (configurable model, `whisper-1` fallback).
+    /// `OpenAI` (configurable model, `whisper-1` fallback).
     OpenAi,
 }
 
@@ -50,7 +50,7 @@ impl VoiceProvider {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceSettings {
-    /// Selected provider (default ElevenLabs).
+    /// Selected provider (default `ElevenLabs`).
     #[serde(default)]
     pub provider: VoiceProvider,
     /// Inline API key (already resolved, e.g. read from the secrets store by
@@ -61,7 +61,7 @@ pub struct VoiceSettings {
     /// Override for the provider API endpoint (defaults to the public API).
     #[serde(default)]
     pub api_base_url: Option<String>,
-    /// OpenAI transcription model (`voice.openai.model`); `None` uses the
+    /// `OpenAI` transcription model (`voice.openai.model`); `None` uses the
     /// engine default. Ignored by other providers.
     #[serde(default)]
     pub openai_model: Option<String>,

@@ -217,7 +217,7 @@ fn to_verdict<T>(m: Match<T>) -> IgnoreVerdict {
 
 /// Locate the repository git dir for `root`, handling both a `.git` directory
 /// and a `.git` **file** (`gitdir: <path>`) as written by linked worktrees and
-/// CoW checkouts. Returns `None` for non-git roots.
+/// `CoW` checkouts. Returns `None` for non-git roots.
 fn resolve_git_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
     let meta = std::fs::metadata(&dot_git).ok()?;
@@ -725,7 +725,7 @@ pub(super) async fn flush_due(
     }
 }
 
-/// Handle burst scenario: collapse >BURST_THRESHOLD events into bounded
+/// Handle burst scenario: collapse >`BURST_THRESHOLD` events into bounded
 /// per-directory summary events with metadata indicating the burst.
 async fn flush_burst(
     bus: &EventBus,

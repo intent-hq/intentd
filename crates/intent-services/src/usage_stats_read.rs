@@ -109,7 +109,7 @@ fn local_parts(row: &UsageStatsRow, utc: OffsetDateTime, tz: time::UtcOffset) ->
 
 /// The separate token counters (D6) for one aggregation cell: the four
 /// always-present counters plus reasoning ("thought") tokens, which follow
-/// the §5.23 TokenUsageTotals convention — omitted from the wire when zero,
+/// the §5.23 `TokenUsageTotals` convention — omitted from the wire when zero,
 /// never `0`, never `null`.
 #[derive(Debug, Default, Clone, Copy)]
 struct TokenCell {

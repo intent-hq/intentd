@@ -6299,7 +6299,7 @@ mod merge_user_app_message_id {
         v.as_object().unwrap().clone()
     }
 
-    /// Unwrap the merge result, panicking with the RpcErr message on failure
+    /// Unwrap the merge result, panicking with the `RpcErr` message on failure
     /// (`RpcErr` intentionally has no `Debug` impl).
     fn merge_ok(p: &Map<String, Value>, md: Option<Value>) -> Option<Value> {
         match merge_user_app_message_id(p, md) {

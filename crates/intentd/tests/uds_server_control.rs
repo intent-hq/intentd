@@ -3,7 +3,7 @@
 //! Proves that failed listener starts do not persist `server.wsApi.enabled=true`
 //! (settings rollback guard from PR #135). This test does NOT prove the runtime WSS
 //! toggle works on a UDS-only boot; that requires a real composition-root daemon
-//! and is covered by e2e_wss_runtime_control.rs (see the placeholder test below).
+//! and is covered by `e2e_wss_runtime_control.rs` (see the placeholder test below).
 
 mod common;
 
@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Mock ServerControl that always fails start_ws_listener to test rollback.
+/// Mock `ServerControl` that always fails `start_ws_listener` to test rollback.
 struct FailingServerControl;
 
 impl ServerControl for FailingServerControl {
@@ -196,9 +196,9 @@ async fn settings_rollback_on_failed_listener_start() {
 /// contract: FE spawns a UDS-only 'serve', user toggles WS on via UI.
 ///
 /// Note: This test is a placeholder for e2e coverage that needs a real
-/// composition-root daemon. The FailingServerControl mock in this file doesn't
+/// composition-root daemon. The `FailingServerControl` mock in this file doesn't
 /// exercise the fixed path. Full regression coverage for the UDS-started runtime
-/// toggle should be added to e2e_wss_runtime_control.rs or a similar e2e suite
+/// toggle should be added to `e2e_wss_runtime_control.rs` or a similar e2e suite
 /// that spawns an actual intentd process without WSS enabled.
 #[tokio::test]
 #[ignore = "placeholder for e2e coverage in e2e_wss_runtime_control.rs"]

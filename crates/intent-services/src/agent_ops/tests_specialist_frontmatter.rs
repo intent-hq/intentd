@@ -380,8 +380,8 @@ async fn bundled_specialist_inherits_model_default() {
 }
 
 /// Malicious specialist id with path traversal is rejected.
-/// SECURITY: validate_id is called inside SpecialistsService::resolve() (which
-/// resolve_model uses), blocking all frontmatter lookups from path traversal.
+/// SECURITY: `validate_id` is called inside `SpecialistsService::resolve()` (which
+/// `resolve_model` uses), blocking all frontmatter lookups from path traversal.
 #[tokio::test]
 async fn malicious_specialist_id_rejected() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
@@ -396,8 +396,8 @@ async fn malicious_specialist_id_rejected() {
     assert_eq!(got.model, None);
 }
 
-/// SECURITY: workspace_path is derived from workspace record, not client params
-/// (regression test for review thread PRRT_kwDOS9Wxuc6SIhDc). A malicious client
+/// SECURITY: `workspace_path` is derived from workspace record, not client params
+/// (regression test for review thread `PRRT_kwDOS9Wxuc6SIhDc`). A malicious client
 /// cannot supply a spoofed workspacePath to read project-tier specialists from
 /// other workspaces.
 #[tokio::test]
@@ -458,9 +458,9 @@ async fn spoofed_workspace_path_ignored() {
     assert_eq!(got.model, None, "expected settings chain fallback");
 }
 
-/// SECURITY: resolve_agent_type validates id to prevent path traversal
-/// (regression test for review thread PRRT_kwDOS9Wxuc6SIlcV). The validation
-/// is now done inside resolve() so all frontmatter lookups are guarded.
+/// SECURITY: `resolve_agent_type` validates id to prevent path traversal
+/// (regression test for review thread `PRRT_kwDOS9Wxuc6SIlcV`). The validation
+/// is now done inside `resolve()` so all frontmatter lookups are guarded.
 #[tokio::test]
 async fn malicious_specialist_id_rejected_in_agent_type_resolution() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;

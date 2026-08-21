@@ -30,7 +30,7 @@ pub(crate) mod workspaces;
 /// `ws.app.agents`). The prelude is unconditional (chief-gating is enforced
 /// server-side in dispatch) with ONE exception: `ws.app.question` is omitted
 /// when `agentFeatures.structuredQuestions` is off, so a disabled bridge
-/// fails with a clear `ws.app.question is undefined` TypeError.
+/// fails with a clear `ws.app.question is undefined` `TypeError`.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     let mut fragments = vec![workspaces::PRELUDE, agents::PRELUDE, proposal::PRELUDE];
     if features.structured_questions {

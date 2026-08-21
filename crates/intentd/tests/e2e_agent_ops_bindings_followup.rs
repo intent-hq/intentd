@@ -1,7 +1,7 @@
-//! E2E coverage follow-up for agent_ops.rs reachable operations.
+//! E2E coverage follow-up for `agent_ops.rs` reachable operations.
 //!
-//! Exercises agent_send_message, agent_send_to_task, agent_wake_or_create,
-//! agent_cancel_subscriptions, agent_get_subscriptions, and agent_delegate via in-process
+//! Exercises `agent_send_message`, `agent_send_to_task`, `agent_wake_or_create`,
+//! `agent_cancel_subscriptions`, `agent_get_subscriptions`, and `agent_delegate` via in-process
 //! Services calls. Hermetic tests asserting BE state changes.
 
 #![cfg(unix)]

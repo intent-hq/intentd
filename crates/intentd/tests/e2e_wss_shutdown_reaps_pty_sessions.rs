@@ -232,7 +232,8 @@ async fn await_straggler_pid(pidfile: &Path) -> i32 {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "straggler pid never written to {pidfile:?}"
+            "straggler pid never written to {}",
+            pidfile.display()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

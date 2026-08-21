@@ -44,7 +44,7 @@ impl Drop for Daemon {
     }
 }
 
-/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// Short base under /tmp (UDS `SUN_LEN` cap); the returned guard removes the
 /// root on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps
 /// it). The `Daemon` drop still removes `data`/`scratch` first so the daemon
 /// is dead before its tree goes away.

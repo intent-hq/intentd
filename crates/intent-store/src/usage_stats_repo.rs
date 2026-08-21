@@ -24,8 +24,8 @@ use crate::Store;
 
 /// One additive contribution to a `(bucket_utc, model, provider)` bucket. All counters
 /// default to 0, so writers set only the fields their path owns (turn end:
-/// tokens + runs + longest_run_ms; session start: sessions_started;
-/// lines-changed: lines_added/lines_deleted). `longest_run_ms` is folded in
+/// tokens + runs + `longest_run_ms`; session start: `sessions_started`;
+/// lines-changed: `lines_added/lines_deleted`). `longest_run_ms` is folded in
 /// with MAX semantics, not summed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageStatsDelta {
@@ -445,11 +445,11 @@ mod tests {
     }
 
     /// The 0057 migration backfill stamps pre-D12 rows (NULL local columns)
-    /// from `bucket_utc` via SQLite's system-timezone conversion and leaves
+    /// from `bucket_utc` via `SQLite`'s system-timezone conversion and leaves
     /// already-stamped rows alone. Fresh DBs run the migration against an
     /// empty table, so re-execute the migration's UPDATE (the real embedded
     /// SQL, ALTERs skipped) against seeded pre-D12 rows and check it against
-    /// SQLite's own `'localtime'` conversion.
+    /// `SQLite`'s own `'localtime'` conversion.
     #[tokio::test]
     async fn migration_backfill_stamps_pre_d12_rows_from_system_timezone() {
         let tmp = TempDb::new();
@@ -531,7 +531,7 @@ mod tests {
         }
     }
 
-    /// The 0059 provider migration rebuilds the table (SQLite cannot alter a
+    /// The 0059 provider migration rebuilds the table (`SQLite` cannot alter a
     /// PK) and must preserve pre-existing rows with `provider = 'unknown'`.
     /// Fresh DBs run the migration against an empty table, so recreate the
     /// pre-0059 shape, seed rows, and re-execute the migration's embedded SQL.

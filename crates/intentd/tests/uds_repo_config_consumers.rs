@@ -1,4 +1,4 @@
-//! DoD tests for repo config consumer integrations (workspace.create fallbacks,
+//! `DoD` tests for repo config consumer integrations (workspace.create fallbacks,
 //! script bootstrap, agent instructions).
 
 use std::path::PathBuf;
@@ -149,7 +149,7 @@ fn create_test_repo_with_config(config: &str) -> TempRepo {
     TempRepo(repo_path)
 }
 
-/// DoD test (a): workspace.create with repo branchPrefix and no request prefix -> branch carries prefix.
+/// `DoD` test (a): workspace.create with repo branchPrefix and no request prefix -> branch carries prefix.
 #[tokio::test]
 async fn test_workspace_create_uses_repo_branch_prefix() {
     let db = TempDb::new();
@@ -211,7 +211,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let _ = server.await;
 }
 
-/// DoD test (b): workspace.create with repo setupScript and no request script -> readable
+/// `DoD` test (b): workspace.create with repo setupScript and no request script -> readable
 /// via getSetupScript; a request-supplied script is execute-only and never persisted.
 #[tokio::test]
 async fn test_workspace_create_setup_script_fallback() {
@@ -345,7 +345,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let _ = server.await;
 }
 
-/// DoD test (c): script.list on empty workspace with repo scripts[] -> seeded.
+/// `DoD` test (c): script.list on empty workspace with repo scripts[] -> seeded.
 #[tokio::test]
 async fn test_script_list_bootstrap_from_repo() {
     let db = TempDb::new();
@@ -435,7 +435,7 @@ async fn test_script_list_bootstrap_from_repo() {
     let _ = server.await;
 }
 
-/// DoD test (d): repo instructions reach the composed system prompt.
+/// `DoD` test (d): repo instructions reach the composed system prompt.
 /// This test verifies that when a workspace has a repo config with instructions,
 /// those instructions are included in the agent's system prompt.
 #[tokio::test]
@@ -493,7 +493,7 @@ async fn test_repo_instructions_in_system_prompt() {
 /// Regression test for PR #184 race condition: concurrent `script.list` calls
 /// on an empty workspace with repo config scripts must produce exactly one
 /// set of scripts (no duplicates). The fix uses a per-workspace async lock
-/// (WorkspaceScriptLocks) to serialize bootstrap operations.
+/// (`WorkspaceScriptLocks`) to serialize bootstrap operations.
 #[tokio::test]
 async fn concurrent_script_list_no_duplicates() {
     let tmp = TempDb::new();

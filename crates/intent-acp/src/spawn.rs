@@ -36,7 +36,7 @@ pub struct SpawnOptions<'a> {
     pub rules_file: Option<&'a str>,
     /// Path to an MCP config file (appended when the provider supports MCP).
     pub mcp_config_file: Option<&'a str>,
-    /// Pre-serialized MCP block (OpenCode `mcp` config shape) merged into
+    /// Pre-serialized MCP block (`OpenCode` `mcp` config shape) merged into
     /// `OPENCODE_CONFIG_CONTENT` for providers that take env config
     /// (opencode, unsloth). Ignored by every other provider.
     pub env_mcp_config: Option<&'a str>,
@@ -56,11 +56,11 @@ pub struct SpawnOptions<'a> {
     /// [`ProviderConfig::remove_tool_flag`] — providers that don't advertise a
     /// flag silently ignore the input rather than receive an unknown arg.
     pub tools_to_remove: Vec<&'static str>,
-    /// When provider_binary is None and the provider spawns via npx (either a
+    /// When `provider_binary` is None and the provider spawns via npx (either a
     /// `fallback_npx_package` or an npx-only provider's pinned
     /// `npx_only_package`), this is the resolved npx path.
     pub npx_fallback_binary: Option<&'a Path>,
-    /// The package spec to pass to npx when npx_fallback_binary is set (may
+    /// The package spec to pass to npx when `npx_fallback_binary` is set (may
     /// carry a pinned `@<version>` suffix).
     pub npx_fallback_package: Option<&'static str>,
 }

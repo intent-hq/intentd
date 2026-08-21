@@ -6,7 +6,7 @@
 //! also has to be exercised over the real `/ws` upgrade, byte-for-byte,
 //! against the JSON-RPC contract in the monorepo's `docs/protocol/`.
 //!
-//! Drives a real pinned-TLS WebSocket against a live `intentd serve
+//! Drives a real pinned-TLS WebSocket against a live `intentd serve`
 //! with the WSS listener enabled and asserts the exact envelope + payload shapes for:
 //! - `workspace.get({ workspaceId: "__chief__" })` → synthesized shape
 //!   (pinned title / timestamps, empty branch, no repo / worktree).
@@ -22,7 +22,7 @@
 //!   `workspace.delete` → `{ success: true }`; `workspace.dismissAttention`
 //!   → `{ workspace: … }`. Chief remains reachable via `workspace.get`.
 //! - `ws.app.agents.waitFor` (chief-gated cross-workspace waiting): the
-//!   immediate and after_all modes end-to-end through the real MCP bridge
+//!   immediate and `after_all` modes end-to-end through the real MCP bridge
 //!   (mock ACP provider → `workspace_api` tool → service registry → wake
 //!   delivery), plus the non-chief gating error — see the three
 //!   `*_waitfor_*` tests at the bottom of this file.
@@ -632,8 +632,8 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
 /// - agent.list returns agent metadata (queryable by ws.app.agents.list)
 /// - events.subscribe accepts app:* event types (subscription succeeds)
 /// The full ws.app.* MCP tool dispatch path (including actual event emission) is covered
-/// by e2e_mock_agent_workspace_api_bindings.rs and MCP binding unit tests. Proposal
-/// persistence is covered by e2e_mock_agent_ws_app::chief_agent_ws_app_proposal_resource_persisted.
+/// by `e2e_mock_agent_workspace_api_bindings.rs` and MCP binding unit tests. Proposal
+/// persistence is covered by `e2e_mock_agent_ws_app::chief_agent_ws_app_proposal_resource_persisted`.
 #[tokio::test]
 async fn ws_app_surface_events_and_gating_over_wss() {
     let data_dir = temp_data_dir();
@@ -1586,7 +1586,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     let _ = wss_rpc_envelope(&mut rpc, 35, "agent.stop", json!({ "agentId": chief_id })).await;
 }
 
-/// `ws.app.agents.waitFor` (after_all mode) end-to-end over the real WSS
+/// `ws.app.agents.waitFor` (`after_all` mode) end-to-end over the real WSS
 /// wire: the chief enrolls targets in TWO different user workspaces in ONE
 /// delegation group; the group seals when the chief's registering turn ends
 /// (parent idle) and fires a SINGLE aggregated wake once both settle.
@@ -1802,7 +1802,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
 }
 
 /// Scoped `agent.cancelSubscriptions` by `groupId` end-to-end over the real
-/// WSS wire: the chief registers an after_all delegation group on two
+/// WSS wire: the chief registers an `after_all` delegation group on two
 /// targets, an unknown `groupId` is rejected with `-32602` (registry
 /// untouched), and cancelling the real `groupId` removes the group AND both
 /// grouped watches in one call.

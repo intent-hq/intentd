@@ -73,7 +73,7 @@ pub enum ProviderRuntime {
     Node,
     /// Electron binary run with `ELECTRON_RUN_AS_NODE=1` (still V8).
     Electron,
-    /// Natively-compiled binary — not V8, no NODE_OPTIONS handling.
+    /// Natively-compiled binary — not V8, no `NODE_OPTIONS` handling.
     Native,
 }
 
@@ -116,7 +116,7 @@ pub struct ProviderConfig {
     /// Flag for model selection (e.g., `--model`). `None` when the provider
     /// passes model config through other mechanisms (env vars, custom args).
     pub model_flag: Option<&'static str>,
-    /// Default agent name for the ACP session (e.g., `build` for OpenCode).
+    /// Default agent name for the ACP session (e.g., `build` for `OpenCode`).
     pub default_agent: Option<&'static str>,
     /// Whether the provider implements the ACP `authenticate` method.
     pub supports_authenticate: bool,

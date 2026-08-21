@@ -20,7 +20,7 @@
 //!   high-churn state that stays SQLite-backed.
 //!
 //! Keys that older daemons **used to** persist here but that have since moved
-//! back to SQLite or been removed outright are listed in
+//! back to `SQLite` or been removed outright are listed in
 //! [`LEGACY_SETTINGS_PATHS`]. A file containing one of them still parses (the
 //! value is captured for a one-time boot import-or-discard-and-strip by the
 //! composition root); any other unknown key remains a hard parse error.
@@ -141,8 +141,8 @@ pub struct WorkspaceSettings {
     pub ssh_key_path: Option<String>,
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
-    /// `workspace.cowIsolation` — CoW workspace provisioning and per-agent
-    /// sandboxing (requires CoW filesystem support on the workspaces root;
+    /// `workspace.cowIsolation` — `CoW` workspace provisioning and per-agent
+    /// sandboxing (requires `CoW` filesystem support on the workspaces root;
     /// workspace creation fails when unsupported).
     pub cow_isolation: bool,
 }
@@ -394,7 +394,7 @@ pub struct VoiceSettings {
     /// code, e.g. `"en"`) applied when a `voice.transcribe` call carries no
     /// per-call `language`. Unset/empty → provider auto-detection.
     pub language: Option<String>,
-    /// `[voice.openai]` — OpenAI provider tuning.
+    /// `[voice.openai]` — `OpenAI` provider tuning.
     pub openai: VoiceOpenAiSettings,
     /// `[voice.workspaceVocabulary]` — auto-derived workspace vocabulary.
     pub workspace_vocabulary: VoiceWorkspaceVocabularySettings,
@@ -409,7 +409,7 @@ pub enum VoiceProvider {
     Openai,
 }
 
-/// `[voice.openai]` — OpenAI speech-to-text tuning (`voice.openai.*`,
+/// `[voice.openai]` — `OpenAI` speech-to-text tuning (`voice.openai.*`,
 /// non-secret; the API key is a secret in `secrets.json`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -842,7 +842,7 @@ where
 }
 
 /// Dotted wire paths that older daemons persisted in `config.toml` but that
-/// have since moved back to the SQLite `settings` table or been removed from
+/// have since moved back to the `SQLite` `settings` table or been removed from
 /// the product entirely. A file containing one of these still parses via
 /// [`SettingsFile::parse_str_with_legacy`] — the value is captured so the
 /// composition root can run a one-time import-into-SQLite (or discard, for
@@ -896,7 +896,7 @@ impl SettingsFile {
     /// Parse `text` like [`SettingsFile::parse_str`], but tolerate the known
     /// [`LEGACY_SETTINGS_PATHS`]: their values are removed from the document
     /// before the strict parse and returned in the legacy map (dotted wire
-    /// path → JSON value) so the caller can import them into SQLite and strip
+    /// path → JSON value) so the caller can import them into `SQLite` and strip
     /// the file. Every **other** unknown key is still a hard error.
     pub fn parse_str_with_legacy(text: &str) -> Result<(Self, LegacySettings)> {
         let raw: toml::Table = text.parse().map_err(|e: toml::de::Error| {

@@ -259,7 +259,7 @@ impl Services {
 ///
 /// Sandbox branches are resolved in the worktree repo, while the bundler
 /// (`transfer_git`) fetches each branch from its sandbox's own repo — so for
-/// CoW sandboxes whose branch exists only in the sandbox repo, the estimate
+/// `CoW` sandboxes whose branch exists only in the sandbox repo, the estimate
 /// may undercount those refs.
 fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
     let mut refs: Vec<String> = vec!["HEAD".to_string()];

@@ -1,4 +1,4 @@
-//! E2E coverage follow-up for note_ops.rs + comment operations (PR B).
+//! E2E coverage follow-up for `note_ops.rs` + comment operations (PR B).
 //!
 //! Hermetic Services-level tests exercising note.add, note.edit, note.editLines uncovered paths,
 //! plus comment.add (search-context anchoring), comment.respond, comment.list. All tests assert

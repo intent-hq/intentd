@@ -1,8 +1,8 @@
 //! E2E coverage for agent.queueMessage / agent.getQueue / agent.removeQueuedMessage /
 //! agent.readConversation / agent.summary / agent.diagnostics
-//! (intent-services agent_ops.rs coverage boost).
+//! (intent-services `agent_ops.rs` coverage boost).
 //!
-//! Tests call intent_services::Services directly (not via WSS transport) for hermetic
+//! Tests call `intent_services::Services` directly (not via WSS transport) for hermetic
 //! in-process coverage. Asserts on backend state changes.
 
 #![cfg(unix)]
@@ -20,7 +20,7 @@ use intent_services::{EventBus, Services};
 use intent_store::Store;
 use serde_json::json;
 
-/// Clean up SQLite database including -wal and -shm sidecars.
+/// Clean up `SQLite` database including -wal and -shm sidecars.
 fn cleanup_db(db: &PathBuf) {
     std::fs::remove_file(db).ok();
     std::fs::remove_file(db.with_extension("db-wal")).ok();

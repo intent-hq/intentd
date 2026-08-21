@@ -77,7 +77,7 @@ pub(crate) struct ParsedRequest {
 
 /// Map a voice engine/registry error onto a domain error (→ `-32603`): a
 /// missing key (`NotConfigured` — exclusively the registry's no-key case;
-/// provider failures such as OpenAI model-unavailable use distinct variants)
+/// provider failures such as `OpenAI` model-unavailable use distinct variants)
 /// surfaces as `VoiceNotConfigured` so the wire carries
 /// `error.data.code = "voice-no-api-key"` (monorepo#1448); any other
 /// provider failure surfaces as `Internal` with a descriptive message (§9).
@@ -191,7 +191,7 @@ pub(crate) fn parse_request(params: &serde_json::Value) -> Result<ParsedRequest>
 }
 
 /// Select the active provider: the per-call override wins, else the
-/// `voice.provider` setting value, else the default (ElevenLabs). An invalid
+/// `voice.provider` setting value, else the default (`ElevenLabs`). An invalid
 /// stored setting value falls back to the default rather than erroring.
 pub(crate) fn select_provider(
     setting_value: Option<&str>,
@@ -241,7 +241,7 @@ pub(crate) fn parse_vocabulary_setting(value: Option<&serde_json::Value>) -> Vec
 /// `voice.vocabulary` terms, the auto-derived workspace vocabulary (empty
 /// when the call carries no `workspaceId` — PROTOCOL §5.41, v4.6), and the
 /// request keyterms — in that fixed order, under the existing dedup/cap
-/// rules — and compose the OpenAI prompt (see [`intent_voice::context`]).
+/// rules — and compose the `OpenAI` prompt (see [`intent_voice::context`]).
 /// Both fields are always populated; each engine consumes the one it
 /// supports. `language` is the resolved value from [`resolve_language`]
 /// (per-call > `voice.language` setting > auto-detect).

@@ -236,7 +236,7 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   The unsloth endpoint (which adds the `provider.unsloth-studio` block)
 ///   rides [`build_provider_env_with_unsloth`]; this 4-arg form passes `None`.
 ///
-/// `mcp_config_json` must be a serialized JSON object in the OpenCode `mcp`
+/// `mcp_config_json` must be a serialized JSON object in the `OpenCode` `mcp`
 /// config shape (see `to_opencode_mcp_config` in `intent-acp`); it is spliced
 /// in verbatim. Providers that don't take env config ignore it.
 pub fn build_provider_env(

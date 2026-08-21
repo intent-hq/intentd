@@ -1,4 +1,4 @@
-//! Standalone CoW checkout provisioning for `workspace.create` (§5.1).
+//! Standalone `CoW` checkout provisioning for `workspace.create` (§5.1).
 //!
 //! [`provision_cow_checkout`] is the copy-on-write counterpart of
 //! [`crate::worktree::provision_worktree`]: instead of a linked worktree it
@@ -6,7 +6,7 @@
 //! then inside the clone creates + checks out the workspace branch from
 //! `base_ref` and hard-resets tracked files to that base. Untracked files are
 //! deliberately preserved — carrying `node_modules`/`target`-style artifacts
-//! into the checkout for free is the point of CoW.
+//! into the checkout for free is the point of `CoW`.
 //!
 //! [`provision_local_clone_checkout`] is the non-CoW standalone sibling: a
 //! plain local clone of an arbitrary source checkout, used when the filesystem
@@ -26,13 +26,13 @@ use crate::repo_cache::{provision_plain_clone_checkout, OriginTarget};
 /// provisioning summary log.
 const SLOWEST_SUBTREES_LOGGED: usize = 5;
 
-/// Phase timings and clone statistics for one CoW checkout provisioning, so a
+/// Phase timings and clone statistics for one `CoW` checkout provisioning, so a
 /// slow `workspace.create`/`workspace.duplicate` is attributable from logs.
 #[derive(Debug, Default)]
 pub(crate) struct CowProvisionTimings {
     /// Wall-clock duration of the whole provisioning call.
     pub total: Duration,
-    /// Duration of the CoW clone itself.
+    /// Duration of the `CoW` clone itself.
     pub cow_clone: Duration,
     /// The clone was a single whole-tree primitive call (macOS fast path).
     pub whole_tree_clone: bool,
@@ -63,7 +63,7 @@ impl CowProvisionTimings {
     }
 }
 
-/// Provision a standalone CoW checkout: clone `repo_path` to `checkout_path`
+/// Provision a standalone `CoW` checkout: clone `repo_path` to `checkout_path`
 /// with copy-on-write, then in the clone create `branch` from `base_ref`
 /// (resolution order matches `provision_worktree`:
 /// `refs/remotes/{remote}/{base_ref}` → `refs/heads/{base_ref}` → any
@@ -301,7 +301,7 @@ fn strip_worktree_registrations(checkout_path: &Path) -> Result<()> {
 /// repository, which both the hard reset and a plain superproject clean
 /// skip — the identified paths are removed explicitly instead of via a
 /// blanket `clean -ffdx`, which would also delete the legitimate untracked
-/// files the CoW copy intentionally preserves. A path the checked-out
+/// files the `CoW` copy intentionally preserves. A path the checked-out
 /// state still tracks as ordinary content (a submodule turned plain
 /// directory/file) is left alone: removing it would delete tracked files
 /// the reset just wrote. Iteration is in sorted order, so a removed parent
@@ -394,7 +394,7 @@ fn is_tracked_content(
         .is_some_and(|tree| tree.get_path(&inner_rel).is_ok())
 }
 
-/// The CoW clone is a byte-for-byte copy, so it inherits the source's
+/// The `CoW` clone is a byte-for-byte copy, so it inherits the source's
 /// `origin` remote verbatim — both the fetch URL and any
 /// `remote.origin.pushurl`. Resolve each via [`resolve_source_origin`] so the
 /// clone's `origin` is valid from its own directory: a relative local path is
@@ -517,7 +517,7 @@ pub(crate) fn checkout_in_clone(
 ///    (`+refs/remotes/origin/*:refs/remotes/origin/*`) so `base_ref`
 ///    resolution sees every upstream branch, not just the source's local ones.
 /// 3. Create + check out `branch` from `base_ref` via [`checkout_in_clone`]
-///    (same base-ref resolution and branch-reuse semantics as the CoW path)
+///    (same base-ref resolution and branch-reuse semantics as the `CoW` path)
 ///    and hard-reset to it.
 /// 4. Retarget `origin` at the source's own `origin` URL, resolved so it is
 ///    valid from the duplicate's directory ([`resolve_source_origin`]). When
@@ -613,7 +613,7 @@ mod tests {
     use crate::cow::{cow_probe, CowSupport};
     use crate::testutil::{commit_file, init_repo, write_file, TempDir};
 
-    /// Skip guard: CoW cloning depends on the filesystem under `TMPDIR` (CI
+    /// Skip guard: `CoW` cloning depends on the filesystem under `TMPDIR` (CI
     /// may run on non-CoW filesystems). Returns `true` when supported.
     fn cow_available(src: &std::path::Path) -> bool {
         let dst = std::env::temp_dir();
@@ -972,7 +972,7 @@ mod tests {
     }
 
     /// A **relative** local-path `origin` (`../upstream`) inherited by the
-    /// CoW clone resolves against the clone's own directory, where it names
+    /// `CoW` clone resolves against the clone's own directory, where it names
     /// something else entirely. It is absolutized against the SOURCE so it
     /// still names the same upstream (monorepo#1582).
     #[test]
@@ -1090,7 +1090,7 @@ mod tests {
         assert_self_contained(&checkout, source.path());
     }
 
-    /// A network-URL `origin` is location-independent, so the CoW clone
+    /// A network-URL `origin` is location-independent, so the `CoW` clone
     /// carries it over verbatim.
     #[test]
     fn cow_checkout_carries_network_origin_verbatim() {
@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     /// A **relative** `remote.origin.pushurl` (`../upstream`) inherited by
-    /// the CoW clone re-resolves against the clone's own directory, so it is
+    /// the `CoW` clone re-resolves against the clone's own directory, so it is
     /// absolutized against the SOURCE just like the fetch URL; the network
     /// fetch URL itself carries over verbatim.
     #[test]
@@ -1461,7 +1461,7 @@ mod tests {
             .to_string()
     }
 
-    /// CoW hydration of a cache-shaped source with a submodule: a `base_ref`
+    /// `CoW` hydration of a cache-shaped source with a submodule: a `base_ref`
     /// pinned at an older gitlink lands the submodule work tree on that older
     /// commit, resolved from the copied local module objects — no network
     /// (the submodule's only remote is deleted before provisioning). The
@@ -1514,7 +1514,7 @@ mod tests {
         );
     }
 
-    /// A submodule anomaly during CoW hydration (module git dirs gone AND the
+    /// A submodule anomaly during `CoW` hydration (module git dirs gone AND the
     /// real URL unreachable) degrades to a warning — provisioning succeeds
     /// and the superproject checkout is intact.
     #[test]
@@ -1686,9 +1686,9 @@ mod tests {
             .exists());
     }
 
-    /// After CoW hydration the checkout's `submodule.<name>.url` config
+    /// After `CoW` hydration the checkout's `submodule.<name>.url` config
     /// matches `.gitmodules` even when the source carried a divergent
-    /// configured URL — the closing `submodule sync` gives the CoW path the
+    /// configured URL — the closing `submodule sync` gives the `CoW` path the
     /// same URL parity as direct hydration.
     #[test]
     fn cow_checkout_syncs_divergent_submodule_url_to_gitmodules() {

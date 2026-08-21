@@ -4,7 +4,7 @@
 //! the `agent.retry` redrive — its RPC response and the drain-start
 //! `agent:queue:processing` signal — carries that same original `turnId`.
 //!
-//! This is the regression lock for turn_id preservation in
+//! This is the regression lock for `turn_id` preservation in
 //! `persist_error_and_requeue`: if the requeue stops threading the failed
 //! turn's original `turn_id` onto the fresh queue entry, the SAME-`turnId`
 //! assertions below fail.

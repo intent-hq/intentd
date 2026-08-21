@@ -42,7 +42,7 @@ use uuid::Uuid;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 /// The three unsolicited chunk texts the mock emits on wake — one
-/// `session/update` agent_message_chunk per trigger-file line.
+/// `session/update` `agent_message_chunk` per trigger-file line.
 const WAKE_LINES: [&str; 3] = [
     "[compaction] context window compacted. ",
     "Background task finished: ",

@@ -41,7 +41,7 @@ fn free_port() -> u16 {
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
-    /// If false, skip data_dir cleanup in Drop (for tests that reuse the same data_dir)
+    /// If false, skip `data_dir` cleanup in Drop (for tests that reuse the same `data_dir`)
     cleanup_data_dir: bool,
 }
 
