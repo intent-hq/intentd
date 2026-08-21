@@ -98,6 +98,17 @@ navigation are deterministic offscreen thanks to viewport emulation. Reveal a ta
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
 
+Tab operations do not require the workspace to be currently open/visible in the app:
+every action (`openTab` hidden or visible, `closeTab`, `showTab`, `evaluate`,
+`screenshot`, …) works regardless of workspace visibility — webviews spin up in the
+background as needed. Visibility/activation effects apply to the persisted layout
+state: `showTab` mounts (and with `focus: true`, activates) the tab in the
+workspace's layout so it is correct when the user next opens the workspace. When the
+workspace is not currently visible in the UI, no actual UI focus/activation is
+attempted: `showTab { focus: true }`, `focusTab`, and `openTab { visible: true }`
+succeed, apply their state effects, skip the UI focus attempt, and the action result
+carries a warning that the workspace is not visible so no UI focus was attempted.
+
 ## Basic Actions
 - `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, and visibility info
 - `{ action: "getAccessibilityTree", tabId? }` - Get page structure as YAML
