@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.29] - 2026-08-21
+
+### 🚀 Features
+
+- First-class provider param on agent.delegate ([#1375](https://github.com/intent-hq/intentd/pull/1375))
+
+### 🐛 Bug Fixes
+
+- *(git)* Order intentd's credential helper ahead of OS-default ones ([#1364](https://github.com/intent-hq/intentd/pull/1364))
+- Add workspace.delete to the compound-op statement tier ([#3074](https://github.com/intent-hq/intentd/pull/3074))
+- Self-heal default provider settings and remove positional auggie fallback ([#1373](https://github.com/intent-hq/intentd/pull/1373))
+- Surface a client-visible terminal state for wedged turns ([#1374](https://github.com/intent-hq/intentd/pull/1374))
+
+### 📚 Documentation
+
+- Burn down pedantic missing_errors_doc and missing_panics_doc ([#1371](https://github.com/intent-hq/intentd/pull/1371))
+- Burn down pedantic doc_markdown ([#1367](https://github.com/intent-hq/intentd/pull/1367))
+
+
 ## [0.7.28] - 2026-08-21
 
 ### 🔧 Refactor
