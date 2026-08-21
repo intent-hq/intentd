@@ -561,11 +561,12 @@ fn resolve_delegate_reasoning_effort(
 }
 
 /// Resolve the provider `agent.delegate` should spawn on when the caller
-/// supplies no explicit `model` (spec Decision D2). The wire has no
-/// `provider` param, so the daemon must derive one itself instead of leaving
-/// `AgentCreateExtra.provider` unset — which would fall through to the
-/// spawn path's positional last resort regardless of the user's actual
-/// configured default.
+/// supplies no explicit `provider` param and no explicit `model` (spec
+/// Decision D2). An explicit `provider` param (PROTOCOL §5.5) short-circuits
+/// this derivation entirely at the call site; without it the daemon must
+/// derive one itself instead of leaving `AgentCreateExtra.provider` unset —
+/// which would fall through to the spawn path's positional last resort
+/// regardless of the user's actual configured default.
 ///
 /// 1. The specialist's frontmatter `codingAgent` (3-tier resolution), or —
 ///    when that is unset — the provider prefix of its compound `model`
@@ -6114,14 +6115,19 @@ impl Services {
                 .unwrap_or(0)
                 + 1
         });
-        // D2: resolve the provider up front when the caller gave no explicit
-        // `model` — the wire has no `provider` param on `agent.delegate`, so
-        // without this the created session's `provider` stays `None` and the
-        // spawn path falls through to the hardcoded default (Auggie),
-        // regardless of the user's actual configured default. A compound
-        // explicit `model` (e.g. `opencode:kimi-k3`) already pins its own
-        // provider via `agent_create_op`'s existing derivation, so D2 is
-        // skipped in that case.
+        // D2: resolve the provider up front. Precedence (PROTOCOL §5.5):
+        // explicit `provider` param > compound-`model` prefix > specialist
+        // frontmatter `codingAgent` (or its compound `model` prefix) >
+        // settings-derived default. An explicit `provider` must be known and
+        // available, and a compound explicit `model` naming a DIFFERENT
+        // known provider is a contradiction — both reject with `-32602`
+        // before any side effect (an unknown compound prefix is left to
+        // `agent_create_op`'s unconditional prefix validation). Without any
+        // resolution the created session's `provider` stays `None` and the
+        // spawn path falls through to the positional default regardless of
+        // the user's actual configured default; a compound explicit `model`
+        // (e.g. `opencode:kimi-k3`) pins its own provider via
+        // `agent_create_op`'s existing derivation.
         // SECURITY: derive workspace_path from the stored workspace record,
         // never a client-supplied value (same rationale as
         // `agent_create_op`'s model resolution).
@@ -6131,7 +6137,25 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
-        let delegate_provider = if input.model.is_none() {
+        let delegate_provider = if let Some(provider_param) = input.provider.as_deref() {
+            ensure_known_provider("agent.delegate", provider_param)?;
+            ensure_provider_available(
+                "agent.delegate",
+                provider_param,
+                &self.effective_settings().providers.paths,
+            )?;
+            if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
+                let (prefix, _) = intent_providers::parse_compound_model_id(model);
+                if intent_providers::find_provider(&prefix)
+                    .is_some_and(|cfg| cfg.id != provider_param)
+                {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.delegate: model {model} names provider {prefix} but provider is {provider_param}"
+                    )));
+                }
+            }
+            Some(provider_param.to_string())
+        } else if input.model.is_none() {
             resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
             None
@@ -6701,6 +6725,9 @@ impl Services {
                         model: opts
                             .and_then(|o| o.model.clone())
                             .or_else(|| input.model.clone()),
+                        provider: opts
+                            .and_then(|o| o.provider.clone())
+                            .or_else(|| input.provider.clone()),
                         reasoning_effort: opts
                             .and_then(|o| o.reasoning_effort.clone())
                             .or_else(|| input.reasoning_effort.clone()),

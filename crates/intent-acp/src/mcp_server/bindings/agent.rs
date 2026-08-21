@@ -275,7 +275,7 @@ async fn delegate(
                     Ok(entry) => entries.push(entry),
                     Err(_) => {
                         return Err(format!(
-                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, reasoningEffort? }} objects, got: {v}"
+                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }} objects, got: {v}"
                         ));
                     }
                 }
@@ -291,6 +291,7 @@ async fn delegate(
         agent_instructions: opt_str(args, "agentInstructions"),
         specialist: opt_str(args, "specialist"),
         model: opt_str(args, "model"),
+        provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
         behavior_prompt: opt_str(args, "behaviorPrompt"),
         wait_mode: opt_str(args, "waitMode"),
