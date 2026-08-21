@@ -477,8 +477,12 @@ pub(crate) fn aggregate_reviews(reviews: &[Review]) -> ReviewAggregate {
 /// of inline review comments across `threads` (EVERY thread comment counts,
 /// including replies inside a thread) and the number of unresolved threads.
 pub(crate) fn count_thread_comments(threads: &[ReviewThread]) -> (i64, i64) {
-    let review_comment_count = threads.iter().map(|t| t.comments.len() as i64).sum();
-    let unresolved = threads.iter().filter(|t| !t.is_resolved).count() as i64;
+    let review_comment_count = threads
+        .iter()
+        .map(|t| i64::try_from(t.comments.len()).expect("value fits in i64"))
+        .sum();
+    let unresolved = i64::try_from(threads.iter().filter(|t| !t.is_resolved).count())
+        .expect("value fits in i64");
     (review_comment_count, unresolved)
 }
 
@@ -787,7 +791,9 @@ pub(crate) fn merge_requirements(
             })
             .collect(),
     };
-    let tally = |word: &str| items.iter().filter(|c| c.status == word).count() as i64;
+    let tally = |word: &str| {
+        i64::try_from(items.iter().filter(|c| c.status == word).count()).expect("value fits in i64")
+    };
     let names = |word: &str| {
         items
             .iter()
@@ -796,7 +802,7 @@ pub(crate) fn merge_requirements(
             .collect::<Vec<_>>()
     };
     let checks = MergeRequirementsChecks {
-        total: items.len() as i64,
+        total: i64::try_from(items.len()).expect("value fits in i64"),
         passed: tally("passed"),
         failed: tally("failed"),
         pending: tally("pending"),
@@ -974,8 +980,8 @@ pub(crate) async fn merge_requirements_for_pr(
 
 /// Validate/default the `mergeMethod` argument (TS `validateMergeMethod`,
 /// default `merge`); an invalid value throws → `-32603`.
-pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMethod> {
-    match method.as_deref() {
+pub(crate) fn validate_merge_method(method: Option<&str>) -> Result<MergeMethod> {
+    match method {
         None | Some("merge") => Ok(MergeMethod::Merge),
         Some("squash") => Ok(MergeMethod::Squash),
         Some("rebase") => Ok(MergeMethod::Rebase),
@@ -1635,13 +1641,13 @@ mod tests {
     fn validates_merge_method_with_default() {
         assert_eq!(validate_merge_method(None).unwrap(), MergeMethod::Merge);
         assert_eq!(
-            validate_merge_method(Some("squash".into())).unwrap(),
+            validate_merge_method(Some("squash")).unwrap(),
             MergeMethod::Squash
         );
         assert_eq!(
-            validate_merge_method(Some("rebase".into())).unwrap(),
+            validate_merge_method(Some("rebase")).unwrap(),
             MergeMethod::Rebase
         );
-        assert!(validate_merge_method(Some("bad".into())).is_err());
+        assert!(validate_merge_method(Some("bad")).is_err());
     }
 }

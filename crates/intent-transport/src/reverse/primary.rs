@@ -50,6 +50,7 @@ struct Entry {
 
 impl PrimaryReverseRegistry {
     /// Build an empty registry (no clients connected).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -61,6 +62,7 @@ impl PrimaryReverseRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn register(&self, channel: ReverseChannel) -> PrimaryReverseGuard {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -81,6 +83,7 @@ impl PrimaryReverseRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn primary(&self) -> Option<ReverseChannel> {
         self.inner
             .entries
@@ -95,6 +98,7 @@ impl PrimaryReverseRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner
             .entries
@@ -104,6 +108,7 @@ impl PrimaryReverseRegistry {
     }
 
     /// Whether the registry currently has no live entries.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

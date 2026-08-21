@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const AGENT_CONFIGS_DIR_NAME: &str = "agent-configs";
 
 /// The agent-configs root for a data dir: `<data_dir>/agent-configs`.
+#[must_use]
 pub fn agent_configs_root(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_CONFIGS_DIR_NAME)
 }

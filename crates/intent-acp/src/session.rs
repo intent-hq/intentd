@@ -88,6 +88,7 @@ fn session_setup_timeout() -> Duration {
 /// Public so the service layer's warn-and-continue path can render the
 /// actual configured window in the timeout-warning message instead of a
 /// hardcoded literal.
+#[must_use]
 pub fn prompt_idle_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -109,6 +110,7 @@ pub struct ActivityTracker {
 
 impl ActivityTracker {
     /// Create a new tracker initialized to "now".
+    #[must_use]
     pub fn new() -> Self {
         Self {
             last_active_ms: Arc::new(AtomicU64::new(elapsed_ms())),
@@ -121,6 +123,7 @@ impl ActivityTracker {
     }
 
     /// Milliseconds since the last activity.
+    #[must_use]
     pub fn idle_ms(&self) -> u64 {
         elapsed_ms().saturating_sub(self.last_active_ms.load(Ordering::SeqCst))
     }
@@ -136,7 +139,7 @@ impl Default for ActivityTracker {
 fn elapsed_ms() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    start.elapsed().as_millis() as u64
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// `session/new` with `{ cwd, mcpServers, _meta? }` → the agent's session id and initial
@@ -316,6 +319,7 @@ pub async fn cancel(conn: &Connection, session_id: &str) -> AcpResult<()> {
 }
 
 /// Whether the agent advertised the `loadSession` capability in its handshake.
+#[must_use]
 pub fn supports_load_session(init: &InitializeResponse) -> bool {
     init.agent_capabilities.load_session
 }
@@ -418,6 +422,7 @@ pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate>
 /// Parse a `session/update` notification and map it. Returns `None` when the
 /// method is not `session/update`, the params fail to parse, or the variant has
 /// no canonical event. Keeps schema parsing inside `intent-acp`.
+#[must_use]
 pub fn map_notification(note: &IncomingNotification) -> Option<MappedUpdate> {
     if note.method != "session/update" {
         return None;
@@ -569,6 +574,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// tool-call mappers' [`resolve_input_and_name`]) feeds the rewritten
 /// `{server}_{tool}` string in as `title`, keeping the two equivalent on
 /// every path.
+#[must_use]
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_affix(name);

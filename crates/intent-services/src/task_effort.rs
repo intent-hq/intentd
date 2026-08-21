@@ -107,6 +107,8 @@ fn side_minutes(s: &str, fallback_unit: Option<Unit>) -> Option<(f64, Option<Uni
     Some((total, last_unit))
 }
 
+// Guarded finite + non-negative; the float→int cast saturates at u64::MAX.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn to_minutes(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0).then(|| (value.round() as u64).min(MAX_EFFORT_MINUTES))
 }

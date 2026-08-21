@@ -424,7 +424,7 @@ async fn boot_seeded(
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
     Fixture {
@@ -727,7 +727,7 @@ async fn removed_pr_methods_return_method_not_found_over_wss() {
     {
         let resp = wss_rpc_raw(
             &mut rpc,
-            id as i64 + 1,
+            i64::try_from(id).expect("value fits in i64") + 1,
             method,
             json!({ "workspaceId": fx.ws_id.as_str() }),
         )

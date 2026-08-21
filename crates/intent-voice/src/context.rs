@@ -22,6 +22,7 @@ pub(crate) const MAX_KEYTERM_CHARS: usize = 50;
 /// terms first, then request terms; duplicates dropped case-insensitively
 /// (first spelling wins); terms longer than [`MAX_KEYTERM_CHARS`] chars or
 /// blank are skipped; capped at [`MAX_KEYTERMS`].
+#[must_use]
 pub fn merge_keyterms(vocabulary: &[String], request_keyterms: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -43,6 +44,7 @@ pub fn merge_keyterms(vocabulary: &[String], request_keyterms: &[String]) -> Vec
 
 /// Compose the `OpenAI` `prompt`: style hint, then the merged vocabulary as a
 /// comma-separated list, then the request `prompt` (when present).
+#[must_use]
 pub fn compose_prompt(keyterms: &[String], request_prompt: Option<&str>) -> String {
     let mut prompt = String::from(OPENAI_STYLE_HINT);
     if !keyterms.is_empty() {

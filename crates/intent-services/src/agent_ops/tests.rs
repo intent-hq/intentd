@@ -4756,7 +4756,10 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
     assert_eq!(tu["name"], "view", "name intact for FE classifyTool");
     assert_eq!(tu["toolCallId"], "tc-1", "pairing id intact");
     assert_eq!(tu["inputTruncated"], true);
-    assert!(tu["inputBytes"].as_u64().unwrap() as usize > SLIM_PROJECTION_BUDGET_BYTES);
+    assert!(
+        usize::try_from(tu["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
+            > SLIM_PROJECTION_BUDGET_BYTES
+    );
     assert!(
         tu["input"].get("path").is_some() && tu["input"].get("blob").is_some(),
         "input keys preserved: {:?}",
@@ -4769,7 +4772,10 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
     assert_eq!(tr["tool_use_id"], "tc-1");
     assert_eq!(tr["is_error"], false);
     assert_eq!(tr["outputTruncated"], true);
-    assert_eq!(tr["outputBytes"].as_u64().unwrap() as usize, big.len());
+    assert_eq!(
+        usize::try_from(tr["outputBytes"].as_u64().unwrap()).expect("value fits in usize"),
+        big.len()
+    );
     assert!(tr["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES);
     // Under-budget blocks: byte-identical, no flags.
     assert_eq!(blocks[0], content[0]);
@@ -4846,7 +4852,10 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     let thumbed = &blocks[0];
     assert_eq!(thumbed["dataTruncated"], true);
     assert_eq!(thumbed["dataIsThumbnail"], true);
-    assert_eq!(thumbed["dataBytes"].as_u64().unwrap() as usize, data.len());
+    assert_eq!(
+        usize::try_from(thumbed["dataBytes"].as_u64().unwrap()).expect("value fits in usize"),
+        data.len()
+    );
     let served = thumbed["data"].as_str().expect("thumbnail data served");
     assert!(
         served.len() < data.len(),
@@ -4870,7 +4879,7 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     assert!(legacy.get("data").is_none(), "unrenderable data omitted");
     assert_eq!(legacy["dataTruncated"], true);
     assert_eq!(
-        legacy["dataBytes"].as_u64().unwrap() as usize,
+        usize::try_from(legacy["dataBytes"].as_u64().unwrap()).expect("value fits in usize"),
         garbage.len()
     );
     assert_eq!(legacy["mimeType"], "image/png", "mimeType intact");
@@ -9387,7 +9396,9 @@ async fn models_list_legacy_negative_window_expires_then_refetches() {
         .expect("failed fetch");
     assert_eq!(res["source"], "static");
     // Past the negative TTL the fetch runs again; success clears the entry.
-    let later = legacy_now() + crate::model_catalog::MODELS_NEGATIVE_TTL.as_millis() as u64 + 1;
+    let later = legacy_now()
+        + u64::try_from(crate::model_catalog::MODELS_NEGATIVE_TTL.as_millis()).unwrap_or(u64::MAX)
+        + 1;
     let recovered = vec![json!({ "id": "rec", "name": "Rec", "provider": "auggie" })];
     let expected = recovered.clone();
     let res = svc
@@ -10747,7 +10758,10 @@ async fn report_to_parent_delivers_for_delegated_caller() {
         .expect("report delivered");
     assert_eq!(result["ok"], json!(true));
     assert_eq!(result["parentAgentId"].as_str(), Some(parent.0.as_str()));
-    assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
+    assert_eq!(
+        result["reportLength"],
+        json!(i64::try_from(report.chars().count()).expect("count fits in i64"))
+    );
     assert!(result["savedAt"].is_string());
 
     // Report-time wake: reportToParent now delivers an immediate wake to the parent.

@@ -526,7 +526,7 @@ async fn reap_child_group(child: &mut tokio::process::Child) {
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Parse `git clone --progress` stderr line-by-line and publish one
@@ -773,7 +773,8 @@ impl SubmoduleAwareParser {
         if let Some(slice) = self.slice.take() {
             self.base = Self::capped_top(slice);
         }
-        let remaining = (self.registered.saturating_sub(self.started) + 1) as u32;
+        let remaining =
+            u32::try_from(self.registered.saturating_sub(self.started) + 1).unwrap_or(u32::MAX);
         let width = (100 - self.base) / remaining;
         self.slice = Some((self.base, self.base + width));
     }

@@ -112,7 +112,7 @@ fn next_subscription_id_is_monotonic_and_prefixed() {
 fn error_frame_tags_invalid_params_with_data_code() {
     // -32602 carries the machine-readable discriminator (PROTOCOL §3.3).
     let v = parse(&error_frame(
-        json!(7),
+        &json!(7),
         -32602,
         "eventTypes must be a non-empty array",
     ));
@@ -125,7 +125,7 @@ fn error_frame_tags_invalid_params_with_data_code() {
 
     // Other codes stay data-less.
     for code in [-32600, -32601, -32603, -32001] {
-        let v = parse(&error_frame(json!(1), code, "boom"));
+        let v = parse(&error_frame(&json!(1), code, "boom"));
         assert_eq!(v["error"]["code"], json!(code));
         assert!(v["error"].get("data").is_none(), "no data for {code}: {v}");
     }

@@ -289,6 +289,7 @@ pub struct PtyHost {
 
 impl PtyHost {
     /// Create an empty host.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -344,7 +345,7 @@ impl PtyHost {
         }));
 
         let reader_fanout = Arc::clone(&fanout);
-        let handle = std::thread::spawn(move || read_loop(reader, reader_fanout));
+        let handle = std::thread::spawn(move || read_loop(reader, &reader_fanout));
 
         let cwd = spec
             .cwd
@@ -788,7 +789,7 @@ fn exit_watch_loop(session: &PtySession) {
 
 /// Blocking reader loop (own thread): append each chunk to scrollback and
 /// broadcast it under one lock so attach sees a consistent history/live seam.
-fn read_loop(mut reader: Box<dyn Read + Send>, fanout: Arc<Mutex<Fanout>>) {
+fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buf) {
@@ -902,7 +903,7 @@ fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::E
         PtySignal::Terminate => Signal::SIGTERM,
         PtySignal::Kill => Signal::SIGKILL,
     };
-    killpg(Pid::from_raw(pid as i32), signal)
+    killpg(Pid::from_raw(pid.cast_signed()), signal)
 }
 
 /// Whether the process group led by `pid` (pgid == pid via `setsid`) has no
@@ -914,7 +915,7 @@ fn process_group_empty(pid: u32) -> bool {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
     matches!(
-        killpg(Pid::from_raw(pid as i32), None),
+        killpg(Pid::from_raw(pid.cast_signed()), None),
         Err(nix::errno::Errno::ESRCH)
     )
 }
@@ -992,7 +993,7 @@ mod tests {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
         matches!(
-            kill(Pid::from_raw(pid as i32), None),
+            kill(Pid::from_raw(pid.cast_signed()), None),
             Ok(()) | Err(nix::errno::Errno::EPERM)
         )
     }

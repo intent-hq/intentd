@@ -4000,7 +4000,8 @@ mod mcp_bridge_tests {
                         guard.armed = false;
                     }
                     let payload_len =
-                        message["params"]["payload_len"].as_u64().unwrap_or(0) as usize;
+                        usize::try_from(message["params"]["payload_len"].as_u64().unwrap_or(0))
+                            .expect("value fits in usize");
                     Some(json!({
                         "jsonrpc": "2.0", "id": id,
                         "result": { "ok": true, "payload": "x".repeat(payload_len) }
@@ -4120,7 +4121,7 @@ mod mcp_bridge_tests {
             for _ in 0..n {
                 let resp = read_response(&mut reader).await;
                 let id = resp["id"].as_i64().expect("id must survive intact");
-                let expected_len = (64 * 1024 + id) as usize;
+                let expected_len = usize::try_from(64 * 1024 + id).expect("value fits in usize");
                 assert_eq!(
                     resp["result"]["payload"].as_str().unwrap().len(),
                     expected_len,
@@ -4128,7 +4129,7 @@ mod mcp_bridge_tests {
                 );
                 assert!(seen.insert(id), "duplicate response for id {id}");
             }
-            assert_eq!(seen.len(), n as usize);
+            assert_eq!(seen.len(), usize::try_from(n).expect("value fits in usize"));
         }
 
         #[tokio::test]
@@ -4615,7 +4616,7 @@ mod mcp_bridge_tests {
         async fn initial_buffer_overflow_falls_back_to_retryable_error() {
             let addr = reserve_free_addr().await;
             let mut bridge = spawn_bridge(addr, fast_cfg());
-            for id in 0..(INITIAL_BUFFER_MAX_LINES as i64) {
+            for id in 0..(i64::try_from(INITIAL_BUFFER_MAX_LINES).expect("small const")) {
                 bridge.send_request(id).await;
             }
             // The line past the cap is rejected with the retryable error.
@@ -7656,7 +7657,7 @@ mod wsapi6_bindings_tests {
             Box::pin(async move {
                 if let Some(envelope) = fe_envelope {
                     return intent_services::browser_ops::shape_agent_result(
-                        envelope,
+                        &envelope,
                         actions.len(),
                     )
                     .map_err(|e| intent_core::Error::Internal(e.message));

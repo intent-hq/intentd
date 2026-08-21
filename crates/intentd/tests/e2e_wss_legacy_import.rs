@@ -261,7 +261,8 @@ async fn wss_serves_rpcs_and_streams_workspace_created_during_first_boot_import(
     // Resolve the live WSS port + fingerprint over UDS, then connect a real
     // pinned TLS WebSocket (bearer token in the query string).
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"].as_u64().expect("bound port") as u16;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("bound port"))
+        .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

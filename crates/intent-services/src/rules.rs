@@ -28,7 +28,7 @@ const MAX_RULE_CONTENT_LEN: usize = 50_000;
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Wrap user-rule content for prompt injection (port of
@@ -66,7 +66,7 @@ fn file_mtime_ms(path: &Path) -> i64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as i64)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Strip an optional leading YAML frontmatter block, returning the body (port of
@@ -731,7 +731,7 @@ mod tests {
     }
 
     /// Helper to create a test workspace with a repository path
-    fn make_test_workspace(repo_path: PathBuf) -> Workspace {
+    fn make_test_workspace(repo_path: &Path) -> Workspace {
         let ts = intent_core::now_iso();
         Workspace {
             id: intent_core::WorkspaceId("test-ws".to_string()),
@@ -798,7 +798,7 @@ This is a test skill.
 
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
-        let workspace = make_test_workspace(repo_path.to_path_buf());
+        let workspace = make_test_workspace(repo_path);
 
         let prompt = assemble_system_prompt(
             &store,
@@ -856,7 +856,7 @@ This is a test skill.
 
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
-        let workspace = make_test_workspace(repo_path.to_path_buf());
+        let workspace = make_test_workspace(repo_path);
 
         let prompt = assemble_system_prompt(
             &store,

@@ -570,7 +570,7 @@ async fn reject_overloaded(
     match rpc_id {
         Some(id) => out_tx
             .send_priority(events::error_frame(
-                id,
+                &id,
                 OVERLOAD_ERROR_CODE,
                 OVERLOAD_ERROR_MESSAGE,
             ))
@@ -614,8 +614,8 @@ async fn handle_fast_path(
                 // it can never be preceded by an `events.event` notification.
                 if id.present {
                     let frame = events::success_frame(
-                        id.echo,
-                        json!({ "subscriptionId": subscription_id }),
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
@@ -635,7 +635,7 @@ async fn handle_fast_path(
             Ok(subscription_id) => {
                 let success = subs.remove(&subscription_id);
                 if id.present {
-                    let frame = events::success_frame(id.echo, json!({ "success": success }));
+                    let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
                 }
                 true
@@ -649,7 +649,7 @@ async fn handle_fast_path(
 /// (notifications get no response). Returns `false` if the channel is closed.
 async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &OutboundSender) -> bool {
     if id.present {
-        let frame = events::error_frame(id.echo, -32602, message);
+        let frame = events::error_frame(&id.echo, -32602, message);
         return out_tx.send_priority(frame).await.is_ok();
     }
     true
@@ -788,8 +788,8 @@ async fn handle_sub_fast_path(
                 // can never be preceded by a `subscription.push` notification (§3.4).
                 if id.present {
                     let frame = events::success_frame(
-                        id.echo,
-                        json!({ "subscriptionId": subscription_id }),
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
@@ -842,8 +842,8 @@ async fn handle_sub_fast_path(
                 let subscription_id = events::next_subscription_id();
                 if id.present {
                     let frame = events::success_frame(
-                        id.echo,
-                        json!({ "subscriptionId": subscription_id }),
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
@@ -896,8 +896,8 @@ async fn handle_sub_fast_path(
                     let subscription_id = events::next_subscription_id();
                     if id.present {
                         let frame = events::success_frame(
-                            id.echo,
-                            json!({ "subscriptionId": subscription_id }),
+                            &id.echo,
+                            &json!({ "subscriptionId": subscription_id }),
                         );
                         if out_tx.send_priority(frame).await.is_err() {
                             return false;
@@ -923,7 +923,7 @@ async fn handle_sub_fast_path(
             Ok(subscription_id) => {
                 let success = subs.remove(&subscription_id);
                 if id.present {
-                    let frame = events::success_frame(id.echo, json!({ "success": success }));
+                    let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
                 }
                 true

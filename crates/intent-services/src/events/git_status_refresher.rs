@@ -208,7 +208,7 @@ async fn refresh_workspace(
             return;
         }
     };
-    if let Err(e) = bus.publish(&changes_git_status_event(ws_id, status)).await {
+    if let Err(e) = bus.publish(&changes_git_status_event(ws_id, &status)).await {
         tracing::warn!(workspace = %ws_id, error = %e, "changes:git-status publish failed");
     }
 }

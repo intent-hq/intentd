@@ -598,6 +598,8 @@ pub(super) fn estimate_model_bytes(params_billion: f64) -> f64 {
 
 /// Whether a model with `params_billion` total parameters is estimated to
 /// fit within [`RAM_FIT_FRACTION`] of `total_ram_bytes`.
+// RAM sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool {
     estimate_model_bytes(params_billion) <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
@@ -608,6 +610,8 @@ pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool
 /// param-count estimate bakes in. Shared with the spawn-time quant-variant
 /// selection ([`crate::unsloth_server`]) so both fit checks apply one
 /// consistent headroom policy.
+// RAM/model sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn gguf_bytes_fit_within_ram(model_bytes: u64, total_ram_bytes: u64) -> bool {
     (model_bytes as f64) + FIT_HEADROOM_BYTES <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }

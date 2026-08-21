@@ -166,6 +166,7 @@ fn pairs_array(map: &BTreeMap<String, String>) -> Value {
 }
 
 /// Convert to the `OpenCode` config `mcp` block (port of `toOpenCodeMcpConfig`).
+#[must_use]
 pub fn to_opencode_mcp_config(normalized: &NormalizedMcpServers) -> Value {
     let mut mcp = Map::new();
     for (name, server) in normalized {
@@ -224,6 +225,7 @@ fn remote_entry(kind: &str, url: &str, headers: &Option<BTreeMap<String, String>
 
 /// Convert to the Auggie `--mcp-config` `{ mcpServers }` shape (the storage
 /// format): stdio entries are `{ command, args, env }`, remotes carry `type`.
+#[must_use]
 pub fn to_auggie_mcp_config(normalized: &NormalizedMcpServers) -> Value {
     let mut servers = Map::new();
     for (name, server) in normalized {
@@ -284,6 +286,7 @@ fn acp_remote(
 /// shape as [`to_acp_mcp_servers`] — stdio entries serialize untagged (no
 /// `type` field), remotes carry `type: http|sse` — but typed so the session
 /// lifecycle helpers take `Vec<McpServer>` directly.
+#[must_use]
 pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpServer> {
     let mut servers = Vec::new();
     for (name, server) in normalized {
@@ -409,6 +412,7 @@ pub(crate) fn to_codex_mcp_overrides(
 /// Return a copy of `servers` where each stdio server's `env` is the parent
 /// baseline merged with that server's existing env (existing env wins). Remote
 /// servers are returned unchanged (port of `applyBaselineEnvToStdioServers`).
+#[must_use]
 pub fn apply_baseline_env_to_stdio_servers(
     servers: &NormalizedMcpServers,
     baseline: &EnvMap,

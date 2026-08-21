@@ -451,7 +451,8 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
 
     let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"].as_str().expect("fp");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(fp);
 
     // Subscriber conn — before any agent activity.

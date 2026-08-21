@@ -116,6 +116,8 @@ pub(crate) struct AgentSnapshot {
     pub(crate) pending_attention: Option<String>,
 }
 
+// serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -1067,7 +1069,7 @@ fn parse_model_line(line: &str) -> Option<(String, String)> {
 /// dynamic discovery succeeded: an empty list labeled `source: "static"` with
 /// a `warning`, never an error. (The former static tier catalog went with the
 /// tier tables — the provider CLI owns model discovery.)
-pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Value {
+pub(crate) fn static_provider_response(provider_id: &str, warning: &str) -> Value {
     json!({
         "providerId": provider_id,
         "models": [],
@@ -1646,13 +1648,13 @@ fn build_create_metadata(
 /// when empty so pre-widening callers that only inspect `ok`/`agentId`/
 /// `created`/`result` stay wire-compatible.
 fn build_wake_response(
-    agent_id: AgentId,
-    agent_name: String,
+    agent_id: &AgentId,
+    agent_name: &str,
     created: bool,
     action: &str,
-    task_title: String,
-    result: Value,
-    cleaned_up: Vec<AgentId>,
+    task_title: &str,
+    result: &Value,
+    cleaned_up: &[AgentId],
 ) -> Value {
     let mut out = json!({
         "ok": true,
@@ -2362,7 +2364,8 @@ impl Services {
         // log is insert-only (appends only extend the tail, so existing row
         // positions never shift — a racing `replace_agent_messages` degrades
         // no worse than an already-stale page token).
-        let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
+        let total = usize::try_from(self.store.count_agent_messages(&agent_id).await?.max(0))
+            .expect("value fits in usize");
         // Seek resolution: `aroundMessageId` / `aroundIndex` win over any
         // token (mutual exclusivity is enforced at the transport boundary);
         // a forward (`prevToken`-minted) cursor is recognized next; otherwise
@@ -2382,14 +2385,16 @@ impl Services {
                 .get_agent_message_index(&agent_id, &mid)
                 .await?
                 .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {mid}")))?;
-            let index = index.max(0) as usize;
+            let index = usize::try_from(index.max(0)).expect("value fits in usize");
             slim_anchor = crate::pagination::BudgetAnchor::Target(index);
             Some(crate::pagination::page_window_around(total, limit, index))
         } else if let Some(idx) = around_index {
             // Ordinal seek: clamp into [0, total - 1] — client estimates are
             // approximate, so an overshooting index lands on the newest page
             // instead of erroring (negatives were rejected at the boundary).
-            let clamped = (idx.max(0) as usize).min(total.saturating_sub(1));
+            let clamped = usize::try_from(idx.max(0))
+                .expect("non-negative")
+                .min(total.saturating_sub(1));
             slim_anchor = crate::pagination::BudgetAnchor::Target(clamped);
             Some(crate::pagination::page_window_around(total, limit, clamped))
         } else {
@@ -2410,7 +2415,11 @@ impl Services {
         };
         let mut page: Vec<AgentMessage> = self
             .store
-            .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
+            .get_agent_messages_page(
+                &agent_id,
+                i64::try_from(start).expect("value fits in i64"),
+                i64::try_from(end - start).expect("value fits in i64"),
+            )
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
@@ -4045,7 +4054,7 @@ impl Services {
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
-                format!("no dynamic model discovery for provider '{provider_id}'"),
+                &format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
         let version_key = (source.version_key)();
@@ -4072,7 +4081,7 @@ impl Services {
             }
             None => Ok(static_provider_response(
                 &provider_id,
-                resolved
+                &resolved
                     .warning
                     .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
@@ -5355,7 +5364,7 @@ impl Services {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        let report_len = report_text.chars().count() as i64;
+        let report_len = i64::try_from(report_text.chars().count()).expect("value fits in i64");
         // Persist the completion report on the child so `agent.get`/`agent.list`
         // (and `ws.agent.summary`) can re-serve it after restarts.
         let saved_at = now_iso();
@@ -7875,11 +7884,13 @@ impl Services {
         let agent_id = &session.id;
         // Count-only aggregate: `active_hooks_for_agent` would hydrate every
         // hook row the agent ever owned (code + lastState blobs included).
-        let hooks = self
-            .store
-            .count_active_hooks_by_agent(agent_id)
-            .await
-            .unwrap_or(0) as usize;
+        let hooks = usize::try_from(
+            self.store
+                .count_active_hooks_by_agent(agent_id)
+                .await
+                .unwrap_or(0),
+        )
+        .expect("value fits in usize");
         let agent_watches = self.list_watches_for_parent(agent_id).len();
         // Length-only registry read: `queue_snapshot` materializes each
         // entry's wire JSON (image/file blocks included) just to be counted.
@@ -7894,11 +7905,13 @@ impl Services {
         // the `parent_agent_id` index, unscoped by workspace so a Chief
         // parent's cross-workspace delegates count too — O(this agent's
         // children), never O(workspace sessions). Fails open to 0.
-        let running_sub_agents = self
-            .store
-            .count_unsettled_child_agents(agent_id)
-            .await
-            .unwrap_or(0) as usize;
+        let running_sub_agents = usize::try_from(
+            self.store
+                .count_unsettled_child_agents(agent_id)
+                .await
+                .unwrap_or(0),
+        )
+        .expect("value fits in usize");
         let num_questions_asked = self.pending_question_count(agent_id).await;
         // Per-agent indexed read over this agent's monitor rows; labels only,
         // no snapshot hydration. Fails open to empty.
@@ -8480,8 +8493,10 @@ impl Services {
                         .filter(|e| e["editing"].as_bool() != Some(true))
                         .filter_map(|e| {
                             let queued_at = e["queuedAt"].as_str()?;
-                            let queued_ms =
-                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let queued_ms = i64::try_from(
+                                parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000,
+                            )
+                            .unwrap_or(0);
                             let age = (now_ms - queued_ms).max(0);
                             if age > STALE_QUEUE_ENTRY_AFTER_MS {
                                 Some((e["id"].as_str().unwrap_or_default(), age))
@@ -9025,13 +9040,13 @@ impl Services {
                 "woke_existing"
             };
             let mut response = build_wake_response(
-                agent_id.clone(),
-                agent_name,
+                &agent_id.clone(),
+                &agent_name,
                 false,
                 action,
-                task_title.clone(),
-                result,
-                cleaned_up,
+                &task_title.clone(),
+                &result,
+                &cleaned_up,
             );
             // SUB-1: auto-subscribe the waking caller to the target's
             // completion (TS `WakeOrCreateTaskAgentTool`). Response text
@@ -9298,13 +9313,13 @@ impl Services {
             )
             .await?;
         let mut response = build_wake_response(
-            agent.clone(),
-            agent_name,
+            &agent.clone(),
+            &agent_name,
             true,
             "created_new",
-            task_title.clone(),
-            result,
-            cleaned_up,
+            &task_title.clone(),
+            &result,
+            &cleaned_up,
         );
         // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
         // created agent's completion, mirroring the woke-existing branch. The
@@ -10291,7 +10306,7 @@ impl Services {
                     .map(|(i, m)| intent_store::AgentQueueRow {
                         id: m.id.clone(),
                         agent_id: agent_id.clone(),
-                        position: i as i64,
+                        position: i64::try_from(i).expect("value fits in i64"),
                         payload: serde_json::to_value(m).unwrap_or(Value::Null),
                         created_at: m.queued_at.clone(),
                         turn_id: m.turn_id.clone(),
@@ -10658,7 +10673,9 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
 /// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
 /// Parse an RFC-3339 timestamp into epoch milliseconds, or `0` when malformed.
 fn iso_ms(ts: &str) -> i64 {
-    parse_iso(ts).map_or(0, |dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
+    parse_iso(ts).map_or(0, |dt| {
+        i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+    })
 }
 
 /// Non-negative age in milliseconds of `ts` relative to `now_ms`.

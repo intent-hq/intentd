@@ -558,7 +558,7 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
 }
 
 /// A `NewEvent` for `agent:tool:call` with the given `output` payload.
-fn tool_call_event(output: serde_json::Value) -> NewEvent {
+fn tool_call_event(output: &serde_json::Value) -> NewEvent {
     let mut ev = new_event("agent:tool:call", Some("agent-1"), ActorType::Agent);
     ev.data = json!({
         "toolCallId": "tc-1",
@@ -583,7 +583,7 @@ async fn oversized_tool_call_payload_is_capped_in_store_but_full_on_broadcast() 
     // Output alone (~64 KiB) pushes the payload well past the 16 KiB cap.
     let big_output = "x".repeat(64 * 1024);
     let stored = bus
-        .publish(&tool_call_event(json!(big_output)))
+        .publish(&tool_call_event(&json!(big_output)))
         .await
         .expect("publish");
 
@@ -624,7 +624,7 @@ async fn oversized_tool_call_payload_is_capped_in_store_but_full_on_broadcast() 
 async fn small_tool_call_payload_persists_verbatim() {
     let (_tmp, bus) = bus().await;
     let stored = bus
-        .publish(&tool_call_event(json!("short output")))
+        .publish(&tool_call_event(&json!("short output")))
         .await
         .expect("publish");
 
@@ -984,7 +984,7 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
     const OVERFLOW: usize = 64;
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
-        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+        let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
     // Delivery resumes after the lag report: the surviving events arrive.
@@ -1031,7 +1031,7 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
 
     const OVERFLOW: usize = 64;
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
-        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+        let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
     let first = timeout(Duration::from_secs(5), sub.recv_delivery())
@@ -1065,7 +1065,7 @@ async fn recv_skips_lag_markers_transparently() {
     let mut sub = bus.subscribe(filter);
 
     for _ in 0..(BROADCAST_CAPACITY + 8) {
-        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+        let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
     let batch = timeout(Duration::from_secs(5), sub.recv())

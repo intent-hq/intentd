@@ -14,6 +14,7 @@ use crate::map_git_err;
 
 /// The empty status returned for remote workspaces and non-repositories,
 /// matching the TS `getStatus` fallback (`branch:""`, everything zeroed).
+#[must_use]
 pub fn empty_status() -> GitStatus {
     GitStatus {
         branch: String::new(),
@@ -48,8 +49,8 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
     let has_untracked_files = files.iter().any(|f| f.status == GitFileStatus::Untracked);
     tracing::debug!(
         files = files.len(),
-        scan_ms = scan_elapsed.as_millis() as u64,
-        total_ms = started.elapsed().as_millis() as u64,
+        scan_ms = u64::try_from(scan_elapsed.as_millis()).unwrap_or(u64::MAX),
+        total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "status: working-tree status scan"
     );
     Ok(GitStatus {
@@ -65,6 +66,7 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
 
 /// Mirror `git branch --show-current`: the branch shorthand, empty on a detached
 /// HEAD, and the unborn branch name when there is no commit yet.
+#[must_use]
 pub fn current_branch(repo: &Repository) -> String {
     match repo.head() {
         Ok(head) if head.is_branch() => head.shorthand().unwrap_or("").to_string(),
@@ -81,6 +83,7 @@ pub fn current_branch(repo: &Repository) -> String {
 /// Path-based convenience over [`current_branch`]: open the repository at
 /// `worktree_path` and return its checked-out branch. `None` when the repo
 /// cannot be opened or `HEAD` is not a branch (detached / unborn).
+#[must_use]
 pub fn current_branch_at(worktree_path: &Path) -> Option<String> {
     let repo = Repository::open(worktree_path).ok()?;
     let name = current_branch(&repo);
@@ -109,7 +112,10 @@ fn ahead_behind(repo: &Repository, branch: &str) -> (i64, i64) {
         return (0, 0);
     };
     match repo.graph_ahead_behind(local, upstream) {
-        Ok((a, b)) => (a as i64, b as i64),
+        Ok((a, b)) => (
+            i64::try_from(a).expect("value fits in i64"),
+            i64::try_from(b).expect("value fits in i64"),
+        ),
         Err(_) => (0, 0),
     }
 }

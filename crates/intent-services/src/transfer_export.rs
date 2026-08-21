@@ -494,7 +494,8 @@ impl Services {
             )));
         }
         let offset = seq * max_chunk as u64;
-        let len = (size_bytes - offset).min(max_chunk as u64) as usize;
+        let len = usize::try_from((size_bytes - offset).min(max_chunk as u64))
+            .expect("value fits in usize");
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let mut file = std::fs::File::open(&archive_path)
                 .map_err(|e| Error::Internal(format!("open export archive failed: {e}")))?;
@@ -1057,7 +1058,8 @@ mod tests {
             .expect("start");
         let export_id = started["exportId"].as_str().expect("exportId").to_string();
         assert_eq!(
-            started["maxChunkBytes"].as_u64().unwrap() as usize,
+            usize::try_from(started["maxChunkBytes"].as_u64().unwrap())
+                .expect("value fits in usize"),
             EXPORT_MAX_CHUNK_BYTES
         );
         assert!(wait_ready(&svc, &export_id).await, "build must succeed");

@@ -85,8 +85,7 @@ pub async fn eval(
             let out: Result<serde_json::Value, RunErr> = ctx
                 .async_with(async |ctx| {
                     if let Some(h) = host_for_bind {
-                        bind_host(ctx.clone(), h)
-                            .map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
+                        bind_host(&ctx, h).map_err(|e| RunErr::Engine(stringify_js_err(e)))?;
                     }
                     run_user_code(ctx, &code_owned).await
                 })
@@ -127,7 +126,7 @@ fn stringify_js_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn bind_host<'js>(ctx: rquickjs::Ctx<'js>, host: HostFn) -> rquickjs::Result<()> {
+fn bind_host<'js>(ctx: &rquickjs::Ctx<'js>, host: HostFn) -> rquickjs::Result<()> {
     let host_arc = host;
     let host_raw = Function::new(
         ctx.clone(),

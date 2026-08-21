@@ -185,6 +185,7 @@ pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) 
 /// into base + reasoning effort; the base is written as `model`, and the effort
 /// (from the model id, else the `env_effort` fallback) as `model_reasoning_effort`.
 /// `env_effort` is supplied by the spawn layer (e.g. `CODEX_REASONING_EFFORT`).
+#[must_use]
 pub fn apply_codex_config_args(
     args: Vec<String>,
     raw_model: Option<&str>,
@@ -239,6 +240,7 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 /// `mcp_config_json` must be a serialized JSON object in the `OpenCode` `mcp`
 /// config shape (see `to_opencode_mcp_config` in `intent-acp`); it is spliced
 /// in verbatim. Providers that don't take env config ignore it.
+#[must_use]
 pub fn build_provider_env(
     config: &ProviderConfig,
     model: Option<&str>,
@@ -259,6 +261,7 @@ pub fn build_provider_env(
 /// (managed-server lifecycle not yet run) the unsloth child spawns with
 /// permission-only config and no provider block. Every other provider
 /// ignores `unsloth_endpoint`.
+#[must_use]
 pub fn build_provider_env_with_unsloth(
     config: &ProviderConfig,
     model: Option<&str>,
@@ -498,6 +501,7 @@ const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
 /// `#!/usr/bin/env node` shebang resolves the right `node`. Entries are
 /// de-duplicated while preserving order. Port of the `getAuggieExecPATH` behavior
 /// (generalized across providers).
+#[must_use]
 pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
     enhanced_path_with(
         provider_binary,

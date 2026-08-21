@@ -409,7 +409,8 @@ async fn agent_features_settings_round_trip() {
 
     let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"].as_str().expect("fp");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let mut ws = wss_connect(port, client_config(fp)).await;
 
     let mut id = 100;
@@ -487,7 +488,8 @@ async fn agent_features_gate_new_sessions_only() {
 
     let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"].as_str().expect("fp");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(fp);
 
     // Subscriber conn — before any agent activity.
@@ -972,7 +974,8 @@ async fn specialist_model_options_surface_in_bridge_description() {
 
     let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"].as_str().expect("fp");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(fp);
 
     let mut sub = wss_connect(port, cfg.clone()).await;

@@ -283,7 +283,8 @@ async fn repo_config_wss_e2e() {
 
     // Get server fingerprint and port
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().unwrap() as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().unwrap()).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .unwrap()

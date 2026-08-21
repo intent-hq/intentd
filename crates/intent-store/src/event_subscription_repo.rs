@@ -53,7 +53,7 @@ impl Store {
         .bind(&s.workspace_id.0)
         .bind(&s.subscriber_agent_id.0)
         .bind(event_types)
-        .bind(s.exclude_self as i64)
+        .bind(i64::from(s.exclude_self))
         .bind(s.batch_window_ms)
         .bind(&s.created_at)
         .execute(self.write_pool())

@@ -61,7 +61,9 @@ pub(crate) fn parse_max_terms_setting(raw: Option<&str>) -> usize {
         Some(s) => serde_json::from_str::<serde_json::Value>(s)
             .ok()
             .and_then(|v| v.as_u64())
-            .map_or(DEFAULT_MAX_TERMS, |n| n as usize),
+            .map_or(DEFAULT_MAX_TERMS, |n| {
+                usize::try_from(n).expect("value fits in usize")
+            }),
     }
 }
 
@@ -84,6 +86,8 @@ pub(crate) async fn resolve_max_terms(store: &Store) -> usize {
 /// (the settings service returns numbers as JSON floats): a non-negative
 /// finite number is truncated and honored (`0` disables derivation); absent
 /// or malformed degrades to [`DEFAULT_MAX_TERMS`] — never an error.
+// Guarded finite + non-negative; the float→int cast saturates at usize::MAX.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn parse_max_terms_value(value: Option<&serde_json::Value>) -> usize {
     value
         .and_then(serde_json::Value::as_f64)

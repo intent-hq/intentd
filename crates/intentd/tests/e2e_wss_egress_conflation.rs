@@ -166,7 +166,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(api, bus.clone(), &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
@@ -252,10 +252,10 @@ async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
     // connection's outbound lane fill up, engaging the conflating forwarder.
     let mut expected: Vec<u8> = Vec::with_capacity(CHUNKS * CHUNK_BYTES);
     for i in 0..CHUNKS {
-        let byte = (i % 251) as u8;
+        let byte = u8::try_from(i % 251).expect("< 251");
         let chunk = vec![byte; CHUNK_BYTES];
         expected.extend_from_slice(&chunk);
-        fx.bus.publish_transient(&terminal_event(
+        let _ = fx.bus.publish_transient(&terminal_event(
             ws_id,
             "terminal:data",
             json!({ "terminalId": "t-1", "chunk": BASE64.encode(&chunk) }),
@@ -264,7 +264,7 @@ async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
         // in-daemon publishers do.
         tokio::task::yield_now().await;
     }
-    fx.bus.publish_transient(&terminal_event(
+    let _ = fx.bus.publish_transient(&terminal_event(
         ws_id,
         "terminal:exit",
         json!({ "terminalId": "t-1", "exitCode": 0 }),

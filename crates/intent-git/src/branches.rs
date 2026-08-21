@@ -87,7 +87,10 @@ fn ahead_behind_vs_origin(repo: &Repository, branch_name: &str) -> (i64, i64) {
         return (0, 0);
     };
     match repo.graph_ahead_behind(local, upstream) {
-        Ok((a, b)) => (a as i64, b as i64),
+        Ok((a, b)) => (
+            i64::try_from(a).expect("value fits in i64"),
+            i64::try_from(b).expect("value fits in i64"),
+        ),
         Err(_) => (0, 0),
     }
 }

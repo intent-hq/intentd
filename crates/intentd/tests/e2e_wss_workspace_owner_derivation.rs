@@ -94,7 +94,8 @@ async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let fp_hex = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");
-    let port = status["result"]["port"].as_u64().expect("bound port") as u16;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("bound port"))
+        .expect("value fits in u16");
     let cfg = client_config(fp_hex);
     let scratch = root.join("scratch");
     std::fs::create_dir_all(&scratch).expect("mkdir scratch");

@@ -262,7 +262,8 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     assert!(await_uds(&socket).await, "daemon did not start");
     let status =
         common::await_wss_status_logged(&socket, &daemon.data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

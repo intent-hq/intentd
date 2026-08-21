@@ -333,6 +333,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 /// virtual scope for Chief-of-Staff agents that never appears in
 /// `workspace.list` and is never persisted, but `workspace.get` returns
 /// this shape and `agent.create` accepts its id as the workspace scope.
+#[must_use]
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
@@ -406,6 +407,7 @@ impl UsageCost {
     /// an accepted consequence of storing a single figure — a cross-currency
     /// numeric comparison is semantically meaningless and the daemon never
     /// invents a conversion rate.
+    #[must_use]
     pub fn merge(lhs: Option<&UsageCost>, rhs: Option<&UsageCost>) -> Option<UsageCost> {
         match (lhs, rhs) {
             (None, None) => None,
@@ -446,6 +448,8 @@ pub struct TokenUsageTotals {
     pub cost: Option<UsageCost>,
 }
 
+// serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -473,6 +477,7 @@ impl TokenUsageTotals {
 /// the end-of-turn token report. Shared by the store's usage-row fetch (which
 /// hydrates message contents only for fallback sessions, monorepo#738) and the
 /// tally itself, so the two decisions can never drift apart.
+#[must_use]
 pub fn token_usage_reported(
     baseline: Option<&TokenUsageTotals>,
     snapshot: Option<&TokenUsageTotals>,
@@ -677,6 +682,7 @@ pub struct WorkspaceTaskStats {
 /// (`TASK_LINK_REGEX_FLEXIBLE`). Shared by the enriched `taskStats` path
 /// (intent-services `compute_task_stats`) and the cheap store-level counting
 /// query (`Store::count_task_stats`) so the two stay in lock-step.
+#[must_use]
 pub fn extract_spec_task_ids(content: &str) -> std::collections::HashSet<String> {
     const MARKER: &str = "(intent://local/task/";
     let mut ids = std::collections::HashSet::new();
@@ -994,6 +1000,7 @@ pub struct NoteMetadata {
 impl NoteMetadata {
     /// True when no metadata field is populated; used by [`Note`]'s
     /// `skip_serializing_if` so plain notes omit the `metadata` key entirely.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.task.is_none()
     }
@@ -1850,6 +1857,7 @@ pub struct CommentWire {
 
 impl CommentWire {
     /// Map a stored [`Comment`] to its nested wire shape.
+    #[must_use]
     pub fn from_comment(c: &Comment) -> Self {
         let anchor_context = match (&c.anchor_before, &c.anchor_after) {
             (None, None) => None,
@@ -2268,6 +2276,7 @@ pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
 /// and passes through). Shared by the serve-time slim projection
 /// (intent-services `tool_block`) and the write-time `lastToolUse` preview
 /// (intent-store, [`last_tool_use_preview`]).
+#[must_use]
 pub fn slim_body_size(body: &serde_json::Value) -> usize {
     struct CountingSink(usize);
     impl std::io::Write for CountingSink {
@@ -2498,6 +2507,7 @@ pub enum MessageOrigin {
 
 impl MessageOrigin {
     /// `true` for [`MessageOrigin::User`].
+    #[must_use]
     pub fn is_user(self) -> bool {
         matches!(self, MessageOrigin::User)
     }
@@ -3227,6 +3237,7 @@ pub enum BatchTaskEntry {
 
 impl BatchTaskEntry {
     /// The task-note id this entry addresses, regardless of shape.
+    #[must_use]
     pub fn task_note_id(&self) -> &NoteId {
         match self {
             BatchTaskEntry::Id(id) => id,
@@ -3833,7 +3844,10 @@ mod tests {
         let preview = last_tool_use_preview(&big).unwrap();
         assert_eq!(preview["name"], "write_file");
         assert_eq!(preview["inputTruncated"], true);
-        assert!(preview["inputBytes"].as_u64().unwrap() as usize > SLIM_PROJECTION_BUDGET_BYTES);
+        assert!(
+            usize::try_from(preview["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
+                > SLIM_PROJECTION_BUDGET_BYTES
+        );
         assert_eq!(preview["input"]["path"], "/tmp/a.txt");
         let served = serde_json::to_string(&preview["input"]).unwrap();
         assert!(

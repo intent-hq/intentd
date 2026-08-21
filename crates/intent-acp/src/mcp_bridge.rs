@@ -88,11 +88,13 @@ pub struct McpBridge {
 
 impl McpBridge {
     /// The bound loopback address (`127.0.0.1:<ephemeral-port>`).
+    #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
     /// The address as a `host:port` string for the bridge subcommand args.
+    #[must_use]
     pub fn connect_addr(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
     }
@@ -269,7 +271,7 @@ async fn serve_connection<S: BridgeDispatch>(
                                 dispatch.0.abort();
                                 tracing::warn!(
                                     %method,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                                     "mcp bridge dispatch exceeded watchdog deadline; aborted and synthesized timeout error"
                                 );
                                 if let Some(id) = id {

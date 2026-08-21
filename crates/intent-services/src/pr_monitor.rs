@@ -149,7 +149,7 @@ pub(crate) async fn fetch_shared_snapshot(
     let (pr, requirements, review_comment_count) =
         pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     let conversation_count = match sc.list_comments(repo_ref, number).await {
-        Ok(comments) => Some(comments.len() as i64),
+        Ok(comments) => Some(i64::try_from(comments.len()).expect("value fits in i64")),
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -337,7 +337,7 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
     );
     PullRequestInfo {
         id: m.pr_number.to_string(),
-        number: m.pr_number as u64,
+        number: m.pr_number.cast_unsigned(),
         url,
         title,
         status,
@@ -531,7 +531,7 @@ impl Services {
     ) -> Result<(PrMonitor, MergeRequirements)> {
         let existing = self
             .store
-            .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number as i64)
+            .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
             .await?;
         if existing.is_none() {
             let cap = self.pr_monitors_max_per_agent as usize;
@@ -566,7 +566,7 @@ impl Services {
                 agent_id: agent_id.clone(),
                 repo_owner: repo_owner.to_string(),
                 repo_name: repo_name.to_string(),
-                pr_number: pr_number as i64,
+                pr_number: pr_number.cast_signed(),
                 state: PrMonitorState::Active,
                 last_snapshot: baseline.clone(),
                 baseline_snapshot: baseline.clone(),
@@ -582,7 +582,7 @@ impl Services {
                 monitor = Some(m);
             } else if let Some(winner) = self
                 .store
-                .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number as i64)
+                .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
                 .await?
             {
                 // Lost an insert race against a concurrent register of the
@@ -943,7 +943,9 @@ impl Services {
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
         let shared =
-            match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64).await {
+            match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number.cast_unsigned())
+                .await
+            {
                 Ok(shared) => shared,
                 Err(e) => {
                     self.record_pr_monitor_error(&monitor, &e.to_string()).await;
@@ -966,6 +968,7 @@ impl Services {
     /// Spawn the ONE centralized poll loop: every `[prMonitor] pollSeconds`
     /// (re-read each tick), poll every DUE active monitor. Returns the task
     /// handle so the composition root can hold/abort it.
+    #[must_use]
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         tokio::spawn(async move {
@@ -1050,7 +1053,11 @@ impl Services {
                     // wedging the sweep for every other monitor.
                     let fetched = match tokio::time::timeout(
                         self.pr_monitor_fetch_timeout,
-                        fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64),
+                        fetch_shared_snapshot(
+                            sc.as_ref(),
+                            &repo_ref,
+                            monitor.pr_number.cast_unsigned(),
+                        ),
                     )
                     .await
                     {
@@ -1102,7 +1109,8 @@ impl Services {
         let Some(at) = monitor.last_polled_at.as_deref().and_then(parse_iso) else {
             return false;
         };
-        let interval = time::Duration::seconds(self.pr_monitor_poll_interval().as_secs() as i64);
+        let interval =
+            time::Duration::seconds(self.pr_monitor_poll_interval().as_secs().cast_signed());
         time::OffsetDateTime::now_utc() - at < interval
     }
 
@@ -1277,7 +1285,7 @@ impl Services {
     /// An unparseable/absent anchor emits immediately rather than stranding
     /// a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
-        let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs() as i64);
+        let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs().cast_signed());
         let now = time::OffsetDateTime::now_utc();
         if let Some(since) = monitor.pending_since.as_deref().and_then(parse_iso) {
             if now - since >= window * PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR {
@@ -1660,7 +1668,7 @@ impl Services {
         let (owner, name) = self.resolve_monitor_repo(workspace_id, repo).await?;
         let existing = self
             .store
-            .find_active_pr_monitor(agent_id, &owner, &name, pr_number as i64)
+            .find_active_pr_monitor(agent_id, &owner, &name, pr_number.cast_signed())
             .await?
             .ok_or_else(|| {
                 Error::NotFound(format!(

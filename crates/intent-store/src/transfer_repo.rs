@@ -442,7 +442,7 @@ fn bind_json_value<'q>(
 ) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
     Ok(match value {
         serde_json::Value::Null => query.bind(Option::<String>::None),
-        serde_json::Value::Bool(b) => query.bind(*b as i64),
+        serde_json::Value::Bool(b) => query.bind(i64::from(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 query.bind(i)
@@ -503,6 +503,8 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
+// Byte extraction from a 24-bit accumulator: truncation is the point.
+#[allow(clippy::cast_possible_truncation)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {

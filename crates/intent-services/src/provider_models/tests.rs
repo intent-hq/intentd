@@ -1408,6 +1408,8 @@ fn parse_param_count_billions_handles_dense_and_moe_names() {
 }
 
 #[test]
+// Small test constants: float→int casts are exact and saturating.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn fits_within_ram_applies_the_seventy_percent_threshold() {
     // A 20B dense model: ~20e9 * 0.6 + 1GiB headroom ≈ 12.99 GB. Comfortably
     // under 70% of 32 GiB (~22.4 GB).
@@ -1422,6 +1424,12 @@ fn fits_within_ram_applies_the_seventy_percent_threshold() {
 }
 
 #[test]
+// Small test constants: float↔int casts are exact and saturating.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn gguf_bytes_fit_within_ram_shares_the_catalog_budget() {
     // 15 GB of weights + 1 GiB headroom ≈ 16.07 GB, under 70% of 32 GiB
     // (~24.05 GB) but over 70% of 16 GiB (~12.03 GB).

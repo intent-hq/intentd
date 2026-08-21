@@ -959,7 +959,7 @@ impl Harness for V1 {
             "[PR monitor {label}] {} change{} detected on \"{}\" ({}):\n{bullets}\n\nWhere the PR \
              stands now:\n{}",
             changes.len(),
-            plural(changes.len() as i64),
+            plural(i64::try_from(changes.len()).expect("value fits in i64")),
             snapshot.title,
             snapshot.url,
             self.pr_checklist(snapshot)

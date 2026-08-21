@@ -138,6 +138,8 @@ async fn rpc(
 
 /// Test that server.wsApi.port setting exists and can be read/updated
 #[tokio::test]
+// Port values are small whole-valued floats: casts are exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn port_setting_crud() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -217,6 +219,8 @@ async fn port_setting_crud() {
 
 /// Test that changing port while listener is running triggers restart
 #[tokio::test]
+// Port values are small whole-valued floats: casts are exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn port_change_restarts_listener() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");

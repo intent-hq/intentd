@@ -24,7 +24,7 @@ use intent_store::Store;
 
 const SESSION_ID: &str = "mock-session-1";
 
-fn workspace(id: &WorkspaceId, path: std::path::PathBuf) -> Workspace {
+fn workspace(id: &WorkspaceId, path: &std::path::Path) -> Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
@@ -101,7 +101,7 @@ async fn setup_manager(
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root.clone()))
         .await
         .expect("insert ws");
 

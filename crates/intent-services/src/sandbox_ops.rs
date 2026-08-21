@@ -39,7 +39,7 @@ async fn apply_test_provision_hooks() -> Result<()> {
         test_provision_delay_from(std::env::var(TEST_PROVISION_DELAY_MS_ENV).ok().as_deref())
     {
         tracing::warn!(
-            delay_ms = delay.as_millis() as u64,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             "provision_sandbox: artificial delay (test seam)"
         );
         tokio::time::sleep(delay).await;

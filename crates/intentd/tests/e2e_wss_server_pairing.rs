@@ -217,7 +217,8 @@ async fn boot(data_dir: &Path) -> (u16, String) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -241,7 +242,7 @@ async fn server_pairing_info_over_uds() {
 
     assert_eq!(result["token"].as_str().unwrap(), TOKEN);
     assert_eq!(result["certFingerprint"].as_str().unwrap(), fp);
-    assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["path"].as_str().unwrap(), "/ws");
     assert!(result["localIps"].is_array());
     assert!(result["hostname"].is_string());
@@ -310,7 +311,7 @@ async fn pairing_get_info_over_uds() {
 
     assert_eq!(result["token"].as_str().unwrap(), TOKEN);
     assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
-    assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["version"].as_u64().unwrap(), 1);
     assert!(result["hosts"].is_array());
 
@@ -364,7 +365,7 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
             !hosts.contains(&"127.0.0.1".to_string()),
             "wide bind must not advertise loopback: {hosts:?}"
         );
-        assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+        assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
         assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
     } else {
         let error = &response["error"];

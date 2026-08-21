@@ -765,6 +765,8 @@ fn memory_budget_max_mb() -> f64 {
 /// clients a value is settable that the write path refuses. Clamping keeps the
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
         // INVARIANT: this bound may be tighter than the `config.toml` parse
@@ -1337,8 +1339,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Daemon-wide cap on concurrently live ephemeral ACP adapters (one-shot completions and model probes). Each costs ~610 MB and holds no agent slot; over-limit calls queue and fail with error.data.code \"adapter-busy\" if their own timeout expires first (changes apply on daemon restart)",
             "agents",
             Some(1.0),
-            Some(intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT as f64),
-            intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS as f64,
+            Some(f64::from(intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT)),
+            f64::from(intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS),
         ),
         number(
             "agents.idleReapMinutes",
@@ -1347,7 +1349,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agents",
             Some(0.0),
             None,
-            intent_core::config::DEFAULT_IDLE_REAP_MINUTES as f64,
+            f64::from(intent_core::config::DEFAULT_IDLE_REAP_MINUTES),
         ),
         enumerated(
             "agents.flushQueuedMessages",
@@ -1512,6 +1514,7 @@ pub(crate) fn worktrees_location(settings: &SettingsFile) -> String {
 /// explicit cap; 0 (the default) means "auto" (RAM-based cap via
 /// `default_process_cap`). The typed schema already rejects negative /
 /// out-of-range / garbled values.
+#[must_use]
 pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
     let n = settings.agents.max_concurrent;
     (n > 0).then_some(n as usize)
@@ -1522,13 +1525,14 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// explicit `0` is off; an absent key (`None`, the default) resolves to the
 /// recommended budget derived from `total_memory_bytes`
 /// ([`intent_services::recommended_memory_budget_bytes`]).
+#[must_use]
 pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u64) -> Option<u64> {
     match settings.agents.memory_budget_mb {
         None => Some(crate::agent_manager::recommended_memory_budget_bytes(
             total_memory_bytes,
         )),
         Some(0) => None,
-        Some(mb) => Some(mb as u64 * 1024 * 1024),
+        Some(mb) => Some(u64::from(mb) * 1024 * 1024),
     }
 }
 
@@ -1538,6 +1542,7 @@ pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u6
 /// yields a usable bound — a `0` that predates the schema bound (or survived a
 /// hand-edited file) falls back to the default rather than admitting an
 /// unbounded spawn.
+#[must_use]
 pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
     let n = settings.agents.max_concurrent_adapters;
     if n == 0 {
@@ -1738,6 +1743,9 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 /// floats become integers so `u16`/`u32` fields (e.g. `server.port`) accept
 /// the `5182.0` shape JSON clients commonly send. Float fields re-accept
 /// integers via the schema's lenient deserializer.
+// The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
+// i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
@@ -2518,6 +2526,8 @@ mod tests {
     /// demonstrates the tighter-than case only exists on a seat smaller than
     /// the parse bound, which is every real one but need not be assumed.
     #[test]
+    // The advertised max is a small whole-valued float: casts are exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
         let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
         let max = memory_budget_max_mb();

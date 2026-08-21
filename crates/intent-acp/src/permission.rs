@@ -110,6 +110,7 @@ pub enum PermissionOutcome {
 impl PermissionOutcome {
     /// The `RequestPermissionResponse` body returned to the agent over ACP
     /// (`{ outcome: { outcome: "selected", optionId } }` or `{ outcome: "cancelled" }`).
+    #[must_use]
     pub fn to_response_value(&self) -> Value {
         json!({ "outcome": self.to_event_value() })
     }
@@ -195,6 +196,7 @@ impl Default for PermissionRegistry {
 
 impl PermissionRegistry {
     /// A registry with the default 5-minute prompt timeout.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_timeout(DEFAULT_PERMISSION_TIMEOUT)
     }
@@ -361,7 +363,7 @@ fn now_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

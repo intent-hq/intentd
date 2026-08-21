@@ -160,12 +160,14 @@ fn capture(duration_ms: i64, frequency_hz: i64) -> Result<serde_json::Value> {
     // Blocklist per pprof guidance: unwinding through these from the signal
     // handler risks deadlocks on their internal locks.
     let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(frequency_hz as i32)
+        .frequency(i32::try_from(frequency_hz).expect("frequency clamped to [1, 250]"))
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
         .map_err(|e| Error::Internal(format!("failed to start stack sampler: {e}")))?;
 
-    std::thread::sleep(std::time::Duration::from_millis(duration_ms as u64));
+    std::thread::sleep(std::time::Duration::from_millis(
+        duration_ms.cast_unsigned(),
+    ));
 
     let report = guard
         .report()

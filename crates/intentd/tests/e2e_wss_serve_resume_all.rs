@@ -283,7 +283,7 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         #[cfg(not(unix))]
@@ -434,7 +434,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
 
     // Get system status to retrieve port and fingerprint for WSS
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -581,7 +582,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
     eprintln!("Setting agents.resumeInterruptedOnStart=on over WSS");
     {
         let status = common::await_wss_status(&socket).await;
-        let port = status["result"]["port"].as_u64().expect("port") as u16;
+        let port = u16::try_from(status["result"]["port"].as_u64().expect("port"))
+            .expect("value fits in u16");
         let fingerprint = status["result"]["fingerprint"]
             .as_str()
             .expect("fingerprint")
@@ -645,7 +647,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
     assert!(await_uds(&socket).await, "daemon2 did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

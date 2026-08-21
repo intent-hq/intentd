@@ -107,7 +107,7 @@ pub(crate) async fn handle(
             return None;
         }
         return Some(error_frame(
-            req.id_echo,
+            &req.id_echo,
             -32001,
             "pairing.getInfo is local-only",
         ));
@@ -117,17 +117,17 @@ pub(crate) async fn handle(
         return None;
     }
     match result {
-        Ok(v) => Some(success_frame(req.id_echo, v)),
+        Ok(v) => Some(success_frame(&req.id_echo, &v)),
         // Listener-down carries the machine-readable discriminator
         // `error.data.code = "listener-down"` so `intentd pair` auto-enable
         // stops depending on message prose (monorepo#1822).
         Err(e @ Error::ListenerDown) => Some(error_frame_with_data(
-            req.id_echo,
+            &req.id_echo,
             e.code(),
             &e.to_string(),
-            json!({ "code": "listener-down" }),
+            &json!({ "code": "listener-down" }),
         )),
-        Err(e) => Some(error_frame(req.id_echo, e.code(), &e.to_string())),
+        Err(e) => Some(error_frame(&req.id_echo, e.code(), &e.to_string())),
     }
 }
 

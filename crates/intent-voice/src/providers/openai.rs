@@ -67,11 +67,7 @@ impl OpenAiEngine {
     }
 
     /// Build the multipart form for one attempt (forms are not cloneable).
-    fn build_form(
-        &self,
-        request: &TranscribeRequest,
-        model: &str,
-    ) -> Result<reqwest::multipart::Form> {
+    fn build_form(request: &TranscribeRequest, model: &str) -> Result<reqwest::multipart::Form> {
         let file_name = super::elevenlabs::file_name_for(&request.mime_type);
         let part = reqwest::multipart::Part::bytes(request.audio.clone())
             .file_name(file_name)
@@ -93,7 +89,7 @@ impl OpenAiEngine {
     /// One transcription attempt against `model`.
     async fn attempt(&self, request: &TranscribeRequest, model: &str) -> Result<Transcript> {
         let url = format!("{}/v1/audio/transcriptions", self.base_url);
-        let form = self.build_form(request, model)?;
+        let form = Self::build_form(request, model)?;
         let resp = self
             .http
             .post(&url)
@@ -124,7 +120,12 @@ impl OpenAiEngine {
         let duration_ms = body
             .get("duration")
             .and_then(Value::as_f64)
-            .map(|secs| (secs * 1000.0) as u64);
+            // Float→int casts saturate; durations are non-negative seconds.
+            .map(|secs| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = (secs * 1000.0) as u64;
+                ms
+            });
         Ok(Transcript { text, duration_ms })
     }
 }

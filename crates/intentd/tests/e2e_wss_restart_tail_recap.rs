@@ -481,7 +481,8 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(&fp);
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
     let mut ws = common::wss_connect_with_retry(port, cfg, &url).await;

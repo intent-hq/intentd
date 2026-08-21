@@ -47,6 +47,7 @@ pub struct ReverseChannel {
 impl ReverseChannel {
     /// Build a channel that pushes reverse requests through `out_tx` (the
     /// connection's outbound frame queue).
+    #[must_use]
     pub fn new(out_tx: mpsc::Sender<String>) -> Self {
         Self {
             out_tx,

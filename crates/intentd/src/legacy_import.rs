@@ -651,7 +651,7 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     let reason = if e.is_panic() {
-                        format!("import panicked: {}", panic_message(e.into_panic()))
+                        format!("import panicked: {}", panic_message(&e.into_panic()))
                     } else {
                         "import task cancelled".to_string()
                     };
@@ -685,7 +685,7 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
 
 /// Best-effort human-readable panic payload (`panic!` carries `&str` or
 /// `String` in practice).
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -2270,7 +2270,7 @@ mod tests {
 
     /// Write `<root>/<id>/.workspace/workspace.json` with `extra` fields merged
     /// over a minimal legacy manifest (including the FE-only legacy arrays).
-    fn write_legacy_workspace(root: &Path, id: &str, extra: Value) -> PathBuf {
+    fn write_legacy_workspace(root: &Path, id: &str, extra: &Value) -> PathBuf {
         let dir = root.join(id);
         let ws_dir = dir.join(".workspace");
         std::fs::create_dir_all(&ws_dir).unwrap();
@@ -2351,11 +2351,11 @@ mod tests {
     #[tokio::test]
     async fn imports_legacy_workspaces_and_drops_legacy_fields() {
         let (root, _root_g) = temp_root("import");
-        write_legacy_workspace(&root, "ws-a", json!({}));
+        write_legacy_workspace(&root, "ws-a", &json!({}));
         write_legacy_workspace(
             &root,
             "ws-b",
-            json!({"archived": true, "archivedAt": "2025-06-01T00:00:00Z"}),
+            &json!({"archived": true, "archivedAt": "2025-06-01T00:00:00Z"}),
         );
         // Entries without .workspace/workspace.json are ignored.
         std::fs::create_dir_all(root.join("not-a-workspace")).unwrap();
@@ -2386,7 +2386,7 @@ mod tests {
     #[tokio::test]
     async fn publishes_workspace_created_only_for_fresh_inserts() {
         let (root, _root_g) = temp_root("created-events");
-        write_legacy_workspace(&root, "ws-evt", json!({}));
+        write_legacy_workspace(&root, "ws-evt", &json!({}));
         let (store, _db_g) = open_store().await;
         let bus = EventBus::new(store.clone());
         let mut sub = bus.subscribe(intent_services::SubscriptionFilter {
@@ -2429,7 +2429,7 @@ mod tests {
         let ws_dir = write_legacy_workspace(
             &root,
             "ws-setup-script",
-            json!({"setupScript": "#!/bin/bash\nset -e\nnpm install\n"}),
+            &json!({"setupScript": "#!/bin/bash\nset -e\nnpm install\n"}),
         );
         write_legacy_note(
             &ws_dir,
@@ -2468,7 +2468,7 @@ mod tests {
             ("evil-e", ".."),
             ("evil-f", "."),
         ] {
-            let dir = write_legacy_workspace(&root, dir_name, json!({ "id": hostile_id }));
+            let dir = write_legacy_workspace(&root, dir_name, &json!({ "id": hostile_id }));
             // Give each one an asset so a missed guard would attempt a copy.
             let assets_dir = dir.join(".workspace").join("assets");
             std::fs::create_dir_all(&assets_dir).unwrap();
@@ -2515,7 +2515,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_reports_plan_without_writing() {
         let (root, _root_g) = temp_root("dry");
-        write_legacy_workspace(&root, "ws-dry", json!({}));
+        write_legacy_workspace(&root, "ws-dry", &json!({}));
         let (store, _db_g) = open_store().await;
 
         let report = run(
@@ -2536,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn existing_ids_are_skipped_unless_forced() {
         let (root, _root_g) = temp_root("idem");
-        write_legacy_workspace(&root, "ws-x", json!({"title": "Old title"}));
+        write_legacy_workspace(&root, "ws-x", &json!({"title": "Old title"}));
         let (store, _db_g) = open_store().await;
         run(&store, &opts(vec![root.clone()])).await.unwrap();
 
@@ -2547,7 +2547,7 @@ mod tests {
         assert!(report.to_string().contains("already in DB"), "{report}");
 
         // --force overwrites the existing row.
-        write_legacy_workspace(&root, "ws-x", json!({"title": "New title"}));
+        write_legacy_workspace(&root, "ws-x", &json!({"title": "New title"}));
         let report = run(
             &store,
             &Options {
@@ -2574,12 +2574,12 @@ mod tests {
         write_legacy_workspace(
             &root,
             "ws-live",
-            json!({"worktreePath": live_dir.to_string_lossy(), "skipWorktree": false}),
+            &json!({"worktreePath": live_dir.to_string_lossy(), "skipWorktree": false}),
         );
         write_legacy_workspace(
             &root,
             "ws-gone",
-            json!({"worktreePath": "/nonexistent/legacy/worktree", "skipWorktree": false}),
+            &json!({"worktreePath": "/nonexistent/legacy/worktree", "skipWorktree": false}),
         );
         let (store, _db_g) = open_store().await;
         run(&store, &opts(vec![root.clone()])).await.unwrap();
@@ -2607,9 +2607,9 @@ mod tests {
     async fn skips_chief_duplicates_and_malformed_manifests() {
         let (root_a, _root_a_g) = temp_root("roots-a");
         let (root_b, _root_b_g) = temp_root("roots-b");
-        write_legacy_workspace(&root_a, "__chief__", json!({}));
-        write_legacy_workspace(&root_a, "ws-dup", json!({"title": "From root A"}));
-        write_legacy_workspace(&root_b, "ws-dup", json!({"title": "From root B"}));
+        write_legacy_workspace(&root_a, "__chief__", &json!({}));
+        write_legacy_workspace(&root_a, "ws-dup", &json!({"title": "From root A"}));
+        write_legacy_workspace(&root_b, "ws-dup", &json!({"title": "From root B"}));
         let broken = root_a.join("ws-broken").join(".workspace");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("workspace.json"), "{ nope").unwrap();
@@ -2635,7 +2635,7 @@ mod tests {
     #[tokio::test]
     async fn first_boot_hook_imports_once_and_writes_marker() {
         let (root, _root_g) = temp_root("boot");
-        write_legacy_workspace(&root, "ws-boot", json!({}));
+        write_legacy_workspace(&root, "ws-boot", &json!({}));
         let (store, _db_g) = open_store().await;
 
         // Fresh DB, no marker → import runs and the completion marker is
@@ -2654,7 +2654,7 @@ mod tests {
             .is_none());
 
         // Marker present → the hook is a no-op even on a "fresh" DB signal.
-        write_legacy_workspace(&root, "ws-later", json!({}));
+        write_legacy_workspace(&root, "ws-later", &json!({}));
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
     }
@@ -2667,8 +2667,8 @@ mod tests {
     #[tokio::test]
     async fn first_boot_hook_writes_marker_despite_parse_failure() {
         let (root, _root_g) = temp_root("boot-parse-failure");
-        write_legacy_workspace(&root, "ws-good", json!({}));
-        write_legacy_workspace(&root, "ws-bad", json!({"setupScript": 42}));
+        write_legacy_workspace(&root, "ws-good", &json!({}));
+        write_legacy_workspace(&root, "ws-bad", &json!({"setupScript": 42}));
         let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
@@ -2718,8 +2718,8 @@ mod tests {
     #[tokio::test]
     async fn panicking_workspace_does_not_abort_the_run() {
         let (root, _root_g) = temp_root("panic-isolation");
-        write_legacy_workspace(&root, "ws-a-panics", json!({"__testPanic": true}));
-        write_legacy_workspace(&root, "ws-b-good", json!({}));
+        write_legacy_workspace(&root, "ws-a-panics", &json!({"__testPanic": true}));
+        write_legacy_workspace(&root, "ws-b-good", &json!({}));
         let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
@@ -2745,8 +2745,8 @@ mod tests {
     #[tokio::test]
     async fn first_boot_hook_survives_panicking_workspace_and_writes_marker() {
         let (root, _root_g) = temp_root("boot-panic");
-        write_legacy_workspace(&root, "ws-panics", json!({"__testPanic": true}));
-        write_legacy_workspace(&root, "ws-survives", json!({}));
+        write_legacy_workspace(&root, "ws-panics", &json!({"__testPanic": true}));
+        write_legacy_workspace(&root, "ws-survives", &json!({}));
         let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
@@ -2786,7 +2786,7 @@ mod tests {
     #[tokio::test]
     async fn clean_run_clears_stale_failure_summary() {
         let (root, _root_g) = temp_root("summary-clear");
-        write_legacy_workspace(&root, "ws-flaky", json!({"setupScript": 42}));
+        write_legacy_workspace(&root, "ws-flaky", &json!({"setupScript": 42}));
         let (store, _db_g) = open_store().await;
 
         let first = run(&store, &opts(vec![root.clone()])).await.unwrap();
@@ -2797,7 +2797,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        write_legacy_workspace(&root, "ws-flaky", json!({}));
+        write_legacy_workspace(&root, "ws-flaky", &json!({}));
         let second = run(&store, &opts(vec![root.clone()])).await.unwrap();
         persist_failure_summary(&store, &second).await;
         assert!(store
@@ -2813,8 +2813,8 @@ mod tests {
     #[tokio::test]
     async fn failure_summary_excludes_benign_skips() {
         let (root, _root_g) = temp_root("summary-benign");
-        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
-        write_legacy_workspace(&root, "ws-existing", json!({}));
+        write_legacy_workspace(&root, "ws-managed", &json!({"managedBy": "intentd"}));
+        write_legacy_workspace(&root, "ws-existing", &json!({}));
         let (store, _db_g) = open_store().await;
 
         // Seed ws-existing so the run reports it "already in DB".
@@ -2833,8 +2833,8 @@ mod tests {
     #[tokio::test]
     async fn second_run_recovers_parse_failure_and_skips_existing_workspace() {
         let (root, _root_g) = temp_root("parse-recovery");
-        write_legacy_workspace(&root, "ws-existing", json!({}));
-        write_legacy_workspace(&root, "ws-recovered", json!({"setupScript": 42}));
+        write_legacy_workspace(&root, "ws-existing", &json!({}));
+        write_legacy_workspace(&root, "ws-recovered", &json!({"setupScript": 42}));
         let (store, _db_g) = open_store().await;
 
         let first = run(&store, &opts(vec![root.clone()])).await.unwrap();
@@ -2842,7 +2842,7 @@ mod tests {
         assert!(first.has_compatibility_failures(), "{first}");
         write_completion_marker(&store).await.unwrap();
 
-        write_legacy_workspace(&root, "ws-recovered", json!({}));
+        write_legacy_workspace(&root, "ws-recovered", &json!({}));
         let second = run(&store, &opts(vec![root.clone()])).await.unwrap();
 
         assert_eq!(second.imported(), 1, "{second}");
@@ -2862,8 +2862,8 @@ mod tests {
     #[tokio::test]
     async fn skips_daemon_managed_manifest_without_force() {
         let (root, _root_g) = temp_root("managed");
-        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
-        write_legacy_workspace(&root, "ws-legacy", json!({}));
+        write_legacy_workspace(&root, "ws-managed", &json!({"managedBy": "intentd"}));
+        write_legacy_workspace(&root, "ws-legacy", &json!({}));
         let (store, _db_g) = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
@@ -2885,7 +2885,7 @@ mod tests {
     #[tokio::test]
     async fn first_boot_hook_skips_daemon_managed_manifest_and_writes_marker() {
         let (root, _root_g) = temp_root("boot-managed");
-        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
+        write_legacy_workspace(&root, "ws-managed", &json!({"managedBy": "intentd"}));
         let (store, _db_g) = open_store().await;
 
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
@@ -2901,7 +2901,7 @@ mod tests {
     #[tokio::test]
     async fn force_imports_daemon_managed_manifest() {
         let (root, _root_g) = temp_root("managed-force");
-        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
+        write_legacy_workspace(&root, "ws-managed", &json!({"managedBy": "intentd"}));
         let (store, _db_g) = open_store().await;
 
         let force_opts = Options {
@@ -2924,7 +2924,7 @@ mod tests {
     #[tokio::test]
     async fn first_boot_hook_skips_preexisting_db() {
         let (root, _root_g) = temp_root("boot-existing");
-        write_legacy_workspace(&root, "ws-pre", json!({}));
+        write_legacy_workspace(&root, "ws-pre", &json!({}));
         let (store, _db_g) = open_store().await;
 
         // Pre-existing DB, no pending marker → never imports, and no marker
@@ -2955,7 +2955,7 @@ mod tests {
     #[tokio::test]
     async fn killed_mid_import_resumes_on_next_boot() {
         let (root, _root_g) = temp_root("boot-resume");
-        write_legacy_workspace(&root, "ws-a", json!({}));
+        write_legacy_workspace(&root, "ws-a", &json!({}));
         let (store, _db_g) = open_store().await;
 
         // First boot: fresh DB → Start, and the pending marker is persisted
@@ -2975,7 +2975,7 @@ mod tests {
         // written afterwards to stand in for the part of the legacy tree the
         // interrupted run never reached.
         run(&store, &opts(vec![root.clone()])).await.unwrap();
-        write_legacy_workspace(&root, "ws-b", json!({}));
+        write_legacy_workspace(&root, "ws-b", &json!({}));
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
         assert!(store
             .get_setting(LEGACY_IMPORT_MARKER_KEY)
@@ -3038,7 +3038,7 @@ mod tests {
     #[tokio::test]
     async fn source_is_never_mutated() {
         let (root, _root_g) = temp_root("readonly");
-        write_legacy_workspace(&root, "ws-ro", json!({}));
+        write_legacy_workspace(&root, "ws-ro", &json!({}));
         let manifest = root.join("ws-ro").join(".workspace").join("workspace.json");
         let before = std::fs::read(&manifest).unwrap();
         let (store, _db_g) = open_store().await;
@@ -3050,7 +3050,7 @@ mod tests {
     #[tokio::test]
     async fn imports_notes_with_frontmatter_spec_and_task() {
         let (root, _root_g) = temp_root("notes");
-        let ws_dir = write_legacy_workspace(&root, "ws-notes", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-notes", &json!({}));
         write_legacy_note(
             &ws_dir,
             "spec.md",
@@ -3119,7 +3119,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_note_frontmatter_imports_body_best_effort() {
         let (root, _root_g) = temp_root("notes-malformed");
-        let ws_dir = write_legacy_workspace(&root, "ws-bad-notes", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-bad-notes", &json!({}));
         // Unparseable YAML between valid delimiters: body still lands, with a
         // filename-derived title.
         write_legacy_note(
@@ -3175,7 +3175,7 @@ mod tests {
     #[tokio::test]
     async fn notes_import_is_idempotent_per_note_id() {
         let (root, _root_g) = temp_root("notes-idem");
-        let ws_dir = write_legacy_workspace(&root, "ws-note-idem", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-note-idem", &json!({}));
         write_legacy_note(
             &ws_dir,
             "spec.md",
@@ -3230,7 +3230,7 @@ mod tests {
     #[tokio::test]
     async fn imports_comments_with_threads_anchors_and_extras() {
         let (root, _root_g) = temp_root("comments");
-        let ws_dir = write_legacy_workspace(&root, "ws-comments", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-comments", &json!({}));
         write_legacy_note(&ws_dir, "spec.md", "---\nid: spec\n---\n\nSpec body\n");
         // Realistic legacy sidecar: a root comment with anchor/extras, a reply
         // in the same thread, a suggestion, and one malformed entry (no id).
@@ -3371,7 +3371,7 @@ mod tests {
     #[tokio::test]
     async fn comments_import_is_idempotent_and_survives_malformed_files() {
         let (root, _root_g) = temp_root("comments-idem");
-        let ws_dir = write_legacy_workspace(&root, "ws-c-idem", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-c-idem", &json!({}));
         write_legacy_note(&ws_dir, "spec.md", "---\nid: spec\n---\n\nSpec\n");
         write_legacy_note(&ws_dir, "other.md", "---\nid: other\n---\n\nOther\n");
         write_legacy_meta(
@@ -3507,7 +3507,7 @@ mod tests {
     #[tokio::test]
     async fn imports_agent_transcripts_as_completed_sessions() {
         let (root, _root_g) = temp_root("agents");
-        let ws_dir = write_legacy_workspace(&root, "ws-agents", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-agents", &json!({}));
         write_legacy_agent(
             &ws_dir,
             &format!("{LEGACY_AGENT_ID}.json"),
@@ -3640,7 +3640,7 @@ mod tests {
     #[tokio::test]
     async fn agent_import_is_idempotent_and_mints_ids_for_invalid() {
         let (root, _root_g) = temp_root("agents-idem");
-        let ws_dir = write_legacy_workspace(&root, "ws-agent-idem", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-agent-idem", &json!({}));
         write_legacy_agent(
             &ws_dir,
             "not-a-uuid.json",
@@ -3694,7 +3694,7 @@ mod tests {
     #[tokio::test]
     async fn imported_agent_sessions_are_never_swept_as_interrupted() {
         let (root, _root_g) = temp_root("agents-heal");
-        let ws_dir = write_legacy_workspace(&root, "ws-agent-heal", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-agent-heal", &json!({}));
         // Legacy file frozen mid-flight ("Processing"): imports as Completed.
         write_legacy_agent(
             &ws_dir,
@@ -3726,7 +3726,7 @@ mod tests {
         let (root, _root_g) = temp_root("symlink");
         let (outside, _outside_g) = temp_root("symlink-outside");
         std::fs::write(outside.join("secret.txt"), b"outside-data").unwrap();
-        let ws_dir = write_legacy_workspace(&root, "ws-symlink", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-symlink", &json!({}));
         let assets_dir = ws_dir.join(".workspace").join("assets");
         let notes_dir = ws_dir.join(".workspace").join("notes");
         std::fs::create_dir_all(&assets_dir).unwrap();
@@ -3800,7 +3800,7 @@ mod tests {
     async fn imports_assets_into_workspace_scoped_root() {
         let (root, _root_g) = temp_root("assets");
         let (assets_root, _assets_g) = temp_root("assets-dest");
-        let ws_dir = write_legacy_workspace(&root, "ws-assets", json!({}));
+        let ws_dir = write_legacy_workspace(&root, "ws-assets", &json!({}));
         let src = ws_dir.join(".workspace").join("assets");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("img1.png"), b"png-bytes").unwrap();
@@ -3857,7 +3857,7 @@ mod tests {
     #[tokio::test]
     async fn no_assets_dir_or_root_is_a_noop() {
         let (root, _root_g) = temp_root("assets-none");
-        write_legacy_workspace(&root, "ws-no-assets", json!({}));
+        write_legacy_workspace(&root, "ws-no-assets", &json!({}));
         let (store, _db_g) = open_store().await;
         // assets_root set but the legacy workspace has no assets dir.
         let (assets_root, _assets_g) = temp_root("assets-none-dest");
@@ -3885,7 +3885,7 @@ mod tests {
     async fn imports_app_level_blobs_when_absent() {
         let (root, _root_g) = temp_root("app-blobs");
         let (app_dir, _app_g) = temp_root("app-dir");
-        write_legacy_workspace(&root, "ws-hist", json!({}));
+        write_legacy_workspace(&root, "ws-hist", &json!({}));
         write_app_file(
             &app_dir,
             "repo-registry.json",
@@ -3940,7 +3940,7 @@ mod tests {
     async fn app_level_blobs_never_clobber_existing_settings() {
         let (root, _root_g) = temp_root("app-preserve");
         let (app_dir, _app_g) = temp_root("app-preserve-dir");
-        write_legacy_workspace(&root, "ws-keep", json!({}));
+        write_legacy_workspace(&root, "ws-keep", &json!({}));
         write_app_file(
             &app_dir,
             "repo-registry.json",
@@ -3998,7 +3998,7 @@ mod tests {
     #[tokio::test]
     async fn app_dir_dry_run_missing_or_malformed_files() {
         let (root, _root_g) = temp_root("app-edge");
-        write_legacy_workspace(&root, "ws-edge", json!({}));
+        write_legacy_workspace(&root, "ws-edge", &json!({}));
         let (store, _db_g) = open_store().await;
 
         // Dry-run never touches app settings even with an app_dir configured.

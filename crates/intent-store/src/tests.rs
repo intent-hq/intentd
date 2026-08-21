@@ -809,13 +809,16 @@ async fn note_version_append_list_get_and_prune() {
         .list_note_versions(&ws_id, &note.id)
         .await
         .expect("list versions");
-    assert_eq!(versions.len(), MAX_NOTE_VERSIONS as usize);
+    assert_eq!(
+        versions.len(),
+        usize::try_from(MAX_NOTE_VERSIONS).expect("value fits in usize")
+    );
     assert_eq!(versions.first().map(|e| e.v), Some(6), "oldest 5 pruned");
     assert_eq!(versions.last().map(|e| e.v), Some(total));
     assert!(versions.iter().all(|e| e.entry_type == "snapshot"));
     assert_eq!(
         versions.last().map(|e| e.content_length),
-        Some(note.content.len() as i64)
+        Some(i64::try_from(note.content.len()).expect("value fits in i64"))
     );
 
     let got = store
@@ -2963,7 +2966,10 @@ async fn retention_sweep_chunked_deletion_completes() {
 
     let old = "2026-01-01T00:00:00Z";
     let new = "2026-06-01T00:00:00Z";
-    let total_old = crate::event_repo::RETENTION_DELETE_CHUNK as usize * 2 + 50;
+    let total_old = usize::try_from(crate::event_repo::RETENTION_DELETE_CHUNK)
+        .expect("value fits in usize")
+        * 2
+        + 50;
     let mut seed: Vec<NewEvent> = (0..total_old)
         .map(|_| typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()))
         .collect();
@@ -3117,7 +3123,7 @@ async fn incremental_vacuum_releases_freelist_pages() {
         .expect("drain vacuum");
     assert_eq!(
         freed_bounded + freed_rest,
-        freelist_after_delete as u64,
+        freelist_after_delete.cast_unsigned(),
         "all freelist pages should be released"
     );
     assert_eq!(store.freelist_count().await.expect("freelist"), 0);
@@ -6223,7 +6229,10 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         .list_agent_flipped_completions(&agent_a)
         .await
         .expect("list capped");
-    assert_eq!(listed.len(), crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize);
+    assert_eq!(
+        listed.len(),
+        usize::try_from(crate::AGENT_FLIPPED_COMPLETIONS_CAP).expect("value fits in usize")
+    );
     assert!(
         !listed.iter().any(|(_, n)| n == &first),
         "oldest row evicted at the cap"
@@ -6261,7 +6270,7 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         .expect("list after reopen");
     assert_eq!(
         listed.len(),
-        crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize - 1
+        usize::try_from(crate::AGENT_FLIPPED_COMPLETIONS_CAP).expect("value fits in usize") - 1
     );
 
     // Take (consume-on-stamp read): returns the rows oldest-first and

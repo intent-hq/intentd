@@ -174,7 +174,7 @@ impl Action {
 /// Map a `notify` event kind to an [`Action`]; `None` for access/other kinds
 /// that carry no mutation (they are dropped, matching the TS adapter which only
 /// forwards add/change/unlink).
-fn action_for(kind: &EventKind) -> Option<Action> {
+fn action_for(kind: EventKind) -> Option<Action> {
     match kind {
         EventKind::Create(_) => Some(Action::Create),
         EventKind::Remove(_) => Some(Action::Delete),
@@ -205,7 +205,7 @@ enum IgnoreVerdict {
     None,
 }
 
-fn to_verdict<T>(m: Match<T>) -> IgnoreVerdict {
+fn to_verdict<T>(m: &Match<T>) -> IgnoreVerdict {
     if m.is_ignore() {
         IgnoreVerdict::Ignore
     } else if m.is_whitelist() {
@@ -361,13 +361,13 @@ impl GitignoreMatcher {
             if !abs.starts_with(dir) {
                 continue;
             }
-            let v = to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(abs, is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
         }
         if let Some(matcher) = &self.exclude {
-            let v = to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(abs, is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
@@ -375,13 +375,13 @@ impl GitignoreMatcher {
         if let Some(matcher) = &self.global {
             // The global matcher is rooted at "" (per `Gitignore::global`), so
             // it must see the relative path, not the absolute one.
-            let v = to_verdict(matcher.matched_path_or_any_parents(Path::new(rel), is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(Path::new(rel), is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
         }
         if let Some(matcher) = &self.defaults {
-            return to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            return to_verdict(&matcher.matched_path_or_any_parents(abs, is_dir));
         }
         IgnoreVerdict::None
     }
@@ -551,12 +551,12 @@ impl FileWatcher {
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         workspace_id: WorkspaceId,
-        root: PathBuf,
+        root: &Path,
     ) -> Self {
         // `subscribe` returns the canonical root it demuxes against, so the
         // relative-path strip works against the paths the OS reports (macOS
         // FSEvents resolves `/var/...` → `/private/var/...`).
-        let (sub, raw_rx, root) = hub.subscribe(&root);
+        let (sub, raw_rx, root) = hub.subscribe(root);
         let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx));
         Self { _sub: sub, task }
     }
@@ -636,7 +636,7 @@ fn ingest(
     event: &notify::Event,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
-    let Some(action) = action_for(&event.kind) else {
+    let Some(action) = action_for(event.kind) else {
         return;
     };
     let deadline = tokio::time::Instant::now() + DEBOUNCE;
@@ -857,24 +857,24 @@ mod tests {
     #[test]
     fn action_for_maps_notify_kinds() {
         assert_eq!(
-            action_for(&EventKind::Create(CreateKind::File)),
+            action_for(EventKind::Create(CreateKind::File)),
             Some(Action::Create)
         );
         assert_eq!(
-            action_for(&EventKind::Remove(RemoveKind::File)),
+            action_for(EventKind::Remove(RemoveKind::File)),
             Some(Action::Delete)
         );
         assert_eq!(
-            action_for(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
+            action_for(EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
             Some(Action::Rename)
         );
         assert_eq!(
-            action_for(&EventKind::Modify(ModifyKind::Data(
+            action_for(EventKind::Modify(ModifyKind::Data(
                 notify::event::DataChange::Content
             ))),
             Some(Action::Modify)
         );
-        assert_eq!(action_for(&EventKind::Other), None);
+        assert_eq!(action_for(EventKind::Other), None);
     }
 
     #[test]

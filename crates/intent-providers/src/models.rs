@@ -14,6 +14,7 @@ use crate::config::first_provider_id;
 /// positional last resort; callers that can derive a settings-based default
 /// should pre-filter on `:` and never rely on this attribution. Port of
 /// `parseCompoundModelId`.
+#[must_use]
 pub fn parse_compound_model_id(compound: &str) -> (String, String) {
     match compound.split_once(':') {
         Some((provider, model)) => (provider.to_string(), model.to_string()),
@@ -488,6 +489,7 @@ fn split_on_column_gaps(line: &str) -> Vec<&str> {
 /// one is present, then text rows (with `(default)`/`(current)` markers). The
 /// exit code is never trusted — the command exits 0 in both auth states.
 /// Port of `parseGrokModelsCommandOutput`.
+#[must_use]
 pub fn parse_grok_models_command_output(stdout: &str) -> GrokModelsCommandOutput {
     let lines = strip_grok_preamble_lines(stdout);
     let text = lines.join("\n");

@@ -159,6 +159,7 @@ pub(crate) fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<Strin
 /// Match one event type against one pattern. A `prefix:*` pattern matches any
 /// type starting with `prefix:`; every other pattern is an exact match. Mirrors
 /// the `matchesFilter` rule (`endsWith(":*")` → `startsWith(slice(0,-1))`).
+#[must_use]
 pub fn event_type_matches(event_type: &str, pattern: &str) -> bool {
     if pattern.ends_with(":*") {
         let prefix = &pattern[..pattern.len() - 1];

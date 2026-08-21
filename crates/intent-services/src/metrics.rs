@@ -72,7 +72,12 @@ pub async fn recompute(store: &Store, workspace_id: &WorkspaceId) -> Result<()> 
         .fold((0i64, 0i64), |(a, d), (pa, pd)| (a + pa, d + pd));
 
     store
-        .upsert_workspace_metrics(workspace_id, ws_add, ws_del, ws_paths.len() as i64)
+        .upsert_workspace_metrics(
+            workspace_id,
+            ws_add,
+            ws_del,
+            i64::try_from(ws_paths.len()).unwrap_or(i64::MAX),
+        )
         .await?;
     store
         .delete_agent_metrics_for_workspace(workspace_id)
@@ -84,7 +89,7 @@ pub async fn recompute(store: &Store, workspace_id: &WorkspaceId) -> Result<()> 
                 agent_id,
                 acc.additions,
                 acc.deletions,
-                acc.paths.len() as i64,
+                i64::try_from(acc.paths.len()).unwrap_or(i64::MAX),
             )
             .await?;
     }

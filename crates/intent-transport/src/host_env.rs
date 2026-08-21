@@ -7,6 +7,7 @@
 /// a display unless the process was reached over SSH (no local console). Public
 /// so the CLI `status`/`doctor` surfaces (§5.7) report the same value
 /// `host.status` returns.
+#[must_use]
 pub fn detect_has_display() -> bool {
     has_display(
         std::env::var_os("DISPLAY").is_some(),
@@ -47,6 +48,7 @@ pub(crate) fn detect_display_server() -> Option<String> {
 /// Local OS hostname (`os.hostname()` equivalent), or `intent` on failure.
 /// Public so the composition root can include it in the `system.status`
 /// snapshot alongside `host.status` and `server.pairingInfo`.
+#[must_use]
 pub fn local_hostname() -> String {
     whoami::hostname()
         .ok()

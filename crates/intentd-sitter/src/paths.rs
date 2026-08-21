@@ -84,6 +84,7 @@ impl SitterPaths {
     }
 
     /// Derive the sitter layout below a known data dir.
+    #[must_use]
     pub fn from_data_dir(data_dir: &Path) -> Self {
         let sitter_dir = data_dir.join("sitter");
         Self {
@@ -99,6 +100,7 @@ impl SitterPaths {
 
     /// Path of the installed daemon binary for `version`:
     /// `versions/<version>/intentd[.exe]`.
+    #[must_use]
     pub fn daemon_binary(&self, version: &str) -> PathBuf {
         self.versions_dir.join(version).join(DAEMON_BIN_NAME)
     }

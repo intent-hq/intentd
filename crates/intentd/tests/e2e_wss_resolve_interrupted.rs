@@ -391,7 +391,8 @@ async fn resolve_interrupted_resume_and_abandon() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
 
     // Open WSS connection
     let cfg = client_config(&fp);
@@ -579,7 +580,8 @@ async fn resolve_interrupted_invalid_params_validation() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
 
     // Open WSS connection
     let cfg = client_config(&fp);

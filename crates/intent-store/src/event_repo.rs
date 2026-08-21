@@ -248,7 +248,7 @@ impl Store {
                     // always end in `:`): fall back to a case-sensitive
                     // substr comparison, correct but not index-served.
                     qb.push(" AND substr(event_type, 1, ")
-                        .push_bind(prefix.chars().count() as i64)
+                        .push_bind(i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX))
                         .push(") = ")
                         .push_bind(prefix.clone());
                 }

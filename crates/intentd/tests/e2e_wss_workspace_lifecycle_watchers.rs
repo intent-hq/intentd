@@ -311,7 +311,8 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -393,7 +394,9 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
     // silence assertion (window comfortably beyond the 500ms debounce and
     // scaled like the other waits, so a load-delayed debounce cannot slip
     // past the drain).
-    let drain_window_ms = common::test_timeout(Duration::from_millis(1000)).as_millis() as u64;
+    let drain_window_ms =
+        u64::try_from(common::test_timeout(Duration::from_millis(1000)).as_millis())
+            .unwrap_or(u64::MAX);
     while drain_extra(&mut sub, "specialists:changed", drain_window_ms)
         .await
         .is_some()

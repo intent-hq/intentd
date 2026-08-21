@@ -37,6 +37,7 @@ fn home_dir() -> Option<PathBuf> {
 /// The auggie-managed binary path (`~/.augment/bin/auggie[.exe]`), highest
 /// priority in auggie discovery. This is auggie's own install location, not a
 /// generic Intent-managed binary tier.
+#[must_use]
 pub fn managed_binary_path() -> Option<PathBuf> {
     managed_binary_path_with_home(home_dir().as_deref())
 }
@@ -57,17 +58,20 @@ fn managed_binary_path_with_home(home: Option<&Path>) -> Option<PathBuf> {
 /// then each nvm-managed node version's `bin`.
 ///
 /// Re-exported from `intent_core::path_utils` for backward compatibility.
+#[must_use]
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
     path_utils::enhanced_path_dirs()
 }
 
 /// The enhanced PATH joined into a single `OsString` (for a child's `PATH` env).
+#[must_use]
 pub fn enhanced_path() -> OsString {
     std::env::join_paths(enhanced_path_dirs()).unwrap_or_default()
 }
 
 /// Find the first auggie executable across `dirs` (first dir, first candidate
 /// name wins).
+#[must_use]
 pub fn find_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
     for dir in dirs {
         for name in candidate_names() {
@@ -137,6 +141,7 @@ fn resolve_runnable(recorded: &Path, is_windows: bool) -> Option<PathBuf> {
 /// a scan of the enhanced PATH. The marker beats the PATH scan because it is
 /// auggie's authoritative record of where it installed itself — daemon-launched
 /// processes inherit a minimal PATH that often misses that directory entirely.
+#[must_use]
 pub fn find_auggie() -> Option<PathBuf> {
     find_auggie_with_home(home_dir().as_deref(), &enhanced_path_dirs())
 }
@@ -159,6 +164,7 @@ fn find_auggie_with_home(home: Option<&Path>, path_dirs: &[PathBuf]) -> Option<P
 /// Build the PATH for *executing* auggie (port of `getAuggieExecPATH`): prepend
 /// the binary's own directory so its co-located `node` resolves, then the
 /// enhanced PATH.
+#[must_use]
 pub fn exec_path(auggie_path: &Path) -> OsString {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();

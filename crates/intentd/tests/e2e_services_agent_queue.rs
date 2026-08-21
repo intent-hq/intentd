@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::{
@@ -27,7 +27,7 @@ fn cleanup_db(db: &PathBuf) {
     std::fs::remove_file(db.with_extension("db-shm")).ok();
 }
 
-fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
+fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
@@ -92,7 +92,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root.clone()))
         .await
         .expect("insert ws");
 

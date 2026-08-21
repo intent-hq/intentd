@@ -48,6 +48,7 @@ const MAX_PER_AGENT: usize = 32;
 /// Mint a fresh attachment nonce: `tar-` + 12 hex chars. Short (16 chars
 /// total) so a provider's column-wrap is unlikely to split it mid-id;
 /// collision within one agent's TTL window is negligible.
+#[must_use]
 pub fn new_attachment_id() -> String {
     let hex = uuid::Uuid::new_v4().simple().to_string();
     format!("{NONCE_PREFIX}{}", &hex[..12])
@@ -83,6 +84,7 @@ pub struct TurnAttachment {
 impl TurnAttachment {
     /// Build the canonical `{ type: "resource", resource: {…} }` content item
     /// the transcript writer turns into a standalone block (§7.1 shape).
+    #[must_use]
     pub fn resource_item(&self) -> Value {
         json!({
             "type": "resource",
@@ -115,6 +117,7 @@ pub struct TurnAttachmentRegistry {
 }
 
 impl TurnAttachmentRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

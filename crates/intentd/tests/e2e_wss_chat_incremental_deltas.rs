@@ -170,7 +170,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(api, bus.clone(), &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
@@ -731,7 +731,7 @@ async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
         )
         .await
         .expect("append assistant message");
-    fx.bus.publish_transient(&stream_event(
+    let _ = fx.bus.publish_transient(&stream_event(
         &ws_id,
         &agent_id,
         CHAT_STREAM_DELTA,
@@ -740,14 +740,14 @@ async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
             "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
         }),
     ));
-    fx.bus.publish_transient(&stream_event(
+    let _ = fx.bus.publish_transient(&stream_event(
         &ws_id,
         &agent_id,
         AGENT_STREAM_END,
         json!({ "agentId": agent_id }),
     ));
     for _ in 0..2048 {
-        fx.bus.publish_transient(&NewEvent {
+        let _ = fx.bus.publish_transient(&NewEvent {
             workspace_id: WorkspaceId::from(ws_id.as_str()),
             timestamp: now_iso(),
             event_type: "note:created".to_string(),

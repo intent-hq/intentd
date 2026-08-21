@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const CHIEF_CWD_DIR_NAME: &str = "chief-cwd";
 
 /// The chief spawn-cwd dir for a data dir: `<data_dir>/chief-cwd`.
+#[must_use]
 pub fn chief_cwd_root(data_dir: &Path) -> PathBuf {
     data_dir.join(CHIEF_CWD_DIR_NAME)
 }

@@ -145,6 +145,8 @@ pub(crate) fn build_workspace_summary(
         .cloned()
         .collect();
     let active_agents = aggregate_agent_activity(&agent_events);
+    // Event counts and window sizes are far below 2^53: loss-free in f64.
+    #[allow(clippy::cast_precision_loss)]
     let event_rate = all_events.len() as f64 / minutes_ago as f64;
 
     let mut order: Vec<String> = Vec::new();

@@ -72,7 +72,7 @@ fn req_pr_number(args: &Value) -> Result<u64, String> {
     if pr_number <= 0 {
         return Err("prNumber is required and must be a number".to_string());
     }
-    Ok(pr_number as u64)
+    Ok(pr_number.cast_unsigned())
 }
 
 /// The optional cross-repo override; slug validation lives in the engine, but

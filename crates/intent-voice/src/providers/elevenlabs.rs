@@ -54,7 +54,7 @@ impl ElevenLabsEngine {
     }
 
     /// Build the multipart form for one attempt (forms are not cloneable).
-    fn build_form(&self, request: &TranscribeRequest) -> Result<reqwest::multipart::Form> {
+    fn build_form(request: &TranscribeRequest) -> Result<reqwest::multipart::Form> {
         let file_name = file_name_for(&request.mime_type);
         let part = reqwest::multipart::Part::bytes(request.audio.clone())
             .file_name(file_name)
@@ -90,7 +90,7 @@ pub(crate) fn file_name_for(mime_type: &str) -> String {
 impl VoiceEngine for ElevenLabsEngine {
     async fn transcribe(&self, request: TranscribeRequest) -> Result<Transcript> {
         let url = format!("{}/v1/speech-to-text", self.base_url);
-        let form = self.build_form(&request)?;
+        let form = Self::build_form(&request)?;
         let resp = self
             .http
             .post(&url)
@@ -121,7 +121,12 @@ impl VoiceEngine for ElevenLabsEngine {
             .and_then(|words| words.last())
             .and_then(|w| w.get("end"))
             .and_then(Value::as_f64)
-            .map(|secs| (secs * 1000.0) as u64);
+            // Float→int casts saturate; durations are non-negative seconds.
+            .map(|secs| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = (secs * 1000.0) as u64;
+                ms
+            });
         Ok(Transcript { text, duration_ms })
     }
 

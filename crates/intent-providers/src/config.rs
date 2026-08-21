@@ -253,6 +253,7 @@ impl ProviderConfig {
     /// targets the `unsloth` CLI itself (the secondary binary the
     /// daemon-managed server lifecycle shells out to). Every other provider
     /// owns its own primary.
+    #[must_use]
     pub fn primary_binary_provider_id(&self) -> &'static str {
         match self.id {
             "unsloth" => "opencode",
@@ -461,6 +462,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
 ];
 
 /// Find a provider by id, or `None` if unknown.
+#[must_use]
 pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
     ACP_PROVIDERS.iter().find(|p| p.id == provider_id)
 }
@@ -476,6 +478,7 @@ pub(crate) fn first_provider_config() -> &'static ProviderConfig {
 }
 
 /// The first registered provider id (see [`first_provider_config`]).
+#[must_use]
 pub fn first_provider_id() -> &'static str {
     first_provider_config().id
 }
@@ -489,6 +492,7 @@ const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 /// when unknown. Unknown ids warn (see [`warns_on_unknown_provider`]) so
 /// registry gaps surface in logs instead of silently spawning the fallback
 /// agent. Port of `getProviderConfig`.
+#[must_use]
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
     find_provider(provider_id).unwrap_or_else(|| {
         let fallback = first_provider_config();
@@ -511,6 +515,7 @@ pub(crate) fn warns_on_unknown_provider(provider_id: &str) -> bool {
 }
 
 /// All registered provider ids, in definition order. Port of `getAllProviderIds`.
+#[must_use]
 pub fn all_provider_ids() -> Vec<&'static str> {
     ACP_PROVIDERS.iter().map(|p| p.id).collect()
 }
@@ -556,6 +561,7 @@ pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
 /// Whether an error message indicates the provider needs authentication,
 /// using the provider's configured `auth_error_patterns` (case-insensitive).
 /// Port of `isProviderAuthenticationError`.
+#[must_use]
 pub fn is_provider_authentication_error(provider_id: &str, error_message: &str) -> bool {
     let config = provider_config(provider_id);
     let Some(patterns) = config.auth_error_patterns else {

@@ -180,6 +180,7 @@ impl std::error::Error for FrameError {}
 
 impl Frame {
     /// The stream this frame belongs to.
+    #[must_use]
     pub fn stream_id(&self) -> u32 {
         match self {
             Self::Open { stream_id, .. }
@@ -192,6 +193,7 @@ impl Frame {
     }
 
     /// Encode into the `[opcode u8][streamId u32 BE][payload]` wire form.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         fn build(opcode: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(HEADER_LEN + payload.len());

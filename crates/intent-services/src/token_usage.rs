@@ -183,6 +183,7 @@ pub(crate) fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
 /// cost-only report never zeroes a fallback session's counters
 /// ([`intent_core::token_usage_reported`] keeps the store-side hydration
 /// decision in lockstep).
+#[must_use]
 pub fn agent_token_tally(
     agent_id: &str,
     model: Option<&str>,

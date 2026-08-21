@@ -672,7 +672,7 @@ pub(crate) fn build_env_json(
     raw_path: &str,
     shell: &str,
     home: &Path,
-    var_names: Vec<String>,
+    var_names: &[String],
 ) -> Value {
     let sep = path_separator();
     let entries: Vec<&str> = raw_path.split(sep).filter(|s| !s.is_empty()).collect();
@@ -704,7 +704,7 @@ pub(crate) fn env_probe() -> Value {
         .collect();
     var_names.sort();
     var_names.dedup();
-    build_env_json(&raw_path, &shell, &home, var_names)
+    build_env_json(&raw_path, &shell, &home, &var_names)
 }
 
 /// Expand `~` / `~/...` to `home` (mirrors the FE `expandPath`). Anything else

@@ -246,7 +246,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 
     // Discover bound port + fingerprint via UDS
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -319,7 +320,8 @@ async fn specialist_hidden_round_trips_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -377,7 +379,8 @@ async fn embedded_bundled_catalog_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -473,7 +476,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -617,7 +621,8 @@ async fn specialist_model_options_round_trip_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

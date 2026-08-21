@@ -889,7 +889,7 @@ fn build_env_json_is_secret_safe_and_well_shaped() {
         &raw_path,
         "/bin/zsh",
         &home,
-        vec!["PATH".to_string(), "SECRET_TOKEN".to_string()],
+        &["PATH".to_string(), "SECRET_TOKEN".to_string()],
     );
     assert_eq!(v["path"], raw_path);
     assert_eq!(v["shell"], "/bin/zsh");

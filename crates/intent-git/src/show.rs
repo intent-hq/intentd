@@ -60,7 +60,7 @@ pub fn show_file(worktree_path: &Path, refname: &str, file_path: &str) -> Result
     };
     // A gitlink's to_object() would fail (the pin commit is not in this odb),
     // so route on the tree-entry mode before dereferencing.
-    let mode = entry.filemode() as u32;
+    let mode = entry.filemode().cast_unsigned();
     if mode == MODE_GITLINK {
         return Err(not_a_file(&rel, mode));
     }

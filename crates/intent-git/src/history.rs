@@ -133,13 +133,16 @@ pub fn history_since(
         limit,
         base_ref = base_ref.unwrap_or(""),
         include_files,
-        pushed_check_ms = pushed_elapsed.as_millis() as u64,
-        per_commit_diff_ms = diff_elapsed.as_millis() as u64,
-        other_ms = total
-            .saturating_sub(diff_elapsed)
-            .saturating_sub(pushed_elapsed)
-            .as_millis() as u64,
-        total_ms = total.as_millis() as u64,
+        pushed_check_ms = u64::try_from(pushed_elapsed.as_millis()).unwrap_or(u64::MAX),
+        per_commit_diff_ms = u64::try_from(diff_elapsed.as_millis()).unwrap_or(u64::MAX),
+        other_ms = u64::try_from(
+            total
+                .saturating_sub(diff_elapsed)
+                .saturating_sub(pushed_elapsed)
+                .as_millis()
+        )
+        .unwrap_or(u64::MAX),
+        total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
         "history_since: revwalk + per-commit tree diffs"
     );
     if total >= SLOW_GIT_WARN_THRESHOLD {
@@ -147,7 +150,7 @@ pub fn history_since(
             worktree = %worktree_path.display(),
             limit,
             commits = out.len(),
-            total_ms = total.as_millis() as u64,
+            total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
             "history_since: slow history read"
         );
     }
@@ -337,7 +340,7 @@ pub fn resolve_workspace_boundary(
         tracing::debug!(
             resolved = boundary.is_some(),
             base_ref = base_ref.unwrap_or(""),
-            total_ms = started.elapsed().as_millis() as u64,
+            total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "resolve_workspace_boundary"
         );
     }
@@ -484,13 +487,16 @@ pub fn history_bounded(
         include_older,
         include_files,
         bounded = boundary_sha.is_some(),
-        pushed_check_ms = pushed_elapsed.as_millis() as u64,
-        per_commit_diff_ms = diff_elapsed.as_millis() as u64,
-        other_ms = total
-            .saturating_sub(diff_elapsed)
-            .saturating_sub(pushed_elapsed)
-            .as_millis() as u64,
-        total_ms = total.as_millis() as u64,
+        pushed_check_ms = u64::try_from(pushed_elapsed.as_millis()).unwrap_or(u64::MAX),
+        per_commit_diff_ms = u64::try_from(diff_elapsed.as_millis()).unwrap_or(u64::MAX),
+        other_ms = u64::try_from(
+            total
+                .saturating_sub(diff_elapsed)
+                .saturating_sub(pushed_elapsed)
+                .as_millis()
+        )
+        .unwrap_or(u64::MAX),
+        total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
         "history_bounded: revwalk + per-commit tree diffs"
     );
     if total >= SLOW_GIT_WARN_THRESHOLD {
@@ -498,7 +504,7 @@ pub fn history_bounded(
             worktree = %worktree_path.display(),
             limit,
             commits = out.len(),
-            total_ms = total.as_millis() as u64,
+            total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
             "history_bounded: slow history read"
         );
     }

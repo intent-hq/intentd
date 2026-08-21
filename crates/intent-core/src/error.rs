@@ -149,6 +149,7 @@ pub enum CloneErrorCategory {
 
 impl CloneErrorCategory {
     /// Stable wire identifier for this category (`error.data.code`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             CloneErrorCategory::PathInvalid => "path-invalid",
@@ -165,6 +166,7 @@ impl CloneErrorCategory {
 
 impl Error {
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
+    #[must_use]
     pub fn code(&self) -> i32 {
         match self {
             Error::InvalidParams(_)

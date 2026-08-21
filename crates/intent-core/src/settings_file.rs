@@ -584,6 +584,7 @@ pub enum ResumeInterruptedOnStart {
 
 impl ResumeInterruptedOnStart {
     /// The wire/TOML string for this value.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             ResumeInterruptedOnStart::Auto => "auto",
@@ -820,9 +821,13 @@ where
         fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<f64, E> {
             Ok(v)
         }
+        // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
+        #[allow(clippy::cast_precision_loss)]
         fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
+        // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
+        #[allow(clippy::cast_precision_loss)]
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
@@ -949,26 +954,26 @@ impl SettingsFile {
     ///
     /// Returns `Error::InvalidInput` naming the offending key when a value is out of range.
     pub fn validate(&self) -> Result<()> {
-        fn bad(key: &str, msg: String) -> Error {
+        fn bad(key: &str, msg: &str) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
         }
         let v = self.notifications.volume;
         if !(0.0..=1.0).contains(&v) {
             return Err(bad(
                 "notifications.volume",
-                format!("must be between 0 and 1, got {v}"),
+                &format!("must be between 0 and 1, got {v}"),
             ));
         }
         if self.server.port < 1024 {
             return Err(bad(
                 "server.port",
-                format!("must be between 1024 and 65535, got {}", self.server.port),
+                &format!("must be between 1024 and 65535, got {}", self.server.port),
             ));
         }
         if self.server.ws_api.port < 1024 {
             return Err(bad(
                 "server.wsApi.port",
-                format!(
+                &format!(
                     "must be between 1024 and 65535, got {}",
                     self.server.ws_api.port
                 ),
@@ -985,7 +990,7 @@ impl SettingsFile {
         {
             return Err(bad(
                 "server.bindAddress",
-                format!(
+                &format!(
                     "must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {:?}",
                     self.server.bind_address
                 ),
@@ -996,7 +1001,7 @@ impl SettingsFile {
         if self.server.max_outstanding_rpcs > 100_000 {
             return Err(bad(
                 "server.maxOutstandingRpcs",
-                format!(
+                &format!(
                     "must be 0 (unlimited) or between 1 and 100000, got {}",
                     self.server.max_outstanding_rpcs
                 ),
@@ -1005,7 +1010,7 @@ impl SettingsFile {
         if self.agents.max_concurrent > 200 {
             return Err(bad(
                 "agents.maxConcurrent",
-                format!(
+                &format!(
                     "must be between 0 and 200, got {}",
                     self.agents.max_concurrent
                 ),
@@ -1015,7 +1020,7 @@ impl SettingsFile {
             if mb > 1_024_000 {
                 return Err(bad(
                     "agents.memoryBudgetMb",
-                    format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
+                    &format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
                 ));
             }
         }
@@ -1026,21 +1031,21 @@ impl SettingsFile {
         if !(1..=MAX_CONCURRENT_ADAPTERS_LIMIT).contains(&adapters) {
             return Err(bad(
                 "agents.maxConcurrentAdapters",
-                format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
+                &format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
             ));
         }
         let chars = self.workspace_api.max_output_chars;
         if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
             return Err(bad(
                 "workspaceApi.maxOutputChars",
-                format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
+                &format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
         let terms = self.voice.workspace_vocabulary.max_terms;
         if terms > 100 {
             return Err(bad(
                 "voice.workspaceVocabulary.maxTerms",
-                format!("must be between 0 and 100, got {terms}"),
+                &format!("must be between 0 and 100, got {terms}"),
             ));
         }
         Ok(())

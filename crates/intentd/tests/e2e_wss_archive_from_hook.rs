@@ -61,7 +61,7 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         let _ = self.child.wait();
@@ -414,7 +414,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -586,7 +587,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
         // stall could elapse before `hook.runNow`'s archive lands — the wake
         // then takes the idle delivery-time gate instead and the test
         // silently stops covering the end-of-turn drain path.
-        "firstTurnDelayMs": common::test_timeout(Duration::from_millis(4000)).as_millis() as u64,
+        "firstTurnDelayMs": u64::try_from(common::test_timeout(Duration::from_millis(4000)).as_millis()).unwrap_or(u64::MAX),
         "response": "acknowledged",
     })
     .to_string();
@@ -607,7 +608,8 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

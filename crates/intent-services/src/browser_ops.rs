@@ -101,6 +101,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<BrowserExecArgs, Browse
 /// Build the params object the daemon dispatches on the FE-served reverse
 /// intent (`browser.exec`). Optional envelope fields are omitted when absent
 /// so the wire payload stays minimal.
+#[must_use]
 pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
     let mut out = Map::new();
     out.insert("actions".to_string(), Value::Array(args.actions.clone()));
@@ -132,7 +133,7 @@ pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
 /// # Errors
 ///
 /// Returns an internal `BrowserExecError` when the frontend response is not an object, reports failure, or carries no results.
-pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
+pub fn shape_result(fe_response: &Value) -> Result<Value, BrowserExecError> {
     let obj = fe_response.as_object().ok_or_else(|| {
         BrowserExecError::internal("browser.exec: frontend returned a non-object response")
     })?;
@@ -195,7 +196,7 @@ pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
 ///
 /// Returns an internal `BrowserExecError` when the frontend response is not an object, reports failure without results, or carries no results.
 pub fn shape_agent_result(
-    fe_response: Value,
+    fe_response: &Value,
     requested_actions: usize,
 ) -> Result<Value, BrowserExecError> {
     if let Some(obj) = fe_response.as_object() {

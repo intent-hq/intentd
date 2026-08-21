@@ -326,7 +326,8 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 

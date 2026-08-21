@@ -28,7 +28,10 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
-        let _ = signal::killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        let _ = signal::killpg(
+            Pid::from_raw(self.child.id().cast_signed()),
+            Signal::SIGKILL,
+        );
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -259,7 +262,8 @@ async fn list_active_tracks_only_mid_turn_agents_over_real_wss() {
         &data_dir.join("daemon.log"),
     )
     .await;
-    let port = status["result"]["port"].as_u64().expect("WSS port") as u16;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("WSS port"))
+        .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");

@@ -347,7 +347,7 @@ pub(crate) fn read_output(
     terminal_id: &str,
     max_lines: Option<i64>,
     paginate: bool,
-    page_token: Option<String>,
+    page_token: Option<&String>,
 ) -> Result<Value> {
     let id = PtyId::parse(terminal_id)
         .ok_or_else(|| Error::Internal(format!("Terminal not found: {terminal_id}")))?;
@@ -371,7 +371,7 @@ pub(crate) fn read_output(
         return Ok(crate::pagination::paginate_text_lines(
             &strip_ansi(&raw),
             max_lines,
-            page_token.as_deref(),
+            page_token.map(std::string::String::as_str),
         ));
     }
 
@@ -381,7 +381,8 @@ pub(crate) fn read_output(
 
     let clean = strip_ansi(&raw);
     let lines: Vec<&str> = clean.split('\n').collect();
-    let max_line_count = max_lines.unwrap_or(200).clamp(1, 10000) as usize;
+    let max_line_count =
+        usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
     let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
         lines[lines.len() - max_line_count..].to_vec()
     } else {
@@ -546,7 +547,7 @@ fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes:
     let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
     publish_event_transient(
         bus,
-        terminal_event(
+        &terminal_event(
             ws,
             TERMINAL_DATA,
             json!({ "terminalId": terminal_id, "chunk": chunk }),
@@ -649,7 +650,9 @@ impl TerminalHost for PtyTerminalHost {
             {
                 spec.scrollback_bytes = limit;
             }
-            let pty_id = pty.spawn(spec).map_err(acp_err)?;
+            let pty_id = pty
+                .spawn(spec)
+                .map_err(|e: intent_core::Error| acp_err(&e))?;
             Ok(pty_id.to_string())
         })
     }
@@ -658,8 +661,14 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         Box::pin(async move {
             let id = acp_resolve(&terminal_id)?;
-            let limit = pty.scrollback(id).map_err(acp_err)?;
-            let exit = pty.try_exit(id).ok().flatten().map(to_exit_info);
+            let limit = pty
+                .scrollback(id)
+                .map_err(|e: intent_core::Error| acp_err(&e))?;
+            let exit = pty
+                .try_exit(id)
+                .ok()
+                .flatten()
+                .map(|exit: PtyExit| to_exit_info(&exit));
             Ok(TerminalOutputInfo {
                 output: String::from_utf8_lossy(&limit).into_owned(),
                 truncated: false,
@@ -672,8 +681,11 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         Box::pin(async move {
             let id = acp_resolve(&terminal_id)?;
-            let exit = pty.wait(id).await.map_err(acp_err)?;
-            Ok(to_exit_info(exit))
+            let exit = pty
+                .wait(id)
+                .await
+                .map_err(|e: intent_core::Error| acp_err(&e))?;
+            Ok(to_exit_info(&exit))
         })
     }
 
@@ -697,7 +709,7 @@ impl TerminalHost for PtyTerminalHost {
 }
 
 /// Map a host error into an ACP terminal error.
-fn acp_err(e: Error) -> AcpError {
+fn acp_err(e: &Error) -> AcpError {
     AcpError::Terminal(e.to_string())
 }
 
@@ -709,7 +721,7 @@ fn acp_resolve(terminal_id: &str) -> AcpResult<PtyId> {
 
 /// Convert a host [`PtyExit`] into the ACP exit shape (`signal` is unavailable
 /// through the host abstraction).
-fn to_exit_info(exit: PtyExit) -> TerminalExitInfo {
+fn to_exit_info(exit: &PtyExit) -> TerminalExitInfo {
     TerminalExitInfo {
         exit_code: Some(exit.exit_code),
         signal: None,
@@ -1893,7 +1905,7 @@ mod tests {
 
         let token = page1["nextToken"].as_str().unwrap().to_string();
         let page2 =
-            read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(token)).unwrap();
+            read_output(pty.as_ref(), &ws("ws-1"), &id, Some(2), false, Some(&token)).unwrap();
         assert!(!page2["items"].as_array().unwrap().is_empty());
 
         kill(pty.as_ref(), &id).await.unwrap();

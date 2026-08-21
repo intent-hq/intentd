@@ -60,8 +60,8 @@ impl Store {
         .bind(&w.parent_agent_name)
         .bind(&w.child_agent_id.0)
         .bind(&w.group_id)
-        .bind(w.report_delivered as i64)
-        .bind(w.wake_on_attention as i64)
+        .bind(i64::from(w.report_delivered))
+        .bind(i64::from(w.wake_on_attention))
         .bind(&w.created_at)
         .execute(self.write_pool())
         .await

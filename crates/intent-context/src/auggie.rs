@@ -50,12 +50,14 @@ pub struct AuggieContextEngine {
 
 impl AuggieContextEngine {
     /// Construct an engine that discovers auggie lazily. Never fails (§8.3).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Construct with a known binary path (a user-configured path, or tests),
     /// pre-seeding the discovery cache.
+    #[must_use]
     pub fn with_path(path: PathBuf) -> Self {
         Self {
             cached_path: Mutex::new(Some(path)),
@@ -175,7 +177,7 @@ async fn run_auggie(
             if let Some(pid) = pid {
                 use nix::sys::signal::{killpg, Signal};
                 use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
             }
             #[cfg(not(unix))]
             let _ = pid;

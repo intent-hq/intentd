@@ -207,6 +207,7 @@ fn collect_nested_paths(
 /// `git init` on macOS/Windows filesystems). Callers pass the result to
 /// [`submodule_containing`]/[`to_repo_relative`] so the gitlink guard compares
 /// paths the same way the filesystem — and therefore `index.add_path` — does.
+#[must_use]
 pub fn ignores_case(repo: &Repository) -> bool {
     repo.config()
         .and_then(|c| c.get_bool("core.ignorecase"))
@@ -270,6 +271,7 @@ fn strip_prefix_components(
 /// spelling (`SUB/a.txt` for submodule `sub`) resolves to the same file on
 /// disk, so a byte-exact comparison would let it past the guard and
 /// `index.add_path` would flatten the `160000` gitlink into a tree.
+#[must_use]
 pub fn submodule_containing<'a>(
     submodules: &'a std::collections::BTreeSet<String>,
     rel_path: &str,
@@ -351,6 +353,7 @@ pub(crate) fn reject_submodule_internal_paths(repo: &Repository, paths: &[String
 /// Lexical noise (`./`, doubled separators) is *not* rewritten here — it is
 /// folded where it matters, in [`submodule_containing`]'s component-wise match
 /// — so the returned string keeps the caller's spelling for error messages.
+#[must_use]
 pub fn to_repo_relative(workdir: Option<&Path>, raw: &str, ignore_case: bool) -> String {
     let p = Path::new(raw);
     if !p.is_absolute() {

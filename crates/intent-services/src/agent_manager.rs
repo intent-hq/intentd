@@ -521,6 +521,7 @@ const DEFAULT_PROCESS_CAP: usize = 8;
 /// cap while high-RAM machines are not artificially throttled (for exact byte
 /// counts: 16 GB → 8, 32 GB → 24, 64 GB → 56, ≥108 GB → 100; Linux `MemTotal`
 /// runs slightly below nominal RAM, so a nominal 16 GB box may compute 7).
+#[must_use]
 pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
     let budget_gb = total_memory_bytes.saturating_sub(8 * GB) / GB;
     budget_gb.clamp(4, 100) as usize
@@ -539,6 +540,7 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 ///
 /// The recommended default: `agents.memoryBudgetMb` defaults to auto (the
 /// absent key; explicit 0 = off), and boot wiring resolves auto to this value.
+#[must_use]
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
     (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
 }
@@ -546,6 +548,7 @@ pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
 /// Best-effort process cap from detected system RAM, falling back to
 /// [`DEFAULT_PROCESS_CAP`] when total memory is unknown (RAM detection
 /// supports Linux and macOS; other platforms fall back to the default).
+#[must_use]
 pub fn default_process_cap() -> usize {
     match total_memory_bytes() {
         Some(bytes) => compute_process_cap(bytes),
@@ -604,7 +607,7 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Async callback that tears down one process when the registry evicts/reaps it
@@ -752,6 +755,7 @@ pub struct BusEventSink {
 
 impl BusEventSink {
     /// Wire a sink over the shared event bus.
+    #[must_use]
     pub fn new(bus: EventBus) -> Self {
         Self { bus }
     }
@@ -960,7 +964,7 @@ pub struct ProcessRegistry {
 /// taken, saturating at 0.
 fn charged_bytes(sampled: u64, pending: i64) -> u64 {
     if pending >= 0 {
-        sampled.saturating_add(pending as u64)
+        sampled.saturating_add(pending.cast_unsigned())
     } else {
         sampled.saturating_sub(pending.unsigned_abs())
     }
@@ -978,6 +982,7 @@ fn budget_admits(charged: u64, budget_bytes: u64, live: usize) -> bool {
 
 impl ProcessRegistry {
     /// A registry with a fixed concurrency `cap`.
+    #[must_use]
     pub fn new(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
@@ -1056,7 +1061,7 @@ impl ProcessRegistry {
         if self.memory.get().is_some() {
             inner.budget_pending_bytes = inner
                 .budget_pending_bytes
-                .saturating_add(agents.saturating_mul(PROVISIONAL_AGENT_BYTES as i64));
+                .saturating_add(agents.saturating_mul(PROVISIONAL_AGENT_BYTES.cast_signed()));
         }
     }
 
@@ -1490,7 +1495,7 @@ impl ProcessRegistry {
         C: Fn(&AgentId) -> bool,
         R: Fn(&AgentId),
     {
-        let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
+        let cutoff = now_ms().saturating_sub(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
         let candidates = {
             let inner = self.inner.lock().unwrap();
             idle_older_than(&inner, cutoff)
@@ -2094,6 +2099,7 @@ impl AgentManager {
     }
 
     /// Override the permission policy used by spawned agents' client handlers.
+    #[must_use]
     pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
         self.policy = policy;
         self
@@ -2107,6 +2113,7 @@ impl AgentManager {
     /// Override the executable used as the generated `--mcp-config` bridge
     /// command (defaults to the current `intentd` binary). Tests point this at
     /// `CARGO_BIN_EXE_intentd` so a spawned child reaches the in-process server.
+    #[must_use]
     pub fn with_mcp_bridge_exe(mut self, exe: impl Into<PathBuf>) -> Self {
         self.mcp_bridge_exe = exe.into();
         self
@@ -2115,6 +2122,7 @@ impl AgentManager {
     /// Enable per-agent stderr capture (STAB-53): every spawned child's stderr
     /// is appended to `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition
     /// root passes `intent_core::agent_logs_root(&config.data_dir)`.
+    #[must_use]
     pub fn with_agent_log_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.agent_log_root = Some(root.into());
         self
@@ -2125,6 +2133,7 @@ impl AgentManager {
     /// `intent_core::agent_configs_root(&config.data_dir)` after sweeping
     /// leftovers; the directory is created on demand right before a spawn
     /// writes into it.
+    #[must_use]
     pub fn with_agent_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.agent_config_root = Some(root.into());
         self
@@ -2133,6 +2142,7 @@ impl AgentManager {
     /// Set the dedicated spawn cwd for chief provider children (STAB-50).
     /// The composition root passes `intent_core::chief_cwd_root(&config.data_dir)`;
     /// the directory is created on demand right before a chief spawn resolves.
+    #[must_use]
     pub fn with_chief_cwd_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.chief_cwd_root = Some(root.into());
         self
@@ -7308,7 +7318,7 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
         return;
     };
     let descendants = descendant_pids(pid).await;
-    let pgid = Pid::from_raw(pid as i32);
+    let pgid = Pid::from_raw(pid.cast_signed());
     let _ = killpg(pgid, Signal::SIGTERM);
     // Wait briefly for the group to drain, then SIGKILL the whole group so any
     // grandchild that ignored SIGTERM is still removed.
@@ -7356,7 +7366,7 @@ async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
     for (mut child, spawn_pid) in children {
         match child.id().or(spawn_pid) {
             Some(pid) => {
-                let pgid = Pid::from_raw(pid as i32);
+                let pgid = Pid::from_raw(pid.cast_signed());
                 let _ = killpg(pgid, Signal::SIGTERM);
                 pgids.push(pgid);
                 // Reap on a task so all waits run concurrently.
@@ -9550,6 +9560,13 @@ fn spawn_backoff_from(env_val: Option<&str>) -> (Vec<u64>, bool) {
 /// spawn retries desynchronize instead of landing inside the same host load
 /// spike (monorepo#616). Entropy comes from a v4 UUID's random low bits
 /// rather than pulling in a `rand` dependency.
+// Intentional lossy float math: the mantissa mask keeps `r` exact in f64,
+// delays are far below 2^53, and the final float→int cast saturates.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn jitter_delay_ms(delay_ms: u64) -> u64 {
     const MANTISSA_BITS: u32 = 53;
     let r = (Uuid::new_v4().as_u128() as u64) & ((1u64 << MANTISSA_BITS) - 1);

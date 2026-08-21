@@ -57,7 +57,7 @@ const REAP_POLL: Duration = Duration::from_millis(25);
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Build a wire `McpServerStatus` (§5.22), omitting absent optional fields.
@@ -705,7 +705,7 @@ async fn probe_sse(
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.send().await.map_err(|e| classify_send_error(e, url))?;
+    let resp = req.send().await.map_err(|e| classify_send_error(&e, url))?;
     check_http_status(resp.status())
 }
 
@@ -818,7 +818,7 @@ async fn post_rpc(
     if let Some(ver) = protocol_version {
         req = req.header("MCP-Protocol-Version", ver);
     }
-    req.send().await.map_err(|e| classify_send_error(e, url))
+    req.send().await.map_err(|e| classify_send_error(&e, url))
 }
 
 /// Read a JSON-RPC response envelope from a streamable-HTTP reply: a JSON body
@@ -875,7 +875,7 @@ fn sse_response_for_id(buf: &str, id: u64) -> Option<Value> {
 }
 
 /// Map a transport-level reqwest failure onto a user-facing `lastError`.
-fn classify_send_error(e: reqwest::Error, url: &str) -> Error {
+fn classify_send_error(e: &reqwest::Error, url: &str) -> Error {
     if e.is_timeout() {
         Error::Internal(format!("timed out connecting to {url}"))
     } else if e.is_connect() {
@@ -946,7 +946,7 @@ fn kill_group(
 ) -> std::result::Result<(), nix::errno::Errno> {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    killpg(Pid::from_raw(pid as i32), sig)
+    killpg(Pid::from_raw(pid.cast_signed()), sig)
 }
 
 /// Stateless executor for the `mcp.servers.*` namespace (PROTOCOL §5.22) over

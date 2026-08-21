@@ -151,7 +151,7 @@ impl DiskUsageCache {
                             workspace_dir = %workspace_dir.display(),
                             bytes = usage.bytes,
                             files = usage.file_count,
-                            total_ms = started.elapsed().as_millis() as u64,
+                            total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                             "disk usage: walk completed"
                         );
                         cache.entries.lock().unwrap().insert(

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// Expand a leading `~` / `~/` in `input` against `home`. Anything else —
 /// including `~user` forms — passes through verbatim.
+#[must_use]
 pub fn expand_tilde_with(input: &str, home: &Path) -> PathBuf {
     if input == "~" {
         return home.to_path_buf();
@@ -36,6 +37,7 @@ pub fn expand_tilde_with(input: &str, home: &Path) -> PathBuf {
 /// Expand a leading `~` / `~/` against the process environment's home
 /// directory (`$HOME`, with `USERPROFILE` as the Windows fallback). When no
 /// home can be resolved the input passes through unchanged.
+#[must_use]
 pub fn expand_tilde(input: &str) -> PathBuf {
     match env_home_dir() {
         Some(home) => expand_tilde_with(input, &home),
@@ -47,6 +49,7 @@ pub fn expand_tilde(input: &str) -> PathBuf {
 /// as UTF-8 text. When the expanded path is not valid UTF-8 (a non-UTF-8
 /// `$HOME`), the input passes through unchanged rather than being lossily
 /// rewritten to a path that does not exist on disk.
+#[must_use]
 pub fn expand_tilde_string(input: &str) -> String {
     match expand_tilde(input).to_str() {
         Some(expanded) => expanded.to_owned(),

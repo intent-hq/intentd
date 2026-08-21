@@ -180,7 +180,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<AsyncTokenStore>,
+        token_store: &Arc<AsyncTokenStore>,
         options: WsOptions,
         control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Result<Self> {
@@ -189,7 +189,7 @@ impl WsApiServer {
             api,
             bus,
             acceptor: Some(acceptor),
-            token_store: Some((*token_store).clone()),
+            token_store: Some((**token_store).clone()),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             // The WSS transport is remote by default; an override forces it
@@ -266,7 +266,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<AsyncTokenStore>,
+        token_store: &Arc<AsyncTokenStore>,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
         control: Option<Arc<dyn crate::control::SystemControl>>,
@@ -341,6 +341,7 @@ impl WsApiServer {
     /// # Panics
     ///
     /// Panics if the client-set mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn client_count(&self) -> usize {
         self.inner
             .clients
@@ -351,6 +352,7 @@ impl WsApiServer {
 
     /// The pinned SHA-256 certificate fingerprint (colon-separated hex), or
     /// `None` when running in insecure dev mode without a TLS certificate.
+    #[must_use]
     pub fn fingerprint(&self) -> Option<&str> {
         self.inner.fingerprint.as_deref()
     }
@@ -358,6 +360,7 @@ impl WsApiServer {
     /// Whether the listener is running in insecure (plain-`ws://`, no bearer
     /// auth) dev mode. Used by `system.status` so remote clients see the
     /// real TLS posture rather than a phantom fingerprint.
+    #[must_use]
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
     }
@@ -407,7 +410,7 @@ impl WsInner {
     pub(crate) async fn heartbeat_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(self.heartbeat_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout_ms = self.heartbeat_timeout.as_millis() as i64;
+        let timeout_ms = i64::try_from(self.heartbeat_timeout.as_millis()).unwrap_or(i64::MAX);
         loop {
             tick.tick().await;
             let now = now_ms();
@@ -867,7 +870,7 @@ fn header_str(value: &[u8]) -> Option<String> {
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

@@ -103,8 +103,8 @@ async fn file_store_credentials() -> Option<Credentials> {
             return None;
         }
     };
-    let token = non_empty(pair.0.unwrap_or_default())?;
-    let organization = non_empty(pair.1.unwrap_or_default())?;
+    let token = non_empty(&pair.0.unwrap_or_default())?;
+    let organization = non_empty(&pair.1.unwrap_or_default())?;
     Some(Credentials {
         token,
         organization,
@@ -114,16 +114,16 @@ async fn file_store_credentials() -> Option<Credentials> {
 /// Read both halves of the credential pair from the environment.
 fn env_credentials() -> Option<Credentials> {
     pick_env_credentials(
-        std::env::var("SENTRY_API_TOKEN").ok(),
-        std::env::var("SENTRY_ORG").ok(),
+        std::env::var("SENTRY_API_TOKEN").ok().as_deref(),
+        std::env::var("SENTRY_ORG").ok().as_deref(),
     )
 }
 
 /// Pure selection of env credentials (testable). Both halves must be
 /// non-empty after trimming.
 pub(crate) fn pick_env_credentials(
-    token: Option<String>,
-    organization: Option<String>,
+    token: Option<&str>,
+    organization: Option<&str>,
 ) -> Option<Credentials> {
     let token = token.and_then(non_empty)?;
     let organization = organization.and_then(non_empty)?;
@@ -134,7 +134,7 @@ pub(crate) fn pick_env_credentials(
 }
 
 /// `Some(s)` only when `s` is non-empty after trimming.
-fn non_empty(s: String) -> Option<String> {
+fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -149,17 +149,17 @@ mod tests {
 
     #[test]
     fn picks_non_empty_env_pair() {
-        let c = pick_env_credentials(Some("tok".into()), Some("acme".into())).unwrap();
+        let c = pick_env_credentials(Some("tok"), Some("acme")).unwrap();
         assert_eq!(c.token, "tok");
         assert_eq!(c.organization, "acme");
     }
 
     #[test]
     fn missing_half_yields_none() {
-        assert!(pick_env_credentials(Some("tok".into()), None).is_none());
-        assert!(pick_env_credentials(None, Some("acme".into())).is_none());
-        assert!(pick_env_credentials(Some("   ".into()), Some("acme".into())).is_none());
-        assert!(pick_env_credentials(Some("tok".into()), Some(String::new())).is_none());
+        assert!(pick_env_credentials(Some("tok"), None).is_none());
+        assert!(pick_env_credentials(None, Some("acme")).is_none());
+        assert!(pick_env_credentials(Some("   "), Some("acme")).is_none());
+        assert!(pick_env_credentials(Some("tok"), Some("")).is_none());
     }
 
     #[test]
