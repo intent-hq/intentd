@@ -6122,12 +6122,11 @@ impl Services {
         // available, and a compound explicit `model` naming a DIFFERENT
         // known provider is a contradiction — both reject with `-32602`
         // before any side effect (an unknown compound prefix is left to
-        // `agent_create_op`'s unconditional prefix validation). Without any
-        // resolution the created session's `provider` stays `None` and the
-        // spawn path falls through to the positional default regardless of
-        // the user's actual configured default; a compound explicit `model`
-        // (e.g. `opencode:kimi-k3`) pins its own provider via
-        // `agent_create_op`'s existing derivation.
+        // `agent_create_op`'s unconditional prefix validation). When nothing
+        // resolves at all, `resolve_delegate_provider` fails loudly with
+        // `-32602` (monorepo#3044: no positional last resort); a compound
+        // explicit `model` (e.g. `opencode:kimi-k3`) pins its own provider
+        // via `agent_create_op`'s existing derivation.
         // SECURITY: derive workspace_path from the stored workspace record,
         // never a client-supplied value (same rationale as
         // `agent_create_op`'s model resolution).
