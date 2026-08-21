@@ -204,14 +204,14 @@ impl Store {
     /// Uses raw `BEGIN IMMEDIATE` (same pattern as `insert_events`):
     /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
     /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
     /// `max_connections=1` on the write pool, concurrent recomputes serialize
     /// at `pool.acquire()` instead.
     ///
     /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
     /// `agent_message` for sessions still on the per-message fallback (no
     /// snapshot/baseline token report), and that work happens while holding
-    /// the daemon's sole write connection and the SQLite write lock. The
+    /// the daemon's sole write connection and the `SQLite` write lock. The
     /// report-backed skip keeps the common case cheap, and the fallback read
     /// projects each message's usage object in SQL and filters to
     /// usage-bearing rows off a partial index instead of materializing message
@@ -351,7 +351,7 @@ impl Store {
     /// (`list_workspaces_lite`, the `workspace.subscribe` seq-0 snapshot) serve
     /// a fresh timestamp after a restart.
     ///
-    /// Comparison runs through SQLite's `julianday()` rather than raw TEXT so
+    /// Comparison runs through `SQLite`'s `julianday()` rather than raw TEXT so
     /// timestamps of differing fractional-second precision order correctly
     /// (lexicographic `…:00Z` vs `…:00.5Z` compares backwards). A malformed
     /// `last_activity` parses to NULL and is treated as "older" (overwritten);
@@ -399,7 +399,7 @@ impl Store {
     /// Also removes the workspace's `draft` rows explicitly — `draft` has no
     /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
     ///
-    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
         let pool = self.write_pool();
@@ -555,7 +555,7 @@ where
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
 }
 
-/// Encode the optional `pr_status` enum to its PascalCase DB word, or `None`.
+/// Encode the optional `pr_status` enum to its `PascalCase` DB word, or `None`.
 fn pr_status_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.pr_status.map(|s| enum_to_db(&s)).transpose()
 }

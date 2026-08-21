@@ -31,7 +31,7 @@ use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
 
-/// SQLite db inside an RAII temp dir: the dir sweep (on drop, including on
+/// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
 /// panic) also covers `-wal`/`-shm` sidecars, and a background task that
 /// lazily reopens a pool connection after drop cannot recreate the file at
 /// the TMPDIR root. Set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir.
@@ -1481,7 +1481,7 @@ async fn manager_tracks_lookup_stop_and_shuts_down() {
 /// (the live-turn slot) as an `assistant` row tagged with the FE
 /// terminal-message convention (`metadata.interrupted = true` +
 /// `stopReason = "interrupted"`) — reusing the turn's minted message id so
-/// block ids match what streamed — alongside the interrupted_agent row. A busy
+/// block ids match what streamed — alongside the `interrupted_agent` row. A busy
 /// agent with no live-turn slot gets only the interrupted row (no phantom
 /// assistant message).
 #[tokio::test]
@@ -2762,7 +2762,7 @@ type MockCallLog = Arc<Mutex<Vec<(String, Value)>>>;
 
 /// The `availableModes` list a mock agent advertises in its `session/new` /
 /// `session/load` response. Defaults to a set that includes `bypassPermissions`
-/// so tests exercising the "set_mode was attempted" assertions keep working;
+/// so tests exercising the "`set_mode` was attempted" assertions keep working;
 /// tests can substitute a bypass-free set (e.g. `default`+`ask`, matching
 /// auggie today) to exercise the skip path.
 #[derive(Clone)]
@@ -4474,7 +4474,7 @@ async fn terminal_failure_persists_error_before_publishing_events() {
 /// Teardown paths that abort the turn worker can land between the streaming
 /// path's terminal-error stash and the terminal-failure handler's take
 /// (monorepo#2050): the orphaned entry describes the aborted turn, so a LATER
-/// failure must not consume it (its streak / stop_reason would mis-describe
+/// failure must not consume it (its streak / `stop_reason` would mis-describe
 /// the new failure). Every worker-abort path — stop/detach, interrupt, retry,
 /// delete — must discard the slot.
 #[tokio::test]
@@ -4967,7 +4967,7 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
 /// ALSO emits `agent:idle` when the agent has no queued ready-to-send messages.
 /// This fixes the bug where a parent that re-messages via agent.send after a
 /// child settles registers a completion watch that never fires (the aborted
-/// worker never reaches run_prompt_turn's idle-emit path). When the agent DOES
+/// worker never reaches `run_prompt_turn`'s idle-emit path). When the agent DOES
 /// have queued messages, idle is suppressed (the agent will resume immediately).
 #[tokio::test]
 async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
@@ -8628,7 +8628,7 @@ async fn agent_retry_response_carries_redriven_turn_id() {
     );
 }
 
-/// monorepo#840: an ORDINARY Error session (no fatal stop_reason, no streak)
+/// monorepo#840: an ORDINARY Error session (no fatal `stop_reason`, no streak)
 /// is NOT quarantined — `send_message` still redrives it (the documented
 /// fresh-message recovery path). Guard against over-blocking. Uses the
 /// `mock` provider without `MOCK_AGENT_SCRIPT_PATH` so the redriven spawn
@@ -8746,7 +8746,7 @@ async fn retry_arms_force_recreate_for_poisoned_session() {
 }
 
 /// monorepo#940 guard: `agent.retry` of an ORDINARY Error session (no fatal
-/// stop_reason, no streak) must NOT arm `force_recreate` — the redrive keeps
+/// `stop_reason`, no streak) must NOT arm `force_recreate` — the redrive keeps
 /// today's `session/load` resume behavior exactly.
 #[tokio::test]
 async fn retry_does_not_arm_force_recreate_for_ordinary_error() {
@@ -8783,7 +8783,7 @@ async fn retry_does_not_arm_force_recreate_for_ordinary_error() {
 
 /// monorepo#940 ordering: the poisoned check in `agent_retry` must read the
 /// identical-failure streak BEFORE `clear_failure_streak` wipes it — a
-/// streak-poisoned session (no fatal stop_reason) still arms
+/// streak-poisoned session (no fatal `stop_reason`) still arms
 /// `force_recreate`, and the streak is cleared afterwards as before.
 #[tokio::test]
 async fn retry_poison_check_reads_streak_before_clear() {
@@ -8911,8 +8911,8 @@ async fn terminal_failure_event_omits_session_corrupted_for_ordinary_error() {
 
 /// A terminal failure appends a durable system-role transcript notice with a
 /// single text block carrying the error text and `meta.kind = "turn-failure"`
-/// (the InterruptionNotice shape), and emits `agent:message` (role=system)
-/// for it. Persisting the error status/stop_reason must not depend on the
+/// (the `InterruptionNotice` shape), and emits `agent:message` (role=system)
+/// for it. Persisting the error `status/stop_reason` must not depend on the
 /// notice (best-effort append).
 #[tokio::test]
 async fn terminal_failure_appends_turn_failure_transcript_notice() {
@@ -9163,7 +9163,7 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
 }
 
 /// monorepo#564 regression: `send_message` to a nonexistent agent id (e.g. a
-/// truncated id) must fail closed with InvalidParams naming the id — NOT
+/// truncated id) must fail closed with `InvalidParams` naming the id — NOT
 /// claim the slot, NOT queue a phantom message, NOT persist a transcript row.
 #[tokio::test]
 async fn send_message_rejects_unknown_agent() {
@@ -9519,7 +9519,7 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
 /// undeliverable queue instead of skipping silently — before the fix the
 /// status-gate `Err` arm returned with the in-memory entries intact, leaving
 /// a permanently wedged queue (every future kick re-skips or re-fails the
-/// `agent_message.agent_id` FK, SQLite 787).
+/// `agent_message.agent_id` FK, `SQLite` 787).
 #[tokio::test]
 async fn drain_against_vanished_session_drops_queue() {
     let (_tmp, mgr) = manager().await;
@@ -10477,7 +10477,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
 /// back-to-back silent timeouts (each answered with a warning turn), the NEXT
 /// timeout takes the terminal path — exactly one `agent:failed` (emitted by
 /// the worker, since `run_prompt_turn` suppressed it), Error park with the
-/// idle-timeout stop_reason, and a requeue for `agent.retry`. The mock parks
+/// idle-timeout `stop_reason`, and a requeue for `agent.retry`. The mock parks
 /// EVERY prompt ("of silence" matches the warning text too), so no turn ever
 /// produces intervening activity.
 #[tokio::test]
@@ -11918,7 +11918,7 @@ mod merge_user_mcp_servers_tests {
     }
 
     /// The opencode env config carries the same `workspace-mcp` bridge entry
-    /// (in OpenCode `mcp` block shape) that the auggie `--mcp-config` path
+    /// (in `OpenCode` `mcp` block shape) that the auggie `--mcp-config` path
     /// generates, pointing at the same bridge endpoint. The bridge exe is
     /// pinned to a space-free absolute path so the expectation does not
     /// depend on whether the host checkout path contains whitespace
@@ -14042,7 +14042,7 @@ mod question_hold_gates {
     use crate::agent_manager::TurnOptions;
     use intent_core::MessageOrigin;
 
-    /// The same trailing-question-block shape as the agent_ops tests.
+    /// The same trailing-question-block shape as the `agent_ops` tests.
     fn question_blocks() -> Value {
         json!([
             { "type": "text", "text": "I have a clarifying question." },

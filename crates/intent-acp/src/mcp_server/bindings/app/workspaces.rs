@@ -1382,7 +1382,7 @@ mod tests {
         assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
     }
 
-    /// Helper: run `create` against a fresh FakeApi and return the proposal.
+    /// Helper: run `create` against a fresh `FakeApi` and return the proposal.
     async fn create_proposal(args: serde_json::Value) -> Value {
         create_proposal_with(Arc::new(FakeApi::default()), args).await
     }

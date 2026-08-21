@@ -35,7 +35,7 @@ impl TokenStore for MemoryStore {
 
 /// A `TokenStore` whose `load_token` sleeps well past the compressed test
 /// timeout, counting calls so tests can prove concurrent callers are
-/// coalesced into a single spawn_blocking.
+/// coalesced into a single `spawn_blocking`.
 #[derive(Default)]
 struct BlockingTokenStore {
     load_calls: AtomicUsize,

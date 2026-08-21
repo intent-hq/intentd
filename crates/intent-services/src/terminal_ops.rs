@@ -536,7 +536,7 @@ fn drain_pending(
 ///
 /// Transient (broadcast-only, never persisted — same path as
 /// `chat:stream:delta`): PTY output is high-volume and must not serialize
-/// behind a durable SQLite commit per chunk, which throttled paste echo to one
+/// behind a durable `SQLite` commit per chunk, which throttled paste echo to one
 /// chunk per writer-batch window. Scrollback replay reads the PTY host ring
 /// buffer via `terminal.getBuffer`, so nothing consumes persisted
 /// `terminal:data` rows. Ordering vs `terminal:exit` is preserved: the stream
@@ -735,7 +735,7 @@ mod tests {
     /// takes to surface, never how long a passing run waits.
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
 
-    /// A temp SQLite path cleaned up on drop (mirrors `events::bus_tests`).
+    /// A temp `SQLite` path cleaned up on drop (mirrors `events::bus_tests`).
     struct TempDb {
         path: PathBuf,
     }
@@ -1901,7 +1901,7 @@ mod tests {
 
     // ---- ACP `PtyTerminalHost` adapter ----
 
-    /// ACP terminal create → output → wait_for_exit happy path.
+    /// ACP terminal create → output → `wait_for_exit` happy path.
     ///
     /// Load-independent (monorepo#573): the child prints the marker and then
     /// stays alive (`exec cat`) until the test has *observed* the output, so

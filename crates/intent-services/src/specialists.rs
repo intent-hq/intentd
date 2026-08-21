@@ -3,7 +3,7 @@
 //! (`<workspacePath>/.intent/specialists/`), then user
 //! (`~/.intent/specialists/`), then bundled (`resources/specialists/`,
 //! read-only). Ports `specialist-file-loader.ts` + `specialists.ipc.ts`'s
-//! combined load. Nothing is persisted in SQLite; `create`/`edit`/`delete`
+//! combined load. Nothing is persisted in `SQLite`; `create`/`edit`/`delete`
 //! write user/project files only and `bundled` definitions are read-only.
 
 use std::path::{Path, PathBuf};
@@ -682,7 +682,7 @@ impl SpecialistsService {
     /// explicit `hidden: false` unhides and an explicit empty scalar clears
     /// (PROTOCOL §5.11).
     /// SECURITY: validates the id before file access to prevent path traversal
-    /// (review thread PRRT_kwDOS9Wxuc6SIlcV).
+    /// (review thread `PRRT_kwDOS9Wxuc6SIlcV`).
     fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
         // Validate id before passing to load_from_dir to prevent path traversal
         // attacks on ALL frontmatter lookups (resolve_agent_type, resolve_model,
@@ -774,7 +774,7 @@ impl SpecialistsService {
     /// order (project > user > bundled), used at spawn time when no explicit
     /// model parameter is supplied. Returns `None` when the specialist is
     /// unknown or declares no `model`, allowing the caller to fall through to
-    /// the settings chain. Validation is now performed inside resolve().
+    /// the settings chain. Validation is now performed inside `resolve()`.
     pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get("model")
@@ -1430,7 +1430,7 @@ mod tests {
     /// Rot-check regression test: the bundled `verifier.md` prompt must instruct
     /// the verifier to mark verified tasks complete with `update_note_task_status`
     /// and explain the completion policy (only APPROVED tasks, DEVIATION/MISSING
-    /// stay in review_required). This prevents future prompt rewrites from
+    /// stay in `review_required`). This prevents future prompt rewrites from
     /// silently dropping the workflow instruction and leaving tasks stuck in
     /// `review_required`.
     #[test]

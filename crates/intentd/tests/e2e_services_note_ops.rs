@@ -1,6 +1,6 @@
-//! E2E coverage for note.* operations (intent-services note_ops.rs coverage boost).
+//! E2E coverage for note.* operations (intent-services `note_ops.rs` coverage boost).
 //!
-//! Tests call intent_services::Services directly (not via WSS transport) for hermetic
+//! Tests call `intent_services::Services` directly (not via WSS transport) for hermetic
 //! in-process coverage. Tests note.add, note.edit, note.editLines, note.updateMetadata,
 //! note.listTasks paths.
 
@@ -18,7 +18,7 @@ use intent_core::{
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 
-/// Clean up SQLite database including -wal and -shm sidecars.
+/// Clean up `SQLite` database including -wal and -shm sidecars.
 fn cleanup_db(db: &PathBuf) {
     std::fs::remove_file(db).ok();
     std::fs::remove_file(db.with_extension("db-wal")).ok();

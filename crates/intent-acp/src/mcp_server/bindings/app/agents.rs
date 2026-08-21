@@ -321,7 +321,7 @@ fn thread_timestamp(thread: &Value) -> String {
         .to_string()
 }
 
-/// Filter out tool_use and tool_result blocks from a message if includeToolCalls=false.
+/// Filter out `tool_use` and `tool_result` blocks from a message if includeToolCalls=false.
 fn filter_tool_calls(mut message: Value) -> Value {
     if let Some(blocks) = message
         .get_mut("contentBlocks")

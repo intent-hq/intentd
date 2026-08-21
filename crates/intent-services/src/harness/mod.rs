@@ -116,7 +116,7 @@ pub(crate) trait Harness: Send + Sync {
 
     // --- Turn envelope (`agent_manager::build_turn_prompt`) ---
 
-    /// `<system>`-wrapped assembled system prompt for the FirstTurnPrepend
+    /// `<system>`-wrapped assembled system prompt for the `FirstTurnPrepend`
     /// fallback.
     fn first_turn_prepend_block(&self, prompt: &str) -> String;
     /// The per-turn state snapshot line around the serialized snapshot JSON.
@@ -129,7 +129,7 @@ pub(crate) trait Harness: Send + Sync {
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
-    /// (FirstTurnPrepend → snapshot → Context → naming nudge → role reminder
+    /// (`FirstTurnPrepend` → snapshot → Context → naming nudge → role reminder
     /// → body) is itself versioned.
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String;
 
@@ -169,7 +169,7 @@ pub(crate) trait Harness: Send + Sync {
     /// `[WORKSPACE EVENTS] Child agent {label} {kind}.` completion wake with
     /// report/summary/error tail and the #2051 watch-retired notes.
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String;
-    /// One `- {label} {kind}.…` per-child line of an after_all group wake,
+    /// One `- {label} {kind}.…` per-child line of an `after_all` group wake,
     /// including the attention fold.
     fn group_child_line(&self, params: &ChildSettlementParams<'_>) -> String;
     /// The aggregated group-settlement wake: header plus accumulated

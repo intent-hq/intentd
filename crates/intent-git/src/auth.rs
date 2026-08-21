@@ -9,7 +9,7 @@
 //! going until the callback returns `Err` (or a working `Cred`). Falling
 //! through to `Cred::default()` produces an anonymous credential that libgit2
 //! silently retries, so an auth-shaped failure (missing/rotated keys after
-//! device de-pairing, for example) can pin the caller's spawn_blocking worker
+//! device de-pairing, for example) can pin the caller's `spawn_blocking` worker
 //! indefinitely — the runtime-saturation vector behind the FE
 //! "JSON-RPC request timed out: host.status" surface. The bounded closure
 //! installed by [`remote_callbacks`] gives libgit2 a fixed number of attempts

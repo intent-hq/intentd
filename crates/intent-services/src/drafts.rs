@@ -1,4 +1,4 @@
-//! services::drafts — BE-persisted per-client chat drafts (§9.10, §15) and the
+//! `services::drafts` — BE-persisted per-client chat drafts (§9.10, §15) and the
 //! `client.hello` client-row upsert (§16).
 //!
 //! The connection→logical-`clientId` binding and the `server` capability block

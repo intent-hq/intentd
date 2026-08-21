@@ -103,8 +103,8 @@ fn sanitizes_malformed_tool_results_and_empty_assistants() {
     assert_eq!(xml.matches("<tool_result ").count(), 1);
 }
 
-/// Regression test for STAB-108: dangling tool_use blocks (no corresponding
-/// tool_result) should be removed during sanitization to prevent provider
+/// Regression test for STAB-108: dangling `tool_use` blocks (no corresponding
+/// `tool_result`) should be removed during sanitization to prevent provider
 /// rejection on session resume.
 #[test]
 fn sanitizes_dangling_tool_use_blocks() {

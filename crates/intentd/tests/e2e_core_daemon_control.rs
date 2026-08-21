@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Verify token generation and persistence via AsyncTokenStore.
+/// Verify token generation and persistence via `AsyncTokenStore`.
 #[tokio::test]
 async fn token_generation_and_persistence() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-token-{}", uuid::Uuid::new_v4()));
@@ -76,7 +76,7 @@ async fn token_rotation_replaces_old() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Verify Config::resolve correctly sets daemon paths.
+/// Verify `Config::resolve` correctly sets daemon paths.
 #[tokio::test]
 async fn config_paths_include_daemon_files() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));

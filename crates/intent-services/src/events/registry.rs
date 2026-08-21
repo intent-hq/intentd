@@ -26,7 +26,7 @@
 //! so `archive_workspace`/`unarchive_workspace` publish `workspace:updated`
 //! with an `archived` boolean in the delta; the registry subscribes to that
 //! event and treats `archived: true` as a suspend (all watch roots torn down —
-//! otherwise every archived workspace leaks its FSEvents streams until daemon
+//! otherwise every archived workspace leaks its `FSEvents` streams until daemon
 //! restart) and `archived: false` as a resume. Resume additionally runs a
 //! catch-up so derived state changed while unwatched is not silently lost: a
 //! `GitStatusRefresher::trigger` plus the skills/specialists rescan (both
@@ -222,7 +222,7 @@ impl WatcherRegistry {
         self.hub.root_established(root)
     }
 
-    /// Live shared FSEvents stream count — the consolidation metric.
+    /// Live shared `FSEvents` stream count — the consolidation metric.
     #[cfg(test)]
     fn stream_count(&self) -> usize {
         self.hub.stream_count()
@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     /// Consolidation regression: two workspaces whose roots sit under the same
-    /// parent share one FSEvents stream, so the in-process demux is the only
+    /// parent share one `FSEvents` stream, so the in-process demux is the only
     /// thing keeping them apart. Each must publish `file:*` events for its own
     /// paths only — a leak here would attribute one workspace's edits to the
     /// other.
@@ -1218,7 +1218,7 @@ mod tests {
 
     /// Regression: archiving a workspace must tear its watch roots down.
     /// Before the fix only `workspace:deleted`/`workspace:closed` deregistered,
-    /// so every archived workspace leaked its FSEvents streams until restart.
+    /// so every archived workspace leaked its `FSEvents` streams until restart.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn archived_workspace_stops_watching_and_unarchive_resumes_it() {
@@ -1283,7 +1283,7 @@ mod tests {
     /// under test before a negative probe, by flushing the shared
     /// [`GitStatusRefresher`] pipeline with a marker workspace
     /// (monorepo#2012). A fixed quiet-gap drain is a race: a refresh from
-    /// earlier churn traverses FSEvents delivery, the 1s debounce, and a
+    /// earlier churn traverses `FSEvents` delivery, the 1s debounce, and a
     /// blocking-pool recompute, and under load its `changes:git-status` can
     /// publish arbitrarily later than any fixed gap.
     ///
@@ -1293,7 +1293,7 @@ mod tests {
     /// single publisher's events in order, so a marker event bounds every
     /// publish enqueued before its own — EXCEPT a workspace refresh due in
     /// the same debounce batch, which can be processed (and published) after
-    /// the marker's (per-batch HashMap order), and a straggler trigger that
+    /// the marker's (per-batch `HashMap` order), and a straggler trigger that
     /// raced in just after the marker's. Both stragglers surface during the
     /// NEXT round, so the pipeline is settled once two consecutive rounds
     /// observe nothing but their marker. Panics if settlement never happens

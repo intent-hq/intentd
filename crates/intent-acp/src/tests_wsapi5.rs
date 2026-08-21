@@ -21,7 +21,7 @@ use crate::WorkspaceMcpServer;
 
 #[derive(Default)]
 struct FakeApi {
-    /// Recorded `git_agent_commit` calls: (message, agent_id, user_requested).
+    /// Recorded `git_agent_commit` calls: (message, `agent_id`, `user_requested`).
     agent_commit_calls: Mutex<Vec<(String, Option<String>, bool)>>,
     script_list_calls: Mutex<u32>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
@@ -49,9 +49,9 @@ struct FakeApi {
     // `Some(Some(x))` or `Some(None)` = the value the last `update_workspace`
     // call landed on after empty/whitespace-clear normalization.
     status_message_state: Mutex<Option<Option<String>>>,
-    /// Recorded `save_asset` calls: (data, mime_type, original_name).
+    /// Recorded `save_asset` calls: (data, `mime_type`, `original_name`).
     save_asset_calls: Mutex<Vec<(String, String, Option<String>)>>,
-    /// Recorded `git_root_register` calls: (path, agent_id).
+    /// Recorded `git_root_register` calls: (path, `agent_id`).
     git_root_register_calls: Mutex<Vec<(String, String)>>,
     /// Recorded `git_root_unregister` calls: path.
     git_root_unregister_calls: Mutex<Vec<String>>,

@@ -305,7 +305,7 @@ mod tests {
     /// budget itself is now widened to 5s for runner-agnostic headroom, but this
     /// guard keeps only one such spawn running at a time). Holding this
     /// guard for each child-spawning test's duration keeps only one such spawn
-    /// running at a time. Mirrors the `CHILD_SPAWN_SERIAL` (provider_models) and
+    /// running at a time. Mirrors the `CHILD_SPAWN_SERIAL` (`provider_models`) and
     /// `WATCHER_TEST_SERIAL` (events/mod.rs) precedents. `unwrap_or_else(
     /// into_inner)` recovers from a poisoned lock so one panicking test does not
     /// cascade into the rest.

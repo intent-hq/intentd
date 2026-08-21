@@ -403,7 +403,7 @@ mod tests {
 
     // ---- op-level tests over a temp store + fake auggie script ----
 
-    /// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in
+    /// RAII temp `SQLite` store: the db (and its `-wal`/`-shm` sidecars) live in
     /// a guarded temp dir removed on drop — including on panic — unless
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {

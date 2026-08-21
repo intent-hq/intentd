@@ -490,7 +490,7 @@ const DEFAULT_PROCESS_CAP: usize = 8;
 /// The 1 GB/agent budget is 2–4× the measured worst case (auggie ≈ 230 MB RSS
 /// avg, claude-code chain ≈ 700 MB), so lower-RAM machines still get a tight
 /// cap while high-RAM machines are not artificially throttled (for exact byte
-/// counts: 16 GB → 8, 32 GB → 24, 64 GB → 56, ≥108 GB → 100; Linux MemTotal
+/// counts: 16 GB → 8, 32 GB → 24, 64 GB → 56, ≥108 GB → 100; Linux `MemTotal`
 /// runs slightly below nominal RAM, so a nominal 16 GB box may compute 7).
 pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
     let budget_gb = total_memory_bytes.saturating_sub(8 * GB) / GB;
@@ -1868,7 +1868,7 @@ pub struct AgentManager {
     busy: Arc<Mutex<HashSet<AgentId>>>,
     /// Agents claimed by the idle-reap sweep for the duration of their kill
     /// (monorepo#2118). The claim is taken under the `busy` lock (lock order
-    /// busy → reap_claims, matching `try_begin`'s read), so "not busy →
+    /// busy → `reap_claims`, matching `try_begin`'s read), so "not busy →
     /// claimed" is atomic against a concurrent `try_begin`: a send racing the
     /// sweep queues instead of starting a turn whose child tree the sweep is
     /// about to kill. Released (no `busy` lock needed) after the kill, when
@@ -1889,7 +1889,7 @@ pub struct AgentManager {
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
     /// Agents whose NEXT turn must carry the assembled system prompt prepended
-    /// as a `<system>` block — the FirstTurnPrepend fallback (§18.1) for
+    /// as a `<system>` block — the `FirstTurnPrepend` fallback (§18.1) for
     /// providers with no (usable) native injection mechanism (codex, cortex,
     /// pi, grok, mock). Set when a
     /// FRESH ACP session is opened (`session/new`, brand-new or recreate) for a
@@ -2586,7 +2586,7 @@ impl AgentManager {
         Ok(to_auggie_mcp_config(&servers))
     }
 
-    /// Serialize the same normalized spawn server set as the OpenCode config
+    /// Serialize the same normalized spawn server set as the `OpenCode` config
     /// `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` at spawn for
     /// env-config providers. The bridge entry points at the same endpoint the
     /// auggie `--mcp-config` path uses.
@@ -3287,7 +3287,7 @@ impl AgentManager {
         self.recreated.lock().unwrap().remove(agent_id)
     }
 
-    /// Arm the FirstTurnPrepend flag for `agent_id` when the provider has no
+    /// Arm the `FirstTurnPrepend` flag for `agent_id` when the provider has no
     /// native system-prompt mechanism (§18.1 fallback). Called only from the
     /// fresh-session branches of [`AgentManager::start_session`] (`session/new`
     /// for a brand-new agent, or the resume-impossible recreate) — never on a
@@ -3303,7 +3303,7 @@ impl AgentManager {
     }
 
     /// Compute the `<system>`-wrapped assembled system prompt for the
-    /// FirstTurnPrepend fallback, or `None` when nothing is pending. The
+    /// `FirstTurnPrepend` fallback, or `None` when nothing is pending. The
     /// prompt text comes from the session's persisted `system_prompt`
     /// (written by [`AgentManager::create_agent`] at spawn time from
     /// `assemble_system_prompt`). The pending flag is consumed only on a
@@ -3627,7 +3627,7 @@ impl AgentManager {
     /// process groups concurrently via [`kill_child_trees`] — total teardown
     /// stays ~one [`PROCESS_GROUP_TERM_GRACE`] period regardless of agent
     /// count, instead of N sequential SIGTERM→grace→SIGKILL cycles. This is
-    /// the `workspace.delete` sweep (same detach-many → kill_child_trees
+    /// the `workspace.delete` sweep (same detach-many → `kill_child_trees`
     /// pattern as `shutdown()`, minus the interrupted-session capture).
     ///
     /// NOTE: with exactly one agent this is NEARLY but not exactly
@@ -4220,7 +4220,7 @@ impl AgentManager {
     /// `agent.listActive`; it never scans persisted workspaces or sessions.
     ///
     /// Lock-order invariant: `busy` is always acquired before `agent_ws`
-    /// (here and in every busy/agent_ws mutator — `try_begin`,
+    /// (here and in every `busy/agent_ws` mutator — `try_begin`,
     /// `release_in_flight_slot`, `end_turn`), and mutators update both maps
     /// while holding the `busy` lock. That makes a claim/release visible
     /// atomically from this snapshot's perspective: a busy agent always has
@@ -4362,7 +4362,7 @@ impl AgentManager {
 
     /// Release the in-flight slot without persisting agent status (used when
     /// terminal spawn failure already persisted Error status and we only need
-    /// to release busy/agent_ws so a future message can restart the worker).
+    /// to release `busy/agent_ws` so a future message can restart the worker).
     async fn release_in_flight_slot(&self, agent_id: &AgentId) {
         let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
@@ -4373,7 +4373,7 @@ impl AgentManager {
     }
 
     /// Remove `agent_id` from `busy` and `agent_ws` atomically with respect to
-    /// `list_busy` (both maps mutated under the `busy` lock, busy → agent_ws
+    /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
     /// removed `agent_ws` entry.
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
@@ -7136,7 +7136,7 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Short bounded window after the SIGKILL sweep in [`kill_child_trees`] during
 /// which the reap tasks are awaited so killed children are actually `wait()`ed
-/// before returning (SIGKILLed children reap almost instantly).
+/// before returning (`SIGKILLed` children reap almost instantly).
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 
@@ -7179,9 +7179,9 @@ async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
 }
 
 /// Parallel shutdown kill sweep: terminate MANY provider process trees under
-/// ONE shared grace window. Every group is SIGTERMed up-front, then a single
+/// ONE shared grace window. Every group is `SIGTERMed` up-front, then a single
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
-/// still-live group is SIGKILLed — so total teardown is ~one grace period
+/// still-live group is `SIGKILLed` — so total teardown is ~one grace period
 /// regardless of how many agents were running (unlike per-child
 /// [`kill_child_tree`], which serialises one grace window per tree). The
 /// pre-kill descendant snapshot (bounded at 2s for a hung `ps`) and the
@@ -7583,10 +7583,10 @@ struct ResolvedSpawn {
     cwd: PathBuf,
     provider_binary: Option<PathBuf>,
     extra_env: BTreeMap<String, String>,
-    /// When provider_binary is None and the provider has a fallback_npx_package,
+    /// When `provider_binary` is None and the provider has a `fallback_npx_package`,
     /// this is the resolved npx path. Otherwise None.
     npx_fallback_binary: Option<PathBuf>,
-    /// The package name to pass to npx when npx_fallback_binary is set.
+    /// The package name to pass to npx when `npx_fallback_binary` is set.
     npx_fallback_package: Option<&'static str>,
     /// Unsloth-managed server endpoint for the `unsloth` provider, filled in
     /// by [`AgentManager::ensure_started`] via
@@ -9353,7 +9353,7 @@ const MAX_SPAWN_ATTEMPTS: u32 = 3;
 /// attempt (monorepo#616); jitter is applied on top (see [`jitter_delay_ms`]).
 const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[5000, 15000];
 /// Default backoff delays between pre-turn persist retry attempts (#547).
-/// Short: the append is a local SQLite write, so a transient failure (busy
+/// Short: the append is a local `SQLite` write, so a transient failure (busy
 /// database, lock contention) clears quickly or not at all.
 const DEFAULT_PERSIST_RETRY_BACKOFF_MS: &[u64] = &[250, 1000];
 
@@ -9376,7 +9376,7 @@ fn env_backoff_ms(var: &str, default: &[u64]) -> Vec<u64> {
 }
 
 /// Get spawn retry backoff delays plus whether jitter applies, overridable
-/// via INTENTD_SPAWN_RETRY_BACKOFF_MS (comma-separated milliseconds, e.g.
+/// via `INTENTD_SPAWN_RETRY_BACKOFF_MS` (comma-separated milliseconds, e.g.
 /// "100,200"). Env-overridden delays are applied verbatim — no jitter — so
 /// tests stay deterministic; the defaults are jittered (monorepo#616).
 fn retry_backoff_ms() -> (Vec<u64>, bool) {
@@ -9462,7 +9462,7 @@ mod spawn_backoff_tests {
 }
 
 /// Get persist retry backoff delays (#547), overridable via
-/// INTENTD_PERSIST_RETRY_BACKOFF_MS with the same format.
+/// `INTENTD_PERSIST_RETRY_BACKOFF_MS` with the same format.
 fn persist_retry_backoff_ms() -> Vec<u64> {
     env_backoff_ms(
         "INTENTD_PERSIST_RETRY_BACKOFF_MS",
@@ -9473,7 +9473,7 @@ fn persist_retry_backoff_ms() -> Vec<u64> {
 /// Classify whether an error from `ensure_started` is retryable. Retryable
 /// errors include session/new or session/load timeouts and handshake failures
 /// (e.g., "agent stdout closed" when the child dies immediately). Non-retryable
-/// errors include InvalidParams, NotFound, Conflict, provider resolution
+/// errors include `InvalidParams`, `NotFound`, Conflict, provider resolution
 /// failures, mock provider missing env, and unknown Internal errors (fail-fast
 /// by default to avoid retry loops on non-transient errors).
 fn is_retryable_spawn_error(err: &Error) -> bool {
@@ -9723,7 +9723,7 @@ async fn persist_terminal_error_status(
 /// `stopReasonTimestamp` fields. `persisted` reports whether the failed
 /// turn's user row durably reached the transcript (STAB-51). A system-role
 /// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
-/// the InterruptionNotice shape, §5.35) is appended best-effort for each
+/// the `InterruptionNotice` shape, §5.35) is appended best-effort for each
 /// DISTINCT terminal failure — a repeat of the identical failure text with
 /// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
 /// fresh redrive of the same message that fails again the same way) skips
@@ -9909,7 +9909,7 @@ async fn persist_error_and_requeue(
 /// there is no row to park in `Error`, the FE already saw `agent:deleted`
 /// (an `agent:failed` toast would resurrect a ghost card with a Retry that
 /// can never succeed), and a requeued entry wedges the queue — every
-/// redrive re-fails the `agent_message.agent_id` FK (SQLite 787) against
+/// redrive re-fails the `agent_message.agent_id` FK (`SQLite` 787) against
 /// the missing session forever. Returns `true` after discarding: the
 /// message is dropped (its durable `agent_queue` rows already cascaded with
 /// the session), the in-memory queue registry entry is removed, and the
@@ -11097,7 +11097,7 @@ mod role_reminder_tests {
 
     /// Ordering: the snapshot line is the outermost RECURRING decoration —
     /// before the `Context:` block, naming instruction, and role reminder —
-    /// while the fire-once FirstTurnPrepend `<system>` block stays outermost
+    /// while the fire-once `FirstTurnPrepend` `<system>` block stays outermost
     /// overall.
     #[tokio::test]
     async fn snapshot_ordering_outermost_recurring_after_first_turn_prepend() {
@@ -11944,7 +11944,7 @@ mod v1_turn_envelope_goldens {
         );
     }
 
-    /// Fully decorated first turn: FirstTurnPrepend + snapshot line +
+    /// Fully decorated first turn: `FirstTurnPrepend` + snapshot line +
     /// Context block + naming nudge + role reminder + body, in that exact
     /// composition order with `\n\n` joins.
     #[tokio::test]
@@ -12348,7 +12348,7 @@ mod rebuild_spawn_opts_tests {
         assert!(env.is_empty(), "setting off must not inject");
     }
 
-    /// Pre-existing caller-set extra_env keys survive the injection — the
+    /// Pre-existing caller-set `extra_env` keys survive the injection — the
     /// helper only fills vacant slots, never clobbers.
     #[test]
     fn inject_git_credential_env_preserves_existing_keys() {

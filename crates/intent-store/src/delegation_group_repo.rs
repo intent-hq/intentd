@@ -30,7 +30,7 @@ pub struct PersistedDelegationGroup {
 }
 
 impl Store {
-    /// Insert or replace a delegation_group row (upsert).
+    /// Insert or replace a `delegation_group` row (upsert).
     pub async fn upsert_delegation_group(&self, g: &PersistedDelegationGroup) -> Result<()> {
         let expected_json = serde_json::to_string(&g.expected_agent_ids)
             .map_err(|e| Error::Internal(format!("encode expected_agent_ids: {e}")))?;
@@ -79,7 +79,7 @@ impl Store {
         Ok(())
     }
 
-    /// Load all undelivered delegation_group rows for a workspace.
+    /// Load all undelivered `delegation_group` rows for a workspace.
     pub async fn list_undelivered_groups(
         &self,
         workspace_id: &WorkspaceId,
@@ -101,7 +101,7 @@ impl Store {
         rows.iter().map(decode_group_row).collect()
     }
 
-    /// Delete a delegation_group row (called on delivery).
+    /// Delete a `delegation_group` row (called on delivery).
     pub async fn delete_delegation_group(&self, group_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM delegation_group WHERE group_id = ?")
             .bind(group_id)

@@ -1,7 +1,7 @@
 //! End-to-end tests for client-served ACP handlers (fs, permission, terminal).
 //!
-//! Drives the mock ACP agent to issue agent→client requests (fs/read_text_file,
-//! fs/write_text_file, session/request_permission, terminal/*) and asserts on
+//! Drives the mock ACP agent to issue agent→client requests (`fs/read_text_file`,
+//! `fs/write_text_file`, `session/request_permission`, terminal/*) and asserts on
 //! the daemon's responses. Covers the client-served slice of the ACP protocol
 //! (spec §6.2–§6.4) at the e2e layer, which was near-0% before this test suite.
 //!
@@ -583,7 +583,7 @@ async fn terminal_output_truncation() {
     let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-/// Test wait_for_exit on a process that exits with non-zero code.
+/// Test `wait_for_exit` on a process that exits with non-zero code.
 #[tokio::test]
 #[cfg(unix)]
 async fn terminal_non_zero_exit() {

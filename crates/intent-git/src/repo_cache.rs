@@ -37,7 +37,7 @@ use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::map_git_err;
 
 /// Default wall-clock bound for the cache clone, matching the service-layer
-/// clone budget (`intent-services` CLONE_TIMEOUT).
+/// clone budget (`intent-services` `CLONE_TIMEOUT`).
 const CACHE_CLONE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 
 /// Env var overriding the clone bound, in whole seconds. Unset, unparseable,
@@ -45,7 +45,7 @@ const CACHE_CLONE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 const CACHE_CLONE_TIMEOUT_ENV: &str = "INTENTD_CACHE_CLONE_TIMEOUT_SECS";
 
 /// Default wall-clock bound for the refresh fetch, matching
-/// [`crate::fetch`]'s SHELL_FETCH_TIMEOUT.
+/// [`crate::fetch`]'s `SHELL_FETCH_TIMEOUT`.
 const CACHE_FETCH_TIMEOUT_DEFAULT: Duration = Duration::from_secs(100);
 
 /// Env var overriding the fetch bound, in whole seconds. Unset, unparseable,
@@ -711,7 +711,7 @@ fn list_cached_branches_blocking(
 ///    GitHub branches) into the clone so `base_ref` resolution sees every
 ///    upstream branch, not just the cache's default.
 /// 3. Create + check out `branch` from `base_ref` (same resolution and
-///    branch-reuse semantics as the CoW checkout path) and hard-reset to it.
+///    branch-reuse semantics as the `CoW` checkout path) and hard-reset to it.
 /// 4. Retarget `origin` from the cache path to `origin_url` (the real GitHub
 ///    URL), so pushes/fetches in the checkout never touch the cache.
 /// 5. Populate submodules from the cache's local module git dirs
@@ -1523,7 +1523,7 @@ mod tests {
         dir
     }
 
-    /// Self-cleaning scratch dir for a cache root (testutil's TempDir is tied
+    /// Self-cleaning scratch dir for a cache root (testutil's `TempDir` is tied
     /// to `init_repo`; a cache root must start empty and non-git).
     struct CacheRoot(PathBuf);
 

@@ -454,8 +454,8 @@ async fn chat_subscribe_isolates_snapshot_per_agent() {
 /// CS-3 reconciliation invariant: the seq-0 snapshot reduced with the live
 /// `chat:stream:delta`/`tool:call`/`stream:end` deltas equals a fresh
 /// `agent.getConversation` snapshot. Drives a mock turn — two text chunks that
-/// coalesce onto one block (added → updated), a tool call (tool_use → tool_use
-/// updated + tool_result added), then trailing text — persists the assistant
+/// coalesce onto one block (added → updated), a tool call (`tool_use` → `tool_use`
+/// updated + `tool_result` added), then trailing text — persists the assistant
 /// message exactly as `run_prompt_turn` would, and finally emits `stream:end`.
 #[tokio::test]
 async fn chat_delta_stream_reconciles_with_fresh_snapshot() {

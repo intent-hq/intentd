@@ -17,7 +17,7 @@ use crate::auto_commit::{
 };
 use crate::Services;
 
-/// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in a
+/// RAII temp `SQLite` store: the db (and its `-wal`/`-shm` sidecars) live in a
 /// guarded temp dir removed on drop — including on panic — unless
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
 struct TempDb {

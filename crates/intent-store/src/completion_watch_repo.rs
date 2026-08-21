@@ -31,9 +31,9 @@ pub struct PersistedCompletionWatch {
 }
 
 impl Store {
-    /// Insert a completion_watch row, or update its mutable columns on id
-    /// conflict (parent anchor/name, group_id, report_delivered). The
-    /// identity columns — child ids/workspace and created_at — are fixed at
+    /// Insert a `completion_watch` row, or update its mutable columns on id
+    /// conflict (parent anchor/name, `group_id`, `report_delivered`). The
+    /// identity columns — child ids/workspace and `created_at` — are fixed at
     /// registration and intentionally not overwritten.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
         sqlx::query(
@@ -65,7 +65,7 @@ impl Store {
         Ok(())
     }
 
-    /// Load every persisted completion_watch row (the registry is
+    /// Load every persisted `completion_watch` row (the registry is
     /// daemon-global, so startup rehydration loads all rows in one pass).
     pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
         let rows = sqlx::query(
@@ -82,7 +82,7 @@ impl Store {
         rows.iter().map(decode_watch_row).collect()
     }
 
-    /// Delete a completion_watch row (fired watch, cancellation).
+    /// Delete a `completion_watch` row (fired watch, cancellation).
     pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM completion_watch WHERE id = ?")
             .bind(id)
@@ -92,7 +92,7 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every completion_watch row registered by `parent_agent_id`
+    /// Delete every `completion_watch` row registered by `parent_agent_id`
     /// (`agent.cancelSubscriptions`).
     pub async fn delete_completion_watches_for_parent(
         &self,

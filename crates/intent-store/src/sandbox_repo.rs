@@ -1,4 +1,4 @@
-//! Sandbox repository: CRUD for agent sandboxes (CoW isolation).
+//! Sandbox repository: CRUD for agent sandboxes (`CoW` isolation).
 
 use intent_core::{AgentId, Result, WorkspaceId};
 use serde::{Deserialize, Serialize};

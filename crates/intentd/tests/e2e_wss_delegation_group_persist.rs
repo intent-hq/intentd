@@ -6,7 +6,7 @@
 //! aggregated wake over WSS with both children's summaries.
 //!
 //! Coverage:
-//! - Delegation groups persist to SQLite (write-through)
+//! - Delegation groups persist to `SQLite` (write-through)
 //! - Groups rehydrate on `agent.resolveInterrupted` with sealed=true
 //! - Pre-restart completions survive restart
 //! - Aggregated wake fires exactly once with both summaries
@@ -353,7 +353,7 @@ where
     }
 }
 
-/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// Short base under /tmp (UDS `SUN_LEN` cap); the returned guard removes the
 /// dir on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
 fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-delgrp-")

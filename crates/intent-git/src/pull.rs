@@ -1,7 +1,7 @@
 //! Branch pull (`git.pull`), porting the legacy `git:pullBranch` IPC handler.
 //!
 //! The workspace-create flow auto-pulls a behind branch before creating the
-//! workspace. Semantics ported from the TS handler (`git.ipc.ts` PULL_BRANCH):
+//! workspace. Semantics ported from the TS handler (`git.ipc.ts` `PULL_BRANCH`):
 //! when `branch_name` is not the checked-out branch, a fetch of
 //! `origin/<branch>` is sufficient (worktrees are created from the
 //! remote-tracking ref); when it is checked out, run the equivalent of

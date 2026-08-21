@@ -55,7 +55,7 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 const WRITER_BATCH_SIZE: usize = 64;
 
 /// Total attempts for a batch insert that fails transiently (write-pool
-/// acquire timeout / SQLITE_BUSY under contention — the write pool has
+/// acquire timeout / `SQLITE_BUSY` under contention — the write pool has
 /// `max_connections=1`, so bursts serialize at `pool.acquire()`). Because the
 /// bus is append-then-broadcast, a failed batch is lost for live subscribers
 /// too (monorepo#2673), so transient contention is worth a couple of retries
@@ -132,7 +132,7 @@ impl EventBus {
     /// writer task has shut down or the send fails.
     ///
     /// Non-agent `file:*` events are downgraded to a transient broadcast
-    /// ([`is_transient_file_event`]) so watcher noise never reaches SQLite;
+    /// ([`is_transient_file_event`]) so watcher noise never reaches `SQLite`;
     /// callers see the same `Ok(Event)` shape either way.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
         if is_transient_file_event(ev) {
@@ -157,7 +157,7 @@ impl EventBus {
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
     }
 
-    /// Mint an event id (UUIDv7) + timestamp and broadcast to live subscribers
+    /// Mint an event id (`UUIDv7`) + timestamp and broadcast to live subscribers
     /// WITHOUT persisting. Used for high-volume ephemeral events (e.g.
     /// `chat:stream:delta`) that do not need durable storage. The wire shape
     /// matches persisted events exactly (same id/timestamp minting as
@@ -266,15 +266,15 @@ impl Drop for Subscription {
 }
 
 /// Writer task: drains events from the inbound channel, batch-persists them in
-/// a single transaction (up to WRITER_BATCH_SIZE per batch), resolves each
+/// a single transaction (up to `WRITER_BATCH_SIZE` per batch), resolves each
 /// oneshot with the result, and broadcasts each stored event in order. Stops
-/// when the channel closes (all EventBus handles dropped).
+/// when the channel closes (all `EventBus` handles dropped).
 ///
 /// **Latency/batching**: after awaiting the first event, the task greedily
 /// drains whatever is already queued (`try_recv`) and flushes immediately — a
 /// lone publish commits without any artificial batch-window wait, while
 /// sustained bursts still coalesce because events that queue during the
-/// previous flush's SQLite commit drain into the next batch.
+/// previous flush's `SQLite` commit drain into the next batch.
 ///
 /// **Shutdown invariant**: The task receives `None` from `rx.recv()` only after
 /// all `EventBus` clones (and their `writer_tx` senders) have been dropped. This
@@ -339,7 +339,7 @@ async fn flush_batch(
 /// oneshots resolve with the error.
 ///
 /// Worst-case stall: the backoff sleeps are small, but each attempt can
-/// itself block for the write pool's acquire timeout (10s) or SQLite's
+/// itself block for the write pool's acquire timeout (10s) or `SQLite`'s
 /// `busy_timeout` (5s) on `BEGIN IMMEDIATE`, so a hard stall costs up to
 /// roughly 3× today's single-attempt bound per batch before the drop —
 /// accepted for monorepo#2673, where observed contention clears in tens of
@@ -417,7 +417,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
 /// Whether a batch-insert error is transient — worth retrying because it
 /// reflects momentary contention, not a defect in the batch itself: the
 /// single-connection write pool's acquire timed out (`insert_events` maps
-/// this to "acquire connection failed: pool timed out …"), or SQLite
+/// this to "acquire connection failed: pool timed out …"), or `SQLite`
 /// reported the database busy/locked (a cross-process writer holding the
 /// lock past `busy_timeout`). Everything else (constraint violations,
 /// payload serialization failures, I/O errors) is permanent and fails the

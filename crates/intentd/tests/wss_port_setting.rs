@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Mock ServerControl that captures port from start_ws_listener calls
+/// Mock `ServerControl` that captures port from `start_ws_listener` calls
 struct MockPortServerControl {
     should_fail: bool,
     requested_port: Arc<tokio::sync::Mutex<Option<u16>>>,

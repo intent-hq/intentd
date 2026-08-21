@@ -160,7 +160,7 @@ pub fn next_check_delay(min: Duration, max: Duration, random: u64) -> Duration {
     min + Duration::from_nanos(u64::try_from(offset).unwrap_or(u64::MAX))
 }
 
-/// A random `u64` from the standard library's randomly-keyed SipHash
+/// A random `u64` from the standard library's randomly-keyed `SipHash`
 /// (no `rand` dependency; jitter does not need cryptographic quality).
 fn random_u64() -> u64 {
     use std::collections::hash_map::RandomState;
@@ -531,7 +531,7 @@ impl Supervisor {
             .map_err(|e| UpdateError::Io(io::Error::other(e)))?
     }
 
-    /// Pick the next check time in [check_min, check_max) and persist it
+    /// Pick the next check time in [`check_min`, `check_max`) and persist it
     /// (with `last_check_at = now`) so restarts don't reset the clock.
     fn schedule_next_check(&self) -> Instant {
         let delay = next_check_delay(self.config.check_min, self.config.check_max, random_u64());

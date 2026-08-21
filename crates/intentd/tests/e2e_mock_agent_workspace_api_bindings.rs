@@ -1,4 +1,4 @@
-//! Hermetic ACP E2E: comprehensive coverage of agent→BE workspace_api bindings.
+//! Hermetic ACP E2E: comprehensive coverage of agent→BE `workspace_api` bindings.
 //!
 //! Each test spawns the mock ACP agent with `MOCK_AGENT_BEHAVIOR` that drives
 //! real MCP `tools/call` invocations for the target binding namespace. We assert

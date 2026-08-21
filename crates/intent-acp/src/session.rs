@@ -284,7 +284,7 @@ pub async fn set_session_config_option(
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
 /// the agent then resolves the in-flight `session/prompt` with
 /// `StopReason::Cancelled`). Hard-cancel/reap process-tree kill is
-/// `SpawnedAgent::kill` (orchestrated by the AgentManager, M3.6) (§6.5).
+/// `SpawnedAgent::kill` (orchestrated by the `AgentManager`, M3.6) (§6.5).
 pub async fn cancel(conn: &Connection, session_id: &str) -> AcpResult<()> {
     let notification = CancelNotification::new(SessionId::new(session_id));
     let params = serde_json::to_value(&notification)?;

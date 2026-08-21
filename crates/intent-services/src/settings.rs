@@ -18,7 +18,7 @@
 //!
 //! Internal readers of TOML-backed keys (e.g. [`branch_prefix`],
 //! [`max_concurrent_agents`]) consume the effective typed [`SettingsFile`]
-//! from the registry snapshot (`Services::effective_settings`); the SQLite
+//! from the registry snapshot (`Services::effective_settings`); the `SQLite`
 //! `settings` table only persists the machine-state blobs. Retired keys
 //! (`model.workspaceOverrides`, monorepo#1000) have no catalog entry:
 //! `settings.update` tolerates-and-ignores them and
@@ -45,7 +45,7 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 /// The retired per-workspace model override path (monorepo#1000). No catalog
 /// entry remains: `settings.get`/`settings.reset` reject it as unknown, but
 /// old clients still writing it via `settings.update` are tolerated-and-
-/// ignored, and [`cleanup_retired_settings`] deletes the stale SQLite row on
+/// ignored, and [`cleanup_retired_settings`] deletes the stale `SQLite` row on
 /// boot.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
@@ -167,7 +167,7 @@ struct AsyncState {
     entries: HashMap<String, Entry>,
     last_warn: HashMap<String, Instant>,
     /// Monotonic counter dispensing a unique `load_id` per in-flight load, so a
-    /// delayed spawn_blocking result can tell whether it still owns the slot.
+    /// delayed `spawn_blocking` result can tell whether it still owns the slot.
     next_load_id: u64,
 }
 
@@ -175,7 +175,7 @@ struct AsyncState {
 /// can wait on, or a resolved value valid until `expires_at`.
 enum Entry {
     /// A blocking load is in progress. `rx` receives `Some(result)` when the
-    /// spawn_blocking task finishes; `started_at` lets late waiters shrink their
+    /// `spawn_blocking` task finishes; `started_at` lets late waiters shrink their
     /// remaining budget so the effective wait per caller stays bounded.
     /// `load_id` uniquely tags this in-flight load so a delayed completion can
     /// detect an intervening store/delete/newer load and refuse to clobber the
@@ -231,7 +231,7 @@ impl AsyncSecretStore {
 
     /// Read the secret for `account`. `Ok(None)` when confirmed absent;
     /// `Err` on timeout / backing-error. Concurrent callers for the same `account`
-    /// are coalesced into a single spawn_blocking; a cached result is served
+    /// are coalesced into a single `spawn_blocking`; a cached result is served
     /// without touching the backing store until it expires.
     pub(crate) async fn load(&self, account: &str) -> Result<Option<String>> {
         let action = {
@@ -330,13 +330,13 @@ impl AsyncSecretStore {
     }
 
     /// Kick off the blocking load for `account`, publishing the result via `tx`
-    /// and swapping the InFlight slot for a Cached one if successful (errors never
+    /// and swapping the `InFlight` slot for a Cached one if successful (errors never
     /// cache, so the next call re-attempts). Runs to completion even after every
     /// awaiting caller has timed out — that's the point: only ONE blocking-pool
     /// thread per account. The `load_id` generation guard ensures a delayed
     /// completion does NOT overwrite a slot that an intervening `store` / `delete` /
     /// newer load already refreshed: the write only happens if the slot is still
-    /// the InFlight tagged with `load_id`.
+    /// the `InFlight` tagged with `load_id`.
     fn spawn_load(
         &self,
         account: String,
@@ -477,8 +477,8 @@ enum LoadAction {
         rx: watch::Receiver<Option<Result<Option<String>>>>,
         started_at: Instant,
     },
-    /// No load in flight; the current caller registered a new InFlight slot
-    /// (tagged with `load_id`) and now owns the spawn_blocking / notify
+    /// No load in flight; the current caller registered a new `InFlight` slot
+    /// (tagged with `load_id`) and now owns the `spawn_blocking` / notify
     /// responsibility.
     Start {
         tx: watch::Sender<Option<Result<Option<String>>>>,
@@ -1535,10 +1535,10 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
     }
 }
 
-/// One-time boot import of legacy `config.toml` keys back into the SQLite
+/// One-time boot import of legacy `config.toml` keys back into the `SQLite`
 /// `settings` table (import-or-discard-and-strip). The registry's load
 /// tolerated the [`intent_core::settings_file::LEGACY_SETTINGS_PATHS`] keys
-/// and captured their values; here each captured value is persisted to SQLite
+/// and captured their values; here each captured value is persisted to `SQLite`
 /// when it matches its catalog definition (overwriting any existing row —
 /// the file value is the user's most recent intent) or discarded with a
 /// warning when it does not (all current legacy keys — `[ai]`,
@@ -1548,8 +1548,8 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
 /// `quickActions.*` beforehand by [`migrate_quick_action_settings`]), and the
 /// keys are then stripped from the file with a comment-preserving rewrite.
 /// Nothing is stripped when a
-/// SQLite write fails, so the next boot retries the import. The strip itself
-/// is best-effort: once the values are safely in SQLite, a failed file
+/// `SQLite` write fails, so the next boot retries the import. The strip itself
+/// is best-effort: once the values are safely in `SQLite`, a failed file
 /// rewrite (read-only file, perms, full disk) is logged and startup continues
 /// — the next boot re-runs the import, which idempotently overwrites the same
 /// rows and retries the strip. Returns the stripped paths (empty when the
@@ -1654,7 +1654,7 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
     Ok(())
 }
 
-/// One-time boot cleanup of stale SQLite rows for retired settings. The
+/// One-time boot cleanup of stale `SQLite` rows for retired settings. The
 /// per-workspace override blob (`model.workspaceOverrides`, monorepo#1000)
 /// no longer has a catalog entry or any reader; delete its row so stale
 /// state cannot resurface if the key ever returns. Idempotent — deleting an
@@ -1727,7 +1727,7 @@ fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
 /// production composition root always wires it), the TOML-backed
 /// [`KNOWN_PATHS`] keys read from and write through the registry
 /// (`config.toml`); without it, every non-secret key keeps the legacy
-/// SQLite path (read-only test wiring).
+/// `SQLite` path (read-only test wiring).
 pub(crate) struct SettingsService<'a> {
     store: &'a Store,
     secrets: &'a AsyncSecretStore,
@@ -1748,7 +1748,7 @@ impl<'a> SettingsService<'a> {
     }
 
     /// The registry serving `path`, when it is a TOML-backed key and the
-    /// registry is wired. `None` falls back to the legacy SQLite path.
+    /// registry is wired. `None` falls back to the legacy `SQLite` path.
     fn registry_for(&self, path: &str) -> Option<&'a SettingsRegistry> {
         self.registry.filter(|_| KNOWN_PATHS.contains(&path))
     }
@@ -1869,7 +1869,7 @@ impl<'a> SettingsService<'a> {
     /// **one atomic apply** (typed-schema + pin validation, single
     /// comment-preserving `config.toml` rewrite; a flag-pinned key rejects the
     /// whole batch with `-32602` before anything mutates) and never touch the
-    /// SQLite `settings` table. Secrets and state-blob keys keep their
+    /// `SQLite` `settings` table. Secrets and state-blob keys keep their
     /// existing stores. If a later secret/DB write in a mixed batch fails,
     /// the already-applied registry batch is compensated (prior values
     /// restored, config.toml rewritten back) so an error return never leaves
@@ -2640,7 +2640,7 @@ mod tests {
 
     /// `workspaceApi.*` round-trip through the registry-wired service:
     /// defaults read with `default` origin, updates persist to config.toml
-    /// (`file` origin, never SQLite), the sub-1000 non-zero value for
+    /// (`file` origin, never `SQLite`), the sub-1000 non-zero value for
     /// `maxOutputChars` rejects with `-32602` via the typed schema, `0`
     /// (unlimited) is accepted, and reset restores the defaults.
     #[tokio::test]
@@ -3095,7 +3095,7 @@ mod tests {
 
     /// Q1 regression: with the registry wired (production composition), a
     /// `settings.update` of a TOML-backed key persists to `config.toml` only —
-    /// it must NOT write a row to the SQLite `settings` table, which now holds
+    /// it must NOT write a row to the `SQLite` `settings` table, which now holds
     /// machine-state blobs + dynamic non-TOML keys exclusively.
     #[tokio::test]
     async fn update_of_toml_backed_key_does_not_write_sqlite() {
@@ -3202,8 +3202,8 @@ mod tests {
     }
 
     /// `voice.openai.model` is a TOML-backed enum with the three supported
-    /// OpenAI transcription models and the gpt-4o-transcribe default; it
-    /// persists through `settings.update` to config.toml (never SQLite).
+    /// `OpenAI` transcription models and the gpt-4o-transcribe default; it
+    /// persists through `settings.update` to config.toml (never `SQLite`).
     #[tokio::test]
     async fn voice_openai_model_is_a_toml_backed_enum() {
         let path = "voice.openai.model";
@@ -3273,7 +3273,7 @@ mod tests {
 
     /// `voice.language` is a TOML-backed optional string (no default —
     /// unset means provider auto-detection); it persists through
-    /// `settings.update` to config.toml (never SQLite).
+    /// `settings.update` to config.toml (never `SQLite`).
     #[tokio::test]
     async fn voice_language_is_a_toml_backed_optional_string() {
         let path = "voice.language";
@@ -3334,7 +3334,7 @@ mod tests {
     /// `model.defaultReasoningEffort` is a TOML-backed optional string (no
     /// default — unset means no global effort preference), stored as-is under
     /// `[model]`; it round-trips through `settings.update` / `settings.reset`
-    /// to config.toml (never SQLite), and a blank string clears it to unset.
+    /// to config.toml (never `SQLite`), and a blank string clears it to unset.
     #[tokio::test]
     async fn model_default_reasoning_effort_is_a_toml_backed_optional_string() {
         let path = "model.defaultReasoningEffort";
@@ -3437,7 +3437,7 @@ mod tests {
     /// `voice.workspaceVocabulary.maxTerms` is a TOML-backed bounded number
     /// (default 50, min 0, max 100 — 0 disables derivation and injection;
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
-    /// config.toml (never SQLite) and rejects out-of-range values.
+    /// config.toml (never `SQLite`) and rejects out-of-range values.
     #[tokio::test]
     async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
         let path = "voice.workspaceVocabulary.maxTerms";
@@ -3760,7 +3760,7 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// [`cleanup_retired_settings`] deletes the stale SQLite row left behind
+    /// [`cleanup_retired_settings`] deletes the stale `SQLite` row left behind
     /// by the retired per-workspace override layer, and is an idempotent
     /// no-op when the row is absent.
     #[tokio::test]
@@ -3878,7 +3878,7 @@ mod tests {
     /// Boot-time legacy handling: a `config.toml` carrying the retired
     /// `model.workspaceOverrides` key loads (tolerated), the value is
     /// DISCARDED (the key has no catalog entry since monorepo#1000, so
-    /// nothing lands in SQLite), the key is stripped from the file with
+    /// nothing lands in `SQLite`), the key is stripped from the file with
     /// comments preserved, and a second import is a no-op.
     #[tokio::test]
     async fn import_legacy_settings_discards_and_strips() {
@@ -4078,7 +4078,7 @@ mod tests {
 
     /// The retired `[ai]` table has no catalog entry at all: a config.toml
     /// still carrying it boots (tolerated), the values are DISCARDED (never
-    /// imported into SQLite), and the whole table is stripped from the file
+    /// imported into `SQLite`), and the whole table is stripped from the file
     /// with comments and sibling keys preserved.
     #[tokio::test]
     async fn import_legacy_settings_discards_and_strips_ai_table() {

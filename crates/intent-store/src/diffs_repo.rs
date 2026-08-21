@@ -41,7 +41,7 @@ pub struct DiffRow {
 
 impl Store {
     /// Upsert a diff keyed by the `UNIQUE(workspace_id, file_path, staged)` index:
-    /// insert with a minted UUIDv7 id, or refresh the content/hunks of the
+    /// insert with a minted `UUIDv7` id, or refresh the content/hunks of the
     /// existing row in place (its id + `created_at` are preserved).
     pub async fn upsert_diff(&self, d: &NewDiff) -> Result<()> {
         let id = Uuid::now_v7().to_string();

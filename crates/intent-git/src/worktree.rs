@@ -140,7 +140,7 @@ pub fn provision_worktree(
 }
 
 /// Map a libgit2 worktree-add error into a domain error, classifying the
-/// "branch already checked out" failure as InvalidParams with an actionable
+/// "branch already checked out" failure as `InvalidParams` with an actionable
 /// message (PROTOCOL §9 `-32602`) instead of a generic Internal error.
 fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     let msg = e.message();
@@ -260,9 +260,9 @@ pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
         .map_err(|e| Error::Internal(format!("cannot remove detached worktree dir: {e}")))
 }
 
-/// CoW counterpart of [`detach_worktree`] for standalone checkouts
+/// `CoW` counterpart of [`detach_worktree`] for standalone checkouts
 /// (`checkoutMode == "cow"`): rename the checkout directory to a unique
-/// sibling trash path awaiting [`remove_detached_worktree`]. A CoW checkout
+/// sibling trash path awaiting [`remove_detached_worktree`]. A `CoW` checkout
 /// is a full clone with no registration in the source repository, so there
 /// is nothing to prune — this is filesystem work only and never opens a
 /// repository. Same semantics as the detach phase: `Ok(None)` when the

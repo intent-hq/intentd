@@ -51,7 +51,7 @@ pub fn prelude() -> String {
 
 /// Feature-aware prelude: namespaces disabled in `[agentFeatures]` are
 /// omitted entirely, so agent code touching them fails with a clear
-/// `ws.<ns> is undefined` TypeError. With every toggle on — the default —
+/// `ws.<ns> is undefined` `TypeError`. With every toggle on — the default —
 /// nothing is omitted.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     prelude_for_bridge(features, false)
