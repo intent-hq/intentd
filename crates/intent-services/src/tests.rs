@@ -12992,6 +12992,10 @@ mod pr {
         assert_eq!(after.pr_number, None);
         assert_eq!(after.pr_url, None);
         assert_eq!(after.pr_status, None);
+        assert!(
+            after.pull_requests.is_none(),
+            "unlink never appends the off-branch PR to the pool"
+        );
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)
@@ -13240,6 +13244,170 @@ mod pr {
             .await
             .unwrap();
         assert_eq!(updated.len(), 0);
+    }
+
+    /// A hung pool-entry re-fetch (monorepo#1988 lineage) is bounded by the
+    /// per-entry timeout: the heal moves past it, keeps the entry's persisted
+    /// snapshot, and the linked-PR delta computed before the heal still
+    /// persists — a persistently hanging oldest-first entry can no longer
+    /// starve the linked refresh out of the per-root budget.
+    #[tokio::test]
+    async fn pool_heal_hung_entry_times_out_and_linked_delta_persists() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        // 500 ms per-root budget → 50 ms per heal entry; generous enough for
+        // the healthy work (SQLite writes) on a saturated CI machine.
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(500));
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        root.pull_requests = Some(vec![pool_entry(
+            7,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // Linked #42 is fetched merged; pool entry #7's fetch went dark.
+        let sc = Arc::new(StubForge {
+            merged_linked: true,
+            hang_get_pr: Some(7),
+            ..Default::default()
+        });
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            svc.refresh_git_root_pr(root, &sc_dyn),
+        )
+        .await
+        .expect("per-entry timeout must bound the hung fetch")
+        .unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+        assert_eq!(*sc.seen_get_pr.lock().unwrap(), vec![42, 7]);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged),
+            "linked delta persists despite the hung pool entry"
+        );
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        let hung = list.iter().find(|p| p.number == 7).unwrap();
+        assert_eq!(hung.status, intent_core::PullRequestStatus::Closed);
+    }
+
+    /// The heal is repo-scoped, not branch-scoped: an unlinked root whose
+    /// HEAD is unreadable (linkage path `Skipped`) still heals its pool,
+    /// upgrading the outcome to `Updated`.
+    #[tokio::test]
+    async fn pool_heal_runs_on_branchless_root_upgrading_skipped() {
+        let primary = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        // A plain directory, not a git repo: current-branch read fails.
+        let plain = std::env::temp_dir().join(format!("intentd-plain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut root = sweep_root(&ws.id, &plain, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        let _ = std::fs::remove_dir_all(&plain);
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
+    }
+
+    /// The heal never re-fetches the PR the linkage path already fetched
+    /// this pass: a linked PR that also sits in the pool is fetched exactly
+    /// once, while other stale entries still heal.
+    #[tokio::test]
+    async fn pool_heal_excludes_the_freshly_fetched_linked_pr() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        root.pull_requests = Some(vec![
+            pool_entry(
+                42,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-01T00:00:00Z",
+            ),
+            pool_entry(
+                43,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-02T00:00:00Z",
+            ),
+        ]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc = Arc::new(StubForge::default());
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = svc.refresh_git_root_pr(root, &sc_dyn).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+        assert_eq!(
+            *sc.seen_get_pr.lock().unwrap(),
+            vec![42, 43],
+            "linked #42 fetched once by the linkage path, never by the heal"
+        );
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        for n in [42u64, 43] {
+            let entry = list.iter().find(|p| p.number == n).unwrap();
+            assert_eq!(entry.status, intent_core::PullRequestStatus::Open);
+        }
+    }
+
+    /// Unlinking on a branch mismatch still refreshes an existing pool entry
+    /// for that PR in place — the fetched snapshot is authoritative and
+    /// already paid for — without the heal re-fetching it this pass.
+    #[tokio::test]
+    async fn unlink_refreshes_existing_pool_entry_in_place() {
+        let primary = SweepRepo::init("main", None);
+        // Root repo is on "main"; the linked PR #42's head is "feature".
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        root.pull_requests = Some(vec![pool_entry(
+            42,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc = Arc::new(StubForge::default());
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = svc.refresh_git_root_pr(root, &sc_dyn).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+        assert_eq!(
+            *sc.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "in-place refresh reuses the unlink fetch; the heal skips #42"
+        );
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, None);
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1, "in-place only — no append");
+        assert_eq!(list[0].number, 42);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
     }
 }
 

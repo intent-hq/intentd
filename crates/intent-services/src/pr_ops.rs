@@ -136,6 +136,9 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrRefreshOutcome {
     /// Not eligible (remote/archived workspace, no repo, or no branch).
+    /// Git-root refreshes still run the repo-scoped stale-pool heal on a
+    /// branchless root ([`refresh_stale_pool_entries`]), upgrading to
+    /// `Updated` when it changed the pool.
     Skipped,
     /// Eligible but nothing changed (linked PR snapshot identical; or no
     /// matching PR found during discovery).
@@ -352,12 +355,16 @@ pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
 /// [`MAX_STALE_POOL_REFETCHES`] entries are re-fetched per call, oldest
 /// `updatedAt` first (unparseable timestamps sort oldest, ties by number);
 /// fail-soft per entry — a forge error logs and keeps the persisted
-/// snapshot. Returns whether the list changed.
+/// snapshot, and each re-fetch is bounded by `per_entry_timeout` so one
+/// hung connection (monorepo#1988 lineage) can never eat the caller's whole
+/// per-root budget and starve the linked-PR delta persist that follows the
+/// heal. Returns whether the list changed.
 pub(crate) async fn refresh_stale_pool_entries(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     list: &mut Option<Vec<PullRequestInfo>>,
     exclude: &[u64],
+    per_entry_timeout: std::time::Duration,
 ) -> bool {
     let Some(items) = list.as_deref() else {
         return false;
@@ -371,15 +378,22 @@ pub(crate) async fn refresh_stale_pool_entries(
     candidates.truncate(MAX_STALE_POOL_REFETCHES);
     let mut changed = false;
     for (_, number) in candidates {
-        match sc.get_pr(repo_ref, number).await {
-            Ok(pr) => {
+        match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
+            Ok(Ok(pr)) => {
                 changed |= upsert_pr_info(list, &build_pr_info(&pr));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     pr_number = number,
                     error = %e,
                     "stale PR pool re-fetch failed; keeping persisted snapshot"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pr_number = number,
+                    timeout = ?per_entry_timeout,
+                    "stale PR pool re-fetch timed out; keeping persisted snapshot"
                 );
             }
         }

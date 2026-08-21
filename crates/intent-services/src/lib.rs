@@ -3222,8 +3222,20 @@ impl Services {
             fetched_fresh.push(number);
             // Clear a stale link only on a positive mismatch against the
             // root's current branch; an unreadable HEAD (empty branch)
-            // never unlinks.
+            // never unlinks. The fetched snapshot still refreshes an
+            // existing pool entry in place (it's authoritative and already
+            // paid for) — but never appends, so an off-branch PR doesn't
+            // join the pool just by having been linked.
             if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
+                if root
+                    .pull_requests
+                    .as_deref()
+                    .is_some_and(|items| items.iter().any(|p| p.number == number))
+                {
+                    // `changed` is set unconditionally below (the unlink
+                    // itself persists), so the upsert's flag is redundant.
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &pr_ops::build_pr_info(&pr));
+                }
                 root.pr_number = None;
                 root.pr_url = None;
                 root.pr_status = None;
@@ -3306,11 +3318,16 @@ impl Services {
                 None => PrRefreshOutcome::Unchanged,
             }
         };
+        // Each heal re-fetch gets a tenth of the per-root budget: the five
+        // capped entries can consume at most half of it, so a hung pool
+        // fetch (monorepo#1988 lineage) can never starve the linked-PR
+        // delta persist below out of the caller's PR_REFRESH_FETCH_TIMEOUT.
         changed |= pr_ops::refresh_stale_pool_entries(
             sc.as_ref(),
             &repo_ref,
             &mut root.pull_requests,
             &fetched_fresh,
+            self.pr_refresh_fetch_timeout / 10,
         )
         .await;
         if !changed {
