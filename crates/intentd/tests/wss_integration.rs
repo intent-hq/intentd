@@ -1192,7 +1192,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             Some(Ok(Message::Ping(p))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
