@@ -912,8 +912,8 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// step instead of being trusted (an unknown `model.default` prefix must not
 /// shadow a perfectly valid `providers.active`). `None` when neither yields
 /// a registered provider — no provider carries a hardcoded default
-/// designation, so callers fall through to [`resolve_provider_id`]'s neutral
-/// positional last resort (the first registered provider).
+/// designation, and there is no positional last resort (monorepo#3044):
+/// resolution that falls through entirely fails loudly at the caller.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
@@ -937,24 +937,21 @@ pub(crate) fn derived_default_provider(
 /// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
 /// yields a non-empty provider) → `provider` field → `configured_default` (the
 /// settings-derived default — see [`derived_default_provider`] — when the
-/// caller has one to offer) → the first registered provider (a neutral
-/// positional last resort; no provider carries a default designation).
-/// Malformed compound ids like `:sonnet` yield an empty prefix and fall
-/// through to the provider field / configured default / last resort. This
-/// ensures `_meta` injection, spawn args, and all provider-keyed logic use a
-/// consistent provider id.
+/// caller has one to offer). Malformed compound ids like `:sonnet` yield an
+/// empty prefix and fall through to the provider field / configured default.
+/// This ensures `_meta` injection, spawn args, and all provider-keyed logic
+/// use a consistent provider id.
 ///
-/// `configured_default` deliberately sits ABOVE the positional last resort
-/// (spec Decision D2): a session with no persisted `provider` (e.g. an older
-/// row, or a creation path that never resolved one) should still prefer the
-/// user's actual configured default. Callers without settings access (e.g.
-/// usage-stats attribution) pass `None`, bottoming out at the first
-/// registered provider for that narrower use.
+/// `None` when nothing resolves (monorepo#3044): the former positional last
+/// resort (the first registered provider, auggie) silently spawned a binary
+/// that may not be installed. Spawn-adjacent callers surface
+/// [`no_default_provider_error`] instead; stats-attribution callers (which
+/// pass `configured_default: None`) fall to their existing `"unknown"` tail.
 pub(crate) fn resolve_provider_id(
     model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
-) -> String {
+) -> Option<String> {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
@@ -969,7 +966,20 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
-        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
+}
+
+/// The loud `-32602`-style error for provider resolution that falls through
+/// entirely (monorepo#3044): no explicit provider/model, no session provider,
+/// and no settings-derived default. Mirrors the resolved-but-unavailable
+/// error style (`ensure_provider_available`) so clients can surface it
+/// directly. `context` names the failing operation (e.g. `agent.delegate`).
+pub(crate) fn no_default_provider_error(context: &str) -> Error {
+    Error::InvalidParams(format!(
+        "{context}: no default provider/model is configured — no explicit \
+         provider or model was given and neither providers.active nor a \
+         compound model.default is set. Choose a provider in Settings > \
+         Agents, or pass an explicit provider/model."
+    ))
 }
 
 /// Resolve the effective model a provider is actually running from the
@@ -1843,13 +1853,16 @@ impl Services {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → configured default → default), then build
-        // provider-specific _meta.
+        // prefix → provider field → configured default), then build
+        // provider-specific _meta. Reached only after a successful spawn (which
+        // resolved the same inputs), so a fall-through here is a settings race —
+        // fail loudly rather than fabricating a positional default (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/new"))?;
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1907,12 +1920,14 @@ impl Services {
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection (recreate path sends
-        // the same prompt as new/load).
+        // the same prompt as new/load). Same loud fall-through as
+        // [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/new"))?;
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
@@ -1980,12 +1995,14 @@ impl Services {
             return Ok(None);
         }
         // Resolve provider using the same precedence as spawn path, then build
-        // provider-specific _meta for system-prompt injection.
+        // provider-specific _meta for system-prompt injection. Same loud
+        // fall-through as [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/load"))?;
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -3362,9 +3379,11 @@ impl Services {
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         // Stats attribution only: no configured-default upgrade here (unlike
         // the spawn-adjacent call sites above), matching the pre-existing
-        // `usage_stats.rs` helpers this mirrors — out of scope for D2.
-        let provider_id =
-            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None));
+        // `usage_stats.rs` helpers this mirrors — out of scope for D2. An
+        // unresolvable provider falls to the `"unknown"` stats tail.
+        let provider_id = prev_readable
+            .then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None))
+            .flatten();
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),

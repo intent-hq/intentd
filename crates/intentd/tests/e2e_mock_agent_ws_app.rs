@@ -101,6 +101,7 @@ async fn chief_agent_ws_app_workspaces_list() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).
@@ -283,6 +284,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -457,6 +459,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -631,6 +634,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
@@ -808,6 +812,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
@@ -979,6 +984,7 @@ async fn non_chief_agent_ws_app_gating_error() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).

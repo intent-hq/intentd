@@ -84,6 +84,7 @@ fn scratch_dir(prefix: &str) -> PathBuf {
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     common::enable_ws_api(data_dir);
+    common::seed_default_provider(data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)

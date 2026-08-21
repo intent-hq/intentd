@@ -387,6 +387,32 @@ impl ModelCatalogCache {
         (entry_version_key == (source.version_key)()).then_some(default_id)
     }
 
+    /// The cached catalog's default-model id for `provider_id`, falling back
+    /// to the FIRST row of the provider's last-good entry when no row is
+    /// marked `isDefault` (default-provider self-heal, monorepo#3044). Same
+    /// synchronous, read-only, probe-free contract as
+    /// [`Self::cached_default_model`]: an unregistered provider, cold cache,
+    /// stale-pin entry, or an empty catalog all return `None` (the caller
+    /// then persists the provider without a model).
+    pub(crate) fn cached_default_or_first_model(&self, provider_id: &str) -> Option<String> {
+        if let Some(m) = self.cached_default_model(provider_id) {
+            return Some(m);
+        }
+        let source = source_for(provider_id)?;
+        let (entry_version_key, first_id) = {
+            let entries = self.entries.lock().expect("model catalog cache poisoned");
+            let entry = entries.get(provider_id)?;
+            let first_id = entry
+                .models
+                .first()
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            (entry.version_key.clone(), first_id)
+        };
+        (entry_version_key == (source.version_key)()).then_some(first_id)
+    }
+
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
     /// `model_id` may be compound (`provider:model`, restricting the search to
     /// that provider) or bare (searched across every registered provider in

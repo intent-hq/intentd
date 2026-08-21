@@ -48,10 +48,28 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".config.toml"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
         }
     }
+}
+
+/// A settings registry (backed by a config file next to the temp db, removed
+/// by [`TempDb`]'s drop) seeding a configured default provider: since
+/// monorepo#3044 there is no positional fallback, so ops that resolve a
+/// provider need `providers.active` set. The `providers.paths` override
+/// points auggie at a deterministic executable so availability checks
+/// (`agent.delegate`) pass without the real binary on the test host.
+pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::SettingsRegistry> {
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[
+            ("providers.active".into(), json!("auggie")),
+            ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+        ])
+        .expect("seed default provider");
+    registry
 }
 
 pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
@@ -106,7 +124,8 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    let registry = test_registry_with_default_provider(&tmp);
+    let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 
@@ -142,7 +161,8 @@ async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    let registry = test_registry_with_default_provider(&tmp);
+    let services = Services::new(store).with_settings_registry(registry);
     let bus = EventBus::new(services.store().clone());
     let services = services.with_event_bus(bus.clone());
     (tmp, services, ws, bus)
@@ -2063,10 +2083,11 @@ async fn fired_completion_watch_does_not_rehydrate() {
 async fn restart_reconcile_skips_already_delivered_completion() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
+    let registry = test_registry_with_default_provider(&tmp);
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -2830,10 +2851,11 @@ async fn unreported_completion_wake_delivers_with_summary() {
 async fn restart_reconcile_skips_completion_after_report_wake_and_rearm() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
+    let registry = test_registry_with_default_provider(&tmp);
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -19629,7 +19651,10 @@ async fn setup_with_manager() -> (
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let registry = test_registry_with_default_provider(&tmp);
+    let services = Services::new(store)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
     let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus.clone()));
     let manager = Arc::new(crate::agent_manager::AgentManager::new(
         services.clone(),

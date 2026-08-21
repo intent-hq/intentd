@@ -381,3 +381,70 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
         "error must never silently point at the hardcoded default provider: {message}"
     );
 }
+
+/// monorepo#3044: nothing configured at all (`providers.active` unset, no
+/// compound `model.default`) — `agent.delegate` without an explicit
+/// provider/model fails the RPC with `-32602` and a clear "no default
+/// provider/model is configured" message, never silently spawning the former
+/// positional fallback (Auggie).
+#[tokio::test]
+async fn delegate_errors_when_no_default_provider_configured_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let ws_result = wss_rpc(
+        &mut ws,
+        10,
+        "workspace.create",
+        json!({ "title": "3044 WSS E2E no default", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
+
+    // Deliberately NO settings.update: nothing configured, nothing healed
+    // (self-heal only runs on the host provider-discovery path, which no
+    // client drives here).
+    let delegate_resp = wss_rpc_raw(
+        &mut ws,
+        20,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+        }),
+    )
+    .await;
+    let error = delegate_resp.get("error").unwrap_or_else(|| {
+        panic!("no configured default must fail loudly, not spawn a positional fallback: {delegate_resp}")
+    });
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "no-default resolution failure maps to invalid params (§9): {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no default provider/model is configured"),
+        "error states that no default provider/model is configured: {message}"
+    );
+    assert!(
+        !message.to_ascii_lowercase().contains("auggie"),
+        "error must never point at the former hardcoded fallback provider: {message}"
+    );
+}

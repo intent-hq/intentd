@@ -159,7 +159,8 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(ws_root.path().to_path_buf()),
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path())),
     );
 
     // Socket lives in a guarded dir under /tmp so the path stays short

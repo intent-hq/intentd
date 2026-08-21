@@ -195,17 +195,17 @@ fn resolve_default_model_from_settings(
 
     // 1. Check provider defaults. With no explicit provider, key the lookup
     // by the settings-derived default (model.default prefix, else
-    // providers.active), bottoming out at the first registered provider.
+    // providers.active); with neither, there is no provider to key on
+    // (monorepo#3044: no positional last resort) and the step is skipped.
     let derived;
     let provider_key = match provider {
-        Some(p) => p,
+        Some(p) => Some(p),
         None => {
-            derived = crate::agent_session::derived_default_provider(&settings)
-                .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-            derived.as_str()
+            derived = crate::agent_session::derived_default_provider(&settings);
+            derived.as_deref()
         }
     };
-    if let Some(model) = settings.model.provider_defaults.get(provider_key) {
+    if let Some(model) = provider_key.and_then(|k| settings.model.provider_defaults.get(k)) {
         if !model.is_empty() {
             return Some(model.clone());
         }
@@ -288,19 +288,21 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default (model.default
-    // prefix, else providers.active), bottoming out at the first registered
-    // provider.
+    // prefix, else providers.active). With neither there is no effective
+    // provider (monorepo#3044: no positional last resort) — the
+    // provider-keyed steps below are skipped and ownership guards pass
+    // compound ids through on their own prefix.
     let derived;
-    let effective_provider = intent_providers::provider_config(match provider {
-        Some(p) => p,
+    let effective_provider: Option<&str> = match provider {
+        Some(p) => Some(intent_providers::provider_config(p).id),
         None => {
             derived =
-                crate::agent_session::derived_default_provider(&services.effective_settings())
-                    .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-            derived.as_str()
+                crate::agent_session::derived_default_provider(&services.effective_settings());
+            derived
+                .as_deref()
+                .map(|p| intent_providers::provider_config(p).id)
         }
-    })
-    .id;
+    };
 
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
@@ -314,7 +316,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
             }
             tracing::debug!(
                 model = m,
-                provider = effective_provider,
+                provider = effective_provider.unwrap_or_default(),
                 specialist = spec_id,
                 "specialist frontmatter model belongs to another provider; ignoring"
             );
@@ -330,7 +332,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
         }
         tracing::warn!(
             model = m,
-            provider = effective_provider,
+            provider = effective_provider.unwrap_or_default(),
             "configured default model belongs to another provider; \
              falling back to the catalog/CLI default"
         );
@@ -341,9 +343,8 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // row is the provider's own by construction, so no ownership guard is
     // needed. Pinning it to session.model freezes the model for the
     // session's lifetime even if the provider later changes its default.
-    if let Some(m) = services
-        .models_catalog
-        .cached_default_model(effective_provider)
+    if let Some(m) =
+        effective_provider.and_then(|p| services.models_catalog.cached_default_model(p))
     {
         return (Some(m), DefaultModelSource::CatalogDefault);
     }
@@ -358,10 +359,13 @@ pub(crate) fn resolve_agent_default_model_with_source(
 /// resolved provider (`agent_create_op` derives `session.provider` from it).
 /// Bare ids reuse [`ensure_bare_model_matches_provider`]'s asymmetric
 /// evidence rules (cached dynamic catalogs; absence of evidence passes).
+/// With no effective provider at all (monorepo#3044), only a known compound
+/// id passes — it carries its own provider; a bare id has nothing to be
+/// validated against and falls through.
 fn default_model_belongs_to_provider(
     services: &Services,
     provider_param: Option<&str>,
-    effective_provider: &str,
+    effective_provider: Option<&str>,
     model: &str,
 ) -> bool {
     if model.contains(':') {
@@ -370,8 +374,12 @@ fn default_model_belongs_to_provider(
             return false;
         }
         provider_param.is_none()
-            || intent_providers::provider_config(&prefix).id == effective_provider
+            || effective_provider
+                .is_some_and(|ep| intent_providers::provider_config(&prefix).id == ep)
     } else {
+        let Some(effective_provider) = effective_provider else {
+            return false;
+        };
         ensure_bare_model_matches_provider(
             "agent.create",
             &services.models_catalog,
@@ -566,14 +574,11 @@ fn resolve_delegate_reasoning_effort(
 /// 2. The settings-derived default (provider of `model.default`, else
 ///    `providers.active` — [`crate::agent_session::derived_default_provider`]),
 ///    with the same known/available requirement.
-/// 3. Neither is set: no resolution is made here (`Ok(None)`) — the
-///    session's `provider` stays unset, exactly like the pre-existing model
-///    resolution's "no configured default" case. `resolve_provider_id`
-///    (`agent_session.rs`) applies the same configured-default precedence at
-///    spawn time, but with no configured default to offer either, that
-///    precedence bottoms out at the first registered provider (neutral
-///    positional last resort) — this residual, no-config case is the one
-///    scenario where the positional fallback still applies.
+/// 3. Neither is set: a clear `-32602` (monorepo#3044) — the former residual
+///    `Ok(None)` left the session's `provider` unset, and spawn-time
+///    resolution bottomed out at the first registered provider (auggie),
+///    silently spawning a binary that may not be installed. Resolution that
+///    falls through entirely now fails loudly at the front door instead.
 fn resolve_delegate_provider(
     services: &Services,
     specialist: Option<&str>,
@@ -604,17 +609,20 @@ fn resolve_delegate_provider(
             ensure_provider_available("agent.delegate", &derived, &settings.providers.paths)?;
             Ok(Some(derived))
         }
-        None => Ok(None),
+        None => Err(crate::agent_session::no_default_provider_error(
+            "agent.delegate",
+        )),
     }
 }
 
 /// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
 /// the specialist's frontmatter `codingAgent` (or its compound `model`
 /// prefix) when it names a *known* provider, else the settings-derived
-/// default, bottoming out at the first registered provider — but tolerant of
-/// an unknown/unavailable provider instead of erroring, since a preview must
-/// never fail. Used by [`Services::specialist_model_options`] so the
-/// delegate-docs hint names the default each specialist's *own* provider
+/// default — but tolerant of an unknown/unavailable provider instead of
+/// erroring, since a preview must never fail. `None` when nothing resolves
+/// (monorepo#3044: no positional last resort) — the preview then shows the
+/// provider CLI default. Used by [`Services::specialist_model_options`] so
+/// the delegate-docs hint names the default each specialist's *own* provider
 /// override would actually pin, instead of assuming every specialist spawns
 /// on the shared settings-derived provider (a specialist pinned to another
 /// provider previously showed that other provider's fallback/`None`).
@@ -622,7 +630,7 @@ pub(crate) fn resolve_delegate_provider_preview(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
-) -> String {
+) -> Option<String> {
     if let Some(spec_id) = specialist {
         let specialists_svc = services.specialists_service();
         let explicit = specialists_svc
@@ -635,12 +643,11 @@ pub(crate) fn resolve_delegate_provider_preview(
             });
         if let Some(provider_id) = explicit {
             if intent_providers::find_provider(&provider_id).is_some() {
-                return provider_id;
+                return Some(provider_id);
             }
         }
     }
     crate::agent_session::derived_default_provider(&services.effective_settings())
-        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
 
 /// Reject a known provider id that the daemon's own provider discovery
@@ -2833,6 +2840,19 @@ impl Services {
         if let Some(p) = provider.as_deref() {
             ensure_known_provider("agent.create", p)?;
         }
+        // monorepo#3044: with no explicit provider, no compound model prefix
+        // (`provider` was just derived from one when present), and no
+        // settings-derived default, no spawn provider could ever resolve for
+        // this session. Fail loudly at the front door — the former behavior
+        // persisted the row and the spawn silently bottomed out at the first
+        // registered provider (auggie), installed or not.
+        let derived_default =
+            crate::agent_session::derived_default_provider(&self.effective_settings());
+        if provider.is_none() && derived_default.is_none() {
+            return Err(crate::agent_session::no_default_provider_error(
+                "agent.create",
+            ));
+        }
         // Also validate the resolved model's compound prefix unconditionally:
         // the spawn path (`resolve_provider_id`) gives the model prefix
         // precedence over session.provider, so a valid explicit provider must
@@ -2847,9 +2867,10 @@ impl Services {
                 // spawn would feed the effective provider another provider's
                 // model id (monorepo#607). The effective provider mirrors
                 // `resolve_provider_id` for a bare model: provider field →
-                // settings-derived default → first registered provider. Bare
-                // ids with no ownership evidence pass — ownership cannot be
-                // proven for model lists that were never fetched.
+                // settings-derived default (guaranteed present by the guard
+                // above). Bare ids with no ownership evidence pass —
+                // ownership cannot be proven for model lists that were never
+                // fetched.
                 //
                 // Only a *client-supplied* mismatch hard-fails. A mismatch in
                 // a derived default (specialist frontmatter / settings chain
@@ -2858,17 +2879,10 @@ impl Services {
                 // param) would reject a model the caller never sent and make
                 // the provider uncreatable until settings change; drop it to
                 // the CLI default instead (session.model stays None).
-                let derived;
-                let effective = match provider.as_deref() {
-                    Some(p) => p,
-                    None => {
-                        derived = crate::agent_session::derived_default_provider(
-                            &self.effective_settings(),
-                        )
-                        .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
-                        derived.as_str()
-                    }
-                };
+                let effective = provider
+                    .as_deref()
+                    .or(derived_default.as_deref())
+                    .expect("guarded above: provider or derived default present");
                 match ensure_bare_model_matches_provider(
                     "agent.create",
                     &self.models_catalog,
@@ -3069,6 +3083,7 @@ impl Services {
             &self.store,
             session.model.as_deref(),
             session.provider.as_deref(),
+            crate::agent_session::derived_default_provider(&settings).as_deref(),
         )
         .await;
         self.publish_agent_mutation_event(
@@ -3182,16 +3197,20 @@ impl Services {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
             // model has no prefix: session.provider → settings-derived
-            // default → first registered provider): a bare id provably owned
-            // by another provider (cached dynamic catalogs) is the same
-            // misroute vector (monorepo#607).
+            // default): a bare id provably owned by another provider (cached
+            // dynamic catalogs) is the same misroute vector (monorepo#607).
+            // With neither set the session could never spawn — fail loudly
+            // instead of validating against a positional default
+            // (monorepo#3044).
             let derived;
             let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
                 Some(p) => p,
                 None => {
                     derived =
                         crate::agent_session::derived_default_provider(&self.effective_settings())
-                            .unwrap_or_else(|| intent_providers::first_provider_id().to_string());
+                            .ok_or_else(|| {
+                                crate::agent_session::no_default_provider_error("agent.setModel")
+                            })?;
                     derived.as_str()
                 }
             };
