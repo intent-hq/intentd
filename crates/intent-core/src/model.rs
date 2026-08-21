@@ -3168,6 +3168,13 @@ pub struct AgentDelegateInput {
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
     pub model: Option<String>,
+    /// Explicit ACP provider for the delegated child (PROTOCOL §5.5).
+    /// Disambiguates models that exist under multiple providers. Wins over
+    /// every derived resolution rung (compound-`model` prefix, specialist
+    /// frontmatter, settings default); must name a known, available
+    /// provider, and a compound `model` naming a DIFFERENT provider is a
+    /// contradiction — both reject with `-32602` before any side effect.
+    pub provider: Option<String>,
     /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
     /// Wins over the chosen model option's `reasoningEffort` and the
     /// specialist's frontmatter scalar; validated against the cached model
@@ -3187,7 +3194,7 @@ pub struct AgentDelegateInput {
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task
-    /// `specialist`/`model`/`reasoningEffort` overrides. Mutually exclusive
+    /// `specialist`/`model`/`provider`/`reasoningEffort` overrides. Mutually exclusive
     /// with `taskNoteId`/`noteId`/`taskText`, and the single-task-only
     /// `agentInstructions`/`force` are rejected alongside it; when present
     /// the result enumerates every listed task with its disposition
@@ -3212,7 +3219,7 @@ pub struct AgentDelegateInput {
 #[serde(untagged)]
 pub enum BatchTaskEntry {
     /// Bare task-note id — inherits the call's top-level
-    /// `specialist`/`model`/`reasoningEffort` defaults.
+    /// `specialist`/`model`/`provider`/`reasoningEffort` defaults.
     Id(NoteId),
     /// Object entry with per-task overrides.
     Options(BatchTaskOptions),
@@ -3229,7 +3236,7 @@ impl BatchTaskEntry {
 }
 
 /// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
-/// `specialist`/`model`/`reasoningEffort` override the call's top-level
+/// `specialist`/`model`/`provider`/`reasoningEffort` override the call's top-level
 /// defaults for that task only. `agentInstructions` is carried solely so the
 /// delegate op can reject it with a clear error — it is never honored (each
 /// started task's first message resolves from its own task note).
@@ -3246,6 +3253,8 @@ pub struct BatchTaskOptions {
     pub specialist: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
