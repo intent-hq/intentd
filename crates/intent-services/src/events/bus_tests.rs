@@ -39,7 +39,7 @@ fn new_event(event_type: &str, actor_id: Option<&str>, actor_type: ActorType) ->
         event_type: event_type.to_string(),
         actor: EventActor {
             actor_type,
-            id: actor_id.map(|s| s.to_string()),
+            id: actor_id.map(std::string::ToString::to_string),
             ..Default::default()
         },
         session_id: None,
@@ -411,7 +411,7 @@ async fn concurrent_burst_batches_events_correctly() {
                 for seq in 0..EVENTS_PER_PUBLISHER {
                     let ev = new_event(
                         "test:burst",
-                        Some(&format!("publisher-{}", publisher_id)),
+                        Some(&format!("publisher-{publisher_id}")),
                         ActorType::Agent,
                     );
                     let mut ev_with_seq = ev;
@@ -477,16 +477,13 @@ async fn concurrent_burst_batches_events_correctly() {
         assert_eq!(
             seqs.len(),
             EVENTS_PER_PUBLISHER,
-            "publisher {} should have {} events",
-            publisher_id,
-            EVENTS_PER_PUBLISHER
+            "publisher {publisher_id} should have {EVENTS_PER_PUBLISHER} events"
         );
         let mut sorted = seqs.clone();
         sorted.sort_unstable();
         assert_eq!(
             seqs, sorted,
-            "publisher {} events should be in order",
-            publisher_id
+            "publisher {publisher_id} events should be in order"
         );
     }
 
@@ -512,8 +509,7 @@ async fn concurrent_burst_batches_events_correctly() {
     // regressions where batching breaks.
     assert!(
         elapsed < Duration::from_secs(3),
-        "burst should complete in <3s with batching; took {:?}",
-        elapsed
+        "burst should complete in <3s with batching; took {elapsed:?}"
     );
 }
 
@@ -537,7 +533,7 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
         let result = bus
             .publish(&new_event(
                 "test:failure",
-                Some(&format!("publisher-{}", i)),
+                Some(&format!("publisher-{i}")),
                 ActorType::Agent,
             ))
             .await;
@@ -549,8 +545,7 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
     for err in &errors {
         assert!(
             err.contains("batch insert failed"),
-            "error should indicate batch insert failure: {}",
-            err
+            "error should indicate batch insert failure: {err}"
         );
     }
 

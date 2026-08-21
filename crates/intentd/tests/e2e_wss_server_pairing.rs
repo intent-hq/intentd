@@ -207,7 +207,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -539,7 +539,7 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => return Some(text),
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 _ => return None,
             }
         }
@@ -561,7 +561,7 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     let status: Value = loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => break serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     };

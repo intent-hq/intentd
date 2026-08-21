@@ -66,7 +66,7 @@ async fn create_agent(
             None,
             None,
             false,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create");

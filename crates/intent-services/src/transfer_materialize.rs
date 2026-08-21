@@ -69,9 +69,9 @@ impl MaterializedGit {
         ws.repository_path = Some(checkout);
         ws.worktree_path = None;
         ws.checkout_mode = Some(CheckoutMode::Direct);
-        ws.branch = self.workspace_branch.clone();
+        ws.branch.clone_from(&self.workspace_branch);
         if ws.base_commit_sha.is_none() {
-            ws.base_commit_sha = self.base_sha.clone();
+            ws.base_commit_sha.clone_from(&self.base_sha);
         }
         sandboxes.retain_mut(|sb| {
             match self.sandboxes.iter().find(|m| m.agent_id == sb.agent_id.0) {
@@ -114,8 +114,7 @@ fn created_paths(out: &MaterializedGit) -> Vec<PathBuf> {
         .chain(out.sandboxes.iter().map(|s| {
             s.path
                 .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| s.path.clone())
+                .map_or_else(|| s.path.clone(), Path::to_path_buf)
         }))
         .collect()
 }
@@ -645,7 +644,7 @@ mod tests {
         let repo = git2::Repository::open(repo_path).unwrap();
         let remotes = repo.remotes().unwrap();
         let mut names = Vec::new();
-        for name in remotes.iter() {
+        for name in &remotes {
             if let Ok(Some(n)) = name {
                 names.push(n.to_string());
             }

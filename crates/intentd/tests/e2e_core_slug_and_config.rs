@@ -79,11 +79,10 @@ async fn workspace_id_random_slug_when_no_prompt() {
     let ws_id = result.workspace.id.0.as_str();
     // Verify it's a valid slug shape: word-word
     let parts: Vec<&str> = ws_id.split('-').collect();
-    assert_eq!(parts.len(), 2, "random slug should be word-word: {}", ws_id);
+    assert_eq!(parts.len(), 2, "random slug should be word-word: {ws_id}");
     assert!(
         intent_core::slug::is_workspace_slug(ws_id),
-        "random slug should be recognized as a workspace slug: {}",
-        ws_id
+        "random slug should be recognized as a workspace slug: {ws_id}"
     );
 
     // Clean up (drop store/services before removing SQLite files)
@@ -129,10 +128,10 @@ async fn config_resolve_reads_idle_reap_from_file() {
     let cfg_path = tmp_dir.join("config.toml");
     std::fs::write(
         &cfg_path,
-        r#"
+        r"
 [agents]
 idleReapMinutes = 50
-"#,
+",
     )
     .expect("write config");
 

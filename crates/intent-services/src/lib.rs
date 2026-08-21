@@ -1016,8 +1016,7 @@ impl Services {
     pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
         self.hook_clock_skew
             .as_ref()
-            .map(|s| s.load(std::sync::atomic::Ordering::SeqCst))
-            .unwrap_or(0)
+            .map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the
@@ -1785,8 +1784,7 @@ impl Services {
         if let Ok(mut map) = self.last_activity_debouncers.lock() {
             let should_insert = map
                 .get(&workspace_id)
-                .map(|(existing_gen, _)| gen > *existing_gen)
-                .unwrap_or(true);
+                .is_none_or(|(existing_gen, _)| gen > *existing_gen);
 
             if should_insert {
                 if let Some((_, old_handle)) =
@@ -2033,9 +2031,9 @@ impl Services {
                     continue;
                 }
                 let missing_owner = ws.repository_owner.is_none()
-                    || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+                    || ws.repository_owner.as_deref().is_some_and(str::is_empty);
                 let missing_name = ws.repository_name.is_none()
-                    || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+                    || ws.repository_name.as_deref().is_some_and(str::is_empty);
                 if (missing_owner || missing_name)
                     && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
                 {
@@ -2093,9 +2091,9 @@ impl Services {
 
         // Only fill fields that are still missing in the currently persisted state.
         let missing_owner = ws.repository_owner.is_none()
-            || ws.repository_owner.as_deref().is_some_and(|o| o.is_empty());
+            || ws.repository_owner.as_deref().is_some_and(str::is_empty);
         let missing_name = ws.repository_name.is_none()
-            || ws.repository_name.as_deref().is_some_and(|n| n.is_empty());
+            || ws.repository_name.as_deref().is_some_and(str::is_empty);
 
         if missing_owner {
             ws.repository_owner = Some(owner.clone());
@@ -2199,10 +2197,7 @@ impl Services {
         };
         // A never-provisioned directory can never yield a value, so don't
         // arm a walk (it would fail and leave `refreshing` forever-true).
-        let is_dir = tokio::fs::metadata(&dir)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+        let is_dir = tokio::fs::metadata(&dir).await.is_ok_and(|m| m.is_dir());
         if !is_dir {
             return Ok(serde_json::json!({ "refreshing": false }));
         }
@@ -2335,8 +2330,7 @@ impl Services {
             let should_emit = {
                 let gen_valid = if let Ok(map) = debouncers.lock() {
                     map.get(&ws_id)
-                        .map(|(current_gen, _)| *current_gen == gen)
-                        .unwrap_or(false)
+                        .is_some_and(|(current_gen, _)| *current_gen == gen)
                 } else {
                     false
                 };
@@ -2382,8 +2376,7 @@ impl Services {
         if let Ok(mut map) = self.idle_debouncers.lock() {
             let should_insert = map
                 .get(&workspace_id)
-                .map(|(existing_gen, _)| gen > *existing_gen)
-                .unwrap_or(true);
+                .is_none_or(|(existing_gen, _)| gen > *existing_gen);
 
             if should_insert {
                 if let Some((_, old_handle)) =
@@ -2568,8 +2561,7 @@ impl Services {
             // `acpSessionId` and immutable `provider` invariants (§9.5) are
             // untouched because those columns are not written here.
             let stop_reason = format!(
-                "daemon restarted while the agent was responding (previous status: {})",
-                prev_str
+                "daemon restarted while the agent was responding (previous status: {prev_str})"
             );
             self.store
                 .set_agent_session_status(
@@ -2829,7 +2821,7 @@ impl Services {
         tokio::task::spawn_blocking(move || intent_git::refs::rev_parse(&dir, "HEAD"))
             .await
             .ok()
-            .and_then(|r| r.ok())
+            .and_then(std::result::Result::ok)
     }
 
     /// Persist (insert-or-merge) a workspace git root and emit the matching
@@ -2952,7 +2944,7 @@ impl Services {
                 })
                 .await
                 .ok()
-                .and_then(|r| r.ok())
+                .and_then(std::result::Result::ok)
                 .flatten()
                 .and_then(|url| Self::parse_github_owner_repo(&url))
                 .map_or((None, None), |(o, n)| (Some(o), Some(n)));
@@ -3982,8 +3974,7 @@ impl Services {
             .lock()
             .expect("agent failure streak registry poisoned")
             .get(agent_id)
-            .map(|(_, n)| *n)
-            .unwrap_or(0)
+            .map_or(0, |(_, n)| *n)
     }
 
     /// Whether `session` is provably poisoned (monorepo#840): parked in
@@ -5360,7 +5351,11 @@ impl Services {
             );
         }
         let wake = format_group_wake(&group);
-        let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
+        let event_refs: Vec<&Event> = group
+            .raw_events
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
         let mut metadata = build_event_notification_metadata(&event_refs);
         // Enqueue-time trigger record (intent-hq/monorepo#2044), aggregated
         // form: every group member that settled via a genuine `agent:idle`
@@ -6453,7 +6448,7 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
         let ms =
             parse_iso(c).and_then(|dt| i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok());
         if let Some(ms) = ms {
-            if best.as_ref().map(|(b, _)| ms > *b).unwrap_or(true) {
+            if best.as_ref().is_none_or(|(b, _)| ms > *b) {
                 best = Some((ms, c.to_string()));
             }
         }
@@ -6589,7 +6584,7 @@ impl Services {
             }
             if let Ok(mut map) = services.line_attribution_debouncers.lock() {
                 let existing = map.get(&(ws.clone(), nid.clone()));
-                if existing.map(|h| h.is_finished()).unwrap_or(false) {
+                if existing.is_some_and(tokio::task::AbortHandle::is_finished) {
                     map.remove(&(ws, nid));
                 }
             }
@@ -6902,7 +6897,7 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
         if id == "spec" {
             continue;
         }
-        if note.parent_id.as_ref().map(|p| p.as_str()) != Some("spec") {
+        if note.parent_id.as_ref().map(intent_core::NoteId::as_str) != Some("spec") {
             continue;
         }
         if has_links && !linked.contains(id) {
@@ -6912,7 +6907,7 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
             continue;
         }
         match task.status {
-            TaskStatus::Cancelled => continue,
+            TaskStatus::Cancelled => {}
             TaskStatus::Complete => {
                 stats.total += 1;
                 stats.completed += 1;
@@ -7082,14 +7077,17 @@ fn find_dependency_cycle(
             n.metadata.task.as_ref().map(|t| {
                 (
                     n.id.as_str(),
-                    t.depends_on.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+                    t.depends_on
+                        .iter()
+                        .map(intent_core::NoteId::as_str)
+                        .collect::<Vec<_>>(),
                 )
             })
         })
         .collect();
     graph.insert(
         source.as_str(),
-        new_deps.iter().map(|d| d.as_str()).collect(),
+        new_deps.iter().map(intent_core::NoteId::as_str).collect(),
     );
 
     let target = source.as_str();
@@ -7447,8 +7445,7 @@ fn checkout_parent_is_workspace_dir(checkout: &str, workspace_id: &WorkspaceId) 
     Path::new(checkout)
         .parent()
         .and_then(Path::file_name)
-        .map(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
-        .unwrap_or(false)
+        .is_some_and(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
 }
 
 /// Derive a repository display name from a local `repositoryPath` basename,
@@ -7513,8 +7510,7 @@ fn workspace_dir_candidates(
         .filter(|parent| {
             parent
                 .file_name()
-                .map(|n| n == std::ffi::OsStr::new(id.as_str()))
-                .unwrap_or(false)
+                .is_some_and(|n| n == std::ffi::OsStr::new(id.as_str()))
         })
     {
         dirs.push(parent.to_path_buf());
@@ -7544,8 +7540,7 @@ fn default_workspaces_root() -> PathBuf {
     }
     assert_hermetic_root_absent();
     std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("intent")
         .join("workspaces")
 }
@@ -7564,8 +7559,7 @@ pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     }
     Some(
         std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, PathBuf::from)
             .join("intent")
             .join("workspaces"),
     )
@@ -7755,8 +7749,7 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
         match e.file_type() {
             Ok(t) if t.is_dir() => true,
             Ok(t) if t.is_file() => std::fs::read_to_string(e.path())
-                .map(|s| s.trim_start().starts_with("gitdir:"))
-                .unwrap_or(false),
+                .is_ok_and(|s| s.trim_start().starts_with("gitdir:")),
             _ => false,
         }
     });
@@ -8562,7 +8555,7 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
             .as_ref()
             .is_some_and(|t| !is_terminal_task_status(t.status))
         {
-            let parent = n.parent_id.as_ref().map(|p| p.as_str());
+            let parent = n.parent_id.as_ref().map(intent_core::NoteId::as_str);
             children.entry(parent).or_default().push(n);
         }
     }
@@ -8617,22 +8610,18 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     flattened
         .into_iter()
         .filter(|n| {
-            all_children
-                .get(n.id.as_str())
-                .map(|kids| {
-                    kids.iter().all(|c| {
-                        c.metadata
-                            .task
-                            .as_ref()
-                            .map(|t| t.status == TaskStatus::Complete)
-                            .unwrap_or(true)
-                    })
+            all_children.get(n.id.as_str()).is_none_or(|kids| {
+                kids.iter().all(|c| {
+                    c.metadata
+                        .task
+                        .as_ref()
+                        .is_none_or(|t| t.status == TaskStatus::Complete)
                 })
-                .unwrap_or(true)
-                && n.metadata
-                    .task
-                    .as_ref()
-                    .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
+            }) && n
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
         })
         .map(|n| n.id.0.clone())
         .collect()
@@ -8795,12 +8784,7 @@ fn bounded_needle_snippet(s: &str) -> String {
     // more than EDGE chars.
     let head_end = s.char_indices().nth(EDGE).map(|(i, _)| i);
     // Byte offset of the EDGE-th char from the end.
-    let tail_start = s
-        .char_indices()
-        .rev()
-        .nth(EDGE - 1)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let tail_start = s.char_indices().rev().nth(EDGE - 1).map_or(0, |(i, _)| i);
     match head_end {
         Some(head_end) if head_end < tail_start => {
             format!("{}…{}", &s[..head_end], &s[tail_start..])
@@ -9795,8 +9779,7 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
         ws.worktree_path
             .as_deref()
             .and_then(|p| std::fs::canonicalize(p).ok())
-            .map(|p| p == canon_target)
-            .unwrap_or(false)
+            .is_some_and(|p| p == canon_target)
     })
 }
 
@@ -9850,7 +9833,7 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .data
         .get("agentId")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .or_else(|| event.actor.id.clone())
 }
 
@@ -10583,14 +10566,14 @@ impl Services {
                 // edges, so checking each edge alone is equivalent to
                 // checking the combined list.
                 let checked = validate_relation_ids(self_id, &edge, &all, "dependsOn")
-                    .and_then(|_| match find_dependency_cycle(self_id, &edge, &all) {
+                    .and_then(|()| match find_dependency_cycle(self_id, &edge, &all) {
                         Some(cycle) => Err(Error::Internal(format!(
                             "dependsOn would create a cycle: {}",
                             cycle.join(" -> ")
                         ))),
                         None => Ok(()),
                     })
-                    .and_then(|_| ensure_no_tree_relative_dependency(self_id, &edge, &all));
+                    .and_then(|()| ensure_no_tree_relative_dependency(self_id, &edge, &all));
                 match checked {
                     Ok(()) => deps.push(dep),
                     Err(e) => warnings.push(format!(
@@ -10876,7 +10859,9 @@ impl Services {
             if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
                 match path {
                     "server.wsApi.port" => {
-                        if let Some(new_port) = change.get("value").and_then(|v| v.as_f64()) {
+                        if let Some(new_port) =
+                            change.get("value").and_then(serde_json::Value::as_f64)
+                        {
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -10894,7 +10879,7 @@ impl Services {
                                         port = port,
                                         "server.wsApi.port → {}: failed to restart WSS listener", port
                                     );
-                                    Error::Internal(format!("failed to restart WSS listener on port {}: {}", port, e))
+                                    Error::Internal(format!("failed to restart WSS listener on port {port}: {e}"))
                                 })?;
                                 tracing::info!(
                                     port = bound_port,
@@ -10930,7 +10915,7 @@ impl Services {
                                         bind_address = addr,
                                         "server.bindAddress → {}: failed to restart WSS listener", addr
                                     );
-                                    Error::Internal(format!("failed to restart WSS listener on {}: {}", addr, e))
+                                    Error::Internal(format!("failed to restart WSS listener on {addr}: {e}"))
                                 })?;
                                 tracing::info!(
                                     bind_address = addr,
@@ -10948,7 +10933,9 @@ impl Services {
                         }
                     }
                     "server.wsApi.enabled" => {
-                        if let Some(enabled) = change.get("value").and_then(|v| v.as_bool()) {
+                        if let Some(enabled) =
+                            change.get("value").and_then(serde_json::Value::as_bool)
+                        {
                             if enabled {
                                 // Attempt to start the listener
                                 let port = control.start_ws_listener().await.map_err(|e| {
@@ -10956,7 +10943,7 @@ impl Services {
                                         error = ?e,
                                         "server.wsApi.enabled → true: failed to start WSS listener"
                                     );
-                                    Error::Internal(format!("failed to start WSS listener: {}", e))
+                                    Error::Internal(format!("failed to start WSS listener: {e}"))
                                 })?;
                                 tracing::info!(
                                     port,
@@ -12736,6 +12723,27 @@ impl WorkspaceApi for Services {
                     ),
                 }
             }
+            // List-frame slimming (monorepo#3041), following the v4.2
+            // `diskUsage` precedent — optional fields simply never present on
+            // list rows, no wire-shape change. Applied after the join-merge so
+            // the guarantee also covers base rows served on the panic
+            // degradation path above (a base row still carries its persisted
+            // `tokenUsage`):
+            // - `tokenUsage` is detail-only (clients read it via
+            //   `workspace.getTokenUsage` + the tokenUsage-changed event,
+            //   never off list rows) and dominated large frames (~26% of a
+            //   real 180-workspace payload).
+            // - `agentSummary` on ARCHIVED rows: archived workspaces render
+            //   no HUD/coverflow agent cards, yet their accumulated sessions
+            //   made archived rows the bulk of the aggregate (~65% of
+            //   agentSummary bytes measured). Active rows keep the full
+            //   summary; `workspace.get` keeps both fields for detail reads.
+            for ws in &mut list {
+                ws.token_usage = None;
+                if ws.archived {
+                    ws.agent_summary = None;
+                }
+            }
             tracing::debug!(
                 workspaces = count,
                 total_ms = started.elapsed().as_millis() as u64,
@@ -12779,6 +12787,9 @@ impl WorkspaceApi for Services {
                 ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
                 ws.agent_summary = None;
                 ws.diff_summary = None;
+                // Detail-only on the wire (monorepo#3041): list rows never
+                // carry `tokenUsage` — same rationale as the full list path.
+                ws.token_usage = None;
                 ws.cow_supported = cow_supported;
                 // Keep PR fields if already on the row (cheap, already stored);
                 // do not fetch/refresh them here.
@@ -13075,9 +13086,7 @@ impl WorkspaceApi for Services {
                             let explicit_clone_path = input
                                 .clone_path
                                 .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .is_some();
+                                .map(str::trim).as_ref().is_some_and(|s| !s.is_empty());
                             // Hydration also requires that a checkout will
                             // actually be provisioned below: remote /
                             // `skipWorktree` / caller-supplied `worktreePath`
@@ -13088,7 +13097,7 @@ impl WorkspaceApi for Services {
                                 && input
                                     .worktree_path
                                     .as_deref()
-                                    .is_none_or(|p| p.is_empty());
+                                    .is_none_or(str::is_empty);
                             let cache_owner_repo = if explicit_clone_path
                                 || !provisions_checkout
                             {
@@ -13293,8 +13302,7 @@ impl WorkspaceApi for Services {
                             if target.as_os_str().is_empty()
                                 || target
                                     .file_name()
-                                    .map(|n| n.is_empty())
-                                    .unwrap_or(true)
+                                    .is_none_or(std::ffi::OsStr::is_empty)
                             {
                                 return Err(Error::CloneFailed {
                                     category: intent_core::CloneErrorCategory::PathInvalid,
@@ -13394,9 +13402,7 @@ impl WorkspaceApi for Services {
                         && input
                             .github_url
                             .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .is_none()
+                            .map(str::trim).as_ref().is_none_or(|s| s.is_empty())
                     {
                         // Half-initialized recovery (#962 review): a mid-init
                         // failure can leave `.git` without a resolvable HEAD,
@@ -13437,7 +13443,7 @@ impl WorkspaceApi for Services {
                     // Apply derived owner when caller left it blank.
                     if input
                         .repository_owner
-                        .as_deref().is_none_or(|o| o.is_empty())
+                        .as_deref().is_none_or(str::is_empty)
                     {
                         if let Some((owner, _)) = origin_derived.as_ref() {
                             input.repository_owner = Some(owner.clone());
@@ -13447,7 +13453,7 @@ impl WorkspaceApi for Services {
                     // basename when origin remote is missing/unparseable.
                     if input
                         .repository_name
-                        .as_deref().is_none_or(|n| n.is_empty())
+                        .as_deref().is_none_or(str::is_empty)
                     {
                         if let Some((_, name)) = origin_derived {
                             input.repository_name = Some(name);
@@ -13468,7 +13474,7 @@ impl WorkspaceApi for Services {
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
                     let branch_auto_generated =
-                        input.branch.as_deref().is_none_or(|b| b.is_empty());
+                        input.branch.as_deref().is_none_or(str::is_empty);
                     let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
                         Some(explicit) => explicit,
                         None => {
@@ -13696,7 +13702,7 @@ impl WorkspaceApi for Services {
                                     intent_core::CheckoutMode::Cow => {
                                         reporter
                                             .milestone("cow-copy", 88, "Copying repository...")
-                                            .await
+                                            .await;
                                     }
                                     _ => {
                                         reporter
@@ -13705,7 +13711,7 @@ impl WorkspaceApi for Services {
                                                 88,
                                                 "Checking out repository...",
                                             )
-                                            .await
+                                            .await;
                                     }
                                 }
                             }
@@ -13895,12 +13901,12 @@ impl WorkspaceApi for Services {
                                                     Some(base) => {
                                                         intent_git::branches::create_branch_at(
                                                             &repo, &branch, base,
-                                                        )?
+                                                        )?;
                                                     }
                                                     None => {
                                                         intent_git::branches::create_branch(
                                                             &repo, &branch, true,
-                                                        )?
+                                                        )?;
                                                     }
                                                 }
                                             }
@@ -14026,7 +14032,7 @@ impl WorkspaceApi for Services {
                                                     30,
                                                     "Copying repository (CoW)...",
                                                 )
-                                                .await
+                                                .await;
                                         }
                                         _ => {
                                             reporter
@@ -14035,7 +14041,7 @@ impl WorkspaceApi for Services {
                                                     30,
                                                     "Creating linked worktree...",
                                                 )
-                                                .await
+                                                .await;
                                         }
                                     }
                                 }
@@ -15055,23 +15061,23 @@ impl WorkspaceApi for Services {
                 // outweighs propagating a mutex-poison panic.
                 live_turns
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 last_turn_silent_tails
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 truncation_redrives
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 pending_truncation_redrive
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
                 agent_queues
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&session.id);
             }
             // Sweep the deleted workspace out of the daemon-global
@@ -15084,7 +15090,7 @@ impl WorkspaceApi for Services {
             {
                 let mut registry = agent_subscriptions
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 registry
                     .subscriptions
                     .retain(|s| s.parent_workspace_id != id);
@@ -15157,7 +15163,7 @@ impl WorkspaceApi for Services {
             let leaked: Vec<(String, WorkspaceId, AgentId)> = {
                 let mut registry = agent_subscriptions
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut leaked = Vec::new();
                 registry.subscriptions.retain(|s| {
                     if s.child_workspace_id == id {
@@ -15323,8 +15329,7 @@ impl WorkspaceApi for Services {
                     // worktree path (the old worktree is now orphaned).
                     let skip_worktree = recreated
                         .as_ref()
-                        .map(|r| r.worktree_path == ws_cleanup.worktree_path)
-                        .unwrap_or(false);
+                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
                     if !skip_worktree {
                         let repo_dir = ws_cleanup
                             .repository_path
@@ -15412,7 +15417,7 @@ impl WorkspaceApi for Services {
                                         .await;
                                     if let Some(trash) = trash {
                                         let removal = tokio::task::spawn_blocking(move || {
-                                            cleanup_detached_worktree(&trash)
+                                            cleanup_detached_worktree(&trash);
                                         })
                                         .await;
                                         if let Err(e) = removal {
@@ -16662,8 +16667,7 @@ impl WorkspaceApi for Services {
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_millis() as u64);
                     return Ok(SetupScript {
                         script: script_str,
                         project_type: None,
@@ -18157,8 +18161,7 @@ impl WorkspaceApi for Services {
                         .metadata
                         .task
                         .as_ref()
-                        .map(|t| status_word(t.status))
-                        .unwrap_or("unknown")
+                        .map_or("unknown", |t| status_word(t.status))
                         .to_string(),
                 })
                 .collect();
@@ -19712,7 +19715,7 @@ impl WorkspaceApi for Services {
                 tokio::task::spawn_blocking(move || intent_git::remote::origin_url(&origin_dir))
                     .await
                     .ok()
-                    .and_then(|r| r.ok())
+                    .and_then(std::result::Result::ok)
                     .flatten()
                     .and_then(|url| Self::parse_github_owner_repo(&url))
                     .map_or((None, None), |(o, n)| (Some(o), Some(n)));
@@ -19837,18 +19840,18 @@ impl WorkspaceApi for Services {
                     Ok(content) => {
                         // Strip `gitdir:` prefix (tolerant of varied whitespace), quotes, and trim.
                         let trimmed = content.trim();
-                        let gitdir = trimmed
-                            .strip_prefix("gitdir:")
-                            .map(|s| s.trim())
-                            .map(|s| {
-                                // If quoted, strip the quotes.
-                                if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
-                                    &s[1..s.len() - 1]
-                                } else {
-                                    s
-                                }
-                            })
-                            .unwrap_or(trimmed);
+                        let gitdir =
+                            trimmed
+                                .strip_prefix("gitdir:")
+                                .map(str::trim)
+                                .map_or(trimmed, |s| {
+                                    // If quoted, strip the quotes.
+                                    if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                                        &s[1..s.len() - 1]
+                                    } else {
+                                        s
+                                    }
+                                });
                         // Resolve relative gitdir paths against the worktree directory.
                         let gitdir_path = if std::path::Path::new(gitdir).is_relative() {
                             path.join(gitdir)
@@ -21074,7 +21077,7 @@ impl WorkspaceApi for Services {
                         // so host.status never runs (seen as bulk permit held
                         // 5-40s with "nothing else" making progress).
                         let started = std::time::Instant::now();
-                        let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+                        let path_count = paths.as_ref().map_or(0, std::vec::Vec::len);
                         let walk_worktree = worktree.clone();
                         let walk_paths = paths.clone();
                         let walk_commit = commit_hash.clone();
@@ -21141,17 +21144,14 @@ impl WorkspaceApi for Services {
                             staged,
                             "git.diffs: coalesced into identical in-flight walk"
                         );
-                        match rx.wait_for(|slot| slot.is_some()).await {
-                            Ok(slot) => {
-                                return match slot.clone().expect("wait_for guarantees Some") {
-                                    Ok(shared) => Ok((*shared).clone()),
-                                    Err(msg) => Err(Error::Internal(msg)),
-                                };
-                            }
-                            // The leader vanished without publishing
-                            // (cancelled RPC / panicked walk): retry — the
-                            // next join elects a new leader.
-                            Err(_) => continue,
+                        // On `Err` the leader vanished without publishing
+                        // (cancelled RPC / panicked walk): retry — the next
+                        // join elects a new leader.
+                        if let Ok(slot) = rx.wait_for(std::option::Option::is_some).await {
+                            return match slot.clone().expect("wait_for guarantees Some") {
+                                Ok(shared) => Ok((*shared).clone()),
+                                Err(msg) => Err(Error::Internal(msg)),
+                            };
                         }
                     }
                 }
@@ -23413,11 +23413,7 @@ impl WorkspaceApi for Services {
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
             let is_configured = match pr_ops::resolve_source_control(injected).await {
-                Ok(sc) => sc
-                    .check_auth()
-                    .await
-                    .map(|s| s.authenticated)
-                    .unwrap_or(false),
+                Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
                 Err(_) => false,
             };
             let slot = state.lock().await;
@@ -24420,10 +24416,14 @@ impl WorkspaceApi for Services {
     /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
-    /// shaping stays in [`browser_ops`] (byte-for-byte parity with the FE
-    /// tool); failure modes surface as `Error::Internal` with the underlying
-    /// reason so the MCP caller can distinguish "no client connected" from a
-    /// proxy-side failure. An empty `actions` batch is rejected with
+    /// shaping stays in [`browser_ops`], via the agent-surface variant
+    /// [`browser_ops::shape_agent_result`]: structured per-action failures
+    /// (`not-owner` / `already-claimed`) are preserved as data instead of
+    /// flattening into a top-level error (intent-hq/monorepo#3042).
+    /// Remaining failure modes surface as `Error::Internal` with the
+    /// underlying reason so the MCP caller can distinguish "no client
+    /// connected" from a proxy-side failure. An empty `actions` batch is
+    /// rejected with
     /// `Error::InvalidParams` (JSON-RPC `-32602`) before any dispatch — the
     /// FE tool has no meaningful behavior on an empty batch and the
     /// client-triggered path already enforces the same guard. When no
@@ -24447,6 +24447,10 @@ impl WorkspaceApi for Services {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
+            // Shape by *request* arity: the FE aborts a batch on the first
+            // failing action, so the reply's results count can be shorter
+            // than the batch (see `shape_agent_result`).
+            let requested_actions = actions.len();
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
@@ -24466,7 +24470,8 @@ impl WorkspaceApi for Services {
                             Error::Internal(format!("browser.exec: {message}"))
                         }
                     })?;
-            browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
+            browser_ops::shape_agent_result(response, requested_actions)
+                .map_err(|e| Error::Internal(e.message))
         })
     }
 
@@ -24905,17 +24910,14 @@ impl Services {
                         workspace_id = %workspace_id.as_str(),
                         "accept-changes.getStatus: coalesced into identical in-flight build"
                     );
-                    match rx.wait_for(|slot| slot.is_some()).await {
-                        Ok(slot) => {
-                            return match slot.clone().expect("wait_for guarantees Some") {
-                                Ok(shared) => Ok((*shared).clone()),
-                                Err(msg) => Err(Error::Internal(msg)),
-                            };
-                        }
-                        // The leader vanished without publishing (cancelled
-                        // RPC / panicked build): retry — the next join elects
-                        // a new leader.
-                        Err(_) => continue,
+                    // On `Err` the leader vanished without publishing
+                    // (cancelled RPC / panicked build): retry — the next join
+                    // elects a new leader.
+                    if let Ok(slot) = rx.wait_for(std::option::Option::is_some).await {
+                        return match slot.clone().expect("wait_for guarantees Some") {
+                            Ok(shared) => Ok((*shared).clone()),
+                            Err(msg) => Err(Error::Internal(msg)),
+                        };
                     }
                 }
             }
@@ -25018,7 +25020,7 @@ impl Services {
                 // serving the pre-mutation snapshot until the TTL.
                 let succeeded = matches!(
                     &outcome,
-                    Ok(v) if v.get("success").and_then(|s| s.as_bool()) == Some(true)
+                    Ok(v) if v.get("success").and_then(serde_json::Value::as_bool) == Some(true)
                 );
                 if !succeeded {
                     self.git_status_cache.invalidate(&worktree);
@@ -25689,9 +25691,7 @@ impl Services {
             ));
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         if has_remote {
             let token = self.ac_git_token(worktree).await;
             let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
@@ -25766,9 +25766,7 @@ impl Services {
             ));
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         let trunk_ref = if has_remote {
             format!("origin/{trunk}")
         } else {
@@ -25781,8 +25779,7 @@ impl Services {
 
         let has_conflicts =
             intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
-                .map(|m| m.has_conflicts)
-                .unwrap_or(false);
+                .is_ok_and(|m| m.has_conflicts);
         if has_conflicts {
             return Err(ac_step_failure(
                 steps.clone(),
@@ -25891,9 +25888,7 @@ impl Services {
             }
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         let token = if has_remote {
             self.ac_git_token(worktree).await
         } else {
@@ -26013,8 +26008,7 @@ impl Services {
         if !can_fast_forward {
             let fresh_conflicts =
                 intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
-                    .map(|m| m.has_conflicts)
-                    .unwrap_or(false);
+                    .is_ok_and(|m| m.has_conflicts);
             if fresh_conflicts {
                 return Err(ac_step_failure(
                     steps.clone(),
@@ -26301,7 +26295,7 @@ fn json_opt_str(value: Option<&serde_json::Value>) -> Option<String> {
 fn json_opt_bool(options: Option<&serde_json::Value>, key: &str) -> bool {
     options
         .and_then(|o| o.get(key))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -26440,8 +26434,8 @@ async fn record_agent_file_mutation(
         commit_hash: None,
         old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
         new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-        additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-        deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+        additions: summary.as_ref().map_or(0, |s| s.additions),
+        deletions: summary.as_ref().map_or(0, |s| s.deletions),
     };
     let (lines_added, lines_deleted) = match crate::file_tracking::track_change(store, change).await
     {

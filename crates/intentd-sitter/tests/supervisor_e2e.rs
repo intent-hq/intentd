@@ -8,6 +8,7 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -86,7 +87,7 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            Ok(_) if header != "\r\n" && !header.is_empty() => {}
             _ => break,
         }
     }
@@ -127,8 +128,10 @@ fn dead_url() -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// `.tar.xz` with `intentd-<triple>/intentd` (mode 0755) — the cargo-dist
@@ -382,7 +385,9 @@ fn no_network_and_nothing_installed_exits_nonzero() {
 
 #[test]
 fn update_mid_run_swaps_binary_and_preserves_args() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -443,7 +448,9 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
 
 #[test]
 fn config_channel_switch_applies_at_next_periodic_check() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -509,7 +516,9 @@ fn config_channel_switch_applies_at_next_periodic_check() {
 
 #[test]
 fn flag_pinned_channel_ignores_config_switch_mid_run() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -575,7 +584,9 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
 
 #[test]
 fn crash_respawn_backs_off_exponentially() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(7));
@@ -623,7 +634,9 @@ fn crash_respawn_backs_off_exponentially() {
 
 #[test]
 fn sighup_during_crash_backoff_respawns_the_state_json_version() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     // 0.1.0 crash-loops; a 30s backoff (never elapsing within the test)
@@ -895,7 +908,9 @@ fn run_one_shot(data_dir: &Path, base_url: &str, args: &[&str]) -> std::process:
 
 #[test]
 fn restart_command_respawns_state_version_without_exiting_sitter() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
@@ -1051,7 +1066,9 @@ fn double_dash_restart_forwards_verbatim_to_the_daemon() {
 
 #[test]
 fn sitter_initiated_stop_does_not_respawn() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));

@@ -15,6 +15,7 @@
 //! it is the only path in this module that ever bypasses those checks.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -311,7 +312,7 @@ impl WsApiServer {
 
     /// Gracefully stop the listener (idempotent).
     pub async fn stop(&self) {
-        self.inner.stop().await
+        self.inner.stop().await;
     }
 
     /// The bound port, or `None` when not currently running.
@@ -494,7 +495,7 @@ impl WsInner {
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n"
         );
         if let Some(value) = &extensions_header {
-            response.push_str(&format!("Sec-WebSocket-Extensions: {value}\r\n"));
+            let _ = write!(response, "Sec-WebSocket-Extensions: {value}\r\n");
         }
         response.push_str("\r\n");
         stream.write_all(response.as_bytes()).await?;
@@ -846,8 +847,7 @@ fn header_str(value: &[u8]) -> Option<String> {
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]

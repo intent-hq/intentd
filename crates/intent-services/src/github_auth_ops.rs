@@ -283,10 +283,10 @@ fn is_safe_login_base_uri(uri: &str) -> bool {
         return false;
     };
     let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority
-        .strip_prefix("[::1]")
-        .map(|_| "::1")
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
+    let host = authority.strip_prefix("[::1]").map_or_else(
+        || authority.split(':').next().unwrap_or_default(),
+        |_| "::1",
+    );
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
@@ -333,7 +333,7 @@ pub(crate) fn auth_status_to_wire(is_configured: bool, slot: Option<&FlowSlot>) 
         "oauthUrl": oauth_url,
         "configuredButNeedsUpdate": false,
         "updatedScopes": "",
-        "deviceFlow": slot.map(flow_to_wire).unwrap_or(Value::Null),
+        "deviceFlow": slot.map_or(Value::Null, flow_to_wire),
     })
 }
 

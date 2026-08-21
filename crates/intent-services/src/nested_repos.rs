@@ -111,13 +111,8 @@ pub(crate) fn stage_all_skipping_nested(
     let nested = untracked_nested_repo_dirs(repo)?;
     // `Path` equality compares components, so a trailing `/` on the matched
     // path is ignored.
-    let mut skip_nested = |path: &Path, _spec: &[u8]| -> i32 {
-        if nested.iter().any(|n| n == path) {
-            1 // skip
-        } else {
-            0 // add
-        }
-    };
+    let mut skip_nested =
+        |path: &Path, _spec: &[u8]| -> i32 { i32::from(nested.iter().any(|n| n == path)) };
     index
         .add_all(
             ["*"].iter(),

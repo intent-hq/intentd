@@ -798,7 +798,7 @@ impl WorkspaceApi for FakeApi {
                 workspace_id: WorkspaceId::from("ws-1"),
                 timestamp: "t0".to_string(),
                 event_type: params.event_type.unwrap_or_default(),
-                actor: Default::default(),
+                actor: intent_core::EventActor::default(),
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,
@@ -2221,7 +2221,7 @@ async fn parse_error_is_minus_32700() {
 #[tokio::test]
 async fn invalid_request_matrix() {
     for msg in [
-        r#"[1,2,3]"#,
+        r"[1,2,3]",
         r#"{"jsonrpc":"1.0","id":1,"method":"workspace.list"}"#,
         r#"{"jsonrpc":"2.0","id":1,"method":""}"#,
         r#"{"jsonrpc":"2.0","id":true,"method":"workspace.list"}"#,
@@ -4661,7 +4661,7 @@ async fn metrics_methods_are_routed_not_method_not_found() {
     for (method, params) in [
         ("metrics.getWorkspaceStats", r#"{"workspaceId":"ws-1"}"#),
         ("metrics.getAgentStats", r#"{"agentId":"agent-1"}"#),
-        ("metrics.getAllWorkspaceStats", r#"{}"#),
+        ("metrics.getAllWorkspaceStats", r"{}"),
         ("metrics.clearAgentStats", r#"{"agentId":"agent-1"}"#),
     ] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
@@ -5363,7 +5363,7 @@ async fn script_lifecycle_and_run_dispatch() {
     let out = v["result"]
         .as_str()
         .expect("script.output result is a string");
-    assert!(out.starts_with("["), "header line present: {out:?}");
+    assert!(out.starts_with('['), "header line present: {out:?}");
     assert!(out.contains("maxLines=10"), "maxLines threaded: {out:?}");
 
     // Missing scriptId → -32602.
@@ -5587,8 +5587,16 @@ mod send_message_payload_forwarding {
         assert_eq!(v["result"]["success"], Value::Bool(true));
 
         let cap = api.send.lock().unwrap().clone();
-        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
-        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(
+            cap.workspace_id
+                .as_ref()
+                .map(intent_core::WorkspaceId::as_str),
+            Some("ws-1")
+        );
+        assert_eq!(
+            cap.agent_id.as_ref().map(intent_core::AgentId::as_str),
+            Some("agent-1")
+        );
         assert_eq!(cap.content.as_deref(), Some("hi"));
         assert_eq!(cap.message_id.as_deref(), Some("m-1"));
         assert_eq!(cap.priority.as_deref(), Some("interrupt"));
@@ -5635,8 +5643,16 @@ mod send_message_payload_forwarding {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["result"]["success"], Value::Bool(true));
         let cap = api.send_now.lock().unwrap().clone();
-        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
-        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(
+            cap.workspace_id
+                .as_ref()
+                .map(intent_core::WorkspaceId::as_str),
+            Some("ws-1")
+        );
+        assert_eq!(
+            cap.agent_id.as_ref().map(intent_core::AgentId::as_str),
+            Some("agent-1")
+        );
         assert_eq!(cap.message_id.as_deref(), Some("user-msg-queued"));
     }
 
@@ -6154,8 +6170,16 @@ mod edit_and_regenerate {
         assert_eq!(v["result"]["truncatedCount"], json!(3));
 
         let cap = api.edit.lock().unwrap().clone();
-        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
-        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(
+            cap.workspace_id
+                .as_ref()
+                .map(intent_core::WorkspaceId::as_str),
+            Some("ws-1")
+        );
+        assert_eq!(
+            cap.agent_id.as_ref().map(intent_core::AgentId::as_str),
+            Some("agent-1")
+        );
         assert_eq!(cap.message_id.as_deref(), Some("msg-7"));
         assert_eq!(cap.content.as_deref(), Some("edited text"));
         assert_eq!(

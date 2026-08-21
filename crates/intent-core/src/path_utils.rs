@@ -239,8 +239,7 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     // dump failure from failing the whole capture — the env payload is
     // optional and degrades to an empty map.
     let cmd = format!(
-        r#"printf '{}%s{}'  "$PATH"; printf '{}'; /usr/bin/env -0 2>/dev/null || /usr/bin/awk 'BEGIN{{for(k in ENVIRON)printf "%s=%s%c",k,ENVIRON[k],0}}' 2>/dev/null || true; printf '{}'"#,
-        PATH_START_SENTINEL, PATH_END_SENTINEL, ENV_START_SENTINEL, ENV_END_SENTINEL
+        r#"printf '{PATH_START_SENTINEL}%s{PATH_END_SENTINEL}'  "$PATH"; printf '{ENV_START_SENTINEL}'; /usr/bin/env -0 2>/dev/null || /usr/bin/awk 'BEGIN{{for(k in ENVIRON)printf "%s=%s%c",k,ENVIRON[k],0}}' 2>/dev/null || true; printf '{ENV_END_SENTINEL}'"#
     );
     let mut args = flags.to_vec();
     args.push(&cmd);
@@ -567,9 +566,7 @@ pub fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -642,11 +639,7 @@ mod tests {
         let dirs = enhanced_path_dirs();
         let mut seen = HashSet::new();
         for dir in &dirs {
-            assert!(
-                seen.insert(dir),
-                "Directory {:?} appears multiple times",
-                dir
-            );
+            assert!(seen.insert(dir), "Directory {dir:?} appears multiple times");
         }
     }
 
@@ -996,8 +989,7 @@ mod tests {
         // 70,000 'X' characters = 70KB, well over typical pipe buffer size
         let noise = "X".repeat(70_000);
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n",
-            noise
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{noise}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n"
         );
         let start = std::time::Instant::now();
         let dirs = write_and_capture(&fake_shell, &script).dirs;
@@ -1012,8 +1004,7 @@ mod tests {
         assert_eq!(dirs[0], PathBuf::from("/large/bin"));
         assert!(
             elapsed < Duration::from_secs(5),
-            "Should complete well within timeout (no deadlock), took {:?}",
-            elapsed
+            "Should complete well within timeout (no deadlock), took {elapsed:?}"
         );
     }
 

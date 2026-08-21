@@ -239,7 +239,7 @@ fn strip_prefix_components(
     let mut want = meaningful_components(prefix);
     loop {
         match (want.next(), rest.peek()) {
-            (None, _) => return Some(rest.map(|c| c.as_os_str()).collect()),
+            (None, _) => return Some(rest.map(std::path::Component::as_os_str).collect()),
             (Some(_), None) => return None,
             (Some(w), Some(t)) => {
                 let eq = if ignore_case {
@@ -418,7 +418,7 @@ mod tests {
     }
 
     fn submodules(paths: &[&str]) -> std::collections::BTreeSet<String> {
-        paths.iter().map(|p| p.to_string()).collect()
+        paths.iter().map(std::string::ToString::to_string).collect()
     }
 
     /// A path strictly inside a submodule matches; the gitlink path itself

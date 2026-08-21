@@ -123,8 +123,7 @@ pub fn push_refspec(
         "refs/intent/tmp-push-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     );
     repo.reference(&tmp_ref, oid, true, "intent push-refspec temp")
         .map_err(map_git_err)?;

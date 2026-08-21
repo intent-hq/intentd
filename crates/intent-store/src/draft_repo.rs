@@ -44,7 +44,7 @@ impl Store {
         attachments: Option<&serde_json::Value>,
     ) -> Result<String> {
         let now = now_iso();
-        let attachments_json = attachments.map(|v| v.to_string());
+        let attachments_json = attachments.map(std::string::ToString::to_string);
         sqlx::query(
             "INSERT INTO draft (workspace_id, agent_id, client_id, text, attachments, updated_at) \
              VALUES (?,?,?,?,?,?) \

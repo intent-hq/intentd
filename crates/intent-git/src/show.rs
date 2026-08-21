@@ -16,7 +16,7 @@ use intent_core::{Error, Result};
 use crate::map_git_err;
 
 /// Gitlink (submodule pin) tree-entry mode.
-const MODE_GITLINK: u32 = 0o160000;
+const MODE_GITLINK: u32 = 0o160_000;
 
 /// Read `file_path` at `refname` from the repository at `worktree_path`.
 ///

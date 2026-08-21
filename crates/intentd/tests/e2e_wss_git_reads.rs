@@ -191,7 +191,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -545,8 +545,7 @@ async fn git_get_config_over_wss() {
             .as_str()
             .unwrap()
             .contains("workspaceId"),
-        "error mentions workspaceId: {:?}",
-        resp
+        "error mentions workspaceId: {resp:?}"
     );
 
     // Non-existent workspace → -32602.

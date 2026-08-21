@@ -152,8 +152,14 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             None
         };
-        assert_eq!(cache.get_or_compute("k", compute, |v| v.is_some()), None);
-        assert_eq!(cache.get_or_compute("k", compute, |v| v.is_some()), None);
+        assert_eq!(
+            cache.get_or_compute("k", compute, std::option::Option::is_some),
+            None
+        );
+        assert_eq!(
+            cache.get_or_compute("k", compute, std::option::Option::is_some),
+            None
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -254,16 +260,23 @@ mod tests {
     fn evicts_negative_slots_on_sweep() {
         let cache: DiscoveryCache<Option<i32>> = DiscoveryCache::new(Duration::from_secs(60));
         // Create a slot with a negative result (never cached, but the slot exists).
-        assert_eq!(cache.get_or_compute("neg", || None, |v| v.is_some()), None);
+        assert_eq!(
+            cache.get_or_compute("neg", || None, std::option::Option::is_some),
+            None
+        );
         // Trigger the sweep.
         for i in 0..100 {
-            cache.get_or_compute(&format!("fill-{i}"), || Some(i), |v| v.is_some());
+            cache.get_or_compute(
+                &format!("fill-{i}"),
+                || Some(i),
+                std::option::Option::is_some,
+            );
         }
         // The "neg" slot must have been evicted (it had no cached value). We
         // can't directly inspect the slot map, but we can verify that the
         // sweep ran without panicking and the cache still works.
         assert_eq!(
-            cache.get_or_compute("neg", || Some(42), |v| v.is_some()),
+            cache.get_or_compute("neg", || Some(42), std::option::Option::is_some),
             Some(42)
         );
     }

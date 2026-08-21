@@ -128,7 +128,7 @@ pub fn pull_branch(
 /// markers). Returns whether the apply left index conflicts.
 fn pop_stash(repo: &mut Repository) -> std::result::Result<bool, git2::Error> {
     repo.stash_apply(0, None)?;
-    let conflicted = repo.index().map(|i| i.has_conflicts()).unwrap_or(false);
+    let conflicted = repo.index().is_ok_and(|i| i.has_conflicts());
     if !conflicted {
         repo.stash_drop(0)?;
     }

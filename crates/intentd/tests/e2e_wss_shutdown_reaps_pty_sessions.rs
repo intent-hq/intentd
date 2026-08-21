@@ -180,7 +180,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -200,13 +200,12 @@ fn pid_dead(pid: i32) -> bool {
             .args(["-o", "state=", "-p"])
             .arg(pid.to_string())
             .output()
-            .map(|o| {
+            .is_ok_and(|o| {
                 !o.status.success()
                     || String::from_utf8_lossy(&o.stdout)
                         .trim_start()
                         .starts_with('Z')
-            })
-            .unwrap_or(false),
+            }),
     }
 }
 

@@ -163,7 +163,10 @@ mod tests {
 
     #[test]
     fn ignores_empty_values() {
-        assert_eq!(pick_env_token(Some("   ".into()), Some("".into())), None);
+        assert_eq!(
+            pick_env_token(Some("   ".into()), Some(String::new())),
+            None
+        );
         assert_eq!(pick_env_token(None, None), None);
     }
 

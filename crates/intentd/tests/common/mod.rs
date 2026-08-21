@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 #[cfg(unix)]
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -282,7 +283,7 @@ async fn await_wss_status_impl(socket: &Path, log_path: Option<&Path>) -> serde_
 /// it additionally dumps the log tail on timeout (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped(socket: &Path) {
-    await_wss_stopped_impl(socket, None).await
+    await_wss_stopped_impl(socket, None).await;
 }
 
 /// [`await_wss_stopped`] variant that also surfaces the tail of the daemon
@@ -290,7 +291,7 @@ pub async fn await_wss_stopped(socket: &Path) {
 /// attributable from the failure output alone (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped_logged(socket: &Path, log_path: &Path) {
-    await_wss_stopped_impl(socket, Some(log_path)).await
+    await_wss_stopped_impl(socket, Some(log_path)).await;
 }
 
 #[cfg(unix)]
@@ -374,9 +375,7 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
-        "\n[server.wsApi]\nenabled = true\nport = {port}\n"
-    ));
+    let _ = write!(text, "\n[server.wsApi]\nenabled = true\nport = {port}\n");
     std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
 }
 

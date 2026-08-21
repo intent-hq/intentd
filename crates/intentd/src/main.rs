@@ -393,8 +393,7 @@ async fn enable_wss_listener(
         Some(addr) => addr.to_string(),
         None => current_bind_address(socket)
             .await
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+            .map_or_else(|| "127.0.0.1".to_string(), |a| a.to_string()),
     };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
@@ -814,7 +813,7 @@ fn init_tracing() {
 
     // Create the data directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        eprintln!("WARN: failed to create log directory {:?}: {}", log_dir, e);
+        eprintln!("WARN: failed to create log directory {log_dir:?}: {e}");
     }
 
     // Set up file appender with rotation: keep ~5 files, rotate daily
@@ -831,8 +830,7 @@ fn init_tracing() {
         Ok(appender) => Some(appender),
         Err(e) => {
             eprintln!(
-                "WARN: failed to create log file appender: {}, continuing with stderr-only logging",
-                e
+                "WARN: failed to create log file appender: {e}, continuing with stderr-only logging"
             );
             None
         }
@@ -866,23 +864,17 @@ fn init_tracing() {
             .with_ansi(false)
             .with_filter(output_filter());
         match subscriber.with(file_layer).try_init() {
-            Ok(_) => {
+            Ok(()) => {
                 // Store the guard in a static to keep it alive for the process lifetime.
                 // Dropping it would stop the background file writer thread.
                 let _ = LOG_GUARD.set(guard);
             }
-            Err(e) => eprintln!(
-                "WARN: failed to initialize tracing (already initialized?): {}",
-                e
-            ),
+            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {e}"),
         }
     } else {
         match subscriber.try_init() {
-            Ok(_) => {}
-            Err(e) => eprintln!(
-                "WARN: failed to initialize tracing (already initialized?): {}",
-                e
-            ),
+            Ok(()) => {}
+            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {e}"),
         }
     }
 }
@@ -907,10 +899,10 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |panic_info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
 
-        let location = panic_info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown location".to_string());
+        let location = panic_info.location().map_or_else(
+            || "unknown location".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
 
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             s.to_string()
@@ -942,8 +934,8 @@ fn install_panic_hook() {
         );
 
         // Also write to stderr so it's visible in immediate context
-        eprintln!("PANIC at {}: {}", location, message);
-        eprintln!("Backtrace:\n{}", backtrace);
+        eprintln!("PANIC at {location}: {message}");
+        eprintln!("Backtrace:\n{backtrace}");
 
         // Chain the default hook to preserve standard Rust panic formatting
         default_hook(panic_info);
@@ -1796,8 +1788,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         let notify = shutdown_notify.clone();
         async move {
             tokio::select! {
-                _ = shutdown_signal() => {}
-                _ = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
+                () = shutdown_signal() => {}
+                () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
         }
     };
@@ -1828,9 +1820,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         // arrive within the window before running one sweep.
                         loop {
                             tokio::select! {
-                                _ = tokio::time::sleep(WAKE_RESUME_DEBOUNCE) => break,
+                                () = tokio::time::sleep(WAKE_RESUME_DEBOUNCE) => break,
                                 drained = resume_rx.recv() => match drained {
-                                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                                    Ok(_) | Err(RecvError::Lagged(_)) => {},
                                     Err(RecvError::Closed) => break,
                                 },
                             }
@@ -2428,7 +2420,7 @@ fn descendant_tree_usage(
         &|pid| {
             sys.process(pid)
                 .filter(|p| p.thread_kind().is_none())
-                .map(|p| p.memory())
+                .map(sysinfo::Process::memory)
         },
         root,
         agent_roots,
@@ -2642,8 +2634,7 @@ impl SystemControl for DaemonControl {
             let clients = state
                 .ws_server
                 .as_ref()
-                .map(|s| s.client_count())
-                .unwrap_or(0);
+                .map_or(0, intent_transport::WsApiServer::client_count);
             (port, fingerprint, clients)
         } else {
             (None, None, 0)
@@ -2825,7 +2816,7 @@ impl intent_core::ServerControl for DaemonControl {
             {
                 Ok(result) => result
                     .get("value")
-                    .and_then(|v| v.as_f64())
+                    .and_then(serde_json::Value::as_f64)
                     .map(|p| p as u16),
                 Err(_) => None,
             };
@@ -2847,9 +2838,8 @@ impl intent_core::ServerControl for DaemonControl {
                 Ok(result) => match result.get("value").and_then(|v| v.as_str()) {
                     Some(raw) => Some(raw.parse::<std::net::IpAddr>().map_err(|_| {
                         intent_core::Error::InvalidParams(format!(
-                            "server.bindAddress {:?} is not a valid IP address — fix it in \
-                             config.toml ([server] bindAddress) or via settings",
-                            raw
+                            "server.bindAddress {raw:?} is not a valid IP address — fix it in \
+                             config.toml ([server] bindAddress) or via settings"
                         ))
                     })?),
                     None => None,
@@ -2914,15 +2904,13 @@ impl intent_core::ServerControl for DaemonControl {
                 let error_kind = e.kind();
                 let error_msg = if error_kind == std::io::ErrorKind::AddrInUse {
                     format!(
-                        "Port {} is already in use — choose a different port or stop the process using it",
-                        desired_port
+                        "Port {desired_port} is already in use — choose a different port or stop the process using it"
                     )
                 } else {
                     // Other bind errors: name the address (server.bindAddress)
                     // + port and include the OS error text
                     format!(
-                        "failed to bind {}:{} (server.bindAddress): {}",
-                        bind_address, desired_port, e
+                        "failed to bind {bind_address}:{desired_port} (server.bindAddress): {e}"
                     )
                 };
                 intent_core::Error::Internal(error_msg)
@@ -4687,7 +4675,7 @@ async fn report_context_engine() {
             println!("[ok] context engine: {name} available (version {version})");
         }
         EngineAvailability::Unavailable { reason } => {
-            println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully")
+            println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully");
         }
     }
 }
@@ -4878,10 +4866,10 @@ async fn report_provider_availability(config: &Config) {
                             npx.display()
                         ),
                         Some((false, verdict)) => {
-                            println!("  [--] {} unavailable{verdict}", provider.id)
+                            println!("  [--] {} unavailable{verdict}", provider.id);
                         }
                         None => {
-                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display())
+                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display());
                         }
                     }
                 }
@@ -4919,11 +4907,10 @@ async fn report_provider_availability(config: &Config) {
             .unwrap_or_default();
         // Spawn via the resolved path when available (grok's binary may live
         // outside PATH at ~/.grok/bin/grok), else the bare command.
-        let program = provider
-            .resolved_path
-            .as_ref()
-            .map(|p| p.as_os_str().to_os_string())
-            .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
+        let program = provider.resolved_path.as_ref().map_or_else(
+            || std::ffi::OsString::from(provider.command),
+            |p| p.as_os_str().to_os_string(),
+        );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
     }
@@ -4945,8 +4932,7 @@ async fn report_pi_cli_verdict() -> (bool, String) {
             let path = status
                 .resolved_path
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| status.command.clone());
+                .map_or_else(|| status.command.clone(), |p| p.display().to_string());
             let version = status.version_output.as_deref().unwrap_or("unknown");
             (true, format!(" (pi CLI {version}: {path})"))
         }
@@ -5066,21 +5052,21 @@ async fn report_db_health(store: &Store) {
             if rows.len() == 1 {
                 match rows[0].try_get::<String, _>(0) {
                     Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
-                    Ok(result) => println!("  [WARN] integrity_check: {}", result),
-                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {}", e),
+                    Ok(result) => println!("  [WARN] integrity_check: {result}"),
+                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {e}"),
                 }
             } else {
                 println!("  [WARN] integrity_check: {} issues found", rows.len());
                 for row in rows {
                     match row.try_get::<String, _>(0) {
-                        Ok(result) => println!("    - {}", result),
-                        Err(e) => println!("    - [decode error: {}]", e),
+                        Ok(result) => println!("    - {result}"),
+                        Err(e) => println!("    - [decode error: {e}]"),
                     }
                 }
             }
         }
         Err(e) => {
-            println!("  [WARN] integrity_check failed: {}", e);
+            println!("  [WARN] integrity_check failed: {e}");
         }
     }
 
@@ -5101,18 +5087,15 @@ async fn report_db_health(store: &Store) {
                 (Ok(busy), Ok(log), Ok(checkpointed)) => {
                     if busy != 0 {
                         println!(
-                            "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
-                            busy, log, checkpointed
+                            "  [WARN] wal_checkpoint(PASSIVE): busy={busy}, log={log} frames, checkpointed={checkpointed} frames (checkpoint incomplete)"
                         );
                     } else if checkpointed < log {
                         println!(
-                            "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
-                            log, checkpointed
+                            "  [WARN] wal_checkpoint(PASSIVE): log={log} frames, checkpointed={checkpointed} frames (partial checkpoint)"
                         );
                     } else {
                         println!(
-                            "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
-                            log, checkpointed
+                            "  [ok] wal_checkpoint(PASSIVE): log={log} frames, checkpointed={checkpointed} frames"
                         );
                     }
                 }
@@ -5122,7 +5105,7 @@ async fn report_db_health(store: &Store) {
             }
         }
         Err(e) => {
-            println!("  [WARN] wal_checkpoint failed: {}", e);
+            println!("  [WARN] wal_checkpoint failed: {e}");
         }
     }
 
@@ -5139,15 +5122,13 @@ async fn report_db_health(store: &Store) {
         .and_then(|row| row.try_get::<i64, _>(0).ok());
     let freelist = store.freelist_count().await;
     match (auto_vacuum, &freelist) {
-        (Some(2), Ok(freelist)) => println!(
-            "  [ok] auto_vacuum: INCREMENTAL (freelist_count={} pages)",
-            freelist
-        ),
+        (Some(2), Ok(freelist)) => {
+            println!("  [ok] auto_vacuum: INCREMENTAL (freelist_count={freelist} pages)");
+        }
         (Some(mode), Ok(freelist)) => {
             let label = if mode == 1 { "FULL" } else { "NONE" };
             println!(
-                "  [WARN] auto_vacuum: {} (freelist_count={} pages; deleted pages are not returned to the filesystem)",
-                label, freelist
+                "  [WARN] auto_vacuum: {label} (freelist_count={freelist} pages; deleted pages are not returned to the filesystem)"
             );
             if mode == 0 {
                 println!(
@@ -5166,8 +5147,7 @@ async fn report_db_health(store: &Store) {
     let read_size = read_pool.size();
     let read_idle = read_pool.num_idle();
     println!(
-        "  [ok] write_pool: size={}, idle={} | read_pool: size={}, idle={}",
-        write_size, write_idle, read_size, read_idle
+        "  [ok] write_pool: size={write_size}, idle={write_idle} | read_pool: size={read_size}, idle={read_idle}"
     );
 }
 
@@ -6346,7 +6326,7 @@ mod tests {
         loop {
             match lines.next() {
                 Some(Ok(line)) if line.contains("READY") => break,
-                Some(_) => continue,
+                Some(_) => {}
                 None => panic!("child exited before READY"),
             }
         }

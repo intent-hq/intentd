@@ -897,7 +897,9 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     // timeout path, and under full parallel-suite load (plus a first-exec
     // Gatekeeper scan on macOS) the spawn alone can take seconds
     // (monorepo#921).
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
@@ -920,7 +922,9 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
     // only succeeds when its own parent dir is on the child's $PATH. Same
     // generous timeout rationale as the opencode analog above (monorepo#921).
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
@@ -946,7 +950,9 @@ async fn grok_cli_timeout_flows_into_attributed_warning() {
     // bound (parity with the opencode analog): a first-exec Gatekeeper scan
     // on macOS can delay the spawn itself by seconds, and the attributed
     // warning already proves the timeout path fired.
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
@@ -1295,7 +1301,9 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     // PID first thing, then sleeps far past the injected timeout — a ~5s
     // budget leaves slow runners ample time to write the PID file before the
     // deadline even under full-suite parallel load.
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("pid");
@@ -1343,7 +1351,9 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 async fn opencode_timeout_flows_into_attributed_warning() {
     // The timeout reason must surface through the fetch result attribution
     // (`opencode: ...`), matching what models.list callers see.
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");

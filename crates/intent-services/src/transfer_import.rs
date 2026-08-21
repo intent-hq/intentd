@@ -22,6 +22,7 @@
 //! (the [`crate::transfer_git::TransferRefsManifest`]).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -791,11 +792,10 @@ fn assemble_and_extract(
             "assembled archive is {total} bytes, expected {declared_size}"
         )));
     }
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let actual: String = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     if actual != declared_sha256 {
         return Err(Error::InvalidParams(format!(
             "archive checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
@@ -1054,7 +1054,9 @@ async fn rollback_materialized_attachments(created: &[PathBuf]) {
 /// JSON row (not this struct) is what lands in the store.
 fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value) -> Workspace {
     let s = |key: &str| -> Option<String> {
-        row.get(key).and_then(|v| v.as_str()).map(|v| v.to_string())
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string)
     };
     let now = now_iso();
     Workspace {
@@ -1275,10 +1277,10 @@ fn transform_rows(
                         .to_string();
                     if let Some(serde_json::Value::String(path)) = map.get_mut("path") {
                         // <ws-dir>/sandboxes/<agentId>/<last component>
-                        let slug = Path::new(path.as_str())
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "repo".to_string());
+                        let slug = Path::new(path.as_str()).file_name().map_or_else(
+                            || "repo".to_string(),
+                            |s| s.to_string_lossy().to_string(),
+                        );
                         *path = ws_dir
                             .join("sandboxes")
                             .join(&agent)
@@ -1832,11 +1834,10 @@ mod tests {
     fn sha256_hex(bytes: &[u8]) -> String {
         let mut hasher = sha2::Sha256::new();
         hasher.update(bytes);
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        hasher.finalize().iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
     }
 
     fn b64(bytes: &[u8]) -> String {
@@ -1998,8 +1999,7 @@ mod tests {
             stats
                 .iter()
                 .find(|s| s.name == n)
-                .map(|s| s.row_count)
-                .unwrap_or(-1)
+                .map_or(-1, |s| s.row_count)
         };
         assert_eq!(row_count("draft"), 0);
         assert_eq!(row_count("note"), 1);

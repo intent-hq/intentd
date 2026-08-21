@@ -167,7 +167,7 @@ async fn drain_progress_events(ws: &mut PlainWs, progress_id: &str, secs: u64) -
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             None => return out,
             Some(Err(_)) => return out,
         }
@@ -383,7 +383,7 @@ async fn workspace_create_without_progress_id_stays_silent_over_wss() {
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             _ => break,
         }
     }

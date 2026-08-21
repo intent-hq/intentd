@@ -42,7 +42,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -210,7 +210,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -451,9 +451,9 @@ async fn workspace_api_settings_round_trip_over_wss() {
         .find(|e| e["path"] == "workspaceApi.maxOutputChars")
         .expect("workspaceApi.maxOutputChars missing from settings.list");
     assert_eq!(chars["type"], json!("number"));
-    assert_eq!(chars["value"], json!(100000.0));
+    assert_eq!(chars["value"], json!(100_000.0));
     assert_eq!(chars["min"], json!(0.0));
-    assert_eq!(chars["max"], json!(10000000.0));
+    assert_eq!(chars["max"], json!(10_000_000.0));
     assert_eq!(chars["origin"], json!("default"));
     let toon = settings
         .iter()
@@ -469,7 +469,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
         2,
         "settings.update",
         json!({ "changes": [
-            {"path": "workspaceApi.maxOutputChars", "value": 250000},
+            {"path": "workspaceApi.maxOutputChars", "value": 250_000},
             {"path": "workspaceApi.toonOutput", "value": false}
         ] }),
     )
@@ -486,7 +486,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
     .await;
     // Registry-read numbers are reported as floats on the wire (see
     // `wire_value`), matching the numeric shape of the catalog defaults.
-    assert_eq!(resp["result"]["value"], json!(250000.0));
+    assert_eq!(resp["result"]["value"], json!(250_000.0));
     assert_eq!(resp["result"]["origin"], json!("file"));
     let resp = wss_rpc(
         &mut ws,
@@ -499,7 +499,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
     assert_eq!(resp["result"]["origin"], json!("file"));
 
     // Sub-1000 non-zero / over-max values reject with -32602.
-    for bad in [json!(500), json!(20000000)] {
+    for bad in [json!(500), json!(20_000_000)] {
         let resp = wss_rpc(
             &mut ws,
             5,
@@ -528,7 +528,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
         json!({"path": "workspaceApi.maxOutputChars"}),
     )
     .await;
-    assert_eq!(resp["result"]["value"], json!(100000.0));
+    assert_eq!(resp["result"]["value"], json!(100_000.0));
     let resp = wss_rpc(
         &mut ws,
         8,

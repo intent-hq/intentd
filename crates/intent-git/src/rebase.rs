@@ -131,7 +131,7 @@ pub(crate) fn run_rebase(repo: &Repository, trunk_ref: &str) -> (bool, Option<St
         match rebase.next() {
             None => break,
             Some(Ok(_op)) => {
-                let has_conflicts = repo.index().map(|i| i.has_conflicts()).unwrap_or(false);
+                let has_conflicts = repo.index().is_ok_and(|i| i.has_conflicts());
                 if has_conflicts {
                     let _ = rebase.abort();
                     return (false, Some(CONFLICT_MSG.to_string()), true);

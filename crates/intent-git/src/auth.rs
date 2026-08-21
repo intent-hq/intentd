@@ -453,7 +453,7 @@ pub fn is_https_github_url(url: &str) -> bool {
 /// same "no usable token" rule. The token value is never logged.
 pub fn usable_token(token: Option<&str>) -> Option<&str> {
     let token = token?.trim();
-    if token.is_empty() || token.chars().any(|c| c.is_control()) {
+    if token.is_empty() || token.chars().any(char::is_control) {
         return None;
     }
     Some(token)

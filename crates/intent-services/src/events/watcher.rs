@@ -596,7 +596,7 @@ async fn debounce_loop(
                     return;
                 }
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 // Ingest everything already delivered before deciding what is
                 // due, so the burst decision sees the full backlog even when
                 // publishes are slow (STAB-121).

@@ -1074,10 +1074,10 @@ impl ScriptManager {
                             url_done = self.try_detect_url(ws, script_id, &chunk).await;
                         }
                     }
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Lagged(_)) => {},
                     Err(RecvError::Closed) => break,
                 },
-                _ = tokio::time::sleep(EXIT_POLL) => {
+                () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(self.pty.try_exit(pty_id), Ok(Some(_))) {
                         loop {
                             match live.try_recv() {
@@ -1088,7 +1088,7 @@ impl ScriptManager {
                                             self.try_detect_url(ws, script_id, &chunk).await;
                                     }
                                 }
-                                Err(TryRecvError::Lagged(_)) => continue,
+                                Err(TryRecvError::Lagged(_)) => {},
                                 Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
                             }
                         }
@@ -1314,7 +1314,7 @@ impl ScriptManager {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
-        spec.cwd = cwd.clone();
+        spec.cwd.clone_from(cwd);
         spec.env = spawn_env_overlay(def.env.as_ref());
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
@@ -1461,7 +1461,7 @@ fn match_local_url(rest: &str) -> Option<String> {
     let after_colon = after_scheme[host.len()..].strip_prefix(':')?;
     let digits: String = after_colon
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect();
     if digits.is_empty() {
         return None;
@@ -2085,7 +2085,7 @@ mod tests {
         let listed = h.services.script_list(h.ws.clone()).await.expect("list");
         let scripts = listed["scripts"].as_array().expect("scripts array");
         let mut names: Vec<&str> = scripts.iter().filter_map(|s| s["name"].as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["a", "b"], "workspace-scoped");
     }
 

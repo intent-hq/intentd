@@ -19,24 +19,24 @@ use serde_json::Value;
 
 use super::{map_err, req_i64};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.pr = {
         snapshot: (prNumber, options) =>
             host({ method: 'pr.snapshot', args: { prNumber, ...(options || {}) } }),
     };
-"#;
+";
 
 /// The `agentFeatures.prMonitor` segment of the `ws.pr` prelude: the three
 /// monitor installers, appended to [`PRELUDE`] only when the toggle is on. A
 /// unit test guards that the segment stays syntactically attachable.
-pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r#"
+pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r"
     ws.pr.monitor = (prNumber, options) =>
         host({ method: 'pr.monitor', args: { prNumber, ...(options || {}) } });
     ws.pr.unmonitor = (prNumber, options) =>
         host({ method: 'pr.unmonitor', args: { prNumber, ...(options || {}) } });
     ws.pr.monitors = () => host({ method: 'pr.monitors' });
-"#;
+";
 
 /// Feature-aware `ws.pr` prelude: the monitor installers are omitted when
 /// `agentFeatures.prMonitor` is off, so agent code touching them fails with a

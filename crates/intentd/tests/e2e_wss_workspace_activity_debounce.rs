@@ -112,7 +112,7 @@ impl ServerCertVerifier for PinnedVerifier {
         let hash = Sha256::digest(end_entity.as_ref());
         let hex = hash
             .iter()
-            .map(|b| format!("{:02X}", b))
+            .map(|b| format!("{b:02X}"))
             .collect::<Vec<_>>()
             .join(":");
         if hex == self.fingerprint {
@@ -196,14 +196,14 @@ async fn wss_rpc(
         match ws.next().await {
             Some(Ok(Message::Text(txt))) => {
                 let v: Value = serde_json::from_str(&txt).expect("parse ws msg");
-                if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+                if v.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
                     return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
                 ws.send(Message::Pong(p)).await.expect("pong");
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             _ => panic!("ws closed before response"),
         }
     }
@@ -226,7 +226,7 @@ async fn wss_event_opt(
                 Some(Ok(Message::Ping(p))) => {
                     let _ = ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 _ => return None,
             }
         }

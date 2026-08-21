@@ -289,8 +289,7 @@ impl Services {
                             p
                         } else {
                             return Err(Error::InvalidParams(format!(
-                                "configured auggie path is not a valid file: {}",
-                                trimmed
+                                "configured auggie path is not a valid file: {trimmed}"
                             )));
                         }
                     }
@@ -532,7 +531,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                r#"import readline from 'node:readline';
+                r"import readline from 'node:readline';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const rl = readline.createInterface({{ input: process.stdin, terminal: false }});
 rl.on('line', (line) => {{
@@ -549,7 +548,7 @@ rl.on('line', (line) => {{
     send({{ jsonrpc: '2.0', id: msg.id, result: {{ stopReason: 'end_turn' }} }});
   }}
 }});
-"#
+"
             ),
         )
         .expect("write mock adapter");
@@ -648,7 +647,7 @@ rl.on('line', (line) => {{
         let script = dir.path().join("adapter.mjs");
         std::fs::write(
             &script,
-            r#"import readline from 'node:readline';
+            r"import readline from 'node:readline';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', (line) => {
@@ -665,7 +664,7 @@ rl.on('line', (line) => {
     send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
   }
 });
-"#,
+",
         )
         .expect("write mock adapter");
         let bin = dir.path().join("codex-acp");

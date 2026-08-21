@@ -305,7 +305,7 @@ impl Supervisor {
                 Ok(UpdateOutcome::Installed { version, previous }) => {
                     match previous {
                         Some(previous) => {
-                            eprintln!("intentd-sitter: updated intentd {previous} -> {version}")
+                            eprintln!("intentd-sitter: updated intentd {previous} -> {version}");
                         }
                         None => eprintln!("intentd-sitter: installed intentd {version}"),
                     }
@@ -453,7 +453,7 @@ impl Supervisor {
                         }
                         break; // respawn (possibly a new version after SIGHUP)
                     }
-                    _ = tokio::time::sleep_until(next_check_at), if supervised => {
+                    () = tokio::time::sleep_until(next_check_at), if supervised => {
                         match self.check().await {
                             Ok(UpdateOutcome::Installed { version, previous }) => {
                                 eprintln!(
@@ -572,7 +572,7 @@ impl Supervisor {
         *backoff = backoff.saturating_mul(2).min(self.config.backoff_cap);
         eprintln!("intentd-sitter: respawning intentd in {delay:?}");
         tokio::select! {
-            _ = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
+            () = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
             event = signals.recv() => match event {
                 SignalEvent::Shutdown(signal) => BackoffOutcome::Shutdown(128 + signal),
                 #[cfg(unix)]
@@ -746,7 +746,7 @@ mod tests {
             CHECK_MIN_ENV => Some("100".to_string()),
             CHECK_MAX_ENV => Some("200".to_string()),
             BACKOFF_INITIAL_ENV => Some("not a number".to_string()),
-            BACKOFF_CAP_ENV => Some("".to_string()),
+            BACKOFF_CAP_ENV => Some(String::new()),
             KILL_TIMEOUT_ENV => Some("5000".to_string()),
             _ => None,
         });

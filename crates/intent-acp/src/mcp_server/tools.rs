@@ -272,8 +272,8 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI), `showTab` (reveal a hidden owned tab; `focus: true` also activates it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
@@ -496,8 +496,8 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI), `showTab` (reveal a hidden owned tab; `focus: true` also activates it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
@@ -1071,8 +1071,7 @@ mod tests {
         all_namespaces()
             .iter()
             .find(|(ns, _)| *ns == namespace)
-            .map(|(_, src)| *src)
-            .unwrap_or("")
+            .map_or("", |(_, src)| *src)
     }
 
     // Methods whose dispatch arm exists solely to surface a
@@ -1368,10 +1367,7 @@ mod tests {
                     .find("Namespaces")
                     .unwrap_or_else(|| panic!("chief={is_chief} {label}: no Namespaces index"));
                 // The index block ends at the first blank line after its header.
-                let end = desc[start..]
-                    .find("\n\n")
-                    .map(|i| start + i)
-                    .unwrap_or(desc.len());
+                let end = desc[start..].find("\n\n").map_or(desc.len(), |i| start + i);
                 assert!(
                     end <= BUDGET,
                     "chief={is_chief} {label}: description prefix through the end of the \

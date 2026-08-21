@@ -349,7 +349,7 @@ mod tests {
         let second = sample_stacks(Some(100), Some(99)).await;
         match second {
             Err(Error::Internal(msg)) => {
-                assert!(msg.contains("already in progress"), "msg: {msg}")
+                assert!(msg.contains("already in progress"), "msg: {msg}");
             }
             other => panic!("expected in-progress rejection, got {other:?}"),
         }

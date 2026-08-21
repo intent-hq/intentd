@@ -212,7 +212,7 @@ async fn explicit_effort_param_and_explicit_clear_outrank_the_setting() {
         None,
         None,
         AgentCreateExtra {
-            reasoning_effort: Some("".into()),
+            reasoning_effort: Some(String::new()),
             ..Default::default()
         },
     )

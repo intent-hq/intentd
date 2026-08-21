@@ -185,7 +185,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -217,7 +217,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected event frame, got {other:?}"),
         }
     }
@@ -254,7 +254,7 @@ async fn interrupted_agents_persisted_across_restart() {
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("Daemon log:\n{}", log);
+            eprintln!("Daemon log:\n{log}");
         }
         panic!("daemon did not start");
     }
@@ -494,7 +494,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("Daemon log:\n{}", log);
+            eprintln!("Daemon log:\n{log}");
         }
         panic!("daemon did not start");
     }

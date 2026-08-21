@@ -126,7 +126,7 @@ impl WorkspaceMcpServer {
     ) -> Self {
         let denylist = get_tool_denylist_for_agent_type(agent_type)
             .into_iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         Self {
             denylist,

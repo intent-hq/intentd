@@ -215,7 +215,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -781,7 +781,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -910,7 +910,7 @@ async fn host_exec_stream_over_wss() {
                     exit_ok = event["data"]["ok"].as_bool();
                     break;
                 }
-                _ => continue,
+                _ => {}
             }
         }
     }
@@ -1121,7 +1121,7 @@ async fn host_exec_stream_acp_handshake_probe_over_wss() {
                     String::from_utf8_lossy(&acc)
                 );
             }
-            _ => continue,
+            _ => {}
         }
     }
     let parsed = parsed.expect("received a JSON-RPC reply line on stdout");

@@ -138,7 +138,10 @@ where
             rx
         }
     };
-    let published = flight.wait_for(|o| o.is_some()).await.map(|o| o.clone());
+    let published = flight
+        .wait_for(std::option::Option::is_some)
+        .await
+        .map(|o| o.clone());
     let outcome = match published {
         Ok(published) => published.expect("guarded by wait_for"),
         // The driver vanished without publishing (panic). Evict the dead
@@ -321,8 +324,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| !s.success())
-            .unwrap_or(true)
+            .map_or(true, |s| !s.success())
         {
             eprintln!("skipping ls_remote_lists_local_file_remote: git not on PATH");
             return;
@@ -352,8 +354,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| !s.success())
-            .unwrap_or(true)
+            .map_or(true, |s| !s.success())
         {
             eprintln!("skipping ls_remote_failure_is_redacted_error: git not on PATH");
             return;

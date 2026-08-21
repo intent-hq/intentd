@@ -280,8 +280,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
     let p = Path::new(raw);
     if p.is_absolute() {
         p.strip_prefix(workdir)
-            .map(drop_curdir)
-            .unwrap_or_else(|_| drop_curdir(p))
+            .map_or_else(|_| drop_curdir(p), drop_curdir)
     } else {
         drop_curdir(p)
     }
@@ -297,7 +296,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
 fn drop_curdir(p: &Path) -> String {
     p.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .map(|c| c.as_os_str())
+        .map(std::path::Component::as_os_str)
         .collect::<std::path::PathBuf>()
         .to_string_lossy()
         .to_string()
@@ -803,7 +802,7 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = discard(dir.path(), &[".".to_string()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
-        let err = discard(dir.path(), &["".to_string()]).unwrap_err();
+        let err = discard(dir.path(), &[String::new()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
     }
 

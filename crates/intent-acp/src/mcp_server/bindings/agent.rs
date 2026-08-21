@@ -26,7 +26,7 @@ use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
 /// and the identical constant in `dispatch.rs`).
 const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent responds.";
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.agent = {
         create: (name, message, opts) =>
@@ -67,7 +67,7 @@ pub(crate) const PRELUDE: &str = r#"
         reportBlocker: (reason) =>
             host({ method: 'agent.reportBlocker', args: { reason } }),
     };
-"#;
+";
 
 /// The `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` installer
 /// lines inside [`PRELUDE`], removed when `agentFeatures.attentionRequests`

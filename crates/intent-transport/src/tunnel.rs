@@ -510,7 +510,7 @@ where
                     return false;
                 }
             }
-            _ = &mut deadline => {
+            () = &mut deadline => {
                 if let Some(handle) = streams.remove(&stream_id) {
                     handle.abort.abort();
                 }
@@ -626,7 +626,7 @@ async fn run_stream(
                 }
                 None => break,
             },
-            _ = &mut idle => break,
+            () = &mut idle => break,
         }
     }
     let _ = out_tx.send(Frame::Close { stream_id }).await;

@@ -115,8 +115,7 @@ fn dequeue_wait_annotation_min_ms() -> i128 {
     std::env::var("INTENTD_DEQUEUE_WAIT_MIN_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(i128::from)
-        .unwrap_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS)
+        .map_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS, i128::from)
 }
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
@@ -576,8 +575,7 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Async callback that tears down one process when the registry evicts/reaps it
@@ -838,8 +836,8 @@ impl BusEventSink {
             commit_hash: None,
             old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
             new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-            additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-            deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+            additions: summary.as_ref().map_or(0, |s| s.additions),
+            deletions: summary.as_ref().map_or(0, |s| s.deletions),
         };
         let attributed_agent = change.agent_id.clone();
         let (lines_added, lines_deleted) =
@@ -1387,8 +1385,7 @@ impl ProcessRegistry {
             .unwrap()
             .entries
             .get(agent_id)
-            .map(|e| e.is_active)
-            .unwrap_or(false)
+            .is_some_and(|e| e.is_active)
     }
 
     /// Evict idle processes in LRU order (the idle-reap hook; full
@@ -1818,7 +1815,10 @@ impl Drop for TeardownFence {
     fn drop(&mut self) {
         // Poison recovery mirrors the delete-path sweeps: unfencing is the
         // last chance to keep the set from leaking these ids forever.
-        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stopping = self
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in &self.ids {
             stopping.remove(id);
         }
@@ -2436,7 +2436,7 @@ impl AgentManager {
             auth_error_patterns: opts
                 .provider
                 .auth_error_patterns
-                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .map(|p| p.iter().map(std::string::ToString::to_string).collect())
                 .unwrap_or_default(),
             // STAB-53: capture the child's stderr under
             // `<agent-logs>/<agent-id>/<YYYY-MM-DD>.log` so a child that dies
@@ -2509,7 +2509,7 @@ impl AgentManager {
             _rules_config: rules_config,
             _pi_extension: pi_extension,
             session_mcp_servers,
-            spawned_model: opts.model.map(|s| s.to_string()),
+            spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
@@ -3557,9 +3557,9 @@ impl AgentManager {
         // appends trail it (the `model_changed` system notice lands after the
         // user row and before this render); with no user row fall back to
         // dropping the last message.
-        let prior = match messages.iter().rposition(|m| m.role == "user") {
+        let prior: &[_] = match messages.iter().rposition(|m| m.role == "user") {
             Some(idx) => &messages[..idx],
-            None => messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]),
+            None => messages.split_last().map_or(&[], |(_, rest)| rest),
         };
         if prior.is_empty() {
             return content.to_string();
@@ -4194,8 +4194,7 @@ impl AgentManager {
         let had_output = self
             .services
             .live_turn(agent_id)
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|live| !live.blocks.is_empty());
         let redelivery = if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
             self.derive_stop_redelivery(agent_id, None).await
         } else {
@@ -5805,8 +5804,7 @@ impl AgentManager {
         let has_output = self
             .services
             .live_turn(agent_id)
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|live| !live.blocks.is_empty());
 
         // Sender attribution for the interrupted row / `stream:end` payload:
         // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
@@ -7939,7 +7937,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
     spawn_opts.npx_fallback_package = opts.npx_fallback_package;
     spawn_opts.extra_env = opts.extra_env.clone();
-    spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
+    spawn_opts.tools_to_remove.clone_from(&opts.tools_to_remove);
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
@@ -8455,7 +8453,7 @@ async fn run_message_worker(
                                     log.display()
                                 ),
                                 None => {
-                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally")
+                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
                                 }
                             }
                             handle_terminal_turn_failure(
@@ -8486,7 +8484,7 @@ async fn run_message_worker(
                         log.display()
                     ),
                     None => {
-                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries")
+                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
                     }
                 }
                 handle_terminal_spawn_failure(
@@ -8762,7 +8760,7 @@ async fn run_message_worker(
                 .redeliver_completion_after_queue_mutation(&agent_id)
                 .await;
             break 'outer;
-        };
+        }
         if mgr.try_begin_outcome(&agent_id, &workspace_id, false).await == TryBeginOutcome::Started
         {
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
@@ -9089,7 +9087,7 @@ async fn prepare_flush_turn(
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
     let mut stale_flags = Vec::with_capacity(entries.len());
-    for entry in entries.iter_mut() {
+    for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
         stale_flags.push(stale);
@@ -9686,7 +9684,7 @@ pub(crate) async fn persist_terminal_error_status_via_services(
         )
         .await
     {
-        Ok(_) => true,
+        Ok(()) => true,
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
             false
@@ -11473,7 +11471,7 @@ mod dead_child_respawn_tests {
             ConnectionHooks::default(),
         ));
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
-        let child_pid = child.as_ref().and_then(|c| c.id());
+        let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         let handle = AgentHandle {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),

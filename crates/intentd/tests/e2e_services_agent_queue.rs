@@ -111,7 +111,7 @@ async fn agent_queue_add_get_remove_lifecycle() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -187,7 +187,7 @@ async fn agent_conversation_and_summary() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -272,7 +272,7 @@ async fn agent_diagnostics_baseline() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

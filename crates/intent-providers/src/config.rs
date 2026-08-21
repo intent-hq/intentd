@@ -535,10 +535,10 @@ pub(crate) fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
 /// `{command} login`). Port of `getProviderAuthErrorMessage`.
 pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
     let config = provider_config(provider_id);
-    let login_cmd = config
-        .login_command_hint
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| format!("{} login", config.command));
+    let login_cmd = config.login_command_hint.map_or_else(
+        || format!("{} login", config.command),
+        std::string::ToString::to_string,
+    );
 
     if is_remote {
         format!(

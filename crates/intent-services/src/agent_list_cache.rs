@@ -98,8 +98,7 @@ impl AgentListProjectionCache {
             .lock()
             .unwrap()
             .get(workspace_id)
-            .map(|s| s.epoch)
-            .unwrap_or(0)
+            .map_or(0, |s| s.epoch)
     }
 
     fn lookup(

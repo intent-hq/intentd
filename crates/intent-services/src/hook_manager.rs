@@ -276,8 +276,10 @@ async fn run_hook_script(
         .last_state
         .as_deref()
         .filter(|s| serde_json::from_str::<Value>(s).is_ok())
-        .map(|s| format!("JSON.parse({})", Value::String(s.to_string())))
-        .unwrap_or_else(|| "null".to_string());
+        .map_or_else(
+            || "null".to_string(),
+            |s| format!("JSON.parse({})", Value::String(s.to_string())),
+        );
     let full_code = format!(
         "{prelude}\n\
          const __hook_logs = [];\n\
@@ -1068,7 +1070,7 @@ impl Services {
     /// run already in flight at expiry completes normally). The task
     /// deregisters itself from [`Services::hook_tasks`] on every exit path.
     fn spawn_hook_task(&self, hook: Hook) {
-        self.spawn_hook_task_with_initial_delay(hook, None)
+        self.spawn_hook_task_with_initial_delay(hook, None);
     }
 
     /// [`Services::spawn_hook_task`] with an explicit first-iteration sleep:
@@ -1098,8 +1100,8 @@ impl Services {
                     }
                 };
                 tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = expiry => {
+                    () = tokio::time::sleep(delay) => {}
+                    () = expiry => {
                         services.expire_hook(&mut hook).await;
                         break;
                     }
@@ -1315,7 +1317,7 @@ impl Services {
                     self.store
                         .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                         .await?;
-                    hook.last_logs = logs.clone();
+                    hook.last_logs.clone_from(logs);
                 }
                 // Persist the error before the terminal state so a reader
                 // that observes `evicted` always sees `lastError`.
@@ -3205,6 +3207,36 @@ mod tests {
         }
     }
 
+    /// Deterministic pin for the verbatim-preservation contract: when the
+    /// persisted deadline is earlier than a fresh `now + delayMs` countdown,
+    /// [`resumed_next_run`] returns the persisted string VERBATIM (no
+    /// reparse/reformat drift) with the remaining time to it. The
+    /// integration test below can only observe this best-effort — under
+    /// load the due run may fire before the row is read
+    /// (intent-hq/monorepo#3055).
+    #[test]
+    fn resumed_next_run_preserves_earlier_deadline_verbatim() {
+        let (ws, owner) = (WorkspaceId::new(), AgentId::from("agent-hooks"));
+        // 60s out: comfortably earlier than the fresh 10-minute cadence, and
+        // wide enough that the remaining-delay bounds below hold under any
+        // realistic scheduler stall between building the row and the call.
+        let due_at = next_run_at_iso(60_000);
+        let hook = countdown_row(
+            &ws,
+            &owner,
+            "verbatim",
+            Some(due_at.clone()),
+            next_run_at_iso(MAX_HOOK_TTL_MS),
+        );
+        let (next_run_at, initial_delay) = resumed_next_run(&hook);
+        assert_eq!(next_run_at, due_at, "persisted deadline kept verbatim");
+        assert!(
+            initial_delay > Duration::from_secs(30) && initial_delay <= Duration::from_secs(60),
+            "remaining time to the persisted deadline — neither an immediate \
+             run nor a fresh cadence: {initial_delay:?}"
+        );
+    }
+
     /// A restart must not push a hook's countdown back: rehydration resumes
     /// with the EARLIER of the persisted `nextRunAt` and a fresh
     /// `now + delayMs` countdown (intent-hq/monorepo#2856), so a
@@ -3225,13 +3257,24 @@ mod tests {
         );
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
-        // The persisted countdown survives the restart verbatim...
+        // The persisted countdown survives the restart verbatim... unless
+        // the due run already fired under load (`update_hook_run` replaces
+        // `next_run_at` atomically with the `run_count` bump), which itself
+        // proves the near deadline was honored. The verbatim min semantics
+        // are pinned by `resumed_next_run_preserves_earlier_deadline_verbatim`.
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
-        assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        if stored.run_count == 1 {
+            assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        }
         // ...and the run fires on it, nowhere near the 10-minute cadence a
         // reset countdown would impose (the poll deadline is 10s).
-        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
-        assert_eq!(ran.state, HookState::Scheduled);
+        // `run_count` persists before the Running→Scheduled state write, so
+        // wait on both — a `run_count`-only poll can legally observe the row
+        // mid-run as `Running` (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
     }
 
@@ -3250,8 +3293,12 @@ mod tests {
         );
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
-        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
-        assert_eq!(ran.state, HookState::Scheduled);
+        // Wait on state too — `run_count` persists before the
+        // Running→Scheduled write (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
     }
 

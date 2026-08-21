@@ -1101,7 +1101,7 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// key pick up a future default flip automatically (intent-hq/monorepo#2643).
 /// Parsing this template must yield exactly [`SettingsFile::default`]
 /// (enforced by a unit test).
-pub const DEFAULT_CONFIG_TEMPLATE: &str = r##"# intentd configuration (non-secret settings).
+pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret settings).
 #
 # Strictly parsed: unknown keys, wrong types, and out-of-range values are
 # startup errors. Secrets (API tokens, MCP server configs) never live here --
@@ -1400,7 +1400,7 @@ debounceSeconds = 60
 # PR monitor poll seconds -- how often (in seconds) the centralized loop polls
 # each monitored PR (minimum 10).
 pollSeconds = 30
-"##;
+"#;
 
 #[cfg(test)]
 mod tests {

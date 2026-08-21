@@ -135,7 +135,7 @@ async fn accept_loop(listener: TcpListener, remote_port: u16) {
                                 tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                         }
                         Err(e) => {
-                            tracing::debug!(error = %e, port = remote_port, "forward dial failed")
+                            tracing::debug!(error = %e, port = remote_port, "forward dial failed");
                         }
                     }
                 });

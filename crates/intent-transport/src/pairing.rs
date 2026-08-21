@@ -8,6 +8,7 @@
 //! the long-lived bearer token (Decision 4), so remote (TCP) callers get a
 //! -32001 auth error regardless of the `--mode` locality flag.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -53,9 +54,11 @@ fn encode_query_value(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out

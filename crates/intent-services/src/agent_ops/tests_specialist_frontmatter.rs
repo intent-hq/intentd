@@ -82,29 +82,25 @@ async fn create_agent(
 /// Create a specialist file with frontmatter model in the user tier.
 fn create_user_specialist(dir: &Path, id: &str, model: &str) {
     let content = format!(
-        "---\nname: \"{}\"\ndescription: \"Test specialist\"\nmodel: \"{}\"\n---\n\nTest prompt",
-        id, model
+        "---\nname: \"{id}\"\ndescription: \"Test specialist\"\nmodel: \"{model}\"\n---\n\nTest prompt"
     );
-    std::fs::write(dir.join(format!("{}.md", id)), content).expect("write specialist");
+    std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
 }
 
 /// Create a specialist file without a model field.
 fn create_specialist_without_model(dir: &Path, id: &str) {
-    let content = format!(
-        "---\nname: \"{}\"\ndescription: \"Test specialist\"\n---\n\nTest prompt",
-        id
-    );
-    std::fs::write(dir.join(format!("{}.md", id)), content).expect("write specialist");
+    let content =
+        format!("---\nname: \"{id}\"\ndescription: \"Test specialist\"\n---\n\nTest prompt");
+    std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
 }
 
 /// Create a specialist file with a retired frontmatter modelTier (no model)
 /// in the user tier.
 fn create_specialist_with_retired_tier(dir: &Path, id: &str, tier: &str) {
     let content = format!(
-        "---\nname: \"{}\"\ndescription: \"Test specialist\"\nmodelTier: \"{}\"\n---\n\nTest prompt",
-        id, tier
+        "---\nname: \"{id}\"\ndescription: \"Test specialist\"\nmodelTier: \"{tier}\"\n---\n\nTest prompt"
     );
-    std::fs::write(dir.join(format!("{}.md", id)), content).expect("write specialist");
+    std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
 }
 
 /// Create an agent with an explicit provider and no explicit model.
@@ -552,7 +548,7 @@ async fn omitted_name_derives_from_specialist_display_name() {
         &ws,
         None,
         Some("test-specialist".into()),
-        Default::default(),
+        intent_core::AgentCreateExtra::default(),
     )
     .await;
     assert_eq!(agent["name"], "Fancy Display Name");
@@ -569,7 +565,7 @@ async fn omitted_name_derives_from_embedded_spec_writer() {
         &ws,
         None,
         Some("spec-writer".into()),
-        Default::default(),
+        intent_core::AgentCreateExtra::default(),
     )
     .await;
     assert_eq!(agent["name"], "Coordinator");
@@ -585,7 +581,7 @@ async fn explicit_name_beats_specialist_display_name() {
         &ws,
         Some("My Explicit Name"),
         Some("spec-writer".into()),
-        Default::default(),
+        intent_core::AgentCreateExtra::default(),
     )
     .await;
     assert_eq!(agent["name"], "My Explicit Name");
@@ -597,7 +593,14 @@ async fn explicit_name_beats_specialist_display_name() {
 #[tokio::test]
 async fn no_specialist_falls_back_to_generic_name() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
-    let agent = create_agent_with_optional_name(&svc, &ws, None, None, Default::default()).await;
+    let agent = create_agent_with_optional_name(
+        &svc,
+        &ws,
+        None,
+        None,
+        intent_core::AgentCreateExtra::default(),
+    )
+    .await;
     let name = agent["name"].as_str().expect("name");
     assert!(name.starts_with("Agent "), "generic fallback: {name}");
     assert_eq!(agent["nameExplicitlySet"], false);
@@ -613,7 +616,7 @@ async fn unknown_specialist_falls_back_to_generic_name() {
         &ws,
         None,
         Some("no-such-specialist".into()),
-        Default::default(),
+        intent_core::AgentCreateExtra::default(),
     )
     .await;
     let name = agent["name"].as_str().expect("name");

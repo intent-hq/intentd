@@ -233,7 +233,7 @@ pub async fn prompt(
                     usage: response.usage,
                 });
             }
-            _ = tokio::time::sleep(poll_interval) => {
+            () = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());
                 if idle >= idle_window {
                     // Early return drops req_fut; its pending-map entry is

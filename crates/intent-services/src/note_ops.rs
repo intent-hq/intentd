@@ -9,6 +9,7 @@
 //! actionable message directly.
 
 use intent_core::{Error, NoteTaskRow, Result};
+use std::fmt::Write as _;
 
 /// JS `\s` (ASCII subset): space, tab, the line terminators, FF and VT.
 fn is_js_space_char(c: char) -> bool {
@@ -953,8 +954,7 @@ pub(crate) fn context_before(content: &str, pos: usize) -> String {
         .rev()
         .take(ANCHOR_CONTEXT_LEN)
         .last()
-        .map(|(idx, _)| idx)
-        .unwrap_or(pos);
+        .map_or(pos, |(idx, _)| idx);
     content[start..pos].to_string()
 }
 
@@ -965,8 +965,7 @@ pub(crate) fn context_after(content: &str, pos: usize) -> String {
         .char_indices()
         .take(ANCHOR_CONTEXT_LEN)
         .last()
-        .map(|(idx, ch)| pos + idx + ch.len_utf8())
-        .unwrap_or(pos);
+        .map_or(pos, |(idx, ch)| pos + idx + ch.len_utf8());
     content[pos..end].to_string()
 }
 
@@ -1217,8 +1216,7 @@ fn trailing_word(s: &str) -> String {
         .rev()
         .take_while(|(_, c)| !c.is_whitespace())
         .last()
-        .map(|(i, _)| i)
-        .unwrap_or(trimmed.len());
+        .map_or(trimmed.len(), |(i, _)| i);
     trimmed[start..].to_string()
 }
 
@@ -1478,7 +1476,7 @@ pub(crate) fn extract_task_blocks(content: &str) -> TaskBlocksResult {
         out.push_str(&content[cursor..block.start]);
         match parse_task_block_content(&block.body) {
             Some(mut task) => {
-                out.push_str(&format!("<!-- task-block-placeholder-{valid_index} -->"));
+                let _ = write!(out, "<!-- task-block-placeholder-{valid_index} -->");
                 task.key = block.header.key;
                 task.depends_on = block.header.depends_on;
                 task.conflicts_with = block.header.conflicts_with;
@@ -1562,7 +1560,7 @@ fn strip_links(s: &str) -> String {
                 }
             }
         }
-        out.push_str(&rest[..open + 1]);
+        out.push_str(&rest[..=open]);
         rest = &rest[open + 1..];
     }
     out.push_str(rest);
@@ -1622,8 +1620,7 @@ pub(crate) fn new_asset_id(base64_data: &str, mime_type: &str) -> String {
     use std::hash::{Hash, Hasher};
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     base64_data.hash(&mut hasher);
     let hash8 = format!("{:016x}", hasher.finish())[..8].to_string();
@@ -2586,7 +2583,7 @@ mod tests {
     const PHANTOM_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+        ids.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
