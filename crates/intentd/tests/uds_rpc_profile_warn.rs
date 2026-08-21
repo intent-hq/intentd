@@ -292,6 +292,94 @@ async fn script_list_bootstrap_stays_within_statement_budget() {
     );
 }
 
+/// Regression test for intent-hq/monorepo#3018: `agent.getSubscriptions`
+/// used to call `get_agent_session` for every agent present in the payload
+/// (caller + watch children + delegation-group members) just to read
+/// `status`, hydrating each agent's FULL message log — 2 statements per
+/// present agent, with dispatch duration scaling with the watched agents'
+/// transcript sizes. The `agentStatuses` map is now built from one batched
+/// `SELECT id, status ... WHERE id IN (...)`, so the dispatch executes a
+/// single statement regardless of watch fan-out or transcript size. A
+/// statement threshold of 1 pins that: the pre-fix shape (≥ 2 statements
+/// even for a bare caller with no watches) fires the WARN, the batched
+/// shape stays quiet.
+#[tokio::test]
+async fn get_subscriptions_stays_within_statement_budget() {
+    let (_daemon, socket, log_path) = spawn_daemon(
+        "itdp-subs",
+        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "1")],
+    );
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let repo = create_repo_with_config("{}");
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let resp = rpc_with_params(
+        &socket,
+        "agent.create",
+        json!({ "workspaceId": workspace_id, "name": "Subs Agent", "model": "auggie:sonnet4.5" }),
+    )
+    .await;
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Give the caller a transcript — the payload the pre-fix per-agent
+    // `get_agent_session` loop needlessly hydrated.
+    for i in 0..5 {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        let resp = rpc_with_params(
+            &socket,
+            "agent.appendMessage",
+            json!({
+                "workspaceId": workspace_id,
+                "agentId": agent_id,
+                "role": role,
+                "contentBlocks": [{ "type": "text", "text": format!("message {i}") }],
+            }),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "append failed: {resp}");
+    }
+
+    let resp = rpc_with_params(
+        &socket,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(resp["result"]["subscriptions"].is_array(), "resp: {resp}");
+    assert!(
+        resp["result"]["agentStatuses"][agent_id.as_str()].is_string(),
+        "caller status present in agentStatuses, resp: {resp}"
+    );
+
+    // The WARN (were it wrongly emitted) lands on stderr before the response
+    // frame is written, so a single read after the response is sufficient.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &[
+                "exceeded SQL statement budget",
+                "method=agent.getSubscriptions"
+            ]
+        ),
+        0,
+        "agent.getSubscriptions exceeded the lowered statement budget, log:\n{log}"
+    );
+}
+
 /// Regression test for intent-hq/monorepo#2994: `workspace.transfer.plan`
 /// used to compute its per-table row stats with 2 statements per
 /// TRANSFER_TABLES entry (PRAGMA table_info + per-table aggregate, ~56
