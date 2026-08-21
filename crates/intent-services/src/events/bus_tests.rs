@@ -157,13 +157,13 @@ async fn non_agent_file_events_broadcast_without_persisting() {
 /// shutdown `flush_all`.
 #[tokio::test]
 async fn large_transient_file_burst_reaches_a_draining_subscriber() {
+    // Exceed BROADCAST_CAPACITY (1024) in one uninterrupted publish loop.
+    const BURST: usize = 1500;
     let (_tmp, bus) = bus().await;
     let mut filter = SubscriptionFilter::for_subscriber(&["file:*".to_string()], None, false, None);
     filter.batch_window = None;
     let mut sub = bus.subscribe(filter);
 
-    // Exceed BROADCAST_CAPACITY (1024) in one uninterrupted publish loop.
-    const BURST: usize = 1500;
     let consumer = tokio::spawn(async move {
         let mut received = 0usize;
         while received < BURST {
@@ -390,6 +390,9 @@ async fn idle_publish_resolves_without_batch_window_delay() {
 
 #[tokio::test]
 async fn concurrent_burst_batches_events_correctly() {
+    const PUBLISHERS: usize = 30;
+    const EVENTS_PER_PUBLISHER: usize = 17; // ~510 total events
+    const TOTAL_EVENTS: usize = PUBLISHERS * EVENTS_PER_PUBLISHER;
     let (_tmp, bus) = bus().await;
     // Subscribe to capture all events (no batching for simpler per-publisher assertions).
     let filter = SubscriptionFilter {
@@ -397,10 +400,6 @@ async fn concurrent_burst_batches_events_correctly() {
         ..Default::default()
     };
     let mut sub = bus.subscribe(filter);
-
-    const PUBLISHERS: usize = 30;
-    const EVENTS_PER_PUBLISHER: usize = 17; // ~510 total events
-    const TOTAL_EVENTS: usize = PUBLISHERS * EVENTS_PER_PUBLISHER;
 
     // Spawn 30 concurrent tasks, each publishing 17 events.
     let handles: Vec<_> = (0..PUBLISHERS)
@@ -970,6 +969,10 @@ fn lag_warn_throttle_rate_limits_and_accumulates() {
 /// the subscription's filter scope (event types + workspace).
 #[tokio::test]
 async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
+    // Flood the broadcast ring in one non-yielding loop (`publish_transient`
+    // never awaits) so the delivery task cannot drain in between: its receiver
+    // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
+    const OVERFLOW: usize = 64;
     let (_tmp, bus) = bus().await;
     let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
     filter.batch_window = None;
@@ -979,10 +982,6 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     let capture = Capture::default();
     let _guard = tracing::subscriber::set_default(capture.clone());
 
-    // Flood the broadcast ring in one non-yielding loop (`publish_transient`
-    // never awaits) so the delivery task cannot drain in between: its receiver
-    // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
-    const OVERFLOW: usize = 64;
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
         let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
@@ -1024,12 +1023,12 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
 /// `recv` consumers keep seeing only event batches.
 #[tokio::test]
 async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
+    const OVERFLOW: usize = 64;
     let (_tmp, bus) = bus().await;
     let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
     filter.batch_window = None;
     let mut sub = bus.subscribe(filter);
 
-    const OVERFLOW: usize = 64;
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
         let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }

@@ -406,7 +406,7 @@ mod tests {
     /// a guarded temp dir removed on drop — including on panic — unless
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         path: PathBuf,
     }
 
@@ -414,7 +414,7 @@ mod tests {
         fn new() -> Self {
             let dir = crate::tests::test_tempdir("intentd-enhanceops-");
             let path = dir.path().join("store.db");
-            Self { _dir: dir, path }
+            Self { dir, path }
         }
     }
 
@@ -426,7 +426,7 @@ mod tests {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         registry

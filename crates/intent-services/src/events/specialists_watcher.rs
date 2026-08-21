@@ -121,6 +121,7 @@ impl SpecialistsWatcher {
     /// rides the shared stream and needs no separate sync point — subscribing is
     /// synchronous bookkeeping.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
@@ -532,13 +533,13 @@ mod tests {
         std::fs::write(proj.join("doomed.md"), specialist_md("Doomed", "body"))
             .expect("seed specialist");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
@@ -567,7 +568,7 @@ mod tests {
         let proj = project_dir(&ws.path);
         // The project tier does NOT exist when the watcher starts.
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
@@ -581,7 +582,7 @@ mod tests {
         // (monorepo#1630) with a generous quiet window, so only the headroom
         // before the "no event" verdict widens — behavior under test is
         // unchanged.
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
@@ -618,13 +619,13 @@ mod tests {
         let proj = project_dir(&ws.path);
         std::fs::create_dir_all(&proj).expect("mk project tier");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -662,7 +663,7 @@ mod tests {
         let ws1_id = WorkspaceId::from("ws-fanout-1");
         let ws2_id = WorkspaceId::from("ws-fanout-2");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![
@@ -671,7 +672,7 @@ mod tests {
             ],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(
@@ -708,13 +709,13 @@ mod tests {
         // includes this specialist.
         std::fs::write(&file, &content).expect("seed specialist");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rewrite the identical bytes: the file event fires but the resolved

@@ -369,9 +369,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sparse_files_count_allocated_not_apparent_size() {
+        const APPARENT: u64 = 16 << 20;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("sparse.bin");
-        const APPARENT: u64 = 16 << 20;
         fs::File::create(&file).unwrap().set_len(APPARENT).unwrap();
         let usage = compute_dir_usage(dir.path()).unwrap();
         assert!(

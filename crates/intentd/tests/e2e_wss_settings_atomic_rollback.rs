@@ -751,6 +751,7 @@ fn assert_success_envelope(resp: &Value, id: i64) {
     assert!(resp["result"].is_object(), "{resp}");
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// The `agents` memory knobs as clients actually receive them (monorepo#2109):
 /// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
 /// `agents.idleReapMinutes` advertises the shipped 10-minute default.
@@ -767,6 +768,9 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 // The advertised max is a small whole-valued float: casts are exact.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn agent_memory_knobs_over_wss() {
+    // The static bound `SettingsFile` enforces when parsing config.toml. The
+    // catalog bound may sit below it (this machine's RAM) but never above.
+    const PARSE_BOUND_MB: f64 = 1_024_000.0;
     let data_dir = temp_data_dir();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -791,9 +795,6 @@ async fn agent_memory_knobs_over_wss() {
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(port, cfg).await;
 
-    // The static bound `SettingsFile` enforces when parsing config.toml. The
-    // catalog bound may sit below it (this machine's RAM) but never above.
-    const PARSE_BOUND_MB: f64 = 1_024_000.0;
     let budget = "agents.memoryBudgetMb";
     let reap = "agents.idleReapMinutes";
 

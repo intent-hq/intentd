@@ -36,6 +36,7 @@ pub(crate) fn minute_bucket_utc(t: OffsetDateTime) -> String {
     )
 }
 
+#[allow(clippy::similar_names)] // cr/cc mirror the cache-read/cache-creation counter names
 /// Spread one turn's [`UsageRateDelta`] evenly across every UTC minute bucket
 /// the turn spanned — `[turn_end − turn_duration, turn_end]`, inclusive, floored
 /// to UTC minutes — instead of folding it all into the turn-end minute. Buckets

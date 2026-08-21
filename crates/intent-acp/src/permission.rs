@@ -42,11 +42,11 @@ pub enum RiskLevel {
 /// Derive a [`RiskLevel`] from a tool-call title (parity: TS `assessRiskLevel`):
 /// high-risk patterns win over low-risk; everything else is medium.
 pub(crate) fn assess_risk_level(title: &str) -> RiskLevel {
-    let lower = title.to_lowercase();
     const HIGH: [&str; 7] = [
         "delete", "remove", "execute", "write", "modify", "create", "launch",
     ];
     const LOW: [&str; 4] = ["read", "view", "list", "get"];
+    let lower = title.to_lowercase();
     if HIGH.iter().any(|p| lower.contains(p)) {
         RiskLevel::High
     } else if LOW.iter().any(|p| lower.contains(p)) {

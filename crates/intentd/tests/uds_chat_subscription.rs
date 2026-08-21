@@ -894,6 +894,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
 /// superseding the Iter#1c heal-gate assertion this test used to make (that a
 /// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
@@ -1034,6 +1035,7 @@ async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let _ = server.await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// CS-4 cross-agent isolation: a `chat.subscribe` for agent A must NOT receive
 /// agent B's `agent:stream:*` events — the forwarder filters on
 /// `sessionId == agentId`. B's chunk is published first (and dropped); the next

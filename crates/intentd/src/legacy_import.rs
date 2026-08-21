@@ -1582,6 +1582,15 @@ fn session_from_legacy_json(
     stem: &str,
     mut obj: Map<String, Value>,
 ) -> Result<(AgentSession, Vec<Value>), String> {
+    fn lift_string(m: &mut Map<String, Value>, key: &str) -> Option<String> {
+        match m.get(key) {
+            Some(Value::String(_)) => match m.remove(key) {
+                Some(Value::String(s)) if !s.is_empty() => Some(s),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     fn take_string(obj: &mut Map<String, Value>, key: &str) -> Option<String> {
         match obj.remove(key) {
             Some(Value::String(s)) if !s.is_empty() => Some(s),
@@ -1643,15 +1652,6 @@ fn session_from_legacy_json(
         }
         _ => Map::new(),
     };
-    fn lift_string(m: &mut Map<String, Value>, key: &str) -> Option<String> {
-        match m.get(key) {
-            Some(Value::String(_)) => match m.remove(key) {
-                Some(Value::String(s)) if !s.is_empty() => Some(s),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
     let specialist = lift_string(&mut metadata, "specialist");
     let task_note_id = lift_string(&mut metadata, "taskNoteId").map(NoteId::from);
     let completion_report = lift_string(&mut metadata, "completionReport");

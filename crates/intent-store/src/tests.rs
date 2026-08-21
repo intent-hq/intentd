@@ -1180,7 +1180,7 @@ async fn rollback_or_poison_emits_warn_on_detach() {
     .expect("create trap trigger");
 
     let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let _guard = tracing::subscriber::set_default(WarnCapture {
+    let guard = tracing::subscriber::set_default(WarnCapture {
         events: captured.clone(),
         next_span_id: std::sync::atomic::AtomicU64::new(1),
     });
@@ -1188,7 +1188,7 @@ async fn rollback_or_poison_emits_warn_on_detach() {
         .append_note_version(&note, &author, &ts)
         .await
         .expect_err("INSERT must fail on the rollback trigger");
-    drop(_guard);
+    drop(guard);
 
     // The detach path fired (pool size dropped to 0) and emitted a WARN
     // event carrying the ROLLBACK error.

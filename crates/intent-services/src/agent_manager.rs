@@ -1784,7 +1784,7 @@ struct AgentHandle {
     connection: Arc<Connection>,
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     serve_task: JoinHandle<()>,
-    _child: Option<Child>,
+    child: Option<Child>,
     /// The child's pid captured at spawn: `Child::id()` reads `None` once a
     /// `try_wait` liveness probe reaps the exit status, and the pgid-based
     /// teardown (`kill_child_tree`) still needs it to sweep same-group
@@ -2230,7 +2230,7 @@ impl AgentManager {
             .iter_mut()
             .filter_map(|(agent_id, handle)| {
                 let pid = handle.child_pid?;
-                if let Some(child) = handle._child.as_mut() {
+                if let Some(child) = handle.child.as_mut() {
                     if !matches!(child.try_wait(), Ok(None)) {
                         return None;
                     }
@@ -2582,7 +2582,7 @@ impl AgentManager {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task,
-            _child: Some(child),
+            child: Some(child),
             child_pid,
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
@@ -2606,7 +2606,7 @@ impl AgentManager {
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
             let stale_pid = stale.child_pid;
-            if let Some(child) = stale._child.take() {
+            if let Some(child) = stale.child.take() {
                 kill_child_tree(child, stale_pid).await;
             }
         }
@@ -2634,7 +2634,7 @@ impl AgentManager {
         if let Some(mut handle) = fenced {
             self.registry.deregister(&agent_id);
             let spawn_pid = handle.child_pid;
-            if let Some(child) = handle._child.take() {
+            if let Some(child) = handle.child.take() {
                 kill_child_tree(child, spawn_pid).await;
             }
             return Err(Error::NotFound(format!(
@@ -3861,7 +3861,7 @@ impl AgentManager {
         let removed = handle.is_some();
         let child = handle.and_then(|mut h| {
             let spawn_pid = h.child_pid;
-            h._child.take().map(|c| (c, spawn_pid))
+            h.child.take().map(|c| (c, spawn_pid))
         });
         self.registry.deregister(agent_id);
         (removed, child)
@@ -6514,7 +6514,7 @@ impl AgentManager {
         if !handle.connection.is_alive() {
             return false;
         }
-        match handle._child.as_mut() {
+        match handle.child.as_mut() {
             Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
             None => true,
         }
@@ -7128,7 +7128,7 @@ impl AgentManager {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
             let spawn_pid = handle.child_pid;
-            if let Some(child) = handle._child.take() {
+            if let Some(child) = handle.child.take() {
                 kill_child_tree(child, spawn_pid).await;
             }
         }
@@ -7149,7 +7149,7 @@ impl AgentManager {
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
                     let spawn_pid = handle.child_pid;
-                    if let Some(child) = handle._child.take() {
+                    if let Some(child) = handle.child.take() {
                         kill_child_tree(child, spawn_pid).await;
                     }
                 }
@@ -7208,7 +7208,7 @@ impl AgentManager {
                     let Some(handle) = map.get_mut(&agent_id) else {
                         return false;
                     };
-                    let Some(child) = handle._child.as_mut() else {
+                    let Some(child) = handle.child.as_mut() else {
                         return false;
                     };
                     // A respawn installed a NEWER child under this agent id
@@ -7244,7 +7244,7 @@ impl AgentManager {
                             } else {
                                 let dead = map.remove(&agent_id);
                                 registry.deregister(&agent_id);
-                                Some((status, dead.and_then(|mut h| h._child.take())))
+                                Some((status, dead.and_then(|mut h| h.child.take())))
                             }
                         }
                     }
@@ -7294,6 +7294,7 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 
+#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
@@ -7332,6 +7333,7 @@ async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
 
+#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Parallel shutdown kill sweep: terminate MANY provider process trees under
 /// ONE shared grace window. Every group is `SIGTERMed` up-front, then a single
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
@@ -11636,7 +11638,7 @@ mod dead_child_respawn_tests {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: child,
+            child,
             child_pid,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -11672,7 +11674,7 @@ mod dead_child_respawn_tests {
         assert_eq!(acp, "acp-cached", "live child reuses the cached session");
         // No respawn happened: the fake handle (no owned child) is untouched.
         let handles = mgr.handles.lock().unwrap();
-        assert!(handles.get(&agent_id).unwrap()._child.is_none());
+        assert!(handles.get(&agent_id).unwrap().child.is_none());
     }
 
     /// Handle present but the child already exited → `ensure_started` must
@@ -11708,7 +11710,7 @@ mod dead_child_respawn_tests {
         {
             let handles = mgr.handles.lock().unwrap();
             assert!(
-                handles.get(&agent_id).unwrap()._child.is_some(),
+                handles.get(&agent_id).unwrap().child.is_some(),
                 "respawn installed a real child-owning handle"
             );
         }
@@ -12525,6 +12527,7 @@ mod rebuild_spawn_opts_tests {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::used_underscore_binding)] // tests read the RAII `_extension` field; underscore documents production intent
 mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn

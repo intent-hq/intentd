@@ -3719,6 +3719,7 @@ mod tests {
     /// serves the block with data omitted.
     #[tokio::test]
     async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
+        use base64::Engine as _;
         use intent_core::now_iso;
 
         let tmp = TempDb::new("test-thumbnails");
@@ -3744,7 +3745,6 @@ mod tests {
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
             .expect("encode test png");
-        use base64::Engine as _;
         let data = base64::engine::general_purpose::STANDARD.encode(&buf);
 
         let with_image = store
@@ -4264,6 +4264,7 @@ mod tests {
         assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
     }
 
+    #[allow(clippy::similar_names)] // snap(shot)/swap future are both domain terms
     /// Stress loop for the `BEGIN IMMEDIATE` conversion (monorepo#783,
     /// mirroring the #738 verification loop shape): each iteration races
     /// `replace_acp_session_id` (fold + id swap) against a concurrent

@@ -4789,6 +4789,7 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
 /// under-budget image passes through untouched.
 #[tokio::test]
 async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
+    use base64::Engine as _;
     use intent_core::{ConversationProjection, SLIM_PROJECTION_BUDGET_BYTES};
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "SlimImg").await;
@@ -4802,7 +4803,6 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     image::DynamicImage::ImageRgb8(img)
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .expect("encode test png");
-    use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(&buf);
     assert!(data.len() > SLIM_PROJECTION_BUDGET_BYTES);
     let small = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
@@ -10197,6 +10197,15 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
 /// attached). Diagnostics-only: the field never rides `agent.list` payloads.
 #[tokio::test]
 async fn diagnostics_reports_subtree_memory_bytes() {
+    struct FixedProbe(HashMap<AgentId, u64>);
+    impl TreeMemoryProbe for FixedProbe {
+        fn sample(&self) -> Option<(u64, u64)> {
+            Some((self.0.values().sum(), 1))
+        }
+        fn agent_samples(&self) -> HashMap<AgentId, u64> {
+            self.0.clone()
+        }
+    }
     use crate::agent_manager::TreeMemoryProbe;
     use std::collections::HashMap;
 
@@ -10214,16 +10223,6 @@ async fn diagnostics_reports_subtree_memory_bytes() {
             row.get("subtreeMemoryBytes").is_none(),
             "no probe, no field: {row}"
         );
-    }
-
-    struct FixedProbe(HashMap<AgentId, u64>);
-    impl TreeMemoryProbe for FixedProbe {
-        fn sample(&self) -> Option<(u64, u64)> {
-            Some((self.0.values().sum(), 1))
-        }
-        fn agent_samples(&self) -> HashMap<AgentId, u64> {
-            self.0.clone()
-        }
     }
 
     let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
@@ -20221,12 +20220,12 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
 /// recreate observes zero ghost agents and no residual event traffic.
 #[tokio::test]
 async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state() {
-    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let (tmp, svc, ws, bus) = setup_with_bus().await;
     // The delete path walks `workspaces_root` to unlink the daemon-owned
     // workspace dir; pin a hermetic tempdir so it never falls through to the
     // real user home. The dir need not exist — `remove_dir_all` swallows
     // `NotFound`.
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let a = create_agent(&svc, &ws, "Alpha").await;
     let b = create_agent(&svc, &ws, "Beta").await;
     let c = create_agent(&svc, &ws, "Gamma").await;
@@ -20321,8 +20320,8 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
 /// the same event delivers nothing (no duplicate wake).
 #[tokio::test]
 async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
-    let (_t, svc, ws) = setup().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief_ws, "Chief").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -20394,8 +20393,8 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
 /// longer references the deleted workspace as its child side.
 #[tokio::test]
 async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
-    let (_t, svc, ws) = setup().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief_ws, "Chief").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -20435,8 +20434,8 @@ async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
 /// settles.
 #[tokio::test]
 async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
-    let (_t, svc, ws, bus) = setup_with_bus().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws, bus) = setup_with_bus().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief_ws, "Chief").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -20481,8 +20480,8 @@ async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
 /// groups that live entirely in another workspace are untouched.
 #[tokio::test]
 async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
-    let (_t, svc, ws_a) = setup().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws_a) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let ws_b = WorkspaceId::new();
     svc.store()
         .insert_workspace(&workspace(&ws_b))
@@ -25921,6 +25920,7 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
 // agent.watch / agent.unwatch (monorepo#1229): explicit watches
 // ===========================================================================
 
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// `agent.watch` registers a `wake_on_attention` watch; like every ungrouped
 /// watch it is deliver-once — the `agent:idle` wake retires it, and a second
 /// idle with no re-arm delivers nothing.
@@ -26424,6 +26424,7 @@ async fn agent_watch_unwatch_validation_and_removal() {
     ));
 }
 
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// Restart durability: an explicit watch survives daemon restart with its
 /// `wake_on_attention` flag intact.
 #[tokio::test]

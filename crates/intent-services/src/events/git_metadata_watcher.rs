@@ -155,6 +155,7 @@ impl GitMetadataWatcher {
     /// linked worktrees). Registration is deferred off the caller's thread
     /// (monorepo#1572), so tests must wait for it before mutating `.git`.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: std::time::Duration) {
         self._sub.wait_established(timeout).await;
         if let Some(common) = &self._common {
@@ -288,6 +289,8 @@ impl GitCommonDirWatches {
         });
         lock(&entry.workspaces).insert(ws_id.clone(), Registration { token, refresher });
         #[cfg(test)]
+        #[allow(clippy::used_underscore_binding)]
+        // RAII field; underscore documents production lifetime-only intent
         let sub = Arc::clone(&entry._sub);
         drop(state);
         CommonDirGuard {
@@ -736,7 +739,7 @@ mod tests {
             api,
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
-        let _watcher = GitMetadataWatcher::start(
+        let watcher = GitMetadataWatcher::start(
             &SharedWatchHub::new(),
             &GitCommonDirWatches::new(),
             refresher,
@@ -745,7 +748,7 @@ mod tests {
         )
         .expect("git repo must gain a metadata watch");
         // Let the OS watch settle before mutating.
-        _watcher.wait_established(crate::events::LIVENESS).await;
+        watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style operation: only `.git` metadata moves
@@ -974,7 +977,7 @@ mod tests {
             api,
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
-        let _watcher = GitMetadataWatcher::start(
+        let watcher = GitMetadataWatcher::start(
             &SharedWatchHub::new(),
             &GitCommonDirWatches::new(),
             refresher,
@@ -982,7 +985,7 @@ mod tests {
             &root.path.clone(),
         )
         .expect("git repo must gain a metadata watch");
-        _watcher.wait_established(crate::events::LIVENESS).await;
+        watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `COMMIT_EDITMSG` lives in `.git` but is not watched metadata.

@@ -123,6 +123,7 @@ fn temp_data_dir() -> PathBuf {
 }
 
 fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
+    use std::os::unix::process::CommandExt;
     common::enable_ws_api(data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
@@ -140,7 +141,6 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
         .env("MOCK_AGENT_BEHAVIOR", behavior)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    use std::os::unix::process::CommandExt;
     command.process_group(0);
     let child = command.spawn().expect("spawn intentd serve");
     Daemon {

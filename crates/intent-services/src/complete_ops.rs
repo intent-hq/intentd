@@ -419,7 +419,7 @@ mod tests {
     /// a guarded temp dir removed on drop — including on panic — unless
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         path: PathBuf,
     }
 
@@ -427,7 +427,7 @@ mod tests {
         fn new() -> Self {
             let dir = crate::tests::test_tempdir("intentd-completeops-");
             let path = dir.path().join("store.db");
-            Self { _dir: dir, path }
+            Self { dir, path }
         }
     }
 
@@ -439,7 +439,7 @@ mod tests {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         registry
@@ -507,7 +507,7 @@ mod tests {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         let applied: Vec<(String, serde_json::Value)> = keys
@@ -1020,7 +1020,7 @@ rl.on('line', (line) => {
         // then the default — so any client gets the setting for free.
         let (_bin_dir, bin) = fake_auggie_echoing_args("quick-actions");
         let (tmp, services) = services_with_bin(bin).await;
-        let registry = crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+        let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
             .expect("load registry");
         registry
             .apply(&[
@@ -1081,7 +1081,7 @@ rl.on('line', (line) => {
         // quick-action key set, the CLI still runs with no `--model`.
         let (_bin_dir, bin) = fake_auggie_echoing_args("provider-settings");
         let (tmp, services) = services_with_bin(bin).await;
-        let registry = crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+        let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
             .expect("load registry");
         registry
             .apply(&[

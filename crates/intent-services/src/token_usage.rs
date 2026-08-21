@@ -270,6 +270,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::many_single_char_names)] // params mirror the totals() field initials
     fn totals_with_thoughts(i: u64, o: u64, r: u64, c: u64, t: u64) -> TokenUsageTotals {
         TokenUsageTotals {
             thought_tokens: t,

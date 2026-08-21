@@ -35,6 +35,7 @@ pub async fn descendant_pids(root: u32) -> Vec<i32> {
     descendant_pids_many(&[root]).await
 }
 
+#[allow(clippy::similar_names)] // pid/pgid/ppid are the POSIX terms
 /// Snapshot the descendant pids of every `root` by walking the system
 /// `pid → ppid` table (`ps -axo pid=,ppid=`, portable across macOS and
 /// Linux) — ONE `ps` invocation covers the whole batch. Best-effort: any
@@ -104,6 +105,7 @@ fn descendants_in_table(table: &[(i32, i32)], roots: &[i32]) -> Vec<i32> {
     out
 }
 
+#[allow(clippy::similar_names)] // pid/pgid/ppid are the POSIX terms
 /// SIGTERM → grace → SIGKILL any snapshotted descendants that survived the
 /// group kill (i.e. escaped into a foreign process group). Pids that already
 /// died — or whose pid was recycled into the daemon's own process group — are

@@ -1271,6 +1271,11 @@ impl Services {
         let mut loaded = 0usize;
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
         for p in persisted {
+            enum LoadOutcome {
+                Loaded(AgentId, WorkspaceId),
+                AlreadyInMemory,
+                DuplicatePair,
+            }
             // Prune when either endpoint is gone: no wake could fire (child
             // deleted watches are handled by reconciliation below instead,
             // since a deleted child IS a completion signal for the parent).
@@ -1304,11 +1309,6 @@ impl Services {
                     let _ = self.store.delete_completion_watch(&p.id).await;
                     continue;
                 }
-            }
-            enum LoadOutcome {
-                Loaded(AgentId, WorkspaceId),
-                AlreadyInMemory,
-                DuplicatePair,
             }
             let outcome = {
                 let mut guard = self

@@ -1092,6 +1092,7 @@ mod tests {
     /// multi-byte UTF-8 must not panic in `split_name` — placement and
     /// collision suffixing both work.
     #[test]
+    #[allow(clippy::many_single_char_names)] // sequential placement results a..e
     fn place_attachment_multibyte_leading_names() {
         let t = TempRoot::new();
         let root = t.root();

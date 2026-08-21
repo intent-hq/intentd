@@ -670,6 +670,7 @@ fn editors_payload() -> Value {
     })
 }
 
+#[allow(clippy::similar_names)] // launcher vs the recorded launches - deliberate
 #[tokio::test]
 async fn open_in_editor_local_short_circuits_via_launcher() {
     let launcher = RecordingLauncher::new(true);

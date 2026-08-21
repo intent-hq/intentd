@@ -564,6 +564,7 @@ impl FileWatcher {
     /// established. Registration is deferred off the caller's thread
     /// (monorepo#1572), so tests must wait for it before mutating the tree.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     pub(super) async fn wait_established(&self, timeout: Duration) {
         self._sub.wait_established(timeout).await;
     }

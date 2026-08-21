@@ -5476,6 +5476,8 @@ impl Services {
         agent_id: &AgentId,
         session: &AgentSession,
     ) -> bool {
+        // Check retry count (cap at 2 bounces)
+        const MAX_RETRIES: i64 = 2;
         use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
         use intent_store::SandboxStatus;
 
@@ -5499,8 +5501,6 @@ impl Services {
             }
         };
 
-        // Check retry count (cap at 2 bounces)
-        const MAX_RETRIES: i64 = 2;
         let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
 
         // Claim the merge atomically (current status → merging) so this path
@@ -8611,6 +8611,19 @@ fn is_terminal_task_status(status: TaskStatus) -> bool {
 /// (every dep names a `complete` task note — missing and cancelled deps count
 /// as unmet, same rule as `unmet_depends_on_ids`).
 fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
+    // Post-order DFS (children before parent), starting at the root level.
+    fn traverse<'a>(
+        parent: Option<&'a str>,
+        children: &HashMap<Option<&'a str>, Vec<&'a Note>>,
+        out: &mut Vec<&'a Note>,
+    ) {
+        if let Some(level) = children.get(&parent) {
+            for child in level {
+                traverse(Some(child.id.as_str()), children, out);
+                out.push(child);
+            }
+        }
+    }
     // flattenTaskTree: only non-terminal task notes participate, keyed by parent.
     let mut children: HashMap<Option<&str>, Vec<&Note>> = HashMap::new();
     for n in notes {
@@ -8643,19 +8656,6 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
                 .unwrap_or(0);
             ao.cmp(&bo).then_with(|| a.created_at.cmp(&b.created_at))
         });
-    }
-    // Post-order DFS (children before parent), starting at the root level.
-    fn traverse<'a>(
-        parent: Option<&'a str>,
-        children: &HashMap<Option<&'a str>, Vec<&'a Note>>,
-        out: &mut Vec<&'a Note>,
-    ) {
-        if let Some(level) = children.get(&parent) {
-            for child in level {
-                traverse(Some(child.id.as_str()), children, out);
-                out.push(child);
-            }
-        }
     }
     let mut flattened: Vec<&Note> = Vec::new();
     traverse(None, &children, &mut flattened);
@@ -18250,6 +18250,7 @@ impl WorkspaceApi for Services {
         })
     }
 
+    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -20760,6 +20761,21 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         Box::pin(async move {
+            // RAII clear for the single-flight slot: `Drop` runs even when
+            // the detached task panics mid-ensure, so the flag can never
+            // leak into a permanently-busy state. Poisoned locks recover via
+            // `into_inner` — the guarded Option is trivially valid — so a
+            // panic while the tiny critical section is held cannot brick the
+            // method either.
+            struct WarmSlotClear(Arc<Mutex<Option<(String, String)>>>);
+            impl Drop for WarmSlotClear {
+                fn drop(&mut self) {
+                    *self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+            }
             let url = github_url.trim().to_string();
             let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
                 return Err(Error::InvalidParams(format!(
@@ -20790,21 +20806,6 @@ impl WorkspaceApi for Services {
                 &worktrees_location,
             )?
             .join(".repo-cache");
-            // RAII clear for the single-flight slot: `Drop` runs even when
-            // the detached task panics mid-ensure, so the flag can never
-            // leak into a permanently-busy state. Poisoned locks recover via
-            // `into_inner` — the guarded Option is trivially valid — so a
-            // panic while the tiny critical section is held cannot brick the
-            // method either.
-            struct WarmSlotClear(Arc<Mutex<Option<(String, String)>>>);
-            impl Drop for WarmSlotClear {
-                fn drop(&mut self) {
-                    *self
-                        .0
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                }
-            }
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {

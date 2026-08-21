@@ -1432,7 +1432,7 @@ fn mock_handle() -> AgentHandle {
         connection,
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
-        _child: None,
+        child: None,
         child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
@@ -2280,7 +2280,7 @@ fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::Join
     let child = cmd.spawn().expect("spawn sleeper child");
     let pid = child.id().expect("live child has a pid");
     let mut handle = mock_handle();
-    handle._child = Some(child);
+    handle.child = Some(child);
     handle.child_pid = Some(pid);
     mgr.handles.lock().unwrap().insert(id.clone(), handle);
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
@@ -2480,7 +2480,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         let child = cmd.spawn().expect("spawn slow child");
         let pid = child.id().expect("live child has a pid");
         let mut handle = mock_handle();
-        handle._child = Some(child);
+        handle.child = Some(child);
         handle.child_pid = Some(pid);
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
@@ -2926,7 +2926,7 @@ fn track_mock_agent_inner(
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -3042,7 +3042,7 @@ fn track_mock_agent_prompt_rpc_error(
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -5177,7 +5177,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             connection: conn,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -13322,7 +13322,7 @@ mod harness_wake_tests {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,

@@ -1634,6 +1634,7 @@ pub async fn import_legacy_settings(
 ///
 /// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
 pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
+    const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
     let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
         return Ok(());
     };
@@ -1642,7 +1643,6 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
         return Ok(());
     };
     let mut migrated: Vec<String> = Vec::new();
-    const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
     let unknown: Vec<&str> = table
         .keys()
         .map(String::as_str)
@@ -1833,18 +1833,18 @@ impl<'a> SettingsService<'a> {
     /// `tokio::select!` on all `load` futures concurrently through a `join!`
     /// analog so a stalled account never blocks the others.
     pub(crate) async fn list(&self) -> Result<Value> {
-        let defs = definitions();
-        let sensitive: Vec<&'static str> = defs
-            .iter()
-            .filter(|d| d.sensitive)
-            .map(|d| d.path)
-            .collect();
         // Drive every load future concurrently on the current task: a single
         // stalled account never blocks the others because `join_all_pinned`
         // polls every future on each wake-up. Best-effort: errors treated as absent.
         type LoadFuture<'a> = std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>,
         >;
+        let defs = definitions();
+        let sensitive: Vec<&'static str> = defs
+            .iter()
+            .filter(|d| d.sensitive)
+            .map(|d| d.path)
+            .collect();
         let futs: Vec<LoadFuture<'_>> = sensitive
             .iter()
             .map(|path| {

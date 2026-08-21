@@ -320,7 +320,7 @@ impl Services {
         // while they are being captured. Held through the git bundle (stage
         // 3) so the bundle is built against the same quiesced state as the
         // rows.
-        let _teardown_fence = match manager.as_ref() {
+        let teardown_fence = match manager.as_ref() {
             Some(manager) => {
                 let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
                 Some(manager.stop_many(&ids).await)
@@ -422,7 +422,7 @@ impl Services {
         } else {
             None
         };
-        drop(_teardown_fence);
+        drop(teardown_fence);
         if self.export_aborted(export_id) {
             return Ok(None);
         }

@@ -819,8 +819,8 @@ mod tests {
         let ws = test_workspace("ws-boot", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
 
@@ -837,7 +837,7 @@ mod tests {
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         // Nothing is watched yet: the boot seed is empty.
 
         // Register a workspace at runtime via `workspace:created` (payload
@@ -851,7 +851,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, true))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-create.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -864,7 +864,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
             .await
             .expect("publish deleted");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         std::fs::write(root.path.join("after-delete.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
@@ -887,7 +887,7 @@ mod tests {
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
 
         let root = TempDir::new("setup-deferred");
         let ws = test_workspace("ws-setup-deferred", &root.path);
@@ -899,7 +899,7 @@ mod tests {
         // and churn under it must publish nothing.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            _registry.root_established(&root.path).is_none(),
+            registry.root_established(&root.path).is_none(),
             "created workspace must not be watched while setup is pending"
         );
         std::fs::write(root.path.join("during-setup.txt"), "hi").expect("write file");
@@ -913,7 +913,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, true))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-setup.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -935,7 +935,7 @@ mod tests {
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
 
         let root = TempDir::new("no-script");
         let ws = test_workspace("ws-no-script", &root.path);
@@ -945,7 +945,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, false))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("no-script.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -967,7 +967,7 @@ mod tests {
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
+        let registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
 
         let root = TempDir::new("backstop");
         let ws = test_workspace("ws-backstop", &root.path);
@@ -975,7 +975,7 @@ mod tests {
             .await
             .expect("publish created");
         // No completion published: the backstop alone must start the watch.
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-backstop.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -996,7 +996,7 @@ mod tests {
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
+        let registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
 
         let root = TempDir::new("delete-pending");
         let ws = test_workspace("ws-delete-pending", &root.path);
@@ -1014,7 +1014,7 @@ mod tests {
         // Ride out the backstop window: nothing may have started.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(
-            _registry.root_established(&root.path).is_none(),
+            registry.root_established(&root.path).is_none(),
             "deleted-while-pending workspace must never be watched"
         );
         std::fs::write(root.path.join("never.txt"), "hi").expect("write file");
@@ -1039,20 +1039,20 @@ mod tests {
         // only the id, so the registry must resolve the path via the api.
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         // Simulate close → open: after close the watchers are gone, and the
         // reopen path exercises the get_workspace lookup.
         bus.publish(&lifecycle_event(WORKSPACE_CLOSED, &ws, false))
             .await
             .expect("publish closed");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         bus.publish(&lifecycle_event(WORKSPACE_OPENED, &ws, false))
             .await
             .expect("publish opened");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-open.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1170,7 +1170,7 @@ mod tests {
         let ws_b = test_workspace("ws-shared-arch-b", &root_b);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws_a.clone(), ws_b.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         confirm_watch_live(&mut sub, &ws_a.id, &root_a).await;
         confirm_watch_live(&mut sub, &ws_b.id, &root_b).await;
 
@@ -1178,7 +1178,7 @@ mod tests {
         bus.publish(&archive_event(&ws_a, true))
             .await
             .expect("publish archived");
-        wait_for_root(&_registry, &root_a, false).await;
+        wait_for_root(&registry, &root_a, false).await;
 
         std::fs::write(root_a.join("while-archived.txt"), "hi").expect("write in a");
         let leaked = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(2)).await;
@@ -1197,7 +1197,7 @@ mod tests {
         bus.publish(&archive_event(&ws_a, false))
             .await
             .expect("publish unarchived");
-        wait_for_root(&_registry, &root_a, true).await;
+        wait_for_root(&registry, &root_a, true).await;
 
         std::fs::write(root_a.join("after-unarchive.txt"), "hi").expect("write in a");
         let ev = next_file_event(&mut sub, &ws_a.id, LIVENESS).await;
@@ -1221,7 +1221,7 @@ mod tests {
         let ws = test_workspace("ws-archived", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         // Probed rather than written once: the negative assertion after the
         // archive would be vacuous if delivery had never started, and delivery
         // can lag establishment by more than a single write's budget.
@@ -1231,7 +1231,7 @@ mod tests {
         bus.publish(&archive_event(&ws, true))
             .await
             .expect("publish archived");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         std::fs::write(root.path.join("while-archived.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
@@ -1245,7 +1245,7 @@ mod tests {
         bus.publish(&archive_event(&ws, false))
             .await
             .expect("publish unarchived");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-unarchive.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1580,8 +1580,8 @@ mod tests {
         let ws = test_workspace("ws-updated", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         let mut ev = lifecycle_event(WORKSPACE_UPDATED, &ws, false);
         ev.data = serde_json::json!({
@@ -1589,7 +1589,7 @@ mod tests {
             "changes": { "title": "renamed" },
         });
         bus.publish(&ev).await.expect("publish updated");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-update.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1639,13 +1639,13 @@ mod tests {
         ws.worktree_path = ws.path.clone();
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         bus.publish(&archive_event(&ws, true))
             .await
             .expect("publish archived");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         // Change git state while unwatched, then drain anything the archive
         // transition itself may still have had in flight.
@@ -1680,7 +1680,7 @@ mod tests {
         let fake = Arc::new(FakeApi::new(Vec::new()));
         let api: Arc<dyn WorkspaceApi> = fake.clone();
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         // Nothing is watched yet: the boot seed is empty.
 
         // Real repo with a seed commit, registered at runtime. The refresher
@@ -1713,7 +1713,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, true))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         // External `git checkout`-style HEAD rewrite → debounced refresh.
         repo.set_head("refs/heads/other").unwrap();
@@ -1727,7 +1727,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
             .await
             .expect("publish deleted");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         repo.set_head("refs/heads/main").unwrap();
         let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(3)).await;

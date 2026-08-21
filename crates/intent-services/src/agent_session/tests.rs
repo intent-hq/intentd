@@ -5953,13 +5953,12 @@ async fn thought_text_is_absent_from_text_block_extraction() {
 /// more tool calls, asserting the invariant after EVERY step.
 #[tokio::test]
 async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persist() {
+    const GROUP_TEXT: &str =
+        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let mut transcript = super::Transcript::new("m1".to_string());
     services.set_live_turn(&agent_id, "m1", Vec::new());
-
-    const GROUP_TEXT: &str =
-        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
 
     let tool_note = |id: &str, title: &str| IncomingNotification {
         method: "session/update".to_string(),

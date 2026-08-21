@@ -461,6 +461,7 @@ async fn agent_features_settings_round_trip() {
 // dispatch denial, and new-sessions-only semantics.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn agent_features_gate_new_sessions_only() {
     let Some(script) = gate("agentFeatures gating E2E") else {

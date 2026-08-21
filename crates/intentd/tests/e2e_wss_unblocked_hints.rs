@@ -377,6 +377,8 @@ async fn seed_workspace_and_task_notes(data_dir: &Path) -> String {
 /// link, while the wake metadata carries only the enqueue-time trigger stamp.
 #[tokio::test]
 async fn unblocked_section_reaches_parent_wake_over_wss() {
+    const CHILD_MARK: &str = "UNBLK_E2E_CHILD_TURN";
+    const PARENT_GO: &str = "UNBLK_E2E_PARENT_GO";
     let Some(script) = gate("WSS unblocked-hints E2E") else {
         return;
     };
@@ -394,8 +396,6 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     )
     .expect("seed config.toml with agentFeatures.taskGraph");
 
-    const CHILD_MARK: &str = "UNBLK_E2E_CHILD_TURN";
-    const PARENT_GO: &str = "UNBLK_E2E_PARENT_GO";
     let delegate_js = format!(
         "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",
         json!(CHILD_TASK_NOTE_ID),

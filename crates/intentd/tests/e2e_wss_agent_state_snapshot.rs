@@ -404,6 +404,7 @@ fn split_snapshot(text: &str) -> Option<(Value, &str)> {
     Some((v, rest))
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn state_snapshot_injection_toggle_and_tool_over_wss() {
     let Some(script) = gate("agent state snapshot E2E") else {

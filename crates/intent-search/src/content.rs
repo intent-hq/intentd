@@ -71,6 +71,7 @@ fn build_matcher(query: &str, opts: &SearchOpts) -> Result<RegexMatcher> {
         .map_err(|_| Error::InvalidParams("Invalid regex".to_string()))
 }
 
+#[allow(clippy::similar_names)] // matcher/matches are the natural grep-domain names
 /// Run a gitignore-aware content search rooted at `root`. Honors `opts.globs`
 /// (path globs), `opts.maxResults` (sets `truncated` when exceeded), and the
 /// `cancel` token (stops early, best-effort).

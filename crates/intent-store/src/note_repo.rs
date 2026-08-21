@@ -313,6 +313,7 @@ impl Store {
         rows.iter().map(map_note_row).collect()
     }
 
+    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
     /// Cheap per-workspace `taskStats` counting query (no note-body
     /// hydration). Semantics mirror the enriched `compute_task_stats` in
     /// intent-services (the canonical TS `computeTaskStats` port): count the

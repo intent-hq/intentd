@@ -251,6 +251,7 @@ pub struct CommitDetails {
     pub files: Vec<CommitFileChange>,
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Resolve `commit_hash` (full SHA or short ref) against `worktree_path` and
 /// return its metadata plus the per-file `(additions, deletions)` diff against
 /// the first parent. A root commit (no parent) diffs against the empty tree, so

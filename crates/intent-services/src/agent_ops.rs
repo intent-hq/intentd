@@ -3824,6 +3824,12 @@ impl Services {
         agent_id: AgentId,
         messages: Value,
     ) -> Result<Value> {
+        struct Parsed {
+            role: String,
+            content: Value,
+            metadata: Option<Value>,
+            created_at: String,
+        }
         let session = self.store.get_agent_session(&agent_id).await?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
@@ -3834,12 +3840,6 @@ impl Services {
         let raw = messages.as_array().ok_or_else(|| {
             Error::InvalidParams("agent.replaceMessages: `messages` must be an array".to_string())
         })?;
-        struct Parsed {
-            role: String,
-            content: Value,
-            metadata: Option<Value>,
-            created_at: String,
-        }
         let mut parsed: Vec<Parsed> = Vec::with_capacity(raw.len());
         let fallback_ts = now_iso();
         for (i, entry) in raw.iter().enumerate() {
@@ -5044,6 +5044,13 @@ impl Services {
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
+        // Bounded CAS retry: each iteration re-reads the current marker,
+        // re-applies the monotonicity gate, and attempts a guarded write. A
+        // miss means another writer moved the marker between our read and
+        // write; the loop converges because the marker only ever advances.
+        // The cap is defensive — two racing debounced FE triggers settle in
+        // one retry.
+        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
         let message_id = message_id.trim().to_string();
         if message_id.is_empty() {
             return Err(Error::InvalidParams("messageId is required".to_string()));
@@ -5053,13 +5060,6 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
-        // Bounded CAS retry: each iteration re-reads the current marker,
-        // re-applies the monotonicity gate, and attempts a guarded write. A
-        // miss means another writer moved the marker between our read and
-        // write; the loop converges because the marker only ever advances.
-        // The cap is defensive — two racing debounced FE triggers settle in
-        // one retry.
-        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -5924,6 +5924,48 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // Resolve the child's first message up front so it can be persisted as
+        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // stored it so a wake-up can resume). Source priority mirrors the TS
+        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        // Resolve the child agent's name to match the reference `DelegateTaskTool`
+        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
+        // taskNoteId path uses the note's title. Both truncate to 100 chars
+        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
+        // child inherits the generic `Agent xxxxxx` fallback from
+        // `agent_create_op`, which then leaks into the waiting panel, agent
+        // cards, and `agent:idle` wake reports (NAME-1).
+        fn truncate_agent_name(name: String) -> String {
+            // The reference uses JS `.length` / `.substring(0, 97)`, which
+            // count UTF-16 code units — non-BMP characters (e.g. emoji)
+            // count as 2. Match that to avoid off-by-one divergences on
+            // emoji-heavy task titles (Copilot #84 review).
+            let u16_len = name.encode_utf16().count();
+            if u16_len > 100 {
+                let units: Vec<u16> = name.encode_utf16().take(97).collect();
+                // `substring(0, 97)` can split a surrogate pair; drop a
+                // trailing lone high surrogate so the resulting Rust string
+                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
+                let cutoff = if units
+                    .last()
+                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
+                {
+                    units.len() - 1
+                } else {
+                    units.len()
+                };
+                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
+                truncated.push_str("...");
+                truncated
+            } else {
+                name
+            }
+        }
         // `greedy` was a batch-level conflict override; it is REMOVED. Any
         // supplied value — `true`, `false`, or an explicit `null` — rejects
         // on BOTH forms (the check sits before the batch routing so a
@@ -5956,15 +5998,6 @@ impl Services {
         // the `git_ops` gate and the idle subscriber, never in prompts.
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
-        // Resolve the child's first message up front so it can be persisted as
-        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
-        // stored it so a wake-up can resume). Source priority mirrors the TS
-        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
-        // then the linked task note's content (falling back to its title).
-        fn first_nonempty(s: &str) -> Option<String> {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
         let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
         let mut message = input
             .agent_instructions
@@ -6002,39 +6035,6 @@ impl Services {
                 &title,
                 &note_id.0,
             ));
-        }
-        // Resolve the child agent's name to match the reference `DelegateTaskTool`
-        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
-        // taskNoteId path uses the note's title. Both truncate to 100 chars
-        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
-        // child inherits the generic `Agent xxxxxx` fallback from
-        // `agent_create_op`, which then leaks into the waiting panel, agent
-        // cards, and `agent:idle` wake reports (NAME-1).
-        fn truncate_agent_name(name: String) -> String {
-            // The reference uses JS `.length` / `.substring(0, 97)`, which
-            // count UTF-16 code units — non-BMP characters (e.g. emoji)
-            // count as 2. Match that to avoid off-by-one divergences on
-            // emoji-heavy task titles (Copilot #84 review).
-            let u16_len = name.encode_utf16().count();
-            if u16_len > 100 {
-                let units: Vec<u16> = name.encode_utf16().take(97).collect();
-                // `substring(0, 97)` can split a surrogate pair; drop a
-                // trailing lone high surrogate so the resulting Rust string
-                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
-                let cutoff = if units
-                    .last()
-                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
-                {
-                    units.len() - 1
-                } else {
-                    units.len()
-                };
-                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
-                truncated.push_str("...");
-                truncated
-            } else {
-                name
-            }
         }
         let child_name = task_text_msg
             .or_else(|| task_note.as_ref().and_then(|n| first_nonempty(&n.title)))
@@ -6278,24 +6278,6 @@ impl Services {
                     Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                 ) && ws.worktree_path.is_some();
                 if is_direct_mode || is_standalone_checkout {
-                    // Same root fallback as `workspace.create` (the intentd
-                    // binary configures the root via INTENTD_WORKSPACES_DIR /
-                    // `workspaces.root` rather than `.with_workspaces_root`).
-                    let root = self
-                        .workspaces_root
-                        .clone()
-                        .unwrap_or_else(crate::default_workspaces_root);
-                    let aid = AgentId::from(agent_id.as_str());
-                    // The CoW clone runs OFF the delegate critical path
-                    // (monorepo#871): on large checkouts it takes tens of
-                    // seconds, which previously blew through the 30s
-                    // `workspace_api` budget and the harness's own MCP client
-                    // timeout. Register the settlement gate BEFORE returning
-                    // so the child's turn worker (`ensure_started`) blocks its
-                    // first ACP spawn until the clone settles — the child
-                    // never spawns against a half-copied sandbox.
-                    let settled = self.begin_sandbox_provisioning(&aid);
-                    effective_isolation = Some("pending");
                     // Drop guard: settles the gate even if provisioning
                     // panics, so the gate map never accumulates stale
                     // entries. Constructed BEFORE the spawn (and moved into
@@ -6317,6 +6299,24 @@ impl Services {
                             self.services.settle_sandbox_provisioning(&self.aid);
                         }
                     }
+                    // Same root fallback as `workspace.create` (the intentd
+                    // binary configures the root via INTENTD_WORKSPACES_DIR /
+                    // `workspaces.root` rather than `.with_workspaces_root`).
+                    let root = self
+                        .workspaces_root
+                        .clone()
+                        .unwrap_or_else(crate::default_workspaces_root);
+                    let aid = AgentId::from(agent_id.as_str());
+                    // The CoW clone runs OFF the delegate critical path
+                    // (monorepo#871): on large checkouts it takes tens of
+                    // seconds, which previously blew through the 30s
+                    // `workspace_api` budget and the harness's own MCP client
+                    // timeout. Register the settlement gate BEFORE returning
+                    // so the child's turn worker (`ensure_started`) blocks its
+                    // first ACP spawn until the clone settles — the child
+                    // never spawns against a half-copied sandbox.
+                    let settled = self.begin_sandbox_provisioning(&aid);
+                    effective_isolation = Some("pending");
                     let guard = SettleGuard {
                         services: self.clone(),
                         aid,

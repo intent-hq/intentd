@@ -243,7 +243,9 @@ async fn stderr_captured_and_auth_flagged() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stderr_capture_written_to_daily_log_file() {
+    // STAB-56: the capture dir and daily log file are created owner-only.
     use crate::spawn::{spawn_provider, SpawnOptions};
+    use std::os::unix::fs::PermissionsExt;
 
     let tmp = test_temp_dir("intent-acp-stderr-");
     let dir = tmp.path().join("logs");
@@ -298,8 +300,6 @@ async fn stderr_capture_written_to_daily_log_file() {
         "second stderr line captured; got: {content:?}"
     );
 
-    // STAB-56: the capture dir and daily log file are created owner-only.
-    use std::os::unix::fs::PermissionsExt;
     let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "capture dir must be owner-only");
     let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
@@ -6110,6 +6110,7 @@ mod wsapi3_bindings_tests {
     /// test can inspect the peel result; unknown noteIds surface `NotFound`
     /// so the error-path tests can prove JS-visible failures.
     #[derive(Default)]
+    #[allow(clippy::struct_field_names)] // fields mirror the recorded method names
     struct FakeApi {
         get_note_calls: Mutex<Vec<String>>,
         create_note_calls: Mutex<Vec<CreateNoteCall>>,

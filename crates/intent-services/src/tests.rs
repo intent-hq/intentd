@@ -40,13 +40,13 @@ pub(crate) struct DebounceEnvGuard {
 
 impl DebounceEnvGuard {
     pub(crate) fn new(millis: &str) -> Self {
-        let _lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
+        let lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
         let prior_last_activity = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
         let prior_workspace_idle = std::env::var_os("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", millis);
         std::env::set_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", millis);
         Self {
-            _lock,
+            _lock: lock,
             prior_last_activity,
             prior_workspace_idle,
         }
@@ -553,6 +553,14 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
 /// slim `tokenUsage` (all rows) and `agentSummary` (archived rows).
 #[tokio::test]
 async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
+    // Dogfooding shape (issue math: ~10 KB/row at 130 workspaces): the vast
+    // majority archived, each with the agent sessions a coordinator +
+    // sub-agent workflow accumulates over a workspace's life. Unslimmed this
+    // dataset serializes well over 1 MiB — the assertion below only holds
+    // with the list-path slimming in place.
+    const WORKSPACES: usize = 130;
+    const ACTIVE: usize = 8;
+    const SESSIONS_PER_WS: u64 = 20;
     use std::collections::BTreeMap;
 
     use intent_core::{
@@ -615,15 +623,6 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         session_corrupted: false,
         pending_delete_at: None,
     };
-
-    // Dogfooding shape (issue math: ~10 KB/row at 130 workspaces): the vast
-    // majority archived, each with the agent sessions a coordinator +
-    // sub-agent workflow accumulates over a workspace's life. Unslimmed this
-    // dataset serializes well over 1 MiB — the assertion below only holds
-    // with the list-path slimming in place.
-    const WORKSPACES: usize = 130;
-    const ACTIVE: usize = 8;
-    const SESSIONS_PER_WS: u64 = 20;
 
     for i in 0..WORKSPACES {
         let ws = WorkspaceId::new();
@@ -8863,6 +8862,7 @@ mod change_event_parity {
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
     /// bug: on `note.list` with no `id='spec'` note but exactly one top-level,
     /// non-task note titled "Spec", the stray is *adopted* — its `note.id` is
@@ -11763,6 +11763,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     #[tokio::test]
     async fn refresh_all_pauses_between_workspaces() {
         // Inter-workspace pause (intent-hq/monorepo#703): the sweep sleeps
@@ -11936,7 +11937,7 @@ mod pr {
 
     #[tokio::test]
     async fn execute_runs_commit_push_create_pr_pipeline() {
-        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        let (_t, _w, bare, svc, ws, work) = ac_setup(StubForge::default()).await;
         // An unstaged change for the commit step to capture.
         std::fs::write(work.join("feature.txt"), "hello\n").unwrap();
 
@@ -11985,7 +11986,7 @@ mod pr {
         assert_eq!(st["existingPR"]["number"], 7);
 
         // The bare remote now carries the feature branch.
-        let bare_repo = git2::Repository::open_bare(_b.0.clone()).unwrap();
+        let bare_repo = git2::Repository::open_bare(bare.0.clone()).unwrap();
         assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
 
         // mergePR via the stubbed forge.
@@ -23333,6 +23334,7 @@ mod file_ops_service {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
@@ -23535,6 +23537,7 @@ mod file_ops_service {
         let _ = fs::remove_dir_all(&test_root);
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
     /// when an eligible `CoW` provisioning kicks off (monorepo#871 — the clone
     /// runs in a background task, off the delegate critical path). The settled

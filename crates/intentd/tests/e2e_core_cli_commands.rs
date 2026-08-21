@@ -242,6 +242,8 @@ async fn await_stored_token(data_dir: &Path) -> String {
 
 #[tokio::test]
 async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
+    // Exported images embed the bearer token — must be owner-only (0600).
+    use std::os::unix::fs::PermissionsExt;
     let id = Uuid::new_v4().simple().to_string();
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
@@ -321,8 +323,6 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     let svg = std::fs::read_to_string(&svg_path).expect("SVG file written");
     assert!(svg.contains("<svg"), "valid SVG document");
 
-    // Exported images embed the bearer token — must be owner-only (0600).
-    use std::os::unix::fs::PermissionsExt;
     for path in [&png_path, &svg_path] {
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{} should be 0600", path.display());

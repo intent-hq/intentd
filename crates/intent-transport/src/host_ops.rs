@@ -187,6 +187,7 @@ where
     None
 }
 
+#[allow(clippy::similar_names)] // nvm's literal directory layout (versions/<version>)
 fn is_nvm_node_bin_dir(path: &Path) -> bool {
     let Some(version_dir) = path.parent() else {
         return false;

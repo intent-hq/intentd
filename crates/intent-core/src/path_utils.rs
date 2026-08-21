@@ -453,6 +453,7 @@ pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
+#[allow(clippy::similar_names)] // path vs the semver patch component - both domain terms
 fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64, bool)> {
     let version = path.file_name()?.to_str()?.strip_prefix('v')?;
     let core = version.split(['-', '+']).next()?;

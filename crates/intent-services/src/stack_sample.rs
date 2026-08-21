@@ -59,6 +59,14 @@ pub(crate) async fn sample_stacks(
 
     #[cfg(unix)]
     {
+        /// Panic-safe release of the in-progress flag (dropped inside the
+        /// blocking task, so an unwinding capture still releases it).
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                SAMPLING_IN_PROGRESS.store(false, Ordering::Release);
+            }
+        }
         use std::sync::atomic::{AtomicBool, Ordering};
 
         static SAMPLING_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -70,14 +78,6 @@ pub(crate) async fn sample_stacks(
             return Err(Error::Internal(
                 "a stack sampling session is already in progress".to_string(),
             ));
-        }
-        /// Panic-safe release of the in-progress flag (dropped inside the
-        /// blocking task, so an unwinding capture still releases it).
-        struct Release;
-        impl Drop for Release {
-            fn drop(&mut self) {
-                SAMPLING_IN_PROGRESS.store(false, Ordering::Release);
-            }
         }
 
         tokio::task::spawn_blocking(move || {
@@ -302,9 +302,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn preexisting_sigprof_handler_is_restored() {
-        let _serial = CAPTURE_SERIAL.lock().await;
-
         extern "C" fn external_handler(_: libc::c_int) {}
+        let _serial = CAPTURE_SERIAL.lock().await;
 
         // SAFETY: installs/reads SIGPROF dispositions on this test process
         // only; serialized with the other capture tests via CAPTURE_SERIAL.

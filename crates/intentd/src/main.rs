@@ -1806,10 +1806,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
     // wakeResume is disabled (no tracker exists), honoring the config gate.
     if let Some(tracker) = suspend_tracker.clone() {
-        let services_clone = services.clone();
-        let mut resume_rx = tracker.subscribe();
         // Coalesce wake events landing within this window into one sweep.
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
+        let services_clone = services.clone();
+        let mut resume_rx = tracker.subscribe();
         tokio::spawn(async move {
             use tokio::sync::broadcast::error::RecvError;
             loop {
@@ -4012,15 +4012,6 @@ extern "C" fn restore_echo_on_signal(sig: libc::c_int) {
 /// echo, so print one to keep output aligned.
 #[cfg(unix)]
 fn read_line_no_echo() -> anyhow::Result<String> {
-    use std::io::BufRead;
-    use std::sync::atomic::Ordering;
-    let fd = libc::STDIN_FILENO;
-    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let orig = unsafe { orig.assume_init() };
-
     // Publish the saved attrs and install the restoring handlers BEFORE
     // disabling echo, so no window exists where a signal skips the restore.
     const SIGNALS: [libc::c_int; 5] = [
@@ -4030,6 +4021,15 @@ fn read_line_no_echo() -> anyhow::Result<String> {
         libc::SIGHUP,
         libc::SIGTSTP,
     ];
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let fd = libc::STDIN_FILENO;
+    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let orig = unsafe { orig.assume_init() };
+
     unsafe { (&raw mut HIDDEN_READ_ORIG).write(std::mem::MaybeUninit::new(orig)) };
     HIDDEN_READ_ACTIVE.store(true, Ordering::SeqCst);
     let handler = restore_echo_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
