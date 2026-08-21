@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.28] - 2026-08-21
+
+### 🔧 Refactor
+
+- Burn down pedantic style and Option/format lints ([#1360](https://github.com/intent-hq/intentd/pull/1360))
+
+### 🧪 Testing
+
+- De-flake hook rehydration countdown tests racing the run loop
+
+
 ## [0.7.27] - 2026-08-21
 
 ### 🐛 Bug Fixes
