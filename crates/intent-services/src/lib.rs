@@ -11069,6 +11069,10 @@ impl Services {
     /// through the same `settings.update` path clients use, so
     /// `settings:changed` is emitted and every store/hook rule applies. The
     /// model rung is cache-only ([`ModelCatalogCache`]) — never a probe.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the underlying `settings.update` when persisting the healed values fails (e.g. `Error::InvalidParams` from validation or `Error::Internal` from the config rewrite).
     pub async fn heal_default_provider_settings(
         &self,
         installed_provider_ids: &[String],
