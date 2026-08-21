@@ -992,6 +992,225 @@ async fn wss_agent_list_omits_initial_message() {
     srv.ws.stop().await;
 }
 
+/// monorepo#3041 over the real WSS wire (§5.1): `workspace.list` rows omit
+/// `tokenUsage` entirely (absent, never null) and archived rows additionally
+/// omit `agentSummary`, while active rows keep it; the `workspace.subscribe`
+/// seq-0 snapshot rows omit `tokenUsage` the same way; `workspace.get` keeps
+/// both fields for detail reads, archived included.
+#[tokio::test]
+async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
+    use std::collections::BTreeMap;
+
+    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+
+    let srv = start(WsOptions::default()).await;
+
+    // Seed one active and one archived workspace directly through the shared
+    // store, both carrying a persisted `tokenUsage` rollup, each with one
+    // agent session so the list enrichment builds an `agentSummary`.
+    let usage = TokenUsage {
+        by_agent_id: BTreeMap::from([(
+            "agent-slim-a".to_string(),
+            TokenUsageTotals {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_tokens: 5,
+                cache_creation_tokens: 3,
+                thought_tokens: 0,
+                cost: None,
+            },
+        )]),
+        totals: TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 3,
+            thought_tokens: 0,
+            cost: None,
+        },
+        by_model: BTreeMap::new(),
+        last_scan_at: Some(now_iso()),
+    };
+    let ws_active = WorkspaceId::new();
+    let mut active = fixture_workspace(&ws_active);
+    active.token_usage = Some(usage.clone());
+    srv.store
+        .insert_workspace(&active)
+        .await
+        .expect("insert active workspace");
+    let ws_archived = WorkspaceId::new();
+    let mut archived = fixture_workspace(&ws_archived);
+    archived.archived = true;
+    archived.archived_at = Some(now_iso());
+    archived.token_usage = Some(usage);
+    srv.store
+        .insert_workspace(&archived)
+        .await
+        .expect("insert archived workspace");
+
+    let ts = now_iso();
+    let mk_session = |id: &str, ws: &WorkspaceId| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId(id.to_string()),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Slim Agent".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        status: AgentStatus::Idle,
+        is_active: false,
+        system_prompt: None,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+        parent_agent_id: None,
+        specialist: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        messages: vec![],
+        stats: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+    srv.store
+        .insert_agent_session(&mk_session("agent-slim-a", &ws_active))
+        .await
+        .expect("insert active-workspace session");
+    srv.store
+        .insert_agent_session(&mk_session("agent-slim-b", &ws_archived))
+        .await
+        .expect("insert archived-workspace session");
+
+    // workspace.list (includeArchived): tokenUsage absent on every row;
+    // agentSummary absent on the archived row, present on the active one.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{"includeArchived":true}}"#,
+    )
+    .await;
+    let rows = listed["result"]["workspaces"]
+        .as_array()
+        .expect("workspaces array");
+    let row_active = rows
+        .iter()
+        .find(|w| w["id"] == ws_active.0.as_str())
+        .expect("active row");
+    let row_archived = rows
+        .iter()
+        .find(|w| w["id"] == ws_archived.0.as_str())
+        .expect("archived row");
+    assert!(
+        row_active.get("tokenUsage").is_none(),
+        "list rows omit tokenUsage (monorepo#3041): {row_active}"
+    );
+    assert!(
+        row_archived.get("tokenUsage").is_none(),
+        "archived list rows omit tokenUsage: {row_archived}"
+    );
+    assert!(
+        row_active["agentSummary"].is_object(),
+        "active list row keeps agentSummary: {row_active}"
+    );
+    assert!(
+        row_archived.get("agentSummary").is_none(),
+        "archived list rows omit agentSummary (monorepo#3041): {row_archived}"
+    );
+
+    // workspace.get keeps both fields for detail reads — archived included.
+    for ws_id in [&ws_active, &ws_archived] {
+        let got = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{{"workspaceId":"{}"}}}}"#,
+                ws_id.0
+            ),
+        )
+        .await;
+        let ws = &got["result"]["workspace"];
+        assert!(
+            ws["tokenUsage"].is_object(),
+            "workspace.get keeps tokenUsage: {ws}"
+        );
+        assert!(
+            ws["agentSummary"].is_object(),
+            "workspace.get keeps agentSummary: {ws}"
+        );
+    }
+
+    // workspace.subscribe seq-0 snapshot (lite list path, global channel —
+    // archived rows are always included, monorepo#775): rows omit tokenUsage
+    // the same way.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.subscribe","params":{}}"#
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send workspace.subscribe");
+    let mut sub_resp: Option<Value> = None;
+    let mut snap: Option<Value> = None;
+    while sub_resp.is_none() || snap.is_none() {
+        let frame = tokio::time::timeout(Duration::from_secs(10), sub.next())
+            .await
+            .expect("workspace.subscribe frame timed out");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snap = Some(v);
+                } else if v["id"] == 3 {
+                    sub_resp = Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let snap = snap.unwrap();
+    assert_eq!(snap["params"]["kind"], "snapshot", "{snap}");
+    assert_eq!(snap["params"]["seq"], 0, "{snap}");
+    let snap_rows = snap["params"]["snapshot"].as_array().expect("snapshot");
+    for ws_id in [&ws_active, &ws_archived] {
+        let row = snap_rows
+            .iter()
+            .find(|w| w["id"] == ws_id.0.as_str())
+            .expect("seeded workspace in seq-0 snapshot");
+        assert!(
+            row.get("tokenUsage").is_none(),
+            "seq-0 snapshot rows omit tokenUsage (monorepo#3041): {row}"
+        );
+    }
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#564: `agent.sendMessage` to a nonexistent agent id (e.g. a
 /// truncated id) fails closed with `-32602` naming the unknown id — it must
 /// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
