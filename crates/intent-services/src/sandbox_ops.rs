@@ -3257,8 +3257,13 @@ mod tests {
         // Some filesystems reject non-UTF-8 file names outright (APFS on
         // macOS fails with EILSEQ), so the fixture cannot exist there. Probe
         // at runtime and skip instead of failing (intent-hq/monorepo#3028);
-        // the test still runs fully on Linux/CI.
-        if fs::create_dir(repo_path.join(name)).is_err() {
+        // the test still runs fully on Linux/CI. Only the name-rejection
+        // errno may skip — anything else (permissions, ENOSPC) must surface.
+        if let Err(err) = fs::create_dir(repo_path.join(name)) {
+            assert!(
+                matches!(err.raw_os_error(), Some(libc::EILSEQ) | Some(libc::EINVAL)),
+                "unexpected error creating non-UTF-8 fixture: {err}"
+            );
             eprintln!(
                 "skipping create_snapshot_commit_skips_non_utf8_nested_repo_names: \
                  filesystem rejects non-UTF-8 file names"
