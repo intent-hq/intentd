@@ -1,5 +1,5 @@
 //! WSS e2e for specialist frontmatter model resolution (fix for review thread
-//! PRRT_kwDOS9Wxuc6SIhDY): validates that agent.create with a specialistId but
+//! `PRRT_kwDOS9Wxuc6SIhDY`): validates that agent.create with a specialistId but
 //! no explicit model parameter resolves the specialist's frontmatter `model`
 //! field through the 3-tier precedence (project > user > bundled).
 
@@ -358,7 +358,7 @@ async fn specialist_hidden_round_trips_over_wss() {
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
 /// bundled-dir override, `specialist.list` over WSS returns exactly the eight
 /// embedded reference specialists — `pr-shepherd` is gone from the bundled set
-/// (review thread PRRT_kwDOS9Wxuc6YSV2u).
+/// (review thread `PRRT_kwDOS9Wxuc6YSV2u`).
 #[tokio::test]
 async fn embedded_bundled_catalog_over_wss() {
     let data_dir = temp_data_dir();

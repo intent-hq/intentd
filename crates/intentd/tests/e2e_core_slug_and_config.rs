@@ -1,7 +1,7 @@
 //! E2E tests exercising intent-core slug generation and config paths.
 //!
-//! Calls Services directly to exercise slug generation (extract_local_slug,
-//! generate_workspace_slug) and config parsing WITHOUT spawning a daemon.
+//! Calls Services directly to exercise slug generation (`extract_local_slug`,
+//! `generate_workspace_slug`) and config parsing WITHOUT spawning a daemon.
 
 mod common;
 
@@ -55,7 +55,7 @@ async fn workspace_id_derived_from_initial_agent_prompt() {
 }
 
 /// Create a workspace with no prompt and verify the ID is a random slug
-/// (adjective-animal from generate_workspace_slug).
+/// (adjective-animal from `generate_workspace_slug`).
 #[tokio::test]
 async fn workspace_id_random_slug_when_no_prompt() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
@@ -94,7 +94,7 @@ async fn workspace_id_random_slug_when_no_prompt() {
     let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-/// Verify Config::resolve parses env vars and fills defaults.
+/// Verify `Config::resolve` parses env vars and fills defaults.
 #[tokio::test]
 async fn config_resolve_fills_defaults() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
@@ -119,7 +119,7 @@ async fn config_resolve_fills_defaults() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Verify Config::resolve reads idle_reap_minutes from config.toml.
+/// Verify `Config::resolve` reads `idle_reap_minutes` from config.toml.
 #[tokio::test]
 async fn config_resolve_reads_idle_reap_from_file() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));

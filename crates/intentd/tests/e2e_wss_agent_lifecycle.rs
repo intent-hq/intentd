@@ -4763,7 +4763,7 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
     );
 }
 
-/// Pre-seed the daemon's SQLite store with a workspace + target note for the
+/// Pre-seed the daemon's `SQLite` store with a workspace + target note for the
 /// MCP tool call (the daemon opens the same data dir on launch).
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     use intent_core::{NoteCreate, WorkspaceApi, WorkspaceId};
@@ -5421,7 +5421,7 @@ async fn terminal_create_env_over_wss() {
 /// many small output chunks must (a) deliver every chunk to a live WSS
 /// subscriber, in order, before `terminal:exit`, and (b) leave zero
 /// `terminal:data` rows behind for `event.query` — while `terminal:exit`
-/// stays durable. Before the fix each chunk awaited a durable SQLite commit,
+/// stays durable. Before the fix each chunk awaited a durable `SQLite` commit,
 /// serializing paste echo behind the writer batch window.
 #[tokio::test]
 async fn terminal_data_many_chunks_transient_over_wss() {
@@ -9234,8 +9234,8 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
 }
 
 /// Emit `agent:message` on daemon-side user-row appends: verify that the
-/// direct-send, queue-drain (persist_user), and wake-delivery
-/// (deliver_wake_message runtime) paths all publish `agent:message` with the
+/// direct-send, queue-drain (`persist_user`), and wake-delivery
+/// (`deliver_wake_message` runtime) paths all publish `agent:message` with the
 /// persisted row's id. The direct-send branch of `AgentManager::send_message`
 /// emits too (PROTOCOL §5.5 — previously it was silent, which left an
 /// `agent.editAndRegenerate` regenerated user message invisible until reload).
@@ -10217,7 +10217,7 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
 
 /// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an
 /// anonymous `tool_use` block (`name: ""`). The mock parks after emitting a
-/// `tool_call` (in_progress); on `session/cancel` it echoes a title-less
+/// `tool_call` (`in_progress`); on `session/cancel` it echoes a title-less
 /// `tool_call_update` (failed, abort-error output) — the stale echo that,
 /// pre-fix, the interrupt turn's fresh transcript fabricated into an anonymous
 /// `tool_use` + errored `tool_result` pair that broke FE conversation loading.
@@ -12537,7 +12537,7 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
 }
 
 /// Live token-usage capture over the real WSS transport (§5.23 / §6.5): the
-/// mock agent reports an end-of-turn `usage` snapshot on its PromptResponse
+/// mock agent reports an end-of-turn `usage` snapshot on its `PromptResponse`
 /// (the ACP `unstable_end_turn_token_usage` extension); the daemon persists it
 /// and emits `workspace:tokenUsage-changed` immediately (no periodic scan),
 /// with `cachedReadTokens`/`cachedWriteTokens` mapped to

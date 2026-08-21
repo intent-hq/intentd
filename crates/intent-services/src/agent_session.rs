@@ -1570,7 +1570,7 @@ impl Services {
     /// flush owns releasing it. If the worker already persisted the full turn,
     /// the append collides on the UNIQUE id and is logged at debug (benign —
     /// the full row won; the stale slot, if any, is cleared). Errors are logged
-    /// and swallowed: this must never block shutdown or the interrupted_agent
+    /// and swallowed: this must never block shutdown or the `interrupted_agent`
     /// row insert. On a genuine store error the slot is deliberately KEPT (pin
     /// and all) as the only remaining copy of the content.
     ///

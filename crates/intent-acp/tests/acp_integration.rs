@@ -901,7 +901,7 @@ impl TerminalHost for PtyTermHost {
     }
 }
 
-/// An agent's `terminal/*` calls (create → wait_for_exit → output → release)
+/// An agent's `terminal/*` calls (create → `wait_for_exit` → output → release)
 /// run on the real PTY host and return host-backed responses (§6.7).
 #[cfg(unix)]
 #[tokio::test]

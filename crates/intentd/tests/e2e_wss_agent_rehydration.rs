@@ -1,6 +1,6 @@
 //! WSS end-to-end conversation rehydration (P3-1.2): a multi-message
 //! conversation (user / assistant-with-tool-blocks / tool) persisted in the
-//! daemon's SQLite store BEFORE the daemon boots must round-trip through
+//! daemon's `SQLite` store BEFORE the daemon boots must round-trip through
 //! `agent.get` / `agent.getConversation` over a real pinned-TLS WebSocket with
 //! exact ordering, roles, ids, content blocks and timestamps — the FE
 //! rehydration path once `UnifiedPersistence` reads move to the daemon
@@ -252,7 +252,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-/// Pre-seed the daemon's SQLite store with a workspace, a settled agent
+/// Pre-seed the daemon's `SQLite` store with a workspace, a settled agent
 /// session, and a 5-message conversation exercising every persisted role
 /// (`user`, `assistant`, `tool`) and block type (`text`, `tool_use`,
 /// `tool_result`). Returns `(ws_id, agent_id, expected_wire_messages)` where

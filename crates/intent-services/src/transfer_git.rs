@@ -497,7 +497,7 @@ fn resolve_base_commit(repo: &git2::Repository, ws: &Workspace) -> Option<git2::
 
 /// Fetch `src_ref` from a local repository into `dst_ref` of the worktree
 /// repo. Shells out with an explicit full refspec and tag auto-follow
-/// disabled, for the same reason as the sandbox merge path: CoW clones carry
+/// disabled, for the same reason as the sandbox merge path: `CoW` clones carry
 /// non-commit refs (`refs/intent/blobs/*`, `refs/stash`) that libgit2's local
 /// transport trips over.
 fn fetch_local_ref(worktree: &Path, from_repo: &Path, src_ref: &str, dst_ref: &str) -> Result<()> {
@@ -636,7 +636,7 @@ mod tests {
         sha
     }
 
-    /// Status entries as (path, staged, wt_modified, untracked) tuples,
+    /// Status entries as (path, staged, `wt_modified`, untracked) tuples,
     /// sorted, for exact before/after comparisons.
     fn status_fingerprint(repo_path: &Path) -> Vec<(String, bool, bool, bool)> {
         let repo = git2::Repository::open(repo_path).unwrap();
@@ -1390,7 +1390,7 @@ mod tests {
 
     /// A tracked submodule staged for removal while its checkout remains on
     /// disk (`INDEX_DELETED` + `WT_NEW`) is real dirt: the staged deletion
-    /// must travel in the WIP commit, while add_all still skips re-adding the
+    /// must travel in the WIP commit, while `add_all` still skips re-adding the
     /// on-disk checkout (which would fail or undo the removal).
     #[test]
     fn staged_submodule_removal_still_counts_as_dirty() {

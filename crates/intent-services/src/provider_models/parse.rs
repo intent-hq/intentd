@@ -576,7 +576,7 @@ pub(super) fn parse_hf_unsloth_response(body: &str) -> Vec<HfRepo> {
 }
 
 /// Bytes-per-parameter estimate for a Q4-class GGUF quant (the middle of the
-/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to Q4_K_M.
+/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to `Q4_K_M`.
 const BYTES_PER_PARAM_Q4: f64 = 0.6;
 
 /// Fixed headroom (KV cache, context, runtime overhead) added on top of the
@@ -613,7 +613,7 @@ pub(crate) fn gguf_bytes_fit_within_ram(model_bytes: u64, total_ram_bytes: u64) 
 }
 
 /// Parse the total parameter count (in billions) out of an HF repo id's model
-/// name, tolerating both dense names (`27B`) and MoE names that also carry an
+/// name, tolerating both dense names (`27B`) and `MoE` names that also carry an
 /// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the
 /// active count and is skipped). Returns `None` when no size token is found
 /// (e.g. `grok-2-GGUF`, `Qwen3-Coder-Next-GGUF`) — the catalog treats an
@@ -627,7 +627,7 @@ pub(super) fn parse_param_count_billions(repo_id: &str) -> Option<f64> {
 }
 
 /// Parse one `-`/`_`-delimited name token as a total-parameter size
-/// (`27B`, `0.8B`, `270M`), skipping MoE active-parameter markers (`A3B`).
+/// (`27B`, `0.8B`, `270M`), skipping `MoE` active-parameter markers (`A3B`).
 fn parse_size_token(token: &str) -> Option<f64> {
     let lower = token.to_ascii_lowercase();
     let mut chars = lower.chars();

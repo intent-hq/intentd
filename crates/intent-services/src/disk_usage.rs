@@ -23,7 +23,7 @@
 //! `FIEMAP_EXTENT_SHARED` on Linux, `fcntl(F_LOG2PHYS_EXT)` physical-extent
 //! dedup on macOS (no public sharing flag exists) — which multiplies the walk
 //! cost by a syscall per file extent and blows the refresh budget on real
-//! checkouts. The number is therefore an upper bound for CoW workspaces;
+//! checkouts. The number is therefore an upper bound for `CoW` workspaces;
 //! client copy already presents it as approximate.
 //!
 //! ## Cache semantics

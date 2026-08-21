@@ -1,4 +1,4 @@
-//! Linux CoW implementation using per-file FICLONE ioctl.
+//! Linux `CoW` implementation using per-file FICLONE ioctl.
 
 use intent_core::{Error, Result};
 use std::fs;
@@ -14,7 +14,7 @@ use super::CowSupport;
 #[cfg(target_os = "linux")]
 const FICLONE: libc::Ioctl = 0x4004_9409;
 
-/// Get volume IDs (st_dev) for both paths as a cache key.
+/// Get volume IDs (`st_dev`) for both paths as a cache key.
 pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
     let src_meta = fs::metadata(src).ok()?;
     let dst_meta = fs::metadata(dst).ok()?;

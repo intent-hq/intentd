@@ -1,4 +1,4 @@
-//! Integration tests for the [`EventBus`] over a temp SQLite store: publish
+//! Integration tests for the [`EventBus`] over a temp `SQLite` store: publish
 //! appends-to-store-and-broadcasts, type-glob matching, `excludeSelf`, and
 //! `batchWindow` coalescing. Pure matching semantics live in `filter`.
 
@@ -94,7 +94,7 @@ async fn publish_appends_to_store_and_broadcasts() {
 }
 
 /// Hybrid `file:*` persistence: non-agent file events broadcast but are never
-/// written to SQLite, while agent-attributed ones stay durable.
+/// written to `SQLite`, while agent-attributed ones stay durable.
 #[tokio::test]
 async fn non_agent_file_events_broadcast_without_persisting() {
     let (_tmp, bus) = bus().await;
@@ -965,7 +965,7 @@ fn lag_warn_throttle_rate_limits_and_accumulates() {
     );
 }
 
-/// A subscriber driven past BROADCAST_CAPACITY must surface the loss: the
+/// A subscriber driven past `BROADCAST_CAPACITY` must surface the loss: the
 /// delivery task's `Lagged` arm emits a WARN carrying the skipped count and
 /// the subscription's filter scope (event types + workspace).
 #[tokio::test]
@@ -1017,7 +1017,7 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     );
 }
 
-/// A subscriber driven past BROADCAST_CAPACITY must ALSO see the loss in-band:
+/// A subscriber driven past `BROADCAST_CAPACITY` must ALSO see the loss in-band:
 /// `recv_delivery` yields a `Delivery::Lagged(n)` marker at the gap position
 /// (before the surviving post-drop events), carrying the ring's skipped count,
 /// so consumers like the chat forwarder can run a bounded recovery. Plain

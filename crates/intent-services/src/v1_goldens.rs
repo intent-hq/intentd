@@ -1283,7 +1283,7 @@ fn golden_image_and_attachment_notice_bytes() {
 
 /// Supervisor-history truncation markers: the omitted-exchanges comment
 /// (exact bytes inside the wrapper) and the middle-truncation marker line
-/// inside an oversized tool_result.
+/// inside an oversized `tool_result`.
 #[test]
 fn golden_supervisor_history_truncation_markers() {
     use intent_core::AgentMessage;

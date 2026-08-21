@@ -44,7 +44,7 @@ const FAKE_DAEMON_LOG: &str = "FAKE_DAEMON_LOG";
 /// sharply `crash_respawn_backs_off_exponentially`, whose backed-off child can
 /// miss its spawn budget under load). Holding this guard for each such test's
 /// duration keeps only one live supervisor loop running at a time. Mirrors the
-/// `CHILD_SPAWN_SERIAL` (provider_models) and `WATCHER_TEST_SERIAL`
+/// `CHILD_SPAWN_SERIAL` (`provider_models`) and `WATCHER_TEST_SERIAL`
 /// (events/mod.rs) precedents. The brief one-shot tests (`doctor`, `restart`
 /// without a live sitter, single-shot `serve`) spawn once and finish, so they
 /// stay parallel. `unwrap_or_else(into_inner)` recovers from a poisoned lock so

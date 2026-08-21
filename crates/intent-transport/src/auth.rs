@@ -97,7 +97,7 @@ struct TokenState {
     entry: Option<Entry>,
     last_warn: Option<Instant>,
     /// Monotonic counter dispensing a unique `load_id` per in-flight load, so
-    /// a delayed spawn_blocking result can tell whether it still owns the slot.
+    /// a delayed `spawn_blocking` result can tell whether it still owns the slot.
     next_load_id: u64,
 }
 
@@ -105,7 +105,7 @@ struct TokenState {
 /// or a resolved value valid until `expires_at`.
 enum Entry {
     /// A blocking load is in progress. `rx` receives `Some(value)` when the
-    /// spawn_blocking task finishes; `started_at` lets late waiters shrink
+    /// `spawn_blocking` task finishes; `started_at` lets late waiters shrink
     /// their remaining budget so the effective wait per caller stays bounded.
     /// `load_id` uniquely tags this in-flight load so a delayed completion can
     /// detect an intervening store / newer load and refuse to clobber the
@@ -159,7 +159,7 @@ impl AsyncTokenStore {
     }
 
     /// Read the token, returning `None` on absent / timeout / backing-error.
-    /// Concurrent callers are coalesced into a single spawn_blocking; a cached
+    /// Concurrent callers are coalesced into a single `spawn_blocking`; a cached
     /// result is served without touching the backing store until it expires.
     pub async fn load_token(&self) -> Option<String> {
         let action = {
@@ -231,13 +231,13 @@ impl AsyncTokenStore {
     }
 
     /// Kick off the blocking load, publishing the result via `tx` and swapping
-    /// the InFlight slot for a Cached one so subsequent callers short-circuit.
+    /// the `InFlight` slot for a Cached one so subsequent callers short-circuit.
     /// Runs to completion even after every awaiting caller has timed out —
     /// that's the point: only ONE blocking-pool thread at a time. The
     /// `load_id` generation guard ensures a delayed completion does NOT
     /// overwrite a slot that an intervening `store_token` / newer load
     /// already refreshed: the write only happens if the slot is still the
-    /// InFlight tagged with `load_id`.
+    /// `InFlight` tagged with `load_id`.
     fn spawn_load(&self, tx: watch::Sender<Option<Option<String>>>, load_id: u64) {
         let inner = self.inner.clone();
         let state = self.state.clone();
@@ -333,8 +333,8 @@ enum LoadAction {
         rx: watch::Receiver<Option<Option<String>>>,
         started_at: Instant,
     },
-    /// No load in flight; the current caller registered a new InFlight slot
-    /// (tagged with `load_id`) and now owns the spawn_blocking / notify
+    /// No load in flight; the current caller registered a new `InFlight` slot
+    /// (tagged with `load_id`) and now owns the `spawn_blocking` / notify
     /// responsibility.
     Start {
         tx: watch::Sender<Option<Option<String>>>,

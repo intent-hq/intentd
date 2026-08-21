@@ -1,4 +1,4 @@
-//! Best-effort recursive CoW clone walk shared by the Unix implementations.
+//! Best-effort recursive `CoW` clone walk shared by the Unix implementations.
 //!
 //! Clones a directory tree entry by entry: directories are recreated (with
 //! permissions), symlinks recreated, regular files reflinked via the

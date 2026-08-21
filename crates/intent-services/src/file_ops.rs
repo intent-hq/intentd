@@ -35,7 +35,7 @@ pub(crate) fn workspace_root(ws: &Workspace) -> String {
 }
 
 /// Load the workspace and resolve its filesystem root, preferring the calling
-/// agent's sandbox path when available (CoW containment). A missing workspace
+/// agent's sandbox path when available (`CoW` containment). A missing workspace
 /// (or any load error) falls through to an empty root, mirroring the TS handler
 /// which swallows `getWorkspace` failures and proceeds with `workspacePath=''`.
 pub(crate) async fn resolve_root(
@@ -1146,7 +1146,7 @@ mod tests {
 
     /// Regression (monorepo#2144): a dragged FOLDER used to fail the copy step
     /// with an opaque -32603 "Internal error"; it must be rejected up front as
-    /// InvalidParams naming the cause, with no placeholder left behind.
+    /// `InvalidParams` naming the cause, with no placeholder left behind.
     #[test]
     fn place_attachment_copy_from_directory_is_classified() {
         let t = TempRoot::new();

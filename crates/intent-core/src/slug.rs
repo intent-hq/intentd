@@ -18,7 +18,7 @@ fn is_valid_slug_word(w: &str) -> bool {
 }
 
 /// Generate a random `adjective-animal` base slug (TS
-/// `generateWorkspaceSlug`). Uses a fresh UUIDv4 as the entropy source so the
+/// `generateWorkspaceSlug`). Uses a fresh `UUIDv4` as the entropy source so the
 /// crate needs no extra RNG dependency.
 pub fn generate_workspace_slug() -> String {
     let bytes = *uuid::Uuid::new_v4().as_bytes();

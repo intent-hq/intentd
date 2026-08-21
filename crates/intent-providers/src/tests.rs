@@ -575,7 +575,7 @@ impl Drop for EnvGuard {
     }
 }
 
-/// STAB-50: NODE_OPTIONS heap-cap injection for V8-runtime (Node/Electron)
+/// STAB-50: `NODE_OPTIONS` heap-cap injection for V8-runtime (Node/Electron)
 /// providers. All scenarios run inside one test fn because they mutate
 /// process-global env vars — parallel test threads must not race on
 /// `NODE_OPTIONS` / the override seam.

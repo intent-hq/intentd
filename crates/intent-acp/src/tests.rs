@@ -1,5 +1,5 @@
 //! Transport + handshake tests against an in-memory mock agent and (on unix) a
-//! real `sh` mock child process (§6.2–§6.4 DoD).
+//! real `sh` mock child process (§6.2–§6.4 `DoD`).
 
 use std::time::Duration;
 
@@ -364,7 +364,7 @@ async fn spawn_real_child_handshake() {
     agent.kill().await.ok();
 }
 
-/// Session-lifecycle + streaming-mapping tests (§6.5/§6.6 DoD).
+/// Session-lifecycle + streaming-mapping tests (§6.5/§6.6 `DoD`).
 mod session_tests {
     use super::*;
 
@@ -1536,7 +1536,7 @@ mod session_tests {
 }
 
 /// Agent→BE MCP server, config conversions, env baseline/redaction, and the
-/// per-agent-type tool denylist (§6.8 / §18.4 DoD).
+/// per-agent-type tool denylist (§6.8 / §18.4 `DoD`).
 mod mcp_tests {
     use std::ffi::OsStr;
     use std::path::Path;
@@ -1566,10 +1566,10 @@ mod mcp_tests {
 
     /// A `WorkspaceApi` that records the `add_to_note` calls it receives so a tool
     /// call through the MCP server can be observed as a state change.
-    /// A recorded `git_agent_commit` call: (message, agent_id, linked_note_id).
+    /// A recorded `git_agent_commit` call: (message, `agent_id`, `linked_note_id`).
     type CommitRecord = (String, Option<String>, Option<String>);
     /// A recorded `agent_create` call:
-    /// (name, specialist, parent_agent_id, idempotency_key, metadata).
+    /// (name, specialist, `parent_agent_id`, `idempotency_key`, metadata).
     type AgentCreateRecord = (
         Option<String>,
         Option<String>,
@@ -1582,18 +1582,18 @@ mod mcp_tests {
     pub(super) struct MockApi {
         pub(super) added: Mutex<Vec<(String, String)>>,
         pub(super) committed: Mutex<Vec<CommitRecord>>,
-        /// Recorded `create_note` calls: (title, idempotency_key).
+        /// Recorded `create_note` calls: (title, `idempotency_key`).
         pub(super) created: Mutex<Vec<(String, Option<String>)>>,
         pub(super) agent_creates: Mutex<Vec<AgentCreateRecord>>,
-        /// Recorded `agent_send_message` calls: (agent_id, content).
+        /// Recorded `agent_send_message` calls: (`agent_id`, content).
         pub(super) sent: Mutex<Vec<(String, String)>>,
-        /// Recorded `assign_agent` calls: (note_id, agent_id).
+        /// Recorded `assign_agent` calls: (`note_id`, `agent_id`).
         pub(super) assigned: Mutex<Vec<(String, String)>>,
-        /// Recorded `agent_watch_completion` calls: (parent_id, child_id).
+        /// Recorded `agent_watch_completion` calls: (`parent_id`, `child_id`).
         pub(super) watched: Mutex<Vec<(String, String)>>,
-        /// Recorded `agent_watch_completion_for_sender` calls: (caller_id, target_id).
+        /// Recorded `agent_watch_completion_for_sender` calls: (`caller_id`, `target_id`).
         pub(super) sender_watched: Mutex<Vec<(String, String)>>,
-        /// Recorded `get_my_task` calls: task_note_id.
+        /// Recorded `get_my_task` calls: `task_note_id`.
         pub(super) get_my_task_calls: Mutex<Vec<String>>,
     }
 
@@ -2310,7 +2310,7 @@ mod mcp_tests {
 }
 
 /// Client-served handler tests: fs sandbox + events, permission resolve/timeout,
-/// and the terminal stub (§6.7 / PROTOCOL §8 DoD).
+/// and the terminal stub (§6.7 / PROTOCOL §8 `DoD`).
 mod client_served_tests {
     use super::*;
 

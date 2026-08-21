@@ -126,7 +126,7 @@ enum Command {
         #[arg(long)]
         connect: String,
     },
-    /// Migrate an existing Intent (Electron) install into intentd's SQLite store
+    /// Migrate an existing Intent (Electron) install into intentd's `SQLite` store
     /// (§9.7): read `<dir>/workspaces.json` and each workspace's `.workspace/`
     /// entities and idempotently upsert them. Read-only toward the source.
     Import {
@@ -135,7 +135,7 @@ enum Command {
         from: PathBuf,
     },
     /// Import legacy per-directory Intent workspaces
-    /// (`<root>/<id>/.workspace/workspace.json`) into the SQLite store. Scans
+    /// (`<root>/<id>/.workspace/workspace.json`) into the `SQLite` store. Scans
     /// `~/intent/workspaces`, `~/intent`, and `~/.workspaces` by default;
     /// idempotent (ids already in the DB are skipped) and read-only toward the
     /// source. The same module backs the automatic first-boot import in `serve`.
@@ -664,7 +664,7 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
-/// Migrate a legacy Intent `userData` dir into intentd's SQLite store (§9.7).
+/// Migrate a legacy Intent `userData` dir into intentd's `SQLite` store (§9.7).
 /// Opens (creating + migrating) the configured DB, runs the idempotent import,
 /// and prints the per-domain summary. Exits non-zero on a hard source failure.
 async fn cmd_import(from: &Path) -> anyhow::Result<()> {
@@ -678,7 +678,7 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Import legacy per-directory Intent workspaces into the configured SQLite
+/// Import legacy per-directory Intent workspaces into the configured `SQLite`
 /// store. `--root` (repeatable) narrows the scan to explicit directories
 /// (each must exist); otherwise the default legacy roots are scanned. The
 /// first-boot completion marker does not gate explicit CLI runs. A
@@ -813,7 +813,10 @@ fn init_tracing() {
 
     // Create the data directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        eprintln!("WARN: failed to create log directory {log_dir:?}: {e}");
+        eprintln!(
+            "WARN: failed to create log directory {}: {e}",
+            log_dir.display()
+        );
     }
 
     // Set up file appender with rotation: keep ~5 files, rotate daily
@@ -890,7 +893,7 @@ const SIGPIPE_EXIT_CODE: i32 = 141;
 
 /// Install a panic hook that logs the panic message and backtrace to the
 /// tracing log. This ensures panic details are written to the rotating log
-/// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
+/// file (`INTENTD_DATA_DIR/intentd.log`) for post-mortem diagnosis of unexpected
 /// daemon deaths. Chains the default panic hook to preserve standard Rust
 /// panic formatting (thread name, etc.). The process will panic/unwind/abort
 /// according to Rust's standard behavior after both hooks run.
@@ -1952,7 +1955,7 @@ struct DaemonControl {
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
-    /// WsApiServer construction args so `start_ws_listener` can build a fresh
+    /// `WsApiServer` construction args so `start_ws_listener` can build a fresh
     /// server when toggled on. Always present so the runtime toggle works
     /// whether or not the listener was boot-started.
     ws_runtime: Arc<WsRuntimeControl>,
@@ -2557,8 +2560,8 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
     });
 }
 
-/// Runtime control for the WSS listener, shared between DaemonControl and
-/// the lifecycle hooks (§5.12). Holds WsApiServer construction args plus mutable
+/// Runtime control for the WSS listener, shared between `DaemonControl` and
+/// the lifecycle hooks (§5.12). Holds `WsApiServer` construction args plus mutable
 /// state guarded by a Mutex so settings.update can start/stop the listener.
 struct WsRuntimeControl {
     api: Arc<dyn WorkspaceApi>,
@@ -2567,12 +2570,12 @@ struct WsRuntimeControl {
     token_store: Option<Arc<AsyncTokenStore>>,
     ws_options: WsOptions,
     reverse_registry: Arc<PrimaryReverseRegistry>,
-    /// Data directory for building pairing info provider (§5.2) in start_ws_listener.
+    /// Data directory for building pairing info provider (§5.2) in `start_ws_listener`.
     data_dir: PathBuf,
-    /// Mutable runtime state: the live WsApiServer (when started).
+    /// Mutable runtime state: the live `WsApiServer` (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
     /// System control surface (§5.7) for system.status/shutdown over WSS. Set via
-    /// OnceLock after DaemonControl construction to break circular Arc dependency.
+    /// `OnceLock` after `DaemonControl` construction to break circular Arc dependency.
     control: std::sync::OnceLock<Arc<dyn SystemControl>>,
 }
 
@@ -2591,7 +2594,7 @@ struct DaemonPairingInfo {
     data_dir: PathBuf,
     token_store: Arc<AsyncTokenStore>,
     /// Runtime control reference to read the current bound port. Always present
-    /// (WsRuntimeControl is always constructed; the WSS listener boot-starts
+    /// (`WsRuntimeControl` is always constructed; the WSS listener boot-starts
     /// only when server.wsApi.enabled is true, but can be started at runtime
     /// via settings regardless).
     ws_runtime: Arc<WsRuntimeControl>,
@@ -3704,7 +3707,7 @@ fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
 /// created/opened after boot gain watching and deleted/closed workspaces are
 /// torn down without a restart.
 ///
-/// Spawned rather than awaited inline because each FSEvents registration is a
+/// Spawned rather than awaited inline because each `FSEvents` registration is a
 /// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
 /// which would otherwise delay the UDS bind past the FE sidecar's probe window
 /// (monorepo#1581), and run under `block_in_place` so the blocking registration
@@ -3754,7 +3757,7 @@ fn spawn_watcher_registry_init(
 /// hold it for the task's lifetime.
 ///
 /// Spawned rather than started inline for the same reason as
-/// [`spawn_watcher_registry_init`]: `notify`'s FSEvents registration is a
+/// [`spawn_watcher_registry_init`]: `notify`'s `FSEvents` registration is a
 /// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
 /// which would otherwise delay the UDS bind past the FE sidecar's probe window
 /// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
@@ -4769,8 +4772,8 @@ fn report_host_capabilities() {
     );
 }
 
-/// Probe CoW support for the workspaces root at daemon startup. This populates
-/// the cache so later cow_probe calls for the same volume pair are instant. Best-effort;
+/// Probe `CoW` support for the workspaces root at daemon startup. This populates
+/// the cache so later `cow_probe` calls for the same volume pair are instant. Best-effort;
 /// failures are silent (the probe will be retried on demand if needed).
 fn probe_cow_at_startup(config: &Config) {
     let workspaces_root = config.data_dir.join("workspaces");
@@ -4780,9 +4783,9 @@ fn probe_cow_at_startup(config: &Config) {
     }
 }
 
-/// CoW isolation support: probe the workspaces root for copy-on-write capability.
-/// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
-/// Uses the cached result if available (populated by probe_cow_at_startup).
+/// `CoW` isolation support: probe the workspaces root for copy-on-write capability.
+/// Non-fatal — `CoW` isolation degrades gracefully when unsupported (shared mode).
+/// Uses the cached result if available (populated by `probe_cow_at_startup`).
 fn report_cow_support(config: &Config) {
     let workspaces_root = config.data_dir.join("workspaces");
     // Create workspaces dir if it doesn't exist (probe needs it)
@@ -5035,7 +5038,7 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
 }
 
 /// Report database health metrics for diagnostics (STAB-15 observability).
-/// Runs PRAGMA integrity_check, PRAGMA wal_checkpoint(PASSIVE), and reports
+/// Runs PRAGMA `integrity_check`, PRAGMA `wal_checkpoint(PASSIVE)`, and reports
 /// connection pool stats. Never fails the doctor check — all checks are
 /// informational.
 async fn report_db_health(store: &Store) {

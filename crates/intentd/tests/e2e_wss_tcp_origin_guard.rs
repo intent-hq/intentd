@@ -12,7 +12,7 @@
 //!
 //! The test drives an ADVERSARIAL scenario: a remote WSS client attempts to:
 //! a) call `server.rotateToken` (fast-path) → expect -32001
-//! b) disable `server.wsApi.enabled` (slow-path, spawned) → expect InvalidParams error
+//! b) disable `server.wsApi.enabled` (slow-path, spawned) → expect `InvalidParams` error
 //!
 //! Both must refuse, proving the origin context survives into spawned tasks.
 

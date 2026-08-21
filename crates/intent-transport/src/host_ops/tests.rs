@@ -1222,7 +1222,7 @@ fn list_installed_editors_with_windows_uses_binary_resolver() {
     assert!(editors.iter().any(|e| e["id"] == "powershell"));
 }
 
-/// Regression test: run_version_with() enriches PATH with binary's parent dir,
+/// Regression test: `run_version_with()` enriches PATH with binary's parent dir,
 /// enabling scripts that invoke co-located dependencies via PATH lookup to succeed.
 ///
 /// Mirrors the real nvm layout where 'node' is co-located with npm-installed

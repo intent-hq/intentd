@@ -218,7 +218,7 @@ async fn read_until_response(ws: &mut TlsWs, id: i64) -> Value {
 }
 
 /// A transient `file:changed` event (non-agent actor ⇒ never persisted, so
-/// SQLite cannot throttle the flood) with a `payload` of `size` bytes.
+/// `SQLite` cannot throttle the flood) with a `payload` of `size` bytes.
 fn flood_event(i: usize, size: usize) -> NewEvent {
     NewEvent {
         workspace_id: WorkspaceId::from("ws-priority-lanes"),

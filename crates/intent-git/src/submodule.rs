@@ -3,7 +3,7 @@
 //! After a pull that updates a submodule gitlink, the submodule worktree must
 //! be synced to match the new commit. This module provides the bounded shell-out
 //! pattern for `git submodule update --init --recursive`, following the same
-//! approach as `fetch.rs` (timeout + kill, GIT_TERMINAL_PROMPT=0, piped stderr).
+//! approach as `fetch.rs` (timeout + kill, `GIT_TERMINAL_PROMPT=0`, piped stderr).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -156,7 +156,7 @@ const MAX_SUBMODULE_NESTING: u32 = 10;
 /// set, every path relative to `worktree_path` with forward-slash
 /// separators (`sub`, `sub/inner`, …). [`submodule_paths`] reads a single
 /// repository, so a nested submodule is invisible to a caller holding only
-/// the superproject; the CoW orphan cleanup needs the full set to see a
+/// the superproject; the `CoW` orphan cleanup needs the full set to see a
 /// nested work tree orphaned by a reset that moved its parent off the
 /// revision registering it. A submodule that is unpopulated (or otherwise
 /// cannot be opened) still contributes its own path, just nothing beneath

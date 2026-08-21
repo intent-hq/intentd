@@ -10,7 +10,7 @@
 //!
 //! Flow: daemon1 parks the first turn after streaming one chunk
 //! (`blockUntilCancel`), graceful shutdown (system.shutdown) flushes the
-//! partial assistant row + captures the interrupted_agent row; daemon2 (mock
+//! partial assistant row + captures the `interrupted_agent` row; daemon2 (mock
 //! advertises `loadSession` and accepts the resume) resolves the agent via
 //! `agent.resolveInterrupted { resume }`. Asserts on the resumed child's
 //! prompt log: the continuation prompt carries the interrupting user message

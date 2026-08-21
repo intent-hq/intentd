@@ -36,7 +36,7 @@ use tokio::process::Command;
 use crate::file_ops;
 
 /// Grace period between SIGTERM and SIGKILL when reaping a timed-out child,
-/// mirroring `mcp_servers::reap`'s TERM_GRACE.
+/// mirroring `mcp_servers::reap`'s `TERM_GRACE`.
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Wire error codes surfaced by `host.exec` (PROTOCOL §9: `-32602` for invalid

@@ -55,7 +55,7 @@ impl Drop for SpecialistsWatcher {
 
 impl SpecialistsWatcher {
     /// Start watching specialist directories for all workspaces.
-    /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
+    /// `workspaces` is a list of (`workspace_id`, `workspace_path`) pairs.
     pub(super) fn start(
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,

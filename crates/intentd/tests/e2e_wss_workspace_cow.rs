@@ -1,9 +1,9 @@
-//! WSS end-to-end coverage for the CoW provisioning matrix (PROTOCOL §5.1 /
+//! WSS end-to-end coverage for the `CoW` provisioning matrix (PROTOCOL §5.1 /
 //! §5.5 / §6): drives the real pinned-TLS WebSocket against a live
 //! `intentd serve` and asserts:
 //!
 //! - `workspace.create` with `workspace.cowIsolation` ON provisions a
-//!   standalone CoW clone (`checkoutMode: "cow"`, working checkout on the
+//!   standalone `CoW` clone (`checkoutMode: "cow"`, working checkout on the
 //!   workspace branch at the base tip, no worktree registration in the
 //!   source repo).
 //! - `workspace.cowIsolation` OFF keeps the linked-worktree path
@@ -13,7 +13,7 @@
 //!   preference, not a guarantee.
 //! - `skipIsolation: true` wins over `workspace.cowIsolation` ON: direct
 //!   mode, no checkout provisioned at all (no probe, no fallback).
-//! - `agent.delegate` in a CoW workspace provisions a per-agent CoW sandbox
+//! - `agent.delegate` in a `CoW` workspace provisions a per-agent `CoW` sandbox
 //!   (`effectiveIsolation: "pending"` in the delegate result; the
 //!   `sandbox:cow:created` event and session sandbox fields report the settled
 //!   outcome), and completion merges the sandbox back into the workspace
@@ -24,15 +24,15 @@
 //!   gated child still spawns in the settled sandbox (monorepo#871).
 //! - A provisioning FAILURE (test seam) falls back to shared mode: the child
 //!   spawns in the workspace checkout and no sandbox is materialised.
-//! - `workspace.delete` of a CoW workspace removes the clone from disk and
+//! - `workspace.delete` of a `CoW` workspace removes the clone from disk and
 //!   leaves the source repository untouched.
-//! - `workspace.duplicate` of a CoW workspace provisions a fresh standalone
-//!   CoW clone for the duplicate (same decision matrix as create).
+//! - `workspace.duplicate` of a `CoW` workspace provisions a fresh standalone
+//!   `CoW` clone for the duplicate (same decision matrix as create).
 //!
 //! Gated on `git` on PATH plus a CoW-capable filesystem via
 //! `intent_git::cow_probe` (APFS/Btrfs/XFS-reflink); skips cleanly
 //! elsewhere. The worktree-fallback scenario is inverse-gated (runs only
-//! where CoW is NOT supported, e.g. ext4 CI runners). The delegation
+//! where `CoW` is NOT supported, e.g. ext4 CI runners). The delegation
 //! scenario is additionally gated on `node` + the mock ACP agent fixture.
 
 #![cfg(unix)]
@@ -397,7 +397,7 @@ where
 }
 
 /// Scenario A — `workspace.create` with `workspace.cowIsolation` ON: the
-/// checkout is a standalone CoW clone (`checkoutMode: "cow"`), a working
+/// checkout is a standalone `CoW` clone (`checkoutMode: "cow"`), a working
 /// checkout on the workspace branch at the base tip, with NO worktree
 /// registration in the source repo (the clone is fully independent) and the
 /// workspace branch existing only inside the clone.
@@ -535,7 +535,7 @@ async fn workspace_create_defaults_to_worktree_when_cow_isolation_off() {
     drop(daemon);
 }
 
-/// Scenario B2 — mid-flight CoW failure safety net: `workspace.cowIsolation`
+/// Scenario B2 — mid-flight `CoW` failure safety net: `workspace.cowIsolation`
 /// ON and the probe passes, but the clone itself fails as unsupported (forced
 /// via the `INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH` daemon seam, standing
 /// in for e.g. a live socket tree the probe's tiny temp file cannot see).
@@ -661,8 +661,8 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
     drop(daemon);
 }
 
-/// Scenario C — `agent.delegate` in a CoW workspace: the delegated agent gets
-/// its own per-agent CoW sandbox (`effectiveIsolation: "pending"` in the
+/// Scenario C — `agent.delegate` in a `CoW` workspace: the delegated agent gets
+/// its own per-agent `CoW` sandbox (`effectiveIsolation: "pending"` in the
 /// delegate result; the `sandbox:cow:created` event with the §5.5 payload
 /// reports the settled outcome), and when the
 /// child completes its turn the daemon auto-merges the sandbox back into the
@@ -875,7 +875,7 @@ where
 /// Scenario C2 — regression for monorepo#871: SLOW sandbox provisioning must
 /// not block or time out `agent.delegate`. The
 /// `INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS` seam holds `provision_sandbox`
-/// for 10s (standing in for a CoW clone of a large checkout); the delegate
+/// for 10s (standing in for a `CoW` clone of a large checkout); the delegate
 /// must return well under that (comfortably inside the 30s `workspace_api`
 /// budget) with `effectiveIsolation: "pending"`, the `sandbox:cow:created` event
 /// arrives only after the delay, and the child's first ACP spawn waits for
@@ -1092,7 +1092,7 @@ async fn delegate_falls_back_to_shared_mode_when_provisioning_fails() {
     drop(daemon);
 }
 
-/// Scenario D — `workspace.delete` of a CoW workspace removes the clone from
+/// Scenario D — `workspace.delete` of a `CoW` workspace removes the clone from
 /// disk (`<root>/<workspaceId>` swept) and leaves the source repository
 /// untouched: no worktree registrations to prune, no workspace branch, the
 /// original checkout intact.
@@ -1168,7 +1168,7 @@ async fn workspace_delete_removes_cow_clone_over_wss() {
 /// filesystem whose probe reports Unsupported falls back to the
 /// linked-worktree path — the create succeeds with
 /// `checkoutMode: "worktree"` and a working linked-worktree checkout
-/// instead of failing with `-32603`. Inverse-gated: runs only where CoW is
+/// instead of failing with `-32603`. Inverse-gated: runs only where `CoW` is
 /// NOT supported (e.g. ext4 CI runners); on APFS the daemon's probe would
 /// succeed.
 #[tokio::test]
@@ -1225,8 +1225,8 @@ async fn workspace_create_falls_back_to_worktree_when_cow_unsupported_over_wss()
 }
 
 /// Scenario F — `skipIsolation: true` wins over `workspace.cowIsolation` ON:
-/// the workspace is direct-mode (no worktree, no CoW clone, `checkoutMode`
-/// omitted) and the CoW probe never runs — no checkout of any kind is
+/// the workspace is direct-mode (no worktree, no `CoW` clone, `checkoutMode`
+/// omitted) and the `CoW` probe never runs — no checkout of any kind is
 /// provisioned. Runs on any filesystem.
 #[tokio::test]
 async fn workspace_create_skip_isolation_wins_over_cow_isolation() {
@@ -1286,8 +1286,8 @@ async fn workspace_create_skip_isolation_wins_over_cow_isolation() {
     drop(daemon);
 }
 
-/// Scenario G — `workspace.duplicate` of a CoW workspace: the duplicate gets
-/// its own fresh standalone CoW clone (`checkoutMode: "cow"`, real `.git`
+/// Scenario G — `workspace.duplicate` of a `CoW` workspace: the duplicate gets
+/// its own fresh standalone `CoW` clone (`checkoutMode: "cow"`, real `.git`
 /// dir, no worktree registration in the source repo) at
 /// `<root>/<newId>/<repo-slug>` on the duplicate's branch — the same decision
 /// matrix as create.
@@ -1379,7 +1379,7 @@ async fn workspace_duplicate_provisions_cow_clone_over_wss() {
     drop(daemon);
 }
 
-/// Scenario E2 — `workspace.duplicate` mid-flight CoW failure safety net:
+/// Scenario E2 — `workspace.duplicate` mid-flight `CoW` failure safety net:
 /// with the clone forced to fail as unsupported (same seam as Scenario B2),
 /// both the create and the duplicate must transparently fall back to a linked
 /// worktree instead of failing — exercising the duplicate path's

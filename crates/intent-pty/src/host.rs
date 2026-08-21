@@ -772,7 +772,7 @@ fn reap_refused_spawn(session: &PtySession) {
 /// SIGTERM the process group, then escalate to SIGKILL when the group is
 /// non-empty after [`TERM_GRACE`]. Escalation is keyed on the *process
 /// group* emptying, not on the direct child's exit: a descendant that
-/// survives SIGTERM must still be SIGKILLed even when the shell itself
+/// survives SIGTERM must still be `SIGKILLed` even when the shell itself
 /// exited promptly (monorepo#1300). Keep reaping the direct child — a zombie
 /// leader keeps the pgid occupied, so the ESRCH probe only reports empty
 /// once the leader is reaped. Reap via `observe_exit` so the one-shot exit
@@ -833,7 +833,7 @@ mod tests {
     }
 
     /// Deadline scale factor for slow environments (coverage runs export
-    /// INTENTD_TEST_TIMEOUT_MULTIPLIER); never below 1.0, and non-finite
+    /// `INTENTD_TEST_TIMEOUT_MULTIPLIER`); never below 1.0, and non-finite
     /// values (`inf`/`NaN`) are ignored so `Duration::mul_f64` cannot panic.
     fn timeout_multiplier() -> f64 {
         std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")

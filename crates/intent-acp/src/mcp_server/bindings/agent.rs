@@ -77,7 +77,7 @@ pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (
 
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
 /// off the two attention-request installers are omitted, so agent code
-/// touching them fails with a clear `not a function` TypeError. Every other
+/// touching them fails with a clear `not a function` `TypeError`. Every other
 /// `ws.agent.*` method (including `reportToParent`) stays un-gated. With the
 /// toggle on — the default — this borrows [`PRELUDE`] byte-identically.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {

@@ -49,7 +49,7 @@ const STDIN_QUEUE_CAP: usize = 32;
 /// `stdin` payload.
 #[derive(Debug)]
 pub struct HostExecStreamArgs {
-    /// Shared exec fields (command, args, cwd, env, timeout_ms, workspace_id).
+    /// Shared exec fields (command, args, cwd, env, `timeout_ms`, `workspace_id`).
     pub common: HostExecArgs,
     /// Caller-supplied correlation id; a fresh `hexec-<uuid>` is minted when
     /// absent so the response always carries a `requestId` echoable back on
@@ -368,7 +368,7 @@ pub async fn start_stream(
 /// (broadcast-only, never persisted — same path as `chat:stream:delta`):
 /// streamed output is consumed live by the correlated subscriber and has no
 /// event-table readback, so a chatty child must not serialize behind a durable
-/// SQLite commit per chunk. The terminal `host:exec:exit` stays durable but is
+/// `SQLite` commit per chunk. The terminal `host:exec:exit` stays durable but is
 /// published from [`run_wait_loop`] — a different task from these readers — so
 /// unlike the terminal/script paths there is no exit-never-overtakes-data
 /// guarantee: `child.wait()` can return while a pipe still holds unread bytes,

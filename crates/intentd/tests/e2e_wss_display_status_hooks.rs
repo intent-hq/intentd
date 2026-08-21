@@ -273,7 +273,7 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace.
+/// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,

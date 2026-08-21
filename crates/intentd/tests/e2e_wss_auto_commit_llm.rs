@@ -291,7 +291,7 @@ fn gate(test: &str) -> Option<String> {
 
 /// Seed a workspace with a git repo worktree directly in the data dir store
 /// (bypassing the workspace-create dance) so the daemon sees it on boot.
-/// Optionally sets context.auggiePath if an auggie_bin is provided.
+/// Optionally sets context.auggiePath if an `auggie_bin` is provided.
 async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) -> (String, PathBuf) {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,

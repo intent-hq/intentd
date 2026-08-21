@@ -4,7 +4,7 @@
 //! - provider defaults > global default
 //!
 //! (The per-workspace override tier was removed in monorepo#1000; a stale
-//! `model.workspaceOverrides` SQLite row must be ignored. The background-agent
+//! `model.workspaceOverrides` `SQLite` row must be ignored. The background-agent
 //! tier was removed in monorepo#1729 — the renamed `quickActions.*` keys scope
 //! to single-shot quick actions and never to agent sessions.)
 //!
@@ -90,7 +90,7 @@ async fn agent_create_resolves_model_from_settings_default() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
-/// monorepo#1000 regression: a stale `model.workspaceOverrides` SQLite row
+/// monorepo#1000 regression: a stale `model.workspaceOverrides` `SQLite` row
 /// (left behind by a pre-removal daemon) must NOT influence resolution — the
 /// retired tier is gone, so the chain proceeds to the live tiers.
 #[tokio::test]

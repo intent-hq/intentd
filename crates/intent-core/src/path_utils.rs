@@ -400,7 +400,7 @@ pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathB
 ///
 /// Note: Callers that need custom precedence (e.g., provider-binary dir first,
 /// then ~/.augment/bin for auggie, then enriched dirs, then inherited PATH) should
-/// use `enriched_tool_dirs()` + split_paths to build the order themselves.
+/// use `enriched_tool_dirs()` + `split_paths` to build the order themselves.
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
     enhanced_path_dirs_with_home(home_dir().as_deref())
 }
