@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.26] - 2026-08-20
+
+### ⚙️ Miscellaneous Tasks
+
+- Add clippy pedantic ratchet scaffold ([#1351](https://github.com/intent-hq/intentd/pull/1351))
+
+
 ## [0.7.25] - 2026-08-20
 
 ### 🐛 Bug Fixes
