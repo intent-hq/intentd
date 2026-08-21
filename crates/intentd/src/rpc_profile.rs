@@ -103,7 +103,11 @@ fn is_network_tier_method(method: &str) -> bool {
 /// cascade — so its statement count scales with workspace size
 /// (intent-hq/monorepo#3074). `workspace.import.commit` likewise inserts one
 /// row per transferred row inside the dispatch, so its count scales with the
-/// imported workspace's contents.
+/// imported workspace's contents. Import counts are unbounded (322 observed
+/// on a large import), so a big import can still overrun the compound budget
+/// — that residual WARN on a rare, deliberate op is accepted rather than
+/// raising the shared threshold high enough to blunt the N+1 signal for the
+/// bounded members.
 const COMPOUND_STATEMENT_METHODS: &[&str] = &[
     "workspace.create",
     "workspace.delete",
