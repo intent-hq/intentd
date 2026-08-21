@@ -156,6 +156,46 @@ pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
     }
 }
 
+/// Reshape the FE envelope for the **agent-JS surface** (`ws.browser.exec`,
+/// WSAPI-6). Same shaping as [`shape_result`] with one deliberate difference:
+/// a `success: false` envelope that still carries a non-empty `results` array
+/// is returned as data, not collapsed into a top-level error
+/// (intent-hq/monorepo#3042). The FE emits structured per-action failures —
+/// `{ action, success: false, errorCode: "not-owner" | "already-claimed",
+/// ownerAgentId, error }` — and the browser docs promise agents these surface
+/// inside the per-action envelope, "never as a top-level failure"; flattening
+/// them into thrown prose loses `errorCode` / `ownerAgentId`, which agents
+/// need to react (claim the tab, name the owner). Single-action batches yield
+/// the lone action envelope (structured failure intact); multi-action batches
+/// yield the FE envelope (`success` / `results` / `error`) so callers can
+/// detect partial failure without scanning. A failure envelope *without*
+/// per-action results (transport/CDP-level breakage) still surfaces as
+/// `-32603` — there is no structure to preserve.
+///
+/// The wire `browser.exec` client path keeps [`shape_result`] unchanged
+/// (PROTOCOL §5.14 maps envelope failure to `-32603`).
+pub fn shape_agent_result(fe_response: Value) -> Result<Value, BrowserExecError> {
+    let is_failure = fe_response
+        .as_object()
+        .is_some_and(|obj| obj.get("success").and_then(Value::as_bool) == Some(false));
+    if is_failure {
+        let obj = fe_response.as_object().expect("checked above");
+        if let Some(results) = obj.get("results").and_then(Value::as_array) {
+            if !results.is_empty() {
+                return match results.len() {
+                    1 => Ok(single_result_payload(&results[0])),
+                    _ => Ok(json!({
+                        "success": false,
+                        "results": results,
+                        "error": obj.get("error").cloned().unwrap_or(Value::Null),
+                    })),
+                };
+            }
+        }
+    }
+    shape_result(fe_response)
+}
+
 /// Build the wire payload for the single-action case: pass the FE's action
 /// envelope through unchanged. The daemon neither unwraps `result` nor
 /// re-maps action-level `error`s — it forwards exactly what the FE gave us.

@@ -24420,10 +24420,14 @@ impl WorkspaceApi for Services {
     /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
-    /// shaping stays in [`browser_ops`] (byte-for-byte parity with the FE
-    /// tool); failure modes surface as `Error::Internal` with the underlying
-    /// reason so the MCP caller can distinguish "no client connected" from a
-    /// proxy-side failure. An empty `actions` batch is rejected with
+    /// shaping stays in [`browser_ops`], via the agent-surface variant
+    /// [`browser_ops::shape_agent_result`]: structured per-action failures
+    /// (`not-owner` / `already-claimed`) are preserved as data instead of
+    /// flattening into a top-level error (intent-hq/monorepo#3042).
+    /// Remaining failure modes surface as `Error::Internal` with the
+    /// underlying reason so the MCP caller can distinguish "no client
+    /// connected" from a proxy-side failure. An empty `actions` batch is
+    /// rejected with
     /// `Error::InvalidParams` (JSON-RPC `-32602`) before any dispatch — the
     /// FE tool has no meaningful behavior on an empty batch and the
     /// client-triggered path already enforces the same guard. When no
@@ -24466,7 +24470,7 @@ impl WorkspaceApi for Services {
                             Error::Internal(format!("browser.exec: {message}"))
                         }
                     })?;
-            browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
+            browser_ops::shape_agent_result(response).map_err(|e| Error::Internal(e.message))
         })
     }
 
