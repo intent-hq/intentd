@@ -92,6 +92,25 @@ fn parse_args_trims_empty_optional_strings_to_none() {
 }
 
 #[test]
+fn parse_args_and_forward_pass_new_actions_through_verbatim() {
+    // The daemon is a thin proxy: action shapes are opaque, so the
+    // hidden-by-default `openTab { visible }` and the `showTab { tabId,
+    // focus }` reveal action (monorepo#3045) forward to the FE executor
+    // byte-for-byte. Per-action validation (e.g. showTab without tabId)
+    // is FE-owned — the daemon must not reject such a batch.
+    let actions = vec![
+        json!({ "action": "openTab", "url": "http://localhost:5173", "visible": true }),
+        json!({ "action": "showTab", "tabId": "tab-1", "focus": false }),
+        json!({ "action": "showTab" }),
+    ];
+    let args = parse_args(&params_of(json!({ "actions": actions.clone() })))
+        .expect("opaque action shapes pass envelope validation");
+    assert_eq!(args.actions, actions);
+    let forwarded = build_forward_params(&args);
+    assert_eq!(forwarded["actions"], Value::Array(actions));
+}
+
+#[test]
 fn build_forward_params_includes_only_supplied_fields() {
     let args = BrowserExecArgs {
         actions: vec![json!({ "action": "listTabs" })],
