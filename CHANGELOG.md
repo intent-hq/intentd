@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.31] - 2026-08-21
+
+### 🔧 Refactor
+
+- Complete the pedantic clippy burndown, empty the temporary allowlist ([#1382](https://github.com/intent-hq/intentd/pull/1382))
+
+
 ## [0.7.30] - 2026-08-21
 
 ### 🔧 Refactor
