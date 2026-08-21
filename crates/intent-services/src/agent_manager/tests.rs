@@ -1607,6 +1607,150 @@ async fn evict_idle_older_than_evicts_only_stale_idle() {
     assert!(reg.is_registered(&active), "active process kept");
 }
 
+/// monorepo#3040 — the TTL idle sweep was the ONE eviction path that emitted
+/// no `agent:process:evicted`, so an FE chat session bound to the reaped agent
+/// had no signal it was gone. The sweep must fire the registry event callback
+/// with the additive reason `"idle-ttl"` for every process it evicts.
+#[tokio::test]
+async fn ttl_eviction_emits_evicted_event_with_idle_ttl_reason() {
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+    let reg = ProcessRegistry::new(8).with_event_fn(event_fn);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (stale, fresh) = (AgentId::from("stale"), AgentId::from("fresh"));
+    reg.register(stale.clone(), recording_kill(stale.clone(), log.clone()));
+    reg.register(fresh.clone(), recording_kill(fresh.clone(), log.clone()));
+    reg.set_last_active(&stale, 1);
+    reg.set_last_active(&fresh, super::now_ms());
+
+    let evicted = reg
+        .evict_idle_older_than(Duration::from_secs(60), |_| true, |_| {})
+        .await;
+    assert_eq!(evicted, 1);
+
+    // The callback future is spawned; give it a bounded window to record.
+    let mut recorded = Vec::new();
+    for _ in 0..50 {
+        recorded = events.lock().unwrap().clone();
+        if !recorded.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        recorded,
+        vec![(
+            stale.clone(),
+            "agent:process:evicted".to_string(),
+            "idle-ttl".to_string()
+        )],
+        "the TTL sweep emits agent:process:evicted with reason idle-ttl for the stale process only"
+    );
+}
+
+/// Regression for monorepo#3040 — a send to an agent the TTL sweep just
+/// reaped must NOT be silently dropped. The reap only kills the child process
+/// (the session row survives), so `send_message` must take the auto-restore
+/// path: claim the turn slot, persist the user row, and start a turn worker
+/// (which respawns the child on demand). The eviction itself must be
+/// observable on the event bus as `agent:process:evicted` with reason
+/// `idle-ttl` so a bound FE session can react.
+#[tokio::test]
+async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
+    use intent_core::events::AGENT_PROCESS_EVICTED;
+
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-send");
+    let id = AgentId::from("a-reap-send");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    mgr.registry().set_last_active(&id, 1);
+
+    let mut filter = SubscriptionFilter {
+        event_types: vec![AGENT_PROCESS_EVICTED.to_string()],
+        ..Default::default()
+    };
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.contains(&id), "the reap dropped the child handle");
+    assert!(
+        mgr.services.store.get_agent_session(&id).await.is_ok(),
+        "the reap keeps the session row (only the process dies)"
+    );
+
+    // The eviction is observable: agent:process:evicted with reason idle-ttl.
+    let mut evict_event = None;
+    for _ in 0..50 {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
+            Ok(Some(batch)) => {
+                if let Some(ev) = batch
+                    .into_iter()
+                    .find(|ev| ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == id.0)
+                {
+                    evict_event = Some(ev);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    let ev = evict_event.expect("TTL reap publishes agent:process:evicted");
+    assert_eq!(ev.data["reason"], "idle-ttl", "TTL sweep eviction reason");
+
+    // A user send to the reaped agent restores: the RPC succeeds, the user
+    // row is persisted (nothing silently dropped), and `queued == false`
+    // proves `try_begin` won the turn slot (restore path engaged) — the
+    // spawned worker respawns the child on demand. No `is_busy` assertion
+    // here: the worker's spawn attempt fails in this env and releases the
+    // slot, so reading it after the send races that release (#1356 review).
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "are you still there?".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("send to a reaped agent must not error");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "the reap claim is released, so the send starts a turn: {result}"
+    );
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.to_string().contains("are you still there?")),
+        "the post-reap send's user row is persisted, not dropped"
+    );
+}
+
 /// monorepo#2104 (#1161 review) — a live-turn slot that outlived its turn must
 /// not outlive it INTO the next turn. `flush_partial_turn_on_interruption`
 /// deliberately keeps the slot on a non-UNIQUE store error (it is the only copy
