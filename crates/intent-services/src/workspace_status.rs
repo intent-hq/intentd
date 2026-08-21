@@ -661,9 +661,9 @@ fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent 
 }
 
 /// Unit tests for the pure `compute_display_status` derivation (canonical
-/// precedence): failed → blocked → needs_attention → running agent →
+/// precedence): failed → blocked → `needs_attention` → running agent →
 /// active/latest open PR (linked or monitor-signalled) → open tasks →
-/// merged PR → complete/not_started.
+/// merged PR → `complete/not_started`.
 #[cfg(test)]
 mod display_status {
     use intent_core::{
@@ -1740,7 +1740,7 @@ mod display_status_events {
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }
 
-    /// A task-completion transition (in_progress → complete over
+    /// A task-completion transition (`in_progress` → complete over
     /// `task.updateNoteStatus`) emits the event with the self-sufficient
     /// `{ workspaceId, displayStatus }` payload.
     #[tokio::test]
@@ -1774,7 +1774,7 @@ mod display_status_events {
     }
 
     /// A task-status change that does not move the derived rollup (a second
-    /// task flipping not_started → in_progress while the rollup is already
+    /// task flipping `not_started` → `in_progress` while the rollup is already
     /// `in_progress`) publishes no displayStatus event.
     #[tokio::test]
     async fn no_op_recompute_stays_silent() {
@@ -2053,7 +2053,7 @@ mod display_status_events {
 
     /// G2: `agent.update` recomputes when a status-relevant field changes —
     /// flipping the attention-holding agent to `isBackground: true` removes
-    /// it from the needs_attention derivation and emits the demotion.
+    /// it from the `needs_attention` derivation and emits the demotion.
     #[tokio::test]
     async fn agent_update_is_background_transition_emits() {
         let h = harness().await;
@@ -2083,7 +2083,7 @@ mod display_status_events {
 
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
     /// persisting the dismissal marker retires the question hold and emits the
-    /// needs_attention → idle demotion.
+    /// `needs_attention` → idle demotion.
     #[tokio::test]
     async fn question_dismiss_transition_emits() {
         let h = harness().await;
@@ -2882,7 +2882,7 @@ mod display_status_events {
         );
     }
 
-    /// ReviewRequired flag triggers (§6.5 step 2): a `workspace.update`
+    /// `ReviewRequired` flag triggers (§6.5 step 2): a `workspace.update`
     /// carrying `attention: review_required` promotes the derived rollup to
     /// `needs_attention` and emits; `workspace.dismissAttention` retires it
     /// and emits the demotion.

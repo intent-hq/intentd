@@ -255,7 +255,7 @@ fn gate(test: &str) -> Option<String> {
 const TASK_TITLE: &str = "Stall e2e task";
 const TASK_NOTE_ID: &str = "stall-task-note";
 
-/// Seed a workspace AND an `in_progress` task note into the daemon's SQLite
+/// Seed a workspace AND an `in_progress` task note into the daemon's `SQLite`
 /// before it boots, so the mock behavior JSON can reference the note id.
 async fn seed_workspace_and_task_note(data_dir: &Path) -> String {
     use intent_core::{

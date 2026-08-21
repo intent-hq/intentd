@@ -45,7 +45,7 @@ pub async fn read_repo_config(repo_path: &Path) -> RepoConfig {
     let config_path = get_config_file_path(repo_path);
 
     match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => parse_repo_config_tolerant(&content, &format!("{repo_path:?}")),
+        Ok(content) => parse_repo_config_tolerant(&content, &repo_path.display().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // File doesn't exist — that's fine, return empty config
             RepoConfig::default()

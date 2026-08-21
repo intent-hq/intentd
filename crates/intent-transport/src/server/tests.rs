@@ -1,6 +1,6 @@
 //! Unit tests for server pairing fast-path: classify/handle for server.pairingInfo and
-//! server.rotateToken, local-only gating. INTENTD_AUTH_TOKEN rejection is tested in
-//! e2e_wss_server_pairing.rs (env var interaction makes it unsuitable for unit testing).
+//! server.rotateToken, local-only gating. `INTENTD_AUTH_TOKEN` rejection is tested in
+//! `e2e_wss_server_pairing.rs` (env var interaction makes it unsuitable for unit testing).
 
 use std::path::PathBuf;
 use std::pin::Pin;

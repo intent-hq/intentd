@@ -227,7 +227,7 @@ fn create_repo_with_config(config: &str) -> TempRepo {
 
 /// Regression test for intent-hq/monorepo#1778: the first `script.list` for a
 /// fresh workspace bootstraps repo-config scripts, and used to persist each
-/// one individually (1 × get_workspace + N × upsert_script), so any repo with
+/// one individually (1 × `get_workspace` + N × `upsert_script`), so any repo with
 /// ≥ 25 configured scripts tripped the default statement budget on that first
 /// call. The bootstrap now persists in chunked batched upserts (2048 rows per
 /// statement), keeping the dispatch at ~2 statements for any plausible config
@@ -382,10 +382,10 @@ async fn get_subscriptions_stays_within_statement_budget() {
 
 /// Regression test for intent-hq/monorepo#2994: `workspace.transfer.plan`
 /// used to compute its per-table row stats with 2 statements per
-/// TRANSFER_TABLES entry (PRAGMA table_info + per-table aggregate, ~56
+/// `TRANSFER_TABLES` entry (PRAGMA `table_info` + per-table aggregate, ~56
 /// statements for 28 tables), tripping the default statement budget on every
 /// call. The stats read is now batched to exactly two statements (one
-/// pragma_table_info join, one UNION ALL aggregate), keeping the whole
+/// `pragma_table_info` join, one UNION ALL aggregate), keeping the whole
 /// dispatch well within the default budget of 25.
 #[tokio::test]
 async fn transfer_plan_stays_within_statement_budget() {

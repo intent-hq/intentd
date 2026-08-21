@@ -1132,7 +1132,7 @@ impl ScriptManager {
     /// `stopped_by_user` flag set concurrently — a `stop`/`stop_all` landing
     /// between the supervisor's post-backoff stopped check and this
     /// registration (monorepo#1526) — also refuses: the stop keyed its PTY
-    /// kill on the *previous* pty_id, so letting this registration through
+    /// kill on the *previous* `pty_id`, so letting this registration through
     /// would leave the fresh PTY running unstopped. `run()`'s completion path
     /// keeps `false`: its reservation flow owns the stop interaction.
     ///
@@ -1250,7 +1250,7 @@ impl ScriptManager {
     ///
     /// Transient (broadcast-only, never persisted — same path as
     /// `chat:stream:delta` / `terminal:data`): script PTY output is
-    /// high-volume and must not serialize behind a durable SQLite commit per
+    /// high-volume and must not serialize behind a durable `SQLite` commit per
     /// chunk. Scrollback replay reads the PTY host ring buffer via
     /// `script.output`, so nothing consumes persisted `script:output` rows.
     /// All durable `script:state` transitions are emitted on the same
@@ -1307,7 +1307,7 @@ impl ScriptManager {
     }
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
-    /// scope, and the FORCE_COLOR/TERM + enhanced-PATH + script env overlay,
+    /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + script env overlay,
     /// with an inherited `npm_config_prefix` scrubbed so nvm's login-shell init
     /// succeeds. An explicit script env value is preserved.
     fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
@@ -1322,7 +1322,7 @@ impl ScriptManager {
     }
 }
 
-/// Build the env overlay for a spawned script/agent shell: FORCE_COLOR/TERM, an
+/// Build the env overlay for a spawned script/agent shell: `FORCE_COLOR/TERM`, an
 /// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
 /// then the script's own `env` last so it can override. The enhanced PATH keeps
 /// git/node resolvable even when the daemon inherited a sparse Finder/launchd

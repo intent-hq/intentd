@@ -14,7 +14,7 @@
 //!   in TS. `filter.stage` is accepted as a string or an array.
 //! - `AgentAttribution.agentName` is not persisted on `tracked_changes` (M4.7),
 //!   so it is emitted as an empty string until the agent name is sourced.
-//! - The wire `TrackedChange.id` is the persisted row id (UUIDv7), not the TS
+//! - The wire `TrackedChange.id` is the persisted row id (`UUIDv7`), not the TS
 //!   synthetic `git-<n>-<path>` id, since intentd reads persisted rows.
 
 use std::path::Path;

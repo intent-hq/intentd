@@ -47,7 +47,7 @@ use uuid::Uuid;
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// MIME type the FE renders as QuestionCards (PROTOCOL §7.x question resource).
+/// MIME type the FE renders as `QuestionCards` (PROTOCOL §7.x question resource).
 const QUESTION_MIME: &str = "application/vnd.intent.question+json";
 
 /// Turn-1 trigger marker: the mock's `rules` entry matches on this, so the
@@ -56,7 +56,7 @@ const QUESTION_MIME: &str = "application/vnd.intent.question+json";
 const ASK_MARKER: &str = "ASK_QUESTIONS_NOW_E2E";
 
 /// The flattened `Q:`/`A:` answers the FE would send after the user fills in
-/// the QuestionCards — plain text, delivered to the provider verbatim.
+/// the `QuestionCards` — plain text, delivered to the provider verbatim.
 const FLATTENED_ANSWERS: &str = "Q: Which authentication method should the new endpoint use?\n\
 A: OAuth\n\
 \n\
@@ -308,7 +308,7 @@ fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
         .collect()
 }
 
-/// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace —
+/// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace —
 /// the daemon opens the same data dir on launch.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{

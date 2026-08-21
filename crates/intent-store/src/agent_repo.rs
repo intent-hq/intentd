@@ -76,7 +76,7 @@ const MESSAGE_USAGE_JSON_SQL: &str = "json_object('usage', \
 /// covers pre-existing rows that are not.
 ///
 /// Must stay equivalent to the `WHERE` clause of the partial index
-/// `idx_agent_message_usage` (migration 0081) — SQLite only satisfies the
+/// `idx_agent_message_usage` (migration 0081) — `SQLite` only satisfies the
 /// filter from that index when the predicates match, and without the index
 /// the filter would load and JSON-parse every message body in the session.
 const MESSAGE_USAGE_PRESENT_SQL: &str = "CASE WHEN json_valid(content) THEN \
@@ -94,7 +94,7 @@ const MESSAGE_USAGE_PRESENT_SQL: &str = "CASE WHEN json_valid(content) THEN \
 /// with `agent_token_tally`'s fallback rule); a malformed snapshot/baseline
 /// decodes to `None` and stays on the fallback too.
 ///
-/// That fallback read is bounded (monorepo#1571): SQLite projects each
+/// That fallback read is bounded (monorepo#1571): `SQLite` projects each
 /// message's usage object ([`MESSAGE_USAGE_JSON_SQL`]) and drops rows carrying
 /// none ([`MESSAGE_USAGE_PRESENT_SQL`], satisfied from the partial index
 /// `idx_agent_message_usage`), so the bytes crossing the store boundary — and
@@ -164,7 +164,7 @@ pub(crate) async fn fetch_agent_usage_rows(
 }
 
 /// Interrupted agent record (INT-41). Returned by
-/// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
+/// [`Store::list_interrupted_agents`], joined with `agent_session` and workspace.
 #[derive(Debug, Clone)]
 pub struct InterruptedAgent {
     pub agent_id: AgentId,
@@ -222,7 +222,7 @@ pub struct SessionMessageProjection {
     pub last_tool_use: Option<serde_json::Value>,
 }
 
-/// Per-block character cap applied inside SQLite when extracting projection
+/// Per-block character cap applied inside `SQLite` when extracting projection
 /// text (monorepo#1010 P1b). Assistant blocks keep their TAIL — the
 /// `AgentLite` preview is the last non-empty line and the `<agent_digest>`
 /// span is appended at the end — while user blocks keep their HEAD
@@ -516,14 +516,14 @@ impl Store {
 
     /// Insert an agent-session row together with its full message log in ONE
     /// write transaction: either the session and every message commit, or
-    /// nothing does. Messages get minted UUIDv7 ids and 0-based monotonic
+    /// nothing does. Messages get minted `UUIDv7` ids and 0-based monotonic
     /// `seq` values in slice order. Built for the legacy-transcript importer,
     /// whose idempotency check is session-id presence — a partially-persisted
     /// transcript would otherwise be skipped forever on re-runs. The session's
     /// last-message preview columns (0066), `last_message_role` (0070), and
     /// `last_message_id` (0088) are computed from the batch inside
     /// the same transaction. Uses
-    /// whole-transaction retry to absorb SQLITE_BUSY (code 5) during lock
+    /// whole-transaction retry to absorb `SQLITE_BUSY` (code 5) during lock
     /// upgrade (STAB-7).
     pub async fn insert_agent_session_with_messages(
         &self,
@@ -661,7 +661,7 @@ impl Store {
     /// whose stored `status` fails to decode (e.g. a daemon downgrade after
     /// a newer build persisted a new variant) is skipped with a WARN — both
     /// best-effort, matching the old loop's skip-on-error behavior; order is
-    /// unspecified. The id list is chunked well under SQLite's 32766
+    /// unspecified. The id list is chunked well under `SQLite`'s 32766
     /// bind-variable cap (same defense as `bulk_upsert_scripts`), so an
     /// implausibly large `ids` costs extra statements instead of erroring.
     pub async fn get_agent_statuses(&self, ids: &[AgentId]) -> Result<Vec<(AgentId, AgentStatus)>> {
@@ -816,7 +816,7 @@ impl Store {
 
     /// List a workspace's sessions WITHOUT message logs, oldest first. Used by hot
     /// paths (`derive_last_activity`, `enrich_workspace_aggregates`) that only need
-    /// session metadata (name, status, updated_at, etc.) and never read the message
+    /// session metadata (name, status, `updated_at`, etc.) and never read the message
     /// bodies (finding F1: eliminates full agent-message-log hydration from
     /// `workspace.list` / `workspace.get` emit). Reuses the `list_all_agent_sessions`
     /// row-mapping pattern (§9.1).
@@ -845,7 +845,7 @@ impl Store {
     /// never decoded as JSON and never loading overflow pages — so
     /// coordinators can see session-size pressure before turns start dying
     /// under context bloat (intent-hq/monorepo#2669). Returns a map keyed
-    /// by agent_id with `(message_count, has_assistant, conversation_bytes)`
+    /// by `agent_id` with `(message_count, has_assistant, conversation_bytes)`
     /// tuples.
     pub async fn get_agent_session_message_stats(
         &self,
@@ -890,7 +890,7 @@ impl Store {
     /// `agent_message.content` is never touched on this path. A NULL or
     /// corrupt column degrades to `None` ([`decode_preview_col`]) rather than
     /// being repaired; it converges the next time a message is appended.
-    /// Returns a map keyed by agent_id with one entry per session in the
+    /// Returns a map keyed by `agent_id` with one entry per session in the
     /// workspace.
     pub async fn get_agent_session_message_projections(
         &self,
@@ -962,7 +962,7 @@ impl Store {
         })
     }
 
-    /// Get the agent_message watermark for a workspace: the count of messages
+    /// Get the `agent_message` watermark for a workspace: the count of messages
     /// across all agents. This is used by the token-usage scan loop to skip
     /// workspaces that have not changed since the last scan (finding F2).
     /// Returns 0 for workspaces with no agents or no messages.
@@ -1193,14 +1193,14 @@ impl Store {
     }
 
     /// Get lightweight usage data for all agents in a workspace: for each agent,
-    /// returns the agent_id, model, the persisted end-of-turn `token_usage`
+    /// returns the `agent_id`, model, the persisted end-of-turn `token_usage`
     /// snapshot (if any), the persisted `token_usage_baseline` folded from
     /// prior ACP sessions (if any, monorepo#737), and per-message usage
-    /// metadata (for tallying without full AgentSession hydration; finding F2).
+    /// metadata (for tallying without full `AgentSession` hydration; finding F2).
     /// Messages are read ONLY for sessions whose decoded snapshot and baseline
     /// carry no token report — the tally falls back to message sums for those
     /// alone (see `agent_token_tally`), so report-backed sessions return an
-    /// empty list (monorepo#738) — and that read is bounded: SQLite projects
+    /// empty list (monorepo#738) — and that read is bounded: `SQLite` projects
     /// each message's usage metadata and drops rows carrying none, so message
     /// bodies never cross the boundary (monorepo#1571). A malformed
     /// snapshot/baseline decodes to `None` and therefore stays on the fallback.
@@ -1915,7 +1915,7 @@ impl Store {
     /// IMMEDIATE mode acquires the RESERVED (write) lock upfront — readers may
     /// still proceed, especially in WAL mode — avoiding the
     /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
     /// `max_connections=1` on the write pool, concurrent writers serialize at
     /// `pool.acquire()` instead. The CAS-loss early return happens before any
     /// write statement, so the guard's COMMIT closes a read-only transaction —
@@ -2169,7 +2169,7 @@ async fn thumbnails_col_value(content: &serde_json::Value) -> Option<String> {
 
 /// [`thumbnails_col_value`] for a whole batch, positionally aligned with
 /// `messages`. Awaited before the batch write transaction opens, so a
-/// SQLITE_BUSY retry re-runs only the SQL, never the image work.
+/// `SQLITE_BUSY` retry re-runs only the SQL, never the image work.
 async fn batch_thumbnails_col_values(messages: &[OwnedBatchMessage]) -> Vec<Option<String>> {
     let mut out = Vec::with_capacity(messages.len());
     for (_, content, _, _) in messages {
@@ -2184,7 +2184,7 @@ async fn batch_thumbnails_col_values(messages: &[OwnedBatchMessage]) -> Vec<Opti
 /// (intent-services `search_ops`) so index and preview agree: a bare JSON
 /// string is used as-is, an array of content blocks contributes each block's
 /// string `text` field joined by single spaces (order pinned to the array
-/// index via aggregate `ORDER BY`, SQLite 3.44+), and any other shape falls
+/// index via aggregate `ORDER BY`, `SQLite` 3.44+), and any other shape falls
 /// back to its compact JSON encoding. The `json_valid` guard keeps non-JSON
 /// content (impossible from the store's serde-encoded write paths) from
 /// erroring the statement. The 0074 migration's triggers/backfill embed the
@@ -2344,7 +2344,7 @@ impl Store {
             .collect()
     }
 
-    /// Append a message to an agent's insert-only log, minting a UUIDv7 id and
+    /// Append a message to an agent's insert-only log, minting a `UUIDv7` id and
     /// the next monotonic `seq`, and return the persisted [`AgentMessage`].
     pub async fn append_agent_message(
         &self,
@@ -2400,7 +2400,7 @@ impl Store {
     /// MAX. Only the INSERT transaction commits data, so once it completes the
     /// message row (and its preview column) is durable. No committed message can
     /// be lost. Assistant-message append
-    /// (the streaming path) is additionally protected by the AgentManager's
+    /// (the streaming path) is additionally protected by the `AgentManager`'s
     /// per-agent single-flight slot, serializing turns for one agent and
     /// eliminating the seq-race window on that hot path. User-message appends
     /// (sendMessage, sendQueuedMessageNow, wake delivery) can still race if fired
@@ -2745,7 +2745,7 @@ impl Store {
     }
 
     /// Atomically clear the agent's message log and reinsert `messages` under
-    /// fresh 0-based monotonic `seq` values. Row ids are minted here (UUIDv7)
+    /// fresh 0-based monotonic `seq` values. Row ids are minted here (`UUIDv7`)
     /// so callers cannot smuggle stale ids across the swap; the returned
     /// [`AgentMessage`]s carry the new id/`seq` pairing. Used by the FE's
     /// edit-truncate transcript-mutation path (`agent.replaceMessages`,
@@ -2756,7 +2756,7 @@ impl Store {
     /// recomputed from the replacement batch inside the same transaction
     /// (NULL when the batch has no message of that role / no user/assistant
     /// message).
-    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
     pub async fn replace_agent_messages(
         &self,
@@ -2919,7 +2919,7 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// List pending interrupted agents, joined with agent_session (name) and
+    /// List pending interrupted agents, joined with `agent_session` (name) and
     /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
     pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
         let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
@@ -2998,7 +2998,7 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Reset an interrupted agent row back to pending (resolution=NULL, resolved_at=NULL).
+    /// Reset an interrupted agent row back to pending (resolution=NULL, `resolved_at=NULL`).
     /// Used when a resume attempt claimed the row but failed post-claim, to restore
     /// retryability. Returns `true` if a row was updated.
     pub async fn reset_interrupted_resolution(&self, agent_id: &AgentId) -> Result<bool> {
@@ -4040,7 +4040,7 @@ mod tests {
     /// mirroring the #738 verification loop shape): each iteration races
     /// `replace_acp_session_id` (fold + id swap) against a concurrent
     /// write-pool writer (the token-usage recompute) and asserts ZERO
-    /// SQLITE_BUSY failures — IMMEDIATE mode serializes writers at
+    /// `SQLITE_BUSY` failures — IMMEDIATE mode serializes writers at
     /// `pool.acquire()` instead of racing the DEFERRED lock upgrade.
     ///
     /// Run standalone with:
@@ -5838,7 +5838,7 @@ mod tests {
     /// from `{}`, a non-object column is preserved under
     /// `priorNonObjectMetadata`, `system_prompt` is untouched, the CAS guard
     /// enforces expected-absent / expected-value semantics (guard miss →
-    /// `Ok(false)`, no write), and missing/mismatched sessions are NotFound.
+    /// `Ok(false)`, no write), and missing/mismatched sessions are `NotFound`.
     #[tokio::test]
     async fn set_agent_session_metadata_key_atomic_and_guarded() {
         use intent_core::now_iso;
@@ -7707,8 +7707,8 @@ mod tests {
     }
 
     /// `last_tool_use_preview` (0098) is maintained at message-write time:
-    /// a user/assistant append stamps the row's last tool_use block preview
-    /// (NULL actively clears when the row carries no tool_use), system/tool
+    /// a user/assistant append stamps the row's last `tool_use` block preview
+    /// (NULL actively clears when the row carries no `tool_use`), system/tool
     /// appends are transparent, an over-budget input is capped with the
     /// additive truncation flags, and `replace_agent_messages` recomputes
     /// from the batch. Both projection read paths serve the column.
@@ -7891,7 +7891,7 @@ mod tests {
     }
 
     /// The 0098 migration backfill stamps `last_tool_use_preview` from the
-    /// newest user/assistant row's LAST tool_use block: a small input is
+    /// newest user/assistant row's LAST `tool_use` block: a small input is
     /// stored whole, an over-budget input stores only the truncation flags
     /// (the SQL backfill's one bounded divergence from the Rust write path),
     /// and tool-less / empty transcripts stay NULL.

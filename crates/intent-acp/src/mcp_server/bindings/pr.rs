@@ -40,7 +40,7 @@ pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r"
 
 /// Feature-aware `ws.pr` prelude: the monitor installers are omitted when
 /// `agentFeatures.prMonitor` is off, so agent code touching them fails with a
-/// clear `ws.pr.monitor is not a function` TypeError.
+/// clear `ws.pr.monitor is not a function` `TypeError`.
 pub(crate) fn prelude_for(features: &intent_core::settings_file::AgentFeaturesSettings) -> String {
     let mut out = PRELUDE.to_string();
     if features.pr_monitor {

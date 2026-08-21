@@ -113,7 +113,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
-/// Pinned-fingerprint cert verifier (mirrors wss_integration.rs).
+/// Pinned-fingerprint cert verifier (mirrors `wss_integration.rs`).
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,

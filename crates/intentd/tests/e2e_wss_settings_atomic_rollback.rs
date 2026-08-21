@@ -415,7 +415,7 @@ async fn retired_workspace_overrides_over_wss() {
 }
 
 /// `workspaceApi.*` over WSS (per AGENTS.md testing gate): the two
-/// TOML-backed workspace_api output knobs appear in `settings.list` with
+/// TOML-backed `workspace_api` output knobs appear in `settings.list` with
 /// their definitions, round-trip through `settings.update`/`settings.reset`,
 /// and out-of-range values reject with `-32602`.
 #[tokio::test]

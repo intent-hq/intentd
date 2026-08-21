@@ -1410,7 +1410,7 @@ pub(crate) fn find_app_op(name: &str) -> Value {
 /// Catalog id of the platform file manager (Finder / Explorer / Linux FMs).
 const FILE_MANAGER_ID: &str = "finder";
 
-/// Finder's fixed bundle path on macOS — it lives in CoreServices, outside the
+/// Finder's fixed bundle path on macOS — it lives in `CoreServices`, outside the
 /// `/Applications` dirs the bundle probe scans (monorepo#885).
 const MACOS_FINDER_BUNDLE: &str = "/System/Library/CoreServices/Finder.app";
 

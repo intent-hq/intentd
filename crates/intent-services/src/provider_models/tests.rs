@@ -26,7 +26,7 @@ static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Recorded (trimmed) response from
 /// `https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000`
 /// (captured 2026-07-27), covering: a dense model (`Ornith-1.0-35B-GGUF`), an
-/// MoE model whose name carries both total and active param counts
+/// `MoE` model whose name carries both total and active param counts
 /// (`Qwen3.6-35B-A3B-GGUF`), a huge dense model that must be filtered out on
 /// a typical machine (`Ornith-1.0-397B-GGUF`), a small dense model
 /// (`gpt-oss-20b-GGUF`), a repo with no parseable size in its name

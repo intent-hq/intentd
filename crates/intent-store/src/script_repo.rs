@@ -49,7 +49,7 @@ impl Store {
     /// persisting N scripts costs O(1) statements and is all-or-nothing
     /// (intent-hq/monorepo#1778 — the `script.list` bootstrap used to trip the
     /// per-dispatch statement budget with one INSERT per repo-config script).
-    /// Chunked to stay under the bundled SQLite's `SQLITE_MAX_VARIABLE_NUMBER`
+    /// Chunked to stay under the bundled `SQLite`'s `SQLITE_MAX_VARIABLE_NUMBER`
     /// (32766 since 3.32).
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
         // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder

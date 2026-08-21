@@ -2,7 +2,7 @@
 //!
 //! Paths are resolved via the `directories` crate, honoring the
 //! `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment overrides. The data dir
-//! holds the SQLite database (`intentd.db`), the UDS (`intentd.sock`), and the
+//! holds the `SQLite` database (`intentd.db`), the UDS (`intentd.sock`), and the
 //! non-secret settings file (`config.toml`), which is loaded strictly through
 //! [`crate::settings_file::SettingsFile`] — a malformed file fails `resolve()`
 //! instead of being silently ignored.
@@ -95,7 +95,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Path to `config.toml` (non-secret settings).
     pub config_path: PathBuf,
-    /// Path to the SQLite database file.
+    /// Path to the `SQLite` database file.
     pub db_path: PathBuf,
     /// Path to the Unix-domain-socket the daemon listens on.
     pub socket_path: PathBuf,

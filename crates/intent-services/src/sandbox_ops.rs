@@ -1,4 +1,4 @@
-//! Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
+//! Sandbox provisioning and lifecycle for `CoW` agent isolation (direct-mode and
 //! CoW-checkout workspaces).
 
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
 use crate::now_iso;
 
 /// Test hook: artificial delay (milliseconds) at the top of
-/// [`provision_sandbox`], standing in for a slow CoW clone of a large
+/// [`provision_sandbox`], standing in for a slow `CoW` clone of a large
 /// checkout. Lets e2e tests prove provisioning runs off the delegate
 /// critical path (monorepo#871). NOTE: this seam is compiled into release
 /// binaries too (release-mode e2e runs need it); it is inert unless the
@@ -55,14 +55,14 @@ async fn apply_test_provision_hooks() -> Result<()> {
 /// Outcome of sandbox provisioning.
 #[derive(Debug, Clone)]
 pub enum ProvisionOutcome {
-    /// CoW is supported; sandbox was created.
+    /// `CoW` is supported; sandbox was created.
     Supported {
         path: PathBuf,
         branch: String,
         base_commit_sha: String,
         snapshot_commit_sha: Option<String>,
     },
-    /// CoW is not supported; fallback to shared mode (no bytes copied).
+    /// `CoW` is not supported; fallback to shared mode (no bytes copied).
     Unsupported,
 }
 
@@ -91,16 +91,16 @@ pub enum MergeOutcome {
 
 /// Configuration for sandbox provisioning.
 pub(crate) struct ProvisionConfig {
-    /// Workspaces root directory (from config.workspaces_root).
+    /// Workspaces root directory (from `config.workspaces_root`).
     pub workspaces_root: PathBuf,
 }
 
 /// Provision a sandbox for an agent in a sandbox-eligible (direct-mode or
 /// CoW-checkout) workspace.
 ///
-/// 1. Probe CoW support between the canonical repository directory and the sandbox parent.
+/// 1. Probe `CoW` support between the canonical repository directory and the sandbox parent.
 /// 2. If Unsupported, return `ProvisionOutcome::Unsupported` (fallback to shared mode; ZERO bytes copied).
-/// 3. If Supported: cow_clone the canonical directory to `<workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>`.
+/// 3. If Supported: `cow_clone` the canonical directory to `<workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>`.
 /// 4. Create branch `sb/<agentId>` in the sandbox.
 /// 5. If the source had uncommitted changes, create a snapshot commit of the dirty state.
 /// 6. Persist the sandbox record.
@@ -189,7 +189,7 @@ pub async fn provision_sandbox(
     })
 }
 
-/// Synchronous half of [`provision_sandbox`]: filesystem probe, CoW clone,
+/// Synchronous half of [`provision_sandbox`]: filesystem probe, `CoW` clone,
 /// and git2 branch/snapshot setup. Runs on the blocking pool — no store or
 /// event-bus interaction happens here.
 fn provision_sandbox_blocking(
@@ -754,7 +754,7 @@ fn audit_diverged_sandbox_branches(
 ///   initialization).
 /// - Worktree workspaces share the checkout with the user (no sandboxes):
 ///   returns an error.
-/// - Otherwise (skip_worktree = true OR no worktree provisioned): the user's
+/// - Otherwise (`skip_worktree` = true OR no worktree provisioned): the user's
 ///   repository folder (`repository_path`).
 fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let repo_path = match workspace.checkout_mode {
@@ -827,7 +827,7 @@ fn slugify(s: &str) -> String {
 }
 
 /// Restore index-tracked files that are missing from the worktree (the
-/// best-effort CoW clone may have skipped them as non-clonable). Checks out
+/// best-effort `CoW` clone may have skipped them as non-clonable). Checks out
 /// ONLY those paths from the index, so genuinely dirty state — modified
 /// tracked files, staged changes, untracked files — is left untouched.
 fn restore_missing_tracked_files(
@@ -1021,7 +1021,7 @@ fn get_files_in_range(
     Ok(files)
 }
 
-/// Get the list of commits after start_sha up to end_sha (exclusive of start, inclusive of end).
+/// Get the list of commits after `start_sha` up to `end_sha` (exclusive of start, inclusive of end).
 fn get_commits_after(
     repo: &git2::Repository,
     start_sha: &str,
@@ -1146,7 +1146,7 @@ mod tests {
         (dir, repo_path)
     }
 
-    /// Create a test repo under a specific parent directory (for same-volume CoW tests)
+    /// Create a test repo under a specific parent directory (for same-volume `CoW` tests)
     /// Uses workspace root's target dir, not crate's target dir, to ensure same volume.
     fn temp_repo_in_target(name: &str) -> (PathBuf, PathBuf) {
         // Navigate to workspace root (up from crates/intent-services)

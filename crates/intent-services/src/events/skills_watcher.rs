@@ -50,7 +50,7 @@ impl Drop for SkillsWatcher {
 
 impl SkillsWatcher {
     /// Start watching skills directories for all workspaces.
-    /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
+    /// `workspaces` is a list of (`workspace_id`, `workspace_path`) pairs.
     pub(super) fn start(
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,

@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-/// Mock ServerControl that always fails start_ws_listener to test rollback.
+/// Mock `ServerControl` that always fails `start_ws_listener` to test rollback.
 struct FailingServerControl;
 
 impl ServerControl for FailingServerControl {
@@ -514,7 +514,7 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
 
 /// Regression: DB read error during old-value capture fails the batch before
 /// applying anything (Phase 3 wave 2, lib.rs:4484-4497). Proves that when
-/// Store::get_setting returns Err during snapshot capture, the whole batch fails
+/// `Store::get_setting` returns Err during snapshot capture, the whole batch fails
 /// with an error naming the key, and NO settings in the batch are applied.
 #[tokio::test]
 async fn db_read_error_during_capture_fails_batch() {

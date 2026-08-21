@@ -270,7 +270,7 @@ const CHILD_TASK_NOTE_ID: &str = "child-task-note";
 const GATED_TASK_TITLE: &str = "Gated e2e task";
 const GATED_TASK_NOTE_ID: &str = "gated-task-note";
 
-/// Seed a workspace plus two task notes into the daemon's SQLite before it
+/// Seed a workspace plus two task notes into the daemon's `SQLite` before it
 /// boots: the child's task and a `not_started` task that dependsOn it.
 async fn seed_workspace_and_task_notes(data_dir: &Path) -> String {
     use intent_core::{

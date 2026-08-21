@@ -876,7 +876,7 @@ where
     panic!("agent session never settled to idle; last: {last}");
 }
 
-/// DEAD-IDLE (monorepo#764): the child is SIGKILLed out-of-band while the
+/// DEAD-IDLE (monorepo#764): the child is `SIGKILLed` out-of-band while the
 /// agent sits idle after a completed turn. The proactive child-exit watcher
 /// reaps the handle (one WARN, no events, status untouched), and the next
 /// message transparently spawns a FRESH child and completes the turn — no

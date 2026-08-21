@@ -1,7 +1,7 @@
 //! Universal MCP config conversion (§6.8) — port of `universal-mcp-config.ts`.
 //!
 //! We store MCP servers in an Auggie-compatible shape. Other ACP providers
-//! (OpenCode, Claude Code, Codex) each expect different formats. This module
+//! (`OpenCode`, Claude Code, Codex) each expect different formats. This module
 //! normalizes the internal representation into a canonical shape and converts to
 //! provider-specific formats, and injects the safe baseline env into stdio
 //! servers (the `applyBaselineEnvToStdioServers` analog).
@@ -165,7 +165,7 @@ fn pairs_array(map: &BTreeMap<String, String>) -> Value {
     )
 }
 
-/// Convert to the OpenCode config `mcp` block (port of `toOpenCodeMcpConfig`).
+/// Convert to the `OpenCode` config `mcp` block (port of `toOpenCodeMcpConfig`).
 pub fn to_opencode_mcp_config(normalized: &NormalizedMcpServers) -> Value {
     let mut mcp = Map::new();
     for (name, server) in normalized {

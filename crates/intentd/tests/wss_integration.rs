@@ -156,7 +156,7 @@ fn test_tempdir(prefix: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Build a real `Services` API + event bus over a fresh temp SQLite store.
+/// Build a real `Services` API + event bus over a fresh temp `SQLite` store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
 /// since `note.create` mints a fresh `NoteId` by design. `auggie_bin`
@@ -3353,10 +3353,10 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
 
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
-/// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
+/// `cowSupported` mirrors the cached workspaces-root `CoW` probe that fills
 /// `Workspace.cowSupported` (§5.1). The harness injects an existing hermetic
 /// workspaces root, so the probe always runs and the field is present as a
-/// boolean (true on CoW filesystems like APFS, false on e.g. ext4); when the
+/// boolean (true on `CoW` filesystems like APFS, false on e.g. ext4); when the
 /// probe cannot run the field is omitted, never null.
 #[tokio::test]
 async fn wss_system_capabilities_reports_cow_supported() {
@@ -6644,7 +6644,7 @@ async fn wss_file_tracking_load_commits_bounded() {
 }
 
 /// `git.branchStatus` + `git.getBranches` over WSS — the path-based
-/// BranchSelector seam (§5.6). Drives the happy path (response shape parity
+/// `BranchSelector` seam (§5.6). Drives the happy path (response shape parity
 /// with the UDS coverage), the missing-branchName -32602, the
 /// nonexistent-path -32602, and the unregistered-repo branch listing used by
 /// the workspace-create flow.
@@ -8428,7 +8428,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
 
 /// `agent.getConversation` / `chat.subscribe` slim projection over the real
 /// WSS wire (§5.5, §7.1): `projection: "slim"` bounds oversized
-/// tool_use/tool_result bodies (additive `inputTruncated`/`outputTruncated`
+/// `tool_use/tool_result` bodies (additive `inputTruncated`/`outputTruncated`
 /// flags, pairing ids intact) and swaps oversized image data for the
 /// write-time thumbnail (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the
 /// seq-0 snapshot of a slim subscription serves the same bounded blocks;
@@ -10576,7 +10576,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
-/// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
+/// `graceful_shutdown_allows_immediate_restart`). Prefer `base_port: 0` for normal tests.
 fn free_port() -> u16 {
     use std::net::TcpListener;
     TcpListener::bind(("127.0.0.1", 0))

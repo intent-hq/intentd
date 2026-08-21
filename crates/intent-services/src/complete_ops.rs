@@ -2,7 +2,7 @@
 //!
 //! Stateless one-shot completion so background FE requests (slug generation,
 //! note-status checks — the two remaining `background-request.service.ts`
-//! callers) no longer need an ACPProvider or an ephemeral agent session. The
+//! callers) no longer need an `ACPProvider` or an ephemeral agent session. The
 //! daemon owns the full lifecycle: spawn the provider, collect its cleaned
 //! reply, reap the process on any failure path (timeout, cancel, drop). No
 //! session/agent state is created, so there is nothing to garbage-collect on
@@ -415,7 +415,7 @@ mod tests {
     use super::*;
     use intent_store::Store;
 
-    /// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in
+    /// RAII temp `SQLite` store: the db (and its `-wal`/`-shm` sidecars) live in
     /// a guarded temp dir removed on drop — including on panic — unless
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {

@@ -16,7 +16,7 @@
 //! `workspace.list` / `workspace.get` rows (§5.1, monorepo#1396) — the field
 //! was optional, so row shapes remain valid for existing clients. Version 4.3
 //! adds `voice.transcribe` (additive): daemon-side speech-to-text over a
-//! pluggable provider (ElevenLabs Scribe | OpenAI) — 278 router methods,
+//! pluggable provider (`ElevenLabs` Scribe | `OpenAI`) — 278 router methods,
 //! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
 //! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
 //! same `-32603` / "Internal error" envelope, no method-catalog change.

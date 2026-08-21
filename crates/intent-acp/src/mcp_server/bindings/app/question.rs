@@ -44,7 +44,7 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
-/// MCP resource MIME type for questions (FE renders these as QuestionCards).
+/// MCP resource MIME type for questions (FE renders these as `QuestionCards`).
 pub const QUESTION_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.question+json";
 
 /// Unlike the other `app/*` submodules there is no chief gate — see the

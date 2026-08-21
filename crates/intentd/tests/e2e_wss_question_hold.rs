@@ -63,7 +63,7 @@ use uuid::Uuid;
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// MIME type the FE renders as QuestionCards (PROTOCOL §7.x question resource).
+/// MIME type the FE renders as `QuestionCards` (PROTOCOL §7.x question resource).
 const QUESTION_MIME: &str = "application/vnd.intent.question+json";
 
 /// Turn-1 trigger for the asker: the mock's rule matches on this so the
@@ -89,7 +89,7 @@ const HELD_DISMISS: &str = "held until dismissal";
 /// two distinct pending question messages).
 const ASK_AGAIN_MARKER: &str = "ASK_SECOND_QUESTION_NOW_E2E";
 
-/// The flattened `Q:`/`A:` answer a user sends after filling the QuestionCard.
+/// The flattened `Q:`/`A:` answer a user sends after filling the `QuestionCard`.
 const ANSWER_TEXT: &str = "Q: Which environment should I deploy to?\nA: Staging";
 /// An UNTAGGED user message sent while questions are pending: never held
 /// (user origin), but carries no `question_answers` tag, so it must NOT
@@ -346,7 +346,7 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
-/// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace.
+/// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -1282,7 +1282,7 @@ async fn dismiss_questions_idle_empty_queue_starts_notice_turn_over_wss() {
 ///    A's hold is active).
 /// 2. Dismissing A while B still holds automatic deliveries PARKS A's
 ///    notice: `agent.getQueue` surfaces the entry at the queue HEAD with its
-///    `questions_dismissed` metadata — the DoD's undelivered-entry shape.
+///    `questions_dismissed` metadata — the `DoD`'s undelivered-entry shape.
 /// 3. Dismissing B releases the hold: B's notice delivers first (immediate),
 ///    A's parked notice drains behind it — transcript order B-notice →
 ///    A-notice, queue empty.

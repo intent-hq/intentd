@@ -1,7 +1,7 @@
-//! ElevenLabs Scribe provider (`POST /v1/speech-to-text`, multipart).
+//! `ElevenLabs` Scribe provider (`POST /v1/speech-to-text`, multipart).
 //!
 //! Uses `model_id=scribe_v2` — required for keyterm biasing. Merged keyterms
-//! are sent as repeated `keyterms` form fields (the encoding the ElevenLabs
+//! are sent as repeated `keyterms` form fields (the encoding the `ElevenLabs`
 //! SDKs produce for array data parts).
 //!
 //! GUARDRAIL: the API key is a secret. It is stored only to build the
@@ -13,13 +13,13 @@ use serde_json::Value;
 use crate::engine::{TranscribeRequest, Transcript, VoiceEngine};
 use crate::error::{Error, Result};
 
-/// Default ElevenLabs REST base URL.
+/// Default `ElevenLabs` REST base URL.
 pub(crate) const ELEVENLABS_API_BASE_URL: &str = "https://api.elevenlabs.io";
 
 /// Scribe model used for batch transcription (keyterms require v2).
 const MODEL_ID: &str = "scribe_v2";
 
-/// ElevenLabs Scribe implementation of [`VoiceEngine`].
+/// `ElevenLabs` Scribe implementation of [`VoiceEngine`].
 pub(crate) struct ElevenLabsEngine {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.

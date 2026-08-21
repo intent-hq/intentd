@@ -2,8 +2,8 @@
 //! decision 1): at import-commit time, recreate the workspace checkout and
 //! every transferred sandbox from the received bundle. The checkout is cloned
 //! from the bundle at the workspace branch, the base ref is fetched as a
-//! local branch, sandboxes are re-provisioned as CoW clones of the checkout
-//! (plain clone when CoW is unavailable) with their `sb/<agentId>` branches
+//! local branch, sandboxes are re-provisioned as `CoW` clones of the checkout
+//! (plain clone when `CoW` is unavailable) with their `sb/<agentId>` branches
 //! fetched from the bundle, and the sentinel WIP snapshot commits are unwound
 //! so staged/unstaged/untracked state lands exactly as it was on the source.
 //! All-or-nothing: any failure removes everything this module created. No
@@ -135,8 +135,8 @@ pub(crate) fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
 /// Sequence: clone the bundle at the workspace branch into
 /// `<workspaces_root>/<wsId>/<repo-slug>` (origin removed — the staging
 /// bundle path must not persist), fetch the base ref as a local branch,
-/// re-provision each sandbox as a CoW clone of the checkout (plain local
-/// clone when CoW is unavailable) with its branch fetched from the bundle
+/// re-provision each sandbox as a `CoW` clone of the checkout (plain local
+/// clone when `CoW` is unavailable) with its branch fetched from the bundle
 /// and checked out, then unwind the WIP snapshot commits (sandboxes first,
 /// then the workspace) so the dirty state lands exactly as captured.
 ///
@@ -527,7 +527,7 @@ mod tests {
         name
     }
 
-    /// Status entries as (path, staged, wt_modified, untracked) tuples,
+    /// Status entries as (path, staged, `wt_modified`, untracked) tuples,
     /// sorted, for exact source/target comparisons.
     fn status_fingerprint(repo_path: &Path) -> Vec<(String, bool, bool, bool)> {
         let repo = git2::Repository::open(repo_path).unwrap();

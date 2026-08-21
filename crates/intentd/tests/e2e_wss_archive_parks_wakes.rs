@@ -3,7 +3,7 @@
 //! that auto-unarchives the workspace (the archive/auto-unarchive loop).
 //!
 //! Drives: create workspace → Watcher registers `ws.agent.watch` on
-//! WatchTarget through the MCP bridge → target parks mid-turn (mock ACP
+//! `WatchTarget` through the MCP bridge → target parks mid-turn (mock ACP
 //! provider, `parkIfPromptContains`) → `workspace.archive` (the sweep
 //! interrupts the target keep-alive, whose `agent:idle` fires the completion
 //! watch) → asserts:

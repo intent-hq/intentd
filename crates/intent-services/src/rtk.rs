@@ -5,7 +5,7 @@
 //! injection when enabled via `rtk.enabled` setting.
 //!
 //! Mirrors `cloudlands-fe/src/features/agent/main/rtk-detector.ts` including
-//! its exclusion lists (RTK_INTERNAL_COMMANDS and CONFLICTING_COMMANDS).
+//! its exclusion lists (`RTK_INTERNAL_COMMANDS` and `CONFLICTING_COMMANDS`).
 
 use std::process::Command;
 use std::sync::mpsc;

@@ -7,7 +7,7 @@
 //! (the note's stored content at request start). Subsequent full-content
 //! writes compute a single-hunk char-level diff of the new content against the
 //! doc's current text and apply it inside a `yrs` transaction; the merged
-//! resulting text is returned so the caller persists it to SQLite via the
+//! resulting text is returned so the caller persists it to `SQLite` via the
 //! normal `note.*` mutation flow (§5.2). The `yrs` state itself is never
 //! persisted.
 //!
