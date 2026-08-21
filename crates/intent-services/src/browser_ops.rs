@@ -64,6 +64,10 @@ pub struct BrowserExecArgs {
 /// invariants the daemon can check without touching the FE:
 ///   * `actions` is present, an array, and non-empty (`-32602` otherwise);
 ///   * `tabId` / `agentId` / `workspaceId`, when supplied, are strings.
+///
+/// # Errors
+///
+/// Returns an invalid-params `BrowserExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<BrowserExecArgs, BrowserExecError> {
     let actions = match params.get("actions") {
         Some(Value::Array(a)) => a.clone(),
@@ -124,6 +128,10 @@ pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
 /// `-32603` so the caller sees the FE's context. Missing / malformed `results`
 /// also surfaces as `-32603` — the daemon cannot invent a shape it did not
 /// receive.
+///
+/// # Errors
+///
+/// Returns an internal `BrowserExecError` when the frontend response is not an object, reports failure, or carries no results.
 pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
     let obj = fe_response.as_object().ok_or_else(|| {
         BrowserExecError::internal("browser.exec: frontend returned a non-object response")
@@ -182,6 +190,10 @@ pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
 ///
 /// The wire `browser.exec` client path keeps [`shape_result`] unchanged
 /// (PROTOCOL §5.14 maps envelope failure to `-32603`).
+///
+/// # Errors
+///
+/// Returns an internal `BrowserExecError` when the frontend response is not an object, reports failure without results, or carries no results.
 pub fn shape_agent_result(
     fe_response: Value,
     requested_actions: usize,

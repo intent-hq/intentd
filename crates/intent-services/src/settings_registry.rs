@@ -270,6 +270,10 @@ impl SettingsRegistry {
     /// keys are tolerated — their values are captured for the boot-time
     /// import-and-strip
     /// ([`SettingsRegistry::legacy_values`] / [`SettingsRegistry::strip_legacy`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the config file cannot be read or parsed.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let (file, legacy) = SettingsFile::load_or_init_with_legacy(&path)?;
@@ -349,6 +353,10 @@ impl SettingsRegistry {
 
     /// Current effective snapshot (cheap `Arc` clone; never blocks writers
     /// for longer than the pointer swap).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn snapshot(&self) -> Arc<SettingsSnapshot> {
         self.snapshot
             .read()
@@ -384,6 +392,10 @@ impl SettingsRegistry {
     }
 
     /// Current self-write generation (0 until the first `apply` write).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn generation(&self) -> u64 {
         self.inner
             .lock()
@@ -411,6 +423,14 @@ impl SettingsRegistry {
     /// the key rejects [`SettingsRegistry::apply`]. The pin value is
     /// validated against the typed schema. Does not notify subscribers —
     /// pinning happens at boot, before anyone subscribes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` for an unknown setting path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pin(&self, path: &str, value: Value, flag: &str) -> Result<()> {
         if !KNOWN_PATHS.contains(&path) {
             return Err(Error::InvalidParams(format!("unknown setting: {path}")));
@@ -441,6 +461,14 @@ impl SettingsRegistry {
     /// pinned keys are rejected with [`Error::InvalidParams`] before anything
     /// mutates. Returns the changed-key notice (also broadcast to
     /// subscribers when non-empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` for an unknown setting path or an invalid value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         for (path, _) in changes {
@@ -490,6 +518,14 @@ impl SettingsRegistry {
     /// registry state is untouched — the caller (live-reload watcher) keeps
     /// last-good. Returns the changed-key notice (also broadcast to
     /// subscribers when non-empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the config text is not valid TOML.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn reload(&self, text: &str) -> Result<SettingsChanged> {
         let file = SettingsFile::parse_str(text)?;
         let doc: DocumentMut = text

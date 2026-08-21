@@ -1253,6 +1253,14 @@ impl Services {
     /// already watched in memory is pruned — so duplicate rows persisted by
     /// a pre-invariant daemon are coalesced onto the single strongest watch
     /// on upgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if listing the persisted completion watches fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
         let mut persisted = self.store.list_completion_watches().await?;
         // Strongest-first: grouped (0) < ungrouped (1), with the store's

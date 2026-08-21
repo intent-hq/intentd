@@ -71,10 +71,22 @@ pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 pub trait SecretStore: Send + Sync {
     /// Return the stored secret for `account`. `Ok(None)` when confirmed absent;
     /// `Err` on timeout / backing-store failure so snapshot capture can fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on timeout or backing-store failure, so snapshot capture can fail closed.
     fn load(&self, account: &str) -> Result<Option<String>>;
     /// Persist `value` for `account`, replacing any existing secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret cannot be persisted.
     fn store(&self, account: &str, value: &str) -> Result<()>;
     /// Delete the secret for `account`; absence is an idempotent success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing store fails; absence is not an error.
     fn delete(&self, account: &str) -> Result<()>;
 }
 
@@ -1554,6 +1566,10 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
 /// — the next boot re-runs the import, which idempotently overwrites the same
 /// rows and retries the strip. Returns the stripped paths (empty when the
 /// file had no legacy keys or the rewrite failed).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if encoding a legacy value or persisting it to the store fails.
 pub async fn import_legacy_settings(
     registry: &SettingsRegistry,
     store: &Store,
@@ -1609,6 +1625,10 @@ pub async fn import_legacy_settings(
 /// discard the valid siblings the same boot that strips the legacy table. A
 /// member that fails the typed schema is skipped with a warning and the rest
 /// still carry over.
+///
+/// # Errors
+///
+/// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
 pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
     let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
         return Ok(());
@@ -1659,6 +1679,10 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
 /// no longer has a catalog entry or any reader; delete its row so stale
 /// state cannot resurface if the key ever returns. Idempotent — deleting an
 /// absent row is a no-op.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if deleting the settings row fails.
 pub async fn cleanup_retired_settings(store: &Store) -> Result<()> {
     if store
         .delete_setting(RETIRED_WORKSPACE_OVERRIDES_PATH)
@@ -1678,6 +1702,10 @@ pub async fn cleanup_retired_settings(store: &Store) -> Result<()> {
 /// default (`["Intent"]`) applies again. Any other stored value — a
 /// user-modified list, or even a malformed blob — is never touched.
 /// Idempotent — an absent or non-matching row is a no-op.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if reading or deleting the stored setting fails.
 pub async fn migrate_default_vocabulary(store: &Store) -> Result<()> {
     let Some(raw) = store.get_setting(VOICE_VOCABULARY_PATH).await? else {
         return Ok(());

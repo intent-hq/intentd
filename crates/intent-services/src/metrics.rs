@@ -36,6 +36,10 @@ struct Acc {
 /// deltas are not computed). The per-agent breakdown is rewritten from scratch
 /// so stale agents drop out. When a workspace has no tracked changes the rows
 /// are deleted so reads return `null`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if a store read or write fails.
 pub async fn recompute(store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
     let rows = store.list_tracked_changes(workspace_id).await?;
     if rows.is_empty() {

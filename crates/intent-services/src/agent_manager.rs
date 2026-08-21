@@ -998,6 +998,10 @@ impl ProcessRegistry {
     /// status read never perturbs admission state. `queued_spawns` counts
     /// live waiters (dropped receivers excluded), whether they queued on the
     /// slot cap or the budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn budget_status(&self) -> Option<(u64, Option<u64>, u64)> {
         let budget = self.memory.get()?;
         let inner = self.inner.lock().unwrap();
@@ -1059,6 +1063,10 @@ impl ProcessRegistry {
     }
 
     /// Number of registered processes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn size(&self) -> usize {
         self.inner.lock().unwrap().entries.len()
     }
@@ -1071,6 +1079,10 @@ impl ProcessRegistry {
 
     /// Register a freshly spawned process (starts idle). `kill` tears the
     /// process down when the registry evicts/reaps it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn register(&self, agent_id: AgentId, kill: KillFn) {
         self.inner.lock().unwrap().entries.insert(
             agent_id,
@@ -1084,6 +1096,10 @@ impl ProcessRegistry {
 
     /// Remove a process and wake the next queued spawn, if any. When a waiter is
     /// resumed, logs + emits `agent:process:resumed` via the event callback.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn deregister(&self, agent_id: &AgentId) -> bool {
         let resumed_agent = {
             let mut inner = self.inner.lock().unwrap();
@@ -1174,6 +1190,10 @@ impl ProcessRegistry {
     /// also prevent several of them, and one that prevents them kills the work
     /// agents exist to do. Admission is the only lever that is cheap, reversible,
     /// and never wrong about which agent to punish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn acquire(&self, agent_id: &AgentId) {
         loop {
             enum Action {
@@ -2159,6 +2179,10 @@ impl AgentManager {
     /// this costs one non-blocking syscall per live handle. An indeterminate
     /// `try_wait` error is treated as reaped: the pid cannot be trusted, and
     /// its subtree falls back to the aggregate rather than a wrong bucket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn agent_root_pids(&self) -> HashMap<u32, AgentId> {
         self.handles
             .lock()
@@ -2190,6 +2214,10 @@ impl AgentManager {
     }
 
     /// Number of tracked agents.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn len(&self) -> usize {
         self.handles.lock().unwrap().len()
     }
@@ -2200,6 +2228,10 @@ impl AgentManager {
     }
 
     /// Whether `agent_id` is currently tracked (lookup).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn contains(&self, agent_id: &AgentId) -> bool {
         self.handles.lock().unwrap().contains_key(agent_id)
     }
@@ -2227,6 +2259,14 @@ impl AgentManager {
     /// client-served request loop, and track it. Each connection's pending-id
     /// correlation lives in `intent-acp`; the manager keys the handle by
     /// `AgentId` and registers it for lifecycle/eviction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist or the agent is being stopped; `Error::Internal` if MCP bridge setup, config/rules file writes, the pi CLI probe, or spawning the provider process fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn create_agent(
         &self,
         agent_id: AgentId,
@@ -2797,6 +2837,14 @@ impl AgentManager {
     ///    persist it write-once.
     ///
     /// Returns the `acpSessionId` to drive [`AgentManager::run_turn`] (§6.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent is not tracked; `Error::Internal` if the ACP handshake fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn start_session(
         &self,
         agent_id: &AgentId,
@@ -3574,6 +3622,14 @@ impl AgentManager {
     /// updates onto the event bus via the M3.4 router (`run_prompt_turn`).
     /// `turn_id` is the turn correlation id (monorepo#1022) stamped on the
     /// failure-arm `agent:failed`; bare callers (tests) may pass `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent is not tracked, and propagates failures from the prompt turn (e.g. `Error::Internal` when `session/prompt` fails).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn run_turn(
         &self,
         agent_id: &AgentId,
@@ -4146,6 +4202,14 @@ impl AgentManager {
     /// already hold an in-memory payload are skipped (defensive; at boot the
     /// map is empty). Undecodable payloads are dropped from the store (they
     /// can never be consumed) and skipped. Returns the number rehydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted stop-redelivery rows fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_stop_redeliveries(&self) -> Result<usize> {
         let rows = self.services.store.load_all_stop_redeliveries().await?;
         let mut count = 0;
@@ -4701,6 +4765,10 @@ impl AgentManager {
     /// the ACP turn through [`AgentManager::run_turn`], and drains the queue.
     /// Returns the TS-shaped `{ success, queued, messageId | queuedMessage }`
     /// where `messageId` IS the persisted row id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when the request options are invalid; `Error::NotFound` if the agent session does not exist. Turn failures propagate from the underlying run.
     pub async fn send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -5577,6 +5645,14 @@ impl AgentManager {
     ///    replays as `<supervisor>` XML on that prompt.
     /// 6. Send `content` as a fresh user message (normal
     ///    [`AgentManager::send_message`] path; stream events follow).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session or target message does not exist, and propagates failures from re-running the turn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn edit_and_regenerate(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -6197,6 +6273,14 @@ impl AgentManager {
     /// turn). Without this, an empty-queue retry was an invisible no-op: the
     /// agent parked in `pending` with no worker and the FE got a bare
     /// `{ ok: true }` (STAB-54).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist, and propagates failures from re-running the last turn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn agent_retry(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -6746,6 +6830,10 @@ impl AgentManager {
     /// Before stopping each in-flight agent, capture it as an interrupted session
     /// so the FE modal offers resumption on next launch — same as a crash (INT-41
     /// graceful-shutdown gap).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn shutdown(&self) {
         let ids: Vec<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
         let now = intent_core::now_iso();

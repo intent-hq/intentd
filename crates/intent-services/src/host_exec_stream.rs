@@ -64,6 +64,10 @@ pub struct HostExecStreamArgs {
 /// Parse a JSON-RPC params object into [`HostExecStreamArgs`]. Layers the
 /// streaming-only fields on top of [`host_exec::parse_args`] so validation is
 /// identical to the one-shot surface.
+///
+/// # Errors
+///
+/// Returns an invalid-params `HostExecError` when parameters are missing or malformed (e.g. both `stdin` and `stdinBase64` are set).
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, HostExecError> {
     let common = host_exec::parse_args(params)?;
     let request_id = params
@@ -150,6 +154,10 @@ impl HostExecStreamRegistry {
     }
 
     /// Number of live streams (test/diagnostics use).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn len(&self) -> usize {
         self.inner.lock().expect("registry poisoned").len()
     }
@@ -177,6 +185,14 @@ impl HostExecStreamRegistry {
     /// stdin after the (possibly empty) payload so a reader-to-EOF exits.
     /// Returns `Err(-32603)` for an unknown / already-finished `requestId` so
     /// the wire surface can surface a clear "no such stream" error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `HostExecError` when the stream is unknown, its stdin is not writable, or the stream has already closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn write(
         &self,
         request_id: &str,
@@ -211,6 +227,10 @@ impl HostExecStreamRegistry {
     /// Signal cancellation. Returns `true` when a live stream was flipped,
     /// `false` for an unknown / already-finished id (still surfaces `ok:true`
     /// on the wire so the surface is idempotent).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn cancel(&self, request_id: &str) -> bool {
         let map = self.inner.lock().expect("registry poisoned");
         match map.get(request_id) {
@@ -244,6 +264,10 @@ pub fn mint_request_id() -> String {
 /// live and the reader/stdin/wait tasks are running. Errors from validation or
 /// spawn are returned to the caller (mapped to `-32602` / `-32603`); once the
 /// child is up, all further outcomes surface on `host:exec:exit`.
+///
+/// # Errors
+///
+/// Returns a `HostExecError` if `cwd` cannot be resolved or spawning the process fails.
 pub async fn start_stream(
     api: &dyn WorkspaceApi,
     bus: EventBus,
