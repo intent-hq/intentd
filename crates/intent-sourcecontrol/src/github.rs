@@ -786,7 +786,7 @@ fn derive_status_context_state(state: &str) -> CheckState {
 }
 
 /// Map one `statusCheckRollup.contexts` node onto a [`RollupCheck`]. GraphQL
-/// `CheckRun` carries `status`/`conclusion` in SCREAMING_SNAKE_CASE (unlike
+/// `CheckRun` carries `status`/`conclusion` in `SCREAMING_SNAKE_CASE` (unlike
 /// the lowercase REST payload [`derive_check_state`] expects), so the values
 /// are lowercased before mapping; `StatusContext` uses the legacy `state`.
 fn map_rollup_context(value: &Value) -> Option<RollupCheck> {

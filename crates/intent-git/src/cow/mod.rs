@@ -1,9 +1,9 @@
 //! Copy-on-write directory cloning for CoW-capable filesystems.
 //!
 //! Provides `cow_probe` (capability check per volume pair) and `cow_clone` (clone
-//! a directory tree with CoW). Platform-specific implementations: macOS uses
+//! a directory tree with `CoW`). Platform-specific implementations: macOS uses
 //! `clonefile(2)`, Linux uses per-file `FICLONE` ioctl with a tree walk, Windows
-//! uses ReFS block cloning. Never falls back to a byte copy — returns
+//! uses `ReFS` block cloning. Never falls back to a byte copy — returns
 //! `Unsupported` instead.
 
 use intent_core::{Error, Result};
@@ -12,8 +12,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Cache of CoW support results keyed by (src volume ID, dst volume ID).
-/// The volume ID is platform-specific: macOS uses f_fsid, Linux uses st_dev.
+/// Cache of `CoW` support results keyed by (src volume ID, dst volume ID).
+/// The volume ID is platform-specific: macOS uses `f_fsid`, Linux uses `st_dev`.
 static PROBE_CACHE: OnceLock<Mutex<HashMap<(u64, u64), CowSupport>>> = OnceLock::new();
 
 fn get_cache() -> &'static Mutex<HashMap<(u64, u64), CowSupport>> {
@@ -37,12 +37,12 @@ mod windows;
 /// unless the namespaced env var is set.
 pub const TEST_COW_CLONE_UNSUPPORTED_PATH_ENV: &str = "INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH";
 
-/// CoW support result for a (src, dst) directory pair.
+/// `CoW` support result for a (src, dst) directory pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CowSupport {
-    /// CoW clone is supported for this volume pair.
+    /// `CoW` clone is supported for this volume pair.
     Supported,
-    /// CoW clone is not supported (different volumes, unsupported filesystem, etc.).
+    /// `CoW` clone is not supported (different volumes, unsupported filesystem, etc.).
     Unsupported,
 }
 
@@ -71,14 +71,14 @@ impl From<best_effort::WalkStats> for CowCloneStats {
     }
 }
 
-/// Probe whether CoW directory cloning is supported from `src_dir` to `dst_dir`.
+/// Probe whether `CoW` directory cloning is supported from `src_dir` to `dst_dir`.
 ///
 /// This performs a live probe on first call for each (src volume, dst volume) pair,
 /// then caches the result. Creates a tiny temp file in `src_dir` and attempts a real
 /// clone into `dst_dir`. Interprets `EOPNOTSUPP`/`ENOTSUP`/`EXDEV` as `Unsupported`.
 ///
 /// # Errors
-/// Returns an error for I/O failures unrelated to CoW support (e.g., permission
+/// Returns an error for I/O failures unrelated to `CoW` support (e.g., permission
 /// denied, disk full). `Unsupported` is returned as `Ok(CowSupport::Unsupported)`,
 /// not as an error.
 pub fn cow_probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
@@ -134,24 +134,24 @@ fn get_volume_pair(_src: &Path, _dst: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Clone a directory tree from `src` to `dst` using CoW.
+/// Clone a directory tree from `src` to `dst` using `CoW`.
 ///
 /// - macOS: a single whole-tree `clonefile(2)` (clones socket/FIFO nodes on
 ///   APFS), falling back to a best-effort per-entry walk when the whole-tree
 ///   clone fails as unsupported
 /// - Linux: best-effort tree walk + per-file `FICLONE` ioctl
-/// - Windows: ReFS block cloning via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+/// - Windows: `ReFS` block cloning via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
 ///
 /// The Unix walk skips genuinely non-clonable entries (sockets/FIFOs/device
 /// nodes, nested mounts, per-entry unsupported errnos) with logging instead
 /// of failing the clone; real I/O errors on regular files still fail.
 ///
 /// `dst` must not exist. Never falls back to a byte copy — returns
-/// `Error::Unsupported` if CoW is unavailable. On failure, a partially
+/// `Error::Unsupported` if `CoW` is unavailable. On failure, a partially
 /// cloned `dst` is removed best-effort (safe: `dst` did not exist on entry).
 ///
 /// # Errors
-/// - `Error::Unsupported` if CoW is not available for this (src, dst) pair
+/// - `Error::Unsupported` if `CoW` is not available for this (src, dst) pair
 /// - `Error::InvalidInput` if `dst` already exists or `src` doesn't exist
 /// - `Error::Internal` for other I/O failures
 pub fn cow_clone(src: &Path, dst: &Path) -> Result<()> {

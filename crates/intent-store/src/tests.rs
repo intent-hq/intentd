@@ -1,4 +1,4 @@
-//! Unit tests: open a temp SQLite DB, run migrations, and round-trip
+//! Unit tests: open a temp `SQLite` DB, run migrations, and round-trip
 //! workspaces and notes including the `include_archived` filter.
 
 use std::path::PathBuf;
@@ -889,7 +889,7 @@ async fn append_note_version_rolls_back_on_body_error() {
 
 /// Regression for monorepo#657: a failed COMMIT in `append_note_version`
 /// must roll the transaction back so the sole write-pool connection
-/// (max_connections=1) is not returned to the pool still holding an open
+/// (`max_connections=1`) is not returned to the pool still holding an open
 /// transaction + write lock. `defer_foreign_keys = ON` postpones a
 /// ghost-note FK violation to COMMIT time, forcing the COMMIT itself to
 /// fail; pre-fix code propagated the error without ROLLBACK, poisoning the
@@ -1969,8 +1969,8 @@ async fn comment_update_preserves_legacy_extra_keys() {
 /// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
 /// `set_thread_status` all scope by `(id, workspace_id)`, so a caller
 /// declaring workspace B cannot mutate a comment row that belongs to
-/// workspace A. Bare-id probes surface as NotFound / zero-row updates
-/// depending on the mutation shape (mirrors the note_repo 0022 pattern).
+/// workspace A. Bare-id probes surface as `NotFound` / zero-row updates
+/// depending on the mutation shape (mirrors the `note_repo` 0022 pattern).
 #[tokio::test]
 async fn comment_mutations_reject_cross_workspace_bare_id_writes() {
     let tmp = TempDb::new();
@@ -2260,10 +2260,10 @@ async fn event_metadata_round_trips_through_store() {
 }
 
 /// Regression for monorepo#670: a failed COMMIT in `insert_events` must roll
-/// the transaction back so the sole write-pool connection (max_connections=1)
+/// the transaction back so the sole write-pool connection (`max_connections=1`)
 /// is not returned to the pool still holding an open transaction + write
 /// lock. The `event` table has no FK on `workspace_id`, so unlike the
-/// note_version variant this test plants a trap: a trigger on `event`
+/// `note_version` variant this test plants a trap: a trigger on `event`
 /// inserts into a table whose FK is `DEFERRABLE INITIALLY DEFERRED`, so the
 /// violation only surfaces at COMMIT time, forcing the COMMIT itself to
 /// fail. Pre-fix code propagated the error without ROLLBACK, poisoning the
@@ -2811,7 +2811,7 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
 
 /// Finding F4 (fsync half): `connect()` sets `PRAGMA synchronous = NORMAL`
 /// (safe under WAL) to cut fsync load on high-write workloads. This test
-/// asserts that a fresh pool has `synchronous = NORMAL` (2 in SQLite's integer
+/// asserts that a fresh pool has `synchronous = NORMAL` (2 in `SQLite`'s integer
 /// encoding: 0=OFF, 1=NORMAL, 2=FULL).
 #[tokio::test]
 async fn connect_sets_synchronous_normal_under_wal() {
@@ -3044,7 +3044,7 @@ async fn retention_delete_query_plan_uses_index() {
 /// Disk-space reclamation: a freshly created database is in
 /// `auto_vacuum = INCREMENTAL` mode, pages emptied by retention deletes land
 /// on the freelist, and bounded `Store::incremental_vacuum` calls actually
-/// release them (freelist shrinks, logical page_count drops).
+/// release them (freelist shrinks, logical `page_count` drops).
 #[tokio::test]
 async fn incremental_vacuum_releases_freelist_pages() {
     let tmp = TempDb::new();
@@ -3134,7 +3134,7 @@ async fn incremental_vacuum_releases_freelist_pages() {
 }
 
 /// One-time activation (monorepo#720 finding 1): a legacy database created
-/// without auto_vacuum stays in NONE mode when reopened through `Store::open`
+/// without `auto_vacuum` stays in NONE mode when reopened through `Store::open`
 /// (the connect pragma is recorded but inert), so
 /// `Store::activate_incremental_vacuum` must run a VACUUM that converts it to
 /// incremental mode, shrinks the file, and makes subsequent bounded
@@ -3516,7 +3516,7 @@ async fn agent_session_attention_request_round_trip_and_clear() {
 /// G9 regression (attention-clobber race): the full-row
 /// `update_agent_session` must NOT write the `attention_request_*` columns.
 /// A long-lived in-memory `AgentSession` persisted mid-race can therefore
-/// neither resurrect a request that `clear_attention_request` already NULLed
+/// neither resurrect a request that `clear_attention_request` already `NULLed`
 /// nor clobber a fresh one written by `set_attention_request` in the interim.
 #[tokio::test]
 async fn full_row_update_never_touches_attention_request_columns() {
@@ -3798,7 +3798,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
     assert_eq!(resolved.as_deref(), Some("Opus 4.8"));
 }
 
-/// `set_agent_session_status` stop_reason parameter: `None` leaves the column
+/// `set_agent_session_status` `stop_reason` parameter: `None` leaves the column
 /// untouched; `Some(None)` clears it to NULL; `Some(Some(reason))` sets the
 /// new value. Exercises the three-way encoding for set/clear/leave-unchanged
 /// across a status update. `stop_reason_timestamp` is coupled: set → stamped
@@ -5098,9 +5098,9 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
 }
 
 /// Concurrent write + read stress test: verify that the single-writer pool
-/// eliminates SQLITE_BUSY (code 5) errors under heavy concurrent load.
+/// eliminates `SQLITE_BUSY` (code 5) errors under heavy concurrent load.
 /// Spawns ~50 concurrent writes + concurrent reads; all must succeed without
-/// busy_timeout errors, and no read may be latency-coupled to the write storm
+/// `busy_timeout` errors, and no read may be latency-coupled to the write storm
 /// (which is what a shared read/write pool regression looks like).
 #[tokio::test]
 async fn concurrent_writes_no_sqlite_busy() {
@@ -5219,7 +5219,7 @@ async fn concurrent_writes_no_sqlite_busy() {
 
 /// Test the periodic WAL checkpoint task: verify it runs on schedule and stops
 /// cleanly when the handle is aborted. The task runs every 60s and executes
-/// PRAGMA wal_checkpoint(PASSIVE) via the write pool.
+/// PRAGMA `wal_checkpoint(PASSIVE)` via the write pool.
 #[tokio::test]
 async fn periodic_wal_checkpoint_runs_and_stops() {
     let tmp = TempDb::new();
@@ -5250,10 +5250,10 @@ async fn periodic_wal_checkpoint_runs_and_stops() {
     assert_eq!(loaded.len(), 1);
 }
 
-/// Smoke test: verify the two-pool split sizing (write pool max_connections=1,
-/// read pool max_connections=32) and that both pools support basic queries.
+/// Smoke test: verify the two-pool split sizing (write pool `max_connections=1`,
+/// read pool `max_connections=32`) and that both pools support basic queries.
 /// The write pool is single-connection to serialize all mutations and eliminate
-/// in-process writer-vs-writer busy_timeout contention. The read pool size (32)
+/// in-process writer-vs-writer `busy_timeout` contention. The read pool size (32)
 /// is sized to absorb the client-driven startup read burst without slow-acquire
 /// warnings (STAB-6, STAB-46), scaled up from 16 for the RAM-based agent
 /// process cap raise to 56 (intent-hq/intentd#296).
@@ -5659,7 +5659,7 @@ async fn agent_queue_load_defaults_null_turn_id_to_row_id() {
     );
 }
 
-/// A transient SQLITE_BUSY error as surfaced by the repositories
+/// A transient `SQLITE_BUSY` error as surfaced by the repositories
 /// (monorepo#1139: "get note failed: ... (code: 5) database is locked").
 fn busy_error() -> Error {
     Error::Internal(
@@ -5705,9 +5705,9 @@ async fn read_retry_does_not_retry_non_busy_errors() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// Extended busy-family codes (261 SQLITE_BUSY_RECOVERY, 517
-/// SQLITE_BUSY_SNAPSHOT, 773 SQLITE_BUSY_TIMEOUT) are retried like the base
-/// `(code: 5)`, while unrelated 5xx codes (e.g. 516 SQLITE_ABORT_ROLLBACK)
+/// Extended busy-family codes (261 `SQLITE_BUSY_RECOVERY`, 517
+/// `SQLITE_BUSY_SNAPSHOT`, 773 `SQLITE_BUSY_TIMEOUT`) are retried like the base
+/// `(code: 5)`, while unrelated 5xx codes (e.g. 516 `SQLITE_ABORT_ROLLBACK`)
 /// are not.
 #[tokio::test]
 async fn read_retry_classifies_busy_family_codes() {

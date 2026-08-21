@@ -1,4 +1,4 @@
-//! OpenAI transcription provider (`POST /v1/audio/transcriptions`, multipart).
+//! `OpenAI` transcription provider (`POST /v1/audio/transcriptions`, multipart).
 //!
 //! Uses the configured model (`voice.openai.model`, default
 //! `gpt-4o-transcribe`) and falls back to `whisper-1` when the selected model
@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::engine::{TranscribeRequest, Transcript, VoiceEngine};
 use crate::error::{Error, Result};
 
-/// Default OpenAI REST base URL.
+/// Default `OpenAI` REST base URL.
 pub(crate) const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
 
 /// Default transcription model (the `voice.openai.model` catalog default).
@@ -24,7 +24,7 @@ const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
 /// Fallback model when the selected model is unavailable on the account.
 const FALLBACK_MODEL: &str = "whisper-1";
 
-/// OpenAI implementation of [`VoiceEngine`].
+/// `OpenAI` implementation of [`VoiceEngine`].
 pub(crate) struct OpenAiEngine {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.

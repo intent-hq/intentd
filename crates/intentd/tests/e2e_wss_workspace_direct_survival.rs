@@ -14,8 +14,8 @@
 //!
 //! The `direct` outcome is forced deterministically via the
 //! `INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH` daemon seam, so the test does
-//! not depend on host CoW support: on a non-CoW filesystem the duplicate's
-//! probe already selects `direct`, and on a CoW filesystem the seam makes the
+//! not depend on host `CoW` support: on a non-CoW filesystem the duplicate's
+//! probe already selects `direct`, and on a `CoW` filesystem the seam makes the
 //! clone itself report Unsupported, exercising the standalone-source retry arm
 //! that falls back to a plain local clone (never a linked worktree).
 //!

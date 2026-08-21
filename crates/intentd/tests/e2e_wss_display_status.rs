@@ -911,7 +911,7 @@ async fn blocked_transition_over_wss() {
 /// leave `displayStatus: "idle"` and emit no
 /// `workspace:displayStatus-changed`. A `review_required` flag reads as
 /// `needs_attention` and `workspace.dismissAttention` retires it; the ordered
-/// event stream (first event observed is the review_required promotion)
+/// event stream (first event observed is the `review_required` promotion)
 /// proves the unread mutations stayed silent.
 #[tokio::test]
 async fn attention_flag_transitions_over_wss() {

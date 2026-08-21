@@ -1,7 +1,7 @@
 //! Strongly-typed entity identifiers (§9.6).
 //!
 //! Each id is a transparent newtype wrapping a UUID string. `new()` mints a
-//! fresh UUIDv4; `Display`/`FromStr` and `From` conversions round-trip the
+//! fresh `UUIDv4`; `Display`/`FromStr` and `From` conversions round-trip the
 //! underlying string so ids serialize identically to the existing TS wire
 //! format (`#[serde(transparent)]`).
 
@@ -19,7 +19,7 @@ macro_rules! id_newtype {
         pub struct $name(pub String);
 
         impl $name {
-            /// Mint a new id backed by a fresh UUIDv4.
+            /// Mint a new id backed by a fresh `UUIDv4`.
             pub fn new() -> Self {
                 Self(Uuid::new_v4().to_string())
             }

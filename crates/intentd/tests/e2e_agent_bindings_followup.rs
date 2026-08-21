@@ -1,6 +1,6 @@
-//! E2E coverage follow-up part 3 — agent_ops services (PR C).
+//! E2E coverage follow-up part 3 — `agent_ops` services (PR C).
 //!
-//! Hermetic Services-level tests exercising agent_ops service methods. Tests cover:
+//! Hermetic Services-level tests exercising `agent_ops` service methods. Tests cover:
 //! agent.subscribe, agent.diagnostics, agent.status, agent.list, agent.readConversation,
 //! agent.summary via in-process Services pattern (not spawned processes).
 //! All tests assert concrete response contracts unconditionally.

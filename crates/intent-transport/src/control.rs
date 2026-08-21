@@ -46,7 +46,7 @@ pub struct SystemStatus {
     pub arch: String,
     /// Whether a GUI/display is available on the host (§12.3).
     pub has_display: bool,
-    /// The AgentManager concurrency cap (resolved maxConcurrent incl. auto-detection).
+    /// The `AgentManager` concurrency cap (resolved maxConcurrent incl. auto-detection).
     pub max_agents: usize,
     /// The daemon crate version (`CARGO_PKG_VERSION`).
     pub version: String,

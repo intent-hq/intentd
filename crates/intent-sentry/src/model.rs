@@ -118,7 +118,7 @@ pub struct SentryIssueResult {
     pub project_slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Error type from `metadata.type` (e.g. "TypeError").
+    /// Error type from `metadata.type` (e.g. "`TypeError`").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
     /// Error message detail from `metadata.value`.

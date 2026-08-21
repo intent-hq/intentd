@@ -332,7 +332,7 @@ impl Store {
     /// `Store::write_acp_session_id` / `Store::update_workspace_token_usage`):
     /// IMMEDIATE mode acquires the RESERVED (write) lock upfront, avoiding the
     /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
     /// `max_connections=1` on the write pool, in-process writers serialize at
     /// `pool.acquire()`. The `with_write_txn_retry` wrapper (STAB-7) is kept as
     /// belt-and-braces: `BEGIN IMMEDIATE` can still return BUSY when a

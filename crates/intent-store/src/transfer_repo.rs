@@ -187,7 +187,7 @@ impl Store {
     ///
     /// Batched to exactly two statements — one `pragma_table_info` join for
     /// every table's columns, one `UNION ALL` aggregate over all tables — so
-    /// the `workspace.transfer.plan` dispatch stays within the rpc_profile
+    /// the `workspace.transfer.plan` dispatch stays within the `rpc_profile`
     /// statement budget instead of issuing 2 statements per table
     /// (intent-hq/monorepo#2994).
     pub async fn transfer_table_stats(
@@ -283,7 +283,7 @@ impl Store {
     }
 
     /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
-    /// (`column name → value`), in table order. Values map SQLite storage
+    /// (`column name → value`), in table order. Values map `SQLite` storage
     /// classes to JSON: NULL → `null`, INTEGER → number, REAL → number,
     /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
     /// payload the export archive writes to `rows/<table>.jsonl` and
@@ -386,7 +386,7 @@ impl Store {
     }
 }
 
-/// Serialize one SQLite row to a JSON object keyed by column name (see
+/// Serialize one `SQLite` row to a JSON object keyed by column name (see
 /// [`Store::transfer_export_rows`] for the storage-class mapping).
 fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json::Value> {
     let mut object = serde_json::Map::with_capacity(row.columns().len());
@@ -420,7 +420,7 @@ fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json:
     Ok(serde_json::Value::Object(object))
 }
 
-/// Bind one exported JSON value back to its SQLite storage class (the inverse
+/// Bind one exported JSON value back to its `SQLite` storage class (the inverse
 /// of [`row_to_json`]).
 fn bind_json_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,

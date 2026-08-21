@@ -35,7 +35,7 @@ impl Store {
     /// Returns the persisted list read back from the store so callers can
     /// forward it verbatim to `workspace:context-changed` subscribers.
     ///
-    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
     pub async fn replace_workspace_context_items(
         &self,

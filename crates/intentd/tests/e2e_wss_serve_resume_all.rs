@@ -39,7 +39,7 @@ use tokio_tungstenite::WebSocketStream;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// Short base under /tmp (UDS `SUN_LEN` cap); the returned guard removes the
 /// dir on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
 fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wra-")

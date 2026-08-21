@@ -36,14 +36,14 @@ enum RunErr {
     Engine(String),
 }
 
-/// Evaluate a snippet of user JavaScript inside a fresh QuickJS context.
+/// Evaluate a snippet of user JavaScript inside a fresh `QuickJS` context.
 ///
 /// User `code` is wrapped as `(async () => { <code> })()`, its resolved value
 /// is JSON-serialized inside the runtime, and the result is returned as a
 /// [`serde_json::Value`]. `undefined` maps to `Value::Null`.
 ///
 /// A wall-clock budget from `opts.timeout` is enforced by:
-///   1. A QuickJS interrupt handler that raises an uncatchable exception once
+///   1. A `QuickJS` interrupt handler that raises an uncatchable exception once
 ///      the deadline is reached — kills hot loops that never yield.
 ///   2. An outer [`tokio::time::timeout`] with a small safety margin — bounds
 ///      pending `await`s whose futures otherwise never resolve.

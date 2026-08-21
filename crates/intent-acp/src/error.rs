@@ -25,7 +25,7 @@ pub struct JsonRpcError {
 /// Cap on the rendered `data` payload appended by [`JsonRpcError`]'s Display
 /// (monorepo#519): `data` is provider-controlled and unbounded, and the
 /// rendered string flows into `stop_reason` persistence, `agent:failed`
-/// events, and logs. Sized so real actionable details (e.g. the ChatGPT
+/// events, and logs. Sized so real actionable details (e.g. the `ChatGPT`
 /// backend 400 nested by codex-acp, ~300 bytes — monorepo#479) render in
 /// full while pathological payloads stay bounded.
 pub(crate) const MAX_RENDERED_DATA_BYTES: usize = 1024;

@@ -1,5 +1,5 @@
 //! `intentd import --from <dir>` — migrate a legacy Intent (Electron) install
-//! into intentd's SQLite store (§9.7).
+//! into intentd's `SQLite` store (§9.7).
 //!
 //! The importer is **read-only** toward the source (it only ever reads files)
 //! and **idempotent** (every entity is upserted by id, so re-running never

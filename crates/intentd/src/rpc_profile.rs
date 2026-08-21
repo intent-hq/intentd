@@ -19,7 +19,7 @@
 //! ([`DEFAULT_NETWORK_DURATION_WARN_MS`]) so normal upstream latency doesn't
 //! drown out the local-regression signal; every other method keeps the
 //! default budget ([`DEFAULT_DURATION_WARN_MS`]; catches fs walks / git scans
-//! that never touch SQLite). The statement-count budget is tiered the same
+//! that never touch `SQLite`). The statement-count budget is tiered the same
 //! way: legitimately compound multi-entity ops
 //! ([`is_compound_statement_method`] — `workspace.create`) get a higher
 //! default budget ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`]) so their

@@ -638,7 +638,7 @@ async fn e2e_idle_session_reaping() {
     drop(daemon);
 }
 
-/// One-time auto_vacuum activation at startup (monorepo#720 finding 1): boot a
+/// One-time `auto_vacuum` activation at startup (monorepo#720 finding 1): boot a
 /// REAL `intentd serve` on a pre-seeded legacy database in `auto_vacuum = NONE`
 /// mode and assert the daemon serves normally while the startup VACUUM has
 /// converted the file to incremental mode, so retention-loop

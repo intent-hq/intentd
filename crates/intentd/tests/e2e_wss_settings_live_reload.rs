@@ -286,7 +286,7 @@ fn atomic_write(path: &Path, content: &str) {
 /// by polling daemon.log for the readiness line the composition root emits
 /// (`spawn_config_watcher_init` in `crates/intentd/src/main.rs`). The
 /// watcher registers in a background task (monorepo#1581), so a fast test
-/// can otherwise hand-edit config.toml before the FSEvents watch exists and
+/// can otherwise hand-edit config.toml before the `FSEvents` watch exists and
 /// the edit is missed entirely — no wait on `settings:changed`, however
 /// long, can recover it (monorepo#1849). Bounded by [`LIVENESS`]; fails
 /// fast if the daemon reports the watcher failed to start.

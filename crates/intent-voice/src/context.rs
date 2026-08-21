@@ -3,19 +3,19 @@
 //! The daemon biases every transcription with a user-editable vocabulary
 //! (the `voice.vocabulary` setting, read per call by the service layer),
 //! plus a short style hint for prompt-based providers. Request-supplied
-//! context (`prompt`, `keyterms`) is merged on top: OpenAI receives one
-//! composed `prompt` string; ElevenLabs receives the merged `keyterms` array
+//! context (`prompt`, `keyterms`) is merged on top: `OpenAI` receives one
+//! composed `prompt` string; `ElevenLabs` receives the merged `keyterms` array
 //! (deduped case-insensitively, capped at [`MAX_KEYTERMS`], each term ≤
 //! [`MAX_KEYTERM_CHARS`] chars — the Scribe v2 limits).
 
-/// Style hint prefixed to the composed OpenAI `prompt`.
+/// Style hint prefixed to the composed `OpenAI` `prompt`.
 pub(crate) const OPENAI_STYLE_HINT: &str = "Technical dictation in a software-engineering app; \
      preserve code identifiers and file paths verbatim.";
 
-/// ElevenLabs Scribe v2 keyterm cap (batch API allows up to 100 terms).
+/// `ElevenLabs` Scribe v2 keyterm cap (batch API allows up to 100 terms).
 pub(crate) const MAX_KEYTERMS: usize = 100;
 
-/// ElevenLabs Scribe v2 per-keyterm length cap.
+/// `ElevenLabs` Scribe v2 per-keyterm length cap.
 pub(crate) const MAX_KEYTERM_CHARS: usize = 50;
 
 /// Merge the configured `vocabulary` with request `keyterms`: vocabulary
@@ -41,7 +41,7 @@ pub fn merge_keyterms(vocabulary: &[String], request_keyterms: &[String]) -> Vec
     out
 }
 
-/// Compose the OpenAI `prompt`: style hint, then the merged vocabulary as a
+/// Compose the `OpenAI` `prompt`: style hint, then the merged vocabulary as a
 /// comma-separated list, then the request `prompt` (when present).
 pub fn compose_prompt(keyterms: &[String], request_prompt: Option<&str>) -> String {
     let mut prompt = String::from(OPENAI_STYLE_HINT);

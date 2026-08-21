@@ -6,7 +6,7 @@
 //! with (e.g. "intentd", "clippy", "submodule"). Pure functions only: no
 //! file, store, or network access.
 //!
-//! Candidates are identifier-shaped tokens (camelCase, snake_case,
+//! Candidates are identifier-shaped tokens (camelCase, `snake_case`,
 //! kebab-case, dotted, digit-bearing, ALL-CAPS acronyms) and plain or
 //! capitalized words that are absent from — or rare in — the embedded
 //! English frequency list. URLs, emails, hex strings, UUIDs, and pure

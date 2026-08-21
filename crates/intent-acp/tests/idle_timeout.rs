@@ -9,7 +9,7 @@ use tokio::time::sleep;
 
 use intent_acp::session::ActivityTracker;
 
-/// Unit test: ActivityTracker correctly tracks idle time.
+/// Unit test: `ActivityTracker` correctly tracks idle time.
 #[tokio::test]
 async fn activity_tracker_idle_measurement() {
     let tracker = ActivityTracker::new();

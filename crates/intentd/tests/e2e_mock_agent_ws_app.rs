@@ -1,13 +1,13 @@
 //! E2E coverage for chief-gated ws.app.* surface via mock ACP agent.
 //!
-//! Drives real MCP tool invocations through the workspace_api tool with the
+//! Drives real MCP tool invocations through the `workspace_api` tool with the
 //! mock-acp-agent.mjs fixture, asserting:
 //! - ws.app.workspaces.list returns user workspaces (never __chief__)
 //! - ws.app.agents.list returns agent metadata
 //! - ws.app.proposal.show persists application/vnd.intent.proposal+json resource
 //! - Non-chief workspace agents are gated from ws.app.*
 //!
-//! Pattern: reuses the harness from e2e_mock_agent_workspace_api_bindings.rs.
+//! Pattern: reuses the harness from `e2e_mock_agent_workspace_api_bindings.rs`.
 
 mod common;
 
@@ -792,7 +792,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
 /// envelope (`await ws.app.proposal.show(...)` then returns a plain object),
 /// so the tool output carries no `__mcpContentItems` at all — previously
 /// nothing registered and no card rendered while the JS saw `ok: true`.
-/// Drives the full mock-ACP path (tool_call_update → transcript writer) and
+/// Drives the full mock-ACP path (`tool_call_update` → transcript writer) and
 /// asserts the standalone proposal-resource block is still persisted from
 /// the binding-time registration + FIFO claim.
 #[tokio::test]

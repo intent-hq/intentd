@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 
 /// Cap on the serialized `attachments` payload of a `drafts.set` (rejected
-/// with `-32602` above this) to keep SQLite rows bounded (PROTOCOL §5.16).
+/// with `-32602` above this) to keep `SQLite` rows bounded (PROTOCOL §5.16).
 pub(crate) const MAX_ATTACHMENTS_BYTES: usize = 25 * 1024 * 1024;
 
 /// The three `drafts.*` methods, once classified.

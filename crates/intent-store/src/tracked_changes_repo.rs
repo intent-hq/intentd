@@ -58,10 +58,10 @@ impl Store {
     /// Upsert a tracked change keyed by `(workspace_id, path, stage, agent_id)`
     /// (monorepo#957): update the calling agent's existing row in place
     /// (preserving its id + `created_at`) or insert a new one with a minted
-    /// UUIDv7 id. Keying on the agent keeps one attribution row per agent when
+    /// `UUIDv7` id. Keying on the agent keeps one attribution row per agent when
     /// several agents touch the same path — a later touch by agent B no longer
     /// overwrites (and thus silently drops) agent A's attribution. `NULL`
-    /// agent_id (unattributed pipeline) rows key separately via `IS`. There is
+    /// `agent_id` (unattributed pipeline) rows key separately via `IS`. There is
     /// no UNIQUE index on this quad (the audit trail keeps history across
     /// stages), so the upsert is done by hand.
     ///

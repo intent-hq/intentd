@@ -786,7 +786,7 @@ fn workspace_api_error(text: &str) -> Value {
 }
 
 /// Render a [`JsError`] into the reference tool's error-text style. Syntax
-/// errors and `Cannot read properties of undefined` TypeErrors get a
+/// errors and `Cannot read properties of undefined` `TypeErrors` get a
 /// clearer human-facing rewrite; everything else falls through as `Error: …`.
 fn format_js_error(err: &JsError) -> String {
     match err {
@@ -816,7 +816,7 @@ fn format_js_error(err: &JsError) -> String {
     }
 }
 
-/// QuickJS reports syntax errors as bare `Error: ...` with an indicative
+/// `QuickJS` reports syntax errors as bare `Error: ...` with an indicative
 /// phrase in the body (e.g. `unexpected token`, `expected identifier`),
 /// unlike V8 which stamps `SyntaxError:` on the message. Match both so the
 /// friendlier prefix still triggers on either engine.
@@ -830,7 +830,7 @@ fn looks_like_syntax_error(msg: &str) -> bool {
 }
 
 /// Pull the property name out of a `Cannot read properties of undefined
-/// (reading 'foo')` TypeError message, matching the reference regex.
+/// (reading 'foo')` `TypeError` message, matching the reference regex.
 fn extract_missing_prop(msg: &str) -> Option<String> {
     let key = "(reading '";
     let start = msg.find(key)? + key.len();

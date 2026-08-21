@@ -1,6 +1,6 @@
 //! Wire-facing domain structs (§9.1). Every struct uses
 //! `#[serde(rename_all = "camelCase")]` so JSON matches the existing TS types
-//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / snake_case
+//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / `snake_case`
 //! string forms, which are also their stored DB representations.
 
 use std::collections::BTreeMap;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
-/// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
+/// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
 /// `Deleted`), matching the TS string enum exactly; these are also the stored DB
 /// words (the column DEFAULT is unused — inserts always bind explicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ pub enum WorkspaceAttention {
 }
 
 /// Pull-request lifecycle status (§9.1; TS `PullRequestStatus` in
-/// `src/shared/types.ts`). Wire values are the PascalCase variant names
+/// `src/shared/types.ts`). Wire values are the `PascalCase` variant names
 /// (`Open`/`Closed`/`Merged`/`Draft`), matching the TS string enum exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PullRequestStatus {
@@ -111,7 +111,7 @@ pub enum NoteVisibility {
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned canonical status rollup over the active/latest PR,
 /// `taskStats`, live agent activity, and the per-workspace attention axes.
-/// Wire values are the snake_case variant names, matching the FE union
+/// Wire values are the `snake_case` variant names, matching the FE union
 /// exactly. Canonical precedence (§6.5): `Failed` (a top-level agent parked
 /// in `error`) > `Blocked` (a top-level pending `blocker` attention
 /// request) > `NeedsAttention` (discussion requests, pending structured
@@ -242,8 +242,8 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
-    /// Whether CoW isolation is supported on this machine. Computed as:
-    /// cow_probe(workspacesRoot, workspacesRoot) Supported — a machine
+    /// Whether `CoW` isolation is supported on this machine. Computed as:
+    /// `cow_probe(workspacesRoot`, workspacesRoot) Supported — a machine
     /// capability of the workspaces root's filesystem, independent of the
     /// workspace or checkout mode. Used by the FE to gate the Copy-on-Write
     /// opt-in toggle.
@@ -609,7 +609,7 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scripts: Option<Vec<RepoScript>>,
 
-    /// Repo-root-relative directory prefixes excluded from CoW checkout
+    /// Repo-root-relative directory prefixes excluded from `CoW` checkout
     /// provisioning (`workspace.create`/`workspace.duplicate`): matching
     /// directories are not cloned into the checkout (e.g. huge caches that
     /// slow the clone down). `.git` and the repo root itself cannot be
@@ -787,7 +787,7 @@ pub struct WorkspaceCreate {
     pub repository_name: Option<String>,
     pub worktree_path: Option<String>,
     pub scope: Option<String>,
-    /// Opt out of the isolated checkout (worktree or CoW clone) and work
+    /// Opt out of the isolated checkout (worktree or `CoW` clone) and work
     /// directly in the repository folder. Canonical wire name is
     /// `skipIsolation`; `skipWorktree` is the deprecated pre-CoW alias
     /// (either set ⇒ direct mode). The persisted column keeps its historical
@@ -820,7 +820,7 @@ pub struct WorkspaceCreate {
     /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
     /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
     /// it as `data.progressId`, and provisioning paths that stream nothing
-    /// today (worktree / CoW / direct) emit milestone frames. Absent keeps
+    /// today (worktree / `CoW` / direct) emit milestone frames. Absent keeps
     /// the legacy event behavior exactly. Never persisted.
     pub progress_id: Option<String>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
@@ -2625,11 +2625,11 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
-    /// workspaces with CoW support). `None` for shared-mode agents.
+    /// workspaces with `CoW` support). `None` for shared-mode agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
     /// Sandbox path when this agent runs in a CoW-isolated sandbox. The full path
-    /// to the CoW clone of the workspace directory that serves as this agent's
+    /// to the `CoW` clone of the workspace directory that serves as this agent's
     /// working root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_path: Option<String>,
@@ -3177,8 +3177,8 @@ pub struct AgentDelegateInput {
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
     /// Sandbox isolation mode: "cow" (copy-on-write sandbox) or "shared" (default).
-    /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
-    /// the workspace directory. Falls back to shared mode if CoW is unsupported.
+    /// When "cow" and `CoW` is supported, the agent runs in an isolated `CoW` clone of
+    /// the workspace directory. Falls back to shared mode if `CoW` is unsupported.
     pub isolation: Option<String>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
@@ -3793,7 +3793,7 @@ mod tests {
 
     use serde_json::json;
 
-    /// [`last_tool_use_preview`] derivation: the LAST tool_use block wins,
+    /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
     /// an under-budget input passes through whole (no flags), an over-budget
     /// input is capped with the additive `inputTruncated`/`inputBytes`
     /// flags, a tool-less / non-array content yields `None`, and a missing
@@ -4287,7 +4287,7 @@ mod tests {
         }
     }
 
-    /// `WorkspaceStatus` serializes to the PascalCase TS `WorkspaceStatus` string
+    /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string
     /// enum (`src/shared/types.ts`): `Active`/`Inactive`/`Archived`/`Deleted`.
     #[test]
     fn workspace_status_wire_forms_match_ts() {
@@ -4305,7 +4305,7 @@ mod tests {
         }
     }
 
-    /// `Workspace` emits PascalCase `status` and omits absent optionals
+    /// `Workspace` emits `PascalCase` `status` and omits absent optionals
     /// (`skip_serializing_if`) so the iOS decoder sees the documented field set
     /// without nulls.
     #[test]
