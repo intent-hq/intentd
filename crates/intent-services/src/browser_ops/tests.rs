@@ -197,7 +197,7 @@ fn shape_agent_result_success_single_action_matches_shape_result() {
             { "action": "listTabs", "success": true, "result": [{ "id": "tab-1" }] }
         ]
     });
-    let shaped = shape_agent_result(fe.clone()).expect("single action shapes to one result");
+    let shaped = shape_agent_result(fe.clone(), 1).expect("single action shapes to one result");
     assert_eq!(shaped, shape_result(fe).unwrap());
 }
 
@@ -210,7 +210,7 @@ fn shape_agent_result_success_multi_action_matches_shape_result() {
             { "action": "screenshot", "success": true, "result": { "base64": "..." } }
         ]
     });
-    let shaped = shape_agent_result(fe.clone()).expect("multi action shapes to results[]");
+    let shaped = shape_agent_result(fe.clone(), 2).expect("multi action shapes to results[]");
     assert_eq!(shaped, shape_result(fe).unwrap());
 }
 
@@ -227,7 +227,8 @@ fn shape_agent_result_preserves_single_action_not_owner_failure() {
             "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
         }]
     });
-    let shaped = shape_agent_result(fe).expect("ownership failure stays structured, not an error");
+    let shaped =
+        shape_agent_result(fe, 1).expect("ownership failure stays structured, not an error");
     assert_eq!(shaped["action"], "resizeTab");
     assert_eq!(shaped["success"], json!(false));
     assert_eq!(shaped["errorCode"], "not-owner");
@@ -248,7 +249,7 @@ fn shape_agent_result_preserves_single_action_already_claimed_failure() {
             "error": "Tab tab-3 is owned by agent agent-42"
         }]
     });
-    let shaped = shape_agent_result(fe).expect("claim loss stays structured");
+    let shaped = shape_agent_result(fe, 1).expect("claim loss stays structured");
     assert_eq!(shaped["action"], "claimTab");
     assert_eq!(shaped["errorCode"], "already-claimed");
     assert_eq!(shaped["ownerAgentId"], "agent-42");
@@ -270,7 +271,7 @@ fn shape_agent_result_preserves_multi_action_partial_failure_envelope() {
             }
         ]
     });
-    let shaped = shape_agent_result(fe).expect("partial failure keeps per-action results");
+    let shaped = shape_agent_result(fe, 2).expect("partial failure keeps per-action results");
     assert_eq!(shaped["success"], json!(false));
     assert_eq!(shaped["error"], "1 of 2 actions failed");
     let arr = shaped["results"].as_array().expect("results preserved");
@@ -281,9 +282,36 @@ fn shape_agent_result_preserves_multi_action_partial_failure_envelope() {
 }
 
 #[test]
+fn shape_agent_result_multi_action_first_failure_keeps_envelope_shape() {
+    // The FE aborts a batch on the first failing action and returns the
+    // partial results collected so far: a 3-action batch failing at action 1
+    // comes back with results.len() == 1. The shape must key off the
+    // *request* arity, so a multi-action caller still gets the
+    // `{ success, results, error }` envelope, never a bare action envelope.
+    let fe = json!({
+        "success": false,
+        "error": "Tab tab-9 is not owned by you",
+        "results": [{
+            "action": "resizeTab",
+            "success": false,
+            "errorCode": "not-owner",
+            "ownerAgentId": "agent-7",
+            "error": "Tab tab-9 is owned by agent agent-7"
+        }]
+    });
+    let shaped = shape_agent_result(fe, 3).expect("aborted batch keeps envelope shape");
+    assert_eq!(shaped["success"], json!(false));
+    assert_eq!(shaped["error"], "Tab tab-9 is not owned by you");
+    let arr = shaped["results"].as_array().expect("results key present");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["errorCode"], "not-owner");
+    assert_eq!(arr[0]["ownerAgentId"], "agent-7");
+}
+
+#[test]
 fn shape_agent_result_failure_without_results_is_internal_error() {
     let fe = json!({ "success": false, "error": "CDP not attached" });
-    let err = shape_agent_result(fe).expect_err("no per-action detail to preserve");
+    let err = shape_agent_result(fe, 1).expect_err("no per-action detail to preserve");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("CDP not attached"));
 }
@@ -291,13 +319,21 @@ fn shape_agent_result_failure_without_results_is_internal_error() {
 #[test]
 fn shape_agent_result_failure_with_empty_results_is_internal_error() {
     let fe = json!({ "success": false, "error": "CDP not attached", "results": [] });
-    let err = shape_agent_result(fe).expect_err("empty results has nothing to preserve");
+    let err = shape_agent_result(fe, 1).expect_err("empty results has nothing to preserve");
+    assert_eq!(err.code, INTERNAL_ERROR);
+    assert!(err.message.contains("CDP not attached"));
+}
+
+#[test]
+fn shape_agent_result_failure_with_non_array_results_is_internal_error() {
+    let fe = json!({ "success": false, "error": "CDP not attached", "results": "oops" });
+    let err = shape_agent_result(fe, 2).expect_err("non-array results has nothing to preserve");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("CDP not attached"));
 }
 
 #[test]
 fn shape_agent_result_non_object_is_internal_error() {
-    let err = shape_agent_result(json!("nope")).expect_err("non-object is internal");
+    let err = shape_agent_result(json!("nope"), 1).expect_err("non-object is internal");
     assert_eq!(err.code, INTERNAL_ERROR);
 }

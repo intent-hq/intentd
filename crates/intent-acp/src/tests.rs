@@ -7655,8 +7655,11 @@ mod wsapi6_bindings_tests {
             // stands in for what the reverse channel would have returned.
             Box::pin(async move {
                 if let Some(envelope) = fe_envelope {
-                    return intent_services::browser_ops::shape_agent_result(envelope)
-                        .map_err(|e| intent_core::Error::Internal(e.message));
+                    return intent_services::browser_ops::shape_agent_result(
+                        envelope,
+                        actions.len(),
+                    )
+                    .map_err(|e| intent_core::Error::Internal(e.message));
                 }
                 if actions.len() == 1 {
                     Ok(json!({
@@ -7993,6 +7996,45 @@ mod wsapi6_bindings_tests {
         assert_eq!(v["ok"], json!(false));
         assert_eq!(v["code"], json!("already-claimed"));
         assert_eq!(v["owner"], json!("agent-42"));
+    }
+
+    // The FE aborts a batch on the first failing action, so the reply's
+    // partial `results` can be shorter than the request. A multi-action JS
+    // caller must still receive the `{ success, results, error }` envelope
+    // (never a bare action envelope), so `r.results.find(...)` always works.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r#"
+            const r = await ws.browser.exec([
+                { action: 'resizeTab', tabId: 'tab-9', width: 375 },
+                { action: 'screenshot' },
+                { action: 'listTabs' }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, count: r.results.length, code: failed.errorCode, owner: failed.ownerAgentId };
+            "#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["count"], json!(1));
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!("agent-7"));
     }
 
     #[tokio::test]

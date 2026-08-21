@@ -26463,6 +26463,44 @@ mod browser_exec_reverse {
         assert_eq!(results[1]["ownerAgentId"], "agent-42");
     }
 
+    // The FE aborts a batch on the first failing action and returns the
+    // partial results collected so far: a 3-action batch failing at action 1
+    // replies with a single result. The shape must key off the request
+    // arity, so multi-action callers still get the envelope form.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_shape() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 }),
+                    json!({ "action": "screenshot" }),
+                    json!({ "action": "listTabs" }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("aborted batch is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results key present");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["errorCode"], "not-owner");
+        assert_eq!(results[0]["ownerAgentId"], "agent-7");
+    }
+
     #[tokio::test]
     async fn browser_exec_failure_without_results_still_errors() {
         let dispatch = RecordingDispatch::with_reply(json!({

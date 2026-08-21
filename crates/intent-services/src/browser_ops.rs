@@ -165,31 +165,41 @@ pub fn shape_result(fe_response: Value) -> Result<Value, BrowserExecError> {
 /// ownerAgentId, error }` — and the browser docs promise agents these surface
 /// inside the per-action envelope, "never as a top-level failure"; flattening
 /// them into thrown prose loses `errorCode` / `ownerAgentId`, which agents
-/// need to react (claim the tab, name the owner). Single-action batches yield
-/// the lone action envelope (structured failure intact); multi-action batches
-/// yield the FE envelope (`success` / `results` / `error`) so callers can
-/// detect partial failure without scanning. A failure envelope *without*
-/// per-action results (transport/CDP-level breakage) still surfaces as
-/// `-32603` — there is no structure to preserve.
+/// need to react (claim the tab, name the owner).
+///
+/// `requested_actions` is the size of the *request* batch, not the reply: the
+/// FE aborts a batch on the first failing action and returns the partial
+/// `results` collected so far, so a 3-action batch failing at action 1 comes
+/// back with one result. Shaping by reply arity would hand a multi-action
+/// caller an unpredictable shape (bare envelope vs `results[]` depending on
+/// where the batch failed); keying on the request keeps the contract stable —
+/// single-action requests yield the lone action envelope (structured failure
+/// intact), multi-action requests yield the FE envelope
+/// (`success: false` / `results` / `error`, with `results` possibly shorter
+/// than the request on abort). A failure envelope *without* per-action
+/// results (transport/CDP-level breakage) still surfaces as `-32603` — there
+/// is no structure to preserve.
 ///
 /// The wire `browser.exec` client path keeps [`shape_result`] unchanged
 /// (PROTOCOL §5.14 maps envelope failure to `-32603`).
-pub fn shape_agent_result(fe_response: Value) -> Result<Value, BrowserExecError> {
-    let is_failure = fe_response
-        .as_object()
-        .is_some_and(|obj| obj.get("success").and_then(Value::as_bool) == Some(false));
-    if is_failure {
-        let obj = fe_response.as_object().expect("checked above");
-        if let Some(results) = obj.get("results").and_then(Value::as_array) {
-            if !results.is_empty() {
-                return match results.len() {
-                    1 => Ok(single_result_payload(&results[0])),
-                    _ => Ok(json!({
-                        "success": false,
-                        "results": results,
-                        "error": obj.get("error").cloned().unwrap_or(Value::Null),
-                    })),
-                };
+pub fn shape_agent_result(
+    fe_response: Value,
+    requested_actions: usize,
+) -> Result<Value, BrowserExecError> {
+    if let Some(obj) = fe_response.as_object() {
+        if obj.get("success").and_then(Value::as_bool) == Some(false) {
+            if let Some(results) = obj.get("results").and_then(Value::as_array) {
+                if !results.is_empty() {
+                    return if requested_actions == 1 {
+                        Ok(single_result_payload(&results[0]))
+                    } else {
+                        Ok(json!({
+                            "success": false,
+                            "results": results,
+                            "error": obj.get("error").cloned().unwrap_or(Value::Null),
+                        }))
+                    };
+                }
             }
         }
     }

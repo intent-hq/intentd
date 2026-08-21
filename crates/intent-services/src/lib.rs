@@ -24475,6 +24475,10 @@ impl WorkspaceApi for Services {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
+            // Shape by *request* arity: the FE aborts a batch on the first
+            // failing action, so the reply's results count can be shorter
+            // than the batch (see `shape_agent_result`).
+            let requested_actions = actions.len();
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
@@ -24494,7 +24498,8 @@ impl WorkspaceApi for Services {
                             Error::Internal(format!("browser.exec: {message}"))
                         }
                     })?;
-            browser_ops::shape_agent_result(response).map_err(|e| Error::Internal(e.message))
+            browser_ops::shape_agent_result(response, requested_actions)
+                .map_err(|e| Error::Internal(e.message))
         })
     }
 
