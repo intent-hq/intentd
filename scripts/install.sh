@@ -90,8 +90,11 @@ log_unit=""
 log_since=""
 restart_hint=""
 
-# Record where the service log ends before the service gets a chance to write
-# to it, and how to restart it once a human has fixed the cause.
+# Record where the service log ends, and how to restart the service once a
+# human has fixed the cause. Callers run this BEFORE starting/restarting the
+# service: a daemon that fails the instant it starts must still land inside
+# the boundary, so capturing it any later could exclude the very failure
+# verify_daemon needs to quote.
 #
 # macOS: the LaunchAgent's StandardErrorPath, built from the same $HOME the
 # plist writer interpolates (the label does not affect the log path).
@@ -153,9 +156,10 @@ report_daemon_log() {
 }
 
 # Poll `intentd status` until the daemon answers. First service start can be
-# slow: the sitter downloads the real daemon before serving.
+# slow: the sitter downloads the real daemon before serving. The caller must
+# have called note_log_start before starting the service, so the log window
+# quoted on failure covers the whole start.
 verify_daemon() {
-  note_log_start
   info "waiting for the daemon to respond (first start downloads the daemon binary)..."
   waited=0
   while [ "$waited" -lt 60 ]; do
@@ -173,18 +177,27 @@ verify_daemon() {
   # daemon that cannot start (it only gives up minutes after this 60s wait, so
   # this is the common case), or nothing crashed at all and the first download
   # is merely slow. Only the last of the three is a warning.
+  # An explicit on/off auto-resume answer is applied only after this check
+  # passes (apply_auto_resume runs after verify_daemon), so a failure here
+  # drops it — say so instead of dropping it silently.
+  auto_resume_note=""
+  case "${auto_resume:-}" in
+    on | off) auto_resume_note="
+Your auto-resume choice ('$auto_resume') was not applied; once the daemon is up, apply it with:
+  intentd settings agents.resumeInterruptedOnStart $auto_resume" ;;
+  esac
   log_out=$(service_log_tail)
   case "$log_out" in
     *"times in a row without ever staying up"*)
       report_daemon_log "$log_out"
       fail "the daemon could not start and the sitter has given up — the service is stopped.
 Fix the cause reported above, then start it again with:
-  $restart_hint" ;;
+  $restart_hint$auto_resume_note" ;;
     *"exited unexpectedly"* | *"failed to spawn"* | *"failed waiting on intentd"*)
       report_daemon_log "$log_out"
       fail "the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.
 Fix the cause reported above, then start it again with:
-  $restart_hint" ;;
+  $restart_hint$auto_resume_note" ;;
   esac
   warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
 }
@@ -318,6 +331,9 @@ EOF
   systemctl --user daemon-reload
   systemctl --user enable "$unit_name.service" 2>/dev/null \
     || warn "systemctl --user enable $unit_name failed — the service will not start at login"
+  # Log boundary before the start: a failure during the restart itself must
+  # land inside the window verify_daemon quotes.
+  note_log_start
   # restart, not start: a re-run replaces the binary and must pick it up.
   systemctl --user restart "$unit_name.service" \
     || fail "systemctl --user restart $unit_name failed — inspect with: systemctl --user status $unit_name"
@@ -402,6 +418,11 @@ EOF
       waited=$((waited + 1))
     done
   fi
+  # Log boundary after the old agent is fully torn down (its shutdown noise
+  # stays out of the window) but before bootstrap starts the new one, so a
+  # failure during the start itself lands inside the window verify_daemon
+  # quotes.
+  note_log_start
   launchctl bootstrap "gui/$uid" "$plist" \
     || fail "launchctl bootstrap failed for $plist"
   info "LaunchAgent installed and started: $plist"

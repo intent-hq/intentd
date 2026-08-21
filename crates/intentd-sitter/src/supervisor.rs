@@ -91,6 +91,8 @@ pub const KILL_TIMEOUT_ENV: &str = "INTENTD_SITTER_KILL_TIMEOUT_MS";
 
 /// Test-only env override (a count, not milliseconds) for
 /// [`SupervisorConfig::give_up_after_failures`]. Production never sets it.
+/// `0` does not disable the give-up: the counter is checked after each
+/// failure, so `0` behaves like `1` — give up on the first failed start.
 pub const GIVE_UP_AFTER_ENV: &str = "INTENTD_SITTER_GIVE_UP_AFTER";
 
 /// Timing knobs for the supervisor loop. Injectable so tests never sleep

@@ -645,7 +645,9 @@ fn crash_respawn_backs_off_exponentially() {
 /// (`Restart=on-failure`) both relaunch a non-zero exit.
 #[test]
 fn permanent_startup_failure_gives_up_and_exits_zero() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(9));
@@ -692,7 +694,9 @@ fn permanent_startup_failure_gives_up_and_exits_zero() {
 /// forever exactly as before.
 #[test]
 fn crashes_after_a_healthy_run_never_trip_the_give_up() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     // Up for ~500ms (well past the 200ms reset window), then exit 1.
