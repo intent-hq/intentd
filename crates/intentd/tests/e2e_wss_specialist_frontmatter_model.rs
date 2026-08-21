@@ -1,5 +1,5 @@
 //! WSS e2e for specialist frontmatter model resolution (fix for review thread
-//! `PRRT_kwDOS9Wxuc6SIhDY)`: validates that agent.create with a specialistId but
+//! `PRRT_kwDOS9Wxuc6SIhDY`): validates that agent.create with a specialistId but
 //! no explicit model parameter resolves the specialist's frontmatter `model`
 //! field through the 3-tier precedence (project > user > bundled).
 
