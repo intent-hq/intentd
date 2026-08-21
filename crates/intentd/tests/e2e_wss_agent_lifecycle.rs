@@ -13976,3 +13976,183 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
         "both turns produced assistant replies: {conv}"
     );
 }
+
+/// intent-hq/monorepo#3039 over the real WSS wire: `agent.stop` against a
+/// WEDGED transport must still surface the client-visible terminal state.
+/// The mock streams one chunk, then STOPS draining its stdin and floods
+/// unawaited `fs/read_text_file` requests; the daemon's serve loop answers
+/// every one into the unread pipe, so the writer task blocks mid-write and
+/// the bounded writer channel saturates — the incident's exact wedge (a
+/// multi-MB tool result stalling the child). Before the fix the stop's
+/// `session/cancel` awaited channel capacity forever: the RPC never
+/// completed, no terminal event followed, and the FE spun on "Thinking"
+/// until the idle sweep reaped the agent silently. Asserts over the wire:
+/// - `agent.stop` returns `{ success: true }` within a bounded window;
+/// - the terminal `agent:stream:end` (`stopReason: "interrupted"`) and
+///   `agent:idle` both reach the `events.event` subscriber — never an
+///   `agent:failed`;
+/// - the daemon log carries the wedged-cancel WARN, proving the timeout arm
+///   (not a plain wire error) produced the teardown;
+/// - `agent.getSession` settles to `status: "idle"`.
+#[tokio::test]
+async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
+    let Some(script) = gate("WSS wedged-transport stop E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // 5000 unawaited reads ≈ 5000 small error frames — comfortably more than
+    // the OS pipe + the child's paused stream buffer + the 256-slot writer
+    // channel can absorb, so the serve loop is provably parked on a full
+    // channel when the stop's cancel tries to enqueue.
+    let behavior = json!({ "wedgeTransport": { "requestCount": 5000 } }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no terminal event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Wedged", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "ingest something huge" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The turn is observably live once the pre-wedge chunk lands; the mock
+    // then wedges the transport (paused stdin + request flood). Give the
+    // flood a bounded moment to saturate the daemon's writer channel: the
+    // serve loop must already be parked on a full channel when the stop's
+    // cancel tries to enqueue, or the cancel would land normally and the
+    // test would pass vacuously (the daemon-log WARN assert below keeps
+    // this honest either way).
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            if frame["params"]["event"]["type"] == "agent:stream:activity"
+                && frame["params"]["event"]["data"]["agentId"].as_str() == Some(&agent_id)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("mock streamed its pre-wedge chunk");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Stop the wedged turn. Before the fix this RPC hung forever (the cancel
+    // notify parked on the saturated channel ahead of the terminal emits).
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+
+    // The terminal events reach the wire: stream:end (interrupted) + idle,
+    // never a failed.
+    let mut end_frame: Option<Value> = None;
+    let mut saw_idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(end_frame.is_some() && saw_idle) {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("terminal stream:end + idle reached the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("stop must not fail the agent: {ev}"),
+            Some("agent:stream:end") => end_frame = Some(frame.clone()),
+            Some("agent:idle") => saw_idle = true,
+            _ => {}
+        }
+    }
+    let end = &end_frame.expect("stream:end frame")["params"]["event"];
+    assert_eq!(
+        end["data"]["stopReason"], "interrupted",
+        "terminal stream:end carries the interrupt stopReason: {end}"
+    );
+
+    // The wedged-cancel WARN proves the bounded-timeout arm ran — the cancel
+    // was UNDELIVERABLE (parked on the full channel), not merely errored.
+    let log_path = data_dir.join("daemon.log");
+    let mut warned = false;
+    for _ in 0..200 {
+        if tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default()
+            .contains("session/cancel undeliverable (transport wedged)")
+        {
+            warned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        warned,
+        "daemon log carries the wedged-cancel WARN (the timeout arm ran)"
+    );
+
+    // The session settles idle — nothing left for the idle sweep to reap
+    // silently. Poll: the idle event precedes the status persist (monorepo#1164).
+    let mut last = Value::Null;
+    let mut settled = false;
+    for i in 0..100 {
+        last = wss_rpc(
+            &mut rpc,
+            100 + i,
+            "agent.getSession",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if last["session"]["status"] == "idle" {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(settled, "agent session settled to idle; last: {last}");
+}

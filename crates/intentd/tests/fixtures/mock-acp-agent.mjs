@@ -471,6 +471,44 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
+  // Wedged-transport e2e (intent-hq/monorepo#3039): stream one chunk (so the
+  // turn is live), STOP draining stdin, then fire `requestCount` (default
+  // 2000) fs/read_text_file requests WITHOUT awaiting their responses. The
+  // daemon's serve loop answers every one; with nothing reading this
+  // process's stdin the OS pipe fills, the daemon's writer task blocks
+  // mid-write, and its bounded writer channel saturates — the incident's
+  // exact wedge. The prompt never resolves and no session/cancel can ever be
+  // delivered; only a hard child teardown settles the turn. The default read
+  // path is outside any sandbox so each response is a deterministic
+  // small error frame regardless of the spawn cwd.
+  if (behavior.wedgeTransport && promptCount === 1) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'streaming-before-wedge\n' },
+      },
+    });
+    const count = Number.isFinite(behavior.wedgeTransport.requestCount)
+      ? behavior.wedgeTransport.requestCount
+      : 2000;
+    log(`wedging transport: pausing stdin, firing ${count} unawaited fs reads`);
+    process.stdin.pause();
+    // Pausing stdin unrefs its handle; once stdout flushes, node would exit
+    // (closing stdout → a plain transport-closed, NOT the wedge). Keep the
+    // event loop alive so the process sits wedged until the daemon kills it.
+    setInterval(() => {}, 1000);
+    for (let i = 0; i < count; i++) {
+      send({
+        jsonrpc: '2.0',
+        id: nextClientCallId++,
+        method: 'fs/read_text_file',
+        params: { sessionId: SESSION_ID, path: '/outside/any/sandbox/wedge-3039' },
+      });
+    }
+    pendingPromptIds.push(id);
+    return;
+  }
   // Idle-timeout warn-and-continue e2e: the first N turns go COMPLETELY silent
   // — no session/update at all — and park until `session/cancel` resolves them
   // (stopReason `cancelled`), modelling an agent whose turn hangs without any

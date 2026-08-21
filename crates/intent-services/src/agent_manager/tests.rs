@@ -5094,6 +5094,162 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
     );
 }
 
+/// A WEDGED transport (intent-hq/monorepo#3039): the child stopped draining
+/// its stdin — e.g. after ingesting a multi-MB tool result — so the writer
+/// task is blocked mid-`write_all` on the full pipe and the outbound writer
+/// channel is saturated. `Connection::notify` then awaits channel capacity
+/// forever. Returns the connection plus the KEPT far-end duplex halves
+/// (dropping them would error the writes instead of blocking, turning the
+/// wedge into a plain transport-closed).
+async fn wedged_connection() -> (
+    Arc<Connection>,
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+) {
+    // Tiny stdin pipe the far end never reads: the FIRST oversized line
+    // blocks the writer task mid-write_all.
+    let (client_w, agent_r) = tokio::io::duplex(64);
+    let (agent_w, client_r) = tokio::io::duplex(64);
+    let conn = Arc::new(Connection::new(
+        client_w,
+        client_r,
+        None,
+        ConnectionHooks::default(),
+    ));
+    // Saturate the writer channel (capacity 256): one line wedges the writer
+    // task, 256 more fill the channel, the rest park awaiting capacity.
+    let payload = json!({ "pad": "x".repeat(256) });
+    for _ in 0..300 {
+        let conn = Arc::clone(&conn);
+        let payload = payload.clone();
+        tokio::spawn(async move {
+            let _ = conn.notify("wedge/fill", payload).await;
+        });
+    }
+    // The channel is full once a fresh notify no longer completes promptly.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let conn = Arc::clone(&conn);
+            let payload = payload.clone();
+            let probe = tokio::spawn(async move {
+                let _ = conn.notify("wedge/probe", payload).await;
+            });
+            if timeout(Duration::from_millis(100), probe).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("writer channel saturates");
+    // Confirm the saturation with a longer window: under heavy scheduling
+    // starvation the 100ms probe above could break early on a send that
+    // merely wasn't polled in time (residual capacity), and the tests would
+    // then fail on a confusing downstream assert. A fresh notify still
+    // pending after 500ms fails loudly HERE instead.
+    let confirm_conn = Arc::clone(&conn);
+    let confirm_payload = payload.clone();
+    let confirm = tokio::spawn(async move {
+        let _ = confirm_conn.notify("wedge/confirm", confirm_payload).await;
+    });
+    assert!(
+        timeout(Duration::from_millis(500), confirm).await.is_err(),
+        "saturation loop broke early: the confirming notify still found channel capacity"
+    );
+    (conn, agent_r, agent_w)
+}
+
+/// intent-hq/monorepo#3039: `agent.stop` against a WEDGED transport must not
+/// hang. Before the fix, `interrupt` awaited `session/cancel`'s unbounded
+/// channel send forever — Stop never reached the terminal emits, the FE spun
+/// on "Thinking", and the idle sweep later reaped the agent silently. Now the
+/// cancel enqueue is time-bounded: on timeout the child is torn down and the
+/// terminal `agent:stream:end` + `agent:idle` still reach the bus.
+#[tokio::test]
+async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-wedged"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (conn, _agent_r, _agent_w) = wedged_connection().await;
+    let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+    mgr.handles.lock().unwrap().insert(
+        id.clone(),
+        AgentHandle {
+            connection: conn,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "auggie".to_string(),
+            thought_level: None,
+            wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_listener: None,
+        },
+    );
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    // A live `acpSessionId` keeps the stop on the keep-alive interrupt path
+    // (the one that sends `session/cancel` over the wedged wire).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-wedged")
+        .await
+        .unwrap();
+    // Claim the in-flight slot: the incident agent was mid-turn.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The stop must settle within the bounded cancel window (+ margin), not
+    // hang forever on the wedged writer channel.
+    let found = timeout(Duration::from_secs(10), mgr.interrupt(&id))
+        .await
+        .expect("interrupt returns despite the wedged transport (monorepo#3039)");
+    assert!(found, "interrupt finds the live agent");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "wedged-transport stop still emits the terminal stream:end (got {types:?})"
+    );
+    assert!(
+        types.contains(&"agent:idle"),
+        "wedged-transport stop still emits agent:idle so completion watches fire (got {types:?})"
+    );
+    // The undeliverable cancel voided the keep-alive contract: the wedged
+    // child was torn down instead of being left for the silent idle reap.
+    assert!(
+        !mgr.contains(&id),
+        "wedged child handle is removed (not resumable)"
+    );
+    assert!(!mgr.is_busy(&id), "busy slot released");
+}
+
+/// intent-hq/monorepo#3039 (idle-timeout half): the warn-and-continue path's
+/// `session/cancel` settle against a WEDGED transport must report "not
+/// settled" within the bounded window instead of hanging the turn worker —
+/// the caller then tears the child down and the warning turn spawns fresh.
+#[tokio::test]
+async fn cancel_and_settle_idle_prompt_times_out_on_wedged_transport() {
+    let (conn, _agent_r, _agent_w) = wedged_connection().await;
+    let id = AgentId::from("a-wedged-settle");
+    let settled = timeout(
+        Duration::from_secs(10),
+        super::cancel_and_settle_idle_prompt(&conn, &id, "acp-wedged"),
+    )
+    .await
+    .expect("settle returns despite the wedged transport (monorepo#3039)");
+    assert!(!settled, "a wedged child is reported as unsettleable");
+}
+
 /// `priority: "interrupt"` delivery to a BUSY agent preempts the turn
 /// keep-alive: the message streams immediately (`queued: false`) instead of
 /// queueing behind the turn, the preemption emits the terminal
