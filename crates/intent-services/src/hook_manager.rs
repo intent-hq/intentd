@@ -3207,6 +3207,32 @@ mod tests {
         }
     }
 
+    /// Deterministic pin for the verbatim-preservation contract: when the
+    /// persisted deadline is earlier than a fresh `now + delayMs` countdown,
+    /// [`resumed_next_run`] returns the persisted string VERBATIM (no
+    /// reparse/reformat drift) with the remaining time to it. The
+    /// integration test below can only observe this best-effort — under
+    /// load the due run may fire before the row is read
+    /// (intent-hq/monorepo#3055).
+    #[test]
+    fn resumed_next_run_preserves_earlier_deadline_verbatim() {
+        let (ws, owner) = (WorkspaceId::new(), AgentId::from("agent-hooks"));
+        let due_at = next_run_at_iso(1_000);
+        let hook = countdown_row(
+            &ws,
+            &owner,
+            "verbatim",
+            Some(due_at.clone()),
+            next_run_at_iso(MAX_HOOK_TTL_MS),
+        );
+        let (next_run_at, initial_delay) = resumed_next_run(&hook);
+        assert_eq!(next_run_at, due_at, "persisted deadline kept verbatim");
+        assert!(
+            initial_delay <= Duration::from_millis(1_000),
+            "remaining time, not a fresh cadence: {initial_delay:?}"
+        );
+    }
+
     /// A restart must not push a hook's countdown back: rehydration resumes
     /// with the EARLIER of the persisted `nextRunAt` and a fresh
     /// `now + delayMs` countdown (intent-hq/monorepo#2856), so a
@@ -3227,13 +3253,24 @@ mod tests {
         );
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
-        // The persisted countdown survives the restart verbatim...
+        // The persisted countdown survives the restart verbatim... unless
+        // the due run already fired under load (`update_hook_run` replaces
+        // `next_run_at` atomically with the `run_count` bump), which itself
+        // proves the near deadline was honored. The verbatim min semantics
+        // are pinned by `resumed_next_run_preserves_earlier_deadline_verbatim`.
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
-        assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        if stored.run_count == 1 {
+            assert_eq!(stored.next_run_at.as_deref(), Some(due_at.as_str()));
+        }
         // ...and the run fires on it, nowhere near the 10-minute cadence a
         // reset countdown would impose (the poll deadline is 10s).
-        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
-        assert_eq!(ran.state, HookState::Scheduled);
+        // `run_count` persists before the Running→Scheduled state write, so
+        // wait on both — a `run_count`-only poll can legally observe the row
+        // mid-run as `Running` (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
     }
 
@@ -3252,8 +3289,12 @@ mod tests {
         );
         svc.store().insert_hook(&hook).await.unwrap();
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 1);
-        let ran = wait_for_hook(&svc, &hook.hook_id, |h| h.run_count == 2).await;
-        assert_eq!(ran.state, HookState::Scheduled);
+        // Wait on state too — `run_count` persists before the
+        // Running→Scheduled write (intent-hq/monorepo#3055).
+        let ran = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.state == HookState::Scheduled
+        })
+        .await;
         assert!(ran.next_run_at.is_some(), "rescheduled after the run");
     }
 
