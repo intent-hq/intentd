@@ -114,7 +114,10 @@ pub fn hermetic_workspaces_root() -> tempfile::TempDir {
 /// provider fallback, so in-process tests that create/delegate agents without
 /// an explicit provider or model must chain
 /// `.with_settings_registry(common::registry_with_default_provider(dir))`
-/// onto `Services::new(...)` to have a configured default to resolve to.
+/// onto `Services::new(...)` to have a configured default to resolve to. The
+/// `providers.paths` override points auggie at a deterministic executable so
+/// availability checks (`agent.delegate`) pass without the real binary on
+/// the test host.
 pub fn registry_with_default_provider(
     dir: &std::path::Path,
 ) -> Arc<intent_services::SettingsRegistry> {
@@ -122,7 +125,13 @@ pub fn registry_with_default_provider(
         intent_services::SettingsRegistry::load(dir.join("config.toml")).expect("load registry"),
     );
     registry
-        .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
+        .apply(&[
+            ("providers.active".to_string(), serde_json::json!("auggie")),
+            (
+                "providers.paths".to_string(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
         .expect("seed default provider");
     registry
 }
