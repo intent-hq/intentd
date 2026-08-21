@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.30] - 2026-08-21
+
+### 🔧 Refactor
+
+- Burn down pedantic must_use, cast, and signature-adjacent lints ([#1379](https://github.com/intent-hq/intentd/pull/1379))
+
+### ⚡ Performance
+
+- Keep workspace.list/get enrichment off note bodies and duplicate session reads ([#1378](https://github.com/intent-hq/intentd/pull/1378))
+
+
 ## [0.7.29] - 2026-08-21
 
 ### 🚀 Features
