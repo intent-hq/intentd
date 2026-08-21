@@ -2676,13 +2676,12 @@ impl Services {
         };
         let mut out: Vec<(String, String)> = Vec::new();
         for note_id in note_ids {
-            let note = match self
+            let Ok(note) = self
                 .store
                 .get_note(workspace_id, &NoteId::from(note_id.as_str()))
                 .await
-            {
-                Ok(n) => n,
-                _ => continue,
+            else {
+                continue;
             };
             for url in extract_markdown_image_urls(&note.content) {
                 if !url.starts_with("workspace-asset://") {
@@ -3167,82 +3166,18 @@ impl Services {
         .ok()
         .flatten()
         .unwrap_or_default();
-        match root.pr_number {
-            Some(number) => {
-                let pr = sc
-                    .get_pr(&repo_ref, number)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive mismatch against the
-                // root's current branch; an unreadable HEAD (empty branch)
-                // never unlinks.
-                if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
-                    root.pr_number = None;
-                    root.pr_url = None;
-                    root.pr_status = None;
-                    root.updated_at = now_iso();
-                    self.store.update_workspace_git_root_pr(&root).await?;
-                    publish_event(
-                        &self.event_bus,
-                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                    )
-                    .await;
-                    return Ok(PrRefreshOutcome::Unlinked);
-                }
-                let info = pr_ops::build_pr_info(&pr);
-                let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
-                // A merged/closed linked PR stays recorded in `pull_requests`
-                // but no longer blocks discovery: relink to a newer open PR on
-                // the same branch. A discovery failure degrades to the plain
-                // update path below so the status delta is never lost.
-                if matches!(
-                    info.status,
-                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-                ) && !branch.is_empty()
-                {
-                    let discovered = match pr_ops::discover_matching_open_pr(
-                        sc.as_ref(),
-                        &repo_ref,
-                        &branch,
-                        None,
-                        Some(number),
-                    )
-                    .await
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            tracing::warn!(
-                                git_root = %root.id.as_str(),
-                                error = %e,
-                                "git root refresh: relink discovery failed, persisting status only"
-                            );
-                            None
-                        }
-                    };
-                    if let Some(open_pr) = discovered {
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
-                        root.pr_number = Some(open_pr.number);
-                        root.pr_url = Some(open_pr.url.clone());
-                        root.pr_status = Some(open_info.status);
-                        root.updated_at = now_iso();
-                        self.store.update_workspace_git_root_pr(&root).await?;
-                        publish_event(
-                            &self.event_bus,
-                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                        )
-                        .await;
-                        return Ok(PrRefreshOutcome::Linked);
-                    }
-                }
-                let changed = list_changed
-                    || root.pr_status != Some(info.status)
-                    || root.pr_url.as_deref() != Some(pr.url.as_str());
-                if !changed {
-                    return Ok(PrRefreshOutcome::Unchanged);
-                }
-                root.pr_status = Some(info.status);
-                root.pr_url = Some(pr.url.clone());
+        if let Some(number) = root.pr_number {
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            // Clear a stale link only on a positive mismatch against the
+            // root's current branch; an unreadable HEAD (empty branch)
+            // never unlinks.
+            if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
+                root.pr_number = None;
+                root.pr_url = None;
+                root.pr_status = None;
                 root.updated_at = now_iso();
                 self.store.update_workspace_git_root_pr(&root).await?;
                 publish_event(
@@ -3250,34 +3185,95 @@ impl Services {
                     git_root_changed_event(GIT_ROOT_UPDATED, &root),
                 )
                 .await;
-                Ok(PrRefreshOutcome::Updated)
+                return Ok(PrRefreshOutcome::Unlinked);
             }
-            None => {
-                if branch.is_empty() {
-                    return Ok(PrRefreshOutcome::Skipped);
-                }
-                let found =
-                    pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                match found {
-                    Some(pr) => {
-                        let info = pr_ops::build_pr_info(&pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
-                        root.pr_number = Some(pr.number);
-                        root.pr_url = Some(pr.url.clone());
-                        root.pr_status = Some(info.status);
-                        root.updated_at = now_iso();
-                        self.store.update_workspace_git_root_pr(&root).await?;
-                        publish_event(
-                            &self.event_bus,
-                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                        )
-                        .await;
-                        Ok(PrRefreshOutcome::Linked)
+            let info = pr_ops::build_pr_info(&pr);
+            let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+            // A merged/closed linked PR stays recorded in `pull_requests`
+            // but no longer blocks discovery: relink to a newer open PR on
+            // the same branch. A discovery failure degrades to the plain
+            // update path below so the status delta is never lost.
+            if matches!(
+                info.status,
+                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+            ) && !branch.is_empty()
+            {
+                let discovered = match pr_ops::discover_matching_open_pr(
+                    sc.as_ref(),
+                    &repo_ref,
+                    &branch,
+                    None,
+                    Some(number),
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::warn!(
+                            git_root = %root.id.as_str(),
+                            error = %e,
+                            "git root refresh: relink discovery failed, persisting status only"
+                        );
+                        None
                     }
-                    None => Ok(PrRefreshOutcome::Unchanged),
+                };
+                if let Some(open_pr) = discovered {
+                    let open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                    root.pr_number = Some(open_pr.number);
+                    root.pr_url = Some(open_pr.url.clone());
+                    root.pr_status = Some(open_info.status);
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await?;
+                    publish_event(
+                        &self.event_bus,
+                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    )
+                    .await;
+                    return Ok(PrRefreshOutcome::Linked);
                 }
+            }
+            let changed = list_changed
+                || root.pr_status != Some(info.status)
+                || root.pr_url.as_deref() != Some(pr.url.as_str());
+            if !changed {
+                return Ok(PrRefreshOutcome::Unchanged);
+            }
+            root.pr_status = Some(info.status);
+            root.pr_url = Some(pr.url.clone());
+            root.updated_at = now_iso();
+            self.store.update_workspace_git_root_pr(&root).await?;
+            publish_event(
+                &self.event_bus,
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
+            Ok(PrRefreshOutcome::Updated)
+        } else {
+            if branch.is_empty() {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
+            let found =
+                pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
+                    .await
+                    .map_err(pr_ops::map_sc_err)?;
+            match found {
+                Some(pr) => {
+                    let info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                    root.pr_number = Some(pr.number);
+                    root.pr_url = Some(pr.url.clone());
+                    root.pr_status = Some(info.status);
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await?;
+                    publish_event(
+                        &self.event_bus,
+                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    )
+                    .await;
+                    Ok(PrRefreshOutcome::Linked)
+                }
+                None => Ok(PrRefreshOutcome::Unchanged),
             }
         }
     }
@@ -3350,129 +3346,125 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let (owner, repo) = match pr_ops::repo_of(&ws) {
-            Ok(pair) => pair,
-            Err(_) => return Ok(PrRefreshOutcome::Skipped),
+        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+            return Ok(PrRefreshOutcome::Skipped);
         };
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
-        match ws.pr_number {
-            Some(number) => {
-                let pr = sc
-                    .get_pr(&repo_ref, number)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive mismatch against BOTH
-                // the workspace's branch and its baseRef (review workspaces
-                // link PRs whose head equals the workspace's `baseRef`, §7.6);
-                // unknown inputs never unlink.
-                if pr_ops::pr_workspace_mismatch(&pr, &ws.branch, ws.base_ref.as_deref()) {
-                    ws.pr_number = None;
-                    ws.pr_url = None;
-                    ws.pr_status = None;
-                    ws.active_pull_request = None;
-                    ws.updated_at = now_iso();
-                    self.store.update_workspace_pr_linkage(&ws).await?;
-                    publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
-                    self.maybe_emit_display_status_changed(&ws.id).await;
-                    return Ok(PrRefreshOutcome::Unlinked);
-                }
-                let info = pr_ops::build_pr_info(&pr);
-                // Keep the daemon-owned PR list current on every linked refresh.
-                let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
-                // A merged/closed linked PR stays recorded in `pull_requests`
-                // but no longer blocks discovery: relink to a newer open PR
-                // matching the branch (or, failing that, the baseRef), so the
-                // workspace follows the latest PR without waiting for an
-                // unlink. A discovery failure degrades to the plain update
-                // path below so the merged/closed status delta is never lost
-                // to a transient `list_prs` error (the next sweep retries
-                // discovery).
-                if matches!(
-                    info.status,
-                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-                ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
-                {
-                    let discovered = match pr_ops::discover_matching_open_pr(
-                        sc.as_ref(),
-                        &repo_ref,
-                        &ws.branch,
-                        ws.base_ref.as_deref(),
-                        Some(number),
-                    )
-                    .await
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            tracing::warn!(
-                                workspace_id = %ws.id.as_str(),
-                                error = %e,
-                                "pr refresh: relink discovery failed, persisting status only"
-                            );
-                            None
-                        }
-                    };
-                    if let Some(open_pr) = discovered {
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
-                        ws.pr_number = Some(open_pr.number);
-                        ws.pr_url = Some(open_pr.url.clone());
-                        ws.pr_status = Some(open_info.status);
-                        ws.active_pull_request = Some(open_info);
-                        ws.updated_at = now_iso();
-                        self.store.update_workspace_pr_linkage(&ws).await?;
-                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
-                        self.maybe_emit_display_status_changed(&ws.id).await;
-                        return Ok(PrRefreshOutcome::Linked);
-                    }
-                }
-                let changed = list_changed
-                    || ws.pr_status != Some(info.status)
-                    || ws.active_pull_request.as_ref() != Some(&info)
-                    || ws.pr_url.as_deref() != Some(pr.url.as_str());
-                if !changed {
-                    return Ok(PrRefreshOutcome::Unchanged);
-                }
-                ws.pr_status = Some(info.status);
-                ws.pr_url = Some(pr.url.clone());
-                ws.active_pull_request = Some(info);
+        if let Some(number) = ws.pr_number {
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            // Clear a stale link only on a positive mismatch against BOTH
+            // the workspace's branch and its baseRef (review workspaces
+            // link PRs whose head equals the workspace's `baseRef`, §7.6);
+            // unknown inputs never unlink.
+            if pr_ops::pr_workspace_mismatch(&pr, &ws.branch, ws.base_ref.as_deref()) {
+                ws.pr_number = None;
+                ws.pr_url = None;
+                ws.pr_status = None;
+                ws.active_pull_request = None;
                 ws.updated_at = now_iso();
                 self.store.update_workspace_pr_linkage(&ws).await?;
-                publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
-                Ok(PrRefreshOutcome::Updated)
+                return Ok(PrRefreshOutcome::Unlinked);
             }
-            None => {
-                // Discovery: link an open PR matching the branch, or —
-                // failing that — the workspace's baseRef (§7.6).
-                if ws.branch.is_empty() && ws.base_ref.is_none() {
-                    return Ok(PrRefreshOutcome::Skipped);
-                }
-                let found = pr_ops::discover_matching_open_pr(
+            let info = pr_ops::build_pr_info(&pr);
+            // Keep the daemon-owned PR list current on every linked refresh.
+            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // A merged/closed linked PR stays recorded in `pull_requests`
+            // but no longer blocks discovery: relink to a newer open PR
+            // matching the branch (or, failing that, the baseRef), so the
+            // workspace follows the latest PR without waiting for an
+            // unlink. A discovery failure degrades to the plain update
+            // path below so the merged/closed status delta is never lost
+            // to a transient `list_prs` error (the next sweep retries
+            // discovery).
+            if matches!(
+                info.status,
+                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+            ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
+            {
+                let discovered = match pr_ops::discover_matching_open_pr(
                     sc.as_ref(),
                     &repo_ref,
                     &ws.branch,
                     ws.base_ref.as_deref(),
-                    None,
+                    Some(number),
                 )
                 .await
-                .map_err(pr_ops::map_sc_err)?;
-                match found {
-                    Some(pr) => {
-                        let info = pr_ops::build_pr_info(&pr);
-                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
-                        ws.pr_number = Some(pr.number);
-                        ws.pr_url = Some(pr.url.clone());
-                        ws.pr_status = Some(info.status);
-                        ws.active_pull_request = Some(info);
-                        ws.updated_at = now_iso();
-                        self.store.update_workspace_pr_linkage(&ws).await?;
-                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
-                        self.maybe_emit_display_status_changed(&ws.id).await;
-                        Ok(PrRefreshOutcome::Linked)
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace_id = %ws.id.as_str(),
+                            error = %e,
+                            "pr refresh: relink discovery failed, persisting status only"
+                        );
+                        None
                     }
-                    None => Ok(PrRefreshOutcome::Unchanged),
+                };
+                if let Some(open_pr) = discovered {
+                    let open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                    ws.pr_number = Some(open_pr.number);
+                    ws.pr_url = Some(open_pr.url.clone());
+                    ws.pr_status = Some(open_info.status);
+                    ws.active_pull_request = Some(open_info);
+                    ws.updated_at = now_iso();
+                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                    self.maybe_emit_display_status_changed(&ws.id).await;
+                    return Ok(PrRefreshOutcome::Linked);
                 }
+            }
+            let changed = list_changed
+                || ws.pr_status != Some(info.status)
+                || ws.active_pull_request.as_ref() != Some(&info)
+                || ws.pr_url.as_deref() != Some(pr.url.as_str());
+            if !changed {
+                return Ok(PrRefreshOutcome::Unchanged);
+            }
+            ws.pr_status = Some(info.status);
+            ws.pr_url = Some(pr.url.clone());
+            ws.active_pull_request = Some(info);
+            ws.updated_at = now_iso();
+            self.store.update_workspace_pr_linkage(&ws).await?;
+            publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+            self.maybe_emit_display_status_changed(&ws.id).await;
+            Ok(PrRefreshOutcome::Updated)
+        } else {
+            // Discovery: link an open PR matching the branch, or —
+            // failing that — the workspace's baseRef (§7.6).
+            if ws.branch.is_empty() && ws.base_ref.is_none() {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
+            let found = pr_ops::discover_matching_open_pr(
+                sc.as_ref(),
+                &repo_ref,
+                &ws.branch,
+                ws.base_ref.as_deref(),
+                None,
+            )
+            .await
+            .map_err(pr_ops::map_sc_err)?;
+            match found {
+                Some(pr) => {
+                    let info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                    ws.pr_number = Some(pr.number);
+                    ws.pr_url = Some(pr.url.clone());
+                    ws.pr_status = Some(info.status);
+                    ws.active_pull_request = Some(info);
+                    ws.updated_at = now_iso();
+                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                    self.maybe_emit_display_status_changed(&ws.id).await;
+                    Ok(PrRefreshOutcome::Linked)
+                }
+                None => Ok(PrRefreshOutcome::Unchanged),
             }
         }
     }
@@ -4984,13 +4976,12 @@ impl Services {
                             triggers.push((s.workspace_id.0.clone(), n.0.clone()));
                         }
                     }
-                    let flips = match &taken_flip_triggers {
-                        Some(f) => f.clone(),
-                        None => {
-                            let f = self.take_flipped_completion_triggers(child_id).await;
-                            taken_flip_triggers = Some(f.clone());
-                            f
-                        }
+                    let flips = if let Some(f) = &taken_flip_triggers {
+                        f.clone()
+                    } else {
+                        let f = self.take_flipped_completion_triggers(child_id).await;
+                        taken_flip_triggers = Some(f.clone());
+                        f
                     };
                     for pair in flips {
                         if !triggers.contains(&pair) {
@@ -5280,13 +5271,12 @@ impl Services {
             // and deletion wakes never attribute triggers.
             let mut stamped_triggers = trigger_tasks.clone();
             if event.event_type == AGENT_IDLE && !interim_idle {
-                let flips = match &taken_flip_triggers {
-                    Some(f) => f.clone(),
-                    None => {
-                        let f = self.take_flipped_completion_triggers(child_id).await;
-                        taken_flip_triggers = Some(f.clone());
-                        f
-                    }
+                let flips = if let Some(f) = &taken_flip_triggers {
+                    f.clone()
+                } else {
+                    let f = self.take_flipped_completion_triggers(child_id).await;
+                    taken_flip_triggers = Some(f.clone());
+                    f
                 };
                 for pair in flips {
                     if !stamped_triggers.contains(&pair) {
@@ -6141,84 +6131,81 @@ impl Services {
         content: String,
         message_metadata: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        match self.agent_manager() {
-            Some(manager) => {
-                manager
-                    .send_message(
-                        parent_agent_id,
-                        workspace_id.clone(),
-                        content,
-                        None,
-                        crate::agent_manager::TurnOptions {
-                            message_metadata,
-                            ..Default::default()
-                        },
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .send_message(
+                    parent_agent_id,
+                    workspace_id.clone(),
+                    content,
+                    None,
+                    crate::agent_manager::TurnOptions {
+                        message_metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+        } else {
+            // Question hold (PROTOCOL §5.5): parent wakes are automatic —
+            // an active hold parks the wake in the queue instead of
+            // appending a user row that would bury the pending Q&A
+            // (mirrors the manager path's `send_message` gate).
+            if self.question_hold_active(&parent_agent_id).await {
+                let (queued, position) = self.enqueue_message(
+                    &parent_agent_id,
+                    content,
+                    None,
+                    None,
+                    message_metadata,
+                    None,
+                    false,
+                );
+                let result = serde_json::json!({
+                    "success": true,
+                    "queued": true,
+                    "heldForQuestions": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.publish_queue_updated(&parent_agent_id).await;
+                // Race close (hold-check → enqueue vs a concurrent
+                // `dismissQuestions`/answer): this branch is only taken
+                // when no `AgentManager` is attached (see the `match`
+                // above), so there is no drain to kick here — a manager
+                // attaching later re-derives the hold on its own next
+                // trigger.
+                return Ok(result);
+            }
+            // Delivery-time unblocked hints (monorepo#2044): the
+            // store-only persist IS this path's delivery, so the section
+            // is resolved here — matching the manager path's direct-send
+            // arm.
+            let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+                message_metadata.as_ref(),
+            ) {
+                match self
+                    .unblocked_section_for_delivery(
+                        &parent_agent_id,
+                        std::iter::once(message_metadata.as_ref()),
                     )
                     .await
-            }
-            None => {
-                // Question hold (PROTOCOL §5.5): parent wakes are automatic —
-                // an active hold parks the wake in the queue instead of
-                // appending a user row that would bury the pending Q&A
-                // (mirrors the manager path's `send_message` gate).
-                if self.question_hold_active(&parent_agent_id).await {
-                    let (queued, position) = self.enqueue_message(
-                        &parent_agent_id,
-                        content,
-                        None,
-                        None,
-                        message_metadata,
-                        None,
-                        false,
-                    );
-                    let result = serde_json::json!({
-                        "success": true,
-                        "queued": true,
-                        "heldForQuestions": true,
-                        "queuedMessage": queued.to_value(position),
-                    });
-                    self.publish_queue_updated(&parent_agent_id).await;
-                    // Race close (hold-check → enqueue vs a concurrent
-                    // `dismissQuestions`/answer): this branch is only taken
-                    // when no `AgentManager` is attached (see the `match`
-                    // above), so there is no drain to kick here — a manager
-                    // attaching later re-derives the hold on its own next
-                    // trigger.
-                    return Ok(result);
+                {
+                    Some(section) => format!("{content}\n\n{section}"),
+                    None => content,
                 }
-                // Delivery-time unblocked hints (monorepo#2044): the
-                // store-only persist IS this path's delivery, so the section
-                // is resolved here — matching the manager path's direct-send
-                // arm.
-                let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+            } else {
+                content
+            };
+            let blocks = serde_json::json!([{ "type": "text", "text": content }]);
+            self.store
+                .append_agent_message_with_metadata(
+                    &parent_agent_id,
+                    "user",
+                    &blocks,
                     message_metadata.as_ref(),
-                ) {
-                    match self
-                        .unblocked_section_for_delivery(
-                            &parent_agent_id,
-                            std::iter::once(message_metadata.as_ref()),
-                        )
-                        .await
-                    {
-                        Some(section) => format!("{content}\n\n{section}"),
-                        None => content,
-                    }
-                } else {
-                    content
-                };
-                let blocks = serde_json::json!([{ "type": "text", "text": content }]);
-                self.store
-                    .append_agent_message_with_metadata(
-                        &parent_agent_id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                    )
-                    .await?;
-                self.invalidate_agent_list_cache(workspace_id);
-                Ok(serde_json::json!({ "success": true, "queued": false }))
-            }
+                    &now_iso(),
+                )
+                .await?;
+            self.invalidate_agent_list_cache(workspace_id);
+            Ok(serde_json::json!({ "success": true, "queued": false }))
         }
     }
 }
@@ -6885,14 +6872,13 @@ fn decorate_specialist_resolved(
         return;
     };
     let own;
-    let provider = match provider {
-        Some(p) => p,
-        None => {
-            own = agent_ops::resolve_delegate_provider_preview(services, Some(&id), workspace_path);
-            match own.as_deref() {
-                Some(p) => p,
-                None => return,
-            }
+    let provider = if let Some(p) = provider {
+        p
+    } else {
+        own = agent_ops::resolve_delegate_provider_preview(services, Some(&id), workspace_path);
+        match own.as_deref() {
+            Some(p) => p,
+            None => return,
         }
     };
     let Some(model) =
@@ -7179,22 +7165,19 @@ fn find_dependency_cycle(
     let mut path: Vec<&str> = vec![target];
     while let Some((node, idx)) = stack.last_mut() {
         let next = graph.get(*node).and_then(|edges| edges.get(*idx).copied());
-        match next {
-            Some(next) => {
-                *idx += 1;
-                if next == target {
-                    path.push(next);
-                    return Some(path.into_iter().map(str::to_string).collect());
-                }
-                if visited.insert(next) {
-                    stack.push((next, 0));
-                    path.push(next);
-                }
+        if let Some(next) = next {
+            *idx += 1;
+            if next == target {
+                path.push(next);
+                return Some(path.into_iter().map(str::to_string).collect());
             }
-            None => {
-                stack.pop();
-                path.pop();
+            if visited.insert(next) {
+                stack.push((next, 0));
+                path.push(next);
             }
+        } else {
+            stack.pop();
+            path.pop();
         }
     }
     None
@@ -7261,9 +7244,8 @@ fn note_to_workspace_task(
     status_by_id: &HashMap<String, TaskStatus>,
     spec_linked: bool,
 ) -> Result<WorkspaceTask> {
-    let task = match &note.metadata.task {
-        Some(t) => t,
-        None => return Err(Error::Internal("Note is not a task".to_string())),
+    let Some(task) = &note.metadata.task else {
+        return Err(Error::Internal("Note is not a task".to_string()));
     };
     Ok(WorkspaceTask {
         id: note.id.clone(),
@@ -7356,9 +7338,8 @@ fn parse_comment_type(opt: Option<&str>) -> CommentType {
 
 /// Validate an `agent-{uuid}` id, mirroring the TS `agentIdPattern`.
 fn is_valid_agent_id(s: &str) -> bool {
-    let rest = match s.strip_prefix("agent-") {
-        Some(r) => r,
-        None => return false,
+    let Some(rest) = s.strip_prefix("agent-") else {
+        return false;
     };
     let groups = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = rest.split('-').collect();
@@ -7685,13 +7666,12 @@ fn assert_hermetic_root_absent() {
 
 #[cfg(not(test))]
 fn assert_hermetic_root_absent() {
-    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
-        panic!(
-            "hermetic-tests: intentd process reached default_workspaces_root() with \
-             INTENTD_ASSERT_HERMETIC_ROOT set but no INTENTD_WORKSPACES_DIR — the \
-             spawning test harness must set INTENTD_WORKSPACES_DIR to a tempdir"
-        );
-    }
+    assert!(
+        std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_none(),
+        "hermetic-tests: intentd process reached default_workspaces_root() with \
+         INTENTD_ASSERT_HERMETIC_ROOT set but no INTENTD_WORKSPACES_DIR — the \
+         spawning test harness must set INTENTD_WORKSPACES_DIR to a tempdir"
+    );
 }
 
 /// Resolve a workspace-id slug for `workspace.create`, porting the TS
@@ -7818,9 +7798,8 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 3 {
         return;
     }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     let entries: Vec<_> = entries.flatten().collect();
     let is_git_repo = entries.iter().any(|e| {
@@ -7841,17 +7820,13 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
         return;
     }
     for entry in entries {
-        let ft = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() {
             continue;
         }
         let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => continue,
+        let Some(name_str) = name.to_str() else {
+            continue;
         };
         if name_str.starts_with('.') {
             continue;
@@ -10051,15 +10026,12 @@ fn replace_request_id_values(text: &str) -> String {
     while let Some(rel) = lower[pos..].find(KEY) {
         let value_start = pos + rel + KEY.len();
         out.push_str(&text[pos..value_start]);
-        match text[value_start..].find('"') {
-            Some(end_rel) => {
-                out.push_str("<redacted>");
-                pos = value_start + end_rel;
-            }
-            None => {
-                pos = value_start;
-                break;
-            }
+        if let Some(end_rel) = text[value_start..].find('"') {
+            out.push_str("<redacted>");
+            pos = value_start + end_rel;
+        } else {
+            pos = value_start;
+            break;
         }
     }
     out.push_str(&text[pos..]);
@@ -10539,43 +10511,40 @@ impl Services {
                 format!("# {}\n\n{}", task.title, task.content)
             };
             let normalized = task.title.trim().to_lowercase();
-            let task_note_id = match existing_by_title.get(&normalized) {
-                Some(existing_id) => {
-                    // Reused child: `effort=` only applies at creation — it
-                    // never overwrites a possibly user-edited estimate on the
-                    // existing note — so an explicit attribute is surfaced as
-                    // dropped rather than silently ignored.
-                    if task.effort.is_some() {
-                        warnings.push(format!(
-                            "task block {}: effort= ignored — a task note with this \
-                             title already exists and its estimate is preserved",
-                            task_block_label(task)
-                        ));
-                    }
-                    existing_id.clone()
+            let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
+                // Reused child: `effort=` only applies at creation — it
+                // never overwrites a possibly user-edited estimate on the
+                // existing note — so an explicit attribute is surfaced as
+                // dropped rather than silently ignored.
+                if task.effort.is_some() {
+                    warnings.push(format!(
+                        "task block {}: effort= ignored — a task note with this \
+                         title already exists and its estimate is preserved",
+                        task_block_label(task)
+                    ));
                 }
-                None => {
-                    let child = self
-                        .create_child_task_note(
-                            &workspace_id,
-                            &note.id,
-                            &task.title,
-                            body,
-                            TaskStatus::NotStarted,
-                            Some(peer_order),
-                            task.effort.clone(),
-                            caller_agent_id,
-                        )
-                        .await?;
-                    existing_by_title.insert(normalized, child.id.clone());
-                    created_note_ids.push(child.id.0.clone());
-                    created_tasks.push(CreatedTaskEntry {
-                        key: task.key.clone(),
-                        title: task.title.clone(),
-                        note_id: child.id.0.clone(),
-                    });
-                    child.id
-                }
+                existing_id.clone()
+            } else {
+                let child = self
+                    .create_child_task_note(
+                        &workspace_id,
+                        &note.id,
+                        &task.title,
+                        body,
+                        TaskStatus::NotStarted,
+                        Some(peer_order),
+                        task.effort.clone(),
+                        caller_agent_id,
+                    )
+                    .await?;
+                existing_by_title.insert(normalized, child.id.clone());
+                created_note_ids.push(child.id.0.clone());
+                created_tasks.push(CreatedTaskEntry {
+                    key: task.key.clone(),
+                    title: task.title.clone(),
+                    note_id: child.id.0.clone(),
+                });
+                child.id
             };
             let placeholder = format!("<!-- task-block-placeholder-{i} -->");
             let linked = format!(
@@ -11752,15 +11721,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let opts = search_ops::parse_opts(opts)?;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
-                Some(root) => root,
-                None => {
-                    return Ok(serde_json::json!({
-                        "requestId": request_id,
-                        "matches": [],
-                        "truncated": false,
-                    }))
-                }
+            let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
+                return Ok(serde_json::json!({
+                    "requestId": request_id,
+                    "matches": [],
+                    "truncated": false,
+                }));
             };
             // Validate opts (incl. regex) before registering, so a bad regex is
             // surfaced as InvalidParams without leaving a stale cancel token.
@@ -11795,15 +11761,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
-                Some(root) => root,
-                None => {
-                    return Ok(serde_json::json!({
-                        "requestId": request_id,
-                        "files": [],
-                        "truncated": false,
-                    }))
-                }
+            let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
+                return Ok(serde_json::json!({
+                    "requestId": request_id,
+                    "files": [],
+                    "truncated": false,
+                }));
             };
             let token = registry.register(&request_id);
             let outcome = {
@@ -11929,9 +11892,8 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
-                Some(root) => root,
-                None => return Ok(serde_json::json!({ "requestId": request_id, "matches": [] })),
+            let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
+                return Ok(serde_json::json!({ "requestId": request_id, "matches": [] }));
             };
             let token = registry.register(&request_id);
 
@@ -13411,44 +13373,41 @@ impl WorkspaceApi for Services {
                                         });
                                     }
                                 };
-                                match progress.as_deref() {
-                                    Some(reporter) => {
-                                        reporter
-                                            .milestone(
-                                                "cache",
-                                                create_progress::CLONE_SEGMENT_END,
-                                                "Repository cache ready",
-                                            )
-                                            .await;
-                                    }
-                                    None => {
-                                        clone_ops::publish(
-                                            &bus_ref,
-                                            &id,
-                                            clone_ops::progress_event(
-                                                &id,
-                                                &request_id,
-                                                "checkout",
-                                                90,
-                                                "Repository cache ready",
-                                                None,
-                                            ),
+                                if let Some(reporter) = progress.as_deref() {
+                                    reporter
+                                        .milestone(
+                                            "cache",
+                                            create_progress::CLONE_SEGMENT_END,
+                                            "Repository cache ready",
                                         )
                                         .await;
-                                        clone_ops::publish(
-                                            &bus_ref,
+                                } else {
+                                    clone_ops::publish(
+                                        &bus_ref,
+                                        &id,
+                                        clone_ops::progress_event(
                                             &id,
-                                            clone_ops::done_event(
-                                                &id,
-                                                &request_id,
-                                                true,
-                                                None,
-                                                None,
-                                                None,
-                                            ),
-                                        )
-                                        .await;
-                                    }
+                                            &request_id,
+                                            "checkout",
+                                            90,
+                                            "Repository cache ready",
+                                            None,
+                                        ),
+                                    )
+                                    .await;
+                                    clone_ops::publish(
+                                        &bus_ref,
+                                        &id,
+                                        clone_ops::done_event(
+                                            &id,
+                                            &request_id,
+                                            true,
+                                            None,
+                                            None,
+                                            None,
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
@@ -13655,55 +13614,52 @@ impl WorkspaceApi for Services {
                     // existing local/remote branches with a `-N` suffix.
                     let branch_auto_generated =
                         input.branch.as_deref().is_none_or(str::is_empty);
-                    let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
-                        Some(explicit) => explicit,
-                        None => {
-                            let slug = input
-                                .initial_agent
-                                .as_ref()
-                                .and_then(|a| a.prompt.as_deref())
-                                .and_then(intent_core::slug::extract_local_slug)
-                                .unwrap_or_else(intent_core::slug::generate_workspace_slug);
-                            // Branch prefix fallback: repo config > global setting
-                            // (FE parity: workspace.service.ts L1215-1219).
-                            let prefix = if let Some(repo_path) = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                            {
-                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                                match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
-                                    Some(p) => p,
-                                    None => settings_branch_prefix,
-                                }
-                            } else {
-                                settings_branch_prefix
-                            };
-                            let desired = format!("{prefix}{slug}");
-                            let git_repo = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                                .filter(|p| p.join(".git").exists());
-                            match git_repo {
-                                Some(repo) => {
-                                    let want = desired;
-                                    tokio::task::spawn_blocking(move || {
-                                        intent_git::branches::ensure_unique_branch_name(
-                                            &repo, &want,
-                                        )
-                                    })
-                                    .await
-                                    .map_err(|e| {
-                                        Error::Internal(format!(
-                                            "branch uniquification task failed: {e}"
-                                        ))
-                                    })??
-                                }
-                                None => desired,
+                    let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
+                        let slug = input
+                            .initial_agent
+                            .as_ref()
+                            .and_then(|a| a.prompt.as_deref())
+                            .and_then(intent_core::slug::extract_local_slug)
+                            .unwrap_or_else(intent_core::slug::generate_workspace_slug);
+                        // Branch prefix fallback: repo config > global setting
+                        // (FE parity: workspace.service.ts L1215-1219).
+                        let prefix = if let Some(repo_path) = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                        {
+                            let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                            match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
+                                Some(p) => p,
+                                None => settings_branch_prefix,
                             }
+                        } else {
+                            settings_branch_prefix
+                        };
+                        let desired = format!("{prefix}{slug}");
+                        let git_repo = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                            .filter(|p| p.join(".git").exists());
+                        match git_repo {
+                            Some(repo) => {
+                                let want = desired;
+                                tokio::task::spawn_blocking(move || {
+                                    intent_git::branches::ensure_unique_branch_name(
+                                        &repo, &want,
+                                    )
+                                })
+                                .await
+                                .map_err(|e| {
+                                    Error::Internal(format!(
+                                        "branch uniquification task failed: {e}"
+                                    ))
+                                })??
+                            }
+                            None => desired,
                         }
                     };
                     // Normalise the caller-supplied title: trim surrounding
@@ -14705,17 +14661,14 @@ impl WorkspaceApi for Services {
                                         })
                                     }),
                             };
-                            let script = match effective_script {
-                                Some(s) => s,
-                                None => {
-                                    // No script to execute: the setup stage is done.
-                                    publish_event(
-                                        &bus_for_setup,
-                                        workspace_setup_completed_event(&workspace_id, false, None),
-                                    )
-                                    .await;
-                                    return;
-                                }
+                            let Some(script) = effective_script else {
+                                // No script to execute: the setup stage is done.
+                                publish_event(
+                                    &bus_for_setup,
+                                    workspace_setup_completed_event(&workspace_id, false, None),
+                                )
+                                .await;
+                                return;
                             };
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
@@ -15496,8 +15449,7 @@ impl WorkspaceApi for Services {
                 let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
                     matches!(
                         w.checkout_mode,
-                        Some(intent_core::CheckoutMode::Cow)
-                            | Some(intent_core::CheckoutMode::Direct)
+                        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                     )
                 });
                 let sweep_worktree_path = deleted_worktree_path
@@ -15536,8 +15488,10 @@ impl WorkspaceApi for Services {
                                 // workspace's).
                                 let is_standalone = matches!(
                                     ws_cleanup.checkout_mode,
-                                    Some(intent_core::CheckoutMode::Cow)
-                                        | Some(intent_core::CheckoutMode::Direct)
+                                    Some(
+                                        intent_core::CheckoutMode::Cow
+                                            | intent_core::CheckoutMode::Direct
+                                    )
                                 );
                                 // Standalone-checkout removal is gated on the
                                 // root-anchored `checkout_owned` proof above
@@ -16069,7 +16023,7 @@ impl WorkspaceApi for Services {
             // source's `repositoryPath` — is the clone source.
             let source_standalone = matches!(
                 source.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             );
             // For a hydrated standalone source the checkout is `worktreePath`;
             // for an `isNewRepo` `direct` source there is none and the
@@ -18095,13 +18049,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
-            let mut task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => {
-                    return Err(Error::Internal(
-                        "Note is not a task. Use markAsTask() first.".to_string(),
-                    ))
-                }
+            let Some(mut task) = note.metadata.task.clone() else {
+                return Err(Error::Internal(
+                    "Note is not a task. Use markAsTask() first.".to_string(),
+                ));
             };
             let previous_status = task.status;
             let now = now_iso();
@@ -18336,9 +18287,8 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => return Err(Error::Internal("Note is not a task".to_string())),
+            let Some(task) = note.metadata.task.clone() else {
+                return Err(Error::Internal("Note is not a task".to_string()));
             };
             let all = store.list_notes(&workspace_id).await?;
             let subtasks = all
@@ -18596,9 +18546,8 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let mut task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => return Err(Error::Internal("Note is not a task".to_string())),
+            let Some(mut task) = note.metadata.task.clone() else {
+                return Err(Error::Internal("Note is not a task".to_string()));
             };
             let depends_on = depends_on.map(normalize_relation_ids);
             let conflicts_with = conflicts_with.map(normalize_relation_ids);
@@ -18779,9 +18728,8 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let mut task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => return Err(Error::Internal(format!("Note {note_id} is not a task"))),
+            let Some(mut task) = note.metadata.task.clone() else {
+                return Err(Error::Internal(format!("Note {note_id} is not a task")));
             };
             let agent = AgentId::from(agent_id.as_str());
             let already_assigned = task.assigned_agent_ids.contains(&agent);
@@ -19305,14 +19253,13 @@ impl WorkspaceApi for Services {
             }
             fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let all = store.list_comments(&note_id).await?;
-            let target = match thread_id {
-                Some(t) => t,
-                None => {
-                    let cid = comment_id.unwrap();
-                    match all.iter().find(|c| c.id == cid) {
-                        Some(c) => c.thread_id.clone(),
-                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
-                    }
+            let target = if let Some(t) = thread_id {
+                t
+            } else {
+                let cid = comment_id.unwrap();
+                match all.iter().find(|c| c.id == cid) {
+                    Some(c) => c.thread_id.clone(),
+                    None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
                 }
             };
             let mut group: Vec<Comment> =
@@ -19404,14 +19351,13 @@ impl WorkspaceApi for Services {
             let all = store
                 .list_comments_in_workspace(&workspace_id, &note_id)
                 .await?;
-            let (target, parent_from_id) = match thread_id {
-                Some(t) => (t, None),
-                None => {
-                    let cid = comment_id.unwrap();
-                    match all.iter().find(|c| c.id == cid).cloned() {
-                        Some(c) => (c.thread_id.clone(), Some(c)),
-                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
-                    }
+            let (target, parent_from_id) = if let Some(t) = thread_id {
+                (t, None)
+            } else {
+                let cid = comment_id.unwrap();
+                match all.iter().find(|c| c.id == cid).cloned() {
+                    Some(c) => (c.thread_id.clone(), Some(c)),
+                    None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
                 }
             };
             let mut group: Vec<Comment> = all
@@ -19524,14 +19470,13 @@ impl WorkspaceApi for Services {
             }
             fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let all = store.list_comments(&note_id).await?;
-            let target = match thread_id {
-                Some(t) => t,
-                None => {
-                    let cid = comment_id.unwrap();
-                    match all.iter().find(|c| c.id == cid) {
-                        Some(c) => c.thread_id.clone(),
-                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
-                    }
+            let target = if let Some(t) = thread_id {
+                t
+            } else {
+                let cid = comment_id.unwrap();
+                match all.iter().find(|c| c.id == cid) {
+                    Some(c) => c.thread_id.clone(),
+                    None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
                 }
             };
             let count = all.iter().filter(|c| c.thread_id == target).count();
@@ -20064,29 +20009,27 @@ impl WorkspaceApi for Services {
             } else {
                 git_path.join("config")
             };
-            match tokio::fs::read_to_string(&config_path).await {
-                Ok(content) => Ok(content),
-                Err(_) => {
-                    // If direct read fails, try parent directories (mirroring the FE
-                    // `readGitConfig` fallback logic for nested repos). Limit the walk
-                    // to prevent data exposure from climbing too far.
-                    const MAX_PARENT_LEVELS: usize = 5;
-                    let mut current = path.as_path();
-                    for _ in 0..MAX_PARENT_LEVELS {
-                        if let Some(parent) = current.parent() {
-                            let parent_git_config = parent.join(".git").join("config");
-                            if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await
-                            {
-                                return Ok(content);
-                            }
-                            current = parent;
-                        } else {
-                            break;
+            if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
+                Ok(content)
+            } else {
+                // If direct read fails, try parent directories (mirroring the FE
+                // `readGitConfig` fallback logic for nested repos). Limit the walk
+                // to prevent data exposure from climbing too far.
+                const MAX_PARENT_LEVELS: usize = 5;
+                let mut current = path.as_path();
+                for _ in 0..MAX_PARENT_LEVELS {
+                    if let Some(parent) = current.parent() {
+                        let parent_git_config = parent.join(".git").join("config");
+                        if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await {
+                            return Ok(content);
                         }
+                        current = parent;
+                    } else {
+                        break;
                     }
-                    // No config found in the parent chain (or hit depth limit).
-                    Ok(String::new())
                 }
+                // No config found in the parent chain (or hit depth limit).
+                Ok(String::new())
             }
         })
     }
@@ -21405,9 +21348,8 @@ impl WorkspaceApi for Services {
             let limit = pagination::clamp_limit(limit);
             let skip = pagination::parse_offset(page_token.as_deref());
             let empty = serde_json::json!({ "items": [], "nextToken": serde_json::Value::Null });
-            let ws = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(_) => return Ok(empty),
+            let Ok(ws) = store.get_workspace(&workspace_id).await else {
+                return Ok(empty);
             };
             // `gitRootId` is validated before the remote early-return (same
             // policy as `git_status`).
@@ -21864,83 +21806,80 @@ impl WorkspaceApi for Services {
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
-            match self.agent_manager() {
-                Some(manager) => {
-                    // Construct TurnOptions only when the manager is attached
-                    // to avoid cloning large payloads on the fallback path.
-                    let options = crate::agent_manager::TurnOptions {
-                        stdin_context,
-                        note_ids,
-                        context_references,
-                        image_blocks,
-                        file_blocks,
-                        message_metadata,
-                        origin,
-                        ..crate::agent_manager::TurnOptions::default()
-                    };
-                    if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
-                        manager
-                            .interrupt_send_message(
-                                agent_id,
-                                workspace_id,
-                                content,
-                                message_id,
-                                options,
-                            )
-                            .await
-                    } else {
-                        manager
-                            .send_message(agent_id, workspace_id, content, message_id, options)
-                            .await
-                    }
-                }
-                None => {
-                    // Question hold (PROTOCOL §5.5): the store-only fallback
-                    // must honor the automatic-delivery gate too — the row it
-                    // persists would bury the pending Q&A. User-originated
-                    // sends pass through (never held; only an answer-tagged
-                    // row or `agent.dismissQuestions` releases the hold).
-                    if !origin.is_user() && self.question_hold_active(&agent_id).await {
-                        self.require_agent_session(&agent_id).await?;
-                        let (queued, position) = self.enqueue_message(
-                            &agent_id,
+            if let Some(manager) = self.agent_manager() {
+                // Construct TurnOptions only when the manager is attached
+                // to avoid cloning large payloads on the fallback path.
+                let options = crate::agent_manager::TurnOptions {
+                    stdin_context,
+                    note_ids,
+                    context_references,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                    origin,
+                    ..crate::agent_manager::TurnOptions::default()
+                };
+                if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
+                    manager
+                        .interrupt_send_message(
+                            agent_id,
+                            workspace_id,
                             content,
-                            image_blocks,
-                            file_blocks,
-                            message_metadata,
-                            None,
-                            crate::agent_ops::is_interrupt_priority(priority.as_deref()),
-                        );
-                        let result = serde_json::json!({
-                            "success": true,
-                            "queued": true,
-                            "heldForQuestions": true,
-                            "queuedMessage": queued.to_value(position),
-                            "turnId": queued.turn_id,
-                        });
-                        self.publish_queue_updated(&agent_id).await;
-                        // Race close (hold-check → enqueue vs a concurrent
-                        // `dismissQuestions`/answer): this `None` arm only
-                        // runs with no `AgentManager` attached, so there is
-                        // no drain to kick here — same as the other
-                        // store-only fallbacks.
-                        return Ok(result);
-                    }
-                    // Read-only fallback (no `agent_manager` wired): plumb
-                    // `messageMetadata` through the store-only append so the
-                    // persisted row matches the production
-                    // `AgentManager::send_message` path above.
-                    // STAB-7: image_blocks and file_blocks ARE forwarded now.
-                    self.agent_send_message_op(
-                        agent_id,
+                            message_id,
+                            options,
+                        )
+                        .await
+                } else {
+                    manager
+                        .send_message(agent_id, workspace_id, content, message_id, options)
+                        .await
+                }
+            } else {
+                // Question hold (PROTOCOL §5.5): the store-only fallback
+                // must honor the automatic-delivery gate too — the row it
+                // persists would bury the pending Q&A. User-originated
+                // sends pass through (never held; only an answer-tagged
+                // row or `agent.dismissQuestions` releases the hold).
+                if !origin.is_user() && self.question_hold_active(&agent_id).await {
+                    self.require_agent_session(&agent_id).await?;
+                    let (queued, position) = self.enqueue_message(
+                        &agent_id,
                         content,
-                        message_id,
                         image_blocks,
                         file_blocks,
                         message_metadata,
-                    )
-                    .await
+                        None,
+                        crate::agent_ops::is_interrupt_priority(priority.as_deref()),
+                    );
+                    let result = serde_json::json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                        "turnId": queued.turn_id,
+                    });
+                    self.publish_queue_updated(&agent_id).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this `None` arm only
+                    // runs with no `AgentManager` attached, so there is
+                    // no drain to kick here — same as the other
+                    // store-only fallbacks.
+                    return Ok(result);
                 }
+                // Read-only fallback (no `agent_manager` wired): plumb
+                // `messageMetadata` through the store-only append so the
+                // persisted row matches the production
+                // `AgentManager::send_message` path above.
+                // STAB-7: image_blocks and file_blocks ARE forwarded now.
+                self.agent_send_message_op(
+                    agent_id,
+                    content,
+                    message_id,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                )
+                .await
             }
         })
     }
@@ -22015,52 +21954,48 @@ impl WorkspaceApi for Services {
                 file_blocks,
                 ..Default::default()
             };
-            match self.agent_manager() {
-                Some(manager) => {
-                    manager
-                        .edit_and_regenerate(
-                            agent_id,
-                            workspace_id,
-                            message_id,
-                            content,
-                            model,
-                            options,
-                        )
-                        .await
-                }
-                None => {
-                    // Store-level fallback (no `agent_manager` wired — UDS unit
-                    // harnesses): validate + optional model switch + truncate +
-                    // persist the edited message, without the runtime
-                    // stop/recreate/regenerate orchestration (which requires a
-                    // live manager).
-                    self.agent_validate_edit_target_op(&agent_id, &message_id)
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .edit_and_regenerate(
+                        agent_id,
+                        workspace_id,
+                        message_id,
+                        content,
+                        model,
+                        options,
+                    )
+                    .await
+            } else {
+                // Store-level fallback (no `agent_manager` wired — UDS unit
+                // harnesses): validate + optional model switch + truncate +
+                // persist the edited message, without the runtime
+                // stop/recreate/regenerate orchestration (which requires a
+                // live manager).
+                self.agent_validate_edit_target_op(&agent_id, &message_id)
+                    .await?;
+                if let Some(model_id) = model {
+                    self.agent_set_model_op(agent_id.clone(), model_id, None)
                         .await?;
-                    if let Some(model_id) = model {
-                        self.agent_set_model_op(agent_id.clone(), model_id, None)
-                            .await?;
-                    }
-                    let truncated_count =
-                        self.agent_edit_truncate_op(&agent_id, &message_id).await?;
-                    let result = self
-                        .agent_send_message_op(
-                            agent_id,
-                            content,
-                            None,
-                            options.image_blocks,
-                            options.file_blocks,
-                            None,
-                        )
-                        .await?;
-                    let mut result = result;
-                    if let Some(obj) = result.as_object_mut() {
-                        obj.insert(
-                            "truncatedCount".to_string(),
-                            serde_json::json!(truncated_count),
-                        );
-                    }
-                    Ok(result)
                 }
+                let truncated_count = self.agent_edit_truncate_op(&agent_id, &message_id).await?;
+                let result = self
+                    .agent_send_message_op(
+                        agent_id,
+                        content,
+                        None,
+                        options.image_blocks,
+                        options.file_blocks,
+                        None,
+                    )
+                    .await?;
+                let mut result = result;
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "truncatedCount".to_string(),
+                        serde_json::json!(truncated_count),
+                    );
+                }
+                Ok(result)
             }
         })
     }
@@ -23490,53 +23425,52 @@ impl WorkspaceApi for Services {
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
             let cache_root = cache_parent.join(".repo-cache");
-            match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
-                Some(cached) => {
-                    let mut result = serde_json::json!({
-                        "cached": true,
-                        "source": "cache",
-                        "branches": cached.branches,
-                    });
-                    // `defaultBranch` is optional on the wire: omitted (not
-                    // null) when `origin/HEAD` is unresolvable.
-                    if let Some(default) = cached.default_branch {
-                        result["defaultBranch"] = serde_json::Value::String(default);
-                    }
-                    Ok(result)
+            if let Some(cached) =
+                intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
+            {
+                let mut result = serde_json::json!({
+                    "cached": true,
+                    "source": "cache",
+                    "branches": cached.branches,
+                });
+                // `defaultBranch` is optional on the wire: omitted (not
+                // null) when `origin/HEAD` is unresolvable.
+                if let Some(default) = cached.default_branch {
+                    result["defaultBranch"] = serde_json::Value::String(default);
                 }
+                Ok(result)
+            } else {
                 // Cold cache: fall back to one `git ls-remote` against the
                 // GitHub remote (monorepo#1955) — one child process, one
                 // round-trip, token offered via env exactly like the clone
                 // pipeline. Any failure (offline, missing repo, no access)
                 // folds to the pre-fallback `{ cached: false, branches: [] }`
                 // — this method never errors for the FE seam.
-                None => {
-                    let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
-                    let url = format!("{base}/{owner}/{repo}.git");
-                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
-                    match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
-                        Ok(remote) => {
-                            let mut result = serde_json::json!({
-                                "cached": false,
-                                "source": "ls-remote",
-                                "branches": remote.branches,
-                            });
-                            if let Some(default) = remote.default_branch {
-                                result["defaultBranch"] = serde_json::Value::String(default);
-                            }
-                            Ok(result)
+                let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
+                let url = format!("{base}/{owner}/{repo}.git");
+                let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
+                    Ok(remote) => {
+                        let mut result = serde_json::json!({
+                            "cached": false,
+                            "source": "ls-remote",
+                            "branches": remote.branches,
+                        });
+                        if let Some(default) = remote.default_branch {
+                            result["defaultBranch"] = serde_json::Value::String(default);
                         }
-                        Err(e) => {
-                            tracing::debug!(
-                                owner = %owner,
-                                repo = %repo,
-                                "branches.listCached ls-remote fallback failed: {e}"
-                            );
-                            Ok(serde_json::json!({
-                                "cached": false,
-                                "branches": [],
-                            }))
-                        }
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            owner = %owner,
+                            repo = %repo,
+                            "branches.listCached ls-remote fallback failed: {e}"
+                        );
+                        Ok(serde_json::json!({
+                            "cached": false,
+                            "branches": [],
+                        }))
                     }
                 }
             }
@@ -24225,9 +24159,8 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let parsed = file_tracking_ops::parse_filter(filter.as_ref());
             let worktree = ft_worktree(&store, &workspace_id).await;
-            let rows = match store.list_tracked_changes(&workspace_id).await {
-                Ok(r) => r,
-                Err(_) => return Ok(empty_changes_result()),
+            let Ok(rows) = store.list_tracked_changes(&workspace_id).await else {
+                return Ok(empty_changes_result());
             };
             Ok(file_tracking_ops::build_changes_result(
                 rows,
@@ -24270,9 +24203,8 @@ impl WorkspaceApi for Services {
             else {
                 return Ok(empty);
             };
-            let ws = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(_) => return Ok(empty),
+            let Ok(ws) = store.get_workspace(&workspace_id).await else {
+                return Ok(empty);
             };
             if ws.is_remote {
                 return Ok(empty);
@@ -25130,9 +25062,8 @@ impl Services {
         files: Option<Vec<String>>,
     ) -> Result<serde_json::Value> {
         accept_changes::validate_action(&action)?;
-        let ws = match self.store.get_workspace(&workspace_id).await {
-            Ok(w) => w,
-            Err(_) => return Ok(accept_changes::prepare_invalid("Workspace not found")),
+        let Ok(ws) = self.store.get_workspace(&workspace_id).await else {
+            return Ok(accept_changes::prepare_invalid("Workspace not found"));
         };
         let Some(worktree) = git_ops::worktree_path(&ws) else {
             return Ok(accept_changes::prepare_invalid("Workspace has no path"));
@@ -25752,9 +25683,8 @@ impl Services {
         if metadata.is_empty() {
             return;
         }
-        let status = match intent_git::status::status(worktree) {
-            Ok(s) => s,
-            Err(_) => return,
+        let Ok(status) = intent_git::status::status(worktree) else {
+            return;
         };
         let mut by_path: HashMap<String, (bool, &'static str)> = HashMap::new();
         for f in &status.files {
@@ -25857,18 +25787,14 @@ impl Services {
         steps: &mut Vec<serde_json::Value>,
         result: &mut serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<(), serde_json::Value> {
-        let status = match intent_git::status::status(worktree) {
-            Ok(s) => s,
-            Err(_) => {
-                return Err(ac_step_failure(
-                    steps.clone(),
-                    "reset-to-trunk",
-                    "Reset to trunk",
-                    Some("Failed to verify worktree state"),
-                    "Unable to verify worktree is clean before reset. Please try again."
-                        .to_string(),
-                ));
-            }
+        let Ok(status) = intent_git::status::status(worktree) else {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "reset-to-trunk",
+                "Reset to trunk",
+                Some("Failed to verify worktree state"),
+                "Unable to verify worktree is clean before reset. Please try again.".to_string(),
+            ));
         };
         if !status.files.is_empty() {
             return Err(ac_step_failure(

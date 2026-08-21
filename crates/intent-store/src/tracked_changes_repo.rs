@@ -94,13 +94,38 @@ impl Store {
             )
         });
 
-        match existing {
-            Some((id, prev_additions, prev_deletions)) => {
-                sqlx::query(
-                    "UPDATE tracked_changes SET status = ?, agent_id = ?, session_id = ?, \
-                     turn = ?, commit_hash = ?, old_blob_sha = ?, new_blob_sha = ?, \
-                     additions = ?, deletions = ?, updated_at = ? WHERE id = ?",
-                )
+        if let Some((id, prev_additions, prev_deletions)) = existing {
+            sqlx::query(
+                "UPDATE tracked_changes SET status = ?, agent_id = ?, session_id = ?, \
+                 turn = ?, commit_hash = ?, old_blob_sha = ?, new_blob_sha = ?, \
+                 additions = ?, deletions = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&c.status)
+            .bind(&c.agent_id)
+            .bind(&c.session_id)
+            .bind(c.turn)
+            .bind(&c.commit_hash)
+            .bind(&c.old_blob_sha)
+            .bind(&c.new_blob_sha)
+            .bind(c.additions)
+            .bind(c.deletions)
+            .bind(&now)
+            .bind(&id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update tracked change failed: {e}")))?;
+            Ok(Some((prev_additions, prev_deletions)))
+        } else {
+            let id = Uuid::now_v7().to_string();
+            let sql = format!(
+                "INSERT INTO tracked_changes ({TRACKED_CHANGE_COLUMNS}) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            );
+            sqlx::query(&sql)
+                .bind(&id)
+                .bind(&c.workspace_id.0)
+                .bind(&c.path)
+                .bind(&c.stage)
                 .bind(&c.status)
                 .bind(&c.agent_id)
                 .bind(&c.session_id)
@@ -111,39 +136,11 @@ impl Store {
                 .bind(c.additions)
                 .bind(c.deletions)
                 .bind(&now)
-                .bind(&id)
+                .bind(&now)
                 .execute(self.write_pool())
                 .await
-                .map_err(|e| Error::Internal(format!("update tracked change failed: {e}")))?;
-                Ok(Some((prev_additions, prev_deletions)))
-            }
-            None => {
-                let id = Uuid::now_v7().to_string();
-                let sql = format!(
-                    "INSERT INTO tracked_changes ({TRACKED_CHANGE_COLUMNS}) \
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                );
-                sqlx::query(&sql)
-                    .bind(&id)
-                    .bind(&c.workspace_id.0)
-                    .bind(&c.path)
-                    .bind(&c.stage)
-                    .bind(&c.status)
-                    .bind(&c.agent_id)
-                    .bind(&c.session_id)
-                    .bind(c.turn)
-                    .bind(&c.commit_hash)
-                    .bind(&c.old_blob_sha)
-                    .bind(&c.new_blob_sha)
-                    .bind(c.additions)
-                    .bind(c.deletions)
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(self.write_pool())
-                    .await
-                    .map_err(|e| Error::Internal(format!("insert tracked change failed: {e}")))?;
-                Ok(None)
-            }
+                .map_err(|e| Error::Internal(format!("insert tracked change failed: {e}")))?;
+            Ok(None)
         }
     }
 

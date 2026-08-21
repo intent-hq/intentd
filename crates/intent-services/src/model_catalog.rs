@@ -666,38 +666,34 @@ where
     let fetched = cell
         .get_or_init(|| async {
             let fetched = fetch().await;
-            match &fetched.models {
-                Some(models) => {
-                    cache.clear_negative(provider_id);
-                    if !models.is_empty() {
-                        cache.store(provider_id, version_key, models.clone(), now_ms);
-                    }
+            if let Some(models) = &fetched.models {
+                cache.clear_negative(provider_id);
+                if !models.is_empty() {
+                    cache.store(provider_id, version_key, models.clone(), now_ms);
                 }
-                None => {
-                    let reason = fetched
-                        .warning
-                        .clone()
-                        .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-                    cache.store_negative(provider_id, version_key, reason, now_ms);
-                }
+            } else {
+                let reason = fetched
+                    .warning
+                    .clone()
+                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+                cache.store_negative(provider_id, version_key, reason, now_ms);
             }
             fetched
         })
         .await
         .clone();
     cache.finish_inflight(provider_id, version_key, &cell);
-    match fetched.models {
-        Some(models) => ResolvedModels {
+    if let Some(models) = fetched.models {
+        ResolvedModels {
             models: Some(models),
             stale: false,
             warning: fetched.warning,
-        },
-        None => {
-            let reason = fetched
-                .warning
-                .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-            failure_fallback(cache, provider_id, version_key, reason)
         }
+    } else {
+        let reason = fetched
+            .warning
+            .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+        failure_fallback(cache, provider_id, version_key, reason)
     }
 }
 

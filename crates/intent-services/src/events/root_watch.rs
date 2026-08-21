@@ -183,12 +183,11 @@ fn register_off_thread(
 async fn await_registration(
     rx: oneshot::Receiver<notify::Result<RecommendedWatcher>>,
 ) -> Option<notify::Result<RecommendedWatcher>> {
-    match rx.await {
-        Ok(result) => Some(result),
-        Err(_) => {
-            tracing::warn!("watch registration thread did not report a result");
-            None
-        }
+    if let Ok(result) = rx.await {
+        Some(result)
+    } else {
+        tracing::warn!("watch registration thread did not report a result");
+        None
     }
 }
 

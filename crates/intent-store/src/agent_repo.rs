@@ -135,7 +135,9 @@ pub(crate) async fn fetch_agent_usage_rows(
         // (monorepo#738) — and when it does run it projects usage metadata in
         // SQL rather than message bodies (monorepo#1571).
         let contents: Vec<serde_json::Value> =
-            if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+            if intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+                Vec::new()
+            } else {
                 let message_sql = format!(
                     "SELECT {MESSAGE_USAGE_JSON_SQL} AS usage_json FROM agent_message \
                      WHERE agent_id = ? AND {MESSAGE_USAGE_PRESENT_SQL} ORDER BY seq ASC"
@@ -154,8 +156,6 @@ pub(crate) async fn fetch_agent_usage_rows(
                         usage_json.and_then(|s| serde_json::from_str(&s).ok())
                     })
                     .collect()
-            } else {
-                Vec::new()
             };
 
         result.push((agent_id, model, snapshot, baseline, contents));

@@ -115,9 +115,10 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
     let deadline = Instant::now() + common::rpc_read_timeout();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            panic!("wss_rpc timed out waiting for response to id={id} method={method}");
-        }
+        assert!(
+            !remaining.is_zero(),
+            "wss_rpc timed out waiting for response to id={id} method={method}"
+        );
         match timeout(remaining, ws.next()).await.unwrap_or_else(|_| {
             panic!("wss_rpc timed out waiting for response to id={id} method={method}")
         }) {
@@ -148,9 +149,7 @@ async fn drain_until_close(ws: &mut PlainWs, dur: Duration) {
             return;
         }
         match timeout(remaining, ws.next()).await {
-            Err(_) | Ok(None) => return,
-            Ok(Some(Ok(Message::Close(_)))) => return,
-            Ok(Some(Err(_))) => return,
+            Err(_) | Ok(None | Some(Ok(Message::Close(_)) | Err(_))) => return,
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
@@ -271,12 +270,11 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
         if fx.registry.len() < 2 {
             break;
         }
-        if Instant::now() >= dereg_deadline {
-            panic!(
-                "sticky registry did not deregister client A within deadline (len={})",
-                fx.registry.len()
-            );
-        }
+        assert!(
+            Instant::now() < dereg_deadline,
+            "sticky registry did not deregister client A within deadline (len={})",
+            fx.registry.len()
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let call_b = tokio::spawn({

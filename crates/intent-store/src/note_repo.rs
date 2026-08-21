@@ -367,7 +367,7 @@ impl Store {
                     stats.total += 1;
                     stats.completed += 1;
                 }
-                Some("in_progress") | Some("review_required") => {
+                Some("in_progress" | "review_required") => {
                     stats.total += 1;
                     stats.in_progress += 1;
                 }

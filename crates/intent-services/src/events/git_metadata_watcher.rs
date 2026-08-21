@@ -350,7 +350,7 @@ fn is_git_metadata_path(git_dir: &Path, abs: &Path) -> bool {
     };
     match first.to_str() {
         Some("refs") => true,
-        Some("HEAD") | Some("index") | Some("packed-refs") => components.next().is_none(),
+        Some("HEAD" | "index" | "packed-refs") => components.next().is_none(),
         _ => false,
     }
 }
@@ -371,7 +371,7 @@ fn is_worktree_gitdir_metadata_path(gitdir: &Path, abs: &Path) -> bool {
     };
     match first.to_str() {
         Some("refs") => true,
-        Some("HEAD") | Some("index") => components.next().is_none(),
+        Some("HEAD" | "index") => components.next().is_none(),
         _ => false,
     }
 }

@@ -203,9 +203,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => panic!("wss event timed out"),
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => panic!("wss event timed out"),
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            panic!("wss event timed out")
         };
         match next {
             Some(Ok(Message::Text(text))) => {

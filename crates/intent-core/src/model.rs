@@ -3981,7 +3981,7 @@ mod tests {
                 assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
                 assert!(o.agent_instructions.is_none());
             }
-            other => panic!("expected Options, got {other:?}"),
+            other @ BatchTaskEntry::Id(_) => panic!("expected Options, got {other:?}"),
         }
         assert_eq!(tasks[2].task_note_id().0, "min-id");
 

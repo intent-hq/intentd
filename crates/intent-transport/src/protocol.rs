@@ -299,29 +299,26 @@ impl LargeFrameWarnThrottle {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match entries.iter_mut().find(|(m, _)| m == method) {
-            Some((_, last)) => {
-                if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
-                    false
-                } else {
-                    *last = now;
-                    true
-                }
-            }
-            None => {
-                if entries.len() >= MAX_TRACKED_METHODS {
-                    if let Some(stalest) = entries
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (_, last))| *last)
-                        .map(|(i, _)| i)
-                    {
-                        entries.swap_remove(stalest);
-                    }
-                }
-                entries.push((method.to_string(), now));
+        if let Some((_, last)) = entries.iter_mut().find(|(m, _)| m == method) {
+            if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
+                false
+            } else {
+                *last = now;
                 true
             }
+        } else {
+            if entries.len() >= MAX_TRACKED_METHODS {
+                if let Some(stalest) = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(i, _)| i)
+                {
+                    entries.swap_remove(stalest);
+                }
+            }
+            entries.push((method.to_string(), now));
+            true
         }
     }
 

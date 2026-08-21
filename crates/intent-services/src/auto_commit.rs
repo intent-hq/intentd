@@ -215,9 +215,10 @@ impl Services {
 
         // Resolve worktree path for generation + fallback.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
-            Ok(ws) => match ws.worktree_path.map(PathBuf::from) {
-                Some(p) => p,
-                None => {
+            Ok(ws) => {
+                if let Some(p) = ws.worktree_path.map(PathBuf::from) {
+                    p
+                } else {
                     tracing::debug!(
                         agent = %agent_id.0,
                         workspace = %session.workspace_id.0,
@@ -225,7 +226,7 @@ impl Services {
                     );
                     return;
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id.0,
@@ -239,20 +240,19 @@ impl Services {
 
         let linked_note_id = session.task_note_id.clone();
         // Attempt LLM generation; fall back to deterministic subject on any failure.
-        let message = match self
+        let message = if let Some(msg) = self
             .generate_auto_commit_message(&worktree_path, &session, &linked_note_id)
             .await
         {
-            Some(msg) => msg,
-            None => {
-                tracing::debug!(
-                    agent = %agent_id.0,
-                    workspace = %session.workspace_id.0,
-                    "auto-commit using fallback subject"
-                );
-                self.build_auto_commit_subject(&session, &linked_note_id)
-                    .await
-            }
+            msg
+        } else {
+            tracing::debug!(
+                agent = %agent_id.0,
+                workspace = %session.workspace_id.0,
+                "auto-commit using fallback subject"
+            );
+            self.build_auto_commit_subject(&session, &linked_note_id)
+                .await
         };
 
         match self
@@ -440,27 +440,24 @@ impl Services {
         match result {
             Ok(value) => {
                 let text = value["text"].as_str().unwrap_or("");
-                match parse_commit_message_json(text) {
-                    Some(msg) => {
-                        tracing::debug!(
-                            workspace = %session.workspace_id.0,
-                            "generate_auto_commit_message: success"
-                        );
-                        Some(msg)
-                    }
-                    None => {
-                        tracing::warn!(
-                            workspace = %session.workspace_id.0,
-                            "generate_auto_commit_message: unparseable output (no JSON object with a non-empty subject)"
-                        );
-                        let raw: String = text.chars().take(RAW_OUTPUT_LOG_CAP_CHARS).collect();
-                        tracing::debug!(
-                            workspace = %session.workspace_id.0,
-                            raw = %raw,
-                            "generate_auto_commit_message: unparseable raw output (truncated)"
-                        );
-                        None
-                    }
+                if let Some(msg) = parse_commit_message_json(text) {
+                    tracing::debug!(
+                        workspace = %session.workspace_id.0,
+                        "generate_auto_commit_message: success"
+                    );
+                    Some(msg)
+                } else {
+                    tracing::warn!(
+                        workspace = %session.workspace_id.0,
+                        "generate_auto_commit_message: unparseable output (no JSON object with a non-empty subject)"
+                    );
+                    let raw: String = text.chars().take(RAW_OUTPUT_LOG_CAP_CHARS).collect();
+                    tracing::debug!(
+                        workspace = %session.workspace_id.0,
+                        raw = %raw,
+                        "generate_auto_commit_message: unparseable raw output (truncated)"
+                    );
+                    None
                 }
             }
             Err(e) => {

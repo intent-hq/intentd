@@ -418,41 +418,42 @@ pub async fn run(
     };
 
     let (stdout_bytes, stderr_bytes, wait_result, timed_out) = if let Some(ms) = args.timeout_ms {
-        match tokio::time::timeout(Duration::from_millis(ms), wait_fut).await {
-            Ok((out, err, status)) => (out, err, status, false),
-            Err(_) => {
-                // Reap the whole process group: SIGTERM → grace → SIGKILL,
-                // plus a snapshot-before-kill descendant sweep for anything
-                // that escaped into its own process group
-                // (`intent_acp::descendant_sweep`). On non-unix `kill_on_drop`
-                // will still reap the direct child when `child` is dropped by
-                // the returned future's scope.
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    let descendants = intent_acp::descendant_pids(pid).await;
-                    kill_group(pid, nix::sys::signal::Signal::SIGTERM);
-                    tokio::time::sleep(TERM_GRACE).await;
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        // exited during grace
-                    } else {
-                        kill_group(pid, nix::sys::signal::Signal::SIGKILL);
-                    }
-                    intent_acp::sweep_escaped_descendants(&descendants).await;
+        if let Ok((out, err, status)) =
+            tokio::time::timeout(Duration::from_millis(ms), wait_fut).await
+        {
+            (out, err, status, false)
+        } else {
+            // Reap the whole process group: SIGTERM → grace → SIGKILL,
+            // plus a snapshot-before-kill descendant sweep for anything
+            // that escaped into its own process group
+            // (`intent_acp::descendant_sweep`). On non-unix `kill_on_drop`
+            // will still reap the direct child when `child` is dropped by
+            // the returned future's scope.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let descendants = intent_acp::descendant_pids(pid).await;
+                kill_group(pid, nix::sys::signal::Signal::SIGTERM);
+                tokio::time::sleep(TERM_GRACE).await;
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    // exited during grace
+                } else {
+                    kill_group(pid, nix::sys::signal::Signal::SIGKILL);
                 }
-                #[cfg(not(unix))]
-                let _ = pid;
-                // Best-effort drain of whatever the child produced pre-timeout.
-                let status = child.wait().await;
-                let mut out = Vec::new();
-                if let Some(mut r) = stdout_reader.take() {
-                    let _ = r.read_to_end(&mut out).await;
-                }
-                let mut err = Vec::new();
-                if let Some(mut r) = stderr_reader.take() {
-                    let _ = r.read_to_end(&mut err).await;
-                }
-                (out, err, status, true)
+                intent_acp::sweep_escaped_descendants(&descendants).await;
             }
+            #[cfg(not(unix))]
+            let _ = pid;
+            // Best-effort drain of whatever the child produced pre-timeout.
+            let status = child.wait().await;
+            let mut out = Vec::new();
+            if let Some(mut r) = stdout_reader.take() {
+                let _ = r.read_to_end(&mut out).await;
+            }
+            let mut err = Vec::new();
+            if let Some(mut r) = stderr_reader.take() {
+                let _ = r.read_to_end(&mut err).await;
+            }
+            (out, err, status, true)
         }
     } else {
         let (out, err, status) = wait_fut.await;

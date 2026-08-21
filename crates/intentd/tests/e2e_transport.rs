@@ -265,14 +265,13 @@ async fn http_status(port: u16, cfg: Arc<ClientConfig>, request: &str) -> u16 {
     let _ = timeout(Duration::from_secs(3), async {
         loop {
             match tls.read(&mut byte).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     buf.push(byte[0]);
                     if buf.ends_with(b"\r\n") {
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
     })

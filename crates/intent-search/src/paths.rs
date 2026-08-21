@@ -62,10 +62,7 @@ pub fn search_file_names(
         if cancel.is_cancelled() {
             break;
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }

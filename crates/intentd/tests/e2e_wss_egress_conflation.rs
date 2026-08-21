@@ -296,7 +296,6 @@ async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
                         other => panic!("unexpected event type {other:?}"),
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
                 Message::Close(_) => panic!("connection closed mid-stream"),
                 _ => {}
             }

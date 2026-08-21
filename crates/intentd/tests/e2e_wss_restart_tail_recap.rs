@@ -267,9 +267,10 @@ where
         if lines.iter().any(&pred) {
             return lines;
         }
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for {what}; log so far: {lines:?}");
-        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "timed out waiting for {what}; log so far: {lines:?}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -292,16 +293,15 @@ where
         if pred(&session.messages) {
             return;
         }
-        if tokio::time::Instant::now() > deadline {
-            panic!(
-                "timed out waiting for {what}; transcript: {:?}",
-                session
-                    .messages
-                    .iter()
-                    .map(|m| (m.role.clone(), m.content.to_string()))
-                    .collect::<Vec<_>>()
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "timed out waiting for {what}; transcript: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.to_string()))
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

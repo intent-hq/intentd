@@ -1266,21 +1266,22 @@ impl ProcessRegistry {
                     inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
                     inner.wait_queue.push((agent_id.clone(), tx, reason));
                     let used = inner.entries.len();
-                    match over_budget {
-                        Some(charged) => tracing::info!(
+                    if let Some(charged) = over_budget {
+                        tracing::info!(
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
                             charged_memory_bytes = charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
                             "process registry: spawn queued (aggregate memory budget)"
-                        ),
-                        None => tracing::info!(
+                        );
+                    } else {
+                        tracing::info!(
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
                             "process registry: spawn queued (all slots active)"
-                        ),
+                        );
                     }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
@@ -4716,9 +4717,8 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status");
             return;
         }
-        let serialized_status = match serde_json::to_value(status) {
-            Ok(Value::String(s)) => s,
-            _ => return,
+        let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
+            return;
         };
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
@@ -4771,9 +4771,8 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status + stop_reason");
             return;
         }
-        let serialized_status = match serde_json::to_value(status) {
-            Ok(Value::String(s)) => s,
-            _ => return,
+        let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
+            return;
         };
         // Build the event data. When stop_reason is Some(_) — i.e. the call sets or
         // clears the persisted value — include "stopReason" in the event: the string
@@ -5103,13 +5102,12 @@ impl AgentManager {
         // the user-row `agent:message` echo, the RPC result, and the turn
         // worker (via `options`) all carry the SAME id. `spawn_worker` keeps
         // an already-set id, so this is the direct-send mint point.
-        let turn_id = match options.turn_id.clone() {
-            Some(id) => id,
-            None => {
-                let id = new_message_id();
-                options.turn_id = Some(id.clone());
-                id
-            }
+        let turn_id = if let Some(id) = options.turn_id.clone() {
+            id
+        } else {
+            let id = new_message_id();
+            options.turn_id = Some(id.clone());
+            id
         };
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
@@ -5384,24 +5382,21 @@ impl AgentManager {
         } else {
             self.services.dequeue_message(&agent_id)
         };
-        let mut next = match dequeued {
-            Some(msg) => msg,
-            None => {
-                // Raced with another mutation (e.g. remove) that emptied the
-                // ready-to-send queue between the check above and the dequeue.
-                self.end_turn(&agent_id).await;
-                // monorepo#1280: the racing retraction saw this drain's
-                // in-flight slot (`agent_is_busy` true) and skipped its own
-                // redelivery, expecting a turn to end with a terminal
-                // `agent:idle` — but this arm emits none. Re-run the
-                // mutation-path redelivery now that the slot is released;
-                // its guards (marker set, queue empty, not busy) make it a
-                // no-op in every other interleaving.
-                self.services
-                    .redeliver_completion_after_queue_mutation(&agent_id)
-                    .await;
-                return;
-            }
+        let Some(mut next) = dequeued else {
+            // Raced with another mutation (e.g. remove) that emptied the
+            // ready-to-send queue between the check above and the dequeue.
+            self.end_turn(&agent_id).await;
+            // monorepo#1280: the racing retraction saw this drain's
+            // in-flight slot (`agent_is_busy` true) and skipped its own
+            // redelivery, expecting a turn to end with a terminal
+            // `agent:idle` — but this arm emits none. Re-run the
+            // mutation-path redelivery now that the slot is released;
+            // its guards (marker set, queue empty, not busy) make it a
+            // no-op in every other interleaving.
+            self.services
+                .redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
+            return;
         };
         self.services
             .publish_queue_updated_for(
@@ -6913,9 +6908,9 @@ impl AgentManager {
                 continue;
             }
             // Read the workspace from agent_ws (stop() will clear it via end_turn).
-            let workspace_id = match self.agent_ws.lock().unwrap().get(id).cloned() {
-                Some(ws) => ws,
-                None => continue, // Stale busy entry (should not happen).
+            let Some(workspace_id) = self.agent_ws.lock().unwrap().get(id).cloned() else {
+                // Stale busy entry (should not happen).
+                continue;
             };
             // Pin the live-turn slot BEFORE aborting the worker: the abort
             // drops the worker future and with it the LiveTurnGuard, so an
@@ -7253,18 +7248,19 @@ impl AgentManager {
                     }
                 };
                 if let Some((status, dead_child)) = exited {
-                    match &stderr_dir {
-                        Some(dir) => tracing::warn!(
+                    if let Some(dir) = &stderr_dir {
+                        tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped (agent stderr captured at {})",
                             dir.display()
-                        ),
-                        None => tracing::warn!(
+                        );
+                    } else {
+                        tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped"
-                        ),
+                        );
                     }
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
@@ -7506,10 +7502,7 @@ fn build_stdin_context_from_context_references(refs: Option<&Value>) -> Option<S
     }
     let mut parts: Vec<String> = Vec::new();
     for r in arr {
-        let obj = match r.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
+        let Some(obj) = r.as_object() else { continue };
         // Content resolution mirrors the FE: `content` → `selectedText` →
         // `taskText` → `codeChunk` (first non-empty wins).
         let content = ["content", "selectedText", "taskText", "codeChunk"]
@@ -7642,8 +7635,7 @@ fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Val
             a.extend(b);
             Some(Value::Array(a))
         }
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (Some(a), Some(_)) => Some(a),
+        (Some(a), None | Some(_)) | (None, Some(a)) => Some(a),
         (None, None) => None,
     }
 }
@@ -8426,9 +8418,7 @@ async fn run_message_worker(
                                 } else {
                                     false
                                 };
-                                if !boundary_landed {
-                                    mgr.kill_child_only(&agent_id).await;
-                                } else {
+                                if boundary_landed {
                                     // Hold the notifications lock across the
                                     // drain so the warning turn cannot start
                                     // consuming the channel mid-sweep.
@@ -8442,6 +8432,8 @@ async fn run_message_worker(
                                         let mut guard = notes.lock().await;
                                         Services::drain_replay_notifications(&mut guard).await;
                                     }
+                                } else {
+                                    mgr.kill_child_only(&agent_id).await;
                                 }
                                 tracing::warn!(
                                     agent = %agent_id,

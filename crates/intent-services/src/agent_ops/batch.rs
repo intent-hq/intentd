@@ -306,7 +306,10 @@ pub(crate) fn classify_batch_tasks(
                         })
                         .cloned()
                         .collect();
-                    if !unmet.is_empty() {
+                    if unmet.is_empty() {
+                        startable.push(id.as_str());
+                        None
+                    } else {
                         let decision_needed = unmet
                             .iter()
                             .filter(|dep| {
@@ -323,9 +326,6 @@ pub(crate) fn classify_batch_tasks(
                             unmet,
                             decision_needed,
                         })
-                    } else {
-                        startable.push(id.as_str());
-                        None
                     }
                 }
             }

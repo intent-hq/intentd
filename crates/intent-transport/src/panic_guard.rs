@@ -68,9 +68,10 @@ pub(crate) fn maybe_inject_panic(method: &str) {
         return;
     }
     if let Ok(list) = std::env::var("INTENTD_TEST_PANIC_METHOD") {
-        if list.split(',').map(str::trim).any(|m| m == method) {
-            panic!("injected test panic for method {method}");
-        }
+        assert!(
+            !list.split(',').map(str::trim).any(|m| m == method),
+            "injected test panic for method {method}"
+        );
     }
 }
 

@@ -664,9 +664,9 @@ impl Services {
     /// dir. Best-effort.
     pub(crate) async fn sweep_stale_export_staging_dirs(&self) {
         let root = self.export_staging_root();
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(entries) => entries,
-            Err(_) => return, // no staging root yet — nothing to sweep
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+            // no staging root yet — nothing to sweep
+            return;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1036,7 +1036,7 @@ mod tests {
         let exports = svc.transfer_exports.lock().unwrap();
         match &exports.get(export_id).expect("session").state {
             ExportState::Ready(r) => (r.size_bytes, r.sha256.clone()),
-            _ => panic!("session not ready"),
+            ExportState::Building { .. } => panic!("session not ready"),
         }
     }
 

@@ -162,7 +162,7 @@ pub(crate) fn derive_check_state(status: &str, conclusion: Option<&str>) -> Chec
     }
     match conclusion {
         Some("success") => CheckState::Success,
-        Some("neutral") | Some("skipped") => CheckState::Neutral,
+        Some("neutral" | "skipped") => CheckState::Neutral,
         Some("cancelled") => CheckState::Cancelled,
         _ => CheckState::Failure,
     }
@@ -1180,7 +1180,7 @@ impl SourceControl for GitHubSourceControl {
             Some(PrState::Open) => {
                 body.insert("state".into(), json!("open"));
             }
-            Some(PrState::Closed) | Some(PrState::Merged) => {
+            Some(PrState::Closed | PrState::Merged) => {
                 body.insert("state".into(), json!("closed"));
             }
             None => {}

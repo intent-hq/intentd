@@ -409,7 +409,6 @@ mod session_tests {
                         json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                     }
                     "session/new" => json!({ "sessionId": "acp-session-1" }),
-                    "session/load" => json!({}),
                     "session/prompt" => prompt_result.clone(),
                     _ => json!({}),
                 };

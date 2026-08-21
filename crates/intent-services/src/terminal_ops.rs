@@ -47,11 +47,10 @@ const DEFAULT_TERM: &str = "xterm-256color";
 fn ensure_terminal_term(env: &mut Vec<(String, String)>, inherited_term: Option<&str>) {
     match env.iter_mut().rev().find(|(name, _)| name == "TERM") {
         Some((_, value)) if value.is_empty() => *value = DEFAULT_TERM.to_string(),
-        Some(_) => {}
         None if inherited_term.is_none_or(str::is_empty) => {
             env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
         }
-        None => {}
+        Some(_) | None => {}
     }
 }
 
@@ -481,9 +480,8 @@ pub(crate) fn spawn_output_stream(
     pty_id: PtyId,
     terminal_id: String,
 ) {
-    let attachment = match pty.attach(pty_id) {
-        Ok(a) => a,
-        Err(_) => return,
+    let Ok(attachment) = pty.attach(pty_id) else {
+        return;
     };
     tokio::spawn(async move {
         let mut live = attachment.live;
@@ -528,7 +526,7 @@ fn drain_pending(
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
             Err(TryRecvError::Lagged(_)) => {}
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
 }
@@ -883,9 +881,8 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !contains_sub(&acc, needle) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, sub.recv()).await {
                 Ok(Some(batch)) => {

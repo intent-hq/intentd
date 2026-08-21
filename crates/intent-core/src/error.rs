@@ -189,9 +189,10 @@ impl Error {
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
             | Error::WarmInFlight { .. }
-            | Error::AdapterBusy { .. } => -32603,
+            | Error::AdapterBusy { .. }
+            // Unsupported: map to internal error for now
+            | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
-            Error::Unsupported(_) => -32603, // Map to internal error for now
         }
     }
 }

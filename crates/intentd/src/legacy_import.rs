@@ -764,9 +764,7 @@ fn id_is_single_path_component(id: &str) -> bool {
 /// [`run`] turns a panicking per-workspace unit into a logged skip.
 #[cfg(test)]
 fn maybe_injected_test_panic(obj: &Map<String, Value>) {
-    if obj.contains_key("__testPanic") {
-        panic!("injected test panic");
-    }
+    assert!(!obj.contains_key("__testPanic"), "injected test panic");
 }
 
 #[cfg(not(test))]
@@ -1394,9 +1392,8 @@ const KNOWN_BLOCK_TYPES: &[&str] = &[
 /// service-layer check). Legacy files carrying any other id shape get a fresh
 /// server-minted id, with the original preserved in the session metadata.
 fn is_valid_agent_id(s: &str) -> bool {
-    let rest = match s.strip_prefix("agent-") {
-        Some(r) => r,
-        None => return false,
+    let Some(rest) = s.strip_prefix("agent-") else {
+        return false;
     };
     let groups = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = rest.split('-').collect();
@@ -1889,10 +1886,9 @@ fn setting_is_empty(raw: Option<&str>) -> bool {
         Ok(Value::Array(a)) => a.is_empty(),
         Ok(Value::Object(o)) => o.is_empty(),
         Ok(Value::String(s)) => s.is_empty(),
-        Ok(_) => false,
+        Ok(_) | Err(_) => false,
         // Unparseable → treat as PRESENT (preserve): the importer must stay
         // strictly non-clobbering, even toward malformed existing values.
-        Err(_) => false,
     }
 }
 

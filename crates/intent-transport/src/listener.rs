@@ -362,24 +362,20 @@ where
                 BoundedLine::Line
             });
         }
-        match available.iter().position(|&b| b == b'\n') {
-            Some(pos) => {
-                if buf.len() + pos > limit {
-                    return Ok(BoundedLine::TooLong);
-                }
-                buf.extend_from_slice(&available[..pos]);
-                reader.consume(pos + 1);
-                return Ok(BoundedLine::Line);
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > limit {
+                return Ok(BoundedLine::TooLong);
             }
-            None => {
-                let len = available.len();
-                if buf.len() + len > limit {
-                    return Ok(BoundedLine::TooLong);
-                }
-                buf.extend_from_slice(available);
-                reader.consume(len);
-            }
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(BoundedLine::Line);
         }
+        let len = available.len();
+        if buf.len() + len > limit {
+            return Ok(BoundedLine::TooLong);
+        }
+        buf.extend_from_slice(available);
+        reader.consume(len);
     }
 }
 

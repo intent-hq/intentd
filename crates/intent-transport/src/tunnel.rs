@@ -296,7 +296,6 @@ pub(crate) async fn run_tunnel_connection<S>(
     loop {
         tokio::select! {
             incoming = stream.next() => match incoming {
-                None => break,
                 Some(Err(e)) => {
                     // Over-limit inbound message/frame: tell the client why
                     // with a 1009 close, mirroring the `/ws` connection loop.
@@ -340,7 +339,7 @@ pub(crate) async fn run_tunnel_connection<S>(
                     }
                 }
                 Some(Ok(Message::Pong(_))) => last_pong.store(now_ms(), Ordering::Relaxed),
-                Some(Ok(Message::Close(_))) => break,
+                None | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(Message::Text(_))) => {
                     protocol_close(&mut sink, "text frames not allowed on /tunnel").await;
                     break;

@@ -220,9 +220,8 @@ where
         if remaining.is_zero() {
             return None;
         }
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {

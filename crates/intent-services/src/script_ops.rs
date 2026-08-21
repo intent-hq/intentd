@@ -885,21 +885,20 @@ impl ScriptManager {
                 mgr.pty.kill(pty_id).await;
                 return (None, false);
             }
-            let timed_out = match timeout_seconds.filter(|s| *s > 0) {
-                Some(s) => {
-                    let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
-                    match tokio::time::timeout(Duration::from_secs(s.cast_unsigned()), fut).await {
-                        Ok(_) => false,
-                        Err(_) => {
-                            mgr.pty.kill(pty_id).await;
-                            true
-                        }
-                    }
-                }
-                None => {
-                    mgr.run_one(&ws_task, &sid, pty_id, false).await;
+            let timed_out = if let Some(s) = timeout_seconds.filter(|s| *s > 0) {
+                let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
+                if tokio::time::timeout(Duration::from_secs(s.cast_unsigned()), fut)
+                    .await
+                    .is_ok()
+                {
                     false
+                } else {
+                    mgr.pty.kill(pty_id).await;
+                    true
                 }
+            } else {
+                mgr.run_one(&ws_task, &sid, pty_id, false).await;
+                false
             };
             // Group-keyed liveness (monorepo#1300): before the
             // exit is recorded, reap group members that outlived the shell
@@ -985,11 +984,11 @@ impl ScriptManager {
             // whole group is gone — the script can never sit `running` (or
             // flip to `exited`) while trapped survivors linger.
             self.pty.reap_group_stragglers(pty_id).await;
-            let (stopped_by_user, restart_count) =
-                match self.mark_exited(&ws, &script_id, generation, exit).await {
-                    Some(v) => v,
-                    None => return,
-                };
+            let Some((stopped_by_user, restart_count)) =
+                self.mark_exited(&ws, &script_id, generation, exit).await
+            else {
+                return;
+            };
             if stopped_by_user || def.mode != ScriptMode::Service {
                 break;
             }
@@ -1051,9 +1050,8 @@ impl ScriptManager {
         pty_id: PtyId,
         detect_url: bool,
     ) -> Option<PtyExit> {
-        let attachment = match self.pty.attach(pty_id) {
-            Ok(a) => a,
-            Err(_) => return self.pty.try_exit(pty_id).ok().flatten(),
+        let Ok(attachment) = self.pty.attach(pty_id) else {
+            return self.pty.try_exit(pty_id).ok().flatten();
         };
         let mut live = attachment.live;
         let mut url_done = !detect_url;
@@ -1089,7 +1087,7 @@ impl ScriptManager {
                                     }
                                 }
                                 Err(TryRecvError::Lagged(_)) => {},
-                                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                             }
                         }
                         break;
@@ -2457,14 +2455,14 @@ mod tests {
                 break;
             }
             match tokio::time::timeout(remaining, sub.recv()).await {
-                Err(_) => break,
-                Ok(None) => break,
+                Err(_) | Ok(None) => break,
                 Ok(Some(batch)) => {
                     for ev in &batch {
                         let v = serde_json::to_value(ev).expect("serialize");
-                        if v["type"] == "script:state" && v["data"]["status"] == "running" {
-                            panic!("redundant start re-emitted `running`: {v}");
-                        }
+                        assert!(
+                            !(v["type"] == "script:state" && v["data"]["status"] == "running"),
+                            "redundant start re-emitted `running`: {v}"
+                        );
                     }
                 }
             }

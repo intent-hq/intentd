@@ -231,9 +231,8 @@ fn grok_probe_outcome(
     exit_success: bool,
 ) -> CliAuthProbe {
     match (marker, models_empty) {
-        (Some(true), _) => CliAuthProbe::Authenticated,
         (Some(false), _) => CliAuthProbe::NotAuthenticated,
-        (None, false) => CliAuthProbe::Authenticated,
+        (Some(true), _) | (None, false) => CliAuthProbe::Authenticated,
         (None, true) if exit_success => CliAuthProbe::StatusUnknown,
         (None, true) => CliAuthProbe::Failed,
     }

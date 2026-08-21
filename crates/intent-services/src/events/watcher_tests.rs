@@ -285,13 +285,12 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
             }
             Ok(None) => {
                 // Subscription closed unexpectedly
-                if !seen_burst {
-                    panic!(
-                        "Event subscription closed before burst was observed; \
-                         got {} events total",
-                        events.len()
-                    );
-                }
+                assert!(
+                    seen_burst,
+                    "Event subscription closed before burst was observed; \
+                     got {} events total",
+                    events.len()
+                );
                 break;
             }
             Err(_) => {

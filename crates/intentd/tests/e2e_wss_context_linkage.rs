@@ -101,21 +101,24 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
-        if remaining.is_zero() {
-            panic!("wss_rpc timed out: id={id} method={method}");
-        }
-        match timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
+        assert!(
+            !remaining.is_zero(),
+            "wss_rpc timed out: id={id} method={method}"
+        );
+        let frame = timeout(remaining, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("wss_rpc read timeout id={id} method={method}"));
+        match frame {
+            Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json");
                 if v.get("id") == Some(&json!(id)) {
                     return v;
                 }
             }
-            Ok(Some(Ok(Message::Ping(p)))) => {
+            Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => {}
-            Err(_) => panic!("wss_rpc read timeout id={id} method={method}"),
+            Some(Ok(_)) => {}
             other => panic!("unexpected ws frame: {other:?}"),
         }
     }
@@ -129,21 +132,21 @@ async fn next_event(ws: &mut PlainWs) -> Value {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
-        if remaining.is_zero() {
-            panic!("next_event timed out");
-        }
-        match timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
+        assert!(!remaining.is_zero(), "next_event timed out");
+        let frame = timeout(remaining, ws.next())
+            .await
+            .expect("next_event read timeout");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json");
                 if v.get("method") == Some(&json!("events.event")) {
                     return v;
                 }
             }
-            Ok(Some(Ok(Message::Ping(p)))) => {
+            Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => {}
-            Err(_) => panic!("next_event read timeout"),
+            Some(Ok(_)) => {}
             other => panic!("unexpected ws frame: {other:?}"),
         }
     }

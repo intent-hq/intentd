@@ -200,12 +200,11 @@ fn resolve_default_model_from_settings(
     // providers.active); with neither, there is no provider to key on
     // (monorepo#3044: no positional last resort) and the step is skipped.
     let derived;
-    let provider_key = match provider {
-        Some(p) => Some(p),
-        None => {
-            derived = crate::agent_session::derived_default_provider(&settings);
-            derived.as_deref()
-        }
+    let provider_key = if let Some(p) = provider {
+        Some(p)
+    } else {
+        derived = crate::agent_session::derived_default_provider(&settings);
+        derived.as_deref()
     };
     if let Some(model) = provider_key.and_then(|k| settings.model.provider_defaults.get(k)) {
         if !model.is_empty() {
@@ -295,15 +294,13 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // provider-keyed steps below are skipped and ownership guards pass
     // compound ids through on their own prefix.
     let derived;
-    let effective_provider: Option<&str> = match provider {
-        Some(p) => Some(intent_providers::provider_config(p).id),
-        None => {
-            derived =
-                crate::agent_session::derived_default_provider(&services.effective_settings());
-            derived
-                .as_deref()
-                .map(|p| intent_providers::provider_config(p).id)
-        }
+    let effective_provider: Option<&str> = if let Some(p) = provider {
+        Some(intent_providers::provider_config(p).id)
+    } else {
+        derived = crate::agent_session::derived_default_provider(&services.effective_settings());
+        derived
+            .as_deref()
+            .map(|p| intent_providers::provider_config(p).id)
     };
 
     if let Some(spec_id) = specialist {
@@ -860,12 +857,11 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     while let Some(i) = rest.find(start) {
         out.push_str(&rest[..i]);
         let after = &rest[i + start.len()..];
-        match after.find(end) {
-            Some(j) => rest = &after[j + end.len()..],
-            None => {
-                rest = "";
-                break;
-            }
+        if let Some(j) = after.find(end) {
+            rest = &after[j + end.len()..];
+        } else {
+            rest = "";
+            break;
         }
     }
     out.push_str(rest);
@@ -2406,12 +2402,11 @@ impl Services {
             }
             w
         };
-        let (start, end, mut next_token, mut prev_token) = match seek_win {
-            Some(w) => (w.start, w.end, w.next_token, Some(w.prev_token)),
-            None => {
-                let w = crate::pagination::page_window(total, limit, page_token.as_deref());
-                (w.start, w.end, w.next_token, None)
-            }
+        let (start, end, mut next_token, mut prev_token) = if let Some(w) = seek_win {
+            (w.start, w.end, w.next_token, Some(w.prev_token))
+        } else {
+            let w = crate::pagination::page_window(total, limit, page_token.as_deref());
+            (w.start, w.end, w.next_token, None)
         };
         let mut page: Vec<AgentMessage> = self
             .store
@@ -2811,14 +2806,14 @@ impl Services {
         // and only when a specialist tier is actually consulted (model
         // resolution, the specialist reasoning-effort rungs, and/or the
         // specialist prompt snapshot below).
-        let spec_wp = match model.is_none() || specialist.is_some() {
-            true => self
-                .store
+        let spec_wp = if model.is_none() || specialist.is_some() {
+            self.store
                 .get_workspace(&workspace_id)
                 .await
                 .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w)),
-            false => None,
+                .and_then(|w| crate::git_ops::worktree_path(&w))
+        } else {
+            None
         };
         let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
@@ -2922,15 +2917,16 @@ impl Services {
         // effort and pass it down as a param, so this only fires for callers
         // that did not (`reasoning_effort_decided == false`) — which is also
         // what keeps the specialist rungs ahead of the settings default below.
-        let reasoning_effort = match reasoning_effort_decided {
-            true => reasoning_effort,
-            false => resolve_delegate_reasoning_effort(
+        let reasoning_effort = if reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_delegate_reasoning_effort(
                 self,
                 None,
                 specialist.as_deref(),
                 resolved_model.as_deref(),
                 spec_wp.as_deref(),
-            ),
+            )
         };
         // Validate the requested level (PROTOCOL §5.5) against the *resolved*
         // model's cached `effortLevels`, with the same probe-free,
@@ -2949,13 +2945,10 @@ impl Services {
         // Last rung: the settings default effort, applied only when no rung
         // above decided the effort AND the model itself came from the settings
         // default chain (see `resolve_settings_default_reasoning_effort`).
-        let reasoning_effort = match reasoning_effort.is_some() || reasoning_effort_decided {
-            true => reasoning_effort,
-            false => resolve_settings_default_reasoning_effort(
-                self,
-                model_source,
-                resolved_model.as_deref(),
-            ),
+        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
         };
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
@@ -3213,16 +3206,15 @@ impl Services {
             // instead of validating against a positional default
             // (monorepo#3044).
             let derived;
-            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
-                Some(p) => p,
-                None => {
-                    derived =
-                        crate::agent_session::derived_default_provider(&self.effective_settings())
-                            .ok_or_else(|| {
-                                crate::agent_session::no_default_provider_error("agent.setModel")
-                            })?;
-                    derived.as_str()
-                }
+            let effective = if let Some(p) = session.provider.as_deref().filter(|p| !p.is_empty()) {
+                p
+            } else {
+                derived =
+                    crate::agent_session::derived_default_provider(&self.effective_settings())
+                        .ok_or_else(|| {
+                            crate::agent_session::no_default_provider_error("agent.setModel")
+                        })?;
+                derived.as_str()
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
@@ -3524,13 +3516,10 @@ impl Services {
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
     /// mutated) so subscribed clients invalidate their cached projection.
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
-        let obj = match changes {
-            Value::Object(m) => m,
-            _ => {
-                return Err(Error::InvalidParams(
-                    "agent.update: `changes` must be an object".to_string(),
-                ))
-            }
+        let Value::Object(obj) = changes else {
+            return Err(Error::InvalidParams(
+                "agent.update: `changes` must be an object".to_string(),
+            ));
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
@@ -4860,20 +4849,17 @@ impl Services {
                 _ => {}
             }
         }
-        match pending {
-            Some(id) => {
-                let id = id.to_string();
-                self.record_pending_questions_marker(workspace_id, agent_id, &id)
+        if let Some(id) = pending {
+            let id = id.to_string();
+            self.record_pending_questions_marker(workspace_id, agent_id, &id)
+                .await;
+        } else {
+            self.clear_pending_questions_marker(workspace_id, agent_id)
+                .await;
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
                     .await;
-            }
-            None => {
-                self.clear_pending_questions_marker(workspace_id, agent_id)
-                    .await;
-                if let Some(manager) = self.agent_manager() {
-                    manager
-                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                        .await;
-                }
             }
         }
         self.maybe_emit_display_status_changed(workspace_id).await;
@@ -5266,17 +5252,17 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {session_id}")));
             }
         }
-        let stats = match fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
-            Some(cli) => cli,
-            None => {
+        let stats =
+            if let Some(cli) = fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
+                cli
+            } else {
                 let (message_count, tool_count) = transcript_counts(&session.messages);
                 SessionStats {
                     credits_used: None,
                     message_count,
                     tool_count,
                 }
-            }
-        };
+            };
         self.cache_and_emit_session_stats(&session, &stats).await;
         Ok(json!({ "stats": stats }))
     }
@@ -6286,7 +6272,7 @@ impl Services {
                     && ws.repository_path.is_some();
                 let is_standalone_checkout = matches!(
                     ws.checkout_mode,
-                    Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                    Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                 ) && ws.worktree_path.is_some();
                 if is_direct_mode || is_standalone_checkout {
                     // Same root fallback as `workspace.create` (the intentd
@@ -8510,18 +8496,17 @@ impl Services {
             if stale.is_empty() {
                 continue;
             }
-            let archived = match workspace_archived {
-                Some(v) => v,
-                None => {
-                    let v = !workspace_id.is_chief()
-                        && self
-                            .store
-                            .get_workspace(&workspace_id)
-                            .await
-                            .is_ok_and(|w| w.archived);
-                    workspace_archived = Some(v);
-                    v
-                }
+            let archived = if let Some(v) = workspace_archived {
+                v
+            } else {
+                let v = !workspace_id.is_chief()
+                    && self
+                        .store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .is_ok_and(|w| w.archived);
+                workspace_archived = Some(v);
+                v
             };
             if archived {
                 break;

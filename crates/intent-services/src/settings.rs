@@ -605,9 +605,8 @@ impl SettingDefinition {
                 }
             },
             SettingType::Number { min, max } => {
-                let n = match value.as_f64() {
-                    Some(n) => n,
-                    None => return invalid(format!("{}: expected a number", self.path)),
+                let Some(n) = value.as_f64() else {
+                    return invalid(format!("{}: expected a number", self.path));
                 };
                 if let Some(min) = min {
                     if n < min {

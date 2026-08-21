@@ -131,6 +131,6 @@ async fn dispatch_reports_transport_error_when_channel_is_closed() {
         .expect_err("transport error");
     match err {
         ReverseDispatchError::Transport { .. } => {}
-        other => panic!("unexpected error: {other:?}"),
+        other @ ReverseDispatchError::NoClient => panic!("unexpected error: {other:?}"),
     }
 }

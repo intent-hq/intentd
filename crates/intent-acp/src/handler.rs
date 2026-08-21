@@ -195,28 +195,24 @@ impl ClientRequestHandler {
             &parsed,
         );
 
-        let outcome = match self.policy.auto_allow(data.risk_level) {
+        let outcome = if let Some(allow) = self.policy.auto_allow(data.risk_level) {
             // Headless: emit the prompt for observability, then resolve it now.
-            Some(allow) => {
-                self.emit(AGENT_PERMISSION_REQUEST, request_value(&data))
-                    .await;
-                match permission::select_option(&data.options, allow) {
-                    Some(option_id) => PermissionOutcome::Selected { option_id },
-                    None => PermissionOutcome::Cancelled,
-                }
+            self.emit(AGENT_PERMISSION_REQUEST, request_value(&data))
+                .await;
+            match permission::select_option(&data.options, allow) {
+                Some(option_id) => PermissionOutcome::Selected { option_id },
+                None => PermissionOutcome::Cancelled,
             }
+        } else {
             // Interactive: register, surface, and block until answered or timeout.
-            None => {
-                let rx = self.permissions.register(data.clone());
-                self.emit(AGENT_PERMISSION_REQUEST, request_value(&data))
-                    .await;
-                match tokio::time::timeout(self.permissions.timeout(), rx).await {
-                    Ok(Ok(outcome)) => outcome,
-                    _ => {
-                        self.permissions.remove(&request_id);
-                        PermissionOutcome::Cancelled
-                    }
-                }
+            let rx = self.permissions.register(data.clone());
+            self.emit(AGENT_PERMISSION_REQUEST, request_value(&data))
+                .await;
+            if let Ok(Ok(outcome)) = tokio::time::timeout(self.permissions.timeout(), rx).await {
+                outcome
+            } else {
+                self.permissions.remove(&request_id);
+                PermissionOutcome::Cancelled
             }
         };
 

@@ -81,12 +81,14 @@ async fn setup_manager(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    if intent_providers::resolve_on_path("node").is_none() {
-        panic!("node not on PATH");
-    }
-    if !std::path::Path::new(script).exists() {
-        panic!("script not found at {script}");
-    }
+    assert!(
+        intent_providers::resolve_on_path("node").is_some(),
+        "node not on PATH"
+    );
+    assert!(
+        std::path::Path::new(script).exists(),
+        "script not found at {script}"
+    );
 
     let db = std::env::temp_dir().join(format!("intentd-e2e-client-{}.db", uuid::Uuid::new_v4()));
     let ws_root = std::env::temp_dir().join(format!("itd-e2e-client-ws-{}", uuid::Uuid::new_v4()));

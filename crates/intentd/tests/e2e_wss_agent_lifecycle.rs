@@ -287,9 +287,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => return None,
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -3582,12 +3581,11 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let mut parent_wake_ends = 0u32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out waiting for wake milestones: parent_idle_count={parent_idle_count} \
                  parent_wake_ends={parent_wake_ends} child_idle={child_idle} child_id={child_id:?}"
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
@@ -3826,14 +3824,13 @@ async fn attention_request_discussion_over_wss() {
         && task_changed.is_some()
         && idle)
     {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} raise_updated={raise_updated} \
                  system_message={system_message} task_changed={t} idle={idle}",
                 a = attention.is_some(),
                 t = task_changed.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -3977,9 +3974,8 @@ async fn attention_request_discussion_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for attentionRequestCleared"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for attentionRequestCleared")
         };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:updated"
@@ -4029,9 +4025,8 @@ async fn attention_request_discussion_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(re_raised && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the re-raise: re_raised={re_raised} idle={idle}"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the re-raise: re_raised={re_raised} idle={idle}")
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4062,11 +4057,8 @@ async fn attention_request_discussion_over_wss() {
     assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => {
-                panic!("timed out waiting for the automatic delivery's attentionRequestCleared")
-            }
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the automatic delivery's attentionRequestCleared")
         };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:updated"
@@ -4225,9 +4217,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(raised && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the raise: raised={raised} idle={idle}"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the raise: raised={raised} idle={idle}")
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4279,9 +4270,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the automatic nudge turn's agent:idle"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the automatic nudge turn's agent:idle")
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4435,13 +4425,12 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(attention.is_some() && task_changed.is_some() && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} task_changed={t} idle={idle}",
                 a = attention.is_some(),
                 t = task_changed.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4540,12 +4529,11 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let mut task_events = 0u32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(attention.is_some() && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} idle={idle}",
                 a = attention.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4733,13 +4721,12 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
     let mut failed: Option<Value> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while !(attention.is_some() && failed.is_some()) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} failed={f}",
                 a = attention.is_some(),
                 f = failed.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4927,9 +4914,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = match timeout(dur, ws.next()).await {
-            Ok(v) => v,
-            Err(_) => return None,
+        let Ok(next) = timeout(dur, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -5342,9 +5328,8 @@ async fn terminal_create_env_over_wss() {
         if remaining.is_zero() {
             break;
         }
-        let next = match timeout(remaining, sub.next()).await {
-            Ok(next) => next,
-            Err(_) => break,
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -5510,9 +5495,8 @@ async fn terminal_data_many_chunks_transient_over_wss() {
         if remaining.is_zero() {
             break;
         }
-        let next = match timeout(remaining, sub.next()).await {
-            Ok(next) => next,
-            Err(_) => break,
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -5978,10 +5962,8 @@ async fn oversized_request_head_rejected_over_wss() {
     let deadline = Duration::from_secs(2);
     loop {
         match timeout(deadline, tls.read(&mut buf)).await {
-            Ok(Ok(0)) => break,
+            Ok(Ok(0) | Err(_)) | Err(_) => break,
             Ok(Ok(n)) => total.extend_from_slice(&buf[..n]),
-            Ok(Err(_)) => break,
-            Err(_) => break,
         }
         if total.len() > 4096 {
             break;
@@ -9103,11 +9085,8 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let mut child_mid_turn = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !child_mid_turn {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
-                "timed out waiting for the child's report turn to begin: child_id={child_id:?}"
-            ),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the child's report turn to begin: child_id={child_id:?}")
         };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
@@ -9164,13 +9143,12 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_stream_ends >= 2 && child_idle)
     {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out waiting for redrive milestones: parent_idle_count={parent_idle_count} \
                  parent_wake_ends={parent_wake_ends} child_stream_ends={child_stream_ends} \
                  child_idle={child_idle}"
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();

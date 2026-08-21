@@ -274,7 +274,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
 
             let is_multiline = matches!(
                 definition.get("type").and_then(Value::as_str),
-                Some("object") | Some("array")
+                Some("object" | "array")
             );
 
             json!({

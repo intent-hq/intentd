@@ -60,7 +60,7 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
     } else {
         let errno = io::Error::last_os_error();
         match errno.raw_os_error() {
-            Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::EINVAL) => {
+            Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) => {
                 Err(Error::Unsupported("CoW cloning not supported".to_string()))
             }
             _ => Err(Error::Internal(format!("FICLONE ioctl failed: {errno}"))),

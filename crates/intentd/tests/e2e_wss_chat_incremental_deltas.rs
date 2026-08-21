@@ -252,7 +252,6 @@ async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
                         return v;
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
                 Message::Close(_) => panic!("connection closed mid-stream"),
                 _ => {}
             }
@@ -328,17 +327,14 @@ fn apply_incremental_entity(messages: &mut Vec<Value>, entity: &Value) {
         .position(|b| b["id"].as_str() == Some(block_id.as_str()));
     if let Some(fragment) = block.get("textDelta").and_then(|v| v.as_str()) {
         // Incremental fragment: append onto the accumulated text.
-        match pos {
-            Some(bi) => {
-                let acc = blocks[bi]["text"].as_str().unwrap_or_default().to_string();
-                blocks[bi]["text"] = json!(format!("{acc}{fragment}"));
-            }
-            None => {
-                let mut b = block.clone();
-                b.as_object_mut().unwrap().remove("textDelta");
-                b["text"] = json!(fragment);
-                blocks.push(b);
-            }
+        if let Some(bi) = pos {
+            let acc = blocks[bi]["text"].as_str().unwrap_or_default().to_string();
+            blocks[bi]["text"] = json!(format!("{acc}{fragment}"));
+        } else {
+            let mut b = block.clone();
+            b.as_object_mut().unwrap().remove("textDelta");
+            b["text"] = json!(fragment);
+            blocks.push(b);
         }
     } else {
         // Full block (non-text passthrough or terminal reconcile): upsert.

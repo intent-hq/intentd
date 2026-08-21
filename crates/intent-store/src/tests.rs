@@ -136,9 +136,8 @@ async fn open_rejects_database_from_newer_build() {
     }
 
     let result = Store::open(&tmp.path).await;
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!("reopen must refuse a schema from a newer build"),
+    let Err(err) = result else {
+        panic!("reopen must refuse a schema from a newer build")
     };
     let msg = err.to_string();
     assert!(msg.contains("downgrades are unsupported"), "got {msg:?}");

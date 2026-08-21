@@ -167,22 +167,21 @@ async fn run_auggie(
         }
     }
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|e| ContextError::Spawn(e.to_string()))?,
-        Err(_) => {
-            // Kill the whole process group (pgid == pid via `process_group`);
-            // the dropped `wait_with_output` future's `kill_on_drop` covers
-            // the direct child on non-unix.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            return Err(ContextError::Timeout);
+    let output = if let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await {
+        result.map_err(|e| ContextError::Spawn(e.to_string()))?
+    } else {
+        // Kill the whole process group (pgid == pid via `process_group`);
+        // the dropped `wait_with_output` future's `kill_on_drop` covers
+        // the direct child on non-unix.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
         }
+        #[cfg(not(unix))]
+        let _ = pid;
+        return Err(ContextError::Timeout);
     };
 
     Ok(CommandOutput {

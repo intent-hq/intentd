@@ -185,7 +185,7 @@ fn ready_meta(svc: &Services, export_id: &str) -> (u64, String, TransferManifest
     let exports = svc.transfer_exports.lock().unwrap();
     match &exports.get(export_id).expect("session").state {
         ExportState::Ready(r) => (r.size_bytes, r.sha256.clone(), r.manifest.clone()),
-        _ => panic!("session not ready"),
+        ExportState::Building { .. } => panic!("session not ready"),
     }
 }
 

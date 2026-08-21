@@ -119,80 +119,75 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("find workspace git root failed: {e}")))?;
-            let (merged, inserted) = match existing {
-                Some(row) => {
-                    let mut current = root_from_row(&row)?;
-                    for id in &root.registered_by_agent_ids {
-                        if !current.registered_by_agent_ids.contains(id) {
-                            current.registered_by_agent_ids.push(id.clone());
-                        }
+            let (merged, inserted) = if let Some(row) = existing {
+                let mut current = root_from_row(&row)?;
+                for id in &root.registered_by_agent_ids {
+                    if !current.registered_by_agent_ids.contains(id) {
+                        current.registered_by_agent_ids.push(id.clone());
                     }
-                    if root.repo_owner.is_some() {
-                        current.repo_owner = root.repo_owner.clone();
+                }
+                if root.repo_owner.is_some() {
+                    current.repo_owner = root.repo_owner.clone();
+                }
+                if root.repo_name.is_some() {
+                    current.repo_name = root.repo_name.clone();
+                }
+                if current.source == WorkspaceGitRootSource::Auto
+                    && root.source == WorkspaceGitRootSource::Agent
+                {
+                    current.source = WorkspaceGitRootSource::Agent;
+                }
+                current.updated_at = root.updated_at.clone();
+                sqlx::query(
+                    "UPDATE workspace_git_root SET registered_by_agent_ids = ?, \
+                     repo_owner = ?, repo_name = ?, source = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(agent_ids_to_db(&current.registered_by_agent_ids)?)
+                .bind(&current.repo_owner)
+                .bind(&current.repo_name)
+                .bind(enum_to_db(&current.source)?)
+                .bind(&current.updated_at)
+                .bind(&current.id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("merge workspace git root failed: {e}")))?;
+                (current, false)
+            } else {
+                let mut fresh = root.clone();
+                let mut seen: Vec<AgentId> = Vec::new();
+                fresh.registered_by_agent_ids.retain(|id| {
+                    if seen.contains(id) {
+                        false
+                    } else {
+                        seen.push(id.clone());
+                        true
                     }
-                    if root.repo_name.is_some() {
-                        current.repo_name = root.repo_name.clone();
-                    }
-                    if current.source == WorkspaceGitRootSource::Auto
-                        && root.source == WorkspaceGitRootSource::Agent
-                    {
-                        current.source = WorkspaceGitRootSource::Agent;
-                    }
-                    current.updated_at = root.updated_at.clone();
-                    sqlx::query(
-                        "UPDATE workspace_git_root SET registered_by_agent_ids = ?, \
-                         repo_owner = ?, repo_name = ?, source = ?, updated_at = ? WHERE id = ?",
-                    )
-                    .bind(agent_ids_to_db(&current.registered_by_agent_ids)?)
-                    .bind(&current.repo_owner)
-                    .bind(&current.repo_name)
-                    .bind(enum_to_db(&current.source)?)
-                    .bind(&current.updated_at)
-                    .bind(&current.id.0)
+                });
+                let sql = format!(
+                    "INSERT INTO workspace_git_root ({COLUMNS}) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                );
+                sqlx::query(&sql)
+                    .bind(&fresh.id.0)
+                    .bind(&fresh.workspace_id.0)
+                    .bind(&fresh.path)
+                    .bind(enum_to_db(&fresh.source)?)
+                    .bind(&fresh.repo_owner)
+                    .bind(&fresh.repo_name)
+                    .bind(agent_ids_to_db(&fresh.registered_by_agent_ids)?)
+                    .bind(&fresh.registered_commit_sha)
+                    .bind(fresh.pr_number.map(u64::cast_signed))
+                    .bind(&fresh.pr_url)
+                    .bind(fresh.pr_status.map(|s| enum_to_db(&s)).transpose()?)
+                    .bind(pull_requests_to_db(fresh.pull_requests.as_ref())?)
+                    .bind(&fresh.created_at)
+                    .bind(&fresh.updated_at)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| {
-                        Error::Internal(format!("merge workspace git root failed: {e}"))
+                        Error::Internal(format!("insert workspace git root failed: {e}"))
                     })?;
-                    (current, false)
-                }
-                None => {
-                    let mut fresh = root.clone();
-                    let mut seen: Vec<AgentId> = Vec::new();
-                    fresh.registered_by_agent_ids.retain(|id| {
-                        if seen.contains(id) {
-                            false
-                        } else {
-                            seen.push(id.clone());
-                            true
-                        }
-                    });
-                    let sql = format!(
-                        "INSERT INTO workspace_git_root ({COLUMNS}) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    );
-                    sqlx::query(&sql)
-                        .bind(&fresh.id.0)
-                        .bind(&fresh.workspace_id.0)
-                        .bind(&fresh.path)
-                        .bind(enum_to_db(&fresh.source)?)
-                        .bind(&fresh.repo_owner)
-                        .bind(&fresh.repo_name)
-                        .bind(agent_ids_to_db(&fresh.registered_by_agent_ids)?)
-                        .bind(&fresh.registered_commit_sha)
-                        .bind(fresh.pr_number.map(u64::cast_signed))
-                        .bind(&fresh.pr_url)
-                        .bind(fresh.pr_status.map(|s| enum_to_db(&s)).transpose()?)
-                        .bind(pull_requests_to_db(fresh.pull_requests.as_ref())?)
-                        .bind(&fresh.created_at)
-                        .bind(&fresh.updated_at)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            Error::Internal(format!("insert workspace git root failed: {e}"))
-                        })?;
-                    (fresh, true)
-                }
+                (fresh, true)
             };
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("upsert workspace git root commit failed: {e}"))

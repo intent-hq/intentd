@@ -503,10 +503,7 @@ fn local_hostname() -> String {
 
 /// Core origin matcher, parameterized on the local hostname for hermetic tests.
 fn is_allowed_origin_with_host(origin: Option<&str>, local_host: &str) -> bool {
-    let origin = match origin {
-        None => return true,
-        Some(o) => o,
-    };
+    let Some(origin) = origin else { return true };
     if origin.is_empty() {
         return true;
     }

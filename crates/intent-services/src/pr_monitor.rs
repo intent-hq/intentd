@@ -1527,9 +1527,8 @@ impl Services {
         let mut resumed = 0;
         for mut monitor in monitors {
             let owner_gone = match self.store.get_agent_session_status(&monitor.agent_id).await {
-                Ok(AgentStatus::Deleted) => true,
+                Ok(AgentStatus::Deleted) | Err(Error::NotFound(_)) => true,
                 Ok(_) => false,
-                Err(Error::NotFound(_)) => true,
                 Err(e) => return Err(e),
             };
             if owner_gone {
@@ -1625,12 +1624,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         repo: Option<String>,
     ) -> Result<(String, String)> {
-        match repo {
-            Some(slug) => pr_ops::parse_repo_slug(&slug),
-            None => {
-                let ws = self.store.get_workspace(workspace_id).await?;
-                pr_ops::repo_of(&ws)
-            }
+        if let Some(slug) = repo {
+            pr_ops::parse_repo_slug(&slug)
+        } else {
+            let ws = self.store.get_workspace(workspace_id).await?;
+            pr_ops::repo_of(&ws)
         }
     }
 

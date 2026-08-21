@@ -1014,9 +1014,8 @@ impl Services {
             // Prune hooks whose owner no longer exists (deleted agents keep
             // their session row with status `deleted`).
             let owner_gone = match self.store.get_agent_session_status(&hook.agent_id).await {
-                Ok(AgentStatus::Deleted) => true,
+                Ok(AgentStatus::Deleted) | Err(Error::NotFound(_)) => true,
                 Ok(_) => false,
-                Err(Error::NotFound(_)) => true,
                 Err(e) => return Err(e),
             };
             if owner_gone {
@@ -1161,8 +1160,7 @@ impl Services {
         // stop silently if this hook is no longer active.
         match self.store.get_hook(&hook.hook_id).await {
             Ok(h) if matches!(h.state, HookState::Scheduled | HookState::Running) => {}
-            Ok(_) => return Ok(false),
-            Err(Error::NotFound(_)) => return Ok(false),
+            Ok(_) | Err(Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),
         }
         self.store

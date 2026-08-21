@@ -512,18 +512,17 @@ pub(crate) async fn handle(
             }
         }
         HostMethod::ExecStream => {
-            let bus = match bus {
-                Some(b) => b.clone(),
-                None => {
-                    if !id_present {
-                        return None;
-                    }
-                    return Some(error_frame(
-                        &id_echo,
-                        -32603,
-                        "host.execStream requires an event bus",
-                    ));
+            let bus = if let Some(b) = bus {
+                b.clone()
+            } else {
+                if !id_present {
+                    return None;
                 }
+                return Some(error_frame(
+                    &id_echo,
+                    -32603,
+                    "host.execStream requires an event bus",
+                ));
             };
             let parsed = match intent_services::host_exec_stream::parse_args(&params) {
                 Ok(a) => a,
@@ -601,13 +600,12 @@ pub(crate) async fn handle(
 /// invalid base64 (mapped to `-32602` by the caller).
 fn parse_write_stdin(params: &Map<String, Value>) -> Result<Option<Vec<u8>>, String> {
     match (params.get("stdin"), params.get("stdinBase64")) {
-        (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => Ok(None),
-        (Some(Value::Null), Some(Value::Null)) => Ok(None),
-        (Some(text), None) | (Some(text), Some(Value::Null)) => match text {
+        (None | Some(Value::Null), None | Some(Value::Null)) => Ok(None),
+        (Some(text), None | Some(Value::Null)) => match text {
             Value::String(s) => Ok(Some(s.as_bytes().to_vec())),
             _ => Err("Invalid parameter: stdin must be a string".to_string()),
         },
-        (None, Some(b64)) | (Some(Value::Null), Some(b64)) => match b64 {
+        (None | Some(Value::Null), Some(b64)) => match b64 {
             Value::String(s) => base64::engine::general_purpose::STANDARD
                 .decode(s.as_bytes())
                 .map(Some)

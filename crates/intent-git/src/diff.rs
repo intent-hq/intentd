@@ -273,9 +273,8 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
         Ok(mb) => repo.find_commit(mb).ok().and_then(|c| c.tree().ok()),
         Err(_) => None,
     };
-    let head_tree = match repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) {
-        Some(t) => t,
-        None => return Ok(Vec::new()),
+    let Some(head_tree) = repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) else {
+        return Ok(Vec::new());
     };
     let diff = repo
         .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), None)

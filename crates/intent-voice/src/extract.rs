@@ -254,12 +254,11 @@ fn strip_link_targets(line: &str) -> String {
     while let Some(i) = rest.find("](") {
         out.push_str(&rest[..=i]);
         let after = &rest[i + 2..];
-        match after.find(')') {
-            Some(j) => rest = &after[j + 1..],
-            None => {
-                rest = "";
-                break;
-            }
+        if let Some(j) = after.find(')') {
+            rest = &after[j + 1..];
+        } else {
+            rest = "";
+            break;
         }
     }
     out.push_str(rest);

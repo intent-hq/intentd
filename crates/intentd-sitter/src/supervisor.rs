@@ -353,25 +353,20 @@ impl Supervisor {
                 Err(e) => {
                     eprintln!("intentd-sitter: update check failed: {e}");
                     let state = state::load(&self.paths.state_path);
-                    match state
+                    if let Some(version) = state
                         .current_version
                         .filter(|v| self.paths.daemon_binary(v).exists())
                     {
-                        Some(version) => {
-                            eprintln!(
-                                "intentd-sitter: falling back to installed intentd {version}"
-                            );
-                            version
-                        }
-                        None => {
-                            eprintln!(
-                                "intentd-sitter: no intentd daemon is installed for channel {} \
-                                 and the update check failed; cannot start (check network access \
-                                 and retry)",
-                                self.channel.channel
-                            );
-                            return 1;
-                        }
+                        eprintln!("intentd-sitter: falling back to installed intentd {version}");
+                        version
+                    } else {
+                        eprintln!(
+                            "intentd-sitter: no intentd daemon is installed for channel {} \
+                             and the update check failed; cannot start (check network access \
+                             and retry)",
+                            self.channel.channel
+                        );
+                        return 1;
                     }
                 }
             };
@@ -380,32 +375,29 @@ impl Supervisor {
             // One-shot: resolve the installed version with no updater
             // activity (no manifest fetch, no state.json write, no prune).
             let state = state::load(&self.paths.state_path);
-            let version = match state
+            let version = if let Some(version) = state
                 .current_version
                 .filter(|v| self.paths.daemon_binary(v).exists())
             {
-                Some(version) => {
-                    // The channel flag only governs updater behavior, which
-                    // one-shots don't have; surface a mismatch but run anyway.
-                    if state.channel != self.channel.channel {
-                        eprintln!(
-                            "intentd-sitter: note: channel {} requested but the installed \
-                             daemon was installed from channel {}; one-shot commands run \
-                             the installed daemon as-is",
-                            self.channel.channel, state.channel
-                        );
-                    }
-                    version
-                }
-                None => {
+                // The channel flag only governs updater behavior, which
+                // one-shots don't have; surface a mismatch but run anyway.
+                if state.channel != self.channel.channel {
                     eprintln!(
-                        "intentd-sitter: no intentd daemon is installed for channel {}; \
-                         start the daemon first (`intentd serve` or \
-                         `brew services start intentd`) so it gets installed",
-                        self.channel.channel
+                        "intentd-sitter: note: channel {} requested but the installed \
+                         daemon was installed from channel {}; one-shot commands run \
+                         the installed daemon as-is",
+                        self.channel.channel, state.channel
                     );
-                    return 1;
                 }
+                version
+            } else {
+                eprintln!(
+                    "intentd-sitter: no intentd daemon is installed for channel {}; \
+                     start the daemon first (`intentd serve` or \
+                     `brew services start intentd`) so it gets installed",
+                    self.channel.channel
+                );
+                return 1;
             };
             // Never polled: the periodic-check select arm is serve-only.
             (version, Instant::now())

@@ -1289,24 +1289,22 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         sys.total_memory()
     };
     let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
-    let budget_enabled =
-        match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
-            Some(budget_bytes) => {
-                manager
-                    .registry()
-                    .set_memory_budget(budget_bytes, child_usage.clone());
-                tracing::info!(
-                    budget_bytes,
-                    recommended_bytes,
-                    "aggregate agent memory budget enabled"
-                );
-                true
-            }
-            None => {
-                tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
-                false
-            }
-        };
+    let budget_enabled = if let Some(budget_bytes) =
+        agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes)
+    {
+        manager
+            .registry()
+            .set_memory_budget(budget_bytes, child_usage.clone());
+        tracing::info!(
+            budget_bytes,
+            recommended_bytes,
+            "aggregate agent memory budget enabled"
+        );
+        true
+    } else {
+        tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
+        false
+    };
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1549,12 +1547,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // monorepo#2900). An unparseable persisted value falls back to loopback
     // with a warning rather than silently widening the bind (defense in
     // depth — SettingsFile::validate rejects non-IP values at load time).
-    match boot_settings.effective.server.bind_address.parse() {
-        Ok(addr) => ws_options.bind_address = addr,
-        Err(_) => tracing::warn!(
+    if let Ok(addr) = boot_settings.effective.server.bind_address.parse() {
+        ws_options.bind_address = addr;
+    } else {
+        tracing::warn!(
             value = %boot_settings.effective.server.bind_address,
             "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
-        ),
+        );
     }
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
@@ -1675,9 +1674,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
     // serve system.status (§5.7). This breaks the circular Arc dependency between
     // DaemonControl and WsRuntimeControl.
-    if runtime.control.set(control.clone()).is_err() {
-        panic!("control OnceLock should only be set once");
-    }
+    assert!(
+        runtime.control.set(control.clone()).is_ok(),
+        "control OnceLock should only be set once"
+    );
 
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
     // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
@@ -1900,16 +1900,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // survive (`kill_on_drop` only covers the direct child). Letting the sweep
     // settle first puts every child it spawned in the map, so `shutdown` reaps
     // them. Only if the grace expires do we abort and accept the drop path.
-    match tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await {
-        Ok(_) => {}
-        Err(_) => {
-            tracing::warn!(
-                grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
-                "deferred MCP start sweep did not settle within the shutdown grace; \
-                 aborting it — a server mid-handshake may leave orphan grandchildren"
-            );
-            mcp_start_task.abort();
-        }
+    if tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
+            "deferred MCP start sweep did not settle within the shutdown grace; \
+             aborting it — a server mid-handshake may leave orphan grandchildren"
+        );
+        mcp_start_task.abort();
     }
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
@@ -3161,7 +3161,7 @@ fn env_flag(name: &str) -> bool {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("1" | "true" | "yes")
     )
 }
 
@@ -3177,7 +3177,6 @@ fn parse_permission_policy(raw: Option<&str>) -> PermissionPolicy {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("interactive") => PermissionPolicy::Interactive,
         Some("auto") => PermissionPolicy::AutoByRisk,
-        Some("allow") => PermissionPolicy::AllowAll,
         Some("deny") => PermissionPolicy::DenyAll,
         _ => PermissionPolicy::AllowAll,
     }
@@ -3411,27 +3410,24 @@ fn spawn_idle_reap_loop(
     // time below the budget-only cadence (an early TTL sweep is harmless: it
     // just finds nothing old enough).
     let budget_floor = Duration::from_secs(30);
-    let interval = match timings {
-        Some((ttl, interval)) => {
-            let interval = if budget_enabled {
-                interval.min(budget_floor)
-            } else {
-                interval
-            };
-            tracing::info!(
-                ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
-                interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
-                "idle agent reaping enabled"
-            );
+    let interval = if let Some((ttl, interval)) = timings {
+        let interval = if budget_enabled {
+            interval.min(budget_floor)
+        } else {
             interval
-        }
-        None => {
-            tracing::info!(
-                interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
-                "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
-            );
-            budget_floor
-        }
+        };
+        tracing::info!(
+            ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+            "idle agent reaping enabled"
+        );
+        interval
+    } else {
+        tracing::info!(
+            interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
+            "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+        );
+        budget_floor
     };
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -5171,12 +5167,9 @@ async fn report_db_health(store: &Store) {
 #[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}

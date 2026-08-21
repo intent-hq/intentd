@@ -84,7 +84,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => prompt_result.clone(),
                 _ => json!({}),
             };
@@ -533,7 +532,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => json!({ "stopReason": "end_turn" }),
                 _ => json!({}),
             };
@@ -2932,7 +2930,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3017,7 +3014,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3238,7 +3234,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => json!({ "stopReason": "end_turn" }),
                 _ => json!({}),
             };
@@ -3531,7 +3526,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -6006,10 +6000,7 @@ async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persi
                 json!(format!("m1:{index}")),
                 "{step}: block ids stay {{messageId}}:{{index}}"
             );
-            if matches!(
-                block["type"].as_str(),
-                Some("tool_use") | Some("tool_result")
-            ) {
+            if matches!(block["type"].as_str(), Some("tool_use" | "tool_result")) {
                 assert!(index > 0, "{step}: no tool block precedes the group open");
             }
         }

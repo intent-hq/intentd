@@ -465,9 +465,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     let mut hook_id = None::<String>;
     while hook_id.is_none() {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("hook:scheduled never landed"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("hook:scheduled never landed")
         };
         if ev["type"] == json!("hook:scheduled") && ev["data"]["name"] == json!("archiver") {
             assert_eq!(ev["data"]["agentId"], json!(agent_id), "hook owner: {ev}");
@@ -487,11 +486,8 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let mut hook_cancelled = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while archive_delta.is_none() || !hook_cancelled {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => {
-                panic!("timed out: archive_delta={archive_delta:?} hook_cancelled={hook_cancelled}")
-            }
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out: archive_delta={archive_delta:?} hook_cancelled={hook_cancelled}")
         };
         match ev["type"].as_str().unwrap_or_default() {
             "workspace:updated" if ev["data"]["changes"]["archived"] == json!(true) => {
@@ -660,9 +656,8 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     let mut hook_id = None::<String>;
     while hook_id.is_none() {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("hook:scheduled never landed"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("hook:scheduled never landed")
         };
         if ev["type"] == json!("hook:scheduled") && ev["data"]["name"] == json!("archiver") {
             hook_id = Some(ev["data"]["hookId"].as_str().expect("hookId").to_string());
@@ -681,11 +676,10 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     let mut hook_cancelled = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !archive_delta_seen || !hook_cancelled {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!(
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: archive_delta_seen={archive_delta_seen} hook_cancelled={hook_cancelled}"
-            ),
+            )
         };
         match ev["type"].as_str().unwrap_or_default() {
             "workspace:updated" if ev["data"]["changes"]["archived"] == json!(true) => {

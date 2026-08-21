@@ -20042,9 +20042,10 @@ async fn sub1_sendtotask_after_all_no_duplicate_wake() {
             break;
         }
         attempts += 1;
-        if attempts > 100 {
-            panic!("Timeout waiting for aggregated wake content in transcript");
-        }
+        assert!(
+            attempts <= 100,
+            "Timeout waiting for aggregated wake content in transcript"
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 

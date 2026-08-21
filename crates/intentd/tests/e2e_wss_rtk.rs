@@ -187,20 +187,14 @@ async fn wss_rpc(
             .expect("ws rpc timeout")
             .expect("ws closed")
             .expect("ws error");
-        match msg {
-            Message::Text(text) => {
-                let v: Value = serde_json::from_str(&text).expect("invalid json");
-                if v["id"] == id {
-                    return v;
-                }
-                // Skip responses for other requests
+        if let Message::Text(text) = msg {
+            let v: Value = serde_json::from_str(&text).expect("invalid json");
+            if v["id"] == id {
+                return v;
             }
-            Message::Ping(_) | Message::Pong(_) => {
-                // Skip ping/pong frames
-            }
-            _ => {
-                // Skip other frame types
-            }
+            // Skip responses for other requests
+        } else {
+            // Skip other frame types
         }
     }
 }
@@ -220,9 +214,6 @@ async fn wss_event(
                     return v;
                 }
                 // Skip non-event messages (e.g., RPC responses)
-            }
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                // Skip ping/pong frames
             }
             Some(Ok(Message::Close(_))) => {
                 panic!("websocket closed while waiting for event");

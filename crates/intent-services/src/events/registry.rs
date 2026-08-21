@@ -246,21 +246,18 @@ fn start_git_metadata_watch(
     path: &Path,
     suffix: &str,
 ) -> Option<GitMetadataWatcher> {
-    match GitMetadataWatcher::start(
+    if let Some(w) = GitMetadataWatcher::start(
         hub,
         common_watches,
         Arc::clone(refresher),
         ws_id.clone(),
         &path.to_path_buf(),
     ) {
-        Some(w) => {
-            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
-            Some(w)
-        }
-        None => {
-            tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");
-            None
-        }
+        tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
+        Some(w)
+    } else {
+        tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");
+        None
     }
 }
 
@@ -539,12 +536,11 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         })
         .map(PathBuf::from);
 
-    let path = match from_payload {
-        Some(p) => Some(p),
-        None => {
-            let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
-            ws.path.or(ws.worktree_path).map(PathBuf::from)
-        }
+    let path = if let Some(p) = from_payload {
+        Some(p)
+    } else {
+        let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
+        ws.path.or(ws.worktree_path).map(PathBuf::from)
     }?;
 
     path.is_dir().then_some(path)

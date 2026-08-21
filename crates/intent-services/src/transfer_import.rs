@@ -191,9 +191,9 @@ impl Services {
     /// never have its staging directory removed.
     async fn sweep_orphaned_staging_dirs(&self) {
         let root = self.import_staging_root();
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(entries) => entries,
-            Err(_) => return, // no staging root yet — nothing to sweep
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+            // no staging root yet — nothing to sweep
+            return;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -552,9 +552,9 @@ impl Services {
     /// Copy `assets/<assetId>` files into `<assets_root>/<workspaceId>/`.
     /// Best-effort: an unset assets root or a copy failure is logged.
     async fn place_imported_assets(&self, workspace_id: &WorkspaceId, assets_dir: &Path) {
-        let mut entries = match tokio::fs::read_dir(assets_dir).await {
-            Ok(entries) => entries,
-            Err(_) => return, // no assets/ in the archive
+        let Ok(mut entries) = tokio::fs::read_dir(assets_dir).await else {
+            // no assets/ in the archive
+            return;
         };
         let Some(root) = self.assets_root.clone() else {
             tracing::warn!(

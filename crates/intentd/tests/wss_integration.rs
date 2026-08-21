@@ -766,7 +766,7 @@ async fn wss_oversized_message_terminates_connection() {
     let closed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match ws.next().await {
-                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
                 Some(Ok(_)) => {}
             }
         }
@@ -10375,9 +10375,10 @@ async fn wss_workspace_export_lifecycle() {
                     {
                         return;
                     }
-                    if v["params"]["event"]["type"] == "workspace:transfer:failed" {
-                        panic!("second export failed: {v}");
-                    }
+                    assert!(
+                        v["params"]["event"]["type"] != "workspace:transfer:failed",
+                        "second export failed: {v}"
+                    );
                 }
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub2.send(Message::Pong(p)).await;

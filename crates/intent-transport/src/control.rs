@@ -342,17 +342,17 @@ pub(crate) async fn handle(
             // helper's scope gate, so an arbitrary local UDS caller cannot
             // obtain the credential for anything but https://github.com. A
             // scope miss is indistinguishable from "no token" on the wire.
-            if !git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
+            if git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
+                let credential = control.git_credential(pid).await.map(
+                    |(username, password)| json!({ "username": username, "password": password }),
+                );
+                Ok(json!({ "credential": credential }))
+            } else {
                 tracing::debug!(
                     client_pid = pid,
                     "git credential request denied (scope is not https://github.com)"
                 );
                 Ok(json!({ "credential": Value::Null }))
-            } else {
-                let credential = control.git_credential(pid).await.map(
-                    |(username, password)| json!({ "username": username, "password": password }),
-                );
-                Ok(json!({ "credential": credential }))
             }
         }
     };

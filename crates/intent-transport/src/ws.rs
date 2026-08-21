@@ -668,7 +668,6 @@ impl WsInner {
         loop {
             tokio::select! {
                 incoming = stream.next() => match incoming {
-                    None => break,
                     Some(Err(e)) => {
                         // Over-limit inbound message or frame (monorepo#495):
                         // tell the client why with a 1009 (Message Too Big)
@@ -706,7 +705,7 @@ impl WsInner {
                         }
                     }
                     Some(Ok(Message::Pong(_))) => last_pong.store(now_ms(), Ordering::Relaxed),
-                    Some(Ok(Message::Close(_))) => break,
+                    None | Some(Ok(Message::Close(_))) => break,
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
                 Some(frame) = app_rx.recv() => {

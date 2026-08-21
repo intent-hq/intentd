@@ -483,7 +483,7 @@ where
     let mut initial = true;
     let mut buffered: Vec<String> = Vec::new();
     loop {
-        let stream = match connect_with_retry(
+        let Some(stream) = connect_with_retry(
             addr,
             cfg,
             initial,
@@ -493,9 +493,8 @@ where
             &mut connect,
         )
         .await?
-        {
-            Some(stream) => stream,
-            None => return Ok(()),
+        else {
+            return Ok(());
         };
         initial = false;
         let (tcp_read, tcp_write) = stream.into_split();

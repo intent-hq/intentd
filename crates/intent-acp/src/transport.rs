@@ -130,14 +130,13 @@ impl StderrLogSink {
     /// error) the line is dropped — capture is best-effort by design.
     fn send_line(&mut self, line: &str) {
         match self.tx.try_send(line.to_string()) {
-            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !self.drop_warned {
                     self.drop_warned = true;
                     tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }

@@ -227,7 +227,6 @@ async fn wss_event(ws: &mut Ws, secs: u64) -> Value {
                     return v;
                 }
             }
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
             Some(Ok(Message::Close(_))) => panic!("websocket closed while waiting for event"),
             Some(Err(e)) => panic!("websocket error: {e}"),
             None => panic!("websocket stream ended"),

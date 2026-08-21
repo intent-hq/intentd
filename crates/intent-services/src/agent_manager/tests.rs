@@ -3003,7 +3003,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": MGR_ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -11025,9 +11024,8 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 async fn resolve_spawn_without_provider_or_default_fails_loudly() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
-    let err = match resolve_spawn(&session, None, &settings, None) {
-        Ok(_) => panic!("no provider, no model, no configured default must not resolve"),
-        Err(e) => e,
+    let Err(err) = resolve_spawn(&session, None, &settings, None) else {
+        panic!("no provider, no model, no configured default must not resolve")
     };
     assert!(
         matches!(&err, intent_core::Error::InvalidParams(m)

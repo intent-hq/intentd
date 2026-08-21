@@ -97,10 +97,7 @@ pub fn search_in_files(
         if cancel.is_cancelled() || truncated {
             break;
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }

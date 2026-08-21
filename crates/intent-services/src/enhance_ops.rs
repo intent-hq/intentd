@@ -142,40 +142,39 @@ pub(crate) fn clean_agent_message(content: &str) -> String {
         return String::new();
     }
     let cleaned = strip_ansi(content);
-    let cleaned = match cleaned.rfind('🤖') {
-        Some(pos) => cleaned[pos + '🤖'.len_utf8()..].trim().to_string(),
-        None => {
-            // No robot marker: strip tool call/result sections manually (the
-            // FE fallback branch).
-            let mut kept: Vec<&str> = Vec::new();
-            let mut in_tool_section = false;
-            for line in cleaned.split('\n') {
-                let trimmed = line.trim();
-                if trimmed.starts_with("🔧 Tool call:")
-                    || trimmed.starts_with("Tool call:")
-                    || trimmed.starts_with("📋 Tool result:")
-                    || trimmed.starts_with("Tool result:")
-                {
-                    in_tool_section = true;
-                    continue;
-                }
-                if in_tool_section
-                    && (line.starts_with("   ")
-                        || line.starts_with('\t')
-                        || (trimmed.contains(':') && !trimmed.starts_with('#')))
-                {
-                    continue;
-                }
-                if in_tool_section && trimmed.is_empty() {
-                    in_tool_section = false;
-                    continue;
-                }
-                if !in_tool_section {
-                    kept.push(line);
-                }
+    let cleaned = if let Some(pos) = cleaned.rfind('🤖') {
+        cleaned[pos + '🤖'.len_utf8()..].trim().to_string()
+    } else {
+        // No robot marker: strip tool call/result sections manually (the
+        // FE fallback branch).
+        let mut kept: Vec<&str> = Vec::new();
+        let mut in_tool_section = false;
+        for line in cleaned.split('\n') {
+            let trimmed = line.trim();
+            if trimmed.starts_with("🔧 Tool call:")
+                || trimmed.starts_with("Tool call:")
+                || trimmed.starts_with("📋 Tool result:")
+                || trimmed.starts_with("Tool result:")
+            {
+                in_tool_section = true;
+                continue;
             }
-            kept.join("\n")
+            if in_tool_section
+                && (line.starts_with("   ")
+                    || line.starts_with('\t')
+                    || (trimmed.contains(':') && !trimmed.starts_with('#')))
+            {
+                continue;
+            }
+            if in_tool_section && trimmed.is_empty() {
+                in_tool_section = false;
+                continue;
+            }
+            if !in_tool_section {
+                kept.push(line);
+            }
         }
+        kept.join("\n")
     };
     let filtered: Vec<&str> = cleaned
         .split('\n')

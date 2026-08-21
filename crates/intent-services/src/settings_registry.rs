@@ -1318,9 +1318,8 @@ mod tests {
     fn load_still_rejects_other_unknown_keys() {
         let seed = "[model]\nworkspaceOverrides = {}\n\n[agents]\nbogusKey = 1\n";
         let (_dir, path) = temp_config(Some(seed));
-        let err = match SettingsRegistry::load(&path) {
-            Ok(_) => panic!("unknown key must refuse load"),
-            Err(e) => e,
+        let Err(err) = SettingsRegistry::load(&path) else {
+            panic!("unknown key must refuse load")
         };
         assert!(err.to_string().contains("bogusKey"), "{err}");
     }

@@ -286,9 +286,8 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     // params: object kept as-is; positional array coerced to {}; absent/null
     // treated as empty; any other scalar is invalid (§3.1).
     let params: Map<String, Value> = match value.get("params") {
-        None | Some(Value::Null) => Map::new(),
         Some(Value::Object(m)) => m.clone(),
-        Some(Value::Array(_)) => Map::new(),
+        None | Some(Value::Null | Value::Array(_)) => Map::new(),
         Some(_) => {
             if is_notification {
                 return None;
@@ -1585,7 +1584,7 @@ async fn dispatch(
             // present non-string value is a malformed request — reject it
             // rather than silently falling back to the legacy path.
             match params.get("providerId") {
-                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                None | Some(Value::Null | Value::String(_)) => {}
                 Some(_) => {
                     return Err(invalid_params(
                         "agent.setModel: providerId must be a string",

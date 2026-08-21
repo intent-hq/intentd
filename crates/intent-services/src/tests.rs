@@ -17998,9 +17998,7 @@ mod script {
             }
             if v["type"] == "script:output" {
                 let chunk = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
-                if contains(&chunk, b"Restarting (attempt") {
-                    panic!("too-fast-exit service must NOT auto-restart; saw restart separator");
-                }
+                assert!(!contains(&chunk, b"Restarting (attempt"), "too-fast-exit service must NOT auto-restart; saw restart separator");
                 return contains(&chunk, b"Exited too quickly").then_some(());
             }
             None
@@ -21621,7 +21619,7 @@ mod worktree_provisioning {
         assert!(
             matches!(
                 dup.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             ),
             "standalone source must never yield a worktree; got {:?}",
             dup.checkout_mode
@@ -25160,7 +25158,7 @@ mod clone_orchestration {
         assert!(
             matches!(
                 ws.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             ),
             "hydration persists cow or direct: {:?}",
             ws.checkout_mode

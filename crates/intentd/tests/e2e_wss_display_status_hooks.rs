@@ -233,9 +233,8 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
 /// deadline, asserting the notification envelope; `None` on deadline.
 async fn wss_event_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> Option<Value> {
     loop {
-        let next = match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -498,12 +497,11 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let mut demoted = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(promoted && hook_id.is_some() && waiting_raised && idle && demoted) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!(
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: promoted={promoted} hook_id={hook_id:?} \
                  waiting_raised={waiting_raised} idle={idle} demoted={demoted}"
-            ),
+            )
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
@@ -590,12 +588,11 @@ async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let mut wake_idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(hook_cancelled && waiting_dropped && wake_idle) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!(
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: hook_cancelled={hook_cancelled} \
                  waiting_dropped={waiting_dropped} wake_idle={wake_idle}"
-            ),
+            )
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {

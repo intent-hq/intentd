@@ -140,7 +140,7 @@ fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
                             matches!(
                                 output,
                                 Some(Value::String(s)) if !s.is_empty()
-                            ) || matches!(output, Some(Value::Object(_)) | Some(Value::Array(_)));
+                            ) || matches!(output, Some(Value::Object(_) | Value::Array(_)));
                         if has_output || bool_field(block, &["is_error", "isError"]) {
                             valid_tool_result_ids.insert(tool_use_id);
                         }
@@ -195,7 +195,7 @@ fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
                         matches!(
                             output,
                             Some(Value::String(s)) if !s.is_empty()
-                        ) || matches!(output, Some(Value::Object(_)) | Some(Value::Array(_)));
+                        ) || matches!(output, Some(Value::Object(_) | Value::Array(_)));
                     if !has_output && !bool_field(block, &["is_error", "isError"]) {
                         continue;
                     }

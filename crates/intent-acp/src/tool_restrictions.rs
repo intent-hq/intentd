@@ -202,7 +202,7 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
 ///    workspace `ws.agent.*` surface instead of the auggie-native sub-agent.
 #[must_use]
 pub fn get_tools_to_remove(specialist: Option<&str>, agent_type: &str) -> Vec<&'static str> {
-    if matches!(specialist, Some("spec-writer") | Some("coordinator")) {
+    if matches!(specialist, Some("spec-writer" | "coordinator")) {
         let mut out = Vec::with_capacity(
             FILE_WRITE_TOOLS.len() + SUBAGENT_TOOLS.len() + CONFLICTING_BUILTIN_TOOLS.len(),
         );

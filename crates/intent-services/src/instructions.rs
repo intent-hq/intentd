@@ -139,7 +139,7 @@ fn get_instruction_by_id(
     let found = match id {
         "chat" => set.chat,
         "common" => set.common,
-        "debug" => set.debug,
+        "debug" | "fix" => set.debug,
         "workspace" => set.workspace,
         "setup-script-generator" => set.setup_script_generator,
         "task-breakdown" => set.task_breakdown,
@@ -149,14 +149,11 @@ fn get_instruction_by_id(
         "ralph-loop" => set.ralph_loop,
         "workspace-agent" => set.workspace_agent,
         "notes-system-guide" => set.notes_system_guide,
-        "code-review" => set.code_review,
-        "code-walkthrough" => set.code_walkthrough,
+        "code-review" | "review" => set.code_review,
+        "code-walkthrough" | "walkthrough" => set.code_walkthrough,
         "commit-message" => set.commit_message,
         "pr-description" => set.pr_description,
         // Aliases for common agent types.
-        "fix" => set.debug,
-        "review" => set.code_review,
-        "walkthrough" => set.code_walkthrough,
         _ => {
             return if fallback_to_workspace {
                 Some(set.workspace)

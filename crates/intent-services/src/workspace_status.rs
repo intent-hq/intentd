@@ -183,18 +183,17 @@ impl Services {
         // list/get reads cost one in-memory lookup, no per-row store
         // fan-out); only a cache miss — first touch after startup — probes
         // the store and seeds the `workspace:waiting-changed` baseline.
-        ws.waiting = match self.last_waiting_statuses.get(&ws.id) {
-            Some(waiting) => waiting,
-            None => {
-                // Pre-read generation snapshot: a `workspace.delete`
-                // eviction racing the probe must not have this seed
-                // resurrect the baseline.
-                let waiting_generation = self.last_waiting_statuses.generation();
-                let waiting = self.workspace_is_waiting(&ws.id).await;
-                self.last_waiting_statuses
-                    .seed(&ws.id, waiting, waiting_generation);
-                waiting
-            }
+        ws.waiting = if let Some(waiting) = self.last_waiting_statuses.get(&ws.id) {
+            waiting
+        } else {
+            // Pre-read generation snapshot: a `workspace.delete`
+            // eviction racing the probe must not have this seed
+            // resurrect the baseline.
+            let waiting_generation = self.last_waiting_statuses.generation();
+            let waiting = self.workspace_is_waiting(&ws.id).await;
+            self.last_waiting_statuses
+                .seed(&ws.id, waiting, waiting_generation);
+            waiting
         };
         if ws.task_stats.is_none() {
             return;

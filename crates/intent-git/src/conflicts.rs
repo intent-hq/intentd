@@ -66,15 +66,12 @@ pub fn detect_merge_conflicts(
     let ours = resolve_commit(&repo, current_branch)?;
     let theirs = resolve_commit(&repo, target_branch)?;
 
-    let base = match repo.merge_base(ours.id(), theirs.id()) {
-        Ok(base) => base,
-        Err(_) => {
-            return Ok(MergeConflicts {
-                has_conflicts: false,
-                conflicted_files: Vec::new(),
-                cannot_determine: true,
-            });
-        }
+    let Ok(base) = repo.merge_base(ours.id(), theirs.id()) else {
+        return Ok(MergeConflicts {
+            has_conflicts: false,
+            conflicted_files: Vec::new(),
+            cannot_determine: true,
+        });
     };
 
     let base_tree = repo
@@ -136,7 +133,7 @@ mod tests {
         // (`main`/`master`); the probe must find one of them.
         commit_file(dir.path(), "a.txt", "x\n");
         let found = detect_default_branch(dir.path()).unwrap();
-        assert!(matches!(found.as_deref(), Some("main") | Some("master")));
+        assert!(matches!(found.as_deref(), Some("main" | "master")));
     }
 
     #[test]

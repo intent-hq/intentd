@@ -179,8 +179,7 @@ fn action_for(kind: EventKind) -> Option<Action> {
         EventKind::Create(_) => Some(Action::Create),
         EventKind::Remove(_) => Some(Action::Delete),
         EventKind::Modify(ModifyKind::Name(_)) => Some(Action::Rename),
-        EventKind::Modify(_) => Some(Action::Modify),
-        EventKind::Any => Some(Action::Modify),
+        EventKind::Modify(_) | EventKind::Any => Some(Action::Modify),
         EventKind::Access(_) | EventKind::Other => None,
     }
 }
@@ -585,13 +584,12 @@ async fn debounce_loop(
     loop {
         let next_deadline = pending.values().map(|(_, at)| *at).min();
         tokio::select! {
-            maybe = raw_rx.recv() => match maybe {
-                Some(event) => {
+            maybe = raw_rx.recv() => {
+                if let Some(event) = maybe {
                     ingest(&root, &mut matcher, &event, &mut pending);
                     drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
-                }
-                // Watcher dropped: flush whatever is pending, then stop.
-                None => {
+                } else {
+                    // Watcher dropped: flush whatever is pending, then stop.
                     flush_all(&bus, &workspace_id, &mut pending).await;
                     return;
                 }
