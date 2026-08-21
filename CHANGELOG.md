@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.33] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- *(services)* Terminal PR verdicts override stale entries in the list PR pool ([#1387](https://github.com/intent-hq/intentd/pull/1387))
+
+
 ## [0.7.32] - 2026-08-21
 
 ### 📚 Documentation
