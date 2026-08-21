@@ -12723,6 +12723,27 @@ impl WorkspaceApi for Services {
                     ),
                 }
             }
+            // List-frame slimming (monorepo#3041), following the v4.2
+            // `diskUsage` precedent — optional fields simply never present on
+            // list rows, no wire-shape change. Applied after the join-merge so
+            // the guarantee also covers base rows served on the panic
+            // degradation path above (a base row still carries its persisted
+            // `tokenUsage`):
+            // - `tokenUsage` is detail-only (clients read it via
+            //   `workspace.getTokenUsage` + the tokenUsage-changed event,
+            //   never off list rows) and dominated large frames (~26% of a
+            //   real 180-workspace payload).
+            // - `agentSummary` on ARCHIVED rows: archived workspaces render
+            //   no HUD/coverflow agent cards, yet their accumulated sessions
+            //   made archived rows the bulk of the aggregate (~65% of
+            //   agentSummary bytes measured). Active rows keep the full
+            //   summary; `workspace.get` keeps both fields for detail reads.
+            for ws in &mut list {
+                ws.token_usage = None;
+                if ws.archived {
+                    ws.agent_summary = None;
+                }
+            }
             tracing::debug!(
                 workspaces = count,
                 total_ms = started.elapsed().as_millis() as u64,
@@ -12766,6 +12787,9 @@ impl WorkspaceApi for Services {
                 ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
                 ws.agent_summary = None;
                 ws.diff_summary = None;
+                // Detail-only on the wire (monorepo#3041): list rows never
+                // carry `tokenUsage` — same rationale as the full list path.
+                ws.token_usage = None;
                 ws.cow_supported = cow_supported;
                 // Keep PR fields if already on the row (cheap, already stored);
                 // do not fetch/refresh them here.
@@ -24392,10 +24416,14 @@ impl WorkspaceApi for Services {
     /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
-    /// shaping stays in [`browser_ops`] (byte-for-byte parity with the FE
-    /// tool); failure modes surface as `Error::Internal` with the underlying
-    /// reason so the MCP caller can distinguish "no client connected" from a
-    /// proxy-side failure. An empty `actions` batch is rejected with
+    /// shaping stays in [`browser_ops`], via the agent-surface variant
+    /// [`browser_ops::shape_agent_result`]: structured per-action failures
+    /// (`not-owner` / `already-claimed`) are preserved as data instead of
+    /// flattening into a top-level error (intent-hq/monorepo#3042).
+    /// Remaining failure modes surface as `Error::Internal` with the
+    /// underlying reason so the MCP caller can distinguish "no client
+    /// connected" from a proxy-side failure. An empty `actions` batch is
+    /// rejected with
     /// `Error::InvalidParams` (JSON-RPC `-32602`) before any dispatch — the
     /// FE tool has no meaningful behavior on an empty batch and the
     /// client-triggered path already enforces the same guard. When no
@@ -24419,6 +24447,10 @@ impl WorkspaceApi for Services {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
+            // Shape by *request* arity: the FE aborts a batch on the first
+            // failing action, so the reply's results count can be shorter
+            // than the batch (see `shape_agent_result`).
+            let requested_actions = actions.len();
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
@@ -24438,7 +24470,8 @@ impl WorkspaceApi for Services {
                             Error::Internal(format!("browser.exec: {message}"))
                         }
                     })?;
-            browser_ops::shape_result(response).map_err(|e| Error::Internal(e.message))
+            browser_ops::shape_agent_result(response, requested_actions)
+                .map_err(|e| Error::Internal(e.message))
         })
     }
 

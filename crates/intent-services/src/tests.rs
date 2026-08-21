@@ -376,6 +376,308 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(v.get("diskUsage").is_none());
 }
 
+/// List-frame slimming (monorepo#3041): `workspace.list` rows never carry
+/// `tokenUsage` (detail-only — clients read it via `workspace.getTokenUsage`
+/// and the tokenUsage-changed event), and ARCHIVED rows additionally omit
+/// `agentSummary` (no HUD/coverflow agent card renders for an archived
+/// workspace). Active rows keep the full `agentSummary`, and `workspace.get`
+/// keeps serving both fields for detail reads.
+#[tokio::test]
+async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
+    use std::collections::BTreeMap;
+
+    use intent_core::{AgentId, AgentSession, AgentStatus, TokenUsage, TokenUsageTotals};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let usage = TokenUsage {
+        by_agent_id: BTreeMap::from([(
+            "agent-1".to_string(),
+            TokenUsageTotals {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_read_tokens: 5,
+                cache_creation_tokens: 3,
+                thought_tokens: 0,
+                cost: None,
+            },
+        )]),
+        totals: TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 3,
+            thought_tokens: 0,
+            cost: None,
+        },
+        by_model: BTreeMap::new(),
+        last_scan_at: Some(now_iso()),
+    };
+
+    let ws_active = WorkspaceId::new();
+    let mut active = workspace(&ws_active);
+    active.token_usage = Some(usage.clone());
+    store.insert_workspace(&active).await.expect("active ws");
+
+    let ws_archived = WorkspaceId::new();
+    let mut archived = workspace(&ws_archived);
+    archived.archived = true;
+    archived.archived_at = Some(now_iso());
+    archived.token_usage = Some(usage);
+    store
+        .insert_workspace(&archived)
+        .await
+        .expect("archived ws");
+
+    // One live session per workspace so the enrichment builds an
+    // `agentSummary` for both rows before the archived one is slimmed.
+    let mk_session = |id: &str, ws: &WorkspaceId| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from(id),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Agent".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Idle,
+        is_active: false,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+    store
+        .insert_agent_session(&mk_session("agent-1", &ws_active))
+        .await
+        .expect("active session");
+    store
+        .insert_agent_session(&mk_session("agent-2", &ws_archived))
+        .await
+        .expect("archived session");
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    // Full list: tokenUsage never present; agentSummary only on active rows.
+    let list = svc.list_workspaces(true).await.expect("list");
+    let row_active = list.iter().find(|w| w.id == ws_active).expect("active row");
+    let row_archived = list
+        .iter()
+        .find(|w| w.id == ws_archived)
+        .expect("archived row");
+    assert!(row_active.token_usage.is_none(), "list: tokenUsage omitted");
+    assert!(
+        row_archived.token_usage.is_none(),
+        "list: tokenUsage omitted on archived rows"
+    );
+    let summary = row_active
+        .agent_summary
+        .as_ref()
+        .expect("active row keeps agentSummary");
+    assert_eq!(summary.count, 1);
+    assert!(
+        row_archived.agent_summary.is_none(),
+        "archived row omits agentSummary"
+    );
+    // Wire shape: absent, never null (skip_serializing_if on both fields).
+    let v = serde_json::to_value(row_archived).unwrap();
+    assert!(v.get("tokenUsage").is_none());
+    assert!(v.get("agentSummary").is_none());
+
+    // Lite list (workspace.subscribe seq-0): tokenUsage stripped the same way.
+    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    assert!(lite.iter().all(|w| w.token_usage.is_none()));
+
+    // workspace.get keeps both fields for detail reads — archived included.
+    let got_active = svc.get_workspace(ws_active).await.expect("get active");
+    assert!(got_active.token_usage.is_some(), "get keeps tokenUsage");
+    assert!(got_active.agent_summary.is_some());
+    let got_archived = svc.get_workspace(ws_archived).await.expect("get archived");
+    assert!(got_archived.token_usage.is_some());
+    assert!(
+        got_archived.agent_summary.is_some(),
+        "get keeps agentSummary on archived workspaces"
+    );
+}
+
+/// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
+/// dogfooding-shaped (mostly archived, each with agent sessions, a fat
+/// persisted tokenUsage rollup, PR linkage, and a status message) — must
+/// serialize under the 1 MiB transport warn threshold once the list paths
+/// slim `tokenUsage` (all rows) and `agentSummary` (archived rows).
+#[tokio::test]
+async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
+    use std::collections::BTreeMap;
+
+    use intent_core::{
+        AgentId, AgentSession, AgentStatus, PullRequestInfo, PullRequestStatus, TokenUsage,
+        TokenUsageTotals,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let totals = |n: u64| TokenUsageTotals {
+        input_tokens: 1_000_000 + n,
+        output_tokens: 500_000 + n,
+        cache_read_tokens: 2_000_000 + n,
+        cache_creation_tokens: 300_000 + n,
+        thought_tokens: 0,
+        cost: None,
+    };
+    let mk_session = |id: String, ws: &WorkspaceId, n: u64| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from(id.as_str()),
+        workspace_id: ws.clone(),
+        parent_agent_id: (n > 0).then(|| AgentId::from(format!("{}-0", ws.as_str()).as_str())),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: format!("Fix workspace panel focus regression {n}"),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: Some("implementor".to_string()),
+        status: AgentStatus::Idle,
+        is_active: false,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+
+    // Dogfooding shape (issue math: ~10 KB/row at 130 workspaces): the vast
+    // majority archived, each with the agent sessions a coordinator +
+    // sub-agent workflow accumulates over a workspace's life. Unslimmed this
+    // dataset serializes well over 1 MiB — the assertion below only holds
+    // with the list-path slimming in place.
+    const WORKSPACES: usize = 130;
+    const ACTIVE: usize = 8;
+    const SESSIONS_PER_WS: u64 = 20;
+
+    for i in 0..WORKSPACES {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.title = format!("Fix issue #{i}: bring the panel focus back after modal close");
+        row.status_message = Some(
+            "PR #123 open and waiting for review. All gates green; reviewer comments \
+             addressed and threads resolved."
+                .to_string(),
+        );
+        row.repository_path = Some("/home/user/src/intent/monorepo/packages/intentd".to_string());
+        row.worktree_path = Some(format!("/home/user/intent/workspaces/ws-{i}/monorepo"));
+        row.base_commit_sha = Some("f759124bdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
+        row.pull_requests = Some(vec![PullRequestInfo {
+            id: format!("pr-{i}"),
+            number: 1000 + i as u64,
+            url: format!("https://github.com/intent-hq/intentd/pull/{}", 1000 + i),
+            title: format!("fix: bring panel focus back after modal close (#{i})"),
+            status: PullRequestStatus::Merged,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            base_ref: Some("main".to_string()),
+            head_ref: Some(format!("fix/{i}-panel-focus")),
+            head_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string()),
+            author: Some("dev".to_string()),
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: Some(false),
+        }]);
+        // Fat persisted rollup: 8 agents + 3 models per workspace (the field
+        // list rows must no longer carry).
+        row.token_usage = Some(TokenUsage {
+            by_agent_id: (0..SESSIONS_PER_WS)
+                .map(|n| (format!("agent-{}-{n}", uuid::Uuid::new_v4()), totals(n)))
+                .collect(),
+            totals: totals(9),
+            by_model: BTreeMap::from([
+                ("claude-sonnet-4-5".to_string(), totals(1)),
+                ("claude-opus-4-1".to_string(), totals(2)),
+                ("gpt-5".to_string(), totals(3)),
+            ]),
+            last_scan_at: Some(now_iso()),
+        });
+        if i >= ACTIVE {
+            row.archived = true;
+            row.archived_at = Some(now_iso());
+        }
+        store.insert_workspace(&row).await.expect("ws");
+        for n in 0..SESSIONS_PER_WS {
+            store
+                .insert_agent_session(&mk_session(format!("{}-{n}", ws.as_str()), &ws, n))
+                .await
+                .expect("session");
+        }
+    }
+
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+
+    let list = svc.list_workspaces(true).await.expect("list");
+    assert_eq!(list.len(), WORKSPACES);
+    let payload = serde_json::to_string(&serde_json::json!({ "workspaces": list })).unwrap();
+    assert!(
+        payload.len() < 1024 * 1024,
+        "workspace.list for {WORKSPACES} realistic rows must stay under the 1 MiB \
+         frame warn threshold, got {} bytes",
+        payload.len()
+    );
+}
+
 /// `workspace.diskUsage` cache-state → response mapping: a qualifying row
 /// with a provisioned directory answers `{ refreshing: true }` first (walk
 /// armed, field omitted), backfills to `{ diskUsage, refreshing: false }`
@@ -26138,6 +26440,131 @@ mod browser_exec_reverse {
             .await
             .expect_err("transport");
         assert!(matches!(err, Error::Internal(m) if m.contains("timeout")));
+    }
+
+    // Regression (monorepo#3042): a `success: false` FE envelope that carries
+    // structured per-action errors (not-owner / already-claimed) must come
+    // back as data on the agent seam — not flattened into `Error::Internal`.
+    #[tokio::test]
+    async fn browser_exec_preserves_structured_single_action_ownership_failure() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": null,
+                "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 })],
+                None,
+                None,
+            )
+            .await
+            .expect("structured failure is data, not Err");
+        assert_eq!(out["action"], "resizeTab");
+        assert_eq!(out["success"], json!(false));
+        assert_eq!(out["errorCode"], "not-owner");
+        assert_eq!(out["ownerAgentId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn browser_exec_preserves_structured_multi_action_partial_failure() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "1 of 2 actions failed",
+            "results": [
+                { "action": "listTabs", "success": true, "result": [] },
+                {
+                    "action": "claimTab",
+                    "success": false,
+                    "errorCode": "already-claimed",
+                    "ownerAgentId": "agent-42",
+                    "error": "Tab tab-3 is owned by agent agent-42"
+                }
+            ],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "listTabs" }),
+                    json!({ "action": "claimTab", "tabId": "tab-3", "width": 1280 }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("partial failure is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results preserved");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1]["errorCode"], "already-claimed");
+        assert_eq!(results[1]["ownerAgentId"], "agent-42");
+    }
+
+    // The FE aborts a batch on the first failing action and returns the
+    // partial results collected so far: a 3-action batch failing at action 1
+    // replies with a single result. The shape must key off the request
+    // arity, so multi-action callers still get the envelope form.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_shape() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 }),
+                    json!({ "action": "screenshot" }),
+                    json!({ "action": "listTabs" }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("aborted batch is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results key present");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["errorCode"], "not-owner");
+        assert_eq!(results[0]["ownerAgentId"], "agent-7");
+    }
+
+    #[tokio::test]
+    async fn browser_exec_failure_without_results_still_errors() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "CDP not attached",
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .expect_err("no per-action detail to preserve");
+        assert!(matches!(err, Error::Internal(m) if m.contains("CDP not attached")));
     }
 }
 
