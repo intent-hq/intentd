@@ -6,7 +6,7 @@
 //! active hook owns one tokio task; schedules persist to the `hook` table
 //! and rehydrate at boot ([`Services::rehydrate_hooks`]).
 //!
-//! Scripts evaluate in QuickJS via `intent_js::eval` with the exact same
+//! Scripts evaluate in `QuickJS` via `intent_js::eval` with the exact same
 //! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs —
 //! gated by the same `[agentFeatures]` toggles (e.g. no `ws.host.exec` when
 //! `agentFeatures.hostExec` is off; with all defaults on the environment is
@@ -235,7 +235,7 @@ fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
     time_to_expiry(expires_at, skew_ms) == Some(Duration::ZERO)
 }
 
-/// Evaluate one hook script in QuickJS with the `ws.*` environment gated by
+/// Evaluate one hook script in `QuickJS` with the `ws.*` environment gated by
 /// the same `[agentFeatures]` toggles as the `workspace_api` tool (prelude
 /// pruning + dispatch deny; all-defaults is byte-identical to the ungated
 /// environment) and interpret its return value against the script contract.

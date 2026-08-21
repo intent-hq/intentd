@@ -266,7 +266,7 @@ pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
 /// gate for gh CLI side effects (login sync on authorize, logout on revoke):
 /// a mock-host flow (test seam) stores a token gh cannot use, and touching
 /// `gh` from it would reach the host's real login state from tests. Trailing
-/// slashes are insignificant ("https://github.com/" is the same host), so
+/// slashes are insignificant ("<https://github.com>/" is the same host), so
 /// normalize before comparing.
 pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
     base_uri.trim_end_matches('/')

@@ -374,7 +374,7 @@ struct ScanState {
     scanned_directories: usize,
 }
 
-/// Find all SKILL.md files under root_path
+/// Find all SKILL.md files under `root_path`
 async fn find_skill_files(
     root_path: &Path,
     observed_paths: &mut std::collections::HashSet<PathBuf>,

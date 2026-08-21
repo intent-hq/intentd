@@ -602,7 +602,7 @@ pub struct Services {
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
     /// In-memory watermark cache for incremental token-usage scanning (finding F2).
-    /// Maps workspace_id → agent_message count. When the watermark is unchanged
+    /// Maps `workspace_id` → `agent_message` count. When the watermark is unchanged
     /// since the last scan, the workspace is skipped. A restart rescans once.
     /// Shared across clones so every scan tick observes the same watermark state.
     token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
@@ -618,7 +618,7 @@ pub struct Services {
     /// reaches github.com.
     github_login_base_uri: Option<String>,
     /// Shared cache + offload gates for git-derived aggregates that are still
-    /// computed on demand (`diffSummary` for explicit callers, CoW support
+    /// computed on demand (`diffSummary` for explicit callers, `CoW` support
     /// probes on list/get). Diff rollups are **not** attached to the high-
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
@@ -631,19 +631,19 @@ pub struct Services {
     disk_usage: Arc<disk_usage::DiskUsageCache>,
     /// Cached agent.list message projections per workspace. Invalidated on
     /// message append / session create+delete so focus-time list bursts hit
-    /// memory instead of re-running the SQLite JSON window.
+    /// memory instead of re-running the `SQLite` JSON window.
     agent_list_cache: Arc<agent_list_cache::AgentListProjectionCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
     /// MCP dispatch (keyed by a nonce embedded in the model-facing output),
     /// claimed by the transcript writer when the provider echoes the tool's
-    /// completion — so standalone blocks (e.g. ProposalCards) render even
+    /// completion — so standalone blocks (e.g. `ProposalCards`) render even
     /// when the provider garbles the echo. Shared across clones (and with
     /// each agent's [`WorkspaceMcpServer`]) so registration and claim observe
     /// the same state.
     turn_attachments: Arc<intent_core::TurnAttachmentRegistry>,
     /// Per-agent in-flight sandbox-provisioning gates (monorepo#871). A
-    /// delegate with CoW isolation kicks the clone off in a background task
+    /// delegate with `CoW` isolation kicks the clone off in a background task
     /// and returns immediately; the child's turn worker awaits the gate
     /// before its first ACP spawn so the child never runs against a
     /// half-copied sandbox. The entry is removed — and the paired
@@ -795,7 +795,7 @@ pub(crate) type ExportBuildFailpoint = Arc<dyn Fn(&str) -> Option<Error> + Send 
 
 /// Pause inserted between per-workspace iterations of the background sweeps
 /// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage`])
-/// so a single sweep never monopolizes SQLite pool slots: a real sleep (not a
+/// so a single sweep never monopolizes `SQLite` pool slots: a real sleep (not a
 /// bare `yield_now`) lets queued interactive acquires win the slot between
 /// workspaces (intent-hq/monorepo#703).
 pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
@@ -2127,15 +2127,15 @@ impl Services {
         Ok(())
     }
 
-    /// Compute whether CoW isolation is supported on this machine. Probes the
+    /// Compute whether `CoW` isolation is supported on this machine. Probes the
     /// workspaces root's filesystem (root→root) — a machine capability,
     /// independent of any workspace or checkout mode (the FE uses it to gate
-    /// the CoW opt-in toggle, which affects newly created workspaces).
+    /// the `CoW` opt-in toggle, which affects newly created workspaces).
     /// Resolves the root like every other consumer — the injected
     /// `workspaces_root`, else [`default_workspaces_root`]
     /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`) — so
     /// production daemons, which never inject a root, still report the
-    /// capability. Returns Some(true) if the CoW probe reports Supported;
+    /// capability. Returns Some(true) if the `CoW` probe reports Supported;
     /// Some(false) on an unsupported filesystem; None if the probe cannot
     /// run. The live probe is offloaded to the blocking pool and cached per
     /// workspaces root by the shared aggregate cache.
@@ -2889,7 +2889,7 @@ impl Services {
     /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
     /// like the workspace refresh itself.
     ///
-    /// `sc` is `None` when no SourceControl provider is configured: steps
+    /// `sc` is `None` when no `SourceControl` provider is configured: steps
     /// 1–3 are pure git/store work and still run (so submodule detection,
     /// pruning, and the commit-sha backfill don't require forge
     /// credentials); only the per-root PR refresh (step 4) is skipped.
@@ -3444,7 +3444,7 @@ impl Services {
     /// (`list_workspaces`); each workspace is passed into the refresh path
     /// as-is instead of being re-read per iteration, and the sweep pauses
     /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
-    /// monopolizes SQLite pool slots (intent-hq/monorepo#703).
+    /// monopolizes `SQLite` pool slots (intent-hq/monorepo#703).
     ///
     /// Each per-workspace refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
     /// so a hung forge call maps into the existing log-and-continue error
@@ -3528,7 +3528,7 @@ impl Services {
     /// by recency (see [`Services::refresh_all_workspace_prs`]) so idle
     /// workspaces only refresh every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
     /// tick (~30 min). Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
-    /// between workspaces so it never monopolizes SQLite pool slots. Missed
+    /// between workspaces so it never monopolizes `SQLite` pool slots. Missed
     /// ticks are skipped (no pile-up). No-op-safe when source control is
     /// unconfigured (a sweep with due workspaces logs a single warning and
     /// returns; an all-idle tick returns silently before resolving the
@@ -3586,7 +3586,7 @@ impl Services {
     /// (ignoring `lastScanAt`) actually changed. Daemon-internal — there is
     /// no scan RPC. Returns whether a change was written. `NotFound` if the
     /// workspace is absent. **Incremental** (finding F2): skips when the
-    /// agent_message watermark is unchanged since the last scan, and hydrates
+    /// `agent_message` watermark is unchanged since the last scan, and hydrates
     /// only usage metadata (not full message logs) when a scan does run. As a
     /// reconciler it never clobbers a fresher live snapshot with an all-zero
     /// tally (see [`Services::recompute_workspace_token_usage`]).
@@ -3727,7 +3727,7 @@ impl Services {
     /// [`Services::scan_workspace_token_usage`] — the end-of-turn live update
     /// is the primary writer; this sweep catches sessions it cannot see),
     /// pausing [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so the
-    /// sweep never monopolizes SQLite pool slots (intent-hq/monorepo#703).
+    /// sweep never monopolizes `SQLite` pool slots (intent-hq/monorepo#703).
     /// Errors are logged per workspace and never abort the sweep.
     async fn scan_all_token_usage(&self) {
         let workspaces = match self.store.list_workspaces(false).await {
@@ -3760,7 +3760,7 @@ impl Services {
     /// without end-of-turn usage reports / legacy per-message metadata) and
     /// never regresses a live-updated tally to zeros. Each sweep pauses
     /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
-    /// monopolizes SQLite pool slots. The first sweep runs after one
+    /// monopolizes `SQLite` pool slots. The first sweep runs after one
     /// `interval`; missed ticks are skipped (no pile-up). Returns the task
     /// handle so the composition root can hold/abort it.
     pub fn spawn_token_usage_scan_loop(
@@ -3783,9 +3783,9 @@ impl Services {
     /// Spawn the AS-3 completion-delivery worker: subscribe to the AGENT
     /// completion event set (agent:idle / agent:failed / agent:deleted) across
     /// every workspace and, on each child completion, wake every parent holding
-    /// a completion watch for that child (the same agent_send_message_op
+    /// a completion watch for that child (the same `agent_send_message_op`
     /// path reportToParent uses), removing the watch after delivery.
-    /// after_all delegation-group watches (group_id = Some) are left in place for
+    /// `after_all` delegation-group watches (`group_id` = Some) are left in place for
     /// AS-4. No-op-safe when no event bus is wired. Returns the task handle so the
     /// composition root can hold it for the process lifetime.
     pub fn spawn_completion_delivery_loop(&self) -> tokio::task::JoinHandle<()> {
@@ -3958,7 +3958,7 @@ impl Services {
     /// interrupt, retry, delete) can land between the streaming path's stash
     /// and the terminal-failure handler's take; the orphaned entry would
     /// otherwise survive and mis-describe a LATER failure (its streak /
-    /// stop_reason belong to the aborted turn), so every worker-abort path
+    /// `stop_reason` belong to the aborted turn), so every worker-abort path
     /// discards the slot alongside its other per-turn flags.
     pub(crate) fn discard_pending_terminal_error(&self, agent_id: &AgentId) {
         self.pending_terminal_error
@@ -4091,7 +4091,7 @@ impl Services {
     /// from the queue probe or the busy probe (monorepo#1297) — so a later
     /// queue retraction that empties the ready-to-send queue while the agent
     /// is idle synthesizes the real completion: re-running watch delivery
-    /// and sealing the agent's open after_all group. A busy-classified
+    /// and sealing the agent's open `after_all` group. A busy-classified
     /// marker is superseded by the running turn's own terminal `agent:idle`
     /// (the non-interim delivery takes the marker below).
     fn mark_interim_skipped_idle(&self, child_id: &AgentId) {
@@ -4171,7 +4171,7 @@ impl Services {
     /// its real completion and must not fire the agent's own watchers (issue
     /// intent-hq/monorepo#1468: an implementor idling while it waits on its PR
     /// reviewer must not wake its coordinator into a no-progress loop). Grouped
-    /// (after_all) watches count too: a coordinator idling while its delegation
+    /// (`after_all`) watches count too: a coordinator idling while its delegation
     /// group is open is genuinely waiting on its children.
     ///
     /// 2-cycle deadlock guard: a mutual watch pair (A⇄B) in which BOTH sides
@@ -4482,8 +4482,8 @@ impl Services {
         }
     }
 
-    /// Wake every parent whose watch matches child_id, then drop that watch:
-    /// every ungrouped watch is deliver-once-and-retire. group_id = Some
+    /// Wake every parent whose watch matches `child_id`, then drop that watch:
+    /// every ungrouped watch is deliver-once-and-retire. `group_id` = Some
     /// watches defer to the AS-4 delegation-group fan-in and are left
     /// untouched. A single failed delivery is logged and skipped so the
     /// remaining watches still fire. STAB-18: remove ungrouped watches BEFORE
@@ -4521,7 +4521,7 @@ impl Services {
     /// `agent:deleted` — and the attention / reportToParent immediate
     /// wakes, which run on their own paths — are never hook-deferred.
     /// Hook deferral is scoped to the agent's settlement AS A CHILD: the
-    /// idling agent's own parent-side after_all seal gates on the
+    /// idling agent's own parent-side `after_all` seal gates on the
     /// queue/busy classification alone (monorepo#1483 — see the callers).
     ///
     /// Idle-visibility deferral (unified external-wait classification): an
@@ -4533,7 +4533,7 @@ impl Services {
     /// (fail-open on a probe error, same as the hook probe); a monitor that
     /// completed or was cancelled between emit and delivery never defers.
     /// PR-monitor deferral is likewise scoped to the agent's settlement AS A
-    /// CHILD — it does not gate the child's own after_all seal either.
+    /// CHILD — it does not gate the child's own `after_all` seal either.
     ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
@@ -4561,7 +4561,7 @@ impl Services {
     /// skip the settlement record), classified LIVE at delivery time via
     /// [`Services::agent_is_waiting_on_agents`] (which bakes in the 2-cycle
     /// deadlock guard). Like hook-waiting (monorepo#1483), agent-waiting does
-    /// NOT defer the child's OWN after_all group seal — an after_all
+    /// NOT defer the child's OWN `after_all` group seal — an `after_all`
     /// coordinator always holds grouped outgoing watches on its own children,
     /// so gating the seal on agent-waiting would deadlock the group. The
     /// interim-skip marker is reused, and the backstop paths (`agent.unwatch`,
@@ -7976,8 +7976,8 @@ fn cleanup_workspace_worktree_locked(
     trash
 }
 
-/// Locked phase of the `workspace.delete` cleanup for a standalone CoW
-/// checkout (`checkoutMode == "cow"`). A CoW checkout is a full clone with no
+/// Locked phase of the `workspace.delete` cleanup for a standalone `CoW`
+/// checkout (`checkoutMode == "cow"`). A `CoW` checkout is a full clone with no
 /// registration in the source repository and its workspace branch exists only
 /// inside the clone, so the worktree-specific steps of
 /// [`cleanup_workspace_worktree_locked`] (registration prune, source-repo
@@ -8011,7 +8011,7 @@ fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
     trash
 }
 
-/// Best-effort removal of the `<root>/<workspaceId>` dir a CoW probe created
+/// Best-effort removal of the `<root>/<workspaceId>` dir a `CoW` probe created
 /// when checkout provisioning fails afterwards (`provision_cow_checkout`
 /// already removes the clone itself, leaving the parent empty) — repeated
 /// failures must not accumulate empty dirs in the workspaces root
@@ -9317,7 +9317,7 @@ pub(crate) fn git_root_unregistered_event(
 
 /// Wall-clock bound for a single `git.pull` operation before the daemon
 /// short-circuits with a structured failure. Matches the TS handler's
-/// `timeout: 120_000` on `git pull --rebase` (`git.ipc.ts` PULL_BRANCH), so
+/// `timeout: 120_000` on `git pull --rebase` (`git.ipc.ts` `PULL_BRANCH`), so
 /// FE behaviour on a hung remote is unchanged.
 const GIT_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -9858,19 +9858,19 @@ pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> 
 pub(crate) struct CompletionIdleClassification {
     /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
     /// or a worker turn is in flight — the agent's delegating turn is not
-    /// over yet, so the parent-side after_all seal must wait for the real
+    /// over yet, so the parent-side `after_all` seal must wait for the real
     /// completion.
     pub(crate) queue_interim: bool,
     /// Hook-waiting (monorepo#1336): the agent owns active background hooks —
     /// its settlement AS A CHILD (ungrouped watch delivery, grouped
     /// recording) defers until the hooks resolve, but this alone must NOT
-    /// gate the parent-side after_all seal (monorepo#1483).
+    /// gate the parent-side `after_all` seal (monorepo#1483).
     pub(crate) hook_waiting: bool,
     /// PR-monitor-waiting: the agent owns active PR monitors — mirrors
     /// `hook_waiting` exactly (same settlement-as-a-child deferral, same
     /// monorepo#1483 seal exemption): a monitored PR's own poll loop is what
     /// eventually wakes the agent, so this alone must NOT gate the
-    /// parent-side after_all seal either.
+    /// parent-side `after_all` seal either.
     pub(crate) pr_monitor_waiting: bool,
 }
 
@@ -10159,13 +10159,13 @@ pub(crate) fn format_group_child_line(
 pub(crate) struct StallSuspicion {
     /// Title of the child's assigned task note.
     pub(crate) task_title: String,
-    /// Wire (snake_case) form of the task's still-incomplete status.
+    /// Wire (`snake_case`) form of the task's still-incomplete status.
     pub(crate) task_status: String,
 }
 
 impl StallSuspicion {
     /// Fields merged into the event's `data` so the FE metadata (and the
-    /// grouped raw_events) carry the machine-readable flag.
+    /// grouped `raw_events`) carry the machine-readable flag.
     pub(crate) fn annotate_event_data(&self, data: &mut serde_json::Value) {
         if let Some(obj) = data.as_object_mut() {
             obj.insert("stallSuspected".to_string(), serde_json::json!(true));
@@ -10181,7 +10181,7 @@ impl Services {
     /// Evaluate the monorepo#1016 stall predicate for a child completion:
     /// `agent:idle` AND no persisted completion report AND the session has an
     /// assigned task note whose status is not complete/cancelled/
-    /// review_required (monorepo#1898). Every store failure fails OPEN
+    /// `review_required` (monorepo#1898). Every store failure fails OPEN
     /// (returns `None`) — annotation is best-effort and must never block,
     /// delay, or drop a wake.
     pub(crate) async fn stall_suspicion_for_completion(
@@ -10240,7 +10240,7 @@ impl Services {
     }
 }
 
-/// Build the single aggregated wake for a settled after_all delegation group: a
+/// Build the single aggregated wake for a settled `after_all` delegation group: a
 /// header with the child count and completionStatus (`partial` when any child
 /// was deleted or failed, else `completed`) followed by the accumulated
 /// per-child lines. STAB-160: a failed member must not be reported as
@@ -24735,11 +24735,11 @@ impl Services {
     }
 }
 
-/// Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
+/// Sandbox provisioning and lifecycle for `CoW` agent isolation (direct-mode and
 /// CoW-checkout workspaces).
 impl Services {
     /// Provision a sandbox for an agent in a direct-mode or CoW-checkout workspace.
-    /// Returns `ProvisionOutcome::Supported` if CoW is available, or `Unsupported` for fallback.
+    /// Returns `ProvisionOutcome::Supported` if `CoW` is available, or `Unsupported` for fallback.
     pub async fn provision_sandbox(
         &self,
         workspace_id: &WorkspaceId,
@@ -24783,7 +24783,7 @@ impl Services {
     }
 
     /// Await settlement of an in-flight sandbox provisioning for `agent_id`,
-    /// if any (monorepo#871). No timeout by design: the CoW clone of a large
+    /// if any (monorepo#871). No timeout by design: the `CoW` clone of a large
     /// checkout may take tens of seconds and the whole point is that copy
     /// time counts against no request-scoped budget. Returns immediately
     /// when no provisioning is in flight (the common case for every turn
@@ -24891,7 +24891,7 @@ impl Services {
         }
     }
 
-    /// `accept-changes.prepare`: validate + suggest (PrepareResult).
+    /// `accept-changes.prepare`: validate + suggest (`PrepareResult`).
     async fn ac_prepare(
         &self,
         workspace_id: WorkspaceId,
@@ -25277,7 +25277,7 @@ impl Services {
     }
 
     /// Create a PR via the forge (reusing an existing link), persist the linkage,
-    /// emit `pr:linked`, and restore attribution (pushed → pull_request).
+    /// emit `pr:linked`, and restore attribution (pushed → `pull_request`).
     async fn ac_create_pr(
         &self,
         workspace_id: &WorkspaceId,
@@ -26458,7 +26458,7 @@ async fn load_ws_for_pr(store: &Store, workspace_id: &WorkspaceId) -> Result<Wor
         })
 }
 
-/// Snake_case status word for a `TaskStatus` (matches the wire serialization).
+/// `Snake_case` status word for a `TaskStatus` (matches the wire serialization).
 fn status_word(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::NotStarted => "not_started",
@@ -26844,7 +26844,7 @@ pub fn discover_providers_with_npx_overrides(
 /// (monorepo#1662): always emit `cliCommand` / `cliResolved` /
 /// `cliVersionOk` / `cliRequirement`, plus `cliResolvedPath` / `cliVersion`
 /// when known and `unavailableReason` when the gate fires. A gating verdict
-/// (Missing / TooOld) forces `installed` to `false`; Unknown stays
+/// (Missing / `TooOld`) forces `installed` to `false`; Unknown stays
 /// permissive with a WARN. Split out of the payload builder so the
 /// gate-to-fields mapping is unit-testable without a real probe.
 fn apply_pi_cli_fields(
@@ -26953,7 +26953,7 @@ pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
 /// script's own code. The leading `\n` yields a blank separator line when the
 /// script's output ends with a newline (the common case). Assumes `date +%s`
 /// (epoch seconds; not in POSIX before Issue 8 but supported by macOS, GNU
-/// coreutils, and BusyBox — all platforms intentd targets).
+/// coreutils, and `BusyBox` — all platforms intentd targets).
 pub(crate) const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
 
 /// Write `contents` to a fresh file created with mode `0600` on unix (plain

@@ -50,7 +50,7 @@ const LARGE_CONVERSATION_WARN_BYTES: u64 = 4 * 1024 * 1024;
 const QUEUE_PREVIEW_MAX_CHARS: usize = 200;
 
 /// Maximum length for caller-supplied message IDs to prevent unbounded storage
-/// and DoS via oversized persisted IDs.
+/// and `DoS` via oversized persisted IDs.
 pub(crate) const MAX_MESSAGE_ID_LEN: usize = 256;
 
 use crate::agent_subscriptions::CompletionWatch;
@@ -383,7 +383,7 @@ fn default_model_belongs_to_provider(
 }
 
 /// Reject a provider id that is not in the ACP registry with `-32602`
-/// (InvalidParams). Persisting an unknown provider would make the spawn path
+/// (`InvalidParams`). Persisting an unknown provider would make the spawn path
 /// silently fall back to the default binary; hard-fail at the front door
 /// instead (PROTOCOL §5.5). `method` names the rejecting RPC in the message.
 fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
@@ -397,7 +397,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 }
 
 /// Reject a bare model id that provably belongs to a different provider with
-/// `-32602` (InvalidParams). Persisting the mismatch would make the spawn
+/// `-32602` (`InvalidParams`). Persisting the mismatch would make the spawn
 /// path feed another provider's model id to `provider_id`'s binary
 /// (monorepo#607). Ownership evidence is deterministic and probe-free: the
 /// in-memory last-good `ModelCatalogCache` entries under each provider's
@@ -447,7 +447,7 @@ pub(crate) fn ensure_bare_model_matches_provider(
 }
 
 /// Reject a `reasoningEffort` level the resolved model provably does not
-/// support with `-32602` (InvalidParams), naming the valid values. Evidence is
+/// support with `-32602` (`InvalidParams`), naming the valid values. Evidence is
 /// the cached model catalog's `effortLevels` for `model_id`
 /// ([`crate::model_catalog::ModelCatalogCache::cached_effort_levels`]) — the
 /// same probe-free, read-only rule as the bare-model ownership guard: with no
@@ -1546,7 +1546,7 @@ pub(crate) fn has_question_blocks(content: &Value) -> bool {
 }
 
 /// `messageMetadata.type` marker the FE's question wizard stamps on the
-/// flattened Q:/A: answer message (PROTOCOL §5.5, question hold). The daemon
+/// flattened `<<Q:/A>>:` answer message (PROTOCOL §5.5, question hold). The daemon
 /// keys the pending-questions marker clear on this structured tag plus
 /// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
 pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
@@ -1869,7 +1869,7 @@ fn apply_slim_projection(mut message: AgentMessage, thumbnails: Option<&Value>) 
 
 impl Services {
     /// `agent.listActive` (PROTOCOL §5.5): daemon-global mid-turn agents from
-    /// the runtime manager's busy set. Only the small busy set reaches SQLite,
+    /// the runtime manager's busy set. Only the small busy set reaches `SQLite`,
     /// and each lookup selects `updated_at` alone.
     pub(crate) async fn agent_list_active_op(&self) -> Result<Value> {
         let Some(manager) = self.agent_manager() else {
@@ -1963,8 +1963,8 @@ impl Services {
     }
 
     /// Drop the cached agent.list message projections for `workspace_id`.
-    /// Call after any successful agent_message write or session create/delete
-    /// in this workspace so the next list reloads from SQLite.
+    /// Call after any successful `agent_message` write or session create/delete
+    /// in this workspace so the next list reloads from `SQLite`.
     pub(crate) fn invalidate_agent_list_cache(&self, workspace_id: &WorkspaceId) {
         self.agent_list_cache.invalidate(&workspace_id.0);
     }
@@ -4488,7 +4488,7 @@ impl Services {
         }
     }
 
-    /// `agent.sendQueuedMessageNow` (store-only fallback when no AgentManager
+    /// `agent.sendQueuedMessageNow` (store-only fallback when no `AgentManager`
     /// is attached): atomically remove the queued entry named by `message_id`
     /// and persist it to the transcript immediately, preserving the rest of
     /// the queue (PROTOCOL §5.5). Deliberately NOT idempotent (unlike
@@ -7144,7 +7144,7 @@ impl Services {
     }
 
     /// The explicit-registration idle-target guard (monorepo#2972): a
-    /// RuntimeIdle target with NO waiting reason — nothing pending that
+    /// `RuntimeIdle` target with NO waiting reason — nothing pending that
     /// could ever produce a "next completion" — is rejected, because
     /// accepting it either fires an instant synthetic wake replaying the
     /// stale report (settled shape) or leaves a permanently-armed dead
@@ -7231,7 +7231,7 @@ impl Services {
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
     /// cross-workspace targets for non-chief callers, and the idle-target
     /// guard (monorepo#2972, [`Services::check_idle_target_watchable`])
-    /// rejects a RuntimeIdle target with no waiting reason.
+    /// rejects a `RuntimeIdle` target with no waiting reason.
     pub(crate) async fn agent_watch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -8757,7 +8757,7 @@ impl Services {
     /// `Vec::push` append-order means newest is the tail). Shared by
     /// `agent_wake_or_create_op`'s live/resumable scan and the occupancy
     /// guards in `agent_delegate_op` / `assign_agent`. Probe each session:
-    ///   * NotFound / Deleted → stale, queue for cleanup.
+    ///   * `NotFound` / Deleted → stale, queue for cleanup.
     ///   * Poisoned (monorepo#840: Error + session-fatal provider block or
     ///     an identical-failure streak) → NOT resumable: waking it would
     ///     replay the provider-blocked turn ("start a new session" means a
@@ -8765,7 +8765,7 @@ impl Services {
     ///     keeping it as the inheritance source for specialist/model.
     ///     Poisoned ids are ALSO tracked separately: their parked queues
     ///     are migrated onto the wake/create target and the dead session
-    ///     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
+    ///     is GC'd (monorepo#847). `NotFound` / soft-Deleted ids keep the
     ///     cleanup-only behavior.
     ///   * Otherwise → treat as resumable; the newest live session wins.
     ///
@@ -11045,7 +11045,7 @@ impl Services {
     /// parent completion watch when delegated, then deliver a continuation message.
     ///
     /// Claim-then-act semantics prevent concurrent resume races (exactly-one-winner).
-    /// If any post-claim step fails (agent_send_message, session lookup), the row is
+    /// If any post-claim step fails (`agent_send_message`, session lookup), the row is
     /// reset to pending (resolution=NULL) to restore retryability, and the error is
     /// returned loudly.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {

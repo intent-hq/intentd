@@ -1,4 +1,4 @@
-//! End-to-end `note.*` service tests over a temp SQLite store. Pure content
+//! End-to-end `note.*` service tests over a temp `SQLite` store. Pure content
 //! math is covered in `note_ops`; these assert persistence, the setContent
 //! reduction guard, spec-title skip, workspace scoping, and error mapping.
 
@@ -26,8 +26,8 @@ fn disable_node_compile_cache() {
 }
 
 /// Guard for tests that mutate debounce env vars to prevent parallel test
-/// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
-/// WORKSPACE_IDLE debounce vars.
+/// races (`env::set_var` is process-global). Supports both `LAST_ACTIVITY` and
+/// `WORKSPACE_IDLE` debounce vars.
 static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard for debounce env vars: holds the lock, sets the vars, and restores
@@ -938,7 +938,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
 }
 
 /// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
-/// (self filtered out, other-repo filtered out) with the PascalCase status.
+/// (self filtered out, other-repo filtered out) with the `PascalCase` status.
 #[tokio::test]
 async fn cross_workspace_list_siblings_scopes_to_repository() {
     let tmp = TempDb::new();
@@ -7932,7 +7932,7 @@ mod change_event_parity {
 
     /// Regression (intent-hq/monorepo#1481): same race window as above, for
     /// `raise_attention`. Raising IS activity — `updated_at` moves — but the
-    /// write must still be scoped to attention + updated_at, so a concurrent
+    /// write must still be scoped to attention + `updated_at`, so a concurrent
     /// title change survives.
     #[tokio::test]
     async fn raise_attention_race_preserves_concurrent_title_change() {
@@ -9546,7 +9546,7 @@ mod drafts_events {
         assert!(ev.data.get("text").is_none());
     }
 
-    /// Attachments round-trip through the real SQLite store (additive
+    /// Attachments round-trip through the real `SQLite` store (additive
     /// `attachments` column, §5.16): stored verbatim, empty-text-with-
     /// attachments persists, empty-text-no-attachments clears, and the
     /// `draft:changed` payload never carries attachment content.
@@ -12106,7 +12106,7 @@ mod pr {
     }
 
     /// Commit an empty tree in `dir` so its HEAD resolves to a SHA, returning
-    /// the commit SHA (SweepRepo repos have an unborn HEAD by default).
+    /// the commit SHA (`SweepRepo` repos have an unborn HEAD by default).
     fn sweep_commit(dir: &std::path::Path) -> String {
         let repo = git2::Repository::open(dir).unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
@@ -12199,7 +12199,7 @@ mod pr {
         assert_eq!(updated.len(), 1, "no re-stamp churn");
     }
 
-    /// The sweep's local steps run without a SourceControl provider: the
+    /// The sweep's local steps run without a `SourceControl` provider: the
     /// commit-sha backfill still stamps a NULL row when `sc` is `None`
     /// (unconfigured credentials must not strand pre-migration rows).
     #[tokio::test]
@@ -18804,7 +18804,7 @@ mod rules {
         assert!(!prompt.contains("CoW sandbox"), "no CoW mention");
     }
 
-    /// Task 6: shared-mode direct workspace (CoW unsupported) gets no hints.
+    /// Task 6: shared-mode direct workspace (`CoW` unsupported) gets no hints.
     #[tokio::test]
     async fn assembly_omits_hints_for_shared_mode_direct() {
         let tree = worktree();
@@ -18930,9 +18930,9 @@ mod rules {
     }
 
     /// Task 6 (verifier requirement): explicit isolation:"shared" override must prevent
-    /// sandbox hint even when workspace has cow_supported=true and setting ON. This
-    /// mutation test ensures build_isolation_hint keys off session.sandbox_path (actual
-    /// effective isolation), not workspace.cow_supported (capability).
+    /// sandbox hint even when workspace has `cow_supported=true` and setting ON. This
+    /// mutation test ensures `build_isolation_hint` keys off `session.sandbox_path` (actual
+    /// effective isolation), not `workspace.cow_supported` (capability).
     #[tokio::test]
     async fn assembly_omits_sandbox_hint_when_explicit_shared_override() {
         let tree = worktree();
@@ -19062,9 +19062,9 @@ mod rules {
     }
 
     /// Task 6 (verifier requirement): explicit isolation:"cow" override in a setting-OFF
-    /// workspace must still inject sandbox hint when session has sandbox_path. This
-    /// mutation test proves build_isolation_hint respects actual session.sandbox_path
-    /// (effective isolation), not just workspace.cow_supported + setting.
+    /// workspace must still inject sandbox hint when session has `sandbox_path`. This
+    /// mutation test proves `build_isolation_hint` respects actual `session.sandbox_path`
+    /// (effective isolation), not just `workspace.cow_supported` + setting.
     #[tokio::test]
     async fn assembly_injects_sandbox_hint_when_explicit_cow_override() {
         let tree = worktree();
@@ -20740,7 +20740,7 @@ mod worktree_provisioning {
     }
 
     /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
-    /// standalone CoW clone (not a linked worktree) checked out on the
+    /// standalone `CoW` clone (not a linked worktree) checked out on the
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
@@ -20892,13 +20892,13 @@ mod worktree_provisioning {
         );
     }
 
-    /// `workspace.delete` of a CoW workspace removes the checkout directory
+    /// `workspace.delete` of a `CoW` workspace removes the checkout directory
     /// and its `<root>/<workspaceId>` parent but never touches the source
     /// repository: no registration prune and — critically — no branch delete,
     /// even when the source carries a same-named branch and the workspace's
     /// branch is flagged auto-generated (the guard that deletes worktree
-    /// branches). The CoW workspace's branch lives only inside the clone.
-    /// CI-safe: the standalone checkout is a plain `git clone`, so no CoW
+    /// branches). The `CoW` workspace's branch lives only inside the clone.
+    /// CI-safe: the standalone checkout is a plain `git clone`, so no `CoW`
     /// filesystem support is needed to exercise the delete path.
     #[tokio::test]
     async fn delete_cow_checkout_removes_dir_without_touching_source_repo() {
@@ -20984,7 +20984,7 @@ mod worktree_provisioning {
 
     /// cowIsolation on + CoW-capable filesystem: `workspace.duplicate`
     /// mirrors the create decision matrix — the duplicate gets a standalone
-    /// CoW clone with `checkoutMode: "cow"` persisted, and the source repo
+    /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
     #[tokio::test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
@@ -21093,7 +21093,7 @@ mod worktree_provisioning {
         );
     }
 
-    /// Regression for monorepo#774 (`workspace.create` path): when the CoW
+    /// Regression for monorepo#774 (`workspace.create` path): when the `CoW`
     /// probe succeeds but `provision_cow_checkout` fails afterwards (here: an
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
@@ -21138,7 +21138,7 @@ mod worktree_provisioning {
         );
     }
 
-    /// monorepo#774, `workspace.duplicate` path: a CoW provisioning failure
+    /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
     /// after a successful probe is swallowed (the duplicate continues without
     /// a worktree), and the empty `<root>/<wsId>` dir the probe created is
     /// removed on the error path — the dir only reappears via the metadata
@@ -22987,7 +22987,7 @@ mod file_ops_service {
     }
 
     /// Containment integration test: delegate an agent with isolation=cow, perform a
-    /// file write through the agent-scoped ops path (caller_agent_id → resolve_root),
+    /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
     #[tokio::test]
     async fn file_write_via_sandboxed_agent_is_contained() {
@@ -23189,7 +23189,7 @@ mod file_ops_service {
     }
 
     /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
-    /// when an eligible CoW provisioning kicks off (monorepo#871 — the clone
+    /// when an eligible `CoW` provisioning kicks off (monorepo#871 — the clone
     /// runs in a background task, off the delegate critical path). The settled
     /// outcome is observable on the child's session: sandbox fields present on
     /// success, absent on the shared-mode fallback.
@@ -25527,7 +25527,7 @@ mod clone_orchestration {
         );
     }
 
-    /// Pinned CoW coverage (probe-gated like the checkout-mode tests): with
+    /// Pinned `CoW` coverage (probe-gated like the checkout-mode tests): with
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
@@ -26399,7 +26399,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
 
 /// Inter-workspace pause (intent-hq/monorepo#703): `scan_all_token_usage`
 /// sleeps `SWEEP_INTER_WORKSPACE_PAUSE` after each workspace so the sweep
-/// never monopolizes SQLite pool slots — and still completes correctly over
+/// never monopolizes `SQLite` pool slots — and still completes correctly over
 /// several workspaces. `tokio::time::sleep` guarantees at least the requested
 /// duration, so the wall-clock lower bound proves the pause is wired. (Paused
 /// time is unusable here: auto-advance trips sqlx's pool-acquire timeout.)
@@ -26612,7 +26612,7 @@ mod last_activity_events {
         }
     }
 
-    /// After `raise_attention` (which bumps workspace.updated_at), a
+    /// After `raise_attention` (which bumps `workspace.updated_at`), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
     async fn raise_attention_emits_last_activity() {
@@ -26703,7 +26703,7 @@ mod last_activity_events {
         );
     }
 
-    /// Rapid bumps to the same workspace (e.g., multiple raise_attention calls)
+    /// Rapid bumps to the same workspace (e.g., multiple `raise_attention` calls)
     /// coalesce into one `workspace:updated { lastActivity }` event carrying
     /// the latest derived value.
     #[tokio::test]
@@ -27144,7 +27144,7 @@ mod last_activity_events {
         assert!(!changed2, "second scan should skip (unchanged watermark)");
     }
 
-    /// Finding F2: rescan when the agent_message watermark changes.
+    /// Finding F2: rescan when the `agent_message` watermark changes.
     #[tokio::test]
     async fn incremental_token_scan_rescan_on_append() {
         let h = harness().await;
@@ -27437,7 +27437,7 @@ mod last_activity_events {
     }
 
     /// Regression for STAB-N: busy→idle transition debounce (test c).
-    /// workspace_activity() MUST return AgentRunning during the grace window
+    /// `workspace_activity()` MUST return `AgentRunning` during the grace window
     /// (before the debounce fires) so list/get/update responses and the event
     /// stream agree on the derived state.
     #[tokio::test]
@@ -28952,7 +28952,7 @@ mod provider_discovery_payload {
     }
 
     /// The pure gate-to-fields mapping (`apply_pi_cli_fields`): Missing and
-    /// TooOld gate the row off with an actionable reason; Ok and Unknown are
+    /// `TooOld` gate the row off with an actionable reason; Ok and Unknown are
     /// permissive (Unknown logs a WARN instead of gating).
     #[test]
     fn pi_cli_fields_mapping_covers_all_gates() {

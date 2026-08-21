@@ -570,7 +570,7 @@ mod tests {
     /// `#!/usr/bin/env node` shebang resolves the sibling `node`. The stub
     /// execs a bare-named sibling that only resolves through that prepended
     /// directory (it exists nowhere on the inherited PATH) — before the fix
-    /// the spawn exited 127 and the probe reported NotAuthenticated.
+    /// the spawn exited 127 and the probe reported `NotAuthenticated`.
     #[cfg(unix)]
     #[tokio::test]
     async fn probe_child_path_carries_resolved_binary_dir() {
@@ -588,7 +588,7 @@ mod tests {
 
     /// monorepo#1863 regression: exit 127 is a command-resolution failure —
     /// the probe never ran the CLI's auth check — so it maps to Failed
-    /// (`authenticated: null` on the wire), never to NotAuthenticated. Pinned
+    /// (`authenticated: null` on the wire), never to `NotAuthenticated`. Pinned
     /// on both exit-code arms (generic and opencode).
     #[cfg(unix)]
     #[tokio::test]

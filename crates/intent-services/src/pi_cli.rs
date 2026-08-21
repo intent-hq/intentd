@@ -83,7 +83,7 @@ fn is_relative_with_separator(command: &str) -> bool {
 /// verdict (Missing / known-too-old) is a clear, user-facing error naming
 /// the found version, the requirement, and the pi-acp pin
 /// ([`intent_providers::pi_gate_reason`]); Unknown proceeds with a WARN
-/// (version_gate.rs policy). Pure over the status — unit-testable without a
+/// (`version_gate.rs` policy). Pure over the status — unit-testable without a
 /// real probe.
 pub(crate) fn check_pi_cli_for_spawn(status: &PiCliStatus) -> crate::Result<()> {
     if let Some(reason) = intent_providers::pi_gate_reason(&status.gate) {

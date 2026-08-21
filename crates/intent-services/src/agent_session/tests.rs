@@ -1,4 +1,4 @@
-//! Driver tests over a temp SQLite store + a mock ACP agent: a prompt turn
+//! Driver tests over a temp `SQLite` store + a mock ACP agent: a prompt turn
 //! accumulates chunks, publishes events in order with a single terminal
 //! `stream:end`, persists `acpSessionId`, and gates resume on the capability.
 
@@ -127,8 +127,8 @@ fn prompt_updates() -> Vec<String> {
 }
 
 /// A prompt turn that streams one text chunk, a `tool_call` (started), then a
-/// `tool_call_update` that completes it with output — exercises tool_use +
-/// tool_result block accumulation (CS-0 D6).
+/// `tool_call_update` that completes it with output — exercises `tool_use` +
+/// `tool_result` block accumulation (CS-0 D6).
 fn prompt_updates_with_tool_result() -> Vec<String> {
     let chunk = json!({
         "jsonrpc": "2.0",
@@ -4824,7 +4824,7 @@ fn surfaced_levels_filters_default_sentinel() {
 }
 
 /// Regression (PROTOCOL §5.5, Option C): a claude-code-shaped `configOptions`
-/// (thought_level select with default/low/medium/high/max) yields
+/// (`thought_level` select with default/low/medium/high/max) yields
 /// `effortLevels: ["low","medium","high","max"]` on the wire — persisted by
 /// `open_acp_session` itself, carried by the `AgentLite` projection, and
 /// announced by ONE `agent:updated`; the identical re-discovery on the next

@@ -33,7 +33,7 @@ impl Drop for TempDir {
     }
 }
 
-/// One in-process daemon stack: its own SQLite store, workspaces root, and
+/// One in-process daemon stack: its own `SQLite` store, workspaces root, and
 /// assets root — the same wiring the export/import unit suites use.
 async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
     let db = std::env::temp_dir().join(format!("roundtrip-test-{}.db", uuid::Uuid::new_v4()));

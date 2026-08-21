@@ -112,9 +112,9 @@ struct Msg {
 }
 
 /// Drop malformed persisted blocks before rendering (TS
-/// `sanitizeMessagesForHistory`): empty assistant turns, tool_results with
-/// missing/duplicate ids, empty non-error tool_results, and dangling tool_use
-/// blocks (STAB-108: tool_use without a corresponding tool_result causes
+/// `sanitizeMessagesForHistory`): empty assistant turns, `tool_results` with
+/// missing/duplicate ids, empty non-error `tool_results`, and dangling `tool_use`
+/// blocks (STAB-108: `tool_use` without a corresponding `tool_result` causes
 /// provider rejection on session resume).
 fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
     // First pass: collect valid tool_result IDs to identify dangling tool_use blocks.
@@ -219,7 +219,7 @@ fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
 }
 
 /// Render a message's content blocks into XML fragments (TS
-/// `renderContentBlocks`): text/thinking/tool_use/tool_result, each escaped and
+/// `renderContentBlocks`): `text/thinking/tool_use/tool_result`, each escaped and
 /// (for tool blocks) middle-truncated.
 fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
     let mut xml = String::new();

@@ -215,7 +215,7 @@ pub fn agent_token_tally(
 }
 
 /// Lightweight token tally from extracted usage data (finding F2: avoid full
-/// AgentSession hydration). Takes an agent_id, model, and the message content
+/// `AgentSession` hydration). Takes an `agent_id`, model, and the message content
 /// JSON list (usage metadata is embedded in each content block).
 pub(crate) fn agent_token_tally_from_contents(
     agent_id: &str,
