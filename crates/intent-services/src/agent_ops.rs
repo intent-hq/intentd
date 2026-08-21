@@ -6646,6 +6646,20 @@ impl Services {
                 "agent.delegate: force is not supported with tasks — occupied tasks classify as skipped (use the single-task form to force a second agent)".to_string(),
             ));
         }
+        // The top-level `provider` is the batch default shared by every entry
+        // that doesn't override it, so validate it up front — before the
+        // classification loop can start any task — rather than surfacing the
+        // same failure as N per-row `error` dispositions after earlier rows
+        // already spawned. Per-entry `provider` overrides stay per-row
+        // (`error` disposition), consistent with the other per-entry options.
+        if let Some(provider_param) = input.provider.as_deref() {
+            ensure_known_provider("agent.delegate", provider_param)?;
+            ensure_provider_available(
+                "agent.delegate",
+                provider_param,
+                &self.effective_settings().providers.paths,
+            )?;
+        }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a
         // rejection is one clear error before any child is created, not N

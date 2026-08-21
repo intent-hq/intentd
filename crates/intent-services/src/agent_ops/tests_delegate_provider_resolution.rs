@@ -22,7 +22,10 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentDelegateInput, WorkspaceId};
+use intent_core::{
+    AgentDelegateInput, BatchTaskEntry, BatchTaskOptions, NoteCreate, NoteId, WorkspaceApi,
+    WorkspaceId,
+};
 use intent_store::Store;
 use serde_json::json;
 use tempfile::TempDir;
@@ -543,5 +546,150 @@ async fn delegate_unavailable_explicit_provider_errors() {
     assert!(
         message.contains("mock"),
         "error names the unavailable provider: {message}"
+    );
+}
+
+// ── Batch form ──────────────────────────────────────────────────────────────
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some(format!("{title} body")),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    note.id
+}
+
+/// A bad TOP-LEVEL batch `provider` (the default shared by every entry that
+/// doesn't override it) is validated up front: the whole call rejects with
+/// `-32602` before the classification loop can start ANY task — never a
+/// partial batch where earlier rows spawned before a later row surfaced the
+/// same shared failure.
+#[tokio::test]
+async fn batch_delegate_bad_top_level_provider_rejects_before_any_start() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    // "mock" is known but unavailable (env gate off); also cover unknown.
+    let _env = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+
+    for provider in ["typo-provider", "mock"] {
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    tasks: Some(vec![
+                        BatchTaskEntry::Id(t1.clone()),
+                        BatchTaskEntry::Id(t2.clone()),
+                    ]),
+                    provider: Some(provider.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("bad top-level batch provider rejects the whole call");
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "up-front rejection is InvalidParams (-32602): {err}"
+        );
+        assert!(err.to_string().contains(provider), "{err}");
+    }
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(
+        agents.is_empty(),
+        "no task started before the up-front rejection: {agents:?}"
+    );
+}
+
+/// Batch `provider` semantics: an entry without an override inherits the
+/// top-level default (and starts on it), while a per-entry override beats it
+/// — and, being per-entry, a bad override surfaces as that row's `error`
+/// disposition without failing rows that already started (the documented
+/// non-transactional batch contract, same as `model`/`specialist`).
+#[tokio::test]
+async fn batch_delegate_provider_top_level_inherited_and_per_entry_override_wins() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let t1 = seed_task(&svc, &ws, "Inherits").await;
+    let t2 = seed_task(&svc, &ws, "Overrides").await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    BatchTaskEntry::Id(t1.clone()),
+                    BatchTaskEntry::Options(BatchTaskOptions {
+                        task_note_id: t2.clone(),
+                        specialist: None,
+                        model: None,
+                        // Deterministically invalid (unknown id) — proves
+                        // the override is applied to THIS row (the valid
+                        // top-level "mock" would have started it) and stays
+                        // a per-row error.
+                        provider: Some("typo-provider".into()),
+                        reasoning_effort: None,
+                        agent_instructions: None,
+                    }),
+                ]),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("valid top-level provider: the batch call itself succeeds");
+
+    let rows = resp["tasks"].as_array().expect("tasks array");
+    let row = |id: &NoteId| {
+        rows.iter()
+            .find(|r| r["taskNoteId"] == json!(id.0))
+            .unwrap_or_else(|| panic!("row for {} in {resp}", id.0))
+    };
+
+    let r1 = row(&t1);
+    assert_eq!(r1["disposition"], "started", "{resp}");
+    let agent_id = intent_core::AgentId::from(r1["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "entry without an override inherits the top-level batch provider"
+    );
+
+    let r2 = row(&t2);
+    assert_eq!(
+        r2["disposition"], "error",
+        "per-entry override beats the top-level default and fails per-row: {resp}"
+    );
+    assert!(
+        r2["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("typo-provider"),
+        "error row names the overriding provider: {resp}"
     );
 }
