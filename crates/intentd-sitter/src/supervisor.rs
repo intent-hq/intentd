@@ -21,11 +21,21 @@
 //!    child gracefully (SIGTERM + kill timeout on unix; terminate on
 //!    windows) and respawn the new version with the same args
 //! 5. unexpected child exit (non-zero or signal) → respawn the same version
-//!    forever with exponential backoff; clean exit 0 → sitter exits 0;
-//!    sitter-initiated stops never respawn. Only a `serve` invocation is
-//!    babysat this way: one-shot subcommands (`status`, `stop`, `doctor`,
-//!    `call`, …) legitimately exit non-zero, so they run exactly once and
-//!    their exit status passes through
+//!    with exponential backoff — but not forever:
+//!    [`SupervisorConfig::give_up_after_failures`] consecutive failed
+//!    starts, none of which stayed up for
+//!    [`SupervisorConfig::backoff_reset_after`] (spawn errors count too),
+//!    make the sitter log the failure prominently and exit **0**. Zero is
+//!    load-bearing: launchd's `KeepAlive`/`SuccessfulExit: false` and
+//!    systemd's `Restart=on-failure` both relaunch a non-zero exit, so only
+//!    a clean exit actually stops a daemon that can never start. Any start
+//!    that lasts `backoff_reset_after`, an installed update, and a SIGHUP
+//!    restart each clear the counter alongside the backoff, so healthy and
+//!    transiently-failing daemons are supervised exactly as before. Clean
+//!    exit 0 → sitter exits 0; sitter-initiated stops never respawn. Only a
+//!    `serve` invocation is babysat this way: one-shot subcommands
+//!    (`status`, `stop`, `doctor`, `call`, …) legitimately exit non-zero, so
+//!    they run exactly once and their exit status passes through
 //! 6. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
 //! 7. SIGHUP (unix only, sent by `intentd restart`) stops the child
@@ -79,6 +89,12 @@ pub const BACKOFF_CAP_ENV: &str = "INTENTD_SITTER_BACKOFF_CAP_MS";
 pub const BACKOFF_RESET_ENV: &str = "INTENTD_SITTER_BACKOFF_RESET_MS";
 pub const KILL_TIMEOUT_ENV: &str = "INTENTD_SITTER_KILL_TIMEOUT_MS";
 
+/// Test-only env override (a count, not milliseconds) for
+/// [`SupervisorConfig::give_up_after_failures`]. Production never sets it.
+/// `0` does not disable the give-up: the counter is checked after each
+/// failure, so `0` behaves like `1` — give up on the first failed start.
+pub const GIVE_UP_AFTER_ENV: &str = "INTENTD_SITTER_GIVE_UP_AFTER";
+
 /// Timing knobs for the supervisor loop. Injectable so tests never sleep
 /// for hours; production uses [`SupervisorConfig::default`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +109,10 @@ pub struct SupervisorConfig {
     pub backoff_cap: Duration,
     /// Child uptime after which the backoff resets to `backoff_initial`.
     pub backoff_reset_after: Duration,
+    /// Consecutive failed starts — none of which stayed up for
+    /// `backoff_reset_after` — after which the sitter gives up instead of
+    /// respawning forever. See [`Supervisor::report_give_up`].
+    pub give_up_after_failures: u32,
     /// How long a graceful stop waits before force-killing the child.
     pub kill_timeout: Duration,
 }
@@ -105,6 +125,17 @@ impl Default for SupervisorConfig {
             backoff_initial: Duration::from_secs(1),
             backoff_cap: Duration::from_secs(60),
             backoff_reset_after: Duration::from_secs(5 * 60),
+            // Ten consecutive failures. With the backoff above (1s doubling
+            // to a 60s cap) the tenth start lands ~4 minutes after the
+            // first, which outlasts every transient cause we have seen — a
+            // stale socket or lock left by a hard-killed daemon, a slow
+            // first-boot or resume-from-sleep disk, an upgrade swapping the
+            // binary underneath us — while still stopping a genuinely broken
+            // install fast enough to leave one readable diagnosis instead of
+            // an endless log. Any single start that survives
+            // `backoff_reset_after` clears the count, so a daemon that works
+            // at all can never trip it.
+            give_up_after_failures: 10,
             kill_timeout: Duration::from_secs(30),
         }
     }
@@ -143,6 +174,9 @@ impl SupervisorConfig {
         }
         if let Some(v) = ms(KILL_TIMEOUT_ENV) {
             config.kill_timeout = v;
+        }
+        if let Some(v) = get(GIVE_UP_AFTER_ENV).and_then(|v| v.parse::<u32>().ok()) {
+            config.give_up_after_failures = v;
         }
         config
     }
@@ -392,6 +426,9 @@ impl Supervisor {
             None
         };
         let mut backoff = self.config.backoff_initial;
+        // Failed starts since the last one that stayed up (see
+        // `give_up_after_failures`); reset wherever the backoff resets.
+        let mut failures: u32 = 0;
 
         loop {
             let binary = self.paths.daemon_binary(&current_version);
@@ -400,16 +437,27 @@ impl Supervisor {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(e) => {
-                    eprintln!("intentd-sitter: failed to spawn {}: {e}", binary.display());
+                    let what = format!("failed to spawn {}: {e}", binary.display());
                     if !supervised {
+                        eprintln!("intentd-sitter: {what}");
                         return 1;
                     }
+                    // A binary that cannot be spawned at all (missing,
+                    // truncated, wrong arch) is as permanent as one that
+                    // starts and dies, so it feeds the same counter.
+                    failures += 1;
+                    if failures >= self.config.give_up_after_failures {
+                        self.report_give_up(&what, failures);
+                        return 0;
+                    }
+                    eprintln!("intentd-sitter: {what}");
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
                         BackoffOutcome::Shutdown(code) => return code,
                         #[cfg(unix)]
                         BackoffOutcome::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
                             backoff = self.config.backoff_initial;
+                            failures = 0;
                             continue;
                         }
                         BackoffOutcome::Elapsed => continue,
@@ -422,11 +470,11 @@ impl Supervisor {
             loop {
                 tokio::select! {
                     status = child.wait() => {
-                        match status {
+                        let what = match status {
                             Ok(status) if status.success() => return 0,
                             Ok(status) if !supervised => return exit_code(status),
-                            Ok(status) => eprintln!(
-                                "intentd-sitter: intentd {current_version} exited unexpectedly ({}); respawning",
+                            Ok(status) => format!(
+                                "intentd {current_version} exited unexpectedly ({})",
                                 describe_exit(status)
                             ),
                             Err(e) if !supervised => {
@@ -435,19 +483,31 @@ impl Supervisor {
                                 );
                                 return 1;
                             }
-                            Err(e) => eprintln!(
-                                "intentd-sitter: failed waiting on intentd {current_version}: {e}; respawning"
+                            Err(e) => format!(
+                                "failed waiting on intentd {current_version}: {e}"
                             ),
-                        }
+                        };
+                        // A start that lasted `backoff_reset_after` counts as
+                        // a real serve: it clears both the backoff and the
+                        // give-up counter, so a daemon that crashes only
+                        // occasionally keeps being respawned forever.
                         if spawned_at.elapsed() >= self.config.backoff_reset_after {
                             backoff = self.config.backoff_initial;
+                            failures = 0;
                         }
+                        failures += 1;
+                        if failures >= self.config.give_up_after_failures {
+                            self.report_give_up(&what, failures);
+                            return 0;
+                        }
+                        eprintln!("intentd-sitter: {what}; respawning");
                         match self.backoff_sleep(&mut backoff, &mut signals).await {
                             BackoffOutcome::Shutdown(code) => return code,
                             #[cfg(unix)]
                             BackoffOutcome::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
+                                failures = 0;
                             }
                             BackoffOutcome::Elapsed => {}
                         }
@@ -464,6 +524,7 @@ impl Supervisor {
                                 self.graceful_stop(&mut child).await;
                                 current_version = version;
                                 backoff = self.config.backoff_initial;
+                                failures = 0;
                                 break; // respawn the new version
                             }
                             Ok(UpdateOutcome::AlreadyCurrent { .. }) => {}
@@ -493,6 +554,7 @@ impl Supervisor {
                                 self.graceful_stop(&mut child).await;
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
+                                failures = 0;
                                 break; // respawn (possibly a new version)
                             }
                             SignalEvent::Shutdown(signal) => signal,
@@ -561,6 +623,37 @@ impl Supervisor {
                  respawning intentd {current_version}"
             ),
         }
+    }
+
+    /// Report a permanently failing daemon on the way out of serve mode.
+    ///
+    /// The caller must `return 0` right after: launchd (`KeepAlive` with
+    /// `SuccessfulExit: false`) and systemd (`Restart=on-failure`) both
+    /// relaunch a non-zero exit, so giving up with a failure status would
+    /// only move the respawn loop one level up. A clean exit is what makes
+    /// the service stay down until a human fixes the cause.
+    ///
+    /// The daemon inherits the sitter's stdio, so its own error message is
+    /// already in the same log directly above this banner — point at it
+    /// rather than trying to guess the cause.
+    fn report_give_up(&self, what: &str, failures: u32) {
+        eprintln!("intentd-sitter: {what}");
+        eprintln!(
+            "intentd-sitter: intentd failed {failures} times in a row without ever staying up \
+             for {:?}; this looks permanent, not transient, so the sitter is giving up instead \
+             of respawning it forever",
+            self.config.backoff_reset_after
+        );
+        eprintln!(
+            "intentd-sitter: the daemon's own error is logged above — read it first. A common \
+             cause is a data dir written by a newer intentd (downgrades are unsupported): \
+             install the newer version again, or point INTENTD_DATA_DIR at a different dir"
+        );
+        eprintln!(
+            "intentd-sitter: exiting 0 so the service manager leaves it stopped; once the cause \
+             is fixed, start it again (`intentd serve`, `brew services start intentd`, or \
+             `systemctl --user restart intentd`)"
+        );
     }
 
     /// Sleep the current backoff delay (doubling it, capped, for next
@@ -737,6 +830,7 @@ mod tests {
         assert_eq!(config.backoff_initial, Duration::from_secs(1));
         assert_eq!(config.backoff_cap, Duration::from_secs(60));
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
+        assert_eq!(config.give_up_after_failures, 10);
         assert_eq!(config.kill_timeout, Duration::from_secs(30));
     }
 
@@ -748,6 +842,7 @@ mod tests {
             BACKOFF_INITIAL_ENV => Some("not a number".to_string()),
             BACKOFF_CAP_ENV => Some(String::new()),
             KILL_TIMEOUT_ENV => Some("5000".to_string()),
+            GIVE_UP_AFTER_ENV => Some("3".to_string()),
             _ => None,
         });
         assert_eq!(config.check_min, Duration::from_millis(100));
@@ -755,6 +850,7 @@ mod tests {
         assert_eq!(config.backoff_initial, Duration::from_secs(1));
         assert_eq!(config.backoff_cap, Duration::from_secs(60));
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
+        assert_eq!(config.give_up_after_failures, 3);
         assert_eq!(config.kill_timeout, Duration::from_millis(5000));
     }
 
