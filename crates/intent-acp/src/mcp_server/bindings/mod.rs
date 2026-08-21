@@ -53,6 +53,7 @@ pub fn prelude() -> String {
 /// omitted entirely, so agent code touching them fails with a clear
 /// `ws.<ns> is undefined` `TypeError`. With every toggle on — the default —
 /// nothing is omitted.
+#[cfg(test)]
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     prelude_for_bridge(features, false)
 }
@@ -76,9 +77,10 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
         features
     };
     let pr = pr::prelude_for(features);
+    let workspace = workspace::prelude_for(is_sub_agent);
     let mut fragments: Vec<&str> = vec![
         help::PRELUDE,
-        workspace::PRELUDE,
+        workspace.as_str(),
         note::PRELUDE,
         task::PRELUDE,
         comment::PRELUDE,

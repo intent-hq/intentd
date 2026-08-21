@@ -49,6 +49,7 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// MIME type the FE renders as `QuestionCards` (PROTOCOL §7.x question resource).
 const QUESTION_MIME: &str = "application/vnd.intent.question+json";
+const PROPOSAL_MIME: &str = "application/vnd.intent.proposal+json";
 
 /// Turn-1 trigger marker: the mock's `rules` entry matches on this, so the
 /// tool-calling behavior fires ONLY on the first user turn (the flattened
@@ -310,7 +311,7 @@ fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
 
 /// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace —
 /// the daemon opens the same data dir on launch.
-async fn seed_workspace_only(data_dir: &Path) -> String {
+async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
     };
@@ -336,9 +337,9 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             last_activity: None,
             tags: vec![],
             path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
+            repository_path: repository_path.map(|path| path.to_string_lossy().into_owned()),
+            repository_owner: repository_path.map(|_| "intent-hq".to_string()),
+            repository_name: repository_path.map(|_| "intentd".to_string()),
             worktree_path: None,
             scope: None,
             skip_worktree: false,
@@ -412,7 +413,7 @@ async fn question_ask_round_trip_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
+    let ws_id = seed_workspace_only(&data_dir, None).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     // Two workspace_api invocations, ONE ws.app.question.ask per call — the
@@ -676,6 +677,160 @@ async fn question_ask_round_trip_over_wss() {
     );
 }
 
+#[tokio::test]
+async fn workspace_sibling_proposal_round_trip_over_wss() {
+    let Some(script) = gate("WSS workspace.proposeSibling E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let repo_path = data_dir.join("source-repository");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repo_path)
+        .status()
+        .expect("run git init")
+        .success());
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com")] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config")
+            .success());
+    }
+    std::fs::write(repo_path.join("README.md"), "WSS proposal test\n").unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["add", "README.md"])
+        .status()
+        .expect("run git add")
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["commit", "-m", "initial"])
+        .status()
+        .expect("run git commit")
+        .success());
+
+    let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
+    let marker = "PROPOSE_SIBLING_NOW_E2E";
+    let proposal_code = r#"return await ws.workspace.proposeSibling({
+        title: "Focused follow-up",
+        initialPrompt: "Implement only the focused follow-up and run its tests.",
+        specialist: "implementor"
+    });"#;
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": {
+                    "code": proposal_code,
+                    "summary": "propose focused sibling workspace"
+                }
+            },
+            "response": "I prepared the focused follow-up workspace proposal.",
+            "emitToolBlocks": true
+        }],
+        "response": "plain response"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SiblingProposer", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": marker }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+    await_stream_end(&mut sub, &agent_id).await;
+
+    let conversation = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conversation["messages"].as_array().unwrap();
+    let block = messages
+        .iter()
+        .flat_map(|message| message["contentBlocks"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "resource" && block["resource"]["mimeType"] == PROPOSAL_MIME)
+        .unwrap_or_else(|| panic!("persisted proposal resource: {conversation:#}"));
+    assert!(messages.iter().any(|message| {
+        message["contentBlocks"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "tool_result"
+                    && block["output"].as_array().is_some_and(|output| {
+                        output
+                            .iter()
+                            .any(|item| item["resource"]["mimeType"] == PROPOSAL_MIME)
+                    })
+            })
+        })
+    }));
+    let proposal: Value =
+        serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(proposal["kind"], "workspace-create");
+    assert_eq!(proposal["preview"]["workspaceCreate"]["mode"], "sibling");
+    assert_eq!(
+        proposal["preview"]["workspaceCreate"]["title"],
+        "Focused follow-up"
+    );
+    assert_eq!(proposal["preview"]["workspaceCreate"]["branch"], "main");
+    assert_eq!(
+        proposal["payload"]["params"]["repositoryPath"],
+        repo_path.to_string_lossy().as_ref()
+    );
+    assert!(proposal["payload"]["params"]["idempotencyKey"]
+        .as_str()
+        .unwrap()
+        .starts_with("sibling-workspace-"));
+}
+
 // ---------------------------------------------------------------------------
 // Sub-agent gate: per-agent MCP bridge client (parse the generated
 // `intentd-mcp-*.json` and speak newline-delimited JSON-RPC to the loopback
@@ -821,7 +976,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
+    let ws_id = seed_workspace_only(&data_dir, None).await;
     let behavior = json!({ "response": "done" }).to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
