@@ -7638,11 +7638,17 @@ impl Services {
             })
             .collect();
 
+        // Batched status projection (intent-hq/monorepo#3018): one `IN`-list
+        // query for every present agent's status, instead of a per-agent
+        // `get_agent_session` loop that hydrated each agent's full message
+        // log just to read `status` — that made the dispatch duration scale
+        // with the watched agents' transcript sizes (the monorepo#958
+        // incident shape) and its statement count with the watch fan-out.
         let mut agent_statuses = serde_json::Map::new();
-        for id in &present {
-            if let Ok(session) = self.store.get_agent_session(id).await {
-                if let Some(word) = agent_status_wire(session.status) {
-                    agent_statuses.insert(id.0.clone(), json!(word));
+        if let Ok(statuses) = self.store.get_agent_statuses(&present).await {
+            for (id, status) in statuses {
+                if let Some(word) = agent_status_wire(status) {
+                    agent_statuses.insert(id.0, json!(word));
                 }
             }
         }
