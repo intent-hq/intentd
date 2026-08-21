@@ -6806,11 +6806,21 @@ fn specialist_preview_provider(
 /// so the preview matches what a no-model create would actually pin. Both
 /// fields are omitted when resolution yields the provider CLI default
 /// (clients render "Provider default").
+///
+/// `provider` is the caller/settings context from
+/// [`specialist_preview_provider`]; `None` (no `provider` param, no
+/// settings-derived default — monorepo#3044) falls back to the specialist's
+/// OWN provider pin (frontmatter `codingAgent`, or a compound `model`
+/// prefix, via [`agent_ops::resolve_delegate_provider_preview`]) — the
+/// provider a no-model `agent.delegate` would actually spawn on — so a
+/// pinned specialist never previews "Provider default" while creation would
+/// pin a concrete provider. A specialist with no pin of its own stays
+/// undecorated.
 fn decorate_specialist_resolved(
     services: &Services,
     def: &mut serde_json::Value,
     workspace_path: Option<&Path>,
-    provider: &str,
+    provider: Option<&str>,
 ) {
     let Some(id) = def
         .get("id")
@@ -6818,6 +6828,17 @@ fn decorate_specialist_resolved(
         .map(str::to_string)
     else {
         return;
+    };
+    let own;
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            own = agent_ops::resolve_delegate_provider_preview(services, Some(&id), workspace_path);
+            match own.as_deref() {
+                Some(p) => p,
+                None => return,
+            }
+        }
     };
     let Some(model) =
         agent_ops::resolve_agent_default_model(services, Some(&id), workspace_path, Some(provider))
@@ -11485,14 +11506,12 @@ impl WorkspaceApi for Services {
             let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().list(ws_path)?;
-            if let (Some(provider), Some(specs)) = (
-                provider.as_deref(),
-                result
-                    .get_mut("specialists")
-                    .and_then(serde_json::Value::as_array_mut),
-            ) {
+            if let Some(specs) = result
+                .get_mut("specialists")
+                .and_then(serde_json::Value::as_array_mut)
+            {
                 for def in specs {
-                    decorate_specialist_resolved(self, def, ws_path, provider);
+                    decorate_specialist_resolved(self, def, ws_path, provider.as_deref());
                 }
             }
             Ok(result)
@@ -11509,9 +11528,8 @@ impl WorkspaceApi for Services {
             let provider = specialist_preview_provider(self, provider)?;
             let ws_path = workspace_path.as_deref().map(Path::new);
             let mut result = self.specialists_service().get(&id, ws_path)?;
-            if let (Some(provider), Some(def)) = (provider.as_deref(), result.get_mut("specialist"))
-            {
-                decorate_specialist_resolved(self, def, ws_path, provider);
+            if let Some(def) = result.get_mut("specialist") {
+                decorate_specialist_resolved(self, def, ws_path, provider.as_deref());
             }
             Ok(result)
         })
