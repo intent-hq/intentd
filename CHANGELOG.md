@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.27] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- Make dev-env intent-services tests hermetic and macOS-safe ([#1355](https://github.com/intent-hq/intentd/pull/1355))
+- *(acp)* Truncate oversized workspace_api output inline when file redirect fails ([#1354](https://github.com/intent-hq/intentd/pull/1354))
+- Preserve structured browser.exec action-result errors on the agent surface ([#1363](https://github.com/intent-hq/intentd/pull/1363))
+- Batch agent.getSubscriptions status reads into one IN-list query ([#1357](https://github.com/intent-hq/intentd/pull/1357))
+- Emit agent:process:evicted with reason idle-ttl from the TTL idle sweep ([#1356](https://github.com/intent-hq/intentd/pull/1356))
+- Stop serving tokenUsage on workspace.list rows and agentSummary on archived rows ([#1359](https://github.com/intent-hq/intentd/pull/1359))
+
+### 📚 Documentation
+
+- Document hidden-by-default tabs, showTab action, and listTabs visibility ([#1358](https://github.com/intent-hq/intentd/pull/1358))
+- Workspace-inactive semantics for showTab/focusTab/openTab ([#1362](https://github.com/intent-hq/intentd/pull/1362))
+
+
 ## [0.7.26] - 2026-08-20
 
 ### ⚙️ Miscellaneous Tasks
