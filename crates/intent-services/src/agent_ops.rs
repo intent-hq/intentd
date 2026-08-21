@@ -875,7 +875,7 @@ fn strip_group_tags(s: &str) -> String {
                 continue;
             }
         }
-        out.push_str(&rest[..i + 1]);
+        out.push_str(&rest[..=i]);
         rest = &rest[i + 1..];
     }
     out.push_str(rest);
@@ -3541,7 +3541,7 @@ impl Services {
             }
         }
         let mut mutated_only_name = obj.contains_key("name");
-        for (key, value) in obj.iter() {
+        for (key, value) in &obj {
             if key != "name" {
                 mutated_only_name = false;
             }
@@ -3688,7 +3688,7 @@ impl Services {
         };
         let mut event_data = serde_json::Map::new();
         event_data.insert("agentId".into(), json!(agent_id.0));
-        for (k, v) in obj.iter() {
+        for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
         }
         self.publish_agent_mutation_event(
@@ -4377,8 +4377,7 @@ impl Services {
         if let Some(ref id) = message_id {
             if id.len() > MAX_MESSAGE_ID_LEN {
                 return Err(Error::InvalidParams(format!(
-                    "messageId exceeds maximum length of {} bytes",
-                    MAX_MESSAGE_ID_LEN
+                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
                 )));
             }
         }
@@ -7842,7 +7841,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map_or(0, |q| q.len());
+            .map_or(0, std::vec::Vec::len);
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
         // Delegated children not yet settled: one aggregate statement over
         // the `parent_agent_id` index, unscoped by workspace so a Chief
@@ -10858,7 +10857,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let mut file_rows: Vec<Vec<Value>> = Vec::new();
     for m in messages.iter().rev() {
         match m.role.as_str() {
-            "system" => continue,
+            "system" => {}
             "assistant" => {
                 let interrupted = m
                     .metadata
@@ -10926,7 +10925,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let file_blocks: Vec<Value> = file_rows.into_iter().flatten().collect();
     let elided = segments.len().saturating_sub(RESUME_RECAP_MAX_SEGMENTS);
     if elided > 0 {
-        segments.drain(1..1 + elided);
+        segments.drain(1..=elided);
     }
     let has_partial = segments
         .iter()

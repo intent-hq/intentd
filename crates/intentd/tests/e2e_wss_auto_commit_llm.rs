@@ -241,7 +241,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -265,7 +265,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -515,13 +515,18 @@ async fn auto_commit_uses_generated_message_over_wss() {
     );
 
     // Print daemon logs on failure for debugging
-    if commits["items"].as_array().map(|a| a.len()).unwrap_or(0) < 2 {
+    if commits["items"]
+        .as_array()
+        .map(std::vec::Vec::len)
+        .unwrap_or(0)
+        < 2
+    {
         eprintln!("\n=== DAEMON LOGS (last 200 lines) ===");
         if let Ok(logs) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             let lines: Vec<&str> = logs.lines().collect();
             let start = lines.len().saturating_sub(200);
             for line in &lines[start..] {
-                eprintln!("{}", line);
+                eprintln!("{line}");
             }
         }
         eprintln!("===================\n");

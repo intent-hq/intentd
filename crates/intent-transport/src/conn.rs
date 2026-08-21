@@ -386,7 +386,7 @@ pub(crate) async fn process_frame(
                         let _ = out.send_priority(frame).await;
                     }
                 })
-                .await
+                .await;
             });
             return true;
         }
@@ -415,7 +415,7 @@ pub(crate) async fn process_frame(
                         let _ = out.send_priority(frame).await;
                     }
                 })
-                .await
+                .await;
             });
             return true;
         }
@@ -523,7 +523,7 @@ pub(crate) async fn process_frame(
                 let _ = out_tx.send_priority(response).await;
             }
         })
-        .await
+        .await;
     });
     true
 }
@@ -1081,7 +1081,7 @@ async fn forward_chat_subscription(
             },
             // A pending recovery with a quiet bus: retry on a timer so the
             // client is not left stale until the next event happens to arrive.
-            _ = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
+            () = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
                 if !attempt_chat_recovery(
                     api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
                     &mut seq, &out_tx, &mut state, &mut pending_recovery,

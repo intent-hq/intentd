@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::opt_bool;
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.settings = {
@@ -21,7 +21,7 @@ pub(crate) const PRELUDE: &str = r#"
         get: (path) => host({ method: 'app.settings.get', args: { path } }),
         propose: (input) => host({ method: 'app.settings.propose', args: input }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -143,7 +143,7 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 
     // RFC3986 percent-encode the id portion for URI path segment use
     let encoded_id = super::proposal::percent_encode_path_segment(id);
-    format!("intent-proposal://{}/{}", kind, encoded_id)
+    format!("intent-proposal://{kind}/{encoded_id}")
 }
 
 /// Return a proposal with dual text+resource content items.
@@ -206,7 +206,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             .ok_or_else(|| "Each change must have a 'path' field".to_string())?;
 
         if change.get("value").is_none() {
-            return Err(format!("Change for '{}' must have a 'value' field", path));
+            return Err(format!("Change for '{path}' must have a 'value' field"));
         }
 
         // Get setting definition to validate
@@ -214,8 +214,8 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             .settings_get(path.to_string())
             .await
             .map_err(|e| match e {
-                intent_core::Error::NotFound(_) => format!("Unknown app setting path: {}", path),
-                _ => format!("settings.get failed: {}", e),
+                intent_core::Error::NotFound(_) => format!("Unknown app setting path: {path}"),
+                _ => format!("settings.get failed: {e}"),
             })?;
 
         let definition = setting_result
@@ -225,8 +225,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         // Check if setting is sensitive
         if definition.get("sensitive") == Some(&json!(true)) {
             return Err(format!(
-                "Invalid app setting change: {} setting is sensitive and cannot be changed via MCP proposals",
-                path
+                "Invalid app setting change: {path} setting is sensitive and cannot be changed via MCP proposals"
             ));
         }
 
@@ -261,11 +260,11 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             let new_value = change.get("value").unwrap();
             let value_str = new_value
                 .as_str()
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_else(|| serde_json::to_string(new_value).unwrap());
             let before_str = current_value
                 .as_ref()
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .and_then(|v| v.as_str().map(std::string::ToString::to_string))
                 .or_else(|| {
                     current_value
                         .as_ref()
@@ -298,7 +297,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             .unwrap_or("Setting");
         let value_str = format!("{}", validated_changes[0].0.get("value").unwrap());
         (
-            format!("{}: {}", label, value_str),
+            format!("{label}: {value_str}"),
             format!("Switch the {} to {}.", label.to_lowercase(), value_str),
         )
     } else {
@@ -395,8 +394,7 @@ mod tests {
                         }
                     })),
                     _ => Err(intent_core::Error::NotFound(format!(
-                        "Setting not found: {}",
-                        path
+                        "Setting not found: {path}"
                     ))),
                 }
             })

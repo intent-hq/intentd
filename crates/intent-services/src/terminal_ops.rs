@@ -484,12 +484,12 @@ pub(crate) fn spawn_output_stream(
             tokio::select! {
                 recv = live.recv() => match recv {
                     Ok(chunk) => emit_data(&bus, &workspace_id, &terminal_id, &chunk),
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
                     Err(RecvError::Closed) => break,
                 },
-                _ = tokio::time::sleep(EXIT_POLL) => {
+                () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
@@ -515,7 +515,7 @@ fn drain_pending(
     loop {
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
-            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
         }
     }

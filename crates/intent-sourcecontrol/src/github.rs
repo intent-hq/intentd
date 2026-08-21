@@ -517,7 +517,7 @@ fn encode_path_segments(path: &str) -> String {
     for byte in path.bytes() {
         match byte {
             b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
+                out.push(byte as char);
             }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
@@ -698,7 +698,7 @@ mod dto {
     }
 }
 
-const REVIEW_DECISION_QUERY: &str = r#"
+const REVIEW_DECISION_QUERY: &str = r"
 query GetReviewDecision($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
@@ -706,7 +706,7 @@ query GetReviewDecision($owner: String!, $repo: String!, $prNumber: Int!) {
     }
   }
 }
-"#;
+";
 
 /// Map the GraphQL `reviewDecision` payload to [`ReviewDecision`]. GitHub
 /// reports `null` when the base branch has no review requirement; that (or
@@ -729,7 +729,7 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
 /// probe, and a monitor diffing two truncated pages can report phantom
 /// "check removed" lines for whatever fell off. Paginating `contexts` is the
 /// complete fix if that ceiling is ever hit in practice.
-const MERGE_REQUIREMENTS_QUERY: &str = r#"
+const MERGE_REQUIREMENTS_QUERY: &str = r"
 query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
@@ -765,7 +765,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
     }
   }
 }
-"#;
+";
 
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
 /// commit on the PR is its head).
@@ -885,7 +885,7 @@ fn map_branch_rules(value: &Value) -> BranchRules {
     rules
 }
 
-const REVIEW_THREADS_QUERY: &str = r#"
+const REVIEW_THREADS_QUERY: &str = r"
 query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
@@ -902,7 +902,7 @@ query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first:
     }
   }
 }
-"#;
+";
 
 #[async_trait]
 impl SourceControl for GitHubSourceControl {
@@ -2119,14 +2119,14 @@ mod tests {
     fn maps_user_identity_and_omits_credentials() {
         let u = map_user_identity(json!({
             "login": "octocat",
-            "id": 583231,
+            "id": 583_231,
             "name": "The Octocat",
             "avatar_url": "https://avatars.githubusercontent.com/u/583231",
             "html_url": "https://github.com/octocat"
         }))
         .unwrap();
         assert_eq!(u.login, "octocat");
-        assert_eq!(u.id, Some(583231));
+        assert_eq!(u.id, Some(583_231));
         let wire = serde_json::to_value(&u).unwrap();
         assert_eq!(wire["login"], "octocat");
         assert_eq!(

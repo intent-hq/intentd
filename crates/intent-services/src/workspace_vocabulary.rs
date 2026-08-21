@@ -87,7 +87,7 @@ pub(crate) async fn resolve_max_terms(store: &Store) -> usize {
 /// or malformed degrades to [`DEFAULT_MAX_TERMS`] — never an error.
 pub(crate) fn parse_max_terms_value(value: Option<&serde_json::Value>) -> usize {
     value
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .filter(|n| n.is_finite() && *n >= 0.0)
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_MAX_TERMS)

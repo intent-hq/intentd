@@ -608,12 +608,10 @@ mod build_command_tests {
         // The parent dir should be first in the PATH
         let parent_dir = resolved_path.parent().unwrap().display().to_string();
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let expected_prefix = format!("{}{}", parent_dir, sep);
+        let expected_prefix = format!("{parent_dir}{sep}");
         assert!(
             path_value.starts_with(&expected_prefix),
-            "PATH should start with {}, got: {}",
-            expected_prefix,
-            path_value
+            "PATH should start with {expected_prefix}, got: {path_value}"
         );
     }
 
@@ -712,12 +710,10 @@ mod build_command_tests {
         let path_value = env_path.unwrap().1.unwrap().to_string_lossy();
         let parent_dir = npx_path.parent().unwrap().display().to_string();
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let expected_prefix = format!("{}{}", parent_dir, sep);
+        let expected_prefix = format!("{parent_dir}{sep}");
         assert!(
             path_value.starts_with(&expected_prefix),
-            "PATH should start with {} so npx can find node, got: {}",
-            expected_prefix,
-            path_value
+            "PATH should start with {expected_prefix} so npx can find node, got: {path_value}"
         );
     }
 

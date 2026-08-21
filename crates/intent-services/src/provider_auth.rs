@@ -283,7 +283,7 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
 /// primary (only unsloth remaps, and unsloth is not probe-able).
 fn override_key(provider_id: &'static str) -> &'static str {
     intent_providers::find_provider(provider_id)
-        .map(|cfg| cfg.primary_binary_provider_id())
+        .map(intent_providers::ProviderConfig::primary_binary_provider_id)
         .unwrap_or(provider_id)
 }
 
@@ -331,7 +331,7 @@ fn resolve_probe_binary(
             if let Some(p) = override_path.and_then(resolve_auggie_override) {
                 return Some(p.into_os_string());
             }
-            return crate::auggie_discovery::find_auggie().map(|p| p.into_os_string());
+            return crate::auggie_discovery::find_auggie().map(std::path::PathBuf::into_os_string);
         }
         "claude-code" => "claude",
         "codex" => "codex",
@@ -348,7 +348,7 @@ fn resolve_probe_binary(
         command,
         override_path.filter(|_| override_applies),
     )
-    .map(|p| p.into_os_string())
+    .map(std::path::PathBuf::into_os_string)
 }
 
 /// Per-provider auth-status cache: last outcome + fetch instant, plus a

@@ -1054,7 +1054,9 @@ async fn rollback_materialized_attachments(created: &[PathBuf]) {
 /// JSON row (not this struct) is what lands in the store.
 fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value) -> Workspace {
     let s = |key: &str| -> Option<String> {
-        row.get(key).and_then(|v| v.as_str()).map(|v| v.to_string())
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .map(std::string::ToString::to_string)
     };
     let now = now_iso();
     Workspace {

@@ -214,7 +214,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -251,7 +251,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -294,7 +294,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             None | Some(Err(_)) => return None,
         }
     }
@@ -411,7 +411,7 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         .as_array()
         .and_then(|arr| arr.iter().find(|w| w["id"] == ws_id))
         .and_then(|w| w["lastActivity"].as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     // Second subscription on `agent:*`: turn completion is observed via
     // `agent:stream:end`, which a `workspace:*` subscription never receives.
@@ -497,9 +497,7 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         let new_dt = DateTime::parse_from_rfc3339(new_activity).expect("parse new lastActivity");
         assert!(
             new_dt > init_dt,
-            "lastActivity did not advance: {} -> {}",
-            init,
-            new_activity
+            "lastActivity did not advance: {init} -> {new_activity}"
         );
     }
 
@@ -546,7 +544,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

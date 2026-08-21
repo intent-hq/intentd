@@ -117,7 +117,7 @@ async fn event_bindings_query_and_subscribe() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -134,12 +134,12 @@ async fn event_bindings_query_and_subscribe() {
         ..*intent_providers::find_provider("mock").unwrap()
     };
 
-    let js = r#"
+    let js = r"
         const events = await ws.event.query({ eventType: 'note:created', limit: 10 });
         const sub = await ws.event.subscribe(['note:*'], { excludeSelf: true });
         await ws.event.unsubscribe(sub.subscriptionId);
         return { events: events };
-    "#;
+    ";
 
     let behavior = serde_json::json!({
         "toolCall": {
@@ -231,7 +231,7 @@ async fn file_bindings_read_write_list() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -248,7 +248,7 @@ async fn file_bindings_read_write_list() {
         ..*intent_providers::find_provider("mock").unwrap()
     };
 
-    let js = r#"
+    let js = r"
         const content = await ws.file.read('existing.txt');
         await ws.file.write('new.txt', 'new file content');
         await ws.file.mkdir('subdir');
@@ -258,7 +258,7 @@ async fn file_bindings_read_write_list() {
         await ws.file.write('pkg/nested/b.txt', 'bbb');
         await ws.file.rename('pkg', 'moved');
         return { content: content, files: files };
-    "#;
+    ";
 
     let behavior = serde_json::json!({
         "toolCall": {
@@ -322,8 +322,7 @@ async fn file_bindings_read_write_list() {
     );
     assert!(
         actual_ws_root.join("renamed.txt").exists(),
-        "renamed.txt should exist in {:?}",
-        actual_ws_root
+        "renamed.txt should exist in {actual_ws_root:?}"
     );
     let renamed_content =
         std::fs::read_to_string(actual_ws_root.join("renamed.txt")).expect("read renamed.txt");
@@ -396,7 +395,7 @@ async fn agent_bindings_list_and_status() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -415,11 +414,11 @@ async fn agent_bindings_list_and_status() {
 
     // List agents and get status
     let js = format!(
-        r#"
+        r"
         const agents = await ws.agent.list(false);
         const status = await ws.agent.status('{}');
         return {{ agents: agents, status: status }};
-        "#,
+        ",
         agent_id.0
     );
 
@@ -524,7 +523,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create caller");
@@ -537,7 +536,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create target");
@@ -623,7 +622,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
     };
 
     let js = format!(
-        r#"
+        r"
         const target = '{}';
         const out = {{}};
         out.queue = await ws.agent.getQueue(target);
@@ -636,7 +635,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
             out.removeForeignError = error.message;
         }}
         return out;
-        "#,
+        ",
         target_id.0
     );
 
@@ -826,7 +825,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create caller");
@@ -839,7 +838,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create target");
@@ -953,7 +952,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     };
 
     let js = format!(
-        r#"
+        r"
         const target = '{}';
         const out = {{}};
         out.first = await ws.agent.send(target, 'first: please review the diff');
@@ -963,7 +962,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
         out.removed = await ws.agent.removeQueuedMessage(target, out.first.queuedMessage.id);
         out.resend = await ws.agent.send(target, 'combined: review diff AND check tests');
         return out;
-        "#,
+        ",
         target_id.0, task_note.id.0
     );
 
@@ -1217,7 +1216,7 @@ async fn git_bindings_commit() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -1234,10 +1233,10 @@ async fn git_bindings_commit() {
         ..*intent_providers::find_provider("mock").unwrap()
     };
 
-    let js = r#"
+    let js = r"
         const committed = await ws.git.commit('test commit', { files: ['test.txt'], userRequested: true });
         return { committed: committed };
-    "#;
+    ";
 
     let behavior = serde_json::json!({
         "toolCall": {
@@ -1366,7 +1365,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -1385,11 +1384,11 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
 
     // The agent writes its own file, then agent-commits with no `files` list:
     // the fallback must pick up only the attributed write.
-    let js = r#"
+    let js = r"
         await ws.file.write('agent-file.txt', 'agent content\n');
         const committed = await ws.git.commit('agent scoped commit');
         return { committed: committed };
-    "#;
+    ";
 
     let behavior = serde_json::json!({
         "toolCall": {
@@ -1532,7 +1531,7 @@ async fn note_bindings_edit_and_edit_lines() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -1550,12 +1549,12 @@ async fn note_bindings_edit_and_edit_lines() {
     };
 
     let js = format!(
-        r#"
+        r"
         await ws.note.edit('{}', {{ old: 'Line 2 original', new: 'Line 2 edited' }});
         await ws.note.editLines('{}', {{ start: 4, end: 4, content: 'Line 4 edited' }});
         const updated = await ws.note.read('{}');
         return {{ content: updated.content }};
-        "#,
+        ",
         note.id.0, note.id.0, note.id.0
     );
 

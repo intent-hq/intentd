@@ -138,7 +138,10 @@ where
             rx
         }
     };
-    let published = flight.wait_for(|o| o.is_some()).await.map(|o| o.clone());
+    let published = flight
+        .wait_for(std::option::Option::is_some)
+        .await
+        .map(|o| o.clone());
     let outcome = match published {
         Ok(published) => published.expect("guarded by wait_for"),
         // The driver vanished without publishing (panic). Evict the dead

@@ -74,7 +74,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("server.rs", "server."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
-            .unwrap_or_else(|_| panic!("Failed to read {} at test time", filename));
+            .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
         for line in source.lines() {
             let trimmed = line.trim();
             // Skip comments
@@ -142,7 +142,10 @@ const EXPECTED_REVERSE_METHODS: usize = 4;
 #[test]
 fn router_methods_match_actual_source() {
     let actual = extract_router_methods();
-    let catalog: HashSet<String> = ROUTER_METHODS.iter().map(|s| s.to_string()).collect();
+    let catalog: HashSet<String> = ROUTER_METHODS
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     // Combine catalog + aliases for comparison
     let mut expected = catalog.clone();
@@ -151,10 +154,16 @@ fn router_methods_match_actual_source() {
     }
 
     // Find methods in router.rs but not in catalog
-    let missing: Vec<_> = actual.difference(&expected).map(|s| s.as_str()).collect();
+    let missing: Vec<_> = actual
+        .difference(&expected)
+        .map(std::string::String::as_str)
+        .collect();
 
     // Find methods in catalog but not in router.rs
-    let extra: Vec<_> = catalog.difference(&actual).map(|s| s.as_str()).collect();
+    let extra: Vec<_> = catalog
+        .difference(&actual)
+        .map(std::string::String::as_str)
+        .collect();
 
     if !missing.is_empty() || !extra.is_empty() {
         let mut msg = String::from(
@@ -168,7 +177,7 @@ fn router_methods_match_actual_source() {
                 missing.len()
             ));
             for m in missing.iter().take(10) {
-                msg.push_str(&format!("  - {}\n", m));
+                msg.push_str(&format!("  - {m}\n"));
             }
             if missing.len() > 10 {
                 msg.push_str(&format!("  ... and {} more\n", missing.len() - 10));
@@ -181,7 +190,7 @@ fn router_methods_match_actual_source() {
                 extra.len()
             ));
             for m in extra.iter().take(10) {
-                msg.push_str(&format!("  - {}\n", m));
+                msg.push_str(&format!("  - {m}\n"));
             }
             if extra.len() > 10 {
                 msg.push_str(&format!("  ... and {} more\n", extra.len() - 10));
@@ -195,11 +204,20 @@ fn router_methods_match_actual_source() {
 #[test]
 fn fastpath_methods_match_actual_source() {
     let actual = extract_fastpath_methods();
-    let catalog: HashSet<String> = FASTPATH_METHODS.iter().map(|s| s.to_string()).collect();
+    let catalog: HashSet<String> = FASTPATH_METHODS
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
-    let missing: Vec<_> = actual.difference(&catalog).map(|s| s.as_str()).collect();
+    let missing: Vec<_> = actual
+        .difference(&catalog)
+        .map(std::string::String::as_str)
+        .collect();
 
-    let extra: Vec<_> = catalog.difference(&actual).map(|s| s.as_str()).collect();
+    let extra: Vec<_> = catalog
+        .difference(&actual)
+        .map(std::string::String::as_str)
+        .collect();
 
     if !missing.is_empty() || !extra.is_empty() {
         let mut msg = String::from(
@@ -213,7 +231,7 @@ fn fastpath_methods_match_actual_source() {
                 missing.len()
             ));
             for m in &missing {
-                msg.push_str(&format!("  - {}\n", m));
+                msg.push_str(&format!("  - {m}\n"));
             }
         }
 
@@ -223,7 +241,7 @@ fn fastpath_methods_match_actual_source() {
                 extra.len()
             ));
             for m in &extra {
-                msg.push_str(&format!("  - {}\n", m));
+                msg.push_str(&format!("  - {m}\n"));
             }
         }
 
@@ -240,49 +258,43 @@ fn catalog_counts_frozen() {
 
     assert_eq!(
         router_count, EXPECTED_ROUTER_METHODS,
-        "Router method count drift detected: expected {}, got {}. \
+        "Router method count drift detected: expected {EXPECTED_ROUTER_METHODS}, got {router_count}. \
          If you added/removed router methods, update ROUTER_METHODS in catalog.rs, \
-         bump EXPECTED_ROUTER_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version.",
-        EXPECTED_ROUTER_METHODS, router_count
+         bump EXPECTED_ROUTER_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version."
     );
 
     assert_eq!(
         fastpath_count, EXPECTED_FASTPATH_METHODS,
-        "Fast-path method count drift detected: expected {}, got {}. \
+        "Fast-path method count drift detected: expected {EXPECTED_FASTPATH_METHODS}, got {fastpath_count}. \
          If you added/removed fast-path methods, update FASTPATH_METHODS in catalog.rs, \
-         bump EXPECTED_FASTPATH_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version.",
-        EXPECTED_FASTPATH_METHODS, fastpath_count
+         bump EXPECTED_FASTPATH_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version."
     );
 
     assert_eq!(
         alias_count, EXPECTED_ALIASES,
-        "Alias count drift detected: expected {}, got {}. \
+        "Alias count drift detected: expected {EXPECTED_ALIASES}, got {alias_count}. \
          If you added/removed aliases, update METHOD_ALIASES in catalog.rs, \
-         bump EXPECTED_ALIASES, update docs/protocol/05-method-catalog.md, and bump the protocol version.",
-        EXPECTED_ALIASES, alias_count
+         bump EXPECTED_ALIASES, update docs/protocol/05-method-catalog.md, and bump the protocol version."
     );
 
     assert_eq!(
         total, EXPECTED_TOTAL_METHODS,
-        "Total method count drift detected: expected {}, got {} ({} router + {} fastpath + {} aliases). \
-         Update the catalog, docs/protocol/05-method-catalog.md, and bump the protocol version.",
-        EXPECTED_TOTAL_METHODS, total, router_count, fastpath_count, alias_count
+        "Total method count drift detected: expected {EXPECTED_TOTAL_METHODS}, got {total} ({router_count} router + {fastpath_count} fastpath + {alias_count} aliases). \
+         Update the catalog, docs/protocol/05-method-catalog.md, and bump the protocol version."
     );
 
     let notification_count = NOTIFICATIONS.len();
     assert_eq!(
         notification_count, EXPECTED_NOTIFICATIONS,
-        "Notification count drift detected: expected {}, got {}. \
-         Update NOTIFICATIONS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version.",
-        EXPECTED_NOTIFICATIONS, notification_count
+        "Notification count drift detected: expected {EXPECTED_NOTIFICATIONS}, got {notification_count}. \
+         Update NOTIFICATIONS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version."
     );
 
     let reverse_count = REVERSE_METHODS.len();
     assert_eq!(
         reverse_count, EXPECTED_REVERSE_METHODS,
-        "Reverse RPC count drift detected: expected {}, got {}. \
-         Update REVERSE_METHODS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version.",
-        EXPECTED_REVERSE_METHODS, reverse_count
+        "Reverse RPC count drift detected: expected {EXPECTED_REVERSE_METHODS}, got {reverse_count}. \
+         Update REVERSE_METHODS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version."
     );
 }
 
@@ -312,7 +324,7 @@ fn fastpath_methods_are_sorted() {
 fn no_duplicate_router_methods() {
     let mut seen = std::collections::HashSet::new();
     for method in ROUTER_METHODS {
-        assert!(seen.insert(method), "Duplicate router method: {}", method);
+        assert!(seen.insert(method), "Duplicate router method: {method}");
     }
 }
 
@@ -320,11 +332,7 @@ fn no_duplicate_router_methods() {
 fn no_duplicate_fastpath_methods() {
     let mut seen = std::collections::HashSet::new();
     for method in FASTPATH_METHODS {
-        assert!(
-            seen.insert(method),
-            "Duplicate fast-path method: {}",
-            method
-        );
+        assert!(seen.insert(method), "Duplicate fast-path method: {method}");
     }
 }
 
@@ -334,8 +342,7 @@ fn no_overlap_between_router_and_fastpath() {
     for method in FASTPATH_METHODS {
         assert!(
             !router_set.contains(method),
-            "Method {} appears in both ROUTER_METHODS and FASTPATH_METHODS",
-            method
+            "Method {method} appears in both ROUTER_METHODS and FASTPATH_METHODS"
         );
     }
 }
@@ -346,10 +353,7 @@ fn aliases_point_to_router_methods() {
     for (alias, canonical) in METHOD_ALIASES {
         assert!(
             router_set.contains(canonical),
-            "Alias {} points to {}, but {} is not in ROUTER_METHODS",
-            alias,
-            canonical,
-            canonical
+            "Alias {alias} points to {canonical}, but {canonical} is not in ROUTER_METHODS"
         );
     }
 }

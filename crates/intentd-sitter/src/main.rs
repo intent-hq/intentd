@@ -54,7 +54,7 @@ fn run() -> i32 {
         Some(url) => vec![url],
         None => manifest::DEFAULT_MANIFEST_BASE_URLS
             .iter()
-            .map(|base| base.to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
     };
 

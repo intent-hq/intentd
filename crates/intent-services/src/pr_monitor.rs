@@ -820,11 +820,11 @@ impl Services {
         match wake_notice {
             Some(notice) => {
                 self.wake_pr_monitor_owner(&monitor, notice, "cancelled")
-                    .await
+                    .await;
             }
             None => {
                 self.resettle_owner_after_pr_monitor_terminal(&monitor)
-                    .await
+                    .await;
             }
         }
         // A cancelled monitor's open-PR signal lapses — the derived

@@ -192,7 +192,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -404,7 +404,7 @@ async fn git_discard_refuses_traversal_over_wss() {
     assert_eq!(resp["jsonrpc"], json!("2.0"));
     assert_eq!(resp["id"], json!(3));
     assert!(resp.get("result").is_none(), "unexpected result: {resp}");
-    assert_eq!(resp["error"]["code"], -32602, "traversal ⇒ -32602: {resp}",);
+    assert_eq!(resp["error"]["code"], -32602, "traversal ⇒ -32602: {resp}");
     assert!(
         resp["error"]["message"].is_string(),
         "error carries message: {resp}",

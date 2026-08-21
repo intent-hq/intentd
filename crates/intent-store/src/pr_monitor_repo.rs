@@ -126,7 +126,7 @@ impl Store {
             Ok(_) => Ok(true),
             Err(e)
                 if e.as_database_error()
-                    .is_some_and(|d| d.is_unique_violation()) =>
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
             {
                 Ok(false)
             }

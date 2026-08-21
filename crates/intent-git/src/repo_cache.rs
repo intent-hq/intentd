@@ -1235,7 +1235,7 @@ fn run_git_streamed(
     timeout: Duration,
     on_chunk: Option<ProgressChunkFn>,
 ) -> Result<()> {
-    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(std::convert::AsRef::as_ref).collect();
     run_git_os_streamed(dir, &os_args, token, timeout, on_chunk)
 }
 

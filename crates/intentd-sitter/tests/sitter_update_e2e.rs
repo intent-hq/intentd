@@ -61,7 +61,7 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            Ok(_) if header != "\r\n" && !header.is_empty() => {}
             _ => break,
         }
     }

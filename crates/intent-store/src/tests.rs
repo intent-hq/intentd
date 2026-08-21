@@ -5118,8 +5118,8 @@ async fn concurrent_writes_no_sqlite_busy() {
                 let ts = now_iso();
                 let workspace = Workspace {
                     id: ws_id.clone(),
-                    title: format!("Workspace {}", i),
-                    branch: format!("main-{}", i),
+                    title: format!("Workspace {i}"),
+                    branch: format!("main-{i}"),
                     base_ref: None,
                     base_commit_sha: None,
                     status: WorkspaceStatus::Active,
@@ -5131,7 +5131,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     updated_at: ts.clone(),
                     last_activity: None,
                     tags: vec![],
-                    path: Some(format!("/tmp/ws-{}", i)),
+                    path: Some(format!("/tmp/ws-{i}")),
                     repository_path: None,
                     repository_owner: None,
                     repository_name: None,
@@ -5184,8 +5184,7 @@ async fn concurrent_writes_no_sqlite_busy() {
         let result = handle.await.unwrap();
         assert!(
             result.is_ok(),
-            "Write failed (SQLITE_BUSY would be Error::Internal with 'database is locked'): {:?}",
-            result
+            "Write failed (SQLITE_BUSY would be Error::Internal with 'database is locked'): {result:?}"
         );
     }
     let write_storm = storm_start.elapsed();
@@ -5199,16 +5198,13 @@ async fn concurrent_writes_no_sqlite_busy() {
     let mut slowest_read = std::time::Duration::ZERO;
     for handle in read_handles {
         let (result, elapsed) = handle.await.unwrap();
-        assert!(result.is_ok(), "Read failed: {:?}", result);
+        assert!(result.is_ok(), "Read failed: {result:?}");
         slowest_read = slowest_read.max(elapsed);
     }
     let read_budget = std::cmp::max(std::time::Duration::from_secs(5), write_storm / 2);
     assert!(
         slowest_read < read_budget,
-        "Slowest read took {:?} (budget {:?}, write storm {:?}) — reads queueing behind writers?",
-        slowest_read,
-        read_budget,
-        write_storm
+        "Slowest read took {slowest_read:?} (budget {read_budget:?}, write storm {write_storm:?}) — reads queueing behind writers?"
     );
 
     // Verify all 50 workspaces were written
@@ -5822,7 +5818,7 @@ fn migrations_have_unique_versions() {
         if !name.ends_with(".sql") {
             continue;
         }
-        let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
         let version: i64 = digits
             .parse()
             .unwrap_or_else(|_| panic!("migration '{name}' has no numeric version prefix"));
@@ -5959,7 +5955,7 @@ async fn hook_list_filters_by_workspace_and_agent() {
 
     let ws_hooks = store.list_hooks_by_workspace(&ws_a).await.expect("list ws");
     let mut ws_ids: Vec<&str> = ws_hooks.iter().map(|h| h.hook_id.0.as_str()).collect();
-    ws_ids.sort();
+    ws_ids.sort_unstable();
     assert_eq!(ws_ids, vec!["hook-a1", "hook-a2"]);
 
     let agent_hooks = store
@@ -6159,7 +6155,7 @@ async fn hook_load_active_and_delete() {
 
     let active = store.load_active_hooks().await.expect("load active");
     let mut ids: Vec<&str> = active.iter().map(|h| h.hook_id.0.as_str()).collect();
-    ids.sort();
+    ids.sort_unstable();
     assert_eq!(ids, vec!["hook-run", "hook-sched"]);
 
     store

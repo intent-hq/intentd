@@ -206,7 +206,7 @@ impl Services {
                     file_ops::resolve_attachment_source(&root, &r.stored_path)
                         .ok()
                         .and_then(|p| std::fs::metadata(p).ok())
-                        .filter(|m| m.is_file())
+                        .filter(std::fs::Metadata::is_file)
                         .map(|m| m.len())
                 };
                 TransferAttachment {

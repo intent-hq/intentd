@@ -1784,7 +1784,10 @@ impl Drop for TeardownFence {
     fn drop(&mut self) {
         // Poison recovery mirrors the delete-path sweeps: unfencing is the
         // last chance to keep the set from leaking these ids forever.
-        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stopping = self
+            .stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in &self.ids {
             stopping.remove(id);
         }
@@ -2402,7 +2405,7 @@ impl AgentManager {
             auth_error_patterns: opts
                 .provider
                 .auth_error_patterns
-                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .map(|p| p.iter().map(std::string::ToString::to_string).collect())
                 .unwrap_or_default(),
             // STAB-53: capture the child's stderr under
             // `<agent-logs>/<agent-id>/<YYYY-MM-DD>.log` so a child that dies
@@ -2475,7 +2478,7 @@ impl AgentManager {
             _rules_config: rules_config,
             _pi_extension: pi_extension,
             session_mcp_servers,
-            spawned_model: opts.model.map(|s| s.to_string()),
+            spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
             thought_level: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
@@ -8414,7 +8417,7 @@ async fn run_message_worker(
                                     log.display()
                                 ),
                                 None => {
-                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally")
+                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
                                 }
                             }
                             handle_terminal_turn_failure(
@@ -8445,7 +8448,7 @@ async fn run_message_worker(
                         log.display()
                     ),
                     None => {
-                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries")
+                        tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
                     }
                 }
                 handle_terminal_spawn_failure(
@@ -8721,7 +8724,7 @@ async fn run_message_worker(
                 .redeliver_completion_after_queue_mutation(&agent_id)
                 .await;
             break 'outer;
-        };
+        }
         if mgr.try_begin_outcome(&agent_id, &workspace_id, false).await == TryBeginOutcome::Started
         {
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
@@ -9048,7 +9051,7 @@ async fn prepare_flush_turn(
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
     let mut stale_flags = Vec::with_capacity(entries.len());
-    for entry in entries.iter_mut() {
+    for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
         stale_flags.push(stale);
@@ -9645,7 +9648,7 @@ pub(crate) async fn persist_terminal_error_status_via_services(
         )
         .await
     {
-        Ok(_) => true,
+        Ok(()) => true,
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
             false
@@ -11432,7 +11435,7 @@ mod dead_child_respawn_tests {
             ConnectionHooks::default(),
         ));
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
-        let child_pid = child.as_ref().and_then(|c| c.id());
+        let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         let handle = AgentHandle {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),

@@ -371,7 +371,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn availability_available_via_fake_binary() {
-        let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = CHILD_SPAWN_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("avail");
         let bin = dir.path().join("auggie");
@@ -395,7 +397,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_auggie_timeout_group_kills_grandchildren() {
-        let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = CHILD_SPAWN_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("groupkill");
         let bin = dir.path().join("auggie");

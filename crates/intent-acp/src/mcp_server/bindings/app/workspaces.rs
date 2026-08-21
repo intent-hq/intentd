@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.workspaces = {
@@ -25,7 +25,7 @@ pub(crate) const PRELUDE: &str = r#"
         bulkArchive: (ids) => host({ method: 'app.workspaces.bulkArchive', args: { ids } }),
         bulkDelete: (ids) => host({ method: 'app.workspaces.bulkDelete', args: { ids } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -61,7 +61,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
             if let Some(arr) = s.as_array() {
                 Some(
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                        .filter_map(|v| v.as_str().map(str::to_lowercase))
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -282,7 +282,7 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 
     // RFC3986 percent-encode the id portion for URI path segment use
     let encoded_id = super::proposal::percent_encode_path_segment(id);
-    format!("intent-proposal://{}/{}", kind, encoded_id)
+    format!("intent-proposal://{kind}/{encoded_id}")
 }
 
 /// Return a proposal with dual text+resource content items.
@@ -726,7 +726,7 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
     let title = params
         .get("title")
         .and_then(Value::as_str)
-        .map(|s| format!(": {}", s))
+        .map(|s| format!(": {s}"))
         .unwrap_or_default();
 
     let mut fields = normalize_workspace_create_fields(&params);

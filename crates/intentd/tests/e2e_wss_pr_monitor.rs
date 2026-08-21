@@ -1606,7 +1606,7 @@ async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_
         s.checks = vec![
             ("build".into(), CheckState::Pending, true),
             ("lint".into(), CheckState::Pending, false),
-        ]
+        ];
     });
     let monitor = fx
         .services

@@ -296,7 +296,7 @@ impl Store {
             }
             let status: Option<String> = col(row, "status")?;
             match status.as_deref() {
-                Some("cancelled") => continue,
+                Some("cancelled") => {}
                 Some("complete") => {
                     stats.total += 1;
                     stats.completed += 1;

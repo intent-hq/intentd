@@ -145,7 +145,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -179,7 +179,7 @@ async fn agent_status_returns_full_metadata() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -216,7 +216,7 @@ async fn agent_list_returns_created_agents() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent 1");
@@ -230,7 +230,7 @@ async fn agent_list_returns_created_agents() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent 2");
@@ -261,7 +261,7 @@ async fn agent_read_conversation_returns_messages() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -332,7 +332,7 @@ async fn agent_summary_returns_shape() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

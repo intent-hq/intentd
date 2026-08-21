@@ -620,7 +620,7 @@ pub(crate) fn tags_from_db(s: &str) -> Result<Vec<String>> {
 pub(crate) fn enum_to_db<T: serde::Serialize>(v: &T) -> Result<String> {
     serde_json::to_value(v)
         .ok()
-        .and_then(|x| x.as_str().map(|s| s.to_string()))
+        .and_then(|x| x.as_str().map(std::string::ToString::to_string))
         .ok_or_else(|| Error::Internal("failed to encode enum".to_string()))
 }
 

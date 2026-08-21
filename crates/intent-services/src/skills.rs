@@ -413,7 +413,7 @@ async fn walk_directory(
     while let Ok(Some(entry)) = entries.next_entry().await {
         dir_entries.push(entry);
     }
-    dir_entries.sort_by_key(|e| e.file_name());
+    dir_entries.sort_by_key(tokio::fs::DirEntry::file_name);
 
     // Check for SKILL.md in this directory
     let has_skill_file = dir_entries
@@ -584,7 +584,7 @@ fn extract_frontmatter(content: &str) -> Option<FrontmatterExtraction> {
 fn parse_frontmatter_yaml(frontmatter_text: &str) -> Option<serde_yaml::Value> {
     serde_yaml::from_str::<serde_yaml::Value>(frontmatter_text)
         .ok()
-        .filter(|v| v.is_mapping())
+        .filter(serde_yaml::Value::is_mapping)
 }
 
 /// Quote malformed scalar values in YAML (unquoted colons)
@@ -720,7 +720,7 @@ mod tests {
     use super::*;
 
     fn build_skill_content(frontmatter: &str, body: &str) -> String {
-        format!("---\n{}\n---\n\n{}\n", frontmatter, body)
+        format!("---\n{frontmatter}\n---\n\n{body}\n")
     }
 
     async fn write_skill(skill_root: &Path, skill_name: &str, content: &str) -> PathBuf {
@@ -967,7 +967,7 @@ mod tests {
         // Create a deep directory structure beyond MAX_SCAN_DEPTH
         let mut deep_path = skills_root.clone();
         for i in 0..=MAX_SCAN_DEPTH + 1 {
-            deep_path = deep_path.join(format!("level{}", i));
+            deep_path = deep_path.join(format!("level{i}"));
         }
         tokio::fs::create_dir_all(&deep_path).await.unwrap();
 

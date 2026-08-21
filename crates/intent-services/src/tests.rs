@@ -1984,7 +1984,7 @@ async fn task_list_and_get_project_workspace_tasks() {
     let parents: Vec<Option<&str>> = result
         .tasks
         .iter()
-        .map(|t| t.parent_id.as_ref().map(|p| p.as_str()))
+        .map(|t| t.parent_id.as_ref().map(intent_core::NoteId::as_str))
         .collect();
     assert_eq!(
         parents,
@@ -2149,7 +2149,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .await
         .expect("setRelations");
     assert!(r.ok);
-    let dep_ids: Vec<&str> = r.depends_on.iter().map(|d| d.as_str()).collect();
+    let dep_ids: Vec<&str> = r
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(dep_ids, vec!["task-a", "task-b"]);
     assert_eq!(r.conflicts_with[0].as_str(), "task-b");
 
@@ -2161,7 +2165,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .expect("getMyTask");
     assert_eq!(mine.task_metadata.depends_on.len(), 2);
     assert_eq!(mine.task_metadata.conflicts_with.len(), 1);
-    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = mine
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
 
     // task.list projects the same fields.
@@ -2172,7 +2180,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .find(|t| t.id.as_str() == "task-c")
         .expect("task-c row");
     assert_eq!(c.depends_on.len(), 2);
-    let unmet: Vec<&str> = c.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = c
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
 
     // task.get projects them too; task-c has dependsOn edges, so this
@@ -2181,7 +2193,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .task_get(ws.clone(), NoteId::from("task-c"))
         .await
         .expect("task.get");
-    let unmet: Vec<&str> = got.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = got
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
     assert!(got.spec_linked);
 
@@ -2533,7 +2549,11 @@ async fn note_reads_project_unmet_depends_on() {
         .await
         .expect("get c");
     let task = c.metadata.task.as_ref().expect("task metadata");
-    let unmet: Vec<&str> = task.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = task
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
 
     // note.list: same projection; dep-less task rows omit the field on the
@@ -2844,9 +2864,17 @@ async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
     let fe_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Frontend").await;
 
     let ui_meta = child_task_meta(&svc, &ws, &r.created_note_ids, "Wiring").await;
-    let deps: Vec<&str> = ui_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = ui_meta
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![api_id.as_str()], "dependsOn resolved via key=");
-    let conflicts: Vec<&str> = ui_meta.conflicts_with.iter().map(|d| d.as_str()).collect();
+    let conflicts: Vec<&str> = ui_meta
+        .conflicts_with
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(
         conflicts,
         vec![fe_id.as_str()],
@@ -2859,7 +2887,11 @@ async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
         .get_my_task(ws.clone(), NoteId::from(ui_id.as_str()))
         .await
         .expect("getMyTask");
-    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = mine
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec![api_id.as_str()]);
 }
 
@@ -2879,7 +2911,11 @@ async fn convert_blocks_key_takes_precedence_over_title() {
     assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
     let key_owner = child_id_by_title(&svc, &ws, &r.created_note_ids, "Key Owner").await;
     let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
-    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = consumer
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![key_owner.as_str()]);
 }
 
@@ -2909,7 +2945,11 @@ async fn convert_blocks_resolves_existing_task_note_ids() {
         .expect("convertBlocks");
     assert_eq!(r.converted_count, 1);
     let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
-    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = consumer
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec!["pre-task"], "existing task-note id resolves");
     assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
     assert!(
@@ -2942,7 +2982,11 @@ async fn convert_blocks_warns_on_unknown_reference_and_still_converts() {
     assert!(alpha.depends_on.is_empty());
     let alpha_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Alpha").await;
     let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
-    let deps: Vec<&str> = beta.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = beta
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(
         deps,
         vec![alpha_id.as_str()],
@@ -3085,7 +3129,11 @@ async fn convert_blocks_warns_on_validator_rejected_edges() {
     // cycle and Beta→Beta is a self-edge — both rejected.
     let beta_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Beta").await;
     let alpha = child_task_meta(&svc, &ws, &r.created_note_ids, "Alpha").await;
-    let deps: Vec<&str> = alpha.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = alpha
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![beta_id.as_str()], "acyclic edge applies");
     let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
     assert!(beta.depends_on.is_empty(), "rejected edges skipped");
@@ -3149,7 +3197,11 @@ async fn convert_blocks_auto_convert_surfaces_relations_via_note_write() {
     let x_meta = x.metadata.task.as_ref().expect("X task");
     assert_eq!(x_meta.estimated_effort.as_deref(), Some("1d"));
     let y_meta = y.metadata.task.as_ref().expect("Y task");
-    let deps: Vec<&str> = y_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = y_meta
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![x.id.as_str()]);
 }
 
@@ -4047,7 +4099,7 @@ async fn comment_add_empty_target_is_invalid_params() {
             ws,
             id,
             "some note content".into(),
-            "".into(),
+            String::new(),
             "c".into(),
             None,
             None,
@@ -5040,7 +5092,7 @@ async fn insert_file_event(
             event_type: "file:changed".to_string(),
             actor: EventActor {
                 actor_type,
-                id: actor_id.map(|s| s.to_string()),
+                id: actor_id.map(std::string::ToString::to_string),
                 name: actor_id.map(|s| format!("name-{s}")),
                 ..Default::default()
             },
@@ -9737,7 +9789,7 @@ mod pr {
         async fn get_user(&self) -> ScResult<UserIdentity> {
             Ok(UserIdentity {
                 login: "octocat".into(),
-                id: Some(583231),
+                id: Some(583_231),
                 name: Some("The Octocat".into()),
                 avatar_url: Some("https://avatars.example/u/1".into()),
                 html_url: Some("https://github.com/octocat".into()),
@@ -16166,7 +16218,7 @@ mod usage_stats_recording {
                 None,
                 None,
                 false,
-                Default::default(),
+                intent_core::AgentCreateExtra::default(),
             )
             .await
             .expect("create agent");
@@ -19965,26 +20017,25 @@ mod known_repo {
         for _ in 0..100 {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             // Try to receive batched events (could be empty or timeout)
-            match tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await {
-                Ok(Some(batch)) => {
-                    for evt in batch {
-                        if evt.event_type == "workspace:updated"
-                            && evt.workspace_id == id
-                            && evt
-                                .data
-                                .get("changes")
-                                .and_then(|c| c.get("repositoryOwner"))
-                                .is_some()
-                        {
-                            updated_event = Some(evt);
-                            break;
-                        }
-                    }
-                    if updated_event.is_some() {
+            if let Ok(Some(batch)) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await
+            {
+                for evt in batch {
+                    if evt.event_type == "workspace:updated"
+                        && evt.workspace_id == id
+                        && evt
+                            .data
+                            .get("changes")
+                            .and_then(|c| c.get("repositoryOwner"))
+                            .is_some()
+                    {
+                        updated_event = Some(evt);
                         break;
                     }
                 }
-                _ => continue,
+                if updated_event.is_some() {
+                    break;
+                }
             }
         }
 
@@ -20649,11 +20700,12 @@ mod worktree_provisioning {
         let caps = svc.system_capabilities().await.expect("capabilities");
         let obj = caps.as_object().expect("result is an object");
         assert!(
-            obj.get("cowSupported").is_some_and(|v| v.is_boolean()),
+            obj.get("cowSupported")
+                .is_some_and(serde_json::Value::is_boolean),
             "cowSupported present as a boolean when the probe ran: {caps}"
         );
         assert_eq!(
-            obj.get("cowSupported").and_then(|v| v.as_bool()),
+            obj.get("cowSupported").and_then(serde_json::Value::as_bool),
             svc.compute_cow_supported().await,
             "capability mirrors the shared workspaces-root probe"
         );
@@ -22977,10 +23029,7 @@ mod file_ops_service {
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
         if probe == CowSupport::Unsupported {
-            eprintln!(
-                "SKIP test (CoW not supported): {:?} → {:?}",
-                user_dir, workspaces_root
-            );
+            eprintln!("SKIP test (CoW not supported): {user_dir:?} → {workspaces_root:?}");
             let _ = fs::remove_dir_all(&test_root);
             return;
         }
@@ -23086,8 +23135,7 @@ mod file_ops_service {
         let sandbox_file = sandbox_path.join("contained.txt");
         assert!(
             sandbox_file.exists(),
-            "Write must land in sandbox: {:?}",
-            sandbox_file
+            "Write must land in sandbox: {sandbox_file:?}"
         );
         let sandbox_content = fs::read_to_string(&sandbox_file).unwrap();
         assert_eq!(sandbox_content, "sandboxed write");
@@ -23096,8 +23144,7 @@ mod file_ops_service {
         let user_file = user_dir.join("contained.txt");
         assert!(
             !user_file.exists(),
-            "User directory must remain untouched: {:?}",
-            user_file
+            "User directory must remain untouched: {user_file:?}"
         );
 
         // ws.file.getAttachment for a SANDBOXED caller: the source is the
@@ -25828,7 +25875,7 @@ mod repo_warm_cache {
             .await
         {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("owner"), "names the bad segment: {msg}")
+                assert!(msg.contains("owner"), "names the bad segment: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -25850,7 +25897,7 @@ mod repo_warm_cache {
 
         match svc.repo_warm_cache("not-a-repo-url".to_string()).await {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("owner/repo"), "actionable message: {msg}")
+                assert!(msg.contains("owner/repo"), "actionable message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -28621,7 +28668,7 @@ mod turn_token_usage {
                 }
             };
             let recompute = h.services.recompute_workspace_token_usage(&h.ws, false);
-            let (_, recomputed) = tokio::join!(rename, recompute);
+            let ((), recomputed) = tokio::join!(rename, recompute);
             recomputed.expect("recompute ok");
             let ws = h.store.get_workspace(&h.ws).await.expect("reload");
             assert_eq!(ws.title, title, "recompute must never revert the title");
@@ -30165,7 +30212,7 @@ mod harness_versioning {
             parent,
             None,
             false,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent")

@@ -1058,7 +1058,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Daemon-wide cap on outstanding slow-path RPCs across every connection; over-limit requests are rejected with -32011 \"Server overloaded\" (0 = unlimited; changes apply on daemon restart)",
             "server",
             Some(0.0),
-            Some(100000.0),
+            Some(100_000.0),
             256.0,
         ),
         // --- Group B: source control ----------------------------------------

@@ -127,7 +127,7 @@ impl Drop for Daemon {
         if std::thread::panicking() {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -281,7 +281,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -306,7 +306,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

@@ -198,7 +198,7 @@ async fn wss_rpc(
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -513,7 +513,7 @@ async fn await_drained_and_idle(
         let queue = wss_rpc(ws, 30, "agent.getQueue", json!({ "agentId": agent_id })).await;
         let empty = queue["queue"]
             .as_array()
-            .map(|q| q.is_empty())
+            .map(std::vec::Vec::is_empty)
             .unwrap_or(false);
         let got = wss_rpc(
             ws,

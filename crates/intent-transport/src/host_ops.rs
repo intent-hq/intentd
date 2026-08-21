@@ -286,10 +286,10 @@ fn lookup_in_path(name: &str) -> Option<PathBuf> {
 /// resolve, matching provider discovery).
 fn select_path_lookup_line(name: &str, lines: &[&str], is_windows: bool) -> Option<String> {
     if !is_windows {
-        return lines.first().map(|s| s.to_string());
+        return lines.first().map(std::string::ToString::to_string);
     }
     if has_windows_exec_extension(Path::new(name)) {
-        return lines.first().map(|s| s.to_string());
+        return lines.first().map(std::string::ToString::to_string);
     }
     for ext in WINDOWS_EXEC_EXTENSIONS {
         if let Some(line) = lines.iter().find(|line| {
@@ -587,7 +587,10 @@ fn tool_common_paths(name: &str) -> Vec<String> {
 pub(crate) fn tool_availability_op(tools: Option<Vec<String>>) -> Value {
     let names: Vec<String> = match tools {
         Some(t) if !t.is_empty() => t,
-        _ => DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect(),
+        _ => DEFAULT_TOOLS
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
     };
     let mut map = Map::new();
     for name in names {

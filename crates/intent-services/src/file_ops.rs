@@ -630,7 +630,7 @@ fn mtime_iso(t: std::time::SystemTime) -> String {
 fn permissions_octal(md: &std::fs::Metadata) -> String {
     use std::os::unix::fs::PermissionsExt;
     let mode = md.permissions().mode() & 0o777;
-    format!("0{:o}", mode)
+    format!("0{mode:o}")
 }
 
 #[cfg(not(unix))]
@@ -997,7 +997,7 @@ mod tests {
         // Directory → -32602 naming the cause.
         match read_chunk(&root, "dir", 0, 16) {
             Err(Error::InvalidParams(m)) => {
-                assert!(m.contains("directory"), "unexpected message: {m}")
+                assert!(m.contains("directory"), "unexpected message: {m}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1007,7 +1007,7 @@ mod tests {
                 assert!(
                     m.contains(&READ_CHUNK_MAX_BYTES.to_string()),
                     "unexpected message: {m}"
-                )
+                );
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1138,7 +1138,7 @@ mod tests {
         let err = place_attachment(&root, "gone.bin", AttachmentSource::CopyFrom(&missing));
         match err {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1159,7 +1159,7 @@ mod tests {
         let err = place_attachment(&root, "some-folder", AttachmentSource::CopyFrom(&subdir));
         match err {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("directory"), "unexpected message: {msg}")
+                assert!(msg.contains("directory"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1181,7 +1181,7 @@ mod tests {
         let err = place_attachment(&root, "child.txt", AttachmentSource::CopyFrom(&bogus));
         match err {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }

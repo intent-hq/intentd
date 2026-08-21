@@ -261,7 +261,7 @@ impl Store {
                     // can reject a client-supplied `commentId` collision with
                     // InvalidParams even when the race beats a pre-check.
                     if e.as_database_error()
-                        .is_some_and(|d| d.is_unique_violation())
+                        .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
                     {
                         Error::InvalidInput(format!("comment {} already exists", c.id))
                     } else {

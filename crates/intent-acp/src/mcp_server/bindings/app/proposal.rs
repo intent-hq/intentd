@@ -9,13 +9,13 @@ use std::sync::Arc;
 use intent_core::{WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.proposal = {
         show: (proposal) => host({ method: 'app.proposal.show', args: { proposal } }),
     };
-"#;
+";
 
 /// MCP resource MIME type for proposals (parity with FE `proposal-resource.ts`).
 pub const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+json";
@@ -101,7 +101,7 @@ pub fn proposal_resource_uri(proposal: &Value) -> String {
 
     // RFC3986 percent-encode the id portion for URI path segment use
     let encoded_id = percent_encode_path_segment(id);
-    format!("intent-proposal://{}/{}", kind, encoded_id)
+    format!("intent-proposal://{kind}/{encoded_id}")
 }
 
 /// RFC3986 percent-encoding for URI path segments.
@@ -113,7 +113,7 @@ pub(super) fn percent_encode_path_segment(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 vec![b as char]
             }
-            _ => format!("%{:02X}", b).chars().collect(),
+            _ => format!("%{b:02X}").chars().collect(),
         })
         .collect()
 }

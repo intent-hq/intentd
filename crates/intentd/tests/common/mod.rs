@@ -282,7 +282,7 @@ async fn await_wss_status_impl(socket: &Path, log_path: Option<&Path>) -> serde_
 /// it additionally dumps the log tail on timeout (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped(socket: &Path) {
-    await_wss_stopped_impl(socket, None).await
+    await_wss_stopped_impl(socket, None).await;
 }
 
 /// [`await_wss_stopped`] variant that also surfaces the tail of the daemon
@@ -290,7 +290,7 @@ pub async fn await_wss_stopped(socket: &Path) {
 /// attributable from the failure output alone (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped_logged(socket: &Path, log_path: &Path) {
-    await_wss_stopped_impl(socket, Some(log_path)).await
+    await_wss_stopped_impl(socket, Some(log_path)).await;
 }
 
 #[cfg(unix)]

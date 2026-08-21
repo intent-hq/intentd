@@ -254,7 +254,7 @@ pub(crate) fn stats_model_key(
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| p.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
 }
 
@@ -267,7 +267,7 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| p.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| UNKNOWN_PROVIDER.to_string())
 }
 

@@ -102,7 +102,7 @@ mod tests {
     fn user_drops_id_name_and_defaults_optionals() {
         let user = UserIdentity {
             login: "octocat".into(),
-            id: Some(583231),
+            id: Some(583_231),
             name: Some("The Octocat".into()),
             avatar_url: Some("https://avatars/u/1".into()),
             html_url: None,

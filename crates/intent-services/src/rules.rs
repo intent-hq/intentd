@@ -787,13 +787,13 @@ mod tests {
         let skills_dir = repo_path.join(".augment").join("skills").join("test-skill");
         tokio::fs::create_dir_all(&skills_dir).await.unwrap();
 
-        let skill_content = r#"---
+        let skill_content = r"---
 name: test-skill
 description: A test skill for prompt assembly
 ---
 
 This is a test skill.
-"#;
+";
         tokio::fs::write(skills_dir.join("SKILL.md"), skill_content)
             .await
             .unwrap();

@@ -424,7 +424,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_MESSAGE,
         ],
     };
-    types.iter().map(|s| s.to_string()).collect()
+    types.iter().map(std::string::ToString::to_string).collect()
 }
 
 /// Materialize a channel's seq-0 snapshot as a JSON array (TB-0 §1.4). On a read

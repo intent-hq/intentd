@@ -327,7 +327,7 @@ async fn debounce_loop(
                     return;
                 }
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
             }
         }
@@ -528,7 +528,7 @@ mod tests {
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("dyn-ws");
         let ws_id = WorkspaceId::from("ws-skills-dyn");
@@ -587,7 +587,7 @@ mod tests {
     async fn resume_catch_up_survives_a_discovery_cache_refresh_while_suspended() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("pause-ws");
         let ws_id = WorkspaceId::from("ws-skills-pause");

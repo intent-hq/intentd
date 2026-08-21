@@ -42,7 +42,7 @@ fn normalize_for_fuzzy_match(id: &str) -> String {
     let stripped = lower.strip_prefix("claude-").unwrap_or(&lower);
     stripped
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .collect()
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn fuzzy_match_model_in_pool(candidate: &str, pool: &[&str]) -> Optio
     if candidate.is_empty() || pool.is_empty() {
         return None;
     }
-    fuzzy_pick(candidate, pool).map(|m| m.to_string())
+    fuzzy_pick(candidate, pool).map(std::string::ToString::to_string)
 }
 
 /// Parse a Codex model id into its base model and optional reasoning effort.
@@ -103,7 +103,7 @@ pub(crate) fn resolve_preferred_model(
     preference_list
         .iter()
         .find(|p| available_values.contains(p))
-        .map(|p| p.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 /// One model advertised by the Grok CLI. Port of `GrokAcpModel`.
@@ -244,7 +244,7 @@ fn grok_models_from_value(value: &Value) -> Vec<GrokModel> {
         ]
         .iter()
         .find_map(|v| v.and_then(Value::as_array))
-        .map(|v| v.as_slice())
+        .map(std::vec::Vec::as_slice)
         .unwrap_or(&[])
     };
 
@@ -275,7 +275,7 @@ pub(crate) fn parse_grok_initialize_models(result: &Value) -> GrokParsedModels {
         .get("currentModelId")
         .and_then(Value::as_str)
         .or_else(|| result.get("currentModelId").and_then(Value::as_str))
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     GrokParsedModels {
         models: grok_models_from_value(model_state),
         current_model_id,

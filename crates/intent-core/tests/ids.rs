@@ -35,11 +35,11 @@ fn new_generates_fresh_uuid_v4() {
 fn default_uses_new() {
     let a: WorkspaceId = WorkspaceId::default();
     assert_uuid_v4_shape(a.as_str());
-    let b: NoteId = Default::default();
+    let b: NoteId = NoteId::default();
     assert_uuid_v4_shape(b.as_str());
-    let c: AgentId = Default::default();
+    let c: AgentId = AgentId::default();
     assert_uuid_v4_shape(c.as_str());
-    let d: ClientId = Default::default();
+    let d: ClientId = ClientId::default();
     assert_uuid_v4_shape(d.as_str());
 }
 

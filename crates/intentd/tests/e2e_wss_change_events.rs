@@ -222,7 +222,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -259,7 +259,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -1161,7 +1161,7 @@ async fn note_list_reseeds_missing_spec_over_wss() {
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 // Stream close / error during the "should be quiet" window is
                 // not the condition this drain is guarding against; surface
                 // it instead of spinning silently until the timeout.
@@ -1207,7 +1207,7 @@ where
                 Some(Ok(Message::Ping(p))) => {
                     let _ = ws.send(Message::Pong(p)).await;
                 }
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
                 None => panic!("subscription socket closed during drain"),
             }
@@ -2743,7 +2743,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -4093,7 +4093,7 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
     assert_eq!(conv["ok"], json!(true), "convert: {conv}");
     assert_eq!(conv["convertedCount"], json!(2), "convert: {conv}");
     assert_eq!(
-        conv["createdNoteIds"].as_array().map(|a| a.len()),
+        conv["createdNoteIds"].as_array().map(std::vec::Vec::len),
         Some(2),
         "convert: {conv}"
     );

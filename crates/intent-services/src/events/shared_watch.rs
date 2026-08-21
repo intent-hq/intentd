@@ -636,7 +636,7 @@ mod tests {
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(event)) if event.paths.iter().any(|p| p == &want) => return Some(event),
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {}
                 _ => return None,
             }
         }
@@ -650,7 +650,7 @@ mod tests {
     async fn sibling_roots_share_one_stream_and_stay_isolated() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parent = TempDir::new("siblings");
         let a = parent.path.join("ws-a");
         let b = parent.path.join("ws-b");
@@ -729,7 +729,7 @@ mod tests {
     async fn dropping_the_last_subscription_retires_the_stream() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parent = TempDir::new("retire");
         let root = parent.path.join("ws");
         std::fs::create_dir_all(&root).expect("mk ws");

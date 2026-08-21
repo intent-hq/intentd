@@ -94,7 +94,11 @@ pub struct ArgInputs<'a> {
 /// Order mirrors the TS flow: `base_args`, then `--model <id>`, then quiet,
 /// rules, and MCP-config flags — each gated on the provider's capability flags.
 pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<String> {
-    let mut args: Vec<String> = config.base_args.iter().map(|s| s.to_string()).collect();
+    let mut args: Vec<String> = config
+        .base_args
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     if let (Some(model), Some(flag)) = (inputs.model, config.model_flag) {
         if !model.is_empty() && model != MODEL_SENTINEL_DEFAULT {

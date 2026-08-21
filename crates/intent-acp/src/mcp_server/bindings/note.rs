@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.note = {
         read: (id) => host({ method: 'note.read', args: { id } }),
@@ -35,7 +35,7 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'note.updateMetadata', args: { id, ...(options || {}) } }),
         delete: (id) => host({ method: 'note.delete', args: { id } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

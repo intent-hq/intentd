@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use super::{map_err, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.workspace = {
         info: () => host({ method: 'workspace.info' }),
@@ -38,7 +38,7 @@ pub(crate) const PRELUDE: &str = r#"
         emitNotification: (topic, message, metadata) =>
             host({ method: 'workspace.emitNotification', args: { topic, message, metadata } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

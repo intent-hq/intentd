@@ -293,7 +293,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -332,7 +332,7 @@ async fn e2e_transport_full() {
     // The persisted cert inspected off-process carries the same fingerprint.
     match intent_transport::inspect_cert(&data_dir) {
         intent_transport::CertStatus::Valid { fingerprint: disk } => {
-            assert_eq!(disk, fingerprint, "on-disk cert fp matches status fp")
+            assert_eq!(disk, fingerprint, "on-disk cert fp matches status fp");
         }
         other => panic!("expected a valid persisted cert, got {other:?}"),
     }

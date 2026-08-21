@@ -20,7 +20,7 @@ const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 250;
 
 /// GraphQL selection shared by list/search issue queries.
-const ISSUE_FIELDS: &str = r#"
+const ISSUE_FIELDS: &str = r"
     id
     identifier
     title
@@ -35,7 +35,7 @@ const ISSUE_FIELDS: &str = r#"
     creator { name }
     project { name }
     labels { nodes { name } }
-"#;
+";
 
 /// The P0 Linear read API consumed by `linear.*` wire methods.
 #[async_trait]

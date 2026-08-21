@@ -241,7 +241,7 @@ impl Subscription {
         loop {
             match self.rx.recv().await? {
                 Delivery::Batch(batch) => return Some(batch),
-                Delivery::Lagged(_) => continue,
+                Delivery::Lagged(_) => {}
             }
         }
     }
@@ -524,7 +524,6 @@ async fn delivery_task(
                     if out.send(Delivery::Lagged(n)).await.is_err() {
                         return;
                     }
-                    continue;
                 }
                 // Bus dropped: flush any buffered batch, then stop.
                 Err(broadcast::error::RecvError::Closed) => {
@@ -535,7 +534,7 @@ async fn delivery_task(
                 }
             },
             // Batch window elapsed → flush the coalesced events.
-            _ = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
+            () = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
                 deadline = None;
                 if !buffer.is_empty()
                     && out

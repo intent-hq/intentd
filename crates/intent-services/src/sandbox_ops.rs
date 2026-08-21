@@ -279,7 +279,7 @@ fn provision_sandbox_blocking(
         .map_err(|e| Error::Internal(format!("create branch failed: {e}")))?;
 
     // Check out the new branch
-    let refname = format!("refs/heads/{}", branch_name);
+    let refname = format!("refs/heads/{branch_name}");
     sandbox_repo
         .set_head(&refname)
         .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
@@ -530,7 +530,7 @@ pub(crate) async fn merge_sandbox(
         .to_str()
         .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
     let temp_ref = format!("refs/intent/sandbox-merge/{}", agent_id.0);
-    let refspec = format!("+{}:{}", branch_ref_name, temp_ref);
+    let refspec = format!("+{branch_ref_name}:{temp_ref}");
 
     // Sandbox paths are intentd-controlled absolute paths under
     // workspaces_root, so the positional <repository> argument cannot be
@@ -603,7 +603,7 @@ fn apply_sandbox_commits(
     if commits_to_apply.is_empty() {
         // No commits to apply (only the snapshot, or base == HEAD)
         return Ok(MergeOutcome::Merged {
-            commit_range: format!("{}..{} (empty)", start_sha, sandbox_head_sha),
+            commit_range: format!("{start_sha}..{sandbox_head_sha} (empty)"),
             canonical_head: canonical_head_sha,
         });
     }
@@ -691,7 +691,7 @@ fn apply_sandbox_commits(
     }
 
     Ok(MergeOutcome::Merged {
-        commit_range: format!("{}..{}", start_sha, sandbox_head_sha),
+        commit_range: format!("{start_sha}..{sandbox_head_sha}"),
         canonical_head: current_oid.to_string(),
     })
 }
@@ -784,16 +784,14 @@ fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let path = PathBuf::from(repo_path);
     if !path.exists() {
         return Err(Error::InvalidParams(format!(
-            "repository path does not exist: {}",
-            repo_path
+            "repository path does not exist: {repo_path}"
         )));
     }
 
     // Verify it's a git repository
     if !path.join(".git").exists() {
         return Err(Error::InvalidParams(format!(
-            "repository path is not a git repository: {}",
-            repo_path
+            "repository path is not a git repository: {repo_path}"
         )));
     }
 
@@ -1292,8 +1290,7 @@ mod tests {
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
         if probe == CowSupport::Unsupported {
             eprintln!(
-                "Skipping test: CoW not supported between {:?} and {:?}",
-                repo_path, workspaces_root
+                "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -1443,8 +1440,7 @@ mod tests {
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
         if probe == CowSupport::Unsupported {
             eprintln!(
-                "Skipping test: CoW not supported between {:?} and {:?}",
-                repo_path, workspaces_root
+                "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -1610,8 +1606,7 @@ mod tests {
         let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
         if probe == CowSupport::Unsupported {
             eprintln!(
-                "Skipping test: CoW not supported between {:?} and {:?}",
-                repo_path, workspaces_root
+                "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2174,7 +2169,7 @@ mod tests {
                 // Verify file2.txt is in canonical
                 assert!(canonical_path.join("file2.txt").exists());
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // Clean up
@@ -2252,7 +2247,7 @@ mod tests {
                 assert_eq!(overlapping_paths.len(), 1);
                 assert_eq!(overlapping_paths[0], "file1.txt");
             }
-            _ => panic!("Expected Blocked outcome, got {:?}", outcome),
+            _ => panic!("Expected Blocked outcome, got {outcome:?}"),
         }
 
         // Cleanup
@@ -2364,7 +2359,7 @@ mod tests {
                 // Verify canonical is pristine (not mid-merge)
                 assert!(repo.state() == git2::RepositoryState::Clean);
             }
-            _ => panic!("Expected Conflict outcome, got {:?}", outcome),
+            _ => panic!("Expected Conflict outcome, got {outcome:?}"),
         }
 
         // Clean up
@@ -2458,7 +2453,7 @@ mod tests {
                     "WIP snapshot must not be merged"
                 );
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // Clean up
@@ -2528,7 +2523,7 @@ mod tests {
         let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
         match outcome {
             MergeOutcome::Merged { .. } => {}
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // Verify attribution was preserved in canonical
@@ -2792,7 +2787,7 @@ mod tests {
 
         let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
         let MergeOutcome::Merged { canonical_head, .. } = outcome else {
-            panic!("Expected Merged outcome, got {:?}", outcome);
+            panic!("Expected Merged outcome, got {outcome:?}");
         };
 
         // Merge landed in the workspace checkout with attribution preserved.
@@ -2869,7 +2864,7 @@ mod tests {
             let blob_oid = canonical_repo.blob(b"intent blob payload").unwrap();
             canonical_repo
                 .reference(
-                    &format!("refs/intent/blobs/{}", blob_oid),
+                    &format!("refs/intent/blobs/{blob_oid}"),
                     blob_oid,
                     false,
                     "test blob ref",
@@ -2890,14 +2885,14 @@ mod tests {
                     .branch(&branch_name, &head_commit, false)
                     .unwrap();
                 sandbox_repo
-                    .set_head(&format!("refs/heads/{}", branch_name))
+                    .set_head(&format!("refs/heads/{branch_name}"))
                     .unwrap();
 
                 // Blob ref, as inherited from the source repo by CoW clones.
                 let blob_oid = sandbox_repo.blob(b"intent blob payload").unwrap();
                 sandbox_repo
                     .reference(
-                        &format!("refs/intent/blobs/{}", blob_oid),
+                        &format!("refs/intent/blobs/{blob_oid}"),
                         blob_oid,
                         false,
                         "test blob ref",
@@ -2938,7 +2933,7 @@ mod tests {
             MergeOutcome::Merged { .. } => {
                 assert!(canonical_path.join("agent.txt").exists());
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // The temp fetch ref is cleaned up after the merge.
@@ -2981,7 +2976,7 @@ mod tests {
                 .branch(&branch_name, &head_commit, false)
                 .unwrap();
             sandbox_repo
-                .set_head(&format!("refs/heads/{}", branch_name))
+                .set_head(&format!("refs/heads/{branch_name}"))
                 .unwrap();
         }
 
@@ -3021,7 +3016,7 @@ mod tests {
             MergeOutcome::Merged { .. } => {
                 assert!(canonical_path.join("agent.txt").exists());
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         let _ = fs::remove_dir_all(&test_root);
@@ -3076,7 +3071,7 @@ mod tests {
                 );
                 assert!(overlapping_paths.is_empty());
             }
-            _ => panic!("Expected Blocked outcome, got {:?}", outcome),
+            _ => panic!("Expected Blocked outcome, got {outcome:?}"),
         }
 
         // The sandbox record is untouched, so the merge stays retryable.

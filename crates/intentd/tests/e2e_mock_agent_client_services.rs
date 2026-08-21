@@ -129,7 +129,7 @@ async fn create_agent_session(
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

@@ -311,7 +311,7 @@ impl WsApiServer {
 
     /// Gracefully stop the listener (idempotent).
     pub async fn stop(&self) {
-        self.inner.stop().await
+        self.inner.stop().await;
     }
 
     /// The bound port, or `None` when not currently running.

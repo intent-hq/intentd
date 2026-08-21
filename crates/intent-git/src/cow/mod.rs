@@ -266,7 +266,7 @@ mod tests {
         let raw = vec![
             ".git".to_string(),
             ".git/objects".to_string(),
-            "".to_string(),
+            String::new(),
             "   ".to_string(),
             ".".to_string(),
             "..".to_string(),
@@ -323,7 +323,7 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
 
         let result = cow_probe(&src, &dst);
-        eprintln!("cow_probe result for target dir paths: {:?}", result);
+        eprintln!("cow_probe result for target dir paths: {result:?}");
 
         // Cleanup
         let _ = fs::remove_dir_all(&src);

@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_i64, opt_str, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.script = {
         list: () => host({ method: 'script.list' }),
@@ -30,7 +30,7 @@ pub(crate) const PRELUDE: &str = r#"
         run: (scriptId, options) =>
             host({ method: 'script.run', args: { scriptId, ...(options || {}) } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

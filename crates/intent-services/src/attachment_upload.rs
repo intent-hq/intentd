@@ -731,7 +731,7 @@ mod tests {
         let checkout = TempDir::new("attach-up-co");
         let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
-        let payload: Vec<u8> = (0u32..200_000).flat_map(|i| i.to_le_bytes()).collect();
+        let payload: Vec<u8> = (0u32..200_000).flat_map(u32::to_le_bytes).collect();
         let mid = payload.len() / 2;
         let upload_id = begin(&svc, &ws, &payload).await;
 
@@ -1331,11 +1331,7 @@ mod tests {
             .0
             .join(".attachment-upload-staging")
             .join(&upload_id);
-        std::fs::write(
-            staging.join(super::chunk_file_name(1)),
-            &payload[mid..mid + 1],
-        )
-        .unwrap();
+        std::fs::write(staging.join(super::chunk_file_name(1)), &payload[mid..=mid]).unwrap();
         let err = svc
             .file_attachment_upload_commit_op(upload_id.clone())
             .await

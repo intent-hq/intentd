@@ -165,7 +165,10 @@ mod tests {
             panic!("second joiner must follow");
         };
         guard.finish(Ok(Arc::new(serde_json::json!([{ "path": "a" }]))));
-        let slot = rx.wait_for(|s| s.is_some()).await.expect("published");
+        let slot = rx
+            .wait_for(std::option::Option::is_some)
+            .await
+            .expect("published");
         let shared = slot.clone().unwrap().expect("ok result");
         assert_eq!(*shared, serde_json::json!([{ "path": "a" }]));
         drop(slot);
@@ -216,7 +219,10 @@ mod tests {
             panic!("second joiner must follow");
         };
         drop(guard);
-        assert!(rx.wait_for(|s| s.is_some()).await.is_err(), "closed");
+        assert!(
+            rx.wait_for(std::option::Option::is_some).await.is_err(),
+            "closed"
+        );
         assert!(matches!(flights.join(&key(&ws)), Join::Leader(_)));
     }
 

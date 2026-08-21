@@ -71,7 +71,7 @@ impl Drop for Daemon {
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             if !log.is_empty() {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);

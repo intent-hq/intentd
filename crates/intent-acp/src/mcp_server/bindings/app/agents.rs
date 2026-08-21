@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.agents = {
@@ -22,7 +22,7 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'app.agents.readConversation', args: { workspaceId, agentId, ...(opts || {}) } }),
         waitFor: (options) => host({ method: 'app.agents.waitFor', args: options || {} }),
     };
-"#;
+";
 
 const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
@@ -648,8 +648,8 @@ mod tests {
             // Add 60 agents to test default limit
             for i in 0..60 {
                 agents.push(make_agent(
-                    &format!("agent-{}", i),
-                    &format!("Agent {}", i),
+                    &format!("agent-{i}"),
+                    &format!("Agent {i}"),
                     AgentStatus::Active,
                     &ws_id,
                 ));
@@ -679,8 +679,8 @@ mod tests {
             // Add 250 agents to test max limit clamping
             for i in 0..250 {
                 agents.push(make_agent(
-                    &format!("agent-{}", i),
-                    &format!("Agent {}", i),
+                    &format!("agent-{i}"),
+                    &format!("Agent {i}"),
                     AgentStatus::Active,
                     &ws_id,
                 ));

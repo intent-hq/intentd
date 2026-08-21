@@ -126,7 +126,7 @@ fn chat_params_require_agent_id() {
     assert_eq!(p.replace_group.as_deref(), Some("chat:agent-1"));
     assert_eq!(p.since_message_id, None);
 
-    for bad in [r#"{}"#, r#"{"agentId":""}"#, r#"{"agentId":5}"#] {
+    for bad in [r"{}", r#"{"agentId":""}"#, r#"{"agentId":5}"#] {
         let v = parse(bad);
         let err = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap_err();
         assert!(err.contains("agentId is required"));
@@ -229,7 +229,7 @@ fn comment_params_require_workspace_and_note() {
     assert_eq!(p.note_id, "n");
     assert_eq!(p.replace_group.as_deref(), Some("comment:n"));
 
-    for bad in [r#"{}"#, r#"{"workspaceId":"w"}"#, r#"{"noteId":"n"}"#] {
+    for bad in [r"{}", r#"{"workspaceId":"w"}"#, r#"{"noteId":"n"}"#] {
         let v = parse(bad);
         assert!(parse_comment_subscribe_params(v.as_object().unwrap()).is_err());
     }
@@ -241,7 +241,7 @@ fn workspace_params_are_global() {
     let p = parse_workspace_subscribe_params(v.as_object().unwrap()).unwrap();
     assert_eq!(p.replace_group.as_deref(), Some("workspaces"));
     // No workspaceId needed.
-    let empty = parse(r#"{}"#);
+    let empty = parse(r"{}");
     assert!(parse_workspace_subscribe_params(empty.as_object().unwrap()).is_ok());
 }
 
@@ -300,7 +300,7 @@ fn subscribe_params_require_workspace_id() {
     assert_eq!(p.workspace_id, "ws-1");
     assert_eq!(p.replace_group.as_deref(), Some("note:ws-1"));
 
-    for bad in [r#"{}"#, r#"{"workspaceId":""}"#, r#"{"workspaceId":5}"#] {
+    for bad in [r"{}", r#"{"workspaceId":""}"#, r#"{"workspaceId":5}"#] {
         let v = parse(bad);
         let err = parse_subscribe_params(v.as_object().unwrap()).unwrap_err();
         assert!(err.contains("workspaceId is required"));

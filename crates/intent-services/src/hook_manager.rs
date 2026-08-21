@@ -1068,7 +1068,7 @@ impl Services {
     /// run already in flight at expiry completes normally). The task
     /// deregisters itself from [`Services::hook_tasks`] on every exit path.
     fn spawn_hook_task(&self, hook: Hook) {
-        self.spawn_hook_task_with_initial_delay(hook, None)
+        self.spawn_hook_task_with_initial_delay(hook, None);
     }
 
     /// [`Services::spawn_hook_task`] with an explicit first-iteration sleep:
@@ -1098,8 +1098,8 @@ impl Services {
                     }
                 };
                 tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = expiry => {
+                    () = tokio::time::sleep(delay) => {}
+                    () = expiry => {
                         services.expire_hook(&mut hook).await;
                         break;
                     }

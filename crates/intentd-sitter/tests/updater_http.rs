@@ -32,7 +32,7 @@ fn handle(mut stream: TcpStream, routes: &HashMap<String, Vec<u8>>) {
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            Ok(_) if header != "\r\n" && !header.is_empty() => {}
             _ => break,
         }
     }
@@ -199,7 +199,7 @@ fn happy_path_downloads_verifies_installs_and_updates_state() {
 
     // In-flight download dirs are cleaned up.
     let leftovers = fs::read_dir(&paths.tmp_dir)
-        .map(|e| e.count())
+        .map(std::iter::Iterator::count)
         .unwrap_or_default();
     assert_eq!(leftovers, 0);
 }
@@ -523,7 +523,7 @@ fn serve_release_with_archive_hook(
             loop {
                 let mut header = String::new();
                 match reader.read_line(&mut header) {
-                    Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+                    Ok(_) if header != "\r\n" && !header.is_empty() => {}
                     _ => break,
                 }
             }

@@ -218,7 +218,7 @@ pub(crate) fn run_model_arg(repo_id: &str, quant: &str) -> String {
 fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Full-precision GGUF export tags. Valid files in unsloth repos, but never
@@ -559,7 +559,7 @@ impl ManagedServer {
 
     /// OS pid of the owned child; `None` for an adopted server.
     fn pid(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|c| c.id())
+        self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
     /// Snapshot the retained output tail as one newline-joined string. Waits
@@ -1995,7 +1995,7 @@ mod tests {
         assert_eq!(
             ep.limit,
             Some(UnslothModelLimit {
-                context: 262144,
+                context: 262_144,
                 output: 8192
             })
         );
@@ -2411,7 +2411,7 @@ mod tests {
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             mgr.ensure_endpoint(REPO, None, 2, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("cold start");
@@ -2432,7 +2432,7 @@ mod tests {
             let m3 = messages.clone();
             let ep = mgr
                 .ensure_endpoint(other, None, 2, &move |lvl, m| {
-                    m3.lock().unwrap().push((lvl, m))
+                    m3.lock().unwrap().push((lvl, m));
                 })
                 .await
                 .expect("switch");
@@ -2487,7 +2487,7 @@ mod tests {
             let m2 = messages.clone();
             let other = "unsloth/other-model-GGUF";
             mgr.ensure_endpoint(other, None, 0, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("switch");
@@ -2529,7 +2529,7 @@ mod tests {
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             mgr.ensure_endpoint(REPO, None, 1, &move |lvl, m| {
-                m2.lock().unwrap().push((lvl, m))
+                m2.lock().unwrap().push((lvl, m));
             })
             .await
             .expect("dead-child respawn");

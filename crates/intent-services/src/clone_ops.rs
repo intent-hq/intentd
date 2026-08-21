@@ -347,7 +347,7 @@ impl ProgressSink {
                 .await;
             }
             ProgressSink::Create(reporter) => {
-                reporter.clone_progress(phase, percent, message).await
+                reporter.clone_progress(phase, percent, message).await;
             }
         }
     }
@@ -465,8 +465,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
         Ok(Ok(status)) => {
             let msg = match tail_error {
-                Some(t) if !t.is_empty() => format!("git clone failed ({}): {}", status, t),
-                _ => format!("git clone failed ({})", status),
+                Some(t) if !t.is_empty() => format!("git clone failed ({status}): {t}"),
+                _ => format!("git clone failed ({status})"),
             };
             let redacted = redact_credentials(&msg);
             let category = classified(&redacted);

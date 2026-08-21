@@ -537,7 +537,7 @@ pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
     let config = provider_config(provider_id);
     let login_cmd = config
         .login_command_hint
-        .map(|h| h.to_string())
+        .map(std::string::ToString::to_string)
         .unwrap_or_else(|| format!("{} login", config.command));
 
     if is_remote {

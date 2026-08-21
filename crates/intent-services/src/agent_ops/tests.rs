@@ -2655,7 +2655,7 @@ async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -3301,7 +3301,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -3414,7 +3414,7 @@ async fn agent_create_mints_server_assigned_agent_id() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -3442,7 +3442,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -3630,7 +3630,7 @@ async fn report_to_parent_publishes_refreshed_subscriptions_changed() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -3863,7 +3863,12 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
 /// derivation are unaffected.
 #[test]
 fn live_preview_derivation_clips_trailing_partial_line() {
-    let blocks = |texts: &[&str]| texts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let blocks = |texts: &[&str]| {
+        texts
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+    };
 
     // Completed lines advance; the trailing partial line is excluded.
     let (resp, digest) = live_response_and_digest_from_blocks(
@@ -4057,7 +4062,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -5170,7 +5175,7 @@ async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
         .expect_err("unknown message id");
     match err {
         Error::InvalidParams(msg) => {
-            assert!(msg.contains("m-missing"), "names the message id: {msg}")
+            assert!(msg.contains("m-missing"), "names the message id: {msg}");
         }
         other => panic!("expected InvalidParams, got {other:?}"),
     }
@@ -5181,7 +5186,7 @@ async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
         .expect_err("out-of-range synthetic block id");
     match err {
         Error::InvalidParams(msg) => {
-            assert!(msg.contains(":9"), "names the block id: {msg}")
+            assert!(msg.contains(":9"), "names the block id: {msg}");
         }
         other => panic!("expected InvalidParams, got {other:?}"),
     }
@@ -5437,7 +5442,7 @@ async fn set_model_clears_resolved_display_model() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -5482,7 +5487,7 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -5523,7 +5528,7 @@ async fn set_model_reconciles_provider_after_first_real_use() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -5616,7 +5621,7 @@ async fn create_rejects_unknown_provider() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect_err("unknown compound-prefix provider must be rejected");
@@ -5676,7 +5681,7 @@ async fn create_records_session_started_usage_stats() {
         None,
         None,
         false,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("create with model");
@@ -5690,7 +5695,7 @@ async fn create_records_session_started_usage_stats() {
         None,
         None,
         false,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("create without model");
@@ -5830,7 +5835,7 @@ async fn create_rejects_bare_model_owned_by_other_provider() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect_err("bare cortex model with defaulted provider must be rejected");
@@ -5933,7 +5938,7 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
         None,
         None,
         false,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("unknown bare id with defaulted provider");
@@ -6440,7 +6445,7 @@ async fn rename_skip_if_explicitly_set() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create auto-named");
@@ -6714,7 +6719,7 @@ async fn report_to_parent_persists_completion_report() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6777,7 +6782,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6842,7 +6847,7 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6912,7 +6917,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6981,7 +6986,7 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -7126,7 +7131,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
             Some(parent.clone()),
             Some(foreign.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -7183,7 +7188,7 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -7421,7 +7426,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -10707,7 +10712,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create delegated child");
@@ -10768,7 +10773,7 @@ async fn report_to_parent_rejects_non_delegated_caller() {
         .expect_err("not delegated");
     match err {
         Error::Internal(m) => {
-            assert_eq!(m, "report_to_parent is only available to delegated agents")
+            assert_eq!(m, "report_to_parent is only available to delegated agents");
         }
         other => panic!("expected Internal, got {other:?}"),
     }
@@ -10785,7 +10790,7 @@ async fn report_to_parent_rejects_rpc_front_door() {
         .expect_err("no caller context");
     match err {
         Error::Internal(m) => {
-            assert_eq!(m, "report_to_parent is only available to delegated agents")
+            assert_eq!(m, "report_to_parent is only available to delegated agents");
         }
         other => panic!("expected Internal, got {other:?}"),
     }
@@ -11974,7 +11979,7 @@ async fn sender_watch_skips_child_sending_to_parent() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -12036,7 +12041,7 @@ async fn sender_watch_still_registers_for_child_sending_to_non_parent() {
             Some(parent),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -12069,7 +12074,7 @@ async fn sender_watch_still_registers_for_parent_sending_to_child() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -13123,7 +13128,7 @@ async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() 
         None,
         None,
         None,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("create");
@@ -13407,7 +13412,7 @@ async fn create_without_name_keeps_generic_agent_fallback() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -17442,7 +17447,7 @@ async fn request_attention_transitions_linked_task_per_kind() {
                 Some(parent.clone()),
                 Some(note_id.clone()),
                 false,
-                Default::default(),
+                AgentCreateExtra::default(),
             )
             .await
             .expect("create child");
@@ -17496,7 +17501,7 @@ async fn request_attention_repeat_at_target_status_does_not_churn_note() {
             Some(parent.clone()),
             Some(note_id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -17568,7 +17573,7 @@ async fn request_attention_does_not_overwrite_terminal_task_status() {
             None,
             Some(note_id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -18676,7 +18681,7 @@ async fn agent_get_session_projects_full_session_shape() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -18867,7 +18872,7 @@ async fn agent_update_model_change_clears_resolved_model() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -19287,7 +19292,7 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create old");
@@ -19300,7 +19305,7 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create new");
@@ -19341,7 +19346,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create live");
@@ -19354,7 +19359,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create stale");
@@ -19464,7 +19469,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create prev");
@@ -20511,7 +20516,7 @@ async fn clear_completion_report_on_turn_begin() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -21651,7 +21656,7 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
     assert!(persisted_queue(&svc, &target).await.is_empty());
     {
         let guard = svc.agent_queues.lock().unwrap();
-        assert!(guard.get(&target).is_none_or(|q| q.is_empty()));
+        assert!(guard.get(&target).is_none_or(std::vec::Vec::is_empty));
         let parked = guard.get(&poisoned).expect("still parked");
         assert_eq!(parked.len(), 2);
         assert_eq!(parked[0].id, "m-0");
@@ -22053,7 +22058,7 @@ async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -22306,7 +22311,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create prev");

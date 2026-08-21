@@ -148,8 +148,7 @@ fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     // is in use by another worktree (including the main working tree).
     if msg.contains("already checked out") {
         Error::InvalidParams(format!(
-            "branch '{}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree",
-            branch
+            "branch '{branch}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree"
         ))
     } else {
         map_git_err(e)
@@ -293,9 +292,7 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
             // Trash-candidate collision (`EEXIST` / `ENOTEMPTY`; the latter has
             // no stable `ErrorKind` on our MSRV, so probe the candidate): retry
             // with a fresh nonce.
-            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {
-                continue;
-            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {}
             Err(e) => {
                 tracing::debug!(
                     error = %e,

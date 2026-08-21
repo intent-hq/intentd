@@ -136,7 +136,7 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -156,14 +156,14 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
     // The long call polls the workspace root via `ws.file.list` until the
     // release file appears — a real blocking tool call held open server-side.
     let release_file = ws_root.join("release.flag");
-    let long_call_code = r#"
+    let long_call_code = r"
         let found = false;
         while (!found) {
             const entries = await ws.file.list('.');
             found = entries.some((e) => e.name === 'release.flag');
         }
         return 'long-call-done';
-    "#;
+    ";
 
     let behavior = serde_json::json!({
         "bridgeConcurrency": {

@@ -769,7 +769,7 @@ mod find_provider_binary_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let unique_cmd = format!("intent-test-absent-{}", nanos);
+        let unique_cmd = format!("intent-test-absent-{nanos}");
         let result = find_provider_binary("nonexistent", &unique_cmd, None);
         assert_eq!(result, None);
     }
@@ -789,7 +789,7 @@ mod find_provider_binary_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let unique_cmd = format!("intent-test-cmd-{nanos}");
         let result = find_provider_binary("test", &unique_cmd, Some(""));
         assert_eq!(result, None);
     }
@@ -800,7 +800,7 @@ mod find_provider_binary_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let unique_cmd = format!("intent-test-cmd-{nanos}");
         let result = find_provider_binary("test", &unique_cmd, Some("   "));
         assert_eq!(result, None);
     }
@@ -813,7 +813,7 @@ mod find_provider_binary_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let unique_cmd = format!("intent-test-cmd-{}", nanos);
+        let unique_cmd = format!("intent-test-cmd-{nanos}");
         let result = find_provider_binary("test", &unique_cmd, Some("/nonexistent/path/binary"));
         // Should fall through and return None since we don't have managed bin or PATH match
         assert_eq!(result, None);
@@ -827,7 +827,7 @@ mod find_provider_binary_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let unique_cmd = format!("intent-test-nocand-{}", nanos);
+        let unique_cmd = format!("intent-test-nocand-{nanos}");
         let result = find_provider_binary("test", &unique_cmd, None);
         assert_eq!(result, None);
     }

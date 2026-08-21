@@ -643,10 +643,10 @@ impl Services {
             match unwound {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind failed")
+                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind failed");
                 }
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind task failed")
+                    tracing::warn!(path = %path.display(), error = %e, "export cleanup: WIP unwind task failed");
                 }
             }
         }

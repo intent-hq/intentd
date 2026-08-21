@@ -144,7 +144,7 @@ pub(crate) fn parse_effort_minutes(raw: &str) -> Option<u64> {
     // Hyphen-joined unit: "90-minute", "1.5-hour" — read the hyphen as a
     // space when the right side is a unit word.
     let (left, right) = s.split_once('-')?;
-    if !right.chars().next().is_some_and(|c| c.is_alphabetic()) {
+    if !right.chars().next().is_some_and(char::is_alphabetic) {
         return None;
     }
     let (minutes, _) = side_minutes(&format!("{left} {right}"), None)?;

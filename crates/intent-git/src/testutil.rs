@@ -116,7 +116,7 @@ pub(crate) fn commit_gitlink_bump(super_path: &Path, sub_rel: &str, sha: &str) {
         mtime: git2::IndexTime::new(0, 0),
         dev: 0,
         ino: 0,
-        mode: 0o160000,
+        mode: 0o160_000,
         uid: 0,
         gid: 0,
         file_size: 0,

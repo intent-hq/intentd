@@ -24,7 +24,7 @@ fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
 
 /// Shared preamble: an NDJSON JSON-RPC loop that answers `initialize` and
 /// `session/new`, then hands `session/prompt` to `onPrompt(id, msg)`.
-const ADAPTER_PRELUDE: &str = r#"
+const ADAPTER_PRELUDE: &str = r"
 import readline from 'node:readline';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const result = (id, r) => send({ jsonrpc: '2.0', id, result: r });
@@ -44,7 +44,7 @@ rl.on('line', async (line) => {
   if (msg.id !== undefined && msg.method === undefined) return onClientResponse(msg);
 });
 let onClientResponse = () => {};
-"#;
+";
 
 #[tokio::test]
 async fn one_shot_collects_streamed_reply_text() {

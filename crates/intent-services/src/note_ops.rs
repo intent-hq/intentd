@@ -1562,7 +1562,7 @@ fn strip_links(s: &str) -> String {
                 }
             }
         }
-        out.push_str(&rest[..open + 1]);
+        out.push_str(&rest[..=open]);
         rest = &rest[open + 1..];
     }
     out.push_str(rest);
@@ -2586,7 +2586,7 @@ mod tests {
     const PHANTOM_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
     fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+        ids.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]

@@ -645,7 +645,7 @@ mod tests {
         let repo = git2::Repository::open(repo_path).unwrap();
         let remotes = repo.remotes().unwrap();
         let mut names = Vec::new();
-        for name in remotes.iter() {
+        for name in &remotes {
             if let Ok(Some(n)) = name {
                 names.push(n.to_string());
             }

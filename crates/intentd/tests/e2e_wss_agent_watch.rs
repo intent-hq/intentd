@@ -252,7 +252,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -276,7 +276,7 @@ async fn wss_event_opt_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> 
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -602,7 +602,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
 
     const SETUP_SUBS: &str = "WATCH1_SETUP_SUBS";
     const TARGET_GO: &str = "WATCH1_TARGET_GO";
-    let subs_js = r#"
+    let subs_js = r"
         const out = [];
         try { await ws.event.subscribe(['agent:message']); out.push('msgGuard=missing'); }
         catch (e) { out.push('msgGuard=' + (e.message.includes('ws.agent.watch') ? 'watch' : 'other')); }
@@ -615,7 +615,7 @@ async fn agent_subscribe_policy_and_bare_star_narrowing_via_mcp_over_wss() {
         out.push('starDelta=' + sub.eventTypes.includes('chat:stream:delta'));
         out.push('starFile=' + sub.eventTypes.includes('file:*'));
         return out.join(' ');
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -786,18 +786,18 @@ const DISCUSS_REASON: &str = "WATCH2 need a coordinator decision";
 
 /// The mock behavior shared by every WATCH-2 arm.
 fn watch_lifecycle_behavior() -> String {
-    let watch_js = r#"
+    let watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'WatchTarget');
         const r = await ws.agent.watch(t.id);
         return 'watched=' + r.ok + ' watchTarget=' + r.agentId;
-    "#;
-    let unwatch_js = r#"
+    ";
+    let unwatch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'WatchTarget');
         const r = await ws.agent.unwatch(t.id);
         return 'unwatched=' + r.removed;
-    "#;
+    ";
     let blocker_js = format!(
         "return await ws.agent.reportBlocker({});",
         json!(BLOCKER_REASON)
@@ -1245,18 +1245,18 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
     const MIDDLE_GO: &str = "WATCH3_MIDDLE_GO";
     const LEAF_GO: &str = "WATCH3_LEAF_GO";
 
-    let coord_watch_js = r#"
+    let coord_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'DeferMiddle');
         const r = await ws.agent.watch(t.id);
         return 'coordWatched=' + r.ok;
-    "#;
-    let middle_watch_js = r#"
+    ";
+    let middle_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'DeferLeaf');
         const r = await ws.agent.watch(t.id);
         return 'midWatched=' + r.ok;
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -1421,18 +1421,18 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
     const REARM_GO: &str = "WATCH4_REARM_GO";
     const LEAF_GO: &str = "WATCH4_LEAF_GO";
 
-    let middle_watch_js = r#"
+    let middle_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'RearmLeaf');
         const r = await ws.agent.watch(t.id);
         return 'midWatched=' + r.ok;
-    "#;
-    let rearm_js = r#"
+    ";
+    let rearm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'RearmMiddle');
         const r = await ws.agent.watch(t.id);
         return 'rearmed=' + r.ok;
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "watcher acknowledged wake" },
@@ -1637,19 +1637,19 @@ async fn agent_watch_rearm_adoption_after_report_fires_next_completion_over_wss(
         "const r = await ws.agent.create('AdoptChild', '{CHILD_GO} do your work', \
          {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
     );
-    let child_watch_js = r#"
+    let child_watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'AdoptLeaf');
         const r = await ws.agent.watch(t.id);
         return 'leafWatched=' + r.ok;
-    "#;
+    ";
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
-    let rearm_js = r#"
+    let rearm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'AdoptChild');
         const r = await ws.agent.watch(t.id);
         return 'rearmed=' + r.ok;
-    "#;
+    ";
     // Wake-ack rules FIRST: every wake turn (report wake, hook/completion
     // wakes) must ack, never re-run a marker rule off replayed history.
     let behavior = json!({
@@ -1853,12 +1853,12 @@ async fn report_wake_then_rearm_suppresses_same_cycle_completion_over_wss() {
          {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
     );
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
-    let rearm_js = r#"
+    let rearm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'DedupChild');
         const r = await ws.agent.watch(t.id);
         return 'rearmed=' + r.ok;
-    "#;
+    ";
     // Wake-ack rule FIRST: the report wake and any completion wake ack,
     // never re-run a marker rule off replayed history. The child's reporting
     // rule parks a silent tail AFTER the report tool call and BEFORE the
@@ -2061,12 +2061,12 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
         )
     );
     let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
-    let arm_js = r#"
+    let arm_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'HookChild');
         const r = await ws.agent.watch(t.id);
         return 'armed=' + r.ok;
-    "#;
+    ";
     let behavior = json!({
         "rules": [
             { "ifPromptContains": "[Background hook", "response": "hook wake handled" },
@@ -2294,7 +2294,7 @@ async fn wake_rows_serialized(
         .expect("messages array")
         .iter()
         .filter(|m| m["role"] == "user")
-        .map(|m| m.to_string())
+        .map(std::string::ToString::to_string)
         .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect()
 }

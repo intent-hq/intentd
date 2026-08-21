@@ -198,7 +198,7 @@ async fn dropped_request_future_cleans_pending_map_entry() {
     // Drive the future far enough to write the request and insert the entry.
     tokio::select! {
         _ = &mut fut => panic!("request must still be pending"),
-        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
     assert_eq!(conn.pending_len(), 1, "in-flight request is correlated");
     drop(fut);
@@ -1616,14 +1616,14 @@ mod mcp_tests {
                         workspace_id,
                         title: input.title,
                         content: input.content.unwrap_or_default(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 0,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6144,13 +6144,13 @@ mod wsapi3_bindings_tests {
             workspace_id: ws.clone(),
             title: format!("title-{id}"),
             content: "line one\nline two\n![alt](workspace-asset://ws/asset-1)".to_string(),
-            content_type: Default::default(),
+            content_type: intent_core::ContentType::default(),
             tags: vec!["a".to_string()],
             is_pinned: false,
             is_archived: false,
             is_default: false,
             parent_id: None,
-            visibility: Default::default(),
+            visibility: intent_core::NoteVisibility::default(),
             metadata: NoteMetadata { task },
             created_at: "2026-01-01T00:00:00Z".to_string(),
             rev: 1,
@@ -6209,14 +6209,14 @@ mod wsapi3_bindings_tests {
                         workspace_id: ws.clone(),
                         title: "First".to_string(),
                         content: String::new(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: vec!["red".to_string()],
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6226,14 +6226,14 @@ mod wsapi3_bindings_tests {
                         workspace_id: ws,
                         title: "Second".to_string(),
                         content: String::new(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: vec!["blue".to_string()],
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6262,14 +6262,14 @@ mod wsapi3_bindings_tests {
                         workspace_id,
                         title: input.title,
                         content: input.content.unwrap_or_default(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6769,10 +6769,10 @@ mod wsapi3_bindings_tests {
                         kind: CommentType::Comment,
                         content: "root".to_string(),
                         author: "Agent".to_string(),
-                        author_type: Default::default(),
-                        status: Default::default(),
+                        author_type: intent_core::AuthorType::default(),
+                        status: intent_core::CommentStatus::default(),
                         parent_id: None,
-                        anchor: Default::default(),
+                        anchor: Option::default(),
                         anchor_text: None,
                         anchor_context: None,
                         suggestion_diff: None,
@@ -6819,10 +6819,10 @@ mod wsapi3_bindings_tests {
                         kind: CommentType::Comment,
                         content: comment,
                         author: "Agent".to_string(),
-                        author_type: Default::default(),
-                        status: Default::default(),
+                        author_type: intent_core::AuthorType::default(),
+                        status: intent_core::CommentStatus::default(),
                         parent_id: None,
-                        anchor: Default::default(),
+                        anchor: Option::default(),
                         anchor_text: None,
                         anchor_context: None,
                         suggestion_diff: None,
@@ -7494,14 +7494,14 @@ mod wsapi3_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            r#"
+            r"
             const [a, b, c] = await Promise.all([
                 ws.note.list(),
                 ws.note.listTasks('n-1'),
                 ws.task.getMyTask('task-1'),
             ]);
             return { listLen: a.length, taskRows: b.length, taskTitle: c.title };
-            "#,
+            ",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7879,7 +7879,7 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server_with_caller("agent-77");
         let resp = call(
             &srv,
-            r#"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');"#,
+            r"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7903,10 +7903,10 @@ mod wsapi6_bindings_tests {
         let (srv, _api) = server();
         let resp = call(
             &srv,
-            r#"return await ws.browser.exec([
+            r"return await ws.browser.exec([
                 { action: 'listTabs' },
                 { action: 'screenshot' }
-            ]);"#,
+            ]);",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -8605,7 +8605,10 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
-        assert!(v.get("subscriptionId").map(|v| v.is_null()).unwrap_or(true));
+        assert!(v
+            .get("subscriptionId")
+            .map(serde_json::Value::is_null)
+            .unwrap_or(true));
         assert!(api.watch_sender_calls.lock().unwrap().is_empty());
     }
 

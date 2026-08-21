@@ -213,7 +213,7 @@ pub(crate) fn ready_set_delta(
 ) -> Vec<UnblockedTask> {
     let triggers: HashSet<&str> = trigger_completions
         .iter()
-        .map(|id| id.as_str())
+        .map(std::string::String::as_str)
         .filter(|id| snaps.get(*id).map(|s| s.status) == Some(TaskStatus::Complete))
         .collect();
     if triggers.is_empty() {
@@ -280,8 +280,11 @@ mod tests {
     fn snap(status: TaskStatus, deps: &[&str], conflicts: &[&str]) -> BatchTaskSnap {
         BatchTaskSnap {
             status,
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            conflicts_with: conflicts.iter().map(|s| s.to_string()).collect(),
+            depends_on: deps.iter().map(std::string::ToString::to_string).collect(),
+            conflicts_with: conflicts
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             live_agent: None,
             effort_minutes: None,
         }
@@ -293,7 +296,7 @@ mod tests {
     }
 
     fn ids(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(std::string::ToString::to_string).collect()
     }
 
     fn titles(pairs: &[(&str, &str)]) -> HashMap<String, String> {
