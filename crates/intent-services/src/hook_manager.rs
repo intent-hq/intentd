@@ -3217,7 +3217,10 @@ mod tests {
     #[test]
     fn resumed_next_run_preserves_earlier_deadline_verbatim() {
         let (ws, owner) = (WorkspaceId::new(), AgentId::from("agent-hooks"));
-        let due_at = next_run_at_iso(1_000);
+        // 60s out: comfortably earlier than the fresh 10-minute cadence, and
+        // wide enough that the remaining-delay bounds below hold under any
+        // realistic scheduler stall between building the row and the call.
+        let due_at = next_run_at_iso(60_000);
         let hook = countdown_row(
             &ws,
             &owner,
@@ -3228,8 +3231,9 @@ mod tests {
         let (next_run_at, initial_delay) = resumed_next_run(&hook);
         assert_eq!(next_run_at, due_at, "persisted deadline kept verbatim");
         assert!(
-            initial_delay <= Duration::from_millis(1_000),
-            "remaining time, not a fresh cadence: {initial_delay:?}"
+            initial_delay > Duration::from_secs(30) && initial_delay <= Duration::from_secs(60),
+            "remaining time to the persisted deadline — neither an immediate \
+             run nor a fresh cadence: {initial_delay:?}"
         );
     }
 
