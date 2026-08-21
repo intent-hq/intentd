@@ -33,6 +33,7 @@ static NOISE_DIRECTORIES: &[&str] = &[
 ];
 
 /// Resolve the user's home directory from the environment (cross-platform).
+#[cfg(not(test))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -162,6 +163,13 @@ fn get_scan_targets(
 ) -> Vec<ScanTarget> {
     let mut targets = Vec::new();
 
+    // Hermetic-test seam (intent-hq/monorepo#3029): unit tests never fall
+    // back to the developer's real home directory — user-installed skills
+    // would otherwise leak into prompts assembled by tests. Tests that need
+    // user-scope targets pass an explicit `home_override`.
+    #[cfg(test)]
+    let home = home_override;
+    #[cfg(not(test))]
     let home = home_override.or_else(home_dir);
     if let Some(home) = home {
         targets.push(ScanTarget {
@@ -747,6 +755,22 @@ mod tests {
     fn clear_cache() {
         let mut cache = DISCOVERY_CACHE.lock().unwrap();
         cache.clear();
+    }
+
+    /// Hermeticity regression (intent-hq/monorepo#3029): in test builds,
+    /// scanning without an explicit home override must never produce
+    /// user-scope targets — the developer's real home directory (and any
+    /// skills installed there) stays out of test-assembled prompts.
+    #[test]
+    fn test_scan_targets_without_home_override_skip_user_scope() {
+        let targets = get_scan_targets(Some("/tmp/ws"), None);
+        assert!(
+            targets.iter().all(|t| t.scope == "project"),
+            "no user-scope scan targets without an explicit home override"
+        );
+
+        let with_home = get_scan_targets(Some("/tmp/ws"), Some(PathBuf::from("/tmp/home")));
+        assert!(with_home.iter().any(|t| t.scope == "user"));
     }
 
     #[tokio::test]

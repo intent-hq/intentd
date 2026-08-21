@@ -3253,8 +3253,19 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let (_dir, repo_path) = temp_repo("snapshot-nested-non-utf8");
-        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
         let name = std::ffi::OsStr::from_bytes(b"bad-\xff-wt");
+        // Some filesystems reject non-UTF-8 file names outright (APFS on
+        // macOS fails with EILSEQ), so the fixture cannot exist there. Probe
+        // at runtime and skip instead of failing (intent-hq/monorepo#3028);
+        // the test still runs fully on Linux/CI.
+        if fs::create_dir(repo_path.join(name)).is_err() {
+            eprintln!(
+                "skipping create_snapshot_commit_skips_non_utf8_nested_repo_names: \
+                 filesystem rejects non-UTF-8 file names"
+            );
+            return;
+        }
+        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
         make_nested_repo(&repo_path, Path::new(name));
         fs::write(repo_path.join("dirty.txt"), "dirty").unwrap();
 
