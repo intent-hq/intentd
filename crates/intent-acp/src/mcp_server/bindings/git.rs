@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use super::{map_err, opt_bool, opt_vec_str, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.git = {
         commit: (message, opts) =>
@@ -33,7 +33,7 @@ pub(crate) const PRELUDE: &str = r#"
         listRoots: () =>
             host({ method: 'git.listRoots', args: {} }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

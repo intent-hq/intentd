@@ -185,7 +185,7 @@ async fn wss_rpc(ws: &mut common::TlsWs, id: i64, method: &str, params: Value) -
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -210,7 +210,7 @@ async fn wss_event_until(ws: &mut common::TlsWs, deadline: tokio::time::Instant)
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

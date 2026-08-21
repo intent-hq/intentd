@@ -81,7 +81,7 @@ impl<T: Copy + PartialEq> LastObservedCache<T> {
     /// intervened. A poisoned lock returns `u64::MAX` (never matches a live
     /// generation, and the write path bails on the poisoned lock anyway).
     fn generation(&self) -> u64 {
-        self.0.lock().map(|g| g.evictions).unwrap_or(u64::MAX)
+        self.0.lock().map_or(u64::MAX, |g| g.evictions)
     }
 
     /// Seed the baseline when absent (read paths): records the first

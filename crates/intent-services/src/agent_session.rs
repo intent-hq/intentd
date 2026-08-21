@@ -94,8 +94,7 @@ fn wake_resume_self_heal_debounce() -> Duration {
     std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+        .map_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE, Duration::from_millis)
 }
 
 /// Query surface the turn driver uses to decide whether a failed turn's active
@@ -960,11 +959,15 @@ pub(crate) fn resolve_provider_id(
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
         .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .or_else(|| {
+            provider
+                .filter(|p| !p.is_empty())
+                .map(std::string::ToString::to_string)
+        })
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
-                .map(|p| p.to_string())
+                .map(std::string::ToString::to_string)
         })
         .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
@@ -1231,7 +1234,7 @@ impl Services {
     pub(crate) fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone(), silent_tail_ms);
     }
 
@@ -1241,7 +1244,7 @@ impl Services {
     pub(crate) fn last_turn_silent_tail(&self, agent_id: &AgentId) -> Option<u64> {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .copied()
     }
@@ -1251,7 +1254,7 @@ impl Services {
     pub(crate) fn clear_turn_silent_tail(&self, agent_id: &AgentId) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1264,7 +1267,7 @@ impl Services {
         let mut map = self
             .truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = map.entry(agent_id.clone()).or_insert(0);
         *count += 1;
         *count
@@ -1278,7 +1281,7 @@ impl Services {
     pub(crate) fn clear_truncation_redrives(&self, agent_id: &AgentId) {
         self.truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1291,7 +1294,7 @@ impl Services {
     pub(crate) fn arm_truncation_redrive(&self, agent_id: &AgentId) {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone());
     }
 
@@ -1303,7 +1306,7 @@ impl Services {
     pub(crate) fn take_truncation_redrive(&self, agent_id: &AgentId) -> bool {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id)
     }
 
@@ -2080,9 +2083,9 @@ impl Services {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => continue, // a straggler arrived → keep draining
-                Ok(None) => break,       // channel closed
-                Err(_) => break,         // quiet for the settle window → done
+                Ok(Some(_)) => {}  // a straggler arrived → keep draining
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // quiet for the settle window → done
             }
         }
     }
@@ -3331,7 +3334,7 @@ impl Services {
                 prev.as_ref(),
                 &token_usage::snapshot_from_turn_usage(u),
             ),
-            _ => Default::default(),
+            _ => intent_core::TokenUsageTotals::default(),
         };
         let delta = intent_store::UsageStatsDelta {
             input_tokens: tokens.input_tokens,
@@ -3513,7 +3516,7 @@ impl Services {
                     self.turn_attachments
                         .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
                         .iter()
-                        .map(|a| a.resource_item())
+                        .map(intent_core::TurnAttachment::resource_item)
                         .collect()
                 } else {
                     Vec::new()

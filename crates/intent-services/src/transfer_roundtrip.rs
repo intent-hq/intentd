@@ -566,8 +566,7 @@ async fn transfer_round_trip_between_two_stacks() {
             .tables
             .iter()
             .find(|t| t.name == n)
-            .map(|t| t.row_count)
-            .unwrap_or(-1)
+            .map_or(-1, |t| t.row_count)
     };
     assert_eq!(plan_rows("agent_session"), 3);
     assert_eq!(plan_rows("agent_message"), 3);
@@ -608,8 +607,7 @@ async fn transfer_round_trip_between_two_stacks() {
         stats
             .iter()
             .find(|s| s.name == n)
-            .map(|s| s.row_count)
-            .unwrap_or(-1)
+            .map_or(-1, |s| s.row_count)
     };
     assert_eq!(rows("workspace"), 1);
     assert_eq!(rows("note"), 2);

@@ -276,8 +276,10 @@ async fn run_hook_script(
         .last_state
         .as_deref()
         .filter(|s| serde_json::from_str::<Value>(s).is_ok())
-        .map(|s| format!("JSON.parse({})", Value::String(s.to_string())))
-        .unwrap_or_else(|| "null".to_string());
+        .map_or_else(
+            || "null".to_string(),
+            |s| format!("JSON.parse({})", Value::String(s.to_string())),
+        );
     let full_code = format!(
         "{prelude}\n\
          const __hook_logs = [];\n\
@@ -1068,7 +1070,7 @@ impl Services {
     /// run already in flight at expiry completes normally). The task
     /// deregisters itself from [`Services::hook_tasks`] on every exit path.
     fn spawn_hook_task(&self, hook: Hook) {
-        self.spawn_hook_task_with_initial_delay(hook, None)
+        self.spawn_hook_task_with_initial_delay(hook, None);
     }
 
     /// [`Services::spawn_hook_task`] with an explicit first-iteration sleep:
@@ -1098,8 +1100,8 @@ impl Services {
                     }
                 };
                 tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = expiry => {
+                    () = tokio::time::sleep(delay) => {}
+                    () = expiry => {
                         services.expire_hook(&mut hook).await;
                         break;
                     }
@@ -1315,7 +1317,7 @@ impl Services {
                     self.store
                         .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                         .await?;
-                    hook.last_logs = logs.clone();
+                    hook.last_logs.clone_from(logs);
                 }
                 // Persist the error before the terminal state so a reader
                 // that observes `evicted` always sees `lastError`.

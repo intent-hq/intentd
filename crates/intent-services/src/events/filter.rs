@@ -124,7 +124,11 @@ pub(crate) fn resolve_event_types(event_types: &[String]) -> Vec<String> {
     let mut resolved = Vec::new();
     for ev in event_types {
         if ev == "*" {
-            resolved.extend(VALID_EVENT_CATEGORY_WILDCARDS.iter().map(|s| s.to_string()));
+            resolved.extend(
+                VALID_EVENT_CATEGORY_WILDCARDS
+                    .iter()
+                    .map(std::string::ToString::to_string),
+            );
         } else {
             resolved.push(ev.clone());
         }
@@ -143,7 +147,7 @@ pub(crate) fn resolve_event_types_for_agent(event_types: &[String]) -> Vec<Strin
             resolved.extend(
                 AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS
                     .iter()
-                    .map(|s| s.to_string()),
+                    .map(std::string::ToString::to_string),
             );
         } else {
             resolved.push(ev.clone());
@@ -225,7 +229,7 @@ mod tests {
             event_type: event_type.to_string(),
             actor: EventActor {
                 actor_type,
-                id: actor_id.map(|s| s.to_string()),
+                id: actor_id.map(std::string::ToString::to_string),
                 ..Default::default()
             },
             session_id: None,

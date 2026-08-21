@@ -644,7 +644,7 @@ mod watermark_tests {
             Box::pin(conn.request_timeout("session/prompt", json!({}), Duration::from_secs(60)));
         tokio::select! {
             _ = &mut fut => panic!("request must still be pending"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         drop(fut);
         assert!(!conn.has_pending_requests(), "drop guard removed the entry");
@@ -705,7 +705,7 @@ mod watermark_tests {
             Box::pin(conn.request_timeout("session/ping", json!({}), Duration::from_secs(60)));
         tokio::select! {
             _ = &mut fut => panic!("request must still be pending"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         assert!(conn.has_pending_requests(), "in-flight request: pending");
 

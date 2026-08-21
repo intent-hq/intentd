@@ -449,7 +449,7 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
                             .chain(&group.inferred_levels)
                             .any(|level| level.eq_ignore_ascii_case(effort))
                     })
-                    .map(|effort| effort.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect();
                 push_unique(
                     &mut levels,

@@ -190,7 +190,7 @@ where
             Some(Ok(Message::Ping(payload))) => {
                 let _ = ws.send(Message::Pong(payload)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -234,7 +234,7 @@ async fn next_script_change<S>(
             Some(Ok(Message::Ping(payload))) => {
                 let _ = ws.send(Message::Pong(payload)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

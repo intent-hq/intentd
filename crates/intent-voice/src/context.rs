@@ -65,7 +65,7 @@ mod tests {
     use super::*;
 
     fn vocab(terms: &[&str]) -> Vec<String> {
-        terms.iter().map(|s| s.to_string()).collect()
+        terms.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]

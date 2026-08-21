@@ -429,6 +429,7 @@ fn usefulness(spelling: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn extract(sources: &[(SourceKind, &str)]) -> Vec<String> {
         extract_vocabulary(sources, 100)
@@ -573,10 +574,10 @@ mod tests {
 
     #[test]
     fn caps_at_max_terms() {
-        let text: String = (0..20)
-            .map(|i| format!("zzterm{i:02}x "))
-            .collect::<Vec<_>>()
-            .join("");
+        let text = (0..20).fold(String::new(), |mut s, i| {
+            let _ = write!(s, "zzterm{i:02}x ");
+            s
+        });
         let out = extract_vocabulary(&[(SourceKind::Plain, &text)], 5);
         assert_eq!(out.len(), 5);
     }

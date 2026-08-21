@@ -9,6 +9,7 @@
 //! (`serde_json::Value`) rather than typed blocks, mirroring the persisted shape.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use intent_core::AgentMessage;
 use serde_json::{json, Value};
@@ -70,7 +71,7 @@ fn is_truthy(v: &Value) -> bool {
         Value::Null => false,
         Value::Bool(b) => *b,
         Value::String(s) => !s.is_empty(),
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Value::Number(n) => n.as_f64() != Some(0.0),
         Value::Array(_) | Value::Object(_) => true,
     }
 }
@@ -89,8 +90,7 @@ fn str_field(block: &Value, keys: &[&str]) -> String {
 
 /// Whether any of `keys` is truthy (the `a || b || false` boolean chain).
 fn bool_field(block: &Value, keys: &[&str]) -> bool {
-    keys.iter()
-        .any(|k| block.get(*k).map(is_truthy).unwrap_or(false))
+    keys.iter().any(|k| block.get(*k).is_some_and(is_truthy))
 }
 
 /// First truthy value among `keys` (the `a || b` chain for values).
@@ -227,14 +227,15 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
         match block.get("type").and_then(Value::as_str).unwrap_or("") {
             "text" => {
                 let text = str_field(block, &["text", "content"]);
-                xml.push_str(&format!("{indent}<text>{}</text>\n", escape_xml(&text)));
+                let _ = writeln!(xml, "{indent}<text>{}</text>", escape_xml(&text));
             }
             "thinking" => {
                 let thinking = str_field(block, &["text", "content"]);
-                xml.push_str(&format!(
-                    "{indent}<thinking>{}</thinking>\n",
+                let _ = writeln!(
+                    xml,
+                    "{indent}<thinking>{}</thinking>",
                     escape_xml(&thinking)
-                ));
+                );
             }
             "tool_use" => {
                 let raw_name = str_field(block, &["name", "toolName"]);
@@ -254,11 +255,12 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
                     &safe_stringify(&raw_input),
                     MAX_TOOL_CONTENT_CHARS,
                 ));
-                xml.push_str(&format!(
-                    "{indent}<tool_use name=\"{tool_name}\" tool_use_id=\"{tool_use_id}\">\n"
-                ));
-                xml.push_str(&format!("{indent}  {input_str}\n"));
-                xml.push_str(&format!("{indent}</tool_use>\n"));
+                let _ = writeln!(
+                    xml,
+                    "{indent}<tool_use name=\"{tool_name}\" tool_use_id=\"{tool_use_id}\">"
+                );
+                let _ = writeln!(xml, "{indent}  {input_str}");
+                let _ = writeln!(xml, "{indent}</tool_use>");
             }
             "tool_result" => {
                 let tool_use_id = escape_xml(&str_field(block, &["tool_use_id"]));
@@ -269,11 +271,12 @@ fn render_content_blocks(blocks: &[Value], indent: &str) -> String {
                     &safe_stringify(&content),
                     MAX_TOOL_CONTENT_CHARS,
                 ));
-                xml.push_str(&format!(
-                    "{indent}<tool_result tool_use_id=\"{tool_use_id}\" is_error=\"{is_error}\">\n"
-                ));
-                xml.push_str(&format!("{indent}  {content_str}\n"));
-                xml.push_str(&format!("{indent}</tool_result>\n"));
+                let _ = writeln!(
+                    xml,
+                    "{indent}<tool_result tool_use_id=\"{tool_use_id}\" is_error=\"{is_error}\">"
+                );
+                let _ = writeln!(xml, "{indent}  {content_str}");
+                let _ = writeln!(xml, "{indent}</tool_result>");
             }
             _ => {}
         }
@@ -348,9 +351,9 @@ pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize)
                 } else {
                     "agent_response_or_tool_uses"
                 };
-                s.push_str(&format!("  <{tag}>\n"));
+                let _ = writeln!(s, "  <{tag}>");
                 s.push_str(&render_content_blocks(&assistant.blocks, "    "));
-                s.push_str(&format!("  </{tag}>\n"));
+                let _ = writeln!(s, "  </{tag}>");
             }
             s.push_str("</exchange>\n");
             s
@@ -381,9 +384,10 @@ pub(crate) fn format_history_as_xml(messages: &[AgentMessage], max_chars: usize)
 
     let mut exchanges_xml = String::new();
     if omitted_count > 0 {
-        exchanges_xml.push_str(&format!(
-            "<!-- {omitted_count} earlier exchanges omitted due to size limits -->\n"
-        ));
+        let _ = writeln!(
+            exchanges_xml,
+            "<!-- {omitted_count} earlier exchanges omitted due to size limits -->"
+        );
     }
     exchanges_xml.push_str(&included.concat());
 

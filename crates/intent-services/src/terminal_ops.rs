@@ -306,7 +306,7 @@ pub(crate) fn list(
                 .as_ref()
                 .and_then(|i| i.name.as_deref())
                 .unwrap_or("Terminal");
-            let is_executing = info.as_ref().map(|i| i.alive).unwrap_or(false);
+            let is_executing = info.as_ref().is_some_and(|i| i.alive);
             let value = json!({
                 "id": id_str,
                 "name": name,
@@ -372,11 +372,7 @@ pub(crate) fn read_output(
     } else {
         lines.clone()
     };
-    while output_lines
-        .last()
-        .map(|l| l.trim().is_empty())
-        .unwrap_or(false)
-    {
+    while output_lines.last().is_some_and(|l| l.trim().is_empty()) {
         output_lines.pop();
     }
 
@@ -484,12 +480,12 @@ pub(crate) fn spawn_output_stream(
             tokio::select! {
                 recv = live.recv() => match recv {
                     Ok(chunk) => emit_data(&bus, &workspace_id, &terminal_id, &chunk),
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
                     Err(RecvError::Closed) => break,
                 },
-                _ = tokio::time::sleep(EXIT_POLL) => {
+                () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
@@ -515,7 +511,7 @@ fn drain_pending(
     loop {
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
-            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
         }
     }

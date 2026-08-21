@@ -131,7 +131,7 @@ fn parse_commit_message_json(output: &str) -> Option<String> {
             if subject.is_empty() {
                 continue;
             }
-            let body = reply.body.as_deref().map(str::trim).unwrap_or("");
+            let body = reply.body.as_deref().map_or("", str::trim);
             return Some(if body.is_empty() {
                 subject.to_string()
             } else {

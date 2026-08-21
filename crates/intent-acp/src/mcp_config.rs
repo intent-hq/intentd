@@ -256,10 +256,10 @@ pub(crate) fn to_acp_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<Value
                 "env": pairs_array(env),
             })),
             NormalizedMcpServer::Http { url, headers } => {
-                servers.push(acp_remote(name, "http", url, headers))
+                servers.push(acp_remote(name, "http", url, headers));
             }
             NormalizedMcpServer::Sse { url, headers } => {
-                servers.push(acp_remote(name, "sse", url, headers))
+                servers.push(acp_remote(name, "sse", url, headers));
             }
         }
     }

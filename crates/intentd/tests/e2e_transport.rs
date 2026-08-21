@@ -19,6 +19,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -246,7 +247,7 @@ fn upgrade_req(target: &str, origin: Option<&str>) -> String {
         "GET {target} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
     );
     if let Some(o) = origin {
-        r.push_str(&format!("Origin: {o}\r\n"));
+        let _ = write!(r, "Origin: {o}\r\n");
     }
     r.push_str("\r\n");
     r
@@ -293,7 +294,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -332,7 +333,7 @@ async fn e2e_transport_full() {
     // The persisted cert inspected off-process carries the same fingerprint.
     match intent_transport::inspect_cert(&data_dir) {
         intent_transport::CertStatus::Valid { fingerprint: disk } => {
-            assert_eq!(disk, fingerprint, "on-disk cert fp matches status fp")
+            assert_eq!(disk, fingerprint, "on-disk cert fp matches status fp");
         }
         other => panic!("expected a valid persisted cert, got {other:?}"),
     }

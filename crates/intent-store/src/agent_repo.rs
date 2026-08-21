@@ -498,7 +498,7 @@ impl Store {
             .await
             .map_err(|e| {
                 if e.as_database_error()
-                    .is_some_and(|d| d.is_unique_violation())
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
                 {
                     // Agent ids are server-minted (`agent-{uuid}`), so a
                     // UNIQUE(id) violation is a server-side anomaly, not a
@@ -967,13 +967,13 @@ impl Store {
     /// workspaces that have not changed since the last scan (finding F2).
     /// Returns 0 for workspaces with no agents or no messages.
     pub async fn get_workspace_message_watermark(&self, workspace_id: &WorkspaceId) -> Result<u64> {
-        let sql = r#"
+        let sql = r"
             SELECT COUNT(*) as count
             FROM agent_message
             WHERE agent_id IN (
                 SELECT id FROM agent_session WHERE workspace_id = ?
             )
-        "#;
+        ";
         let row = sqlx::query(sql)
             .bind(&workspace_id.0)
             .fetch_one(self.read_pool())
@@ -1959,15 +1959,14 @@ impl Store {
                 return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
             }
             let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
-                .map(|r| {
+                .map_or((None, None), |r| {
                     (
                         r.get::<Option<String>, _>("token_usage")
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         r.get::<Option<String>, _>("token_usage_baseline")
                             .and_then(|s| serde_json::from_str(&s).ok()),
                     )
-                })
-                .unwrap_or((None, None));
+                });
             let folded = match (&baseline, &snapshot) {
                 (None, None) => None,
                 (b, s) => {

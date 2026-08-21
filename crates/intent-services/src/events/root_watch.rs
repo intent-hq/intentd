@@ -449,7 +449,7 @@ mod tests {
     async fn missing_root_watches_nearest_ancestor_non_recursively() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("miss");
         let root = dir.path.join(".intent").join("specialists");
         let watch = watch_root(root, md_only, || {});
@@ -471,7 +471,7 @@ mod tests {
     async fn root_created_later_promotes_and_detects_subsequent_changes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("promote");
         let root = dir.path.join(".intent").join("specialists");
         let hits = Arc::new(AtomicUsize::new(0));
@@ -514,7 +514,7 @@ mod tests {
     async fn directory_only_deletion_is_forwarded() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("rmdir");
         let root = dir.path.join("specialists");
         std::fs::create_dir_all(root.join("nested")).expect("mk root + nested dir");
@@ -546,7 +546,7 @@ mod tests {
     async fn existing_root_registration_does_not_block_the_caller() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("nonblocking");
         let root = dir.path.join("specialists");
         std::fs::create_dir_all(&root).expect("mk root");
@@ -584,7 +584,7 @@ mod tests {
     async fn existing_root_flushes_changes_that_land_before_registration() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("catchup");
         let root = dir.path.join("specialists");
         std::fs::create_dir_all(&root).expect("mk root");

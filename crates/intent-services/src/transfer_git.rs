@@ -191,7 +191,7 @@ pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
         Ok(oid) => Ok(Some(oid.to_string())),
         Err(e) => {
             if let Ok(tree) = repo.find_tree(orig_index_tree) {
-                let restored = index.read_tree(&tree).and_then(|_| index.write());
+                let restored = index.read_tree(&tree).and_then(|()| index.write());
                 if let Err(re) = restored {
                     tracing::warn!(
                         path = %repo_path.display(),
@@ -393,8 +393,7 @@ fn build_bundle(
             sb_repo
                 .head()
                 .ok()
-                .map(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
-                .unwrap_or(false)
+                .is_some_and(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
         };
         // The WIP commit lands on HEAD's branch while the bundler fetches
         // `sb.branch` — so only snapshot when HEAD is on `sb.branch`;
@@ -766,7 +765,11 @@ mod tests {
         );
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter_map(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .map(std::string::ToString::to_string)
+            })
             .collect()
     }
 

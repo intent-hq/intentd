@@ -231,9 +231,7 @@ impl Store {
                     intent_core::Error::Internal(format!("get sandbox retry count failed: {e}"))
                 })?;
 
-        Ok(row
-            .map(|r| r.try_get("retry_count").unwrap_or(0))
-            .unwrap_or(0))
+        Ok(row.map_or(0, |r| r.try_get("retry_count").unwrap_or(0)))
     }
 
     /// Increment the retry count for a sandbox.

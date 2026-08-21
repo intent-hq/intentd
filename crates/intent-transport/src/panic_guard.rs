@@ -172,7 +172,9 @@ pub(crate) mod test_support {
 
     /// Hold the global-state lock for a hand-rolled swap (hook + env).
     pub(crate) fn lock_global_state() -> MutexGuard<'static, ()> {
-        GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+        GLOBAL_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Silence the default panic hook's stderr backtrace inside a scope; the

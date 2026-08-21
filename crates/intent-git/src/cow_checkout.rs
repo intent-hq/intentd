@@ -203,10 +203,10 @@ pub(crate) fn provision_cow_checkout_timed(
                         error = %e,
                         "provision_cow_checkout: cannot read pre-reset submodule paths; skipping orphan cleanup"
                     );
-                    Default::default()
+                    std::collections::BTreeSet::default()
                 })
         } else {
-            Default::default()
+            std::collections::BTreeSet::default()
         };
         let checkout_started = Instant::now();
         let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;

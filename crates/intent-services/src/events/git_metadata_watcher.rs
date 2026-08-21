@@ -48,7 +48,7 @@ use super::shared_watch::{SharedWatchHub, SubHandle};
 
 /// Poison-tolerant lock (one panicking task must not wedge the registry).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A live `.git` metadata watch for one workspace: a subscription to the shared
@@ -724,7 +724,7 @@ mod tests {
         // enough to blow the delivery timeouts below.
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut status_sub, mut file_sub) = bus_and_subs().await;
         let root = TempDir::new("repo");
         let repo = init_repo(&root.path);
@@ -802,7 +802,7 @@ mod tests {
     async fn external_head_change_in_linked_worktree_triggers_status_refresh() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut status_sub, mut file_sub) = bus_and_subs().await;
         let main_root = TempDir::new("wt-main");
         let main_repo = init_repo(&main_root.path);
@@ -869,7 +869,7 @@ mod tests {
     async fn shared_common_dir_ref_change_fans_out_to_all_worktrees() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut status_sub_a, _file_sub) = bus_and_subs().await;
         // Second status subscription so B's event cannot be discarded while
         // draining a batch for A.
@@ -962,7 +962,7 @@ mod tests {
     async fn irrelevant_git_file_does_not_trigger_refresh() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut status_sub, _file_sub) = bus_and_subs().await;
         let root = TempDir::new("quiet");
         let _repo = init_repo(&root.path);

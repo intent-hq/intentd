@@ -159,7 +159,7 @@ mod tests {
         assert!(pick_env_credentials(Some("tok".into()), None).is_none());
         assert!(pick_env_credentials(None, Some("acme".into())).is_none());
         assert!(pick_env_credentials(Some("   ".into()), Some("acme".into())).is_none());
-        assert!(pick_env_credentials(Some("tok".into()), Some("".into())).is_none());
+        assert!(pick_env_credentials(Some("tok".into()), Some(String::new())).is_none());
     }
 
     #[test]

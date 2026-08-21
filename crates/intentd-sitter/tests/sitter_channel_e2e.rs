@@ -7,6 +7,7 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -59,7 +60,7 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            Ok(_) if header != "\r\n" && !header.is_empty() => {}
             _ => break,
         }
     }
@@ -100,8 +101,10 @@ fn dead_url() -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// `.tar.xz` with `intentd-<triple>/intentd` (mode 0755) — the cargo-dist

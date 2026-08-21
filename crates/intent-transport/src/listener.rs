@@ -171,7 +171,7 @@ where
                     Err(e) => tracing::warn!(error = %e, "uds accept failed"),
                 }
             }
-            _ = &mut shutdown => break,
+            () = &mut shutdown => break,
         }
     }
 

@@ -514,7 +514,7 @@ impl SettingsRegistry {
         let changed: BTreeSet<String> = KNOWN_PATHS
             .iter()
             .filter(|p| json_get(&old.effective_json, p) != json_get(&new.effective_json, p))
-            .map(|p| p.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         let notice = SettingsChanged {
             generation: inner.generation,
@@ -1194,7 +1194,7 @@ mod tests {
             .expect("apply");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read dir")
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| name != "config.toml")
             .collect();

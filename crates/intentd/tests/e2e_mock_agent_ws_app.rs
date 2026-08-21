@@ -132,7 +132,7 @@ async fn chief_agent_ws_app_workspaces_list() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -150,10 +150,10 @@ async fn chief_agent_ws_app_workspaces_list() {
     };
 
     // Call ws.app.workspaces.list via MCP
-    let js = r#"
+    let js = r"
         const result = await ws.app.workspaces.list({});
         return { workspaces: result };
-    "#;
+    ";
 
     let behavior = json!({
         "toolCall": {
@@ -295,7 +295,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -469,7 +469,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -642,7 +642,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -819,7 +819,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -1003,7 +1003,7 @@ async fn non_chief_agent_ws_app_gating_error() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -1021,14 +1021,14 @@ async fn non_chief_agent_ws_app_gating_error() {
     };
 
     // Try to call ws.app.workspaces.list from non-chief workspace
-    let js = r#"
+    let js = r"
         try {
             const result = await ws.app.workspaces.list({});
             return { success: true, result };
         } catch (error) {
             return { success: false, error: error.message };
         }
-    "#;
+    ";
 
     let behavior = json!({
         "toolCall": {
@@ -1124,8 +1124,7 @@ async fn non_chief_agent_ws_app_gating_error() {
         .expect("error should be a string");
     assert!(
         error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
-        "Expected gating error message in tool output, got: {}",
-        error_msg
+        "Expected gating error message in tool output, got: {error_msg}"
     );
 
     manager.shutdown().await;

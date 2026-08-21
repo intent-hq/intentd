@@ -528,9 +528,9 @@ pub fn gitlink_hunks(old_sha: Option<&str>, new_sha: Option<&str>) -> Vec<DiffHu
         return Vec::new();
     }
     vec![DiffHunk {
-        old_start: if old_sha.is_some() { 1 } else { 0 },
+        old_start: u32::from(old_sha.is_some()),
         old_lines: u32::from(old_sha.is_some()),
-        new_start: if new_sha.is_some() { 1 } else { 0 },
+        new_start: u32::from(new_sha.is_some()),
         new_lines: u32::from(new_sha.is_some()),
         lines,
     }]

@@ -266,7 +266,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -302,7 +302,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -356,15 +356,9 @@ async fn chief_workspace_over_wss() {
     assert_eq!(chief["createdAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(chief["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(chief["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
-    assert!(chief.get("path").map(Value::is_null).unwrap_or(true));
-    assert!(chief
-        .get("worktreePath")
-        .map(Value::is_null)
-        .unwrap_or(true));
-    assert!(chief
-        .get("repositoryName")
-        .map(Value::is_null)
-        .unwrap_or(true));
+    assert!(chief.get("path").is_none_or(Value::is_null));
+    assert!(chief.get("worktreePath").is_none_or(Value::is_null));
+    assert!(chief.get("repositoryName").is_none_or(Value::is_null));
 
     // (b) `workspace.list` MUST NOT include `__chief__`.
     let resp = wss_rpc_envelope(&mut ws, 3, "workspace.list", json!({})).await;
@@ -446,8 +440,7 @@ async fn chief_workspace_over_wss() {
     .await;
     assert!(resp["result"]["workspace"]
         .get("statusMessage")
-        .map(Value::is_null)
-        .unwrap_or(true));
+        .is_none_or(Value::is_null));
 
     // (e) On Chief: `workspace.archive` returns the synthesized `Workspace`
     //     (Chief cannot be archived, so `archived = false` is preserved);

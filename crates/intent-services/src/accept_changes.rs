@@ -239,8 +239,7 @@ pub(crate) fn build_git_status_value_with(
     let (owner, repo) = remote_url
         .as_deref()
         .and_then(parse_owner_repo)
-        .map(|(o, r)| (Some(o), Some(r)))
-        .unwrap_or((None, None));
+        .map_or((None, None), |(o, r)| (Some(o), Some(r)));
 
     tracing::debug!(
         files = status.files.len(),

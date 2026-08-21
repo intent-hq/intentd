@@ -137,10 +137,7 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 /// Build the `server.rotateToken` result JSON. Returns an error when INTENTD_AUTH_TOKEN is set.
 async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     // Check if INTENTD_AUTH_TOKEN is set (token is fixed by env).
-    if std::env::var("INTENTD_AUTH_TOKEN")
-        .map(|t| !t.is_empty())
-        .unwrap_or(false)
-    {
+    if std::env::var("INTENTD_AUTH_TOKEN").is_ok_and(|t| !t.is_empty()) {
         return Err(Error::InvalidParams(
             "cannot rotate token: INTENTD_AUTH_TOKEN is set (token is fixed by env)".to_string(),
         ));

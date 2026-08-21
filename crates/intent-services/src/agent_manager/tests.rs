@@ -1249,8 +1249,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = evict_event.expect("eviction event published");
@@ -1344,8 +1344,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = queue_event.expect("queue event published");
@@ -1380,8 +1380,8 @@ async fn process_cap_events_queued_resumed_evicted() {
                     break;
                 }
             }
-            Ok(None) => break,  // subscription closed
-            Err(_) => continue, // timeout, try again
+            Ok(None) => break, // subscription closed
+            Err(_) => {}       // timeout, try again
         }
     }
     let ev = resume_event.expect("resume event published");
@@ -1705,7 +1705,7 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
                 }
             }
             Ok(None) => break,
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
     let ev = evict_event.expect("TTL reap publishes agent:process:evicted");
@@ -2876,7 +2876,7 @@ fn track_mock_agent_with_log(
     load_cap: bool,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(
+    let (handle, ()) = track_mock_agent_inner(
         mgr,
         id,
         load_cap,
@@ -2896,7 +2896,7 @@ fn track_mock_agent_with_log_modes(
     modes: MockModes,
 ) -> (JoinHandle<()>, MockCallLog) {
     let log: MockCallLog = Arc::new(Mutex::new(Vec::new()));
-    let (handle, _) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
+    let (handle, ()) = track_mock_agent_inner(mgr, id, load_cap, Some(log.clone()), modes);
     (handle, log)
 }
 
@@ -11664,10 +11664,7 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
     let stray_id = NoteId::new();
     let stray = Note {
         id: stray_id.clone(),
-        content: format!(
-            "![x](workspace-asset://other-ws/{asset})\n",
-            asset = asset_id
-        ),
+        content: format!("![x](workspace-asset://other-ws/{asset_id})\n"),
         ..note.clone()
     };
     let mut stray = stray;
@@ -11752,7 +11749,7 @@ mod merge_user_mcp_servers_tests {
             .unwrap();
         let mut out = NormalizedMcpServers::new();
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
-        assert!(out.is_empty(), "gate off → nothing merged: {:?}", out);
+        assert!(out.is_empty(), "gate off → nothing merged: {out:?}");
     }
 
     #[tokio::test]
@@ -11900,7 +11897,7 @@ mod merge_user_mcp_servers_tests {
             NormalizedMcpServer::Stdio {
                 command: "bridge".into(),
                 args: vec![],
-                env: Default::default(),
+                env: std::collections::BTreeMap::default(),
             },
         );
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
@@ -12834,7 +12831,7 @@ mod flush_batch_id_tests {
             queued_msg("first", &queued_at, false),
             queued_msg("second", &queued_at, false),
         ];
-        for e in entries.iter_mut() {
+        for e in &mut entries {
             super::super::annotate_dequeue_wait(e);
         }
         super::super::stamp_flush_batch_id(&mut entries);
@@ -12877,7 +12874,7 @@ mod flush_batch_id_tests {
             queued_msg("waited", &iso_secs_ago(60), false),
             queued_msg("instant hop", &intent_core::now_iso(), false),
         ];
-        for e in entries.iter_mut() {
+        for e in &mut entries {
             super::super::annotate_dequeue_wait(e);
         }
         assert_eq!(
@@ -13838,7 +13835,7 @@ mod model_change_notice_tests {
             reasoning_effort: None,
             cwd: std::env::temp_dir(),
             provider_binary: None,
-            extra_env: Default::default(),
+            extra_env: std::collections::BTreeMap::default(),
             npx_fallback_binary: None,
             npx_fallback_package: None,
             unsloth_endpoint: None,

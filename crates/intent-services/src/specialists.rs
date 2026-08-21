@@ -927,14 +927,16 @@ impl SpecialistsService {
             .get("roleReminder")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                let body = def
-                    .get("behaviorPrompt")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                auto_generate_role_reminder(body)
-            });
+            .map_or_else(
+                || {
+                    let body = def
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    auto_generate_role_reminder(body)
+                },
+                str::to_string,
+            );
         if reminder.is_empty() {
             return None;
         }

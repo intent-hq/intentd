@@ -261,7 +261,7 @@ async fn serve_connection<S: BridgeDispatch>(
                                     tracing::warn!(%method, error = %e, "mcp bridge dispatch task failed");
                                 }
                             },
-                            _ = tokio::time::sleep(dispatch_timeout) => {
+                            () = tokio::time::sleep(dispatch_timeout) => {
                                 dispatch.0.abort();
                                 tracing::warn!(
                                     %method,
@@ -582,7 +582,7 @@ where
                                 &mut overflowed,
                                 output,
                             )
-                            .await?
+                            .await?;
                         } else if !overflowed
                             && held.len() < INITIAL_BUFFER_MAX_LINES
                             && held_bytes + line.len() <= INITIAL_BUFFER_MAX_BYTES
@@ -626,7 +626,7 @@ where
         tokio::pin!(sleep);
         loop {
             tokio::select! {
-                _ = &mut sleep => break,
+                () = &mut sleep => break,
                 line = input.next_line() => match line? {
                     Some(line) => {
                         buffer_or_reject(
@@ -637,7 +637,7 @@ where
                             &mut overflowed,
                             output,
                         )
-                        .await?
+                        .await?;
                     }
                     None => return Ok(None),
                 },

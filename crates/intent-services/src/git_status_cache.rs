@@ -220,17 +220,14 @@ impl GitStatusCache {
                         worktree = %key.display(),
                         "git status: coalesced into in-flight worktree scan"
                     );
-                    match rx.wait_for(|slot| slot.is_some()).await {
-                        Ok(slot) => {
-                            return match slot.clone().expect("wait_for guarantees Some") {
-                                Ok(shared) => Ok(shared),
-                                Err(msg) => Err(Error::Internal(msg)),
-                            };
-                        }
-                        // The leader vanished without publishing (cancelled
-                        // RPC / panicked scan): retry — the next join elects a
-                        // new leader.
-                        Err(_) => continue,
+                    // On `Err` the leader vanished without publishing
+                    // (cancelled RPC / panicked scan): retry — the next join
+                    // elects a new leader.
+                    if let Ok(slot) = rx.wait_for(std::option::Option::is_some).await {
+                        return match slot.clone().expect("wait_for guarantees Some") {
+                            Ok(shared) => Ok(shared),
+                            Err(msg) => Err(Error::Internal(msg)),
+                        };
                     }
                 }
             }

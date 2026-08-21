@@ -2,6 +2,7 @@
 //! server (127.0.0.1 only — no real network access).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -32,7 +33,7 @@ fn handle(mut stream: TcpStream, routes: &HashMap<String, Vec<u8>>) {
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            Ok(_) if header != "\r\n" && !header.is_empty() => {}
             _ => break,
         }
     }
@@ -71,8 +72,10 @@ fn make_tar_xz(bin_contents: &[u8]) -> Vec<u8> {
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Schema-v1 manifest with a single platform entry for this build's triple.
@@ -199,7 +202,7 @@ fn happy_path_downloads_verifies_installs_and_updates_state() {
 
     // In-flight download dirs are cleaned up.
     let leftovers = fs::read_dir(&paths.tmp_dir)
-        .map(|e| e.count())
+        .map(std::iter::Iterator::count)
         .unwrap_or_default();
     assert_eq!(leftovers, 0);
 }
@@ -523,7 +526,7 @@ fn serve_release_with_archive_hook(
             loop {
                 let mut header = String::new();
                 match reader.read_line(&mut header) {
-                    Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+                    Ok(_) if header != "\r\n" && !header.is_empty() => {}
                     _ => break,
                 }
             }

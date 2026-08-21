@@ -1917,10 +1917,7 @@ async fn dispatch(
                         match v.as_str() {
                             Some(s) => ids.push(s.to_string()),
                             None => {
-                                return Err(invalid_params(format!(
-                                    "resume[{}] must be a string",
-                                    i
-                                )))
+                                return Err(invalid_params(format!("resume[{i}] must be a string")))
                             }
                         }
                     }
@@ -1937,8 +1934,7 @@ async fn dispatch(
                             Some(s) => ids.push(s.to_string()),
                             None => {
                                 return Err(invalid_params(format!(
-                                    "abandon[{}] must be a string",
-                                    i
+                                    "abandon[{i}] must be a string"
                                 )))
                             }
                         }

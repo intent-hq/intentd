@@ -599,7 +599,7 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                 // symlinked directory pointing outside the legacy root is
                 // never a candidate.
                 let mut dirs: Vec<PathBuf> = entries
-                    .filter_map(|e| e.ok())
+                    .filter_map(std::result::Result::ok)
                     .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                     .map(|e| e.path())
                     .collect();
@@ -2241,7 +2241,7 @@ pub async fn maybe_import_on_first_boot(
                 None,
                 decision == FirstBootDecision::Resume,
             )
-            .await
+            .await;
         }
     }
 }

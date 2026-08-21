@@ -130,7 +130,7 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("unexpected ws frame: {other:?}"),
         }
     }
@@ -154,7 +154,7 @@ async fn drain_until_close(ws: &mut PlainWs, dur: Duration) {
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
         }
     }
 }
@@ -179,7 +179,7 @@ async fn try_read_text(ws: &mut PlainWs, dur: Duration) -> Option<Value> {
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             Ok(other) => panic!("unexpected ws frame: {other:?}"),
         }
     }

@@ -228,7 +228,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -253,7 +253,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -301,7 +301,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -327,7 +327,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -4893,7 +4893,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -4921,7 +4921,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             None | Some(Err(_)) => return None,
         }
     }
@@ -5358,7 +5358,7 @@ async fn terminal_create_env_over_wss() {
             Some(Ok(Message::Ping(p))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -5519,7 +5519,7 @@ async fn terminal_data_many_chunks_transient_over_wss() {
             Some(Ok(Message::Ping(p))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -6053,8 +6053,7 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
                 assert!(evt["data"]["queue"].is_array(), "queue array present");
                 if evt["data"]["queue"]
                     .as_array()
-                    .map(|q| !q.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(|q| !q.is_empty())
                 {
                     saw_queue_updated_enqueue = true;
                 }
@@ -6219,8 +6218,7 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
                 // The queue drains to empty once the first turn completes.
                 if evt["data"]["queue"]
                     .as_array()
-                    .map(|q| q.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(std::vec::Vec::is_empty)
                 {
                     saw_queue_drain = true;
                 }
@@ -7618,8 +7616,7 @@ fn seed_local_repo(prefix: &str) -> Option<PathBuf> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     };
     if !run(&["init", "--quiet"]) {
         return None;

@@ -14,10 +14,10 @@ use serde_json::Value;
 use super::super::tools::{help_index, help_namespace};
 use super::opt_str;
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.help = (namespace) => host({ method: 'help.get', args: { namespace } });
-"#;
+";
 
 pub(crate) fn dispatch(
     workspace_id: &WorkspaceId,

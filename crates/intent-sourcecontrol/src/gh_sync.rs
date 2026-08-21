@@ -258,8 +258,7 @@ impl GhCli for SystemGhCli {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 
     fn login_with_token(&self, gh: &Path, token: &SecretString) -> bool {
@@ -282,7 +281,7 @@ impl GhCli for SystemGhCli {
             }
             // Dropping the handle closes stdin so `gh` sees EOF.
         }
-        child.wait().map(|s| s.success()).unwrap_or(false)
+        child.wait().is_ok_and(|s| s.success())
     }
 
     fn active_login(&self, gh: &Path) -> Option<String> {
@@ -335,8 +334,7 @@ impl GhCli for SystemGhCli {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 }
 
@@ -390,8 +388,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]

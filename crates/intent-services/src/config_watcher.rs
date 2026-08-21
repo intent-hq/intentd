@@ -205,7 +205,7 @@ async fn watch_loop<F, Fut>(
                 Some(()) => deadline = Some(tokio::time::Instant::now() + DEBOUNCE),
                 None => return,
             },
-            _ = sleep_until(deadline), if deadline.is_some() => {
+            () = sleep_until(deadline), if deadline.is_some() => {
                 deadline = None;
                 if let ReloadOutcome::Applied(notice) = process_config_change(&registry) {
                     on_change(notice).await;
@@ -244,7 +244,7 @@ mod tests {
         std::fs::write(reg.config_path(), "[git]\nautoCommit = false\n").expect("edit");
         match process_config_change(&reg) {
             ReloadOutcome::Applied(notice) => {
-                assert!(notice.changed.contains("git.autoCommit"), "{notice:?}")
+                assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
             }
             other => panic!("expected Applied, got {other:?}"),
         }
@@ -327,7 +327,7 @@ mod tests {
         std::fs::write(reg.config_path(), "[rtk]\nenabled = false\n").expect("edit");
         match process_config_change(&reg) {
             ReloadOutcome::Applied(notice) => {
-                assert!(notice.changed.contains("rtk.enabled"), "{notice:?}")
+                assert!(notice.changed.contains("rtk.enabled"), "{notice:?}");
             }
             other => panic!("expected Applied, got {other:?}"),
         }
@@ -336,7 +336,7 @@ mod tests {
         std::fs::write(reg.config_path(), &self_written).expect("revert");
         match process_config_change(&reg) {
             ReloadOutcome::Applied(notice) => {
-                assert!(notice.changed.contains("rtk.enabled"), "{notice:?}")
+                assert!(notice.changed.contains("rtk.enabled"), "{notice:?}");
             }
             other => panic!("expected Applied, got {other:?}"),
         }
@@ -370,7 +370,7 @@ mod tests {
     async fn watcher_detects_rename_style_atomic_save() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
         let _watcher = ConfigWatcher::start(reg.clone(), move |notice| {

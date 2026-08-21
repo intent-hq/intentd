@@ -7,6 +7,7 @@
 //! ports the auggie CLI model-list parser.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 use intent_core::events::{
@@ -875,7 +876,7 @@ fn strip_group_tags(s: &str) -> String {
                 continue;
             }
         }
-        out.push_str(&rest[..i + 1]);
+        out.push_str(&rest[..=i]);
         rest = &rest[i + 1..];
     }
     out.push_str(rest);
@@ -927,11 +928,10 @@ pub(crate) fn last_response_and_digest_from_blocks(
         }
         let cleaned = clean_response_text(text);
         if !cleaned.is_empty() {
-            let line = cleaned
-                .lines()
-                .rfind(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string())
-                .unwrap_or_else(|| cleaned.chars().take(200).collect());
+            let line = cleaned.lines().rfind(|l| !l.trim().is_empty()).map_or_else(
+                || cleaned.chars().take(200).collect(),
+                |l| l.trim().to_string(),
+            );
             last_response = Some(line);
         }
     }
@@ -1606,7 +1606,7 @@ fn build_create_metadata(
     if !obj.contains_key("isBackground") {
         obj.insert("isBackground".to_string(), json!(true));
     }
-    let child_depth = parent_depth.map(|d| d + 1).unwrap_or(0);
+    let child_depth = parent_depth.map_or(0, |d| d + 1);
     obj.entry("delegationDepth".to_string())
         .or_insert(json!(child_depth));
     if let Some(caller) = input.caller_agent_id.as_ref() {
@@ -1726,8 +1726,7 @@ fn last_message_role_and_id(messages: &[AgentMessage]) -> (Option<String>, Optio
         .iter()
         .rev()
         .find(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| (Some(m.role.clone()), Some(m.id.clone())))
-        .unwrap_or((None, None))
+        .map_or((None, None), |m| (Some(m.role.clone()), Some(m.id.clone())))
 }
 
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
@@ -1745,8 +1744,7 @@ fn project_lite_from_projection(
     let (last_response, digest) = projection
         .last_assistant_text_blocks
         .as_deref()
-        .map(last_response_and_digest_from_blocks)
-        .unwrap_or((None, None));
+        .map_or((None, None), last_response_and_digest_from_blocks);
     let last_user = projection
         .last_user_text_blocks
         .as_deref()
@@ -1760,7 +1758,7 @@ fn project_lite_from_projection(
         projection.last_message_role.clone(),
         projection.last_message_id.clone(),
     );
-    lite.last_tool_use = projection.last_tool_use.clone();
+    lite.last_tool_use.clone_from(&projection.last_tool_use);
     lite
 }
 
@@ -1794,8 +1792,7 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
         b.get("type").and_then(Value::as_str) == Some("tool_use")
             && b.get("name")
                 .and_then(Value::as_str)
-                .map(|n| n.trim().is_empty())
-                .unwrap_or(true)
+                .is_none_or(|n| n.trim().is_empty())
     }
     let Some(blocks) = message.content.as_array() else {
         return message;
@@ -1815,8 +1812,7 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
             Some("tool_result") => b
                 .get("tool_use_id")
                 .and_then(Value::as_str)
-                .map(|id| !anonymous_ids.contains(id))
-                .unwrap_or(true),
+                .is_none_or(|id| !anonymous_ids.contains(id)),
             _ => true,
         })
         .cloned()
@@ -2240,8 +2236,7 @@ impl Services {
     /// unresolved tool call. `false` when no turn is streaming.
     fn live_turn_has_unresolved_tool(&self, agent_id: &AgentId) -> bool {
         self.live_turn(agent_id)
-            .map(|live| has_unresolved_tool_use(&live.blocks))
-            .unwrap_or(false)
+            .is_some_and(|live| has_unresolved_tool_use(&live.blocks))
     }
 
     /// Turn-liveness for `session` (STAB-125): `(turnInFlight,
@@ -3541,7 +3536,7 @@ impl Services {
             }
         }
         let mut mutated_only_name = obj.contains_key("name");
-        for (key, value) in obj.iter() {
+        for (key, value) in &obj {
             if key != "name" {
                 mutated_only_name = false;
             }
@@ -3688,7 +3683,7 @@ impl Services {
         };
         let mut event_data = serde_json::Map::new();
         event_data.insert("agentId".into(), json!(agent_id.0));
-        for (k, v) in obj.iter() {
+        for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
         }
         self.publish_agent_mutation_event(
@@ -4377,8 +4372,7 @@ impl Services {
         if let Some(ref id) = message_id {
             if id.len() > MAX_MESSAGE_ID_LEN {
                 return Err(Error::InvalidParams(format!(
-                    "messageId exceeds maximum length of {} bytes",
-                    MAX_MESSAGE_ID_LEN
+                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
                 )));
             }
         }
@@ -5389,8 +5383,7 @@ impl Services {
                 .store
                 .get_agent_session(&parent)
                 .await
-                .map(|s| s.workspace_id)
-                .unwrap_or_else(|_| workspace_id.clone());
+                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
             // Mark any ungrouped watches whose parent matches this parent as
             // report_delivered, so deliver_completion_to_watches will skip agent:idle
             // for them (suppressing the duplicate wake). Do NOT mark watches for other
@@ -5796,8 +5789,7 @@ impl Services {
                 .store
                 .get_agent_session(parent)
                 .await
-                .map(|s| s.workspace_id)
-                .unwrap_or_else(|_| workspace_id.clone());
+                .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
             let wake_text = crate::harness::latest().attention_parent_wake(
                 &session.name,
                 &caller.0,
@@ -6324,8 +6316,7 @@ impl Services {
             // (TS `selectIsAgentDeleted`).
             let parent_deleted = parent_session
                 .as_ref()
-                .map(|s| s.status == AgentStatus::Deleted)
-                .unwrap_or(false);
+                .is_some_and(|s| s.status == AgentStatus::Deleted);
             if !parent_deleted {
                 // The watch/group is anchored in the parent's HOME workspace
                 // (where wakes are delivered): for same-workspace delegation
@@ -6334,8 +6325,7 @@ impl Services {
                 // parent session could not be loaded.
                 let parent_home_ws = parent_session
                     .as_ref()
-                    .map(|s| s.workspace_id.clone())
-                    .unwrap_or_else(|| workspace_id.clone());
+                    .map_or_else(|| workspace_id.clone(), |s| s.workspace_id.clone());
                 let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
                 // The scope gate already ran up front (before child creation),
@@ -6730,10 +6720,8 @@ impl Services {
                         format!("waiting on incomplete dependencies: {}", unmet.join(", "));
                     if !decision_needed.is_empty() {
                         obj.insert("decisionNeeded".into(), json!(decision_needed));
-                        reason.push_str(&format!(
-                            "; dependencies {} are cancelled or missing and will never complete — decision needed",
-                            decision_needed.join(", ")
-                        ));
+                        let _ = write!(reason, "; dependencies {} are cancelled or missing and will never complete — decision needed",
+                            decision_needed.join(", "));
                     }
                     obj.insert("reason".into(), json!(reason));
                 }
@@ -6806,9 +6794,10 @@ impl Services {
         // an unestimated chain is longer.
         let critical_path_minutes = batch::serial_remaining_minutes(&requested, &snaps);
         if let Some(minutes) = critical_path_minutes {
-            unlock_message.push_str(&format!(
+            let _ = write!(
+                unlock_message,
                 " ~{minutes} min of serial work remains on the critical path."
-            ));
+            );
         }
         // Count started relation-less tasks in the human-readable summary
         // (annotation only — nothing about the start decision changed).
@@ -6817,10 +6806,8 @@ impl Services {
             .filter(|id| relations_unknown.contains(*id))
             .count();
         if started_unknown > 0 {
-            unlock_message.push_str(&format!(
-                " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
-                started_ids.len()
-            ));
+            let _ = write!(unlock_message, " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
+                started_ids.len());
         }
 
         let mut unlock_plan = json!({
@@ -7021,8 +7008,7 @@ impl Services {
         let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
         let parent_deleted = parent_session
             .as_ref()
-            .map(|s| s.status == AgentStatus::Deleted)
-            .unwrap_or(false);
+            .is_some_and(|s| s.status == AgentStatus::Deleted);
         if parent_deleted {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
@@ -7083,8 +7069,7 @@ impl Services {
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         let skip = caller_session
             .as_ref()
-            .map(is_delegated_background_task_session)
-            .unwrap_or(false);
+            .is_some_and(is_delegated_background_task_session);
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
@@ -7095,17 +7080,14 @@ impl Services {
         // linkage is read from the caller session's `parent_agent_id`,
         // falling back to the metadata `createdByAgentId` the create/delegate
         // writers populate.
-        let is_child_of_target = caller_session
-            .as_ref()
-            .map(|s| {
-                s.parent_agent_id.as_ref() == Some(&target_agent_id)
-                    || s.metadata
-                        .as_ref()
-                        .and_then(|m| m.get("createdByAgentId"))
-                        .and_then(Value::as_str)
-                        == Some(target_agent_id.0.as_str())
-            })
-            .unwrap_or(false);
+        let is_child_of_target = caller_session.as_ref().is_some_and(|s| {
+            s.parent_agent_id.as_ref() == Some(&target_agent_id)
+                || s.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("createdByAgentId"))
+                    .and_then(Value::as_str)
+                    == Some(target_agent_id.0.as_str())
+        });
         if is_child_of_target {
             tracing::debug!(
                 caller = %caller_agent_id.0,
@@ -7440,8 +7422,7 @@ impl Services {
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         if caller_session
             .as_ref()
-            .map(|s| s.status == AgentStatus::Deleted)
-            .unwrap_or(false)
+            .is_some_and(|s| s.status == AgentStatus::Deleted)
         {
             return Err(Error::InvalidParams(format!(
                 "caller agent {caller_agent_id} is deleted"
@@ -7848,7 +7829,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map_or(0, |q| q.len());
+            .map_or(0, std::vec::Vec::len);
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
         // Delegated children not yet settled: one aggregate statement over
         // the `parent_agent_id` index, unscoped by workspace so a Chief
@@ -8463,8 +8444,7 @@ impl Services {
                             .store
                             .get_workspace(&workspace_id)
                             .await
-                            .map(|w| w.archived)
-                            .unwrap_or(false);
+                            .is_ok_and(|w| w.archived);
                     workspace_archived = Some(v);
                     v
                 }
@@ -8902,8 +8882,7 @@ impl Services {
         // keeps the fallback-anchor behavior and still registers a watch.
         let caller_deleted = caller_session
             .as_ref()
-            .map(|s| s.status == AgentStatus::Deleted)
-            .unwrap_or(false);
+            .is_some_and(|s| s.status == AgentStatus::Deleted);
         if let Some(session) = caller_session
             .as_ref()
             .filter(|s| s.status != AgentStatus::Deleted)
@@ -9288,9 +9267,8 @@ impl Services {
             // The watch is anchored in the caller's HOME workspace (falls
             // back to the call's workspace when the session lookup fails)
             // so a chief caller's wake lands in `__chief__`.
-            let caller_home_ws = caller_session
-                .map(|s| s.workspace_id)
-                .unwrap_or_else(|| workspace_id.clone());
+            let caller_home_ws =
+                caller_session.map_or_else(|| workspace_id.clone(), |s| s.workspace_id);
             let subscription_id = self.register_completion_watch(
                 &caller_home_ws,
                 &workspace_id,
@@ -10129,8 +10107,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map(|q| q.iter().any(|m| !m.editing))
-            .unwrap_or(false)
+            .is_some_and(|q| q.iter().any(|m| !m.editing))
     }
 
     /// `true` iff at least one ready-to-send queued entry is user-origin
@@ -10141,8 +10118,7 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .map(|q| q.iter().any(|m| !m.editing && m.user_origin))
-            .unwrap_or(false)
+            .is_some_and(|q| q.iter().any(|m| !m.editing && m.user_origin))
     }
 
     /// The `turn_id` of the oldest **ready-to-send** queued message, without
@@ -10169,7 +10145,7 @@ impl Services {
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
-        let had = guard.get(agent_id).map(|q| !q.is_empty()).unwrap_or(false);
+        let had = guard.get(agent_id).is_some_and(|q| !q.is_empty());
         guard.remove(agent_id);
         had
     }
@@ -10285,7 +10261,7 @@ impl Services {
                 Ok(mut message) => {
                     message.editing = false;
                     if message.turn_id.is_empty() {
-                        message.turn_id = message.id.clone();
+                        message.turn_id.clone_from(&message.id);
                     }
                     map.entry(row.agent_id).or_default().push(message);
                 }
@@ -10615,9 +10591,7 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
 /// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
 /// Parse an RFC-3339 timestamp into epoch milliseconds, or `0` when malformed.
 fn iso_ms(ts: &str) -> i64 {
-    parse_iso(ts)
-        .map(|dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
-        .unwrap_or(0)
+    parse_iso(ts).map_or(0, |dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
 }
 
 /// Non-negative age in milliseconds of `ts` relative to `now_ms`.
@@ -10653,9 +10627,10 @@ fn describe_subscription(
     if let Some(group) = delegation_group {
         let group_id = group["groupId"].as_str().unwrap_or_default();
         let expected = group["expectedAgentIds"].as_array().map_or(0, Vec::len);
-        desc.push_str(&format!(
+        let _ = write!(
+            desc,
             ", delegation group {group_id} (await all, {expected} expected)"
-        ));
+        );
     }
     desc
 }
@@ -10864,7 +10839,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let mut file_rows: Vec<Vec<Value>> = Vec::new();
     for m in messages.iter().rev() {
         match m.role.as_str() {
-            "system" => continue,
+            "system" => {}
             "assistant" => {
                 let interrupted = m
                     .metadata
@@ -10877,7 +10852,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     // row and everything before it.
                     break;
                 }
-                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let blocks: &[Value] = m.content.as_array().map_or(&[], Vec::as_slice);
                 let text = crate::agent_session::text_block_strings(blocks).join("");
                 if !text.is_empty() {
                     segments.push(TailSegment::Partial(text));
@@ -10890,7 +10865,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     .and_then(|meta| meta.get("type"))
                     .and_then(Value::as_str)
                     == Some(RESUME_CONTINUATION_METADATA_TYPE);
-                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let blocks: &[Value] = m.content.as_array().map_or(&[], Vec::as_slice);
                 let text = crate::agent_session::text_block_strings(blocks).join("\n");
                 if tagged_continuation || text == LEGACY_RESUME_CONTINUATION_TEXT {
                     // A previous resume's continuation row (metadata-tagged,
@@ -10932,7 +10907,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let file_blocks: Vec<Value> = file_rows.into_iter().flatten().collect();
     let elided = segments.len().saturating_sub(RESUME_RECAP_MAX_SEGMENTS);
     if elided > 0 {
-        segments.drain(1..1 + elided);
+        segments.drain(1..=elided);
     }
     let has_partial = segments
         .iter()
@@ -10944,9 +10919,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
          context).\n\n",
     );
     if elided > 0 {
-        recap.push_str(&format!(
-            "({elided} older interrupted segment(s) elided.)\n\n"
-        ));
+        let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
     }
     for segment in &segments {
         let (label, tag, text) = match segment {
@@ -10962,13 +10935,14 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                 text,
             ),
         };
-        recap.push_str(&format!(
+        let _ = write!(
+            recap,
             "{label}\n<{tag}>\n{}\n</{tag}>\n\n",
             crate::history_xml::escape_xml(&crate::history_xml::truncate_middle_content(
                 text,
                 RESUME_RECAP_SEGMENT_MAX_CHARS,
-            )),
-        ));
+            ))
+        );
     }
     if !has_partial {
         recap.push_str(

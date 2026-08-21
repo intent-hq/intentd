@@ -528,6 +528,7 @@ mod tests {
     use super::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
     use crate::Store;
     use intent_core::WorkspaceId;
+    use std::fmt::Write as _;
     use uuid::Uuid;
 
     /// A unique temp DB path cleaned up on drop (mirrors `crate::tests::TempDb`,
@@ -835,7 +836,7 @@ attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_p
             .fetch_all(store.read_pool())
             .await
             .expect("table_info");
-            actual.push_str(&format!("{table}: {}\n", cols.join(", ")));
+            let _ = writeln!(actual, "{table}: {}", cols.join(", "));
         }
         let actual = actual.trim_end();
 

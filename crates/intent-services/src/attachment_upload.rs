@@ -18,6 +18,7 @@
 //! `begin` and reported as a clear caller error to its own late calls.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -54,8 +55,7 @@ fn attachment_upload_idle_ttl() -> Duration {
     std::env::var("INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(ATTACHMENT_UPLOAD_IDLE_TTL)
+        .map_or(ATTACHMENT_UPLOAD_IDLE_TTL, Duration::from_millis)
 }
 
 /// One in-flight staged attachment upload: everything `chunk`/`commit`/
@@ -643,11 +643,10 @@ fn assemble_and_verify(
              still be being written; wait for the chunk call to return, then retry the commit"
         )));
     }
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let actual: String = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     if actual != declared_sha256 {
         return Err(Error::InvalidParams(format!(
             "attachment checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
@@ -658,6 +657,7 @@ fn assemble_and_verify(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
 
     use base64::Engine as _;
@@ -688,8 +688,10 @@ mod tests {
     fn sha256_hex(bytes: &[u8]) -> String {
         sha2::Sha256::digest(bytes)
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+            .fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 
     /// One in-process service stack with a seeded workspace whose checkout
@@ -731,7 +733,7 @@ mod tests {
         let checkout = TempDir::new("attach-up-co");
         let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
-        let payload: Vec<u8> = (0u32..200_000).flat_map(|i| i.to_le_bytes()).collect();
+        let payload: Vec<u8> = (0u32..200_000).flat_map(u32::to_le_bytes).collect();
         let mid = payload.len() / 2;
         let upload_id = begin(&svc, &ws, &payload).await;
 
@@ -1331,11 +1333,7 @@ mod tests {
             .0
             .join(".attachment-upload-staging")
             .join(&upload_id);
-        std::fs::write(
-            staging.join(super::chunk_file_name(1)),
-            &payload[mid..mid + 1],
-        )
-        .unwrap();
+        std::fs::write(staging.join(super::chunk_file_name(1)), &payload[mid..=mid]).unwrap();
         let err = svc
             .file_attachment_upload_commit_op(upload_id.clone())
             .await

@@ -198,7 +198,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -255,7 +255,7 @@ where
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             Ok(other) => panic!("subscription socket ended: {other:?}"),
             Err(_) => return None,
         }

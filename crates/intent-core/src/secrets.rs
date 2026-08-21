@@ -46,8 +46,7 @@ pub(crate) fn default_secrets_path() -> PathBuf {
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 /// File-backed secret store (see the module docs for path resolution, atomic

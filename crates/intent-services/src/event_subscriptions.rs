@@ -246,7 +246,7 @@ impl Services {
             let mut guard = self
                 .event_subscriptions
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ids: Vec<String> = guard
                 .iter()
                 .filter(|(_, e)| &e.record.workspace_id == workspace_id)

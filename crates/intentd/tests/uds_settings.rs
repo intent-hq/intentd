@@ -413,9 +413,9 @@ async fn settings_round_trip_redaction_validation_and_event() {
     let list = rpc(&mut w, &mut r, 18, "settings.list", json!({})).await;
     let chars = entry(&list, "workspaceApi.maxOutputChars");
     assert_eq!(chars["type"], "number");
-    assert_eq!(chars["value"], json!(100000.0));
+    assert_eq!(chars["value"], json!(100_000.0));
     assert_eq!(chars["min"], json!(0.0));
-    assert_eq!(chars["max"], json!(10000000.0));
+    assert_eq!(chars["max"], json!(10_000_000.0));
     assert!(chars.get("sensitive").is_none());
     let toon = entry(&list, "workspaceApi.toonOutput");
     assert_eq!(toon["type"], "boolean");
@@ -428,12 +428,12 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!({ "path": "workspaceApi.maxOutputChars" }),
     )
     .await;
-    assert_eq!(got["value"], json!(100000.0));
+    assert_eq!(got["value"], json!(100_000.0));
     assert_eq!(got["definition"]["type"], "number");
 
     // Catalog validation → -32602, nothing applied.
     for bad in [
-        json!([{ "path": "workspaceApi.maxOutputChars", "value": 20000000 }]),
+        json!([{ "path": "workspaceApi.maxOutputChars", "value": 20_000_000 }]),
         json!([{ "path": "workspaceApi.maxOutputChars", "value": "lots" }]),
         json!([{ "path": "workspaceApi.toonOutput", "value": "yes" }]),
     ] {
@@ -455,7 +455,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
         21,
         "settings.update",
         json!({ "changes": [
-            { "path": "workspaceApi.maxOutputChars", "value": 250000 },
+            { "path": "workspaceApi.maxOutputChars", "value": 250_000 },
             { "path": "workspaceApi.toonOutput", "value": false },
         ] }),
     )
@@ -472,7 +472,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!({ "path": "workspaceApi.maxOutputChars" }),
     )
     .await;
-    assert_eq!(got["value"], json!(250000));
+    assert_eq!(got["value"], json!(250_000));
     let got = rpc(
         &mut w,
         &mut r,
@@ -490,7 +490,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
         json!({ "path": "workspaceApi.maxOutputChars" }),
     )
     .await;
-    assert_eq!(reset["value"], json!(100000.0));
+    assert_eq!(reset["value"], json!(100_000.0));
     let _ = read_json(&mut sr).await; // drain the settings:changed event.
     let reset = rpc(
         &mut w,

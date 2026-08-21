@@ -80,7 +80,7 @@ async fn next_for(
                         continue;
                     }
                     match action {
-                        Some(a) if ev.data["action"] != a => continue,
+                        Some(a) if ev.data["action"] != a => {}
                         _ => return Some(ev),
                     }
                 }
@@ -266,7 +266,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type.starts_with("file:") {
-                        if ev.data.get("burst").and_then(|v| v.as_bool()) == Some(true) {
+                        if ev.data.get("burst").and_then(serde_json::Value::as_bool) == Some(true) {
                             seen_burst = true;
                         }
                         eprintln!(
@@ -325,7 +325,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
     // At least one event should have burst=true indicating coalescing occurred.
     let burst_events: Vec<_> = events
         .iter()
-        .filter(|e| e.data.get("burst").and_then(|v| v.as_bool()) == Some(true))
+        .filter(|e| e.data.get("burst").and_then(serde_json::Value::as_bool) == Some(true))
         .collect();
     assert!(
         !burst_events.is_empty(),
@@ -336,7 +336,11 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
     // Verify burst events report the files they collapsed.
     let total_affected: u64 = burst_events
         .iter()
-        .filter_map(|e| e.data.get("affectedCount").and_then(|v| v.as_u64()))
+        .filter_map(|e| {
+            e.data
+                .get("affectedCount")
+                .and_then(serde_json::Value::as_u64)
+        })
         .sum();
     assert!(
         total_affected >= 50,
@@ -392,13 +396,17 @@ async fn drain_file_events(sub: &mut super::bus::Subscription, quiet: Duration) 
 }
 
 fn burst_flag(ev: &Event) -> Option<bool> {
-    ev.data.get("burst").and_then(|v| v.as_bool())
+    ev.data.get("burst").and_then(serde_json::Value::as_bool)
 }
 
 fn affected_sum(events: &[Event]) -> u64 {
     events
         .iter()
-        .filter_map(|e| e.data.get("affectedCount").and_then(|v| v.as_u64()))
+        .filter_map(|e| {
+            e.data
+                .get("affectedCount")
+                .and_then(serde_json::Value::as_u64)
+        })
         .sum()
 }
 
