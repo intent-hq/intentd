@@ -115,6 +115,10 @@ pub struct Updater {
 impl Updater {
     /// Updater against the real GitHub release manifests, trying each of
     /// [`manifest::DEFAULT_MANIFEST_BASE_URLS`] in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::Client`] if the HTTP client cannot be built.
     pub fn new(paths: SitterPaths) -> Result<Self, UpdateError> {
         Self::with_base_urls(paths, manifest::DEFAULT_MANIFEST_BASE_URLS.iter().copied())
     }
@@ -122,6 +126,10 @@ impl Updater {
     /// Updater against exactly one manifest base URL — no fallback (tests
     /// and the `INTENTD_SITTER_MANIFEST_BASE_URL` override use a local
     /// fixture server).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::Client`] if the HTTP client cannot be built.
     pub fn with_base_url(
         paths: SitterPaths,
         base_url: impl Into<String>,
@@ -133,6 +141,10 @@ impl Updater {
     /// fetch tries each in order and the first fetchable + parseable
     /// manifest wins. An empty list is rejected with
     /// [`UpdateError::NoBaseUrls`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::NoBaseUrls`] for an empty list; [`UpdateError::Client`] if the HTTP client cannot be built.
     pub fn with_base_urls<I, S>(paths: SitterPaths, base_urls: I) -> Result<Self, UpdateError>
     where
         I: IntoIterator<Item = S>,
@@ -156,6 +168,10 @@ impl Updater {
     /// Run one update check for `channel`: fetch the manifest and, when it
     /// points at a newer version than `state.current_version`, download,
     /// verify, and install it. Equal or older manifests are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
     pub fn check_and_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
         self.install_from_manifest(channel, false)
     }
@@ -166,6 +182,10 @@ impl Updater {
     /// downgrade path (e.g. beta → stable). Reuses the same
     /// download/verify/install/prune sequence; never touches a running
     /// daemon (the new binary takes effect on the next spawn).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
     pub fn force_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
         self.install_from_manifest(channel, true)
     }
@@ -174,6 +194,10 @@ impl Updater {
     /// without downloading or installing anything. Applies the same
     /// newer-only comparison (and the same "installed only counts when the
     /// binary exists" rule) as [`Updater::check_and_install`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or its version string is invalid.
     pub fn check_only(&self, channel: Channel) -> Result<UpdateCheck, UpdateError> {
         let manifest = self.fetch_manifest(channel)?;
         semver::Version::parse(&manifest.version).map_err(|source| {

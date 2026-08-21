@@ -134,6 +134,10 @@ impl EventBus {
     /// Non-agent `file:*` events are downgraded to a transient broadcast
     /// ([`is_transient_file_event`]) so watcher noise never reaches `SQLite`;
     /// callers see the same `Ok(Event)` shape either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the event writer task has shut down or dropped the response.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
         if is_transient_file_event(ev) {
             let event = self.publish_transient(ev);

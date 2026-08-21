@@ -210,6 +210,10 @@ fn forget_fresh(cache_path: &Path) {
 /// git via the environment (see [`crate::auth`]); it never appears in argv.
 /// Callers for the same repo serialize on a per-repo async lock; the git work
 /// itself runs on the blocking pool.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `owner`/`repo` is not a safe path segment; `Error::Internal` if the clone or refresh fails.
 pub async fn ensure_cached_repo(
     cache_root: &Path,
     github_url: &str,
@@ -225,6 +229,10 @@ pub async fn ensure_cached_repo(
 /// [`CacheEnsureEvent`]s while the ensure runs. The callback is invoked from
 /// the blocking pool and drain threads — it must be cheap and non-blocking
 /// (e.g. a channel send). `None` behaves exactly like [`ensure_cached_repo`].
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `owner`/`repo` is not a safe path segment; `Error::Internal` if the clone or refresh fails.
 pub async fn ensure_cached_repo_with_progress(
     cache_root: &Path,
     github_url: &str,
@@ -592,6 +600,10 @@ fn chunk_fn(
 /// [`ensure_cached_repo`] refresh/re-clone of the same cache (which
 /// hard-resets or deletes the directory mid-read). The closure runs on the
 /// blocking pool.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the blocking task fails; otherwise propagates the closure result.
 pub async fn with_cache_lock_blocking<T, F>(cache_path: &Path, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -635,6 +647,10 @@ pub struct CachedBranches {
 /// reader therefore verifies the slot's `origin` actually points at
 /// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
 /// a local seed) is a miss, never another repo's branch list.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `owner`/`repo` is not a safe path segment; `Error::Internal` if reading the cached branch list fails.
 pub async fn list_cached_branches(
     cache_root: &Path,
     owner: &str,
@@ -744,6 +760,10 @@ pub(crate) fn provision_direct_checkout(
 /// callback: the submodule-population `git submodule update … --progress`
 /// output streams through `on_submodule_chunk` as it arrives. `None` behaves
 /// exactly like [`provision_direct_checkout`].
+///
+/// # Errors
+///
+/// Returns [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::Internal` for clone, checkout, or submodule-population failures.
 pub fn provision_direct_checkout_with_progress(
     cache_path: &Path,
     checkout_path: &Path,

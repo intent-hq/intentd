@@ -26,6 +26,10 @@ pub(crate) fn encode_task_json(task: &intent_core::TaskMetadata) -> Result<Strin
 
 impl Store {
     /// Insert a note row. `metadata.task` is stored opaquely as `task_json` TEXT.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
         let task_json = note
@@ -59,6 +63,10 @@ impl Store {
     }
 
     /// List notes in a workspace, ordered by creation time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_notes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
         let sql =
             format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
@@ -72,6 +80,10 @@ impl Store {
 
     /// List every note across all workspaces, oldest first. Backs the global
     /// `search.notes` adapter (PROTOCOL §5.15), which has no `workspaceId`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note ORDER BY created_at");
         let rows = sqlx::query(&sql)
@@ -89,6 +101,10 @@ impl Store {
     /// The query runs under [`crate::with_read_retry`]: this is the exact read
     /// that surfaced a transient "get note failed: ... (code: 5) database is
     /// locked" to a production client under heavy write load (monorepo#1139).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ? AND workspace_id = ?");
         let row = crate::with_read_retry(|| async {
@@ -111,6 +127,10 @@ impl Store {
     /// `rev`; `metadata.task` is stored opaquely as `task_json` TEXT. The write
     /// is scoped by the note's own `workspace_id` so same-id notes across
     /// workspaces never collide.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note(&self, note: &Note) -> Result<()> {
         self.update_note_versioned(note, None).await
     }
@@ -124,6 +144,10 @@ impl Store {
     /// distinguish a [`Error::Conflict`] (row present, carrying the current
     /// entity) from a [`Error::NotFound`] (row absent). When `None`, this is
     /// the unconditional last-writer-wins bump. In all cases `rev` increments.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_versioned(
         &self,
         note: &Note,
@@ -184,6 +208,10 @@ impl Store {
     }
 
     /// Delete a note by (workspace, id), unconditional. `NotFound` if absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
     pub async fn delete_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<()> {
         self.delete_note_versioned(workspace_id, id, None).await
     }
@@ -196,6 +224,10 @@ impl Store {
     /// [`Error::Conflict`] (row present, carrying the current entity snapshot
     /// prior to deletion) from a [`Error::NotFound`] (row absent). When
     /// `None`, this is the unconditional delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Conflict` (carrying the current entity snapshot prior to deletion) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the delete fails.
     pub async fn delete_note_versioned(
         &self,
         workspace_id: &WorkspaceId,
@@ -238,6 +270,10 @@ impl Store {
 
     /// List a workspace's task notes (those carrying `task_json`), using the
     /// `idx_note_task` partial index. Ordered by creation time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_tasks(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
         let sql = format!(
             "SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? AND task_json IS NOT NULL \
@@ -265,6 +301,10 @@ impl Store {
     /// plus `id` + `json_extract(task_json, '$.status')` for the spec's child
     /// task rows — never the task notes' content bodies — so it stays cheap
     /// on workspaces with large notes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_task_stats(&self, workspace_id: &WorkspaceId) -> Result<WorkspaceTaskStats> {
         let spec_content: Option<String> =
             sqlx::query_scalar("SELECT content FROM note WHERE workspace_id = ? AND id = 'spec'")
@@ -338,6 +378,10 @@ impl Store {
     /// belt-and-braces: `BEGIN IMMEDIATE` can still return BUSY when a
     /// connection outside the write pool (e.g. an external process on the same
     /// DB) holds the write lock past `busy_timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn adopt_stray_spec_note(
         &self,
         workspace_id: &WorkspaceId,

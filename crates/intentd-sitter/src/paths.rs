@@ -58,6 +58,10 @@ pub struct SitterPaths {
 
 impl SitterPaths {
     /// Resolve from the process environment (`INTENTD_DATA_DIR`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataDirError`] when no override is set and the platform data directory cannot be resolved.
     pub fn resolve() -> Result<Self, DataDirError> {
         Self::from_env(std::env::var_os(DATA_DIR_ENV))
     }
@@ -65,6 +69,10 @@ impl SitterPaths {
     /// Resolve from an explicit env-override value (parameterized so tests
     /// never mutate process state). Mirrors intent-core's `Config::resolve`:
     /// any set `INTENTD_DATA_DIR` wins, else the platform default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataDirError`] when no override is set and the platform data directory cannot be resolved.
     pub fn from_env(data_dir_override: Option<OsString>) -> Result<Self, DataDirError> {
         let data_dir = match data_dir_override {
             Some(p) => PathBuf::from(p),

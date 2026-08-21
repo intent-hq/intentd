@@ -116,6 +116,10 @@ impl Drop for McpBridge {
 /// yields one response line, a notification (no `id`) yields nothing. The
 /// dispatch watchdog deadline is derived from the server's (possibly
 /// env-overridden) eval budget via [`effective_dispatch_timeout`].
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding the loopback listener fails.
 pub async fn serve_workspace_mcp_tcp(
     server: Arc<WorkspaceMcpServer>,
 ) -> std::io::Result<McpBridge> {
@@ -423,6 +427,10 @@ struct PendingRequest {
 /// [`BRIDGE_OUTCOME_UNKNOWN_CODE`] — the listener may have executed them
 /// before the drop, so a blind retry could double-apply. Either way the
 /// provider's MCP client never has to time out.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if reading stdin or writing stdout fails; connection drops to `addr` are retried, not surfaced.
 pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
     run_bridge(
         addr,

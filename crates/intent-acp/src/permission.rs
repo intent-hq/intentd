@@ -222,6 +222,10 @@ impl PermissionRegistry {
 
     /// Register `data` as outstanding and return the receiver its outcome will
     /// arrive on (from [`resolve`](Self::resolve) or a timeout-driven removal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn register(&self, data: PermissionRequestData) -> oneshot::Receiver<PermissionOutcome> {
         let (sender, receiver) = oneshot::channel();
         self.inner
@@ -233,6 +237,10 @@ impl PermissionRegistry {
 
     /// Deliver `outcome` to the waiter for `request_id`. Returns `false` when no
     /// such prompt is outstanding (already resolved or timed out).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn resolve(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
         match self.inner.lock().unwrap().remove(request_id) {
             Some(pending) => pending.sender.send(outcome).is_ok(),
@@ -241,11 +249,19 @@ impl PermissionRegistry {
     }
 
     /// Drop a prompt without delivering an outcome (timeout cleanup).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn remove(&self, request_id: &str) {
         self.inner.lock().unwrap().remove(request_id);
     }
 
     /// Snapshot of every outstanding prompt, for client reconnect recovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pending(&self) -> Vec<PermissionRequestData> {
         self.inner
             .lock()

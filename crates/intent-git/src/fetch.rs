@@ -43,6 +43,10 @@ use crate::auth::TOKEN_ENV;
 /// HTTPS github.com remotes (see [`crate::auth`]). Errors when the branch
 /// name is empty, `git` is not on PATH, the remote is unreachable, or the fetch
 /// exceeds [`SHELL_FETCH_TIMEOUT`].
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the branch name is empty, `git` cannot be spawned, the fetch fails or times out.
 pub fn fetch(worktree_path: &Path, remote: &str, branch: &str, token: Option<&str>) -> Result<()> {
     fetch_with_timeout(worktree_path, remote, branch, token, SHELL_FETCH_TIMEOUT)
 }

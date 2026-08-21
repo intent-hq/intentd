@@ -33,6 +33,10 @@ const POP_CONFLICT_MSG: &str = "Pull succeeded but your local changes conflict w
 /// workflow. `token` is an optional caller-resolved GitHub token forwarded to
 /// the fetch step (see [`crate::fetch::fetch`]). Returns the outcome rather
 /// than an `Err` for the expected failure paths (matching the TS contract).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or the fetch step fails; expected pull/stash conflicts are reported in the returned outcome, not as `Err`.
 pub fn pull_branch(
     repo_path: &Path,
     branch_name: &str,

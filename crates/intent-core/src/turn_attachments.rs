@@ -127,6 +127,10 @@ impl TurnAttachmentRegistry {
     /// Register the attachments produced by ONE tool invocation as a single
     /// batch — a later claim attaches all of them together. Evicts expired
     /// entries and enforces the per-agent cap (oldest dropped first).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn register_all(&self, agent_id: &AgentId, attachments: Vec<TurnAttachment>) {
         if attachments.is_empty() {
             return;
@@ -158,6 +162,10 @@ impl TurnAttachmentRegistry {
     /// cannot defeat the attach, and only the tool that registers through
     /// this registry can trigger the blind claim. Empty when nothing is
     /// pending (the caller falls back to echo parsing).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn claim_at_tool_result(
         &self,
         agent_id: &AgentId,
@@ -200,6 +208,10 @@ impl TurnAttachmentRegistry {
     /// `numQuestionsAsked` field of the agent state snapshot, which counts
     /// questions registered earlier in the same turn that are still waiting
     /// for the turn-end drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pending_count_by_mime(&self, agent_id: &AgentId, mime_type: &str) -> usize {
         let mut inner = self.inner.lock().unwrap();
         let Some(entries) = inner.get_mut(agent_id) else {
@@ -216,6 +228,10 @@ impl TurnAttachmentRegistry {
     /// (in registration order) and clear ALL remaining entries — unclaimed
     /// `AtToolResult` leftovers are dropped so they cannot attach to a later
     /// turn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn finish_turn(&self, agent_id: &AgentId) -> Vec<TurnAttachment> {
         let mut inner = self.inner.lock().unwrap();
         let Some(mut entries) = inner.remove(agent_id) else {

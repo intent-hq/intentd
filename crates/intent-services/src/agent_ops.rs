@@ -10312,6 +10312,14 @@ impl Services {
     /// `turn_id = id` so every in-memory entry carries a correlation id.
     /// Returns the number of messages actually inserted into the in-memory
     /// map (agents that already hold a live queue are skipped, not counted).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted agent queues fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
         let rows = self.store.load_all_agent_queues().await?;
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
@@ -11107,6 +11115,10 @@ impl Services {
     /// If any post-claim step fails (`agent_send_message`, session lookup), the row is
     /// reset to pending (resolution=NULL) to restore retryability, and the error is
     /// returned loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` if the agent is not in pending interrupted state (or was already resolved); `Error::Internal` if a store operation fails.
     pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
         // Verify the agent is in pending interrupted state (O(1) query)
         let interrupted = self

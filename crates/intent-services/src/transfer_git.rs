@@ -259,6 +259,10 @@ pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
 /// This is blocking work (git2 I/O plus `git` child processes); async callers
 /// must run it via `spawn_blocking`, like the plan op does for
 /// `estimate_bundle_bytes`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the workspace has no worktree, the staging directory cannot be created, or building the bundle fails.
 pub fn create_transfer_bundle(
     ws: &Workspace,
     sandboxes: &[Sandbox],

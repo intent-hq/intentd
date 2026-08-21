@@ -15,6 +15,10 @@ use crate::Store;
 impl Store {
     /// Get the UI context blob for a workspace. Returns `None` when nothing
     /// has been stored yet (pre-first-save default).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_ui_context(
         &self,
         workspace_id: &WorkspaceId,
@@ -43,6 +47,10 @@ impl Store {
     /// The payload is stored verbatim as JSON text. No shape validation, no
     /// coercion (e.g., no `null` → `[]`, no missing-field defaults). The FE
     /// owns the schema; the daemon is a dumb pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_workspace_ui_context(
         &self,
         workspace_id: &WorkspaceId,

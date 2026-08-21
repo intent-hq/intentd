@@ -328,6 +328,10 @@ pub struct Connection {
 
 impl Connection {
     /// Wire up the writer/reader/stderr tasks around a child's piped stdio.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn new<W, R>(
         stdin: W,
         stdout: R,
@@ -450,12 +454,24 @@ impl Connection {
     }
 
     /// Send a request and await its response with the default timeout (§6.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails; [`AcpError::Rpc`] if the agent answers with a JSON-RPC error; [`AcpError::Timeout`] if no response arrives in time.
     pub async fn request(&self, method: &str, params: Value) -> AcpResult<Value> {
         self.request_timeout(method, params, DEFAULT_REQUEST_TIMEOUT)
             .await
     }
 
     /// Send a request and await its response with an explicit timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails; [`AcpError::Rpc`] if the agent answers with a JSON-RPC error; [`AcpError::Timeout`] if no response arrives in time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn request_timeout(
         &self,
         method: &str,
@@ -544,6 +560,10 @@ impl Connection {
     }
 
     /// Send a notification (no id, no response).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn notify(&self, method: &str, params: Value) -> AcpResult<()> {
         let line = encode_message(None, method, &params)?;
         self.writer_tx
@@ -553,6 +573,10 @@ impl Connection {
     }
 
     /// Send a successful response to an agent→client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn respond_result(&self, id: Value, result: Value) -> AcpResult<()> {
         let msg = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
         let line = format!("{}\n", serde_json::to_string(&msg)?);
@@ -563,6 +587,10 @@ impl Connection {
     }
 
     /// Send an error response to an agent→client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn respond_error(&self, id: Value, error: JsonRpcError) -> AcpResult<()> {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
@@ -577,6 +605,10 @@ impl Connection {
     }
 
     /// Recent stderr lines captured from the agent (newest last).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn recent_stderr(&self) -> Vec<String> {
         self.stderr.lock().unwrap().recent()
     }

@@ -27,6 +27,10 @@ pub fn empty_status() -> GitStatus {
 }
 
 /// Compute the working-tree status for the repository at `worktree_path`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn status(worktree_path: &Path) -> Result<GitStatus> {
     let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;

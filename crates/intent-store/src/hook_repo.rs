@@ -77,6 +77,10 @@ fn hook_from_row(r: &SqliteRow) -> Result<Hook> {
 
 impl Store {
     /// Insert a new hook row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_hook(&self, h: &Hook) -> Result<()> {
         let sql = format!(
             "INSERT INTO hook ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -106,6 +110,10 @@ impl Store {
     }
 
     /// Get a hook by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_hook(&self, hook_id: &HookId) -> Result<Hook> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE hook_id = ?");
         let row = sqlx::query(&sql)
@@ -123,6 +131,10 @@ impl Store {
     }
 
     /// List all hooks in a workspace, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE workspace_id = ? ORDER BY created_at");
         let rows = sqlx::query(&sql)
@@ -140,6 +152,10 @@ impl Store {
     /// snapshot): no `code`/`last_state` blob hydration and no dependence on
     /// how many terminal rows the agent has accumulated, unlike
     /// [`Store::list_hooks_by_agent`] + in-memory filtering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_active_hooks_by_agent(&self, agent_id: &AgentId) -> Result<u64> {
         let n: i64 = sqlx::query(
             "SELECT COUNT(*) AS n FROM hook \
@@ -159,6 +175,10 @@ impl Store {
     /// terminal rows the workspace has accumulated over the daemon's
     /// lifetime, unlike [`Store::list_hooks_by_workspace`] + in-memory
     /// filtering (mirrors [`Store::count_active_hooks_by_agent`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_active_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<u64> {
         let n: i64 = sqlx::query(
             "SELECT COUNT(*) AS n FROM hook \
@@ -175,6 +195,10 @@ impl Store {
     }
 
     /// List all hooks owned by an agent, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE agent_id = ? ORDER BY created_at");
         let rows = sqlx::query(&sql)
@@ -188,6 +212,10 @@ impl Store {
     }
 
     /// Set a hook's lifecycle state; `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_state(&self, hook_id: &HookId, state: HookState) -> Result<()> {
         let res = sqlx::query("UPDATE hook SET state = ? WHERE hook_id = ?")
             .bind(state_to_db(state))
@@ -208,6 +236,10 @@ impl Store {
     /// `state = 'expired'` AND clears `next_run_at`, so no reader can ever
     /// observe an expired hook with a stale `next_run_at`; `NotFound` when
     /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn expire_hook(&self, hook_id: &HookId) -> Result<()> {
         let res = sqlx::query("UPDATE hook SET state = ?, next_run_at = NULL WHERE hook_id = ?")
             .bind(state_to_db(HookState::Expired))
@@ -226,6 +258,10 @@ impl Store {
 
     /// Record a completed run: bump `run_count`, set `last_run_at`, and set
     /// (or clear) `next_run_at`; `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_run(
         &self,
         hook_id: &HookId,
@@ -252,6 +288,10 @@ impl Store {
     }
 
     /// Bump a hook's `dispatch_count`; `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn increment_hook_dispatch_count(&self, hook_id: &HookId) -> Result<()> {
         let res =
             sqlx::query("UPDATE hook SET dispatch_count = dispatch_count + 1 WHERE hook_id = ?")
@@ -272,6 +312,10 @@ impl Store {
 
     /// Set (or clear) a hook's `next_run_at`; `NotFound` when the row is
     /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_next_run(
         &self,
         hook_id: &HookId,
@@ -296,6 +340,10 @@ impl Store {
 
     /// Set (or clear) a hook's `last_error`; `NotFound` when the row is
     /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_last_error(
         &self,
         hook_id: &HookId,
@@ -320,6 +368,10 @@ impl Store {
 
     /// Set (or clear) a hook's `last_logs`; `NotFound` when the row is
     /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_last_logs(
         &self,
         hook_id: &HookId,
@@ -344,6 +396,10 @@ impl Store {
 
     /// Set (or clear) a hook's `last_state`; `NotFound` when the row is
     /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_hook_last_state(
         &self,
         hook_id: &HookId,
@@ -386,6 +442,10 @@ impl Store {
     /// Load every active (`scheduled` or `running`) hook across all
     /// workspaces, oldest first — the boot rehydration read for the hook
     /// scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_active_hooks(&self) -> Result<Vec<Hook>> {
         let sql = format!(
             "SELECT {COLUMNS} FROM hook WHERE state IN ('scheduled', 'running') \

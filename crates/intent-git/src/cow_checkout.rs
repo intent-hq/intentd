@@ -104,6 +104,10 @@ impl CowProvisionTimings {
 /// still point into the ORIGINAL repository's `.git/worktrees/<name>`, so the
 /// branch switch + hard reset below would rewrite the user's source checkout.
 /// Callers route such repos to linked-worktree provisioning instead.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidInput` if `repo_path` cannot be canonicalized; `Error::Unsupported` if the source repository has a gitfile `.git`; [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::Internal` for filesystem or git failures.
 pub fn provision_cow_checkout(
     repo_path: &Path,
     checkout_path: &Path,
@@ -528,6 +532,10 @@ pub(crate) fn checkout_in_clone(
 /// Returns the SHA the checkout lands on. On failure after the clone, the
 /// partially provisioned `checkout_path` is removed best-effort. Blocking —
 /// callers run it on the blocking pool.
+///
+/// # Errors
+///
+/// Returns [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::Internal` for clone or checkout failures.
 pub fn provision_local_clone_checkout(
     source_repo: &Path,
     checkout_path: &Path,

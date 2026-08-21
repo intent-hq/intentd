@@ -517,6 +517,10 @@ impl Services {
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
     /// than persisting a monitor that could never poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -739,6 +743,10 @@ impl Services {
     /// (`ws.pr.unmonitor`): a non-owner is rejected and the owner gets no
     /// self-wake. The FE path (`caller = None`, `prMonitor.cancel`) cancels
     /// any monitor and notifies the owning agent that its monitor is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the monitor does not exist in the workspace; `Error::InvalidParams` if the caller does not own the monitor or the monitor is not active.
     pub async fn pr_monitor_cancel(
         &self,
         workspace_id: &WorkspaceId,
@@ -1498,6 +1506,14 @@ impl Services {
     /// backfilled the baseline to the last poll's snapshot) is delivered
     /// as-is BEFORE that first poll — a wake awaiting delivery at upgrade
     /// time is never dropped. Returns the number of resumed monitors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted monitors, an owner status lookup, or re-emitting pending changes fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_pr_monitors(&self) -> Result<usize> {
         let monitors = self.store.load_active_pr_monitors().await?;
         let mut resumed = 0;

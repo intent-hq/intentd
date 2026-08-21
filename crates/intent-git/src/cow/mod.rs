@@ -81,6 +81,10 @@ impl From<best_effort::WalkStats> for CowCloneStats {
 /// Returns an error for I/O failures unrelated to `CoW` support (e.g., permission
 /// denied, disk full). `Unsupported` is returned as `Ok(CowSupport::Unsupported)`,
 /// not as an error.
+///
+/// # Panics
+///
+/// Panics if the probe-cache mutex is poisoned (a prior panic while holding the lock).
 pub fn cow_probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
     // Try to get volume IDs for cache lookup
     let cache_key = get_volume_pair(src_dir, dst_dir);

@@ -37,6 +37,10 @@ pub fn current_agent_log_file_name() -> String {
 /// so captured stderr — which may contain tokens, paths, or prompt fragments
 /// — is never world-readable; on other platforms this is a plain
 /// `create_dir_all`. Pre-existing directories are left untouched.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if creating the directory chain fails.
 pub fn create_agent_log_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -53,6 +57,10 @@ pub fn create_agent_log_dir(dir: &Path) -> std::io::Result<()> {
 /// so there is no window where it exists with umask-derived permissions;
 /// pre-existing files keep their mode. On other platforms this is a plain
 /// create+append open.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if opening (or creating) the file fails.
 pub fn open_agent_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -69,6 +77,10 @@ pub fn open_agent_log_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// `max_age`, then remove any agent directory the sweep left empty. Returns
 /// the number of files deleted. A missing root is not an error (`Ok(0)`);
 /// per-entry failures are skipped so one bad file never aborts the sweep.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error only when reading `root` fails for a reason other than it being missing; per-entry failures are skipped.
 pub fn sweep_agent_logs(root: &Path, max_age: Duration) -> std::io::Result<usize> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,

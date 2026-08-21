@@ -996,6 +996,10 @@ impl Services {
     /// NOT cancel or skip active rows (decided semantics: the toggle only
     /// rejects NEW schedules; existing hooks run to their terminal
     /// state/TTL). Returns the number of resumed hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted hooks or an owner status lookup fails.
     pub async fn rehydrate_hooks(&self) -> Result<usize> {
         let hooks = self.store.load_active_hooks().await?;
         let mut resumed = 0;

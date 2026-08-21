@@ -452,6 +452,10 @@ async fn resolve_auth_status(
 /// threading the discovery surface uses (monorepo#1065). The install gate
 /// applies each provider's override so overridden providers get probed
 /// (monorepo#1086); an empty map preserves auto-detection-only behavior.
+///
+/// # Errors
+///
+/// Returns an error string when `provider_id` names an unknown provider.
 pub async fn provider_auth_status(
     provider_id: Option<&str>,
     force: bool,

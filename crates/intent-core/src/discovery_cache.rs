@@ -76,6 +76,10 @@ impl<T: Clone> DiscoveryCache<T> {
     /// Every 100th call triggers an opportunistic sweep that evicts expired
     /// slots, bounding memory even when unique one-off requests continually
     /// create new slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn get_or_compute(
         &self,
         key: &str,

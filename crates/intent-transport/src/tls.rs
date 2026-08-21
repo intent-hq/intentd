@@ -47,6 +47,14 @@ static CACHE: Mutex<Option<TlsCertificate>> = Mutex::new(None);
 /// Ensure a TLS certificate is available under `data_dir`. Returns the cached
 /// cert if present, otherwise loads a valid persisted cert, otherwise generates
 /// and persists a new one. The result is cached in memory.
+///
+/// # Errors
+///
+/// Returns an error if generating or persisting a new certificate fails.
+///
+/// # Panics
+///
+/// Panics if the in-memory certificate cache mutex is poisoned (a prior panic while holding the lock).
 pub fn ensure_tls_certificate(data_dir: &Path) -> Result<TlsCertificate> {
     if let Some(cert) = CACHE.lock().expect("tls cache poisoned").clone() {
         return Ok(cert);

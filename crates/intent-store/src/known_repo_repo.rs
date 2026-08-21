@@ -13,6 +13,10 @@ const KNOWN_REPO_COLUMNS: &str = "path, name, owner, added_at, last_used_at";
 impl Store {
     /// List every known repo, most-recently-used first (`last_used_at` DESC),
     /// mirroring TS `getAllRepos()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
         let sql = format!("SELECT {KNOWN_REPO_COLUMNS} FROM known_repo ORDER BY last_used_at DESC");
         let rows = sqlx::query(&sql)
@@ -27,6 +31,10 @@ impl Store {
     /// `last_used_at` is bumped and `name`/`owner` are overwritten when a
     /// non-empty `name`/`Some(owner)` is supplied (else the existing value is
     /// kept). Idempotent on `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_known_repo(
         &self,
         path: &str,
@@ -55,6 +63,10 @@ impl Store {
 
     /// Delete a known repo by `path` (TS `removeRepo`). Returns whether a row
     /// was actually removed; removing an unregistered path is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_known_repo(&self, path: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM known_repo WHERE path = ?")
             .bind(path)

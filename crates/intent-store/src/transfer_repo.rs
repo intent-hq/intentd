@@ -190,6 +190,10 @@ impl Store {
     /// the `workspace.transfer.plan` dispatch stays within the `rpc_profile`
     /// statement budget instead of issuing 2 statements per table
     /// (intent-hq/monorepo#2994).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if either aggregate query fails.
     pub async fn transfer_table_stats(
         &self,
         workspace_id: &WorkspaceId,
@@ -288,6 +292,10 @@ impl Store {
     /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
     /// payload the export archive writes to `rows/<table>.jsonl` and
     /// [`Store::transfer_import_rows`] round-trips on the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn transfer_export_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -318,6 +326,10 @@ impl Store {
     /// their children. Every row's keys are validated against the live
     /// schema. Nothing is visible unless the whole batch commits. Returns
     /// the number of rows inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
     pub async fn transfer_import_rows(
         &self,
         rows: &[(String, Vec<serde_json::Value>)],

@@ -36,6 +36,10 @@ pub struct GitHubSourceControl {
 impl GitHubSourceControl {
     /// Build a client from a personal token, optionally targeting a GitHub
     /// Enterprise instance via `api_base_url` (`octocrab` `.base_uri(...)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the octocrab client cannot be built (e.g. an invalid `api_base_url`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
         let mut builder = octocrab::Octocrab::builder()
             .personal_token(token.to_string())

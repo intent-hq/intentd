@@ -1577,6 +1577,10 @@ impl Services {
     /// carrying the stored-on-write `was_running` marker hydrates with
     /// `previouslyRunning: true` so clients can re-render its tab. Returns the
     /// number of scripts loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted scripts from the store fails.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
         self.script_manager().hydrate().await
     }
@@ -2526,6 +2530,10 @@ impl Services {
     /// (`Completed`/`Error`/`Deleted`) are left untouched. Returns the number
     /// of sessions healed. Errors are surfaced so the composition root can log
     /// and continue: heal is best-effort and never gates `serve`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if listing the agent sessions or persisting a status heal fails.
     pub async fn heal_stale_agent_sessions(&self) -> Result<usize> {
         let sessions = self.store.list_all_agent_sessions().await?;
         let mut healed = 0usize;
@@ -2586,6 +2594,10 @@ impl Services {
 
     /// STAB-108: Rehydrate undelivered delegation groups across all workspaces at daemon startup.
     /// Best-effort: errors are logged but never fatal. Returns the total number of groups rehydrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if listing workspaces with undelivered groups fails; per-workspace rehydration failures are logged and skipped.
     pub async fn heal_delegation_groups_on_startup(&self) -> Result<usize> {
         let workspace_ids = self.store.list_workspaces_with_undelivered_groups().await?;
         let mut total_loaded = 0usize;
@@ -3256,6 +3268,10 @@ impl Services {
     /// The background callers wrap this future in that timeout themselves:
     /// the refresh sweep ([`Services::refresh_all_workspace_prs`]) and the
     /// PR-monitor terminal path (`refresh_workspace_pr_after_terminal`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist, and propagates source-control resolution and refresh failures.
     pub async fn refresh_workspace_pr(
         &self,
         workspace_id: &WorkspaceId,
@@ -11053,6 +11069,10 @@ impl Services {
     /// through the same `settings.update` path clients use, so
     /// `settings:changed` is emitted and every store/hook rule applies. The
     /// model rung is cache-only ([`ModelCatalogCache`]) — never a probe.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the underlying `settings.update` when persisting the healed values fails (e.g. `Error::InvalidParams` from validation or `Error::Internal` from the config rewrite).
     pub async fn heal_default_provider_settings(
         &self,
         installed_provider_ids: &[String],
@@ -24889,6 +24909,10 @@ impl Services {
 impl Services {
     /// Provision a sandbox for an agent in a direct-mode or CoW-checkout workspace.
     /// Returns `ProvisionOutcome::Supported` if `CoW` is available, or `Unsupported` for fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if `workspaces_root` is not configured or provisioning fails.
     pub async fn provision_sandbox(
         &self,
         workspace_id: &WorkspaceId,

@@ -131,6 +131,10 @@ impl ConfigWatcher {
     /// changed effective values (the registry has already been reloaded and
     /// its subscribers notified); the composition root uses it to apply
     /// server runtime hooks and emit `settings:changed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the config path has no parent directory or file name, or if the file watcher cannot be created or registered.
     pub fn start<F, Fut>(registry: Arc<SettingsRegistry>, on_change: F) -> Result<Self>
     where
         F: Fn(SettingsChanged) -> Fut + Send + 'static,

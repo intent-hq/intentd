@@ -371,6 +371,14 @@ impl Services {
     /// row by design), and load the rest into the registry, spawning each
     /// one's delivery task. Idempotent: subscriptions already present in
     /// memory (by id) are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if listing the persisted event subscriptions fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn heal_event_subscriptions_on_startup(&self) -> intent_core::Result<usize> {
         let persisted = self.store.list_event_subscriptions().await?;
         let mut loaded = 0usize;

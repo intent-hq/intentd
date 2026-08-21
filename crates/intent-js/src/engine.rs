@@ -50,6 +50,10 @@ enum RunErr {
 ///
 /// Every call builds a fresh [`AsyncRuntime`] and [`AsyncContext`], so no
 /// state leaks between calls.
+///
+/// # Errors
+///
+/// Returns a [`JsError`] when the runtime cannot be built, the script throws, the result cannot be serialized, or the timeout budget is exhausted.
 pub async fn eval(
     code: &str,
     opts: &EvalOptions,

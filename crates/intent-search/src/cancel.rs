@@ -49,6 +49,10 @@ impl CancelRegistry {
     /// Register `request_id`, returning the token the search should poll. A
     /// re-registered id replaces any prior token (a fresh search supersedes a
     /// finished one).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn register(&self, request_id: &str) -> CancelToken {
         let token = CancelToken::new();
         self.inner
@@ -60,6 +64,10 @@ impl CancelRegistry {
 
     /// Cancel the search registered under `request_id`. Returns `true` when a
     /// live token was found and flipped, `false` for an unknown/finished id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn cancel(&self, request_id: &str) -> bool {
         match self
             .inner
@@ -76,6 +84,10 @@ impl CancelRegistry {
     }
 
     /// Drop the token for `request_id` once its search has finished.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn unregister(&self, request_id: &str) {
         self.inner
             .lock()

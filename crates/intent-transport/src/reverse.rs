@@ -64,6 +64,14 @@ impl ReverseChannel {
     /// Issue a reverse request to the connected client and await its response.
     /// Fails if the connection is closed, the response channel is dropped, or
     /// the client does not reply within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReverseError`] if the connection is closed, the response channel is dropped, or the client does not reply within `timeout`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pending-request mutex is poisoned (a prior panic while holding the lock).
     pub async fn request(
         &self,
         method: &str,

@@ -133,6 +133,10 @@ impl Config {
     /// wrong type, out-of-range value) is an error — never silently ignored.
     /// `INTENTD_IDLE_REAP_MINUTES` / `INTENTD_STREAM_RETENTION_HOURS` env vars
     /// still take precedence over the file for their respective knobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the data directory cannot be resolved or `config.toml` cannot be read/initialized; `Error::InvalidInput` if the file is malformed.
     pub fn resolve() -> Result<Self> {
         let data_dir = match std::env::var_os("INTENTD_DATA_DIR") {
             Some(p) => PathBuf::from(p),

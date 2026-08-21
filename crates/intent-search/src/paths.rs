@@ -40,6 +40,10 @@ impl NameMatcher {
 
 /// Run a gitignore-aware filename search rooted at `root`, honoring `limit`
 /// (sets `truncated` when exceeded) and the `cancel` token (stops early).
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `pattern` is an invalid glob; `Error::Internal` if the walk fails.
 pub fn search_file_names(
     root: &Path,
     pattern: &str,

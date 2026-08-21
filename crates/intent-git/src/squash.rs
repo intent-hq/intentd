@@ -14,6 +14,10 @@ use intent_core::Result;
 use crate::map_git_err;
 
 /// `git write-tree`: write the current index as a tree object and return its SHA.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn write_tree(worktree_path: &Path) -> Result<String> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut index = repo.index().map_err(map_git_err)?;
@@ -24,6 +28,10 @@ pub fn write_tree(worktree_path: &Path) -> Result<String> {
 /// `git commit-tree <tree> -p <parent_sha> -m <message>`: create a commit object
 /// from the current index tree with `parent_sha` as its single parent, returning
 /// the new commit SHA. Does not move any ref (see [`update_ref`]).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `parent_sha` cannot be resolved or the commit cannot be written.
 pub fn commit_tree(worktree_path: &Path, parent_sha: &str, message: &str) -> Result<String> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let tree_oid = {
@@ -42,6 +50,10 @@ pub fn commit_tree(worktree_path: &Path, parent_sha: &str, message: &str) -> Res
 
 /// `git update-ref <refname> <sha>`: force-point `refname` (e.g.
 /// `refs/heads/<trunk>`) at `sha`. Used for the local-only trunk advance.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `sha` is invalid or the ref cannot be updated.
 pub fn update_ref(worktree_path: &Path, refname: &str, sha: &str) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let oid = Oid::from_str(sha).map_err(map_git_err)?;

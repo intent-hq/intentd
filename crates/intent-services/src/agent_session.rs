@@ -2115,6 +2115,9 @@ impl Services {
     /// present; bare callers (tests, harness paths) may pass `None` and the
     /// field is omitted.
     #[allow(clippy::too_many_arguments)]
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.
     pub async fn run_prompt_turn(
         &self,
         conn: &Connection,

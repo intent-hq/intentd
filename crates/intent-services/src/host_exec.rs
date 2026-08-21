@@ -50,6 +50,10 @@ pub const INTERNAL_ERROR: i32 = -32603;
 pub trait ExecPolicy: Send + Sync {
     /// `Ok(())` allows the invocation; `Err(reason)` rejects it with `reason`
     /// surfaced as `-32603` at the transport layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(reason)` when the policy rejects the invocation.
     fn evaluate(&self, command: &str, args: &[String]) -> Result<(), String>;
 }
 
@@ -104,6 +108,10 @@ impl HostExecError {
 
 /// Parse a JSON-RPC params object into [`HostExecArgs`]. Rejects a missing /
 /// empty `command`, non-string `args`/`env`, and negative `timeoutMs`.
+///
+/// # Errors
+///
+/// Returns an invalid-params `HostExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecError> {
     let command = params
         .get("command")
@@ -361,6 +369,10 @@ fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
 /// Execute one `host.exec` request end-to-end: validate policy + `cwd`, spawn,
 /// wait (with `timeoutMs`), reap the process group on timeout, and collect
 /// stdout/stderr. Returns the `{ stdout, stderr, exitCode, timedOut? }` JSON.
+///
+/// # Errors
+///
+/// Returns an internal `HostExecError` if the policy rejects the command, `cwd` cannot be resolved, or spawning/waiting on the process fails.
 pub async fn run(
     api: &dyn WorkspaceApi,
     args: HostExecArgs,
@@ -460,6 +472,10 @@ pub async fn run(
 }
 
 /// Convenience for the transport layer: run with the default v1 policy.
+///
+/// # Errors
+///
+/// Returns an internal `HostExecError` if `cwd` cannot be resolved or spawning/waiting on the process fails.
 pub async fn run_default(
     api: &dyn WorkspaceApi,
     args: HostExecArgs,
@@ -473,6 +489,10 @@ pub async fn run_default(
 /// caller-supplied `workspaceId` is overwritten before parsing), run with the
 /// default policy, and fold [`HostExecError`] codes onto the domain error enum
 /// (`-32602` → `InvalidParams`, else `Internal`).
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` when `params` is not an object or fails validation; execution failures surface as `Error::Internal`.
 pub async fn run_for_workspace(
     api: &dyn WorkspaceApi,
     workspace_id: WorkspaceId,

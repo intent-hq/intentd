@@ -108,6 +108,10 @@ pub(crate) fn has_submodules(worktree_path: &Path) -> bool {
 ///   removal or add that HEAD does not yet reflect;
 /// - [`Repository::submodules`] (`.gitmodules` + config) — the backstop for a
 ///   submodule registered but not yet committed anywhere.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn submodule_paths(repo: &Repository) -> Result<std::collections::BTreeSet<String>> {
     let mut paths = std::collections::BTreeSet::new();
     let commit_mode = i32::from(FileMode::Commit);

@@ -31,6 +31,10 @@ pub struct RebaseOutcome {
 /// Rebase the current `HEAD` onto `trunk_ref` with auto-stash. Returns the outcome
 /// rather than an `Err` for the expected conflict/recovery paths (matching the TS
 /// contract); only a failure to open the repository surfaces as `Err`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` only when the repository cannot be opened or the dirty check/stash fails; rebase conflicts are reported in the returned outcome.
 pub fn rebase_with_autostash(worktree_path: &Path, trunk_ref: &str) -> Result<RebaseOutcome> {
     let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
 

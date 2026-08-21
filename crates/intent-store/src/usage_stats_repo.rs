@@ -91,6 +91,10 @@ impl Store {
     /// `local_date` / `local_hour` untouched, so an existing bucket keeps its
     /// first-writer's stamp. `None` (local offset indeterminate at record
     /// time) persists NULLs, which readers treat like pre-D12 rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn add_usage_stats(
         &self,
         bucket_utc: &str,
@@ -141,6 +145,10 @@ impl Store {
     /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model,
     /// provider)` — the read surface the `stats.getUsage` aggregation (and
     /// tests) build on; period filtering/grouping happens in the service layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
         let rows = sqlx::query(&format!(
             "SELECT bucket_utc, model, provider, local_date, local_hour, {COUNTER_COLUMNS}

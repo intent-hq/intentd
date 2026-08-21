@@ -261,6 +261,10 @@ pub struct Store {
 impl Store {
     /// Open (creating if needed) the database at `db_path` and run migrations.
     /// Builds two pools: a single-connection write pool and a 32-connection read pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
         let write_pool = connect_write(db_path).await?;
         let read_pool = connect_read(db_path).await?;
@@ -321,6 +325,10 @@ impl Store {
     /// pages emptied by deletes that have not yet been reclaimed. On an
     /// incremental-auto-vacuum database these are the pages
     /// [`Self::incremental_vacuum`] can release back to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn freelist_count(&self) -> Result<i64> {
         sqlx::query("PRAGMA freelist_count")
             .fetch_one(&self.write_pool)
@@ -353,6 +361,10 @@ impl Store {
     /// blocked by the rebuild. Callers should treat a failure as non-fatal —
     /// the daemon runs exactly as before, it just cannot return freelist
     /// pages to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn activate_incremental_vacuum(&self) -> Result<AutoVacuumActivation> {
         let mode = sqlx::query("PRAGMA auto_vacuum")
             .fetch_one(&self.write_pool)
@@ -388,6 +400,10 @@ impl Store {
     /// single-connection write pool is never held for long; call it
     /// periodically (e.g. after retention sweeps) to reclaim space
     /// incrementally. Returns the number of pages actually freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn incremental_vacuum(&self, max_pages: u32) -> Result<u64> {
         let before = self.freelist_count().await?;
         sqlx::query(&format!("PRAGMA incremental_vacuum({max_pages})"))
@@ -403,6 +419,10 @@ impl Store {
     /// enough to matter); intended to run periodically after retention
     /// sweeps so the query planner statistics track the shrinking event
     /// table. See <https://sqlite.org/pragma.html#pragma_optimize>.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn optimize(&self) -> Result<()> {
         sqlx::query("PRAGMA optimize")
             .execute(&self.write_pool)
@@ -426,6 +446,10 @@ impl Store {
 
     /// Compare the migrations embedded in the binary against the versions
     /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn migration_status(&self) -> Result<MigrationStatus> {
         let expected: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         let applied: Vec<i64> =
@@ -507,6 +531,10 @@ impl MigrationStatus {
 /// `intentd doctor` reports the current `auto_vacuum` mode and freelist size,
 /// and notes the next-start activation when the database is still in NONE
 /// mode.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
 pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
@@ -582,6 +610,10 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
 
 /// Legacy test helper: builds a single pool (`max_connections=20`) for tests
 /// that predate the write/read pool split. New tests should use `Store::open`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
 #[cfg(test)]
 pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()

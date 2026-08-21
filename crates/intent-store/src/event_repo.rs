@@ -62,6 +62,10 @@ pub struct EventQuery {
 
 impl Store {
     /// Append an event to the log, minting a `UUIDv7` id, and return it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_event(&self, ev: &NewEvent) -> Result<Event> {
         let id = Uuid::now_v7().to_string();
         let actor_json = serde_json::to_string(&ev.actor)
@@ -106,6 +110,10 @@ impl Store {
     /// Batch-insert multiple events in a single transaction, preserving order.
     /// Each event gets a freshly minted `UUIDv7` id. Returns the persisted events
     /// in insertion order. Empty input returns an empty vec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_events(&self, events: &[NewEvent]) -> Result<Vec<Event>> {
         if events.is_empty() {
             return Ok(Vec::new());
@@ -197,6 +205,10 @@ impl Store {
     }
 
     /// Run a filtered event query (newest-first). See [`EventQuery`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {EVENT_COLUMNS} FROM event WHERE 1=1"));
@@ -302,6 +314,10 @@ impl Store {
     /// [`Store::delete_events_by_type_range_before`]) so no single write
     /// transaction holds the pool for long. Idempotent — a re-run with the same
     /// cutoff removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
         // High-volume event families eligible for retention sweep:
         // - agent:stream:* — streaming chunks
@@ -362,6 +378,10 @@ impl Store {
     /// persisted `agent:tool:call` rows beyond bounded recent windows —
     /// conversation replay uses `agent_message`, and live streaming synthesizes
     /// tool blocks from the in-memory bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if a chunked delete fails.
     pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
         self.delete_exact_type_before(intent_core::events::AGENT_TOOL_CALL, cutoff)
             .await
@@ -450,6 +470,10 @@ impl Store {
     }
 
     /// Most-recent events for a workspace regardless of type (newest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
     pub async fn events_by_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -464,6 +488,10 @@ impl Store {
     }
 
     /// Most-recent events of a single `event_type` for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query fails.
     pub async fn events_by_type(
         &self,
         workspace_id: &WorkspaceId,

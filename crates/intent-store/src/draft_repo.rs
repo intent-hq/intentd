@@ -12,6 +12,10 @@ use crate::Store;
 
 impl Store {
     /// Fetch the draft for one `(workspace, agent, client)` triple, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_draft(
         &self,
         workspace_id: &WorkspaceId,
@@ -35,6 +39,10 @@ impl Store {
     /// `updated_at` in place on conflict. `attachments` is stored verbatim as
     /// serialized JSON (NULL when `None`). Returns the `updated_at` timestamp
     /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_draft(
         &self,
         workspace_id: &WorkspaceId,
@@ -66,6 +74,10 @@ impl Store {
 
     /// Delete the draft for one triple. Returns `true` when a row was removed
     /// (an idempotent no-op success otherwise).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_draft(
         &self,
         workspace_id: &WorkspaceId,

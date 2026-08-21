@@ -24,6 +24,10 @@ pub struct MergeConflicts {
 
 /// The current branch shorthand for the repository at `repo_path` (empty on a
 /// detached HEAD), mirroring `git branch --show-current`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn current_branch(repo_path: &Path) -> Result<String> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     Ok(crate::status::current_branch(&repo))
@@ -32,6 +36,10 @@ pub fn current_branch(repo_path: &Path) -> Result<String> {
 /// Probe for the local default branch, trying `main` then `master`, mirroring the
 /// TS `detectDefaultBranch` (`git rev-parse --verify <branch>`). `None` when
 /// neither exists locally.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn detect_default_branch(repo_path: &Path) -> Result<Option<String>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     for name in ["main", "master"] {
@@ -45,6 +53,10 @@ pub fn detect_default_branch(repo_path: &Path) -> Result<Option<String>> {
 /// Detect whether merging `current_branch` into `target_branch` would conflict.
 /// When the two share no merge base the result is `cannot_determine` (the TS
 /// legacy fallback's only non-error producer).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened, a branch tip cannot be resolved, or the merge analysis fails.
 pub fn detect_merge_conflicts(
     repo_path: &Path,
     current_branch: &str,

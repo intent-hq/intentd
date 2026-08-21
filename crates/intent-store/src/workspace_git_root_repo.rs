@@ -97,6 +97,10 @@ impl Store {
     /// `false` when an existing row was merged. The flag is decided inside
     /// the same serialized write transaction as the insert-or-merge itself,
     /// so concurrent registrations of one path observe exactly one insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_workspace_git_root(
         &self,
         root: &WorkspaceGitRoot,
@@ -199,6 +203,10 @@ impl Store {
     }
 
     /// Fetch a single git root by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace_git_root(
         &self,
         id: &WorkspaceGitRootId,
@@ -216,6 +224,10 @@ impl Store {
     }
 
     /// The git root registered for `(workspace_id, path)`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn find_workspace_git_root_by_path(
         &self,
         workspace_id: &WorkspaceId,
@@ -233,6 +245,10 @@ impl Store {
     }
 
     /// Every git root registered for a workspace, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots(
         &self,
         workspace_id: &WorkspaceId,
@@ -255,6 +271,10 @@ impl Store {
     /// `pull_requests IS NOT NULL`, and — unless `include_archived` — on the
     /// owning workspace being live, so cost is O(PR-bearing roots of returned
     /// workspaces) and a large archive never inflates the hot list paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_git_roots_with_prs(
         &self,
         include_archived: bool,
@@ -278,6 +298,10 @@ impl Store {
     }
 
     /// Delete a git root by id; `NotFound` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
         let res = sqlx::query("DELETE FROM workspace_git_root WHERE id = ?")
             .bind(&id.0)
@@ -295,6 +319,10 @@ impl Store {
     /// in-memory entity — the scoped write the background PR-discovery sweep
     /// uses (mirrors [`Store::update_workspace_pr_linkage`]). `NotFound` when
     /// the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_git_root_pr(&self, root: &WorkspaceGitRoot) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace_git_root SET pr_number = ?, pr_url = ?, pr_status = ?, \
@@ -321,6 +349,10 @@ impl Store {
     /// `IS NULL` guard enforces the never-overwrite contract at the SQL
     /// level; a row that already carries a value returns `false` untouched.
     /// `NotFound` when the row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn backfill_workspace_git_root_commit_sha(
         &self,
         id: &WorkspaceGitRootId,

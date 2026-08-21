@@ -89,6 +89,10 @@ pub fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> 
 /// one-liner. Composition roots that share a registry across the UDS + WSS
 /// listeners (REV-1) — and the daemon-wide outstanding-RPC cap — call
 /// [`serve_uds_with_reverse`] instead.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding or serving the local socket fails.
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -122,6 +126,10 @@ where
 /// exposes `server.pairingInfo`/`server.rotateToken` (§5.2) to local clients.
 /// `limiter` is the daemon-wide outstanding-slow-path-RPC cap
 /// (`server.maxOutstandingRpcs`) shared with the WSS listener.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding or serving the local socket fails.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(

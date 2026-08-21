@@ -69,6 +69,10 @@ impl Store {
     /// was created) so callers can derive the line-change **delta** this upsert
     /// represents (the global usage-stats recording needs the growth, not the
     /// replaced cumulative per-file counters).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_tracked_change(&self, c: &NewTrackedChange) -> Result<Option<(i64, i64)>> {
         let now = now_iso();
         let existing: Option<(String, i64, i64)> = sqlx::query(
@@ -150,6 +154,10 @@ impl Store {
     /// baseline for a fresh row on an already-tracked path (monorepo#1009):
     /// each row carries the file's full diff counters, so a new agent's first
     /// row must not re-record lines a sibling row already accounted for.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn max_sibling_tracked_change_counters(
         &self,
         workspace_id: &WorkspaceId,
@@ -180,6 +188,10 @@ impl Store {
     /// the recorded stats/blobs. Backs `file-tracking.stage`/`unstage` (M4.8):
     /// staging/unstaging a file moves its audit row across the git stage without
     /// dropping who produced it. Returns the number of rows transitioned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_tracked_change_stage(
         &self,
         workspace_id: &WorkspaceId,
@@ -205,6 +217,10 @@ impl Store {
 
     /// List a workspace's tracked changes, oldest first. Internal read used by the
     /// pipeline + tests (the UI-facing reads land in M4.8).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_tracked_changes(
         &self,
         workspace_id: &WorkspaceId,
