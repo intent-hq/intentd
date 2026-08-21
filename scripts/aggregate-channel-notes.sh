@@ -1,35 +1,47 @@
 #!/usr/bin/env bash
-# Rewrite the channel-stable release body with aggregated release notes.
+# Rewrite a rolling channel release body with aggregated release notes.
 #
-# Usage: aggregate-stable-notes.sh <promoted-version> [<previous-stable-version>]
+# Usage: aggregate-channel-notes.sh <channel> <promoted-version> [<previous-version>]
 #
-# Collects the bodies of every published (non-draft) vX.Y.Z release in
-# (previous-stable, promoted] (semver order, plain X.Y.Z tags only) and
-# rewrites the `channel-stable` release body as a
-# "Stable channel — currently vX.Y.Z" header followed by one "## vX.Y.Z"
+# <channel> is "stable" or "beta"; the notes land on the fixed
+# `channel-<channel>` release. Collects the bodies of every published
+# (non-draft) vX.Y.Z release in (previous, promoted] (semver order, plain
+# X.Y.Z tags only) and rewrites the channel release body as a
+# "Stable/Beta channel — currently vX.Y.Z" header followed by one "## vX.Y.Z"
 # section per release, newest first. With no previous version (first
 # promotion) the notes contain just the promoted version's body.
 #
 # The base of the aggregated range is persisted in the body as an invisible
 # `<!-- notes-base: X.Y.Z -->` marker. When the range is empty (idempotent
 # re-promotion where previous == promoted, or a promoted version older than
-# the previous stable) — or when the previous version is unknown but the
-# current body carries a marker (re-promotion with an unreadable
-# stable.json) — the marker is used to rebuild the full aggregate instead of
-# collapsing it to a single section; with no usable marker (legacy body) an
-# empty range leaves the body untouched.
+# the previous channel version) — or when the previous version is unknown
+# but the current body carries a marker (re-promotion with an unreadable
+# <channel>.json) — the marker is used to rebuild the full aggregate instead
+# of collapsing it to a single section; with no usable marker (legacy body)
+# an empty range leaves the body untouched.
 #
-# This script is best-effort by design: callers (promote-stable.yml) run it
-# fail-soft so a notes failure never blocks a promotion. Requires: gh
-# (authenticated via GH_TOKEN), jq, and an explicit GITHUB_REPOSITORY
-# (owner/repo) — no default, so a local run can never edit the upstream repo
-# by accident.
+# This script is best-effort by design: callers (promote-stable.yml,
+# promote-beta.yml) run it fail-soft so a notes failure never blocks a
+# promotion. Requires: gh (authenticated via GH_TOKEN), jq, and an explicit
+# GITHUB_REPOSITORY (owner/repo) — no default, so a local run can never edit
+# the upstream repo by accident.
 set -euo pipefail
 
-usage="usage: aggregate-stable-notes.sh <promoted-version> [<previous-stable-version>]"
-PROMOTED="${1:?$usage}"
-PREV="${2:-}"
+usage="usage: aggregate-channel-notes.sh <channel> <promoted-version> [<previous-version>]"
+CHANNEL="${1:?$usage}"
+PROMOTED="${2:?$usage}"
+PREV="${3:-}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set}"
+
+case "$CHANNEL" in
+  stable) channel_name="Stable" ;;
+  beta) channel_name="Beta" ;;
+  *)
+    echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
+    exit 1
+    ;;
+esac
+channel_tag="channel-$CHANNEL"
 
 semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 if [[ ! "$PROMOTED" =~ $semver_re ]]; then
@@ -37,8 +49,8 @@ if [[ ! "$PROMOTED" =~ $semver_re ]]; then
   exit 1
 fi
 if [[ -n "$PREV" && ! "$PREV" =~ $semver_re ]]; then
-  # Unvalidated data (came from a stable.json asset): don't echo it raw.
-  echo "warning: previous stable version is not plain X.Y.Z; treating as unknown" >&2
+  # Unvalidated data (came from a <channel>.json asset): don't echo it raw.
+  echo "warning: previous $CHANNEL version is not plain X.Y.Z; treating as unknown" >&2
   PREV=""
 fi
 
@@ -73,29 +85,29 @@ list_versions() {
 }
 
 # marker_base: print the notes-base marker version from the current
-# channel-stable body (empty when absent). Tolerates a trailing CR in case
+# channel body (empty when absent). Tolerates a trailing CR in case
 # the body was ever hand-edited into CRLF line endings.
 marker_base() {
-  gh release view channel-stable --repo "$REPO" --json body --jq '.body // ""' \
+  gh release view "$channel_tag" --repo "$REPO" --json body --jq '.body // ""' \
     | sed -n 's/^<!-- notes-base: \([0-9.]*\) -->\r\{0,1\}$/\1/p' | head -n1
 }
 
 versions=()
 notes_base=""
 if [[ -z "$PREV" ]]; then
-  # Previous stable unknown. Only a true first promotion (no marker in the
-  # current body) may write just the promoted version's section: a
-  # re-promotion with an unreadable stable.json would otherwise clobber the
-  # existing aggregate, so with a marker present, rebuild from it — and if
-  # that range is empty too, leave the body untouched.
+  # Previous channel version unknown. Only a true first promotion (no marker
+  # in the current body) may write just the promoted version's section: a
+  # re-promotion with an unreadable <channel>.json would otherwise clobber
+  # the existing aggregate, so with a marker present, rebuild from it — and
+  # if that range is empty too, leave the body untouched.
   base=$(marker_base || true)
   if [[ "$base" =~ $semver_re ]]; then
-    echo "previous stable unknown; rebuilding from notes-base marker $base" >&2
+    echo "previous $CHANNEL unknown; rebuilding from notes-base marker $base" >&2
     all_versions=$(list_versions)
     mapfile -t versions < <(collect_range "$base")
     notes_base="$base"
     if [[ ${#versions[@]} -eq 0 ]]; then
-      echo "no versions to aggregate; leaving channel-stable notes untouched" >&2
+      echo "no versions to aggregate; leaving $channel_tag notes untouched" >&2
       exit 0
     fi
   else
@@ -108,8 +120,8 @@ else
 
   # Empty range (idempotent re-promotion where PREV == PROMOTED, or
   # PROMOTED < PREV): rebuild the previous aggregate from the notes-base
-  # marker persisted in the current channel-stable body instead of
-  # collapsing it to a single section.
+  # marker persisted in the current channel body instead of collapsing it
+  # to a single section.
   if [[ ${#versions[@]} -eq 0 ]]; then
     base=$(marker_base || true)
     if [[ "$base" =~ $semver_re ]]; then
@@ -120,7 +132,7 @@ else
     if [[ ${#versions[@]} -eq 0 ]]; then
       # No usable marker (legacy body) or the marker range is empty too:
       # never shrink the aggregate — leave the body untouched.
-      echo "no versions to aggregate; leaving channel-stable notes untouched" >&2
+      echo "no versions to aggregate; leaving $channel_tag notes untouched" >&2
       exit 0
     fi
   fi
@@ -131,9 +143,9 @@ echo "aggregating notes for: ${versions[*]}" >&2
 notes_file=$(mktemp)
 trap 'rm -f "$notes_file"' EXIT
 {
-  echo "Stable channel — currently v$PROMOTED"
+  echo "$channel_name channel — currently v$PROMOTED"
   echo
-  echo "Machine-readable pointer to the latest stable intentd release. Do not consume the tag itself; download the stable.json asset."
+  echo "Machine-readable pointer to the latest $CHANNEL intentd release. Do not consume the tag itself; download the $CHANNEL.json asset."
   echo
   if [[ -n "$notes_base" ]]; then
     echo "<!-- notes-base: $notes_base -->"
@@ -152,5 +164,5 @@ trap 'rm -f "$notes_file"' EXIT
   done
 } >"$notes_file"
 
-gh release edit channel-stable --repo "$REPO" --notes-file "$notes_file"
-echo "updated channel-stable release body with notes for ${#versions[@]} version(s)" >&2
+gh release edit "$channel_tag" --repo "$REPO" --notes-file "$notes_file"
+echo "updated $channel_tag release body with notes for ${#versions[@]} version(s)" >&2

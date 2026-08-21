@@ -24,7 +24,7 @@
 #
 # As a best-effort extra, promotion also rewrites the `channel-stable` release
 # body with aggregated release notes covering every version since the previous
-# stable (aggregate-stable-notes.sh). Notes steps are fail-soft: they never
+# stable (aggregate-channel-notes.sh). Notes steps are fail-soft: they never
 # block the promotion or change manifest publishing.
 #
 # Promotions do not comment on monorepo issues: the release notifier
@@ -145,7 +145,7 @@ jobs:
         env:
           PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
         run: |
-          ./scripts/aggregate-stable-notes.sh "$VERSION" "$PREV_STABLE"
+          ./scripts/aggregate-channel-notes.sh stable "$VERSION" "$PREV_STABLE"
       - name: Post summary
         shell: bash
         env:
