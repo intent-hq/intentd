@@ -187,7 +187,7 @@ impl DeviceFlow {
                 })),
             )
             .await?;
-        match parse_poll_response(body)? {
+        match parse_poll_response(&body)? {
             PollResponse::Authorized { access_token } => {
                 persist_token(self.store.clone(), access_token).await?;
                 Ok(PollStatus::Authorized)
@@ -234,7 +234,7 @@ impl std::fmt::Debug for PollResponse {
 /// Unknown error codes (bad client id, disabled device flow, …) are
 /// non-retryable and surface as [`Error::Api`] carrying only the error code —
 /// never the raw body, which could contain credential material.
-fn parse_poll_response(body: Value) -> Result<PollResponse> {
+fn parse_poll_response(body: &Value) -> Result<PollResponse> {
     if let Some(token) = body.get("access_token").and_then(Value::as_str) {
         if !token.is_empty() {
             return Ok(PollResponse::Authorized {
@@ -306,13 +306,13 @@ pub(crate) async fn revoke_token(store: FileSecretStore) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn classify(body: Value) -> PollResponse {
+    fn classify(body: &Value) -> PollResponse {
         parse_poll_response(body).expect("classifiable response")
     }
 
     #[test]
     fn authorized_when_access_token_present() {
-        let r = classify(json!({
+        let r = classify(&json!({
             "access_token": "gho_test_value",
             "token_type": "bearer",
             "scope": "repo,read:org,workflow"
@@ -325,22 +325,22 @@ mod tests {
 
     #[test]
     fn empty_access_token_is_not_authorized() {
-        let err = parse_poll_response(json!({ "access_token": "" })).unwrap_err();
+        let err = parse_poll_response(&json!({ "access_token": "" })).unwrap_err();
         assert!(matches!(err, Error::Decode(_)));
     }
 
     #[test]
     fn pending_and_terminal_error_codes_classify() {
         assert!(matches!(
-            classify(json!({ "error": "authorization_pending" })),
+            classify(&json!({ "error": "authorization_pending" })),
             PollResponse::Pending
         ));
         assert!(matches!(
-            classify(json!({ "error": "expired_token" })),
+            classify(&json!({ "error": "expired_token" })),
             PollResponse::Expired
         ));
         assert!(matches!(
-            classify(json!({ "error": "access_denied" })),
+            classify(&json!({ "error": "access_denied" })),
             PollResponse::Denied
         ));
     }
@@ -348,18 +348,18 @@ mod tests {
     #[test]
     fn slow_down_carries_the_optional_interval_hint() {
         assert!(matches!(
-            classify(json!({ "error": "slow_down", "interval": 10 })),
+            classify(&json!({ "error": "slow_down", "interval": 10 })),
             PollResponse::SlowDown { interval: Some(10) }
         ));
         assert!(matches!(
-            classify(json!({ "error": "slow_down" })),
+            classify(&json!({ "error": "slow_down" })),
             PollResponse::SlowDown { interval: None }
         ));
     }
 
     #[test]
     fn unknown_error_code_is_a_non_retryable_api_error() {
-        let err = parse_poll_response(json!({ "error": "device_flow_disabled" })).unwrap_err();
+        let err = parse_poll_response(&json!({ "error": "device_flow_disabled" })).unwrap_err();
         match err {
             Error::Api(msg) => assert!(msg.contains("device_flow_disabled")),
             other => panic!("expected Api error, got {other:?}"),
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn unrecognized_body_is_a_decode_error_without_the_body() {
-        let err = parse_poll_response(json!({ "unexpected": "shape" })).unwrap_err();
+        let err = parse_poll_response(&json!({ "unexpected": "shape" })).unwrap_err();
         match err {
             Error::Decode(msg) => assert!(!msg.contains("unexpected")),
             other => panic!("expected Decode error, got {other:?}"),

@@ -764,6 +764,8 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 /// rejected by `SettingsFile::validate` inside `SettingsRegistry::apply`,
 /// i.e. the catalog advertising a value the write path refuses.
 #[tokio::test]
+// The advertised max is a small whole-valued float: casts are exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn agent_memory_knobs_over_wss() {
     let data_dir = temp_data_dir();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];

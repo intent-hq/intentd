@@ -347,7 +347,12 @@ impl WorkspaceMcpServer {
                 .get("value")
                 .and_then(Value::as_f64)
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| n as usize),
+                .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| {
+                    // Guarded finite + non-negative; float→int casts saturate.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let n = n as usize;
+                    n
+                }),
             Err(_) => DEFAULT_MAX_OUTPUT_CHARS,
         };
         (toon_output, max_chars)

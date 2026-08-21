@@ -529,26 +529,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn map(v: Value) -> Map<String, Value> {
+    fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
     }
 
     #[test]
     fn parse_args_requires_command() {
-        let err = parse_args(&map(json!({}))).unwrap_err();
+        let err = parse_args(&map(&json!({}))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("command"));
     }
 
     #[test]
     fn parse_args_rejects_non_string_args() {
-        let err = parse_args(&map(json!({ "command": "echo", "args": [1, 2] }))).unwrap_err();
+        let err = parse_args(&map(&json!({ "command": "echo", "args": [1, 2] }))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[test]
     fn parse_args_caps_timeout() {
-        let a = parse_args(&map(json!({
+        let a = parse_args(&map(&json!({
             "command": "echo",
             "timeoutMs": MAX_TIMEOUT_MS + 1_000,
         })))
@@ -558,14 +558,14 @@ mod tests {
 
     #[test]
     fn parse_args_cwd_requires_workspace_id() {
-        let err = parse_args(&map(json!({ "command": "echo", "cwd": "/tmp" }))).unwrap_err();
+        let err = parse_args(&map(&json!({ "command": "echo", "cwd": "/tmp" }))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("workspaceId"));
     }
 
     #[test]
     fn parse_args_defaults_are_empty() {
-        let a = parse_args(&map(json!({ "command": "echo" }))).unwrap();
+        let a = parse_args(&map(&json!({ "command": "echo" }))).unwrap();
         assert!(a.args.is_empty());
         assert!(a.env.is_empty());
         assert!(a.cwd.is_none());

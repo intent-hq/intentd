@@ -141,7 +141,7 @@ pub(crate) fn build_event_notification(subscription_id: &str, event: &Event) -> 
 }
 
 /// Serialize a JSON-RPC success response for a fast-path request.
-pub(crate) fn success_frame(id: Value, result: Value) -> String {
+pub(crate) fn success_frame(id: &Value, result: &Value) -> String {
     serde_json::to_string(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
         .unwrap_or_default()
 }
@@ -155,7 +155,7 @@ pub(crate) fn success_frame(id: Value, result: Value) -> String {
 /// attached centrally here rather than at each call site. A future fast-path
 /// site addressing a missing entity must emit `"not-found"` via a dedicated
 /// variant instead.
-pub(crate) fn error_frame(id: Value, code: i32, message: &str) -> String {
+pub(crate) fn error_frame(id: &Value, code: i32, message: &str) -> String {
     let error = if code == -32602 {
         json!({ "code": code, "message": message, "data": { "code": "invalid-params" } })
     } else {
@@ -170,7 +170,7 @@ pub(crate) fn error_frame(id: Value, code: i32, message: &str) -> String {
 /// discriminator beyond the centralized `-32602` tagging in [`error_frame`]
 /// (e.g. the pairing listener-down `{ "code": "listener-down" }`,
 /// monorepo#1822).
-pub(crate) fn error_frame_with_data(id: Value, code: i32, message: &str, data: Value) -> String {
+pub(crate) fn error_frame_with_data(id: &Value, code: i32, message: &str, data: &Value) -> String {
     // §3.3 invariant: every -32602 carries an `error.data.code` discriminator
     // — a caller bypassing the centralized tagging must supply one itself.
     debug_assert!(

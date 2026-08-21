@@ -1179,7 +1179,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let services = Services::new(store)
         .with_assets_root(assets_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
-        .with_models_cache_dir(config.data_dir.clone())
+        .with_models_cache_dir(&config.data_dir.clone())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
@@ -1629,7 +1629,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
-    spawn_child_tree_sampler(manager.clone(), child_usage.clone());
+    spawn_child_tree_sampler(manager.clone(), &child_usage.clone());
     let route_info = spawn_route_info_sampler();
     // Workspaces-root disk sampler: report the volume `workspace.create`
     // actually provisions under, resolved with the same precedence as the
@@ -2476,7 +2476,7 @@ fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep 
 /// decides what each poll costs: a full sweep every [`CHILD_TREE_BASE_PERIOD`],
 /// a peak-only sweep in between while an ephemeral adapter chain is live, and
 /// nothing at all otherwise.
-fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsage>) {
+fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsage>) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let Ok(pid) = sysinfo::get_current_pid() else {
@@ -2488,6 +2488,13 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
         sys.refresh_memory();
         match sys.total_memory() {
             0 => CHILD_TREE_WARN_FALLBACK_BYTES,
+            // RAM sizes are far below 2^53 (loss-free in f64); the fraction
+            // is in (0, 1) and the float→int cast saturates anyway.
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
             total => (total as f64 * CHILD_TREE_WARN_FRACTION) as u64,
         }
     };
@@ -2820,7 +2827,13 @@ impl intent_core::ServerControl for DaemonControl {
                 Ok(result) => result
                     .get("value")
                     .and_then(serde_json::Value::as_f64)
-                    .map(|p| p as u16),
+                    // Settings schema bounds the port to u16 range; the
+                    // float→int cast saturates anyway.
+                    .map(|p| {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let p = p as u16;
+                        p
+                    }),
                 Err(_) => None,
             };
             let desired_port = resolve_ws_listener_port(
@@ -2874,7 +2887,7 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.api.clone(),
                     runtime.bus.clone(),
                     tls,
-                    token_store.clone(),
+                    &token_store,
                     ws_options,
                     runtime.reverse_registry.clone(),
                     system_control.clone(),

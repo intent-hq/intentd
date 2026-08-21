@@ -10758,7 +10758,10 @@ async fn report_to_parent_delivers_for_delegated_caller() {
         .expect("report delivered");
     assert_eq!(result["ok"], json!(true));
     assert_eq!(result["parentAgentId"].as_str(), Some(parent.0.as_str()));
-    assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
+    assert_eq!(
+        result["reportLength"],
+        json!(i64::try_from(report.chars().count()).expect("count fits in i64"))
+    );
     assert!(result["savedAt"].is_string());
 
     // Report-time wake: reportToParent now delivers an immediate wake to the parent.

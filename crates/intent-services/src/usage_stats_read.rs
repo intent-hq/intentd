@@ -46,9 +46,9 @@ pub(crate) fn parse_period(period: &str, key: Option<&str>) -> Result<UsagePerio
                 .and_then(|(y, m)| {
                     let year = parse_digits(y, 4)?.cast_signed();
                     let month = parse_digits(m, 2)?;
-                    (1..=12).contains(&month).then_some(UsagePeriod::Month {
+                    (1..=12).contains(&month).then(|| UsagePeriod::Month {
                         year,
-                        month: month as u8,
+                        month: u8::try_from(month).expect("month in 1..=12"),
                     })
                 })
                 .ok_or_else(|| {
@@ -90,7 +90,7 @@ fn parse_local_date(s: &str) -> Option<(i32, u8)> {
     let month = parse_digits(it.next()?, 2)?;
     let day = parse_digits(it.next()?, 2)?;
     (it.next().is_none() && (1..=12).contains(&month) && (1..=31).contains(&day))
-        .then_some((year, month as u8))
+        .then(|| (year, u8::try_from(month).expect("month in 1..=12")))
 }
 
 /// Per-row local wall-clock parts `(year, month, hour_of_day)` used for
@@ -183,8 +183,10 @@ pub(crate) fn aggregate_usage(
             "tzOffsetMinutes must be within ±840 (got {tz_offset_minutes})"
         )));
     }
-    let tz = time::UtcOffset::from_whole_seconds(tz_offset_minutes as i32 * 60)
-        .expect("validated offset is in range");
+    let tz = time::UtcOffset::from_whole_seconds(
+        i32::try_from(tz_offset_minutes).expect("validated offset is in range") * 60,
+    )
+    .expect("validated offset is in range");
 
     // The 24h rolling window: the 24 hourly UTC buckets ending at now's hour.
     let window_end = floor_to_hour(now_utc.to_offset(time::UtcOffset::UTC));

@@ -204,25 +204,25 @@ pub(crate) async fn handle(
                 detect_display_server().as_deref(),
                 is_local,
             );
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::CheckGit => {
             let result = tokio::task::spawn_blocking(host_ops::check_git)
                 .await
                 .unwrap_or_else(|_| json!({ "available": false }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::CheckNode => {
             let result = tokio::task::spawn_blocking(host_ops::check_node)
                 .await
                 .unwrap_or_else(|_| json!({ "available": false }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::CheckGh => {
             let result = tokio::task::spawn_blocking(host_ops::check_gh)
                 .await
                 .unwrap_or_else(|_| json!({ "available": false }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::ListDirectory => {
             let path = params
@@ -233,9 +233,9 @@ pub(crate) async fn handle(
                 tokio::task::spawn_blocking(move || host_ops::list_directory(path.as_deref()))
                     .await;
             match join {
-                Ok(Ok(v)) => success_frame(id_echo, v),
-                Ok(Err(msg)) => error_frame(id_echo, -32603, &msg),
-                Err(e) => error_frame(id_echo, -32603, &format!("listDirectory join error: {e}")),
+                Ok(Ok(v)) => success_frame(&id_echo, &v),
+                Ok(Err(msg)) => error_frame(&id_echo, -32603, &msg),
+                Err(e) => error_frame(&id_echo, -32603, &format!("listDirectory join error: {e}")),
             }
         }
         HostMethod::CreateDirectory => {
@@ -246,7 +246,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Missing required parameter: path",
                     ));
@@ -254,9 +254,13 @@ pub(crate) async fn handle(
             };
             let join = tokio::task::spawn_blocking(move || host_ops::create_directory(&path)).await;
             match join {
-                Ok(Ok(v)) => success_frame(id_echo, v),
-                Ok(Err(msg)) => error_frame(id_echo, -32603, &msg),
-                Err(e) => error_frame(id_echo, -32603, &format!("createDirectory join error: {e}")),
+                Ok(Ok(v)) => success_frame(&id_echo, &v),
+                Ok(Err(msg)) => error_frame(&id_echo, -32603, &msg),
+                Err(e) => error_frame(
+                    &id_echo,
+                    -32603,
+                    &format!("createDirectory join error: {e}"),
+                ),
             }
         }
         HostMethod::DirectoryStatus => {
@@ -267,7 +271,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Missing required parameter: path",
                     ));
@@ -275,8 +279,12 @@ pub(crate) async fn handle(
             };
             let join = tokio::task::spawn_blocking(move || host_ops::directory_status(&path)).await;
             match join {
-                Ok(v) => success_frame(id_echo, v),
-                Err(e) => error_frame(id_echo, -32603, &format!("directoryStatus join error: {e}")),
+                Ok(v) => success_frame(&id_echo, &v),
+                Err(e) => error_frame(
+                    &id_echo,
+                    -32603,
+                    &format!("directoryStatus join error: {e}"),
+                ),
             }
         }
         HostMethod::CheckAuggie => {
@@ -285,7 +293,7 @@ pub(crate) async fn handle(
                 tokio::task::spawn_blocking(move || host_ops::check_auggie(configured.as_deref()))
                     .await;
             let result = join.unwrap_or_else(|_| json!({ "available": false }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::FindBinary => {
             let name = match params.get("name").and_then(Value::as_str) {
@@ -295,7 +303,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Missing required parameter: name",
                     ));
@@ -314,7 +322,7 @@ pub(crate) async fn handle(
                 tokio::task::spawn_blocking(move || host_ops::find_binary_op(&name, &common_paths))
                     .await
                     .unwrap_or_else(|_| json!({ "available": false }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::ToolAvailability => {
             let tools: Option<Vec<String>> =
@@ -326,7 +334,7 @@ pub(crate) async fn handle(
             let result = tokio::task::spawn_blocking(move || host_ops::tool_availability_op(tools))
                 .await
                 .unwrap_or_else(|_| json!({ "tools": {} }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::ProviderDiscovery => {
             // `providers.paths` overrides live in settings, above the
@@ -360,7 +368,7 @@ pub(crate) async fn handle(
                     tracing::warn!(error = %e, "default-provider settings self-heal failed");
                 }
             }
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::ProviderAuthStatus => {
             let provider_id = match params.get("providerId") {
@@ -371,7 +379,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Invalid parameter: providerId must be a non-empty string",
                     ));
@@ -385,7 +393,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Invalid parameter: force must be a boolean",
                     ));
@@ -408,15 +416,15 @@ pub(crate) async fn handle(
             )
             .await
             {
-                Ok(result) => success_frame(id_echo, result),
-                Err(msg) => error_frame(id_echo, -32602, &msg),
+                Ok(result) => success_frame(&id_echo, &result),
+                Err(msg) => error_frame(&id_echo, -32602, &msg),
             }
         }
         HostMethod::Env => {
             let result = tokio::task::spawn_blocking(host_ops::env_probe)
                 .await
                 .unwrap_or_else(|_| json!({ "path": "", "pathEntries": [], "varNames": [] }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::FindApp => {
             let name = match params.get("name").and_then(Value::as_str) {
@@ -426,7 +434,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Missing required parameter: name",
                     ));
@@ -435,13 +443,13 @@ pub(crate) async fn handle(
             let result = tokio::task::spawn_blocking(move || host_ops::find_app_op(&name))
                 .await
                 .unwrap_or_else(|_| json!({ "installed": false }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::ListInstalledEditors => {
             let result = tokio::task::spawn_blocking(host_ops::list_installed_editors_op)
                 .await
                 .unwrap_or_else(|_| json!({ "editors": [] }));
-            success_frame(id_echo, result)
+            success_frame(&id_echo, &result)
         }
         HostMethod::OpenInEditor => {
             let editor_id = params
@@ -454,11 +462,14 @@ pub(crate) async fn handle(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let line = params.get("line").and_then(Value::as_u64).map(|v| v as u32);
+            let line = params
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok());
             let column = params
                 .get("column")
                 .and_then(Value::as_u64)
-                .map(|v| v as u32);
+                .and_then(|v| u32::try_from(v).ok());
             // The platform editor catalog only backs the local short-circuit;
             // the remote path forwards the intent to the FE untouched.
             let editors = if is_local {
@@ -481,8 +492,8 @@ pub(crate) async fn handle(
             )
             .await
             {
-                Ok(()) => success_frame(id_echo, json!({ "ok": true })),
-                Err(e) => error_frame(id_echo, e.code(), &e.to_string()),
+                Ok(()) => success_frame(&id_echo, &json!({ "ok": true })),
+                Err(e) => error_frame(&id_echo, e.code(), &e.to_string()),
             }
         }
         HostMethod::Exec => {
@@ -492,12 +503,12 @@ pub(crate) async fn handle(
                     if !id_present {
                         return None;
                     }
-                    return Some(error_frame(id_echo, e.code, &e.message));
+                    return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
             match intent_services::host_exec::run_default(api, parsed).await {
-                Ok(v) => success_frame(id_echo, v),
-                Err(e) => error_frame(id_echo, e.code, &e.message),
+                Ok(v) => success_frame(&id_echo, &v),
+                Err(e) => error_frame(&id_echo, e.code, &e.message),
             }
         }
         HostMethod::ExecStream => {
@@ -508,7 +519,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32603,
                         "host.execStream requires an event bus",
                     ));
@@ -520,12 +531,12 @@ pub(crate) async fn handle(
                     if !id_present {
                         return None;
                     }
-                    return Some(error_frame(id_echo, e.code, &e.message));
+                    return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
             match intent_services::host_exec_stream::start_stream(api, bus, parsed).await {
-                Ok(request_id) => success_frame(id_echo, json!({ "requestId": request_id })),
-                Err(e) => error_frame(id_echo, e.code, &e.message),
+                Ok(request_id) => success_frame(&id_echo, &json!({ "requestId": request_id })),
+                Err(e) => error_frame(&id_echo, e.code, &e.message),
             }
         }
         HostMethod::ExecStreamWrite => {
@@ -536,7 +547,7 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Missing required parameter: requestId",
                     ));
@@ -548,7 +559,7 @@ pub(crate) async fn handle(
                     if !id_present {
                         return None;
                     }
-                    return Some(error_frame(id_echo, -32602, &msg));
+                    return Some(error_frame(&id_echo, -32602, &msg));
                 }
             };
             let eof = params.get("eof").and_then(Value::as_bool).unwrap_or(false);
@@ -556,8 +567,8 @@ pub(crate) async fn handle(
                 .write(&request_id, data, eof)
                 .await
             {
-                Ok(()) => success_frame(id_echo, json!({ "ok": true })),
-                Err(e) => error_frame(id_echo, e.code, &e.message),
+                Ok(()) => success_frame(&id_echo, &json!({ "ok": true })),
+                Err(e) => error_frame(&id_echo, e.code, &e.message),
             }
         }
         HostMethod::ExecStreamCancel => {
@@ -568,14 +579,14 @@ pub(crate) async fn handle(
                         return None;
                     }
                     return Some(error_frame(
-                        id_echo,
+                        &id_echo,
                         -32602,
                         "Missing required parameter: requestId",
                     ));
                 }
             };
             let cancelled = intent_services::host_exec_stream::registry().cancel(&request_id);
-            success_frame(id_echo, json!({ "ok": true, "cancelled": cancelled }))
+            success_frame(&id_echo, &json!({ "ok": true, "cancelled": cancelled }))
         }
     };
     if !id_present {

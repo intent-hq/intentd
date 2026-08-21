@@ -23,7 +23,7 @@ pub fn now_epoch_ms() -> u64 {
     if ns <= 0 {
         0
     } else {
-        (ns / 1_000_000) as u64
+        u64::try_from(ns / 1_000_000).unwrap_or(u64::MAX)
     }
 }
 

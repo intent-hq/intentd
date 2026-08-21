@@ -36,7 +36,7 @@ pub(crate) fn request_identity(value: &Value) -> (Option<Value>, String) {
 /// If serialization itself ever fails, fall back to a deterministic valid
 /// envelope (id null) rather than an empty frame, matching the router's
 /// `internal_fallback`.
-pub(crate) fn internal_error_frame(id: Value) -> String {
+pub(crate) fn internal_error_frame(id: &Value) -> String {
     serde_json::to_string(&json!({
         "jsonrpc": "2.0",
         "error": { "code": -32603, "message": "Internal error" },
@@ -117,7 +117,7 @@ where
                 panic = %panic_message(payload.as_ref()),
                 "JSON-RPC handler panicked; connection kept alive"
             );
-            rpc_id.map(internal_error_frame)
+            rpc_id.as_ref().map(internal_error_frame)
         }
     }
 }
@@ -149,7 +149,10 @@ where
                 "JSON-RPC handler panicked; connection kept alive"
             );
             match rpc_id {
-                Some(id) => out_tx.send_priority(internal_error_frame(id)).await.is_ok(),
+                Some(id) => out_tx
+                    .send_priority(internal_error_frame(&id))
+                    .await
+                    .is_ok(),
                 None => !out_tx.is_closed(),
             }
         }

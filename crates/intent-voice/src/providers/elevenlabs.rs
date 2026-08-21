@@ -121,7 +121,12 @@ impl VoiceEngine for ElevenLabsEngine {
             .and_then(|words| words.last())
             .and_then(|w| w.get("end"))
             .and_then(Value::as_f64)
-            .map(|secs| (secs * 1000.0) as u64);
+            // Float→int casts saturate; durations are non-negative seconds.
+            .map(|secs| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = (secs * 1000.0) as u64;
+                ms
+            });
         Ok(Transcript { text, duration_ms })
     }
 

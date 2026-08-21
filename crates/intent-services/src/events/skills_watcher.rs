@@ -89,11 +89,12 @@ impl SkillsWatcher {
     /// path first so events from the new watches (including the promotion
     /// catch-up for tier roots created later) are attributable, then the
     /// project-tier roots are watched. Re-registering replaces the watches.
-    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
-        let _ = self
-            .raw_tx
-            .send(SkillsMsg::Add(workspace_id.clone(), workspace_path.clone()));
-        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: &Path) {
+        let _ = self.raw_tx.send(SkillsMsg::Add(
+            workspace_id.clone(),
+            workspace_path.to_path_buf(),
+        ));
+        let watch = start_project_watch(&self.hub, &workspace_id, workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watch);
         }
@@ -153,12 +154,12 @@ impl SkillsWatcher {
     /// schedule one catch-up flush compared against the fingerprint retained
     /// by [`Self::pause_workspace`], so an unchanged tree emits nothing and an
     /// edit made while suspended emits exactly once.
-    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: &Path) {
         let _ = self.raw_tx.send(SkillsMsg::Resume(
             workspace_id.clone(),
-            workspace_path.clone(),
+            workspace_path.to_path_buf(),
         ));
-        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watch);
         }
@@ -541,7 +542,7 @@ mod tests {
         watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.add_workspace(ws_id.clone(), &ws.path.clone());
         watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -617,7 +618,7 @@ mod tests {
         std::fs::write(added.join("SKILL.md"), skill_md("added-skill")).expect("write skill");
         crate::skills::discover_skills(&ws.path.to_string_lossy()).await;
 
-        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        watcher.resume_workspace(ws_id.clone(), &ws.path.clone());
         let events = drain_skills_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert!(
             events.iter().any(|e| e.workspace_id == ws_id),

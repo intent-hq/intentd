@@ -775,7 +775,7 @@ pub fn provision_direct_checkout_with_progress(
     let sha = provision_plain_clone_checkout(
         cache_path,
         checkout_path,
-        OriginTarget::Url(origin_url),
+        &OriginTarget::Url(origin_url),
         branch,
         base_ref,
     )?;
@@ -1159,7 +1159,7 @@ pub(crate) enum OriginTarget<'a> {
 pub(crate) fn provision_plain_clone_checkout(
     source_path: &Path,
     checkout_path: &Path,
-    origin: OriginTarget<'_>,
+    origin: &OriginTarget<'_>,
     branch: &str,
     base_ref: Option<&str>,
 ) -> Result<String> {

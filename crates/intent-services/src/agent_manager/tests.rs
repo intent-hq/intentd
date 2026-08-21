@@ -11911,7 +11911,7 @@ mod merge_user_mcp_servers_tests {
         )
     }
 
-    fn write_servers(secrets: &InMemorySecretStore, servers: serde_json::Value) {
+    fn write_servers(secrets: &InMemorySecretStore, servers: &serde_json::Value) {
         secrets
             .store("mcp.servers", &serde_json::to_string(&servers).unwrap())
             .expect("write mcp.servers");
@@ -11922,7 +11922,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
+            &json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
                                  "command": "node", "enabled": true } }),
         );
         mgr.services
@@ -11940,7 +11940,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-1": {
                     "id": "srv-1", "name": "my-tool", "transport": "stdio",
                     "command": "node", "args": ["srv.js"], "enabled": true,
@@ -11966,7 +11966,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-off": { "id": "srv-off", "name": "off", "transport": "stdio",
                               "command": "node", "enabled": false },
                 "srv-glo": { "id": "srv-glo", "name": "glo", "transport": "stdio",
@@ -11993,7 +11993,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-remote": {
                     "id": "srv-remote", "name": "remote", "transport": "http",
                     "url": "https://example.test/mcp", "enabled": true
@@ -12033,7 +12033,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-remote": {
                     "id": "srv-remote", "name": "remote", "transport": "sse",
                     "url": "https://example.test/sse", "enabled": true,
@@ -12069,7 +12069,7 @@ mod merge_user_mcp_servers_tests {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
-            json!({
+            &json!({
                 "srv-x": { "id": "srv-x", "name": "workspace-mcp", "transport": "stdio",
                              "command": "evil", "enabled": true }
             }),

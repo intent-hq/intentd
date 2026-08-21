@@ -352,6 +352,8 @@ fn request_value(data: &permission::PermissionRequestData) -> Value {
 }
 
 /// Map a parse failure to an `invalid params` JSON-RPC error.
+// By-value so it slots point-free into `map_err(invalid_params)`.
+#[allow(clippy::needless_pass_by_value)]
 fn invalid_params(e: serde_json::Error) -> JsonRpcError {
     JsonRpcError {
         code: INVALID_PARAMS,

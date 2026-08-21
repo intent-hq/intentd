@@ -445,7 +445,7 @@ fn agent() -> AgentId {
     AgentId::from("agent-1")
 }
 
-fn chunk_event(message_id: &str, block_id: &str, block_type: &str, content: Value) -> Event {
+fn chunk_event(message_id: &str, block_id: &str, block_type: &str, content: &Value) -> Event {
     Event {
         id: "evt-1".into(),
         event_type: CHAT_STREAM_DELTA.to_string(),
@@ -547,7 +547,7 @@ fn chat_chunk_delta_accumulates_text_and_flips_added_to_updated() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     // First text chunk for blk-0 → `added`, with the full text so far.
     let d1 = s
-        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
         .expect("text chunk delta");
     assert_eq!(d1["added"][0]["block"]["text"], "Hello");
     assert_eq!(d1["added"][0]["block"]["type"], "text");
@@ -556,7 +556,7 @@ fn chat_chunk_delta_accumulates_text_and_flips_added_to_updated() {
     assert!(d1["updated"].as_array().unwrap().is_empty());
     // Second text chunk for same block → `updated`, with the FULL accumulated text.
     let d2 = s
-        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(", world")))
         .expect("text chunk delta 2");
     assert!(d2["added"].as_array().unwrap().is_empty());
     assert_eq!(d2["updated"][0]["block"]["text"], "Hello, world");
@@ -570,7 +570,7 @@ fn chat_chunk_delta_handles_non_text_block() {
             "msg-2",
             "msg-2:0",
             "image",
-            json!({ "url": "data:image/png;base64,..." }),
+            &json!({ "url": "data:image/png;base64,..." }),
         ))
         .expect("non-text chunk delta");
     let block = &d["added"][0]["block"];
@@ -586,15 +586,15 @@ fn chat_chunk_delta_handles_non_text_block() {
 fn chat_chunk_delta_returns_none_for_missing_required_fields() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     // Missing blockId.
-    let mut e = chunk_event("msg-3", "ignored", "text", json!("x"));
+    let mut e = chunk_event("msg-3", "ignored", "text", &json!("x"));
     e.data.as_object_mut().unwrap().remove("blockId");
     assert!(s.chunk_delta(&e).is_none());
     // Missing messageId.
-    let mut e = chunk_event("msg-3", "msg-3:0", "text", json!("x"));
+    let mut e = chunk_event("msg-3", "msg-3:0", "text", &json!("x"));
     e.data.as_object_mut().unwrap().remove("messageId");
     assert!(s.chunk_delta(&e).is_none());
     // Missing content.
-    let mut e = chunk_event("msg-3", "msg-3:0", "text", json!("x"));
+    let mut e = chunk_event("msg-3", "msg-3:0", "text", &json!("x"));
     e.data.as_object_mut().unwrap().remove("content");
     assert!(s.chunk_delta(&e).is_none());
 }
@@ -940,7 +940,7 @@ fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
             "msg-i",
             "msg-i:0",
             "text",
-            json!("I'll run it. "),
+            &json!("I'll run it. "),
         ))
         .expect("opening text"),
         s.tool_delta(&tool_event_with_ids(
@@ -957,7 +957,7 @@ fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
             "msg-i",
             "msg-i:2",
             "text",
-            json!("<group:Setup>\nChecking output. "),
+            &json!("<group:Setup>\nChecking output. "),
         ))
         .expect("interleaved text"),
         s.tool_delta(&tool_event_with_ids(
@@ -1006,7 +1006,7 @@ fn chat_tool_delta_uses_the_event_result_id_for_parallel_completions() {
         )
     };
     let deltas = vec![
-        s.chunk_delta(&chunk_event("msg-p2", "msg-p2:0", "text", json!("Both. ")))
+        s.chunk_delta(&chunk_event("msg-p2", "msg-p2:0", "text", &json!("Both. ")))
             .expect("opening text"),
         s.tool_delta(&started("msg-p2:1", "t1"))
             .expect("t1 started"),
@@ -1106,7 +1106,7 @@ fn chat_seed_from_snapshot_primes_in_flight_message_state() {
             "msg-live",
             "msg-live:0",
             "text",
-            json!(", world"),
+            &json!(", world"),
         ))
         .expect("post-seed chunk");
     assert!(d["added"].as_array().unwrap().is_empty());
@@ -1124,7 +1124,7 @@ fn chat_chunk_delta_accumulates_thinking_blocks() {
             "msg-6",
             "msg-6:0",
             "thinking",
-            json!("Let me "),
+            &json!("Let me "),
         ))
         .expect("thinking chunk delta");
     assert_eq!(d1["added"][0]["block"]["type"], "thinking");
@@ -1134,7 +1134,7 @@ fn chat_chunk_delta_accumulates_thinking_blocks() {
             "msg-6",
             "msg-6:0",
             "thinking",
-            json!("think."),
+            &json!("think."),
         ))
         .expect("thinking chunk delta 2");
     assert!(d2["added"].as_array().unwrap().is_empty());
@@ -1142,7 +1142,7 @@ fn chat_chunk_delta_accumulates_thinking_blocks() {
     assert_eq!(d2["updated"][0]["block"]["type"], "thinking");
     // The text block that follows the reasoning is a separate accumulator.
     let d3 = s
-        .chunk_delta(&chunk_event("msg-6", "msg-6:1", "text", json!("42.")))
+        .chunk_delta(&chunk_event("msg-6", "msg-6:1", "text", &json!("42.")))
         .expect("text chunk delta");
     assert_eq!(d3["added"][0]["block"]["type"], "text");
     assert_eq!(d3["added"][0]["block"]["text"], "42.");
@@ -1169,7 +1169,7 @@ fn chat_seed_from_snapshot_primes_thinking_blocks() {
             "msg-live",
             "msg-live:0",
             "thinking",
-            json!("think."),
+            &json!("think."),
         ))
         .expect("post-seed thinking chunk");
     assert!(d["added"].as_array().unwrap().is_empty());
@@ -1192,7 +1192,7 @@ fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
     }));
     // After all of the above, a fresh chunk is still `added` (state untouched).
     let d = s
-        .chunk_delta(&chunk_event("msg-x", "msg-x:0", "text", json!("hi")))
+        .chunk_delta(&chunk_event("msg-x", "msg-x:0", "text", &json!("hi")))
         .unwrap();
     assert_eq!(d["added"][0]["block"]["text"], "hi");
     assert!(d["updated"].as_array().unwrap().is_empty());
@@ -1205,7 +1205,7 @@ fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
 fn incremental_chunk_delta_carries_only_the_fragment() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
     let d1 = s
-        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
         .expect("first chunk");
     assert_eq!(d1["added"][0]["block"]["textDelta"], "Hello");
     assert_eq!(d1["added"][0]["block"]["type"], "text");
@@ -1215,7 +1215,7 @@ fn incremental_chunk_delta_carries_only_the_fragment() {
         "incremental deltas never carry the accumulated text: {d1}"
     );
     let d2 = s
-        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(", world")))
         .expect("second chunk");
     assert!(d2["added"].as_array().unwrap().is_empty());
     assert_eq!(
@@ -1224,7 +1224,7 @@ fn incremental_chunk_delta_carries_only_the_fragment() {
     );
     // Thinking chunks take the same shape.
     let d3 = s
-        .chunk_delta(&chunk_event("msg-1", "msg-1:1", "thinking", json!("Hmm")))
+        .chunk_delta(&chunk_event("msg-1", "msg-1:1", "thinking", &json!("Hmm")))
         .expect("thinking chunk");
     assert_eq!(d3["added"][0]["block"]["textDelta"], "Hmm");
     assert_eq!(d3["added"][0]["block"]["type"], "thinking");
@@ -1240,7 +1240,7 @@ fn incremental_chunk_delta_passes_non_text_blocks_through() {
             "msg-2",
             "msg-2:0",
             "image",
-            json!({ "url": "data:image/png;base64,..." }),
+            &json!({ "url": "data:image/png;base64,..." }),
         ))
         .expect("non-text chunk delta");
     let block = &d["added"][0]["block"];
@@ -1271,7 +1271,7 @@ fn incremental_seed_from_snapshot_appends_fragments_after_the_snapshot_text() {
             "msg-live",
             "msg-live:0",
             "text",
-            json!(", world"),
+            &json!(", world"),
         ))
         .expect("post-seed chunk");
     assert!(d["added"].as_array().unwrap().is_empty());
@@ -2479,7 +2479,7 @@ mod chat_message_delta {
         let api = ConvApi::new(conv);
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
         // Turn in flight: first assistant chunk accumulated.
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
             .expect("chunk 1");
         // User row lands mid-turn.
         let d = s
@@ -2489,7 +2489,7 @@ mod chat_message_delta {
         assert_eq!(d["added"][0]["role"], "user");
         // The next chunk still carries the FULL accumulated assistant text.
         let d2 = s
-            .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+            .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(", world")))
             .expect("chunk 2");
         assert_eq!(
             d2["updated"][0]["block"]["text"], "Hello, world",
@@ -3116,7 +3116,7 @@ mod chat_terminal_message_id_fallback {
         // `updated` — one terminal frame, no re-added duplicates.
         let api = ConvApi::new(conversation());
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Working")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Working")))
             .expect("first chunk");
         let d = s
             .delta(&api, &end_event(Some("other-msg")))
@@ -3276,9 +3276,9 @@ mod chat_terminal_reconcile_failure {
     async fn a_failed_re_read_retries_once_then_emits_the_best_effort_frame() {
         let api = FailingConvApi::new();
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
             .expect("first chunk");
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(", world")))
             .expect("second chunk");
         s.tool_delta(&tool_event("msg-1", "msg-1:1", "call-1", "started", None))
             .expect("tool call");
@@ -3340,7 +3340,7 @@ mod chat_terminal_reconcile_failure {
     async fn the_per_turn_state_resets_after_the_best_effort_frame() {
         let api = FailingConvApi::new();
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
             .expect("first chunk");
         s.delta(&api, &end_event("msg-1"))
             .await
@@ -3349,7 +3349,7 @@ mod chat_terminal_reconcile_failure {
         // The next turn starts clean: its first chunk arrives as `added` with
         // the text restarted from the fragment…
         let d = s
-            .chunk_delta(&chunk_event("msg-2", "msg-2:0", "text", json!("Next")))
+            .chunk_delta(&chunk_event("msg-2", "msg-2:0", "text", &json!("Next")))
             .expect("next turn chunk");
         assert_eq!(d["added"][0]["block"]["text"], "Next");
         // …and its own failed reconcile carries only ITS accumulated blocks.
@@ -3376,9 +3376,9 @@ mod chat_terminal_reconcile_failure {
         let api = FailingConvApi::failing_once_then(conversation());
         api.calls.store(1, Ordering::SeqCst); // consume the failing call
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
             .expect("first chunk");
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(", world")))
             .expect("second chunk");
         let d = s
             .delta(&api, &end_event("msg-1"))
@@ -3405,9 +3405,9 @@ mod chat_terminal_reconcile_failure {
     async fn incremental_best_effort_terminal_carries_the_full_accumulated_text() {
         let api = FailingConvApi::new();
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
             .expect("first chunk");
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(", world")))
             .expect("second chunk");
         let d = s
             .delta(&api, &end_event("msg-1"))
@@ -3429,7 +3429,7 @@ mod chat_terminal_reconcile_failure {
         // frame is emitted (persisted seq/timestamp), not the degraded one.
         let api = FailingConvApi::failing_once_then(conversation());
         let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
-        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
             .expect("first chunk");
         let d = s
             .delta(&api, &end_event("msg-1"))

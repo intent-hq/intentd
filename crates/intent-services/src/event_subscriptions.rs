@@ -447,7 +447,7 @@ impl Services {
 fn normalize_batch_window_ms(batch_window: Option<i64>) -> i64 {
     match batch_window {
         Some(ms) if ms > 0 => ms,
-        _ => events::DEFAULT_BATCH_WINDOW.as_millis() as i64,
+        _ => i64::try_from(events::DEFAULT_BATCH_WINDOW.as_millis()).unwrap_or(i64::MAX),
     }
 }
 

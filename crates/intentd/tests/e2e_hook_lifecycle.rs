@@ -948,7 +948,7 @@ async fn hook_lifecycle_over_wss() {
     {
         await_conversation_contains(
             &mut rpc,
-            430 + (i as i64) * 20,
+            430 + i64::try_from(i).expect("fits in i64") * 20,
             &ws_id,
             &intruder_id,
             needle,

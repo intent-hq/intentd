@@ -1198,7 +1198,7 @@ mod tests {
         reg.apply(&set("agents.maxConcurrent", json!(1)))
             .expect("apply first");
         let first = std::fs::read_to_string(&path).expect("read first");
-        for i in 2..=(SELF_WRITE_HISTORY as i64 + 1) {
+        for i in 2..=(i64::try_from(SELF_WRITE_HISTORY).expect("small const") + 1) {
             reg.apply(&set("agents.maxConcurrent", json!(i)))
                 .expect("apply");
         }

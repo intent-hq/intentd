@@ -345,7 +345,7 @@ impl PtyHost {
         }));
 
         let reader_fanout = Arc::clone(&fanout);
-        let handle = std::thread::spawn(move || read_loop(reader, reader_fanout));
+        let handle = std::thread::spawn(move || read_loop(reader, &reader_fanout));
 
         let cwd = spec
             .cwd
@@ -789,7 +789,7 @@ fn exit_watch_loop(session: &PtySession) {
 
 /// Blocking reader loop (own thread): append each chunk to scrollback and
 /// broadcast it under one lock so attach sees a consistent history/live seam.
-fn read_loop(mut reader: Box<dyn Read + Send>, fanout: Arc<Mutex<Fanout>>) {
+fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buf) {

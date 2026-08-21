@@ -74,7 +74,7 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
     let end = token
         .and_then(decode_token)
         .and_then(|v| v.get("b").and_then(Value::as_u64))
-        .map_or(len, |b| (b as usize).min(len));
+        .map_or(len, |b| usize::try_from(b).unwrap_or(usize::MAX).min(len));
     let start = end.saturating_sub(limit);
     let next_token = if start > 0 {
         Some(encode_token(&json!({ "b": start })))

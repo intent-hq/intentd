@@ -773,7 +773,8 @@ impl SubmoduleAwareParser {
         if let Some(slice) = self.slice.take() {
             self.base = Self::capped_top(slice);
         }
-        let remaining = (self.registered.saturating_sub(self.started) + 1) as u32;
+        let remaining =
+            u32::try_from(self.registered.saturating_sub(self.started) + 1).unwrap_or(u32::MAX);
         let width = (100 - self.base) / remaining;
         self.slice = Some((self.base, self.base + width));
     }

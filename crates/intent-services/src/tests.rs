@@ -16204,8 +16204,14 @@ mod file_tracking {
             .into_iter()
             .find(|f| f.path == "b.txt")
             .unwrap();
-        assert_eq!(summary.additions, fd.additions as i64);
-        assert_eq!(summary.deletions, fd.deletions as i64);
+        assert_eq!(
+            summary.additions,
+            i64::try_from(fd.additions).expect("fits in i64")
+        );
+        assert_eq!(
+            summary.deletions,
+            i64::try_from(fd.deletions).expect("fits in i64")
+        );
         assert_eq!(summary.old_blob_sha, fd.old_blob);
         assert_eq!(summary.new_blob_sha, fd.new_blob);
         assert!(!summary.is_binary);
@@ -16272,8 +16278,14 @@ mod file_tracking {
             .find(|f| f.path == "img.bin")
             .unwrap();
         assert_eq!(bin.is_binary, legacy_bin.is_binary);
-        assert_eq!(bin.additions, legacy_bin.additions as i64);
-        assert_eq!(bin.deletions, legacy_bin.deletions as i64);
+        assert_eq!(
+            bin.additions,
+            i64::try_from(legacy_bin.additions).expect("fits in i64")
+        );
+        assert_eq!(
+            bin.deletions,
+            i64::try_from(legacy_bin.deletions).expect("fits in i64")
+        );
         let rows = svc.store().list_diffs(&ws).await.unwrap();
         let bin_row = rows.iter().find(|r| r.file_path == "img.bin").unwrap();
         assert_eq!(bin_row.hunks_json, "[]");

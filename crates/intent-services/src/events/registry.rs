@@ -33,7 +33,7 @@
 //! fingerprint-checked, so an untouched tree emits nothing).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,7 +157,7 @@ impl WatcherRegistry {
             tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files");
             file_watchers.insert(
                 ws_id.clone(),
-                FileWatcher::start(&hub, bus.clone(), ws_id.clone(), path.clone()),
+                FileWatcher::start(&hub, bus.clone(), ws_id.clone(), &path.clone()),
             );
         }
         tracing::info!(count = file_watchers.len(), "file watchers started");
@@ -168,8 +168,8 @@ impl WatcherRegistry {
                 &hub,
                 &git_common,
                 &refresher,
-                ws_id.clone(),
-                path.clone(),
+                &ws_id.clone(),
+                &path.clone(),
                 "",
             ) {
                 git_watchers.insert(ws_id.clone(), w);
@@ -242,8 +242,8 @@ fn start_git_metadata_watch(
     hub: &Arc<SharedWatchHub>,
     common_watches: &Arc<GitCommonDirWatches>,
     refresher: &Arc<GitStatusRefresher>,
-    ws_id: WorkspaceId,
-    path: PathBuf,
+    ws_id: &WorkspaceId,
+    path: &Path,
     suffix: &str,
 ) -> Option<GitMetadataWatcher> {
     match GitMetadataWatcher::start(
@@ -251,7 +251,7 @@ fn start_git_metadata_watch(
         common_watches,
         Arc::clone(refresher),
         ws_id.clone(),
-        path.clone(),
+        &path.to_path_buf(),
     ) {
         Some(w) => {
             tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
@@ -281,16 +281,11 @@ fn start_watches(
     tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files{suffix}");
     file_watchers.insert(
         ws_id.clone(),
-        FileWatcher::start(hub, bus.clone(), ws_id.clone(), path.to_path_buf()),
+        FileWatcher::start(hub, bus.clone(), ws_id.clone(), path),
     );
-    if let Some(w) = start_git_metadata_watch(
-        hub,
-        common_watches,
-        refresher,
-        ws_id.clone(),
-        path.to_path_buf(),
-        suffix,
-    ) {
+    if let Some(w) =
+        start_git_metadata_watch(hub, common_watches, refresher, &ws_id.clone(), path, suffix)
+    {
         git_watchers.insert(ws_id.clone(), w);
     }
 }
@@ -376,8 +371,8 @@ async fn lifecycle_loop(
                             &p.path,
                             " (setup completion backstop)",
                         );
-                        skills.add_workspace(ws_id.clone(), p.path.clone());
-                        specialists.add_workspace(ws_id, p.path);
+                        skills.add_workspace(ws_id.clone(), &p.path.clone());
+                        specialists.add_workspace(ws_id, &p.path);
                     }
                     continue;
                 }
@@ -421,8 +416,8 @@ async fn lifecycle_loop(
                         &p.path,
                         " (setup completed)",
                     );
-                    skills.add_workspace(ws_id.clone(), p.path.clone());
-                    specialists.add_workspace(ws_id, p.path);
+                    skills.add_workspace(ws_id.clone(), &p.path.clone());
+                    specialists.add_workspace(ws_id, &p.path);
                 }
                 WORKSPACE_OPENED => {
                     let Some(path) = resolve_path(&ev, services.as_ref()).await else {
@@ -445,8 +440,8 @@ async fn lifecycle_loop(
                         &path,
                         " (runtime registration)",
                     );
-                    skills.add_workspace(ws_id.clone(), path.clone());
-                    specialists.add_workspace(ws_id, path);
+                    skills.add_workspace(ws_id.clone(), &path.clone());
+                    specialists.add_workspace(ws_id, &path);
                 }
                 WORKSPACE_DELETED | WORKSPACE_CLOSED => {
                     if pending.remove(&ws_id).is_some() {
@@ -518,8 +513,8 @@ async fn lifecycle_loop(
                         // baseline, exactly as it does for any single `file:*`
                         // event today.
                         refresher.trigger(ws_id.clone());
-                        skills.resume_workspace(ws_id.clone(), path.clone());
-                        specialists.resume_workspace(ws_id, path);
+                        skills.resume_workspace(ws_id.clone(), &path.clone());
+                        specialists.resume_workspace(ws_id, &path);
                     }
                     None => {}
                 },

@@ -396,8 +396,10 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         }
         parsed.expect("mock never wrote MOCK_AGENT_TREE_PID_FILE")
     };
-    let child_pid = pids["childPid"].as_i64().expect("childPid") as i32;
-    let grandchild_pid = pids["grandchildPid"].as_i64().expect("grandchildPid") as i32;
+    let child_pid =
+        i32::try_from(pids["childPid"].as_i64().expect("childPid")).expect("pid fits in i32");
+    let grandchild_pid = i32::try_from(pids["grandchildPid"].as_i64().expect("grandchildPid"))
+        .expect("pid fits in i32");
     assert!(!pid_dead(child_pid), "provider child live before shutdown");
     assert!(!pid_dead(grandchild_pid), "grandchild live before shutdown");
 

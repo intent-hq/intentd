@@ -477,7 +477,7 @@ fn golden_hook_wake_logs_section() {
     // LAST 2048 chars survive, nothing more. Positionally distinct bytes
     // pin which end is retained and the exact cap.
     let logs: String = (0..3000)
-        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .map(|i| char::from(b'a' + u8::try_from(i % 26).expect("< 26")))
         .collect();
     assert_eq!(
         crate::hook_manager::with_wake_logs("msg", Some(&logs)),

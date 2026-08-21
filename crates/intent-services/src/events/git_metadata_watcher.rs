@@ -83,7 +83,7 @@ impl GitMetadataWatcher {
         common_watches: &Arc<GitCommonDirWatches>,
         refresher: Arc<GitStatusRefresher>,
         workspace_id: WorkspaceId,
-        root: PathBuf,
+        root: &PathBuf,
     ) -> Option<Self> {
         let dot_git = root.join(".git");
         if dot_git.is_dir() {
@@ -91,7 +91,7 @@ impl GitMetadataWatcher {
             // demuxes against, so the prefix strip works against the paths the
             // OS reports (macOS FSEvents resolves `/var/...` →
             // `/private/var/...`).
-            let (sub, mut rx, root) = hub.subscribe(&root);
+            let (sub, mut rx, root) = hub.subscribe(root);
             let git_dir = root.join(".git");
             let task = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
@@ -116,7 +116,7 @@ impl GitMetadataWatcher {
         }
         // Linked worktree: resolve the `gitdir:` pointer and its `commondir`
         // through git2 rather than parsing the files by hand.
-        let (gitdir, common_dir) = match git2::Repository::open(&root) {
+        let (gitdir, common_dir) = match git2::Repository::open(root) {
             Ok(repo) => (repo.path().to_path_buf(), repo.commondir().to_path_buf()),
             Err(e) => {
                 tracing::warn!(
@@ -711,7 +711,7 @@ mod tests {
             &GitCommonDirWatches::new(),
             refresher,
             ws.id.clone(),
-            root.path.clone(),
+            &root.path.clone(),
         );
         assert!(watcher.is_none(), "no `.git` dir → no watch");
     }
@@ -741,7 +741,7 @@ mod tests {
             &GitCommonDirWatches::new(),
             refresher,
             ws.id.clone(),
-            root.path.clone(),
+            &root.path.clone(),
         )
         .expect("git repo must gain a metadata watch");
         // Let the OS watch settle before mutating.
@@ -822,7 +822,7 @@ mod tests {
             &GitCommonDirWatches::new(),
             refresher,
             ws.id.clone(),
-            wt_path.clone(),
+            &wt_path.clone(),
         )
         .expect("linked worktree workspace must gain a metadata watch");
         watcher.wait_established(Duration::from_secs(10)).await;
@@ -900,7 +900,7 @@ mod tests {
             &common,
             Arc::clone(&refresher),
             ws_a.id.clone(),
-            wt_a_path.clone(),
+            &wt_a_path.clone(),
         )
         .expect("worktree A must gain a metadata watch");
         let watcher_b = GitMetadataWatcher::start(
@@ -908,7 +908,7 @@ mod tests {
             &common,
             Arc::clone(&refresher),
             ws_b.id.clone(),
-            wt_b_path.clone(),
+            &wt_b_path.clone(),
         )
         .expect("worktree B must gain a metadata watch");
         assert_eq!(
@@ -979,7 +979,7 @@ mod tests {
             &GitCommonDirWatches::new(),
             refresher,
             ws.id.clone(),
-            root.path.clone(),
+            &root.path.clone(),
         )
         .expect("git repo must gain a metadata watch");
         _watcher.wait_established(crate::events::LIVENESS).await;

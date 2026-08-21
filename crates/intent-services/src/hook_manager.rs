@@ -192,7 +192,9 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
             let remaining = persisted - now;
             (
                 raw.to_string(),
-                Duration::from_millis(remaining.whole_milliseconds().max(0) as u64),
+                Duration::from_millis(
+                    u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
+                ),
             )
         }
         _ => (
@@ -223,7 +225,9 @@ fn time_to_expiry(expires_at: Option<&str>, skew_ms: i64) -> Option<Duration> {
     };
     let remaining = deadline - OffsetDateTime::now_utc() - time::Duration::milliseconds(skew_ms);
     Some(if remaining.is_positive() {
-        Duration::from_millis(remaining.whole_milliseconds().max(0) as u64)
+        Duration::from_millis(
+            u64::try_from(remaining.whole_milliseconds().max(0)).unwrap_or(u64::MAX),
+        )
     } else {
         Duration::ZERO
     })
@@ -341,7 +345,7 @@ async fn run_hook_script(
                     logs,
                     state: StateUpdate::Keep,
                 },
-                Some("v") => parse_outcome(v.get("__v").cloned().unwrap_or(Value::Null), logs),
+                Some("v") => parse_outcome(&v.get("__v").cloned().unwrap_or(Value::Null), logs),
                 Some("e") => RunOutcome::Failed {
                     error: v
                         .get("__v")
@@ -367,9 +371,9 @@ async fn run_hook_script(
 
 /// Interpret the script's returned value: only `{ dispatch: true }` fires a
 /// dispatch; everything else (including `null` and non-objects) re-runs.
-fn parse_outcome(v: Value, logs: Option<String>) -> RunOutcome {
+fn parse_outcome(v: &Value, logs: Option<String>) -> RunOutcome {
     let mut logs = logs;
-    let state = parse_state(&v, &mut logs);
+    let state = parse_state(v, &mut logs);
     if v.get("dispatch").and_then(Value::as_bool) == Some(true) {
         let message = v
             .get("message")
@@ -3927,7 +3931,7 @@ mod tests {
         let expires =
             OffsetDateTime::parse(hook.expires_at.as_deref().expect("expires_at"), &Rfc3339)
                 .expect("expires_at");
-        (expires - created).whole_milliseconds() as i64
+        i64::try_from((expires - created).whole_milliseconds()).expect("ttl fits in i64")
     }
 
     #[tokio::test]

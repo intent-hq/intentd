@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::json;
 
-fn params_of(v: Value) -> Map<String, Value> {
+fn params_of(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
 
@@ -16,7 +16,7 @@ fn parse_args_requires_actions() {
 
 #[test]
 fn parse_args_rejects_non_array_actions() {
-    let err = parse_args(&params_of(json!({ "actions": "not-an-array" })))
+    let err = parse_args(&params_of(&json!({ "actions": "not-an-array" })))
         .expect_err("actions must be an array");
     assert_eq!(err.code, INVALID_PARAMS);
     assert!(err.message.contains("array"));
@@ -25,14 +25,14 @@ fn parse_args_rejects_non_array_actions() {
 #[test]
 fn parse_args_rejects_empty_actions() {
     let err =
-        parse_args(&params_of(json!({ "actions": [] }))).expect_err("actions must be non-empty");
+        parse_args(&params_of(&json!({ "actions": [] }))).expect_err("actions must be non-empty");
     assert_eq!(err.code, INVALID_PARAMS);
     assert!(err.message.contains("empty"));
 }
 
 #[test]
 fn parse_args_rejects_non_string_tab_id() {
-    let err = parse_args(&params_of(json!({
+    let err = parse_args(&params_of(&json!({
         "actions": [{ "action": "listTabs" }],
         "tabId": 42,
     })))
@@ -43,7 +43,7 @@ fn parse_args_rejects_non_string_tab_id() {
 
 #[test]
 fn parse_args_rejects_non_string_agent_id() {
-    let err = parse_args(&params_of(json!({
+    let err = parse_args(&params_of(&json!({
         "actions": [{ "action": "listTabs" }],
         "agentId": 42,
     })))
@@ -54,7 +54,7 @@ fn parse_args_rejects_non_string_agent_id() {
 
 #[test]
 fn parse_args_rejects_non_string_workspace_id() {
-    let err = parse_args(&params_of(json!({
+    let err = parse_args(&params_of(&json!({
         "actions": [{ "action": "listTabs" }],
         "workspaceId": { "id": "ws-1" },
     })))
@@ -65,7 +65,7 @@ fn parse_args_rejects_non_string_workspace_id() {
 
 #[test]
 fn parse_args_accepts_full_envelope() {
-    let args = parse_args(&params_of(json!({
+    let args = parse_args(&params_of(&json!({
         "actions": [{ "action": "listTabs" }, { "action": "screenshot" }],
         "tabId": "tab-1",
         "agentId": "agent-1",
@@ -80,7 +80,7 @@ fn parse_args_accepts_full_envelope() {
 
 #[test]
 fn parse_args_trims_empty_optional_strings_to_none() {
-    let args = parse_args(&params_of(json!({
+    let args = parse_args(&params_of(&json!({
         "actions": [{ "action": "listTabs" }],
         "tabId": "   ",
         "agentId": null,
@@ -103,7 +103,7 @@ fn parse_args_and_forward_pass_new_actions_through_verbatim() {
         json!({ "action": "showTab", "tabId": "tab-1", "focus": false }),
         json!({ "action": "showTab" }),
     ];
-    let args = parse_args(&params_of(json!({ "actions": actions.clone() })))
+    let args = parse_args(&params_of(&json!({ "actions": actions.clone() })))
         .expect("opaque action shapes pass envelope validation");
     assert_eq!(args.actions, actions);
     let forwarded = build_forward_params(&args);
@@ -134,7 +134,7 @@ fn shape_result_single_action_returns_action_envelope() {
             { "action": "listTabs", "success": true, "result": [{ "id": "tab-1" }] }
         ]
     });
-    let shaped = shape_result(fe).expect("single action shapes to one result");
+    let shaped = shape_result(&fe).expect("single action shapes to one result");
     assert_eq!(shaped["action"], "listTabs");
     assert_eq!(shaped["success"], true);
     assert_eq!(shaped["result"][0]["id"], "tab-1");
@@ -149,7 +149,7 @@ fn shape_result_multiple_actions_returns_results_array() {
             { "action": "screenshot", "success": true, "result": { "base64": "..." } }
         ]
     });
-    let shaped = shape_result(fe).expect("multiple actions shape to results[]");
+    let shaped = shape_result(&fe).expect("multiple actions shape to results[]");
     let arr = shaped["results"].as_array().expect("results is an array");
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["action"], "listTabs");
@@ -163,7 +163,7 @@ fn shape_result_failure_envelope_surfaces_error_context() {
         "error": "CDP not attached",
         "results": []
     });
-    let err = shape_result(fe).expect_err("failure envelope surfaces as error");
+    let err = shape_result(&fe).expect_err("failure envelope surfaces as error");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("CDP not attached"));
 }
@@ -171,14 +171,14 @@ fn shape_result_failure_envelope_surfaces_error_context() {
 #[test]
 fn shape_result_missing_results_is_internal_error() {
     let fe = json!({ "success": true });
-    let err = shape_result(fe).expect_err("missing results is internal error");
+    let err = shape_result(&fe).expect_err("missing results is internal error");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("results"));
 }
 
 #[test]
 fn shape_result_non_object_is_internal_error() {
-    let err = shape_result(json!("nope")).expect_err("non-object is internal");
+    let err = shape_result(&json!("nope")).expect_err("non-object is internal");
     assert_eq!(err.code, INTERNAL_ERROR);
 }
 
@@ -197,8 +197,8 @@ fn shape_agent_result_success_single_action_matches_shape_result() {
             { "action": "listTabs", "success": true, "result": [{ "id": "tab-1" }] }
         ]
     });
-    let shaped = shape_agent_result(fe.clone(), 1).expect("single action shapes to one result");
-    assert_eq!(shaped, shape_result(fe).unwrap());
+    let shaped = shape_agent_result(&fe.clone(), 1).expect("single action shapes to one result");
+    assert_eq!(shaped, shape_result(&fe).unwrap());
 }
 
 #[test]
@@ -210,8 +210,8 @@ fn shape_agent_result_success_multi_action_matches_shape_result() {
             { "action": "screenshot", "success": true, "result": { "base64": "..." } }
         ]
     });
-    let shaped = shape_agent_result(fe.clone(), 2).expect("multi action shapes to results[]");
-    assert_eq!(shaped, shape_result(fe).unwrap());
+    let shaped = shape_agent_result(&fe.clone(), 2).expect("multi action shapes to results[]");
+    assert_eq!(shaped, shape_result(&fe).unwrap());
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn shape_agent_result_preserves_single_action_not_owner_failure() {
         }]
     });
     let shaped =
-        shape_agent_result(fe, 1).expect("ownership failure stays structured, not an error");
+        shape_agent_result(&fe, 1).expect("ownership failure stays structured, not an error");
     assert_eq!(shaped["action"], "resizeTab");
     assert_eq!(shaped["success"], json!(false));
     assert_eq!(shaped["errorCode"], "not-owner");
@@ -249,7 +249,7 @@ fn shape_agent_result_preserves_single_action_already_claimed_failure() {
             "error": "Tab tab-3 is owned by agent agent-42"
         }]
     });
-    let shaped = shape_agent_result(fe, 1).expect("claim loss stays structured");
+    let shaped = shape_agent_result(&fe, 1).expect("claim loss stays structured");
     assert_eq!(shaped["action"], "claimTab");
     assert_eq!(shaped["errorCode"], "already-claimed");
     assert_eq!(shaped["ownerAgentId"], "agent-42");
@@ -271,7 +271,7 @@ fn shape_agent_result_preserves_multi_action_partial_failure_envelope() {
             }
         ]
     });
-    let shaped = shape_agent_result(fe, 2).expect("partial failure keeps per-action results");
+    let shaped = shape_agent_result(&fe, 2).expect("partial failure keeps per-action results");
     assert_eq!(shaped["success"], json!(false));
     assert_eq!(shaped["error"], "1 of 2 actions failed");
     let arr = shaped["results"].as_array().expect("results preserved");
@@ -299,7 +299,7 @@ fn shape_agent_result_multi_action_first_failure_keeps_envelope_shape() {
             "error": "Tab tab-9 is owned by agent agent-7"
         }]
     });
-    let shaped = shape_agent_result(fe, 3).expect("aborted batch keeps envelope shape");
+    let shaped = shape_agent_result(&fe, 3).expect("aborted batch keeps envelope shape");
     assert_eq!(shaped["success"], json!(false));
     assert_eq!(shaped["error"], "Tab tab-9 is not owned by you");
     let arr = shaped["results"].as_array().expect("results key present");
@@ -311,7 +311,7 @@ fn shape_agent_result_multi_action_first_failure_keeps_envelope_shape() {
 #[test]
 fn shape_agent_result_failure_without_results_is_internal_error() {
     let fe = json!({ "success": false, "error": "CDP not attached" });
-    let err = shape_agent_result(fe, 1).expect_err("no per-action detail to preserve");
+    let err = shape_agent_result(&fe, 1).expect_err("no per-action detail to preserve");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("CDP not attached"));
 }
@@ -319,7 +319,7 @@ fn shape_agent_result_failure_without_results_is_internal_error() {
 #[test]
 fn shape_agent_result_failure_with_empty_results_is_internal_error() {
     let fe = json!({ "success": false, "error": "CDP not attached", "results": [] });
-    let err = shape_agent_result(fe, 1).expect_err("empty results has nothing to preserve");
+    let err = shape_agent_result(&fe, 1).expect_err("empty results has nothing to preserve");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("CDP not attached"));
 }
@@ -327,13 +327,13 @@ fn shape_agent_result_failure_with_empty_results_is_internal_error() {
 #[test]
 fn shape_agent_result_failure_with_non_array_results_is_internal_error() {
     let fe = json!({ "success": false, "error": "CDP not attached", "results": "oops" });
-    let err = shape_agent_result(fe, 2).expect_err("non-array results has nothing to preserve");
+    let err = shape_agent_result(&fe, 2).expect_err("non-array results has nothing to preserve");
     assert_eq!(err.code, INTERNAL_ERROR);
     assert!(err.message.contains("CDP not attached"));
 }
 
 #[test]
 fn shape_agent_result_non_object_is_internal_error() {
-    let err = shape_agent_result(json!("nope"), 1).expect_err("non-object is internal");
+    let err = shape_agent_result(&json!("nope"), 1).expect_err("non-object is internal");
     assert_eq!(err.code, INTERNAL_ERROR);
 }

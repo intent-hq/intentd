@@ -3748,7 +3748,7 @@ impl Services {
         // only); persist all other agent events (stream:status, stream:end,
         // tool:call, lifecycle, etc.) for durable audit trail.
         if event_type == CHAT_STREAM_DELTA || event_type == AGENT_STREAM_ACTIVITY {
-            crate::publish_event_transient(&self.event_bus, event);
+            crate::publish_event_transient(&self.event_bus, &event);
         } else {
             crate::publish_event(&self.event_bus, event).await;
         }

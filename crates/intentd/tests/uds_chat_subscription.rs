@@ -1704,20 +1704,20 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
         metadata: None,
         data,
     };
-    bus.publish_transient(&stream_event(
+    let _ = bus.publish_transient(&stream_event(
         CHAT_STREAM_DELTA,
         json!({
             "agentId": agent_id, "content": "the tests.", "messageId": mid,
             "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
         }),
     ));
-    bus.publish_transient(&stream_event(
+    let _ = bus.publish_transient(&stream_event(
         AGENT_STREAM_END,
         json!({ "agentId": agent_id }),
     ));
     // 2048 filler events push the ring (capacity 1024) far past the tail.
     for _ in 0..2048 {
-        bus.publish_transient(&NewEvent {
+        let _ = bus.publish_transient(&NewEvent {
             workspace_id: WorkspaceId::from(ws_id.as_str()),
             timestamp: now_iso(),
             event_type: "note:created".to_string(),

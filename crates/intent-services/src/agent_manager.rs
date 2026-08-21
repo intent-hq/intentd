@@ -9560,6 +9560,13 @@ fn spawn_backoff_from(env_val: Option<&str>) -> (Vec<u64>, bool) {
 /// spawn retries desynchronize instead of landing inside the same host load
 /// spike (monorepo#616). Entropy comes from a v4 UUID's random low bits
 /// rather than pulling in a `rand` dependency.
+// Intentional lossy float math: the mantissa mask keeps `r` exact in f64,
+// delays are far below 2^53, and the final float→int cast saturates.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn jitter_delay_ms(delay_ms: u64) -> u64 {
     const MANTISSA_BITS: u32 = 53;
     let r = (Uuid::new_v4().as_u128() as u64) & ((1u64 << MANTISSA_BITS) - 1);

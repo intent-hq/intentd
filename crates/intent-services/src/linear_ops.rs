@@ -21,7 +21,7 @@ use intent_linear::{
 /// Map a Linear engine/registry error onto the domain `Internal` error
 /// (→ `-32603`): a missing/invalid key (`NotConfigured`) and any other Linear
 /// failure both surface as `Internal` with a descriptive message (§5.28, §9).
-pub(crate) fn map_linear_err(e: intent_linear::Error) -> Error {
+pub(crate) fn map_linear_err(e: &intent_linear::Error) -> Error {
     Error::Internal(e.to_string())
 }
 
@@ -38,14 +38,14 @@ pub(crate) async fn resolve_engine(
         Some(engine) => Ok(engine),
         None => LinearRegistry::from_settings(&LinearSettings::default())
             .await
-            .map_err(map_linear_err),
+            .map_err(|e: intent_linear::Error| map_linear_err(&e)),
     }
 }
 
 /// Validate/default the `linear.listIssues` `filter` (default `assigned`); an
 /// invalid value is rejected with `InvalidParams` (→ `-32602`, §5.28).
-pub(crate) fn parse_filter(filter: Option<String>) -> Result<IssueFilter> {
-    match filter.as_deref() {
+pub(crate) fn parse_filter(filter: Option<&str>) -> Result<IssueFilter> {
+    match filter {
         None | Some("assigned") => Ok(IssueFilter::Assigned),
         Some("created") => Ok(IssueFilter::Created),
         Some("subscribed") => Ok(IssueFilter::Subscribed),
@@ -106,28 +106,22 @@ mod tests {
     fn parses_filter_with_default() {
         assert_eq!(parse_filter(None).unwrap(), IssueFilter::Assigned);
         assert_eq!(
-            parse_filter(Some("assigned".into())).unwrap(),
+            parse_filter(Some("assigned")).unwrap(),
             IssueFilter::Assigned
         );
+        assert_eq!(parse_filter(Some("created")).unwrap(), IssueFilter::Created);
         assert_eq!(
-            parse_filter(Some("created".into())).unwrap(),
-            IssueFilter::Created
-        );
-        assert_eq!(
-            parse_filter(Some("subscribed".into())).unwrap(),
+            parse_filter(Some("subscribed")).unwrap(),
             IssueFilter::Subscribed
         );
-        assert_eq!(
-            parse_filter(Some("team".into())).unwrap(),
-            IssueFilter::Team
-        );
-        assert_eq!(parse_filter(Some("all".into())).unwrap(), IssueFilter::All);
+        assert_eq!(parse_filter(Some("team")).unwrap(), IssueFilter::Team);
+        assert_eq!(parse_filter(Some("all")).unwrap(), IssueFilter::All);
     }
 
     #[test]
     fn rejects_invalid_filter() {
         assert!(matches!(
-            parse_filter(Some("bogus".into())),
+            parse_filter(Some("bogus")),
             Err(Error::InvalidParams(_))
         ));
     }
@@ -141,7 +135,7 @@ mod tests {
 
     #[test]
     fn maps_not_configured_to_internal() {
-        let mapped = map_linear_err(intent_linear::Error::NotConfigured("no key".into()));
+        let mapped = map_linear_err(&intent_linear::Error::NotConfigured("no key".into()));
         assert!(matches!(mapped, Error::Internal(_)));
     }
 

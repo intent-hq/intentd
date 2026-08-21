@@ -128,7 +128,9 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         "total": total,
         "returned": returned,
     });
-    if cursor + (returned as i64) < i64::try_from(total).expect("value fits in i64") {
+    if cursor + i64::try_from(returned).expect("value fits in i64")
+        < i64::try_from(total).expect("value fits in i64")
+    {
         result.as_object_mut().unwrap().insert(
             "nextCursor".to_string(),
             json!(cursor + i64::try_from(returned).expect("value fits in i64")),
@@ -195,7 +197,9 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         let start =
             usize::try_from(start_turn.unwrap_or(1).max(1)).expect("value fits in usize") - 1; // convert to 0-based
         let end = end_turn
-            .map_or(total_messages, |e| (e as usize).min(total_messages))
+            .map_or(total_messages, |e| {
+                usize::try_from(e).map_or(total_messages, |e| e.min(total_messages))
+            })
             .min(start + usize::try_from(MAX_READ_LIMIT).expect("value fits in usize"));
         if end < start + 1 {
             return Err("endTurn must be greater than or equal to startTurn".to_string());

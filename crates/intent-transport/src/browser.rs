@@ -84,8 +84,8 @@ pub(crate) async fn handle(req: BrowserRequest, reverse: &ReverseChannel) -> Opt
     } = req;
     let frame = match method {
         BrowserMethod::Exec => match exec(&params, reverse).await {
-            Ok(v) => success_frame(id_echo, v),
-            Err(e) => error_frame(id_echo, e.code(), &e.to_string()),
+            Ok(v) => success_frame(&id_echo, &v),
+            Err(e) => error_frame(&id_echo, e.code(), &e.to_string()),
         },
     };
     if !id_present {
@@ -147,7 +147,7 @@ pub(crate) async fn exec(
         .request("browser.exec", forwarded, DEFAULT_REVERSE_TIMEOUT)
         .await
         .map_err(|e| BrowserExecError::Proxy(format!("browser.exec: {}", e.message)))?;
-    browser_ops::shape_result(fe_response).map_err(|e| BrowserExecError::Proxy(e.message))
+    browser_ops::shape_result(&fe_response).map_err(|e| BrowserExecError::Proxy(e.message))
 }
 
 #[cfg(test)]

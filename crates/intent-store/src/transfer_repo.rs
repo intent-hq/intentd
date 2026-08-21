@@ -503,6 +503,8 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
+// Byte extraction from a 24-bit accumulator: truncation is the point.
+#[allow(clippy::cast_possible_truncation)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {

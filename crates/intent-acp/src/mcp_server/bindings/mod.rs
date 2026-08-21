@@ -302,6 +302,8 @@ pub(crate) fn opt_vec_str(args: &Value, key: &str) -> Option<Vec<String>> {
 /// Convert a [`intent_core::Error`] into the JS-visible error text used
 /// throughout these bindings (the trait's `Display` impl already renders the
 /// message content the reference builders threw).
+// By-value so it slots point-free into `map_err(map_err)` in every binding.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }

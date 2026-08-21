@@ -1070,7 +1070,7 @@ impl ChatDeltaState {
         };
         let added = self.note_block(&block_id);
         let entity = self.entity(&message_id, block, None, None, false);
-        Some(single_delta(added, entity))
+        Some(single_delta(added, &entity))
     }
 
     /// Map an `agent:tool:call`: synthesize a `tool_use` block matching the
@@ -1449,7 +1449,7 @@ impl ChatDeltaState {
 
 /// Build a single-entity delta envelope, routing the entity to `added` (first
 /// sighting) or `updated` (a known block grown/changed).
-fn single_delta(added: bool, entity: Value) -> Value {
+fn single_delta(added: bool, entity: &Value) -> Value {
     if added {
         json!({ "added": [entity], "updated": [], "removedIds": [] })
     } else {

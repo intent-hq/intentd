@@ -252,7 +252,7 @@ fn truncate_middle(s: &str, max: usize) -> String {
 /// see [`PendingEntryGuard`]) still advances the watermark. This is
 /// client-side bookkeeping only; nothing changes on the wire.
 fn dispatch(
-    value: Value,
+    value: &Value,
     pending: &PendingMap,
     requests: &Option<mpsc::UnboundedSender<IncomingRequest>>,
     notifications: &Option<mpsc::UnboundedSender<IncomingNotification>>,
@@ -379,7 +379,7 @@ impl Connection {
                 }
                 match serde_json::from_str::<Value>(&line) {
                     Ok(value) => dispatch(
-                        value,
+                        &value,
                         &pending_reader,
                         &requests,
                         &notifications,

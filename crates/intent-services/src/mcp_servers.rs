@@ -705,7 +705,7 @@ async fn probe_sse(
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.send().await.map_err(|e| classify_send_error(e, url))?;
+    let resp = req.send().await.map_err(|e| classify_send_error(&e, url))?;
     check_http_status(resp.status())
 }
 
@@ -818,7 +818,7 @@ async fn post_rpc(
     if let Some(ver) = protocol_version {
         req = req.header("MCP-Protocol-Version", ver);
     }
-    req.send().await.map_err(|e| classify_send_error(e, url))
+    req.send().await.map_err(|e| classify_send_error(&e, url))
 }
 
 /// Read a JSON-RPC response envelope from a streamable-HTTP reply: a JSON body
@@ -875,7 +875,7 @@ fn sse_response_for_id(buf: &str, id: u64) -> Option<Value> {
 }
 
 /// Map a transport-level reqwest failure onto a user-facing `lastError`.
-fn classify_send_error(e: reqwest::Error, url: &str) -> Error {
+fn classify_send_error(e: &reqwest::Error, url: &str) -> Error {
     if e.is_timeout() {
         Error::Internal(format!("timed out connecting to {url}"))
     } else if e.is_connect() {

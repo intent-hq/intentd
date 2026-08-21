@@ -360,8 +360,8 @@ pub(crate) async fn handle(
         return None;
     }
     Some(match result {
-        Ok(value) => success_frame(req.id_echo, value),
-        Err((code, message)) => error_frame(req.id_echo, code, &message),
+        Ok(value) => success_frame(&req.id_echo, &value),
+        Err((code, message)) => error_frame(&req.id_echo, code, &message),
     })
 }
 

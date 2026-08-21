@@ -980,8 +980,8 @@ pub(crate) async fn merge_requirements_for_pr(
 
 /// Validate/default the `mergeMethod` argument (TS `validateMergeMethod`,
 /// default `merge`); an invalid value throws → `-32603`.
-pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMethod> {
-    match method.as_deref() {
+pub(crate) fn validate_merge_method(method: Option<&str>) -> Result<MergeMethod> {
+    match method {
         None | Some("merge") => Ok(MergeMethod::Merge),
         Some("squash") => Ok(MergeMethod::Squash),
         Some("rebase") => Ok(MergeMethod::Rebase),
@@ -1641,13 +1641,13 @@ mod tests {
     fn validates_merge_method_with_default() {
         assert_eq!(validate_merge_method(None).unwrap(), MergeMethod::Merge);
         assert_eq!(
-            validate_merge_method(Some("squash".into())).unwrap(),
+            validate_merge_method(Some("squash")).unwrap(),
             MergeMethod::Squash
         );
         assert_eq!(
-            validate_merge_method(Some("rebase".into())).unwrap(),
+            validate_merge_method(Some("rebase")).unwrap(),
             MergeMethod::Rebase
         );
-        assert!(validate_merge_method(Some("bad".into())).is_err());
+        assert!(validate_merge_method(Some("bad")).is_err());
     }
 }

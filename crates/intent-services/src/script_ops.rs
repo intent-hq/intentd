@@ -540,7 +540,7 @@ impl ScriptManager {
         script_id: &str,
         max_lines: Option<i64>,
         paginate: bool,
-        page_token: Option<String>,
+        page_token: Option<&String>,
     ) -> Result<Value> {
         let pty_id = {
             let guard = self.scripts.lock().unwrap();
@@ -560,7 +560,7 @@ impl ScriptManager {
             return Ok(crate::pagination::paginate_text_lines(
                 &buffer,
                 max_lines,
-                page_token.as_deref(),
+                page_token.map(std::string::String::as_str),
             ));
         }
         let line_count = clamp_line_count(max_lines, 100);
@@ -1261,7 +1261,7 @@ impl ScriptManager {
         let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
         publish_event_transient(
             &self.bus,
-            script_event(
+            &script_event(
                 ws,
                 SCRIPT_OUTPUT,
                 json!({ "scriptId": script_id, "chunk": chunk }),

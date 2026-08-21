@@ -103,7 +103,7 @@ async fn create_and_delete_emit_distinct_file_events() {
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
 
     // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
@@ -153,7 +153,7 @@ async fn ignored_paths_emit_nothing() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-1"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -189,7 +189,7 @@ async fn modifying_pre_existing_file_emits_changed_event() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-1"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -227,7 +227,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -361,7 +361,7 @@ async fn normal_single_file_edit_still_emits_individual_event() {
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -612,7 +612,7 @@ async fn dedupe_within_window_emits_one_event_per_path() {
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -761,7 +761,7 @@ async fn gitignored_generated_dir_is_suppressed() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -797,7 +797,7 @@ async fn user_ignored_path_suppressed_across_create_modify_delete() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -829,7 +829,7 @@ async fn nested_gitignore_applies_only_under_its_directory() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -859,7 +859,7 @@ async fn git_info_exclude_is_honored() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -887,7 +887,7 @@ async fn negation_reincludes_file_in_ignored_dir() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -914,7 +914,7 @@ async fn gitignore_edit_takes_effect_without_restart() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -959,7 +959,7 @@ async fn default_patterns_apply_without_gitignore_rule() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -994,7 +994,7 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1029,7 +1029,7 @@ async fn user_negation_overrides_default_pattern() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1055,7 +1055,7 @@ async fn non_git_root_still_applies_default_patterns() {
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
     _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;

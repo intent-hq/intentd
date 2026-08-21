@@ -128,7 +128,9 @@ pub(crate) fn parse_paths(paths: &Value) -> Result<Vec<String>> {
 /// Convert an RFC-3339 timestamp into epoch milliseconds (the TS
 /// `attribution.timestamp` numeric form). Malformed input → `0`.
 pub(crate) fn iso_to_millis(iso: &str) -> i64 {
-    parse_iso(iso).map_or(0, |dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
+    parse_iso(iso).map_or(0, |dt| {
+        i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+    })
 }
 
 /// The absolute file path for a row: `<worktree>/<relativePath>` when a worktree

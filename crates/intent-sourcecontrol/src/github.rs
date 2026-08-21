@@ -857,7 +857,7 @@ fn map_branch_rules(value: &Value) -> BranchRules {
                     .and_then(|p| p.get("required_approving_review_count"))
                     .and_then(Value::as_u64)
                 {
-                    let count = count as u32;
+                    let count = u32::try_from(count).unwrap_or(u32::MAX);
                     rules.required_approving_review_count = Some(
                         rules
                             .required_approving_review_count

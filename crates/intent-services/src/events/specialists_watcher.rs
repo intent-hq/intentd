@@ -104,12 +104,12 @@ impl SpecialistsWatcher {
     /// path first (and primes the fingerprint so pre-existing specialists do
     /// not emit a spurious event), then the project tier is watched.
     /// Re-registering replaces the watch.
-    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: &Path) {
         let _ = self.raw_tx.send(SpecialistsMsg::Add(
             workspace_id.clone(),
-            workspace_path.clone(),
+            workspace_path.to_path_buf(),
         ));
-        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watch);
         }
@@ -157,12 +157,12 @@ impl SpecialistsWatcher {
     /// happened in this process: a workspace archived before daemon start is
     /// never seeded (boot lists unarchived workspaces only), so its resume has
     /// no baseline and emits one benign event.
-    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: &Path) {
         let _ = self.raw_tx.send(SpecialistsMsg::Resume(
             workspace_id.clone(),
-            workspace_path.clone(),
+            workspace_path.to_path_buf(),
         ));
-        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watch);
         }
@@ -766,7 +766,7 @@ mod tests {
         watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.add_workspace(ws_id.clone(), &ws.path.clone());
         watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -838,7 +838,7 @@ mod tests {
         // matches, so the catch-up flush must stay silent.
         watcher.pause_workspace(&ws_id);
         tokio::time::sleep(Duration::from_millis(250)).await;
-        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        watcher.resume_workspace(ws_id.clone(), &ws.path.clone());
 
         let events = drain_specialists_events(
             &mut sub,
@@ -870,7 +870,7 @@ mod tests {
             "a suspended workspace must not emit for its own edits, got {events:?}"
         );
 
-        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        watcher.resume_workspace(ws_id.clone(), &ws.path.clone());
         let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert_eq!(
             events.len(),

@@ -557,7 +557,7 @@ pub fn provision_local_clone_checkout(
         Some(url) => OriginTarget::Url(url),
         None => OriginTarget::Remove,
     };
-    provision_plain_clone_checkout(source_repo, checkout_path, origin, branch, base_ref)
+    provision_plain_clone_checkout(source_repo, checkout_path, &origin, branch, base_ref)
 }
 
 /// The local filesystem path a remote URL denotes, or `None` when the URL is

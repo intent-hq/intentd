@@ -165,7 +165,7 @@ async fn start() -> Server {
         ..Default::default()
     };
     let ws =
-        WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
+        WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {

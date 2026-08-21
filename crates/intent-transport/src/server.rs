@@ -92,7 +92,7 @@ pub(crate) async fn handle(
             return None;
         }
         return Some(error_frame(
-            req.id_echo,
+            &req.id_echo,
             -32001,
             "server.* methods are local-only",
         ));
@@ -111,8 +111,8 @@ pub(crate) async fn handle(
         return None;
     }
     match result {
-        Ok(v) => Some(success_frame(req.id_echo, v)),
-        Err((code, msg)) => Some(error_frame(req.id_echo, code, &msg)),
+        Ok(v) => Some(success_frame(&req.id_echo, &v)),
+        Err((code, msg)) => Some(error_frame(&req.id_echo, code, &msg)),
     }
 }
 

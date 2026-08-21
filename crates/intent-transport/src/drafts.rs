@@ -150,7 +150,7 @@ pub(crate) async fn handle(
     ) else {
         return frame(
             req.id_present,
-            req.id_echo,
+            &req.id_echo,
             Err((
                 -32602,
                 "Missing required parameter: workspaceId/agentId".to_string(),
@@ -198,17 +198,21 @@ pub(crate) async fn handle(
             },
         },
     };
-    frame(req.id_present, req.id_echo, result)
+    frame(req.id_present, &req.id_echo, result)
 }
 
 /// Build the response frame for a `drafts.*` result, or `None` for a
 /// notification (no `id`).
-fn frame(id_present: bool, id_echo: Value, result: Result<Value, (i32, String)>) -> Option<String> {
+fn frame(
+    id_present: bool,
+    id_echo: &Value,
+    result: Result<Value, (i32, String)>,
+) -> Option<String> {
     if !id_present {
         return None;
     }
     Some(match result {
-        Ok(value) => success_frame(id_echo, value),
+        Ok(value) => success_frame(id_echo, &value),
         Err((code, message)) => error_frame(id_echo, code, &message),
     })
 }

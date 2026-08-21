@@ -418,8 +418,8 @@ fn spawn_reader<R>(
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    let ev = chunk_event(&workspace_id, &request_id, event_type, chunk);
-                    bus.publish_transient(&ev);
+                    let ev = chunk_event(&workspace_id, &request_id, event_type, &chunk);
+                    let _ = bus.publish_transient(&ev);
                 }
                 Err(_) => break,
             }
@@ -544,7 +544,7 @@ fn chunk_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     event_type: &'static str,
-    chunk_b64: String,
+    chunk_b64: &str,
 ) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -567,33 +567,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn map(v: Value) -> Map<String, Value> {
+    fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
     }
 
     #[test]
     fn parse_args_defaults_no_stdin_no_request_id() {
-        let a = parse_args(&map(json!({ "command": "echo" }))).unwrap();
+        let a = parse_args(&map(&json!({ "command": "echo" }))).unwrap();
         assert!(a.request_id.is_none());
         assert!(a.stdin.is_none());
     }
 
     #[test]
     fn parse_args_accepts_utf8_stdin() {
-        let a = parse_args(&map(json!({ "command": "cat", "stdin": "hello\n" }))).unwrap();
+        let a = parse_args(&map(&json!({ "command": "cat", "stdin": "hello\n" }))).unwrap();
         assert_eq!(a.stdin.as_deref(), Some(b"hello\n".as_slice()));
     }
 
     #[test]
     fn parse_args_accepts_base64_stdin() {
-        let a = parse_args(&map(json!({ "command": "cat", "stdinBase64": "aGVsbG8K" }))).unwrap();
+        let a = parse_args(&map(
+            &json!({ "command": "cat", "stdinBase64": "aGVsbG8K" }),
+        ))
+        .unwrap();
         assert_eq!(a.stdin.as_deref(), Some(b"hello\n".as_slice()));
     }
 
     #[test]
     fn parse_args_rejects_both_stdin_forms() {
         let err = parse_args(&map(
-            json!({ "command": "cat", "stdin": "x", "stdinBase64": "eA==" }),
+            &json!({ "command": "cat", "stdin": "x", "stdinBase64": "eA==" }),
         ))
         .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
@@ -601,14 +604,14 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_non_string_stdin() {
-        let err = parse_args(&map(json!({ "command": "cat", "stdin": 42 }))).unwrap_err();
+        let err = parse_args(&map(&json!({ "command": "cat", "stdin": 42 }))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[test]
     fn parse_args_caps_timeout_via_host_exec() {
         use crate::host_exec::MAX_TIMEOUT_MS;
-        let a = parse_args(&map(json!({
+        let a = parse_args(&map(&json!({
             "command": "sleep",
             "timeoutMs": MAX_TIMEOUT_MS + 1_000,
         })))

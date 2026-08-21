@@ -108,7 +108,9 @@ pub(crate) fn split_delta_across_minutes(
 pub(crate) fn parse_limit(limit: Option<i64>) -> Result<u32> {
     match limit {
         None => Ok(DEFAULT_RATE_HISTORY_LIMIT),
-        Some(n) if (1..=i64::from(MAX_RATE_HISTORY_LIMIT)).contains(&n) => Ok(n as u32),
+        Some(n) if (1..=i64::from(MAX_RATE_HISTORY_LIMIT)).contains(&n) => {
+            Ok(u32::try_from(n).expect("range-checked"))
+        }
         Some(n) => Err(Error::InvalidParams(format!(
             "limit must be between 1 and {MAX_RATE_HISTORY_LIMIT}, got {n}"
         ))),

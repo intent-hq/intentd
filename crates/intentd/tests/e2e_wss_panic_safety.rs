@@ -151,7 +151,7 @@ async fn start_server() -> (WsApiServer, u16, Arc<ClientConfig>, tempfile::TempD
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     (ws, port, cfg, dir)

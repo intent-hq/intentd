@@ -264,7 +264,7 @@ where
                 // the connection WITHOUT draining the rest of the oversized
                 // line into memory.
                 let frame = crate::events::error_frame(
-                    serde_json::Value::Null,
+                    &serde_json::Value::Null,
                     -32600,
                     &format!(
                         "message exceeds maximum size of {} bytes",

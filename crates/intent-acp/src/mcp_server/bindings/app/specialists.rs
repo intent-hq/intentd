@@ -110,7 +110,7 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 }
 
 /// Return a proposal with dual text+resource content items.
-fn proposal_result(proposal: Value) -> Result<Value, String> {
+fn proposal_result(proposal: &Value) -> Result<Value, String> {
     // Build resource name from preview.title
     let name = proposal
         .get("preview")
@@ -130,7 +130,7 @@ fn proposal_result(proposal: Value) -> Result<Value, String> {
     let resource_item = json!({
         "type": "resource",
         "resource": {
-            "uri": proposal_resource_uri(&proposal),
+            "uri": proposal_resource_uri(proposal),
             "name": name,
             "mimeType": PROPOSAL_RESOURCE_MIME_TYPE,
             "text": serde_json::to_string(&proposal).unwrap_or_else(|_| "{}".to_string())
@@ -351,7 +351,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         }
     });
 
-    proposal_result(proposal)
+    proposal_result(&proposal)
 }
 
 #[cfg(test)]

@@ -765,6 +765,8 @@ fn memory_budget_max_mb() -> f64 {
 /// clients a value is settable that the write path refuses. Clamping keeps the
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
+// MiB counts above 2^53 do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
         // INVARIANT: this bound may be tighter than the `config.toml` parse
@@ -1741,6 +1743,9 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 /// floats become integers so `u16`/`u32` fields (e.g. `server.port`) accept
 /// the `5182.0` shape JSON clients commonly send. Float fields re-accept
 /// integers via the schema's lenient deserializer.
+// The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
+// i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
@@ -2521,6 +2526,8 @@ mod tests {
     /// demonstrates the tighter-than case only exists on a seat smaller than
     /// the parse bound, which is every real one but need not be assumed.
     #[test]
+    // The advertised max is a small whole-valued float: casts are exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
         let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
         let max = memory_budget_max_mb();

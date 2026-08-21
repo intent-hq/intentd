@@ -358,7 +358,7 @@ mod tests {
     }
 
     /// Helper to build a merge patch from a JSON literal.
-    fn patch(v: Value) -> serde_json::Map<String, Value> {
+    fn patch(v: &Value) -> serde_json::Map<String, Value> {
         v.as_object().unwrap().clone()
     }
 
@@ -377,7 +377,7 @@ mod tests {
 
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -401,10 +401,12 @@ mod tests {
         };
         write_repo_config(repo.path(), config).await.unwrap();
 
-        let merged =
-            merge_repo_config(repo.path(), patch(serde_json::json!({"setupScript": null})))
-                .await
-                .unwrap();
+        let merged = merge_repo_config(
+            repo.path(),
+            patch(&serde_json::json!({"setupScript": null})),
+        )
+        .await
+        .unwrap();
         assert!(merged.setup_script.is_none());
         assert_eq!(merged.branch_prefix.as_deref(), Some("feature/"));
 
@@ -437,7 +439,7 @@ mod tests {
         // Unknown keys absent from the patch survive a merge.
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -447,7 +449,7 @@ mod tests {
         // Unknown keys present in the patch overwrite; explicit null clears them.
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"customKey": "updated", "anotherKey": null})),
+            patch(&serde_json::json!({"customKey": "updated", "anotherKey": null})),
         )
         .await
         .unwrap();
@@ -465,7 +467,7 @@ mod tests {
         let repo = temp_repo();
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -489,7 +491,7 @@ mod tests {
 
         let merged = merge_repo_config(
             repo.path(),
-            patch(serde_json::json!({"branchPrefix": "x/"})),
+            patch(&serde_json::json!({"branchPrefix": "x/"})),
         )
         .await
         .unwrap();
@@ -500,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn merge_invalid_field_type_errors() {
         let repo = temp_repo();
-        let err = merge_repo_config(repo.path(), patch(serde_json::json!({"branchPrefix": 42})))
+        let err = merge_repo_config(repo.path(), patch(&serde_json::json!({"branchPrefix": 42})))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid config"));

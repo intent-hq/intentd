@@ -213,7 +213,7 @@ pub(crate) fn classify(value: &Value) -> Option<ForwardRequest> {
 /// Coerce a JSON port number to a valid `u16` TCP port (1..=65535).
 fn as_port(value: u64) -> Option<u16> {
     if (1..=u64::from(u16::MAX)).contains(&value) {
-        Some(value as u16)
+        Some(u16::try_from(value).expect("range-checked"))
     } else {
         None
     }
@@ -241,7 +241,7 @@ pub(crate) async fn handle(
                         None => {
                             return frame(
                                 req.id_present,
-                                req.id_echo,
+                                &req.id_echo,
                                 Err((-32602, "localPort must be a valid TCP port".to_string())),
                             )
                         }
@@ -267,17 +267,21 @@ pub(crate) async fn handle(
             _ => Err((-32602, "Missing required parameter: forwardId".to_string())),
         },
     };
-    frame(req.id_present, req.id_echo, result)
+    frame(req.id_present, &req.id_echo, result)
 }
 
 /// Build the response frame for a `forward.*` result, or `None` for a
 /// notification (no `id`).
-fn frame(id_present: bool, id_echo: Value, result: Result<Value, (i32, String)>) -> Option<String> {
+fn frame(
+    id_present: bool,
+    id_echo: &Value,
+    result: Result<Value, (i32, String)>,
+) -> Option<String> {
     if !id_present {
         return None;
     }
     Some(match result {
-        Ok(value) => success_frame(id_echo, value),
+        Ok(value) => success_frame(id_echo, &value),
         Err((code, message)) => error_frame(id_echo, code, &message),
     })
 }

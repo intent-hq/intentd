@@ -180,7 +180,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<AsyncTokenStore>,
+        token_store: &Arc<AsyncTokenStore>,
         options: WsOptions,
         control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Result<Self> {
@@ -189,7 +189,7 @@ impl WsApiServer {
             api,
             bus,
             acceptor: Some(acceptor),
-            token_store: Some((*token_store).clone()),
+            token_store: Some((**token_store).clone()),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             // The WSS transport is remote by default; an override forces it
@@ -266,7 +266,7 @@ impl WsApiServer {
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<AsyncTokenStore>,
+        token_store: &Arc<AsyncTokenStore>,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
         control: Option<Arc<dyn crate::control::SystemControl>>,
@@ -410,7 +410,7 @@ impl WsInner {
     pub(crate) async fn heartbeat_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(self.heartbeat_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout_ms = self.heartbeat_timeout.as_millis() as i64;
+        let timeout_ms = i64::try_from(self.heartbeat_timeout.as_millis()).unwrap_or(i64::MAX);
         loop {
             tick.tick().await;
             let now = now_ms();
@@ -870,7 +870,7 @@ fn header_str(value: &[u8]) -> Option<String> {
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

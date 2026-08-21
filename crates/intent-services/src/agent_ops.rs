@@ -1069,7 +1069,7 @@ fn parse_model_line(line: &str) -> Option<(String, String)> {
 /// dynamic discovery succeeded: an empty list labeled `source: "static"` with
 /// a `warning`, never an error. (The former static tier catalog went with the
 /// tier tables — the provider CLI owns model discovery.)
-pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Value {
+pub(crate) fn static_provider_response(provider_id: &str, warning: &str) -> Value {
     json!({
         "providerId": provider_id,
         "models": [],
@@ -1648,13 +1648,13 @@ fn build_create_metadata(
 /// when empty so pre-widening callers that only inspect `ok`/`agentId`/
 /// `created`/`result` stay wire-compatible.
 fn build_wake_response(
-    agent_id: AgentId,
-    agent_name: String,
+    agent_id: &AgentId,
+    agent_name: &str,
     created: bool,
     action: &str,
-    task_title: String,
-    result: Value,
-    cleaned_up: Vec<AgentId>,
+    task_title: &str,
+    result: &Value,
+    cleaned_up: &[AgentId],
 ) -> Value {
     let mut out = json!({
         "ok": true,
@@ -2392,7 +2392,9 @@ impl Services {
             // Ordinal seek: clamp into [0, total - 1] — client estimates are
             // approximate, so an overshooting index lands on the newest page
             // instead of erroring (negatives were rejected at the boundary).
-            let clamped = (idx.max(0) as usize).min(total.saturating_sub(1));
+            let clamped = usize::try_from(idx.max(0))
+                .expect("non-negative")
+                .min(total.saturating_sub(1));
             slim_anchor = crate::pagination::BudgetAnchor::Target(clamped);
             Some(crate::pagination::page_window_around(total, limit, clamped))
         } else {
@@ -4052,7 +4054,7 @@ impl Services {
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
-                format!("no dynamic model discovery for provider '{provider_id}'"),
+                &format!("no dynamic model discovery for provider '{provider_id}'"),
             ));
         };
         let version_key = (source.version_key)();
@@ -4079,7 +4081,7 @@ impl Services {
             }
             None => Ok(static_provider_response(
                 &provider_id,
-                resolved
+                &resolved
                     .warning
                     .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
@@ -8491,8 +8493,10 @@ impl Services {
                         .filter(|e| e["editing"].as_bool() != Some(true))
                         .filter_map(|e| {
                             let queued_at = e["queuedAt"].as_str()?;
-                            let queued_ms =
-                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let queued_ms = i64::try_from(
+                                parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000,
+                            )
+                            .unwrap_or(0);
                             let age = (now_ms - queued_ms).max(0);
                             if age > STALE_QUEUE_ENTRY_AFTER_MS {
                                 Some((e["id"].as_str().unwrap_or_default(), age))
@@ -9036,13 +9040,13 @@ impl Services {
                 "woke_existing"
             };
             let mut response = build_wake_response(
-                agent_id.clone(),
-                agent_name,
+                &agent_id.clone(),
+                &agent_name,
                 false,
                 action,
-                task_title.clone(),
-                result,
-                cleaned_up,
+                &task_title.clone(),
+                &result,
+                &cleaned_up,
             );
             // SUB-1: auto-subscribe the waking caller to the target's
             // completion (TS `WakeOrCreateTaskAgentTool`). Response text
@@ -9309,13 +9313,13 @@ impl Services {
             )
             .await?;
         let mut response = build_wake_response(
-            agent.clone(),
-            agent_name,
+            &agent.clone(),
+            &agent_name,
             true,
             "created_new",
-            task_title.clone(),
-            result,
-            cleaned_up,
+            &task_title.clone(),
+            &result,
+            &cleaned_up,
         );
         // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
         // created agent's completion, mirroring the woke-existing branch. The
@@ -10669,7 +10673,9 @@ fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
 /// runtime equivalent (e.g. `deleted`) are omitted so the caller drops the key.
 /// Parse an RFC-3339 timestamp into epoch milliseconds, or `0` when malformed.
 fn iso_ms(ts: &str) -> i64 {
-    parse_iso(ts).map_or(0, |dt| (dt.unix_timestamp_nanos() / 1_000_000) as i64)
+    parse_iso(ts).map_or(0, |dt| {
+        i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+    })
 }
 
 /// Non-negative age in milliseconds of `ts` relative to `now_ms`.

@@ -1016,7 +1016,7 @@ fn merge_ok(mut v: Value) -> Value {
 mod tests {
     use super::*;
 
-    fn entry(id: &str, extra: Value) -> Value {
+    fn entry(id: &str, extra: &Value) -> Value {
         let mut v = json!({
             "id": id,
             "content": format!("content-{id}"),
@@ -1035,10 +1035,10 @@ mod tests {
     fn present_queue_sorts_next_delivery_first() {
         // Deliberately scrambled input: normal, editing, interrupt, normal.
         let raw = vec![
-            entry("normal-1", json!({})),
-            entry("editing-1", json!({ "editing": true })),
-            entry("interrupt-1", json!({ "interruptPriority": true })),
-            entry("normal-2", json!({})),
+            entry("normal-1", &json!({})),
+            entry("editing-1", &json!({ "editing": true })),
+            entry("interrupt-1", &json!({ "interruptPriority": true })),
+            entry("normal-2", &json!({})),
         ];
         let out = present_queue(raw);
         let ids: Vec<&str> = out.iter().map(|e| e["id"].as_str().unwrap()).collect();
@@ -1053,9 +1053,9 @@ mod tests {
     #[test]
     fn present_queue_keeps_interrupt_arrival_order() {
         let raw = vec![
-            entry("interrupt-1", json!({ "interruptPriority": true })),
-            entry("interrupt-2", json!({ "interruptPriority": true })),
-            entry("normal-1", json!({})),
+            entry("interrupt-1", &json!({ "interruptPriority": true })),
+            entry("interrupt-2", &json!({ "interruptPriority": true })),
+            entry("normal-1", &json!({})),
         ];
         let out = present_queue(raw);
         let ids: Vec<&str> = out.iter().map(|e| e["id"].as_str().unwrap()).collect();
@@ -1066,7 +1066,7 @@ mod tests {
     fn present_queue_lifts_attribution_and_drops_bulk() {
         let raw = vec![entry(
             "attributed",
-            json!({
+            &json!({
                 "messageMetadata": {
                     "type": "agent_message",
                     "fromAgentId": "agent-abc",
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn present_queue_user_entries_have_no_attribution() {
-        let out = present_queue(vec![entry("user-entry", json!({}))]);
+        let out = present_queue(vec![entry("user-entry", &json!({}))]);
         assert!(out[0].get("fromAgentId").is_none());
         assert!(out[0].get("fromAgentName").is_none());
     }
@@ -1095,12 +1095,12 @@ mod tests {
         let queue = present_queue(vec![
             entry(
                 "foreign",
-                json!({ "messageMetadata": { "fromAgentId": "agent-other" } }),
+                &json!({ "messageMetadata": { "fromAgentId": "agent-other" } }),
             ),
-            entry("user-entry", json!({})),
+            entry("user-entry", &json!({})),
             entry(
                 "own",
-                json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
+                &json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
             ),
         ]);
         assert_eq!(caller_pending_entry(&queue, &caller), Some("own"));
@@ -1117,7 +1117,7 @@ mod tests {
         let caller = AgentId::from("agent-caller");
         let queue = present_queue(vec![entry(
             "own-editing",
-            json!({
+            &json!({
                 "editing": true,
                 "messageMetadata": { "fromAgentId": "agent-caller" },
             }),
@@ -1131,14 +1131,14 @@ mod tests {
         let queue = present_queue(vec![
             entry(
                 "own-editing",
-                json!({
+                &json!({
                     "editing": true,
                     "messageMetadata": { "fromAgentId": "agent-caller" },
                 }),
             ),
             entry(
                 "own-pending",
-                json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
+                &json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
             ),
         ]);
         assert_eq!(

@@ -338,6 +338,8 @@ impl WorkspaceMcpServer {
     }
 }
 
+// By-value: callers hand over freshly built payloads.
+#[allow(clippy::needless_pass_by_value)]
 fn ok(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }

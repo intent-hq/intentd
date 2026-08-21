@@ -5841,7 +5841,9 @@ mod tests {
                 .get_agent_messages_page(&agent_id, offset, limit)
                 .await
                 .expect("page read");
-            let start = (offset as usize).min(full.len());
+            let start = usize::try_from(offset)
+                .expect("non-negative")
+                .min(full.len());
             let end =
                 (start + usize::try_from(limit).expect("value fits in usize")).min(full.len());
             let expected: Vec<_> = full[start..end].iter().map(|m| (m.seq, &m.id)).collect();

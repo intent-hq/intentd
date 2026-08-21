@@ -429,7 +429,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
     Fixture {

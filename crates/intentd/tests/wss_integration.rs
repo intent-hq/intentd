@@ -197,7 +197,7 @@ async fn make_services(
         services = services.with_auggie_bin(bin);
     }
     if let Some(cache_dir) = models_cache_dir {
-        services = services.with_models_cache_dir(cache_dir);
+        services = services.with_models_cache_dir(&cache_dir);
     }
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, registry, dir)
@@ -254,7 +254,7 @@ async fn start_with_auggie_and_models_cache(
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
     let ws =
-        WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
+        WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -1501,7 +1501,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let server = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
 
@@ -1632,7 +1632,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let server = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
 
@@ -3761,7 +3761,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     // Stamp the current bucket with a local hour that DIFFERS from its UTC
     // hour (same date, so month filtering is unaffected): the month view
     // must group by the recorded stamp while the 24h view ignores it (D12).
-    let divergent_hour = (now.hour() as u8 + 5) % 24;
+    let divergent_hour = (u8::try_from(now.hour()).expect("hour < 24") + 5) % 24;
     let delta = intent_store::UsageStatsDelta {
         input_tokens: 100,
         output_tokens: 40,
@@ -3790,7 +3790,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
             &bucket_old,
             "Sonnet 5",
             "codex",
-            Some(&stamp(old, old.hour() as u8)),
+            Some(&stamp(old, u8::try_from(old.hour()).expect("hour < 24"))),
             &intent_store::UsageStatsDelta {
                 input_tokens: 7,
                 runs: 1,
@@ -5207,7 +5207,7 @@ async fn bind_fails_fast_on_occupied_port() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let err = ws
         .start()
         .await
@@ -5298,7 +5298,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
             api.clone(),
             bus.clone(),
             &tls,
-            token_store.clone(),
+            &token_store.clone(),
             opts,
             None,
         )

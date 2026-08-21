@@ -1779,7 +1779,7 @@ impl Services {
                         &this.event_bus,
                         workspace_updated_event(
                             &ws_id,
-                            serde_json::json!({ "lastActivity": new_val }),
+                            &serde_json::json!({ "lastActivity": new_val }),
                         ),
                     )
                     .await;
@@ -2130,7 +2130,7 @@ impl Services {
 
         publish_event(
             &self.event_bus,
-            workspace_updated_event(&ws.id, serde_json::Value::Object(changes)),
+            workspace_updated_event(&ws.id, &serde_json::Value::Object(changes)),
         )
         .await;
 
@@ -2714,7 +2714,7 @@ impl Services {
     /// `dir` (the daemon data dir), reloading any current-version snapshot.
     /// Composition-root only — call before the surface is shared/cloned.
     #[must_use]
-    pub fn with_models_cache_dir(mut self, dir: PathBuf) -> Self {
+    pub fn with_models_cache_dir(mut self, dir: &Path) -> Self {
         self.models_catalog = Arc::new(model_catalog::ModelCatalogCache::new(Some(
             dir.join(model_catalog::MODELS_CACHE_FILE),
         )));
@@ -6597,7 +6597,7 @@ impl Services {
             attributions: map,
         };
         self.store.upsert_note_line_attribution(&data).await?;
-        publish_event_transient(&self.event_bus, line_attribution_updated_event(&data));
+        publish_event_transient(&self.event_bus, &line_attribution_updated_event(&data));
         Ok(data)
     }
 
@@ -6607,8 +6607,8 @@ impl Services {
     /// into a single recompute + emit after [`LINE_ATTRIBUTION_DEBOUNCE`].
     pub(crate) fn schedule_line_attribution_recompute(
         &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
     ) {
         let key = (workspace_id.clone(), note_id.clone());
         let services = self.clone();
@@ -8703,7 +8703,7 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
 /// computedAt }` (`notes.service.ts` `emitReadyTasksChanged`).
 fn ready_tasks_changed_event(
     workspace_id: &WorkspaceId,
-    ready_task_ids: Vec<String>,
+    ready_task_ids: &[String],
     triggered_by_note: &NoteId,
     previous_status: TaskStatus,
     new_status: TaskStatus,
@@ -8712,7 +8712,7 @@ fn ready_tasks_changed_event(
     ready_tasks_changed_event_with_trigger(
         workspace_id,
         ready_task_ids,
-        serde_json::json!({
+        &serde_json::json!({
             "noteId": triggered_by_note.as_str(),
             "previousStatus": status_word(previous_status),
             "newStatus": status_word(new_status),
@@ -8731,7 +8731,7 @@ fn ready_tasks_changed_event(
 /// byte-identical.
 fn ready_tasks_changed_reason_event(
     workspace_id: &WorkspaceId,
-    ready_task_ids: Vec<String>,
+    ready_task_ids: &[String],
     triggered_by_note: &NoteId,
     reason: &str,
     computed_at: &str,
@@ -8739,7 +8739,7 @@ fn ready_tasks_changed_reason_event(
     ready_tasks_changed_event_with_trigger(
         workspace_id,
         ready_task_ids,
-        serde_json::json!({
+        &serde_json::json!({
             "noteId": triggered_by_note.as_str(),
             "reason": reason,
         }),
@@ -8749,8 +8749,8 @@ fn ready_tasks_changed_reason_event(
 
 fn ready_tasks_changed_event_with_trigger(
     workspace_id: &WorkspaceId,
-    ready_task_ids: Vec<String>,
-    triggered_by: serde_json::Value,
+    ready_task_ids: &[String],
+    triggered_by: &serde_json::Value,
     computed_at: &str,
 ) -> NewEvent {
     NewEvent {
@@ -8812,7 +8812,7 @@ fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAtten
 /// `{ changes: [{ path, value }] }` carrying the **redacted** applied pairs
 /// (PROTOCOL §6.5 / §9.8). Settings are global, so the event carries the empty
 /// workspace id; subscribers that omit a `workspaceId` filter still receive it.
-fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
+fn settings_changed_event(changes: &[serde_json::Value]) -> NewEvent {
     NewEvent {
         workspace_id: WorkspaceId::from_string(String::new()),
         timestamp: now_iso(),
@@ -9003,7 +9003,7 @@ pub async fn publish_workspace_created(bus: &EventBus, ws: &Workspace) {
 /// FE emitter — `changes` is the caller-supplied `WorkspaceUpdate` diff (the
 /// applied delta, not the full row) so clients see exactly which fields
 /// moved.
-fn workspace_updated_event(workspace_id: &WorkspaceId, changes: serde_json::Value) -> NewEvent {
+fn workspace_updated_event(workspace_id: &WorkspaceId, changes: &serde_json::Value) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
@@ -9682,7 +9682,7 @@ fn git_branch_event(
 
 /// Build a `changes:git-status` event carrying the refreshed `WorkspaceGitStatus`
 /// (§5.18, §6.5). Self-sufficient payload `{ workspaceId, status }`.
-fn changes_git_status_event(workspace_id: &WorkspaceId, status: serde_json::Value) -> NewEvent {
+fn changes_git_status_event(workspace_id: &WorkspaceId, status: &serde_json::Value) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
@@ -9703,7 +9703,7 @@ fn changes_git_status_event(workspace_id: &WorkspaceId, status: serde_json::Valu
 /// `Metrics` (§5.20, §6.5). Self-sufficient payload `{ workspaceId, metrics }`.
 fn changes_metrics_changed_event(
     workspace_id: &WorkspaceId,
-    metrics: serde_json::Value,
+    metrics: &serde_json::Value,
 ) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -9833,8 +9833,8 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
 /// `chat:stream:delta` that do not need durable storage.
-pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: NewEvent) -> Option<Event> {
-    bus.as_ref().map(|b| b.publish_transient(&event))
+pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: &NewEvent) -> Option<Event> {
+    bus.as_ref().map(|b| b.publish_transient(event))
 }
 
 /// Best-effort workspace lookup by worktree path (§6.5). Path-scoped git
@@ -10726,7 +10726,7 @@ impl Services {
         let author = resolve_note_version_author(store, caller_agent_id).await;
         capture_note_version(store, &note, &author).await?;
         self.invalidate_crdt_note(&note.workspace_id, &note.id);
-        self.schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+        self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
         // emits `note:updated` after saving the converted note).
@@ -10837,23 +10837,23 @@ impl Services {
     /// further batches mid-stream. The token is always unregistered once settled.
     fn deliver_search(
         &self,
-        request_id: String,
-        workspace_id: Option<WorkspaceId>,
+        request_id: &str,
+        workspace_id: Option<&WorkspaceId>,
         matches: Vec<serde_json::Value>,
         token: intent_search::CancelToken,
     ) -> serde_json::Value {
         let registry = self.search_cancels.clone();
-        let stream_target = match (&self.event_bus, &workspace_id) {
+        let stream_target = match (&self.event_bus, workspace_id) {
             (Some(bus), Some(ws)) if matches.len() > search_ops::INLINE_THRESHOLD => {
                 Some((bus.clone(), ws.clone()))
             }
             _ => None,
         };
         let Some((bus, ws)) = stream_target else {
-            registry.unregister(&request_id);
+            registry.unregister(request_id);
             return serde_json::json!({ "requestId": request_id, "matches": matches });
         };
-        let stream_request_id = request_id.clone();
+        let stream_request_id = request_id.to_string();
         tokio::spawn(async move {
             let mut emitted = 0usize;
             let mut cancelled = false;
@@ -10934,6 +10934,9 @@ impl Services {
                         if let Some(new_port) =
                             change.get("value").and_then(serde_json::Value::as_f64)
                         {
+                            // Settings schema bounds the port to u16 range;
+                            // the float→int cast saturates anyway.
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -11084,7 +11087,7 @@ impl Services {
                 );
             }
         }
-        publish_event(&self.event_bus, settings_changed_event(applied)).await;
+        publish_event(&self.event_bus, settings_changed_event(&applied)).await;
     }
 
     /// Default-provider settings self-heal (monorepo#3044). When no default
@@ -11408,7 +11411,7 @@ impl WorkspaceApi for Services {
                         return Err(e);
                     }
                 }
-                publish_event(&self.event_bus, settings_changed_event(applied.clone())).await;
+                publish_event(&self.event_bus, settings_changed_event(&applied.clone())).await;
             }
             Ok(serde_json::json!({ "applied": applied }))
         })
@@ -11419,7 +11422,7 @@ impl WorkspaceApi for Services {
             let result = self.settings_service().reset(&path).await?;
             publish_event(
                 &self.event_bus,
-                settings_changed_event(vec![result.clone()]),
+                settings_changed_event(std::slice::from_ref(&result)),
             )
             .await;
             Ok(result)
@@ -11543,7 +11546,7 @@ impl WorkspaceApi for Services {
                     path.as_deref(),
                 )
                 .await?;
-            publish_event(&self.event_bus, settings_changed_event(vec![changed])).await;
+            publish_event(&self.event_bus, settings_changed_event(&[changed])).await;
             Ok(rules)
         })
     }
@@ -11815,7 +11818,7 @@ impl WorkspaceApi for Services {
         let registry = self.search_cancels.clone();
         Box::pin(async move {
             // Idempotent: cancelling an unknown/finished id is a no-op success.
-            registry.cancel(&request_id);
+            let _ = registry.cancel(&request_id);
             Ok(serde_json::json!({ "ok": true }))
         })
     }
@@ -11855,7 +11858,7 @@ impl WorkspaceApi for Services {
                 None => Vec::new(),
             };
             let matches = to_value_vec(search_ops::message_fts_matches(hits, &query))?;
-            Ok(services.deliver_search(request_id, workspace_id, matches, token))
+            Ok(services.deliver_search(&request_id, workspace_id.as_ref(), matches, token))
         })
     }
 
@@ -11881,7 +11884,7 @@ impl WorkspaceApi for Services {
                 .await?;
             let matches = search_ops::event_matches(&events, &query, limit);
             let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, workspace_id, matches, token))
+            Ok(services.deliver_search(&request_id, workspace_id.as_ref(), matches, token))
         })
     }
 
@@ -11900,7 +11903,7 @@ impl WorkspaceApi for Services {
             let matches = search_ops::note_matches(&notes, &query);
             let matches = to_value_vec(matches)?;
             // Global search (no workspaceId) → always inline (notes sets are small).
-            Ok(services.deliver_search(request_id, None, matches, token))
+            Ok(services.deliver_search(&request_id, None, matches, token))
         })
     }
 
@@ -11938,8 +11941,8 @@ impl WorkspaceApi for Services {
                         let matches = search_ops::engine_matches(&result);
                         let matches = to_value_vec(matches)?;
                         return Ok(services.deliver_search(
-                            request_id,
-                            Some(workspace_id),
+                            &request_id,
+                            Some(&workspace_id),
                             matches,
                             token,
                         ));
@@ -11973,7 +11976,7 @@ impl WorkspaceApi for Services {
                 };
             let matches = search_ops::codebase_matches(&outcome);
             let matches = to_value_vec(matches)?;
-            Ok(services.deliver_search(request_id, Some(workspace_id), matches, token))
+            Ok(services.deliver_search(&request_id, Some(&workspace_id), matches, token))
         })
     }
 
@@ -12062,7 +12065,7 @@ impl WorkspaceApi for Services {
                 &terminal_id,
                 max_lines,
                 paginate.unwrap_or(false),
-                page_token,
+                page_token.as_ref(),
             )
         })
     }
@@ -12352,7 +12355,7 @@ impl WorkspaceApi for Services {
             // `.intent/.gitignore`.
             repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
             let mut result =
-                file_ops::place_attachment(&root, &file_name, source).map_err(|e| {
+                file_ops::place_attachment(&root, &file_name, &source).map_err(|e| {
                     // Surface placement failures in the daemon log so field
                     // reports are diagnosable without a client-side trace
                     // (monorepo#2144).
@@ -12811,7 +12814,7 @@ impl WorkspaceApi for Services {
                 &script_id,
                 max_lines,
                 paginate.unwrap_or(false),
-                page_token,
+                page_token.as_ref(),
             )
         })
     }
@@ -15124,7 +15127,7 @@ impl WorkspaceApi for Services {
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
-            publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
+            publish_event(&bus, workspace_updated_event(&ws.id, &changes)).await;
             // PR link/status changes feed the derived displayStatus (the
             // `pr_*` rungs sit between activity and taskStats), and so does
             // the attention flag (`unread` / `review_required` axes):
@@ -15873,7 +15876,7 @@ impl WorkspaceApi for Services {
                     &bus,
                     workspace_updated_event(
                         &ws.id,
-                        serde_json::json!({
+                        &serde_json::json!({
                             "archived": true,
                             "status": ws.status,
                             "archivedAt": ws.archived_at,
@@ -16807,7 +16810,7 @@ impl WorkspaceApi for Services {
             // clients mirror the toggle without a follow-up read.
             publish_event(
                 &bus,
-                workspace_updated_event(&id, serde_json::json!({ "autoCommitEnabled": enabled })),
+                workspace_updated_event(&id, &serde_json::json!({ "autoCommitEnabled": enabled })),
             )
             .await;
             Ok(serde_json::json!({ "enabled": enabled, "source": "workspace" }))
@@ -17176,8 +17179,8 @@ impl WorkspaceApi for Services {
                         resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
                     capture_note_version(&store, &note, &author).await?;
                     services.schedule_line_attribution_recompute(
-                        note.workspace_id.clone(),
-                        note.id.clone(),
+                        &note.workspace_id.clone(),
+                        &note.id.clone(),
                     );
                     let mut note = note;
                     let outcome = services
@@ -17267,8 +17270,8 @@ impl WorkspaceApi for Services {
                 // (transport router path), so the version author is the user.
                 capture_note_version(&store, &note, &user_version_author()).await?;
                 services.schedule_line_attribution_recompute(
-                    note.workspace_id.clone(),
-                    note.id.clone(),
+                    &note.workspace_id.clone(),
+                    &note.id.clone(),
                 );
                 let outcome = services
                     .auto_convert_task_blocks_after_write(
@@ -17333,7 +17336,7 @@ impl WorkspaceApi for Services {
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             capture_note_version(&store, &note, &author).await?;
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
@@ -17410,7 +17413,7 @@ impl WorkspaceApi for Services {
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             capture_note_version(&store, &note, &author).await?;
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
@@ -17486,7 +17489,7 @@ impl WorkspaceApi for Services {
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             capture_note_version(&store, &note, &author).await?;
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
@@ -17551,14 +17554,21 @@ impl WorkspaceApi for Services {
             let old_content = note.content.clone();
             let previous_title = note.title.clone();
             if !old_content.is_empty() {
+                // Note sizes are far below 2^53 (loss-free in f64); the rounded
+                // percentage is in [0, 100] so the float→int cast is exact.
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
                 let old_len = old_content.chars().count() as f64;
+                #[allow(clippy::cast_precision_loss)]
                 let new_len = content.chars().count() as f64;
                 let reduction = (old_len - new_len) / old_len * 100.0;
                 if reduction > 50.0 && !confirm_replacement {
+                    // The rounded percentage is in (50, 100]: exact in i64.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let reduction_pct = reduction.round() as i64;
                     return Err(Error::Internal(format!(
                         "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
                         content.chars().count(),
-                        reduction.round() as i64,
+                        reduction_pct,
                         old_content.chars().count()
                     )));
                 }
@@ -17587,7 +17597,7 @@ impl WorkspaceApi for Services {
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             capture_note_version(&store, &note, &author).await?;
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -17768,7 +17778,7 @@ impl WorkspaceApi for Services {
                         &bus,
                         ready_tasks_changed_reason_event(
                             &workspace_id,
-                            ready_task_ids,
+                            &ready_task_ids,
                             &note_id,
                             "note-deleted",
                             &now_iso(),
@@ -17846,6 +17856,9 @@ impl WorkspaceApi for Services {
             let bytes = std::fs::read(&path)
                 .map_err(|e| Error::Internal(format!("Failed to read asset: {e}")))?;
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            // Asset sizes are far below 2^53 (loss-free in f64); the rounded
+            // KiB count fits i64, and the float→int cast saturates anyway.
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let size_kb = ((data.len() as f64) / 1024.0).round() as i64;
             let mime_type = note_ops::mime_from_extension(&asset_id);
             Ok(ReadAssetResult {
@@ -17950,7 +17963,7 @@ impl WorkspaceApi for Services {
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let new_v = capture_note_version(&store, &note, &author).await?;
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 &bus,
@@ -18037,7 +18050,7 @@ impl WorkspaceApi for Services {
             store.update_note(&note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -18130,7 +18143,7 @@ impl WorkspaceApi for Services {
                     &bus,
                     ready_tasks_changed_event(
                         &note.workspace_id,
-                        ready_task_ids,
+                        &ready_task_ids,
                         &note.id,
                         previous_status,
                         new_status,
@@ -18204,7 +18217,7 @@ impl WorkspaceApi for Services {
             store.update_note(&note).await?;
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             services
-                .schedule_line_attribution_recompute(note.workspace_id.clone(), note.id.clone());
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
                 &bus,
                 note_change_event(
@@ -18506,7 +18519,7 @@ impl WorkspaceApi for Services {
                         &services.event_bus,
                         ready_tasks_changed_event(
                             &note.workspace_id,
-                            ready_task_ids,
+                            &ready_task_ids,
                             &note.id,
                             previous,
                             new_status,
@@ -18539,7 +18552,7 @@ impl WorkspaceApi for Services {
                             &services.event_bus,
                             ready_tasks_changed_reason_event(
                                 &note.workspace_id,
-                                ready_task_ids,
+                                &ready_task_ids,
                                 &note.id,
                                 "relations-changed",
                                 &now_iso(),
@@ -18651,7 +18664,7 @@ impl WorkspaceApi for Services {
                     &services.event_bus,
                     ready_tasks_changed_reason_event(
                         &note.workspace_id,
-                        ready_task_ids,
+                        &ready_task_ids,
                         &note.id,
                         "relations-changed",
                         &now_iso(),
@@ -18840,7 +18853,7 @@ impl WorkspaceApi for Services {
                     &bus,
                     ready_tasks_changed_event(
                         &note.workspace_id,
-                        ready_task_ids,
+                        &ready_task_ids,
                         &note.id,
                         previous_status,
                         TaskStatus::InProgress,
@@ -19089,8 +19102,8 @@ impl WorkspaceApi for Services {
                     };
                     services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
-                        note.workspace_id.clone(),
-                        note.id.clone(),
+                        &note.workspace_id.clone(),
+                        &note.id.clone(),
                     );
                     // `note:updated` fires because the add rewrote the note
                     // markdown; without it clients hold a stale rev and hit
@@ -20192,7 +20205,7 @@ impl WorkspaceApi for Services {
                 .await?;
             // Notify the FE bridge so the changes view refreshes without a
             // follow-up `git.status` read (parity with `git.stage`).
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20226,7 +20239,7 @@ impl WorkspaceApi for Services {
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
                 })
                 .await?;
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20293,7 +20306,7 @@ impl WorkspaceApi for Services {
                 git_push_event(&ws.id, &outcome.branch, &outcome.pushed_sha, force),
             )
             .await;
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({
                 "branch": outcome.branch,
                 "pushedSha": outcome.pushed_sha,
@@ -20344,7 +20357,7 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             // Refresh the FE change view without a follow-up `git.status` read.
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20387,7 +20400,7 @@ impl WorkspaceApi for Services {
                 let status = intent_git::status::status(&worktree)
                     .unwrap_or_else(|_| intent_git::status::empty_status());
                 let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+                publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             }
             Ok(serde_json::json!({ "branch": branch_name }))
         })
@@ -20430,7 +20443,7 @@ impl WorkspaceApi for Services {
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({ "branch": branch_name }))
         })
     }
@@ -20493,7 +20506,7 @@ impl WorkspaceApi for Services {
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({
                 "oldBranch": old_branch_name,
                 "newBranch": trimmed_new,
@@ -20616,7 +20629,7 @@ impl WorkspaceApi for Services {
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(&event_bus, changes_git_status_event(&ws.id, status_json)).await;
+                    publish_event(&event_bus, changes_git_status_event(&ws.id, &status_json)).await;
                 }
             }
             Ok(outcome)
@@ -20894,7 +20907,7 @@ impl WorkspaceApi for Services {
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(&event_bus, changes_git_status_event(&ws.id, status_json)).await;
+                    publish_event(&event_bus, changes_git_status_event(&ws.id, &status_json)).await;
                     Ok(intent_core::GitCommitResult {
                         hash: outcome.hash,
                         files: outcome.files,
@@ -21071,7 +21084,7 @@ impl WorkspaceApi for Services {
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
+            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
                 files: outcome.files,
@@ -23085,7 +23098,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            let method = pr_ops::validate_merge_method(merge_method)?;
+            let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let outcome = sc
@@ -23765,7 +23778,7 @@ impl WorkspaceApi for Services {
             let status = engine
                 .auth_status()
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(status)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23779,13 +23792,13 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
-            let filter = linear_ops::parse_filter(filter)?;
+            let filter = linear_ops::parse_filter(filter.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = linear_ops::resolve_engine(injected).await?;
             let page = engine
                 .list_issues(filter, linear_ops::wire_limit(limit), cursor.as_deref())
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             let issues = serde_json::to_value(page.issues)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
             Ok(serde_json::json!({
@@ -23808,7 +23821,7 @@ impl WorkspaceApi for Services {
             let page = engine
                 .search_issues(&query, linear_ops::wire_limit(limit), cursor.as_deref())
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             let issues = serde_json::to_value(page.issues)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
             Ok(serde_json::json!({
@@ -23828,7 +23841,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .get_issue(&id_or_identifier)
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23838,7 +23851,10 @@ impl WorkspaceApi for Services {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             let engine = linear_ops::resolve_engine(injected).await?;
-            let user = engine.viewer().await.map_err(linear_ops::map_linear_err)?;
+            let user = engine
+                .viewer()
+                .await
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(user)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23851,7 +23867,7 @@ impl WorkspaceApi for Services {
             let teams = engine
                 .list_teams(linear_ops::wire_limit(limit))
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(teams)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23867,7 +23883,7 @@ impl WorkspaceApi for Services {
             let states = engine
                 .list_workflow_states(linear_ops::wire_limit(limit))
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(states)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23880,7 +23896,7 @@ impl WorkspaceApi for Services {
             let projects = engine
                 .list_projects(linear_ops::wire_limit(limit))
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(projects)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23893,7 +23909,7 @@ impl WorkspaceApi for Services {
             let labels = engine
                 .list_labels(linear_ops::wire_limit(limit))
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(labels)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23910,7 +23926,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .create_issue(req)
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23927,7 +23943,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .update_issue(req)
                 .await
-                .map_err(linear_ops::map_linear_err)?;
+                .map_err(|e: intent_linear::Error| linear_ops::map_linear_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23949,7 +23965,7 @@ impl WorkspaceApi for Services {
             let status = engine
                 .auth_status()
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             serde_json::to_value(status)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -23965,7 +23981,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
-            let status = sentry_ops::parse_status(status)?;
+            let status = sentry_ops::parse_status(status.as_deref())?;
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
             let request = intent_sentry::FetchIssuesRequest {
@@ -23978,7 +23994,7 @@ impl WorkspaceApi for Services {
             let page = engine
                 .list_issues(request)
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             let issues = serde_json::to_value(page.issues)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
             Ok(serde_json::json!({
@@ -24007,7 +24023,7 @@ impl WorkspaceApi for Services {
                     cursor.as_deref(),
                 )
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             let issues = serde_json::to_value(page.issues)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
             Ok(serde_json::json!({
@@ -24024,7 +24040,7 @@ impl WorkspaceApi for Services {
             let projects = engine
                 .list_projects(sentry_ops::wire_limit(limit))
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             serde_json::to_value(projects)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -24037,7 +24053,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .get_issue(&id_or_short_id)
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -24050,7 +24066,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .resolve_issue(&id)
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -24063,7 +24079,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .ignore_issue(&id)
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -24080,7 +24096,7 @@ impl WorkspaceApi for Services {
             let issue = engine
                 .assign_issue(&id, assigned_to.as_deref())
                 .await
-                .map_err(sentry_ops::map_sentry_err)?;
+                .map_err(|e: intent_sentry::Error| sentry_ops::map_sentry_err(&e))?;
             serde_json::to_value(issue)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
@@ -24638,7 +24654,7 @@ impl WorkspaceApi for Services {
                             Error::Internal(format!("browser.exec: {message}"))
                         }
                     })?;
-            browser_ops::shape_agent_result(response, requested_actions)
+            browser_ops::shape_agent_result(&response, requested_actions)
                 .map_err(|e| Error::Internal(e.message))
         })
     }
@@ -24849,7 +24865,7 @@ impl Services {
         if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
-        publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
+        publish_event(&bus, workspace_updated_event(&ws.id, &changes)).await;
         Ok(ws)
     }
 
@@ -25248,7 +25264,7 @@ impl Services {
                         ));
                         result.insert("commitHash".to_string(), serde_json::json!(hash));
                     }
-                    Err(e) => return Ok(fail_step("commit", "Commit changes", steps, result, e)),
+                    Err(e) => return Ok(fail_step("commit", "Commit changes", steps, result, &e)),
                 }
                 if push_after {
                     match self.ac_push(workspace_id, worktree, branch).await {
@@ -25262,7 +25278,9 @@ impl Services {
                             ));
                             result.insert("pushedSha".to_string(), serde_json::json!(sha));
                         }
-                        Err(e) => return Ok(fail_step("push", "Push to remote", steps, result, e)),
+                        Err(e) => {
+                            return Ok(fail_step("push", "Push to remote", steps, result, &e))
+                        }
                     }
                 }
                 if create_pr_after {
@@ -25287,7 +25305,7 @@ impl Services {
                                 "Create pull request",
                                 steps,
                                 result,
-                                e,
+                                &e,
                             ))
                         }
                     }
@@ -25304,7 +25322,7 @@ impl Services {
                     ));
                     result.insert("pushedSha".to_string(), serde_json::json!(sha));
                 }
-                Err(e) => return Ok(fail_step("push", "Push to remote", steps, result, e)),
+                Err(e) => return Ok(fail_step("push", "Push to remote", steps, result, &e)),
             },
             "create-pr" => {
                 match self
@@ -25328,7 +25346,7 @@ impl Services {
                             "Create pull request",
                             steps,
                             result,
-                            e,
+                            &e,
                         ))
                     }
                 }
@@ -25546,7 +25564,7 @@ impl Services {
         commit_title: Option<String>,
         commit_message: Option<String>,
     ) -> Result<serde_json::Value> {
-        let method = pr_ops::validate_merge_method(merge_method)?;
+        let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
@@ -25641,7 +25659,7 @@ impl Services {
         let status = accept_changes::build_git_status_value(&worktree, &ws)?;
         publish_event(
             &self.event_bus,
-            changes_git_status_event(&workspace_id, status.clone()),
+            changes_git_status_event(&workspace_id, &status.clone()),
         )
         .await;
         Ok(status)
@@ -26384,7 +26402,7 @@ impl Services {
         };
         publish_event(
             &self.event_bus,
-            changes_metrics_changed_event(workspace_id, metrics),
+            changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
 
@@ -26403,7 +26421,7 @@ impl Services {
             {
                 publish_event(
                     &self.event_bus,
-                    changes_git_status_event(workspace_id, status),
+                    changes_git_status_event(workspace_id, &status),
                 )
                 .await;
             }
@@ -26418,7 +26436,7 @@ fn fail_step(
     name: &str,
     mut steps: Vec<serde_json::Value>,
     result: serde_json::Map<String, serde_json::Value>,
-    error: Error,
+    error: &Error,
 ) -> serde_json::Value {
     let msg = error.to_string();
     steps.push(accept_changes::step(id, name, "failed", None, Some(&msg)));

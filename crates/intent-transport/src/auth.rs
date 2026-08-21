@@ -471,7 +471,7 @@ fn percent_decode(input: &str) -> String {
                 let hi = (bytes[i + 1] as char).to_digit(16);
                 let lo = (bytes[i + 2] as char).to_digit(16);
                 if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
+                    out.push(u8::try_from(hi * 16 + lo).expect("hex byte fits in u8"));
                     i += 3;
                 } else {
                     out.push(bytes[i]);

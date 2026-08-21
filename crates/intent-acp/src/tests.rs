@@ -4616,7 +4616,7 @@ mod mcp_bridge_tests {
         async fn initial_buffer_overflow_falls_back_to_retryable_error() {
             let addr = reserve_free_addr().await;
             let mut bridge = spawn_bridge(addr, fast_cfg());
-            for id in 0..(INITIAL_BUFFER_MAX_LINES as i64) {
+            for id in 0..(i64::try_from(INITIAL_BUFFER_MAX_LINES).expect("small const")) {
                 bridge.send_request(id).await;
             }
             // The line past the cap is rejected with the retryable error.
@@ -7657,7 +7657,7 @@ mod wsapi6_bindings_tests {
             Box::pin(async move {
                 if let Some(envelope) = fe_envelope {
                     return intent_services::browser_ops::shape_agent_result(
-                        envelope,
+                        &envelope,
                         actions.len(),
                     )
                     .map_err(|e| intent_core::Error::Internal(e.message));

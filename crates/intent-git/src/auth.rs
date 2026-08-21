@@ -148,6 +148,7 @@ fn github_helper_entries(entry: String, fallbacks: Option<&[String]>) -> Vec<Str
 /// (and `git clone` does not read config from a repository that happens to
 /// surround its cwd). Returns `None` when git could not be run or exited
 /// non-zero — an *unknown* list, which callers must not reset.
+#[must_use]
 pub fn discover_github_helpers(
     cwd: Option<&Path>,
     inherited_config_parameters: Option<&str>,

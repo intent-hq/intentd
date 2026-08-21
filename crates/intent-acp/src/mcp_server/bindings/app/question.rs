@@ -205,11 +205,11 @@ mod tests {
         })
     }
 
-    fn ask_args(question: Value) -> Value {
+    fn ask_args(question: &Value) -> Value {
         json!({ "question": question })
     }
 
-    fn dispatch_ok(registry: &Arc<TurnAttachmentRegistry>, question: Value) -> Value {
+    fn dispatch_ok(registry: &Arc<TurnAttachmentRegistry>, question: &Value) -> Value {
         dispatch(Some(registry), Some(&agent()), "ask", &ask_args(question))
             .expect("ask should succeed")
     }
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn ask_registers_one_at_turn_end_attachment() {
         let registry = Arc::new(TurnAttachmentRegistry::new());
-        let result = dispatch_ok(&registry, valid_question());
+        let result = dispatch_ok(&registry, &valid_question());
         assert_eq!(result["ok"], true);
         let attachment_id = result["attachmentId"].as_str().expect("attachmentId");
 
@@ -253,7 +253,7 @@ mod tests {
         let mut q = valid_question();
         q["explanation"] = json!("  longer context  ");
         q["multiSelect"] = json!(true);
-        dispatch_ok(&registry, q);
+        dispatch_ok(&registry, &q);
         let (_, payload) = queued_payload(&registry);
         assert_eq!(payload["explanation"], "longer context");
         assert_eq!(payload["multiSelect"], true);
@@ -266,7 +266,7 @@ mod tests {
         for i in 0..6 {
             let mut q = valid_question();
             q["header"] = json!(format!("Q{i}"));
-            dispatch_ok(&registry, q);
+            dispatch_ok(&registry, &q);
         }
         let drained = registry.finish_turn(&agent());
         assert_eq!(drained.len(), 6);
@@ -281,7 +281,7 @@ mod tests {
         q["options"] = json!((0..7)
             .map(|i| json!({ "label": format!("opt{i}") }))
             .collect::<Vec<_>>());
-        dispatch_ok(&registry, q);
+        dispatch_ok(&registry, &q);
         let (_, payload) = queued_payload(&registry);
         assert_eq!(payload["options"].as_array().unwrap().len(), 7);
     }
@@ -299,7 +299,7 @@ mod tests {
         for key in ["question", "header"] {
             let mut q = valid_question();
             q[key] = json!("   ");
-            let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(q)).unwrap_err();
+            let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(&q)).unwrap_err();
             assert!(
                 err.contains(&format!("`{key}` is required")),
                 "expected `{key}` error, got: {err}"
@@ -313,12 +313,12 @@ mod tests {
         let registry = Arc::new(TurnAttachmentRegistry::new());
         let mut q = valid_question();
         q.as_object_mut().unwrap().remove("options");
-        let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(q)).unwrap_err();
+        let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(&q)).unwrap_err();
         assert!(err.contains("`options` is required"));
 
         let mut q = valid_question();
         q["options"] = json!([{ "label": "Only one" }]);
-        let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(q)).unwrap_err();
+        let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(&q)).unwrap_err();
         assert!(err.contains("at least 2 options"));
         assert!(registry.finish_turn(&agent()).is_empty());
     }
@@ -328,7 +328,7 @@ mod tests {
         let registry = Arc::new(TurnAttachmentRegistry::new());
         let mut q = valid_question();
         q["options"] = json!([{ "label": "OAuth" }, { "label": "  " }]);
-        let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(q)).unwrap_err();
+        let err = dispatch(Some(&registry), Some(&agent()), "ask", &ask_args(&q)).unwrap_err();
         assert!(err.contains("`options[1].label`"));
         assert!(registry.finish_turn(&agent()).is_empty());
     }
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn ask_fails_without_registry_or_caller() {
         let registry = Arc::new(TurnAttachmentRegistry::new());
-        let args = ask_args(valid_question());
+        let args = ask_args(&valid_question());
         assert!(dispatch(None, Some(&agent()), "ask", &args).is_err());
         assert!(dispatch(Some(&registry), None, "ask", &args).is_err());
         assert!(registry.finish_turn(&agent()).is_empty());
@@ -369,7 +369,7 @@ mod tests {
             Some(&caller),
             Some(&registry),
             "question.ask",
-            &ask_args(valid_question()),
+            &ask_args(&valid_question()),
         )
         .await
         .expect("ask should succeed")
