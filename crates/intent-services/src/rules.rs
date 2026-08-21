@@ -28,8 +28,7 @@ const MAX_RULE_CONTENT_LEN: usize = 50_000;
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Wrap user-rule content for prompt injection (port of
@@ -67,8 +66,7 @@ fn file_mtime_ms(path: &Path) -> i64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Strip an optional leading YAML frontmatter block, returning the body (port of
@@ -580,7 +578,7 @@ pub(crate) async fn assemble_system_prompt(
         // effective state even when the workspace toggle is currently on. The
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
-            auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
+            auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
         parts.push(harness.suggested_next_steps_block(effective_auto_commit));
     }
     if parts.is_empty() {

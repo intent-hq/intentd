@@ -6,6 +6,7 @@
 //! (`provider-config.ts`), and `getAuggieExecPATH` (`execute-auggie-command.ts`).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::{ProviderConfig, ProviderRuntime};
@@ -404,11 +405,12 @@ fn unsloth_provider_part(ep: &UnslothEndpoint, effective_model: &str) -> String 
         json_escape(display)
     );
     if effective_model != ep.model_id {
-        models.push_str(&format!(
+        let _ = write!(
+            models,
             ",\"{}\":{{\"name\":\"{}\"}}",
             json_escape(effective_model),
             json_escape(effective_model)
-        ));
+        );
     }
     format!(
         "\"provider\":{{\"{UNSLOTH_OPENCODE_PROVIDER_ID}\":{{\"npm\":\"{UNSLOTH_NPM_PACKAGE}\",\"name\":\"{UNSLOTH_PROVIDER_NAME}\",\"options\":{{\"baseURL\":\"{}\",\"apiKey\":\"{}\"}},\"models\":{{{models}}}}}}}",
@@ -478,7 +480,7 @@ pub(crate) fn json_escape(s: &str) -> String {
             '\x0C' => out.push_str("\\f"), // form feed
             c if c.is_control() => {
                 // Escape other control characters as \uXXXX.
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             _ => out.push(c),
         }

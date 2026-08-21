@@ -8607,8 +8607,7 @@ mod wsapi4_bindings_tests {
         let v = body(&resp);
         assert!(v
             .get("subscriptionId")
-            .map(serde_json::Value::is_null)
-            .unwrap_or(true));
+            .is_none_or(serde_json::Value::is_null));
         assert!(api.watch_sender_calls.lock().unwrap().is_empty());
     }
 

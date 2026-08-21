@@ -566,9 +566,7 @@ pub fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {

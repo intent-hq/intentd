@@ -2283,9 +2283,7 @@ pub fn slim_body_size(body: &serde_json::Value) -> usize {
         serde_json::Value::String(s) => s.len(),
         other => {
             let mut sink = CountingSink(0);
-            serde_json::to_writer(&mut sink, other)
-                .map(|()| sink.0)
-                .unwrap_or(0)
+            serde_json::to_writer(&mut sink, other).map_or(0, |()| sink.0)
         }
     }
 }

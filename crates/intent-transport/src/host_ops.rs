@@ -739,9 +739,9 @@ fn has_git_marker(dir: &Path) -> bool {
     let git = dir.join(".git");
     match std::fs::metadata(&git) {
         Ok(meta) if meta.is_dir() => true,
-        Ok(meta) if meta.is_file() => std::fs::read_to_string(&git)
-            .map(|s| s.trim_start().starts_with("gitdir:"))
-            .unwrap_or(false),
+        Ok(meta) if meta.is_file() => {
+            std::fs::read_to_string(&git).is_ok_and(|s| s.trim_start().starts_with("gitdir:"))
+        }
         _ => false,
     }
 }
@@ -888,8 +888,7 @@ pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Val
         let entry_path = entry.path();
         let is_dir = entry
             .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or_else(|_| entry_path.is_dir());
+            .map_or_else(|_| entry_path.is_dir(), |t| t.is_dir());
         let is_git_repo = is_dir && has_git_marker(&entry_path);
         entries.push((name, entry_path, is_dir, is_git_repo));
     }
@@ -917,8 +916,7 @@ pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Val
     Ok(json!({
         "path": target.to_string_lossy(),
         "parent": parent
-            .map(|p| Value::String(p.to_string_lossy().into_owned()))
-            .unwrap_or(Value::Null),
+            .map_or(Value::Null, |p| Value::String(p.to_string_lossy().into_owned())),
         "home": home.to_string_lossy(),
         "entries": entries_json,
         "favorites": favorites_cached(home),

@@ -393,8 +393,7 @@ async fn enable_wss_listener(
         Some(addr) => addr.to_string(),
         None => current_bind_address(socket)
             .await
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+            .map_or_else(|| "127.0.0.1".to_string(), |a| a.to_string()),
     };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
@@ -900,10 +899,10 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |panic_info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
 
-        let location = panic_info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown location".to_string());
+        let location = panic_info.location().map_or_else(
+            || "unknown location".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
 
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             s.to_string()
@@ -2635,8 +2634,7 @@ impl SystemControl for DaemonControl {
             let clients = state
                 .ws_server
                 .as_ref()
-                .map(intent_transport::WsApiServer::client_count)
-                .unwrap_or(0);
+                .map_or(0, intent_transport::WsApiServer::client_count);
             (port, fingerprint, clients)
         } else {
             (None, None, 0)
@@ -4909,11 +4907,10 @@ async fn report_provider_availability(config: &Config) {
             .unwrap_or_default();
         // Spawn via the resolved path when available (grok's binary may live
         // outside PATH at ~/.grok/bin/grok), else the bare command.
-        let program = provider
-            .resolved_path
-            .as_ref()
-            .map(|p| p.as_os_str().to_os_string())
-            .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
+        let program = provider.resolved_path.as_ref().map_or_else(
+            || std::ffi::OsString::from(provider.command),
+            |p| p.as_os_str().to_os_string(),
+        );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
     }
@@ -4935,8 +4932,7 @@ async fn report_pi_cli_verdict() -> (bool, String) {
             let path = status
                 .resolved_path
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| status.command.clone());
+                .map_or_else(|| status.command.clone(), |p| p.display().to_string());
             let version = status.version_output.as_deref().unwrap_or("unknown");
             (true, format!(" (pi CLI {version}: {path})"))
         }

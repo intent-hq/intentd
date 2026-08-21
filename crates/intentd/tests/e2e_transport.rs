@@ -19,6 +19,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -246,7 +247,7 @@ fn upgrade_req(target: &str, origin: Option<&str>) -> String {
         "GET {target} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
     );
     if let Some(o) = origin {
-        r.push_str(&format!("Origin: {o}\r\n"));
+        let _ = write!(r, "Origin: {o}\r\n");
     }
     r.push_str("\r\n");
     r

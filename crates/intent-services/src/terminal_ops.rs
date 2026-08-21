@@ -306,7 +306,7 @@ pub(crate) fn list(
                 .as_ref()
                 .and_then(|i| i.name.as_deref())
                 .unwrap_or("Terminal");
-            let is_executing = info.as_ref().map(|i| i.alive).unwrap_or(false);
+            let is_executing = info.as_ref().is_some_and(|i| i.alive);
             let value = json!({
                 "id": id_str,
                 "name": name,
@@ -372,11 +372,7 @@ pub(crate) fn read_output(
     } else {
         lines.clone()
     };
-    while output_lines
-        .last()
-        .map(|l| l.trim().is_empty())
-        .unwrap_or(false)
-    {
+    while output_lines.last().is_some_and(|l| l.trim().is_empty()) {
         output_lines.pop();
     }
 

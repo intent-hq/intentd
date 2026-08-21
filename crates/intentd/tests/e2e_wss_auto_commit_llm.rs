@@ -515,12 +515,7 @@ async fn auto_commit_uses_generated_message_over_wss() {
     );
 
     // Print daemon logs on failure for debugging
-    if commits["items"]
-        .as_array()
-        .map(std::vec::Vec::len)
-        .unwrap_or(0)
-        < 2
-    {
+    if commits["items"].as_array().map_or(0, std::vec::Vec::len) < 2 {
         eprintln!("\n=== DAEMON LOGS (last 200 lines) ===");
         if let Ok(logs) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             let lines: Vec<&str> = logs.lines().collect();

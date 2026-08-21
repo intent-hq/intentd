@@ -84,8 +84,7 @@ async fn auggie_context_engine_real_retrieve_e2e() {
     let workspace_path = manifest_dir
         .ancestors()
         .nth(2)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| manifest_dir.clone());
+        .map_or_else(|| manifest_dir.clone(), Path::to_path_buf);
 
     // Wire a Services over a temp store with a workspace pointing at that
     // worktree, backed by the *real* auggie engine. Under Option A `retrieve()`

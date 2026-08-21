@@ -77,8 +77,7 @@ impl DiffSingleFlight {
             .lock()
             .unwrap()
             .get(key)
-            .map(|tx| tx.receiver_count())
-            .unwrap_or(0)
+            .map_or(0, |tx| tx.receiver_count())
     }
 }
 

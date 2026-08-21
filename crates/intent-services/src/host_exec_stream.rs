@@ -265,11 +265,10 @@ pub async fn start_stream(
     };
 
     let request_id = request_id.unwrap_or_else(mint_request_id);
-    let workspace_id = common
-        .workspace_id
-        .as_deref()
-        .map(WorkspaceId::from)
-        .unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+    let workspace_id = common.workspace_id.as_deref().map_or_else(
+        || WorkspaceId::from_string(String::new()),
+        WorkspaceId::from,
+    );
 
     // Spawn with piped stdin so follow-up writes reach the child.
     let mut cmd = build_command(&common, cwd_resolved.as_deref());

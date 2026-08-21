@@ -18,6 +18,7 @@
 //! `begin` and reported as a clear caller error to its own late calls.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -54,8 +55,7 @@ fn attachment_upload_idle_ttl() -> Duration {
     std::env::var("INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(ATTACHMENT_UPLOAD_IDLE_TTL)
+        .map_or(ATTACHMENT_UPLOAD_IDLE_TTL, Duration::from_millis)
 }
 
 /// One in-flight staged attachment upload: everything `chunk`/`commit`/
@@ -643,11 +643,10 @@ fn assemble_and_verify(
              still be being written; wait for the chunk call to return, then retry the commit"
         )));
     }
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let actual: String = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     if actual != declared_sha256 {
         return Err(Error::InvalidParams(format!(
             "attachment checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
@@ -658,6 +657,7 @@ fn assemble_and_verify(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
 
     use base64::Engine as _;
@@ -688,8 +688,10 @@ mod tests {
     fn sha256_hex(bytes: &[u8]) -> String {
         sha2::Sha256::digest(bytes)
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+            .fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 
     /// One in-process service stack with a seeded workspace whose checkout

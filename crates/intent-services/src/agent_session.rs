@@ -94,8 +94,7 @@ fn wake_resume_self_heal_debounce() -> Duration {
     std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+        .map_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE, Duration::from_millis)
 }
 
 /// Query surface the turn driver uses to decide whether a failed turn's active

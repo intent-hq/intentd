@@ -223,7 +223,7 @@ pub(crate) fn is_placeholder_model(model: Option<&str>) -> bool {
     let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) else {
         return true;
     };
-    let bare = m.split_once(':').map(|(_, b)| b).unwrap_or(m).trim();
+    let bare = m.split_once(':').map_or(m, |(_, b)| b).trim();
     bare.is_empty() || bare.eq_ignore_ascii_case("default")
 }
 
@@ -254,8 +254,7 @@ pub(crate) fn stats_model_key(
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+        .map_or_else(|| UNKNOWN_MODEL.to_string(), str::to_ascii_lowercase)
 }
 
 /// The `usage_stats_hourly` provider key for a session: the resolved provider
@@ -267,8 +266,7 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| UNKNOWN_PROVIDER.to_string())
+        .map_or_else(|| UNKNOWN_PROVIDER.to_string(), str::to_ascii_lowercase)
 }
 
 /// Record one agent-session start (D2: *sessions* = agent sessions) into the

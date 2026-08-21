@@ -91,8 +91,8 @@ struct CacheEntry {
 }
 
 /// Global discovery cache keyed by normalized workspace path
-static DISCOVERY_CACHE: once_cell::sync::Lazy<Mutex<HashMap<String, CacheEntry>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static DISCOVERY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Public API: discover skills for a workspace
 pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
@@ -688,8 +688,7 @@ async fn get_path_fingerprint(path: &Path) -> PathFingerprint {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_millis());
             PathFingerprint {
                 path: path.to_path_buf(),
                 exists: true,

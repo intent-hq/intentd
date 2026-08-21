@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -43,8 +44,10 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
@@ -300,10 +303,10 @@ fn upgrade_req(target: &str, origin: Option<&str>, bearer: Option<&str>) -> Stri
         "GET {target} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
     );
     if let Some(o) = origin {
-        r.push_str(&format!("Origin: {o}\r\n"));
+        let _ = write!(r, "Origin: {o}\r\n");
     }
     if let Some(b) = bearer {
-        r.push_str(&format!("Authorization: Bearer {b}\r\n"));
+        let _ = write!(r, "Authorization: Bearer {b}\r\n");
     }
     r.push_str("\r\n");
     r
@@ -3949,11 +3952,7 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
-    let calls = || {
-        std::fs::read_to_string(&count)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    };
+    let calls = || std::fs::read_to_string(&count).map_or(0, |s| s.lines().count());
 
     // Cold read: the probe runs (and fails) → empty static fallback, legacy
     // shape.
@@ -4014,11 +4013,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
     )
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let calls = || {
-        std::fs::read_to_string(&count)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    };
+    let calls = || std::fs::read_to_string(&count).map_or(0, |s| s.lines().count());
     let last_good = serde_json::json!({
         "version": 2,
         "entries": {
@@ -4506,8 +4501,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let spawned_count = || -> usize {
         std::fs::read_to_string(&spawn_log)
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0)
+            .map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
     };
     let spawned = |what: &str| -> usize {
         let n = spawned_count();
@@ -7531,8 +7525,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
     {
         let init_path =
             std::env::temp_dir().join(format!("itd-init-{}", uuid::Uuid::new_v4().simple()));
@@ -10198,8 +10191,7 @@ async fn wss_workspace_import_commit_materializes_git() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| !s.success())
-        .unwrap_or(true)
+        .map_or(true, |s| !s.success())
     {
         eprintln!("skipping WSS git import E2E: git not available");
         return;
@@ -10226,8 +10218,7 @@ async fn wss_workspace_import_commit_materializes_git() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                .is_ok_and(|s| s.success());
             assert!(ok, "git {args:?}");
         };
         git(&["init", "--quiet", "-b", "main"]);

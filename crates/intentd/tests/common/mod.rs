@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 #[cfg(unix)]
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -374,9 +375,7 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
-        "\n[server.wsApi]\nenabled = true\nport = {port}\n"
-    ));
+    let _ = write!(text, "\n[server.wsApi]\nenabled = true\nport = {port}\n");
     std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
 }
 

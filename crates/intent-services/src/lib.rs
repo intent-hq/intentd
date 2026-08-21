@@ -1016,8 +1016,7 @@ impl Services {
     pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
         self.hook_clock_skew
             .as_ref()
-            .map(|s| s.load(std::sync::atomic::Ordering::SeqCst))
-            .unwrap_or(0)
+            .map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// The shared turn-attachment registry (§7.1 deterministic attach) — the
@@ -1785,8 +1784,7 @@ impl Services {
         if let Ok(mut map) = self.last_activity_debouncers.lock() {
             let should_insert = map
                 .get(&workspace_id)
-                .map(|(existing_gen, _)| gen > *existing_gen)
-                .unwrap_or(true);
+                .is_none_or(|(existing_gen, _)| gen > *existing_gen);
 
             if should_insert {
                 if let Some((_, old_handle)) =
@@ -2199,10 +2197,7 @@ impl Services {
         };
         // A never-provisioned directory can never yield a value, so don't
         // arm a walk (it would fail and leave `refreshing` forever-true).
-        let is_dir = tokio::fs::metadata(&dir)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+        let is_dir = tokio::fs::metadata(&dir).await.is_ok_and(|m| m.is_dir());
         if !is_dir {
             return Ok(serde_json::json!({ "refreshing": false }));
         }
@@ -2335,8 +2330,7 @@ impl Services {
             let should_emit = {
                 let gen_valid = if let Ok(map) = debouncers.lock() {
                     map.get(&ws_id)
-                        .map(|(current_gen, _)| *current_gen == gen)
-                        .unwrap_or(false)
+                        .is_some_and(|(current_gen, _)| *current_gen == gen)
                 } else {
                     false
                 };
@@ -2382,8 +2376,7 @@ impl Services {
         if let Ok(mut map) = self.idle_debouncers.lock() {
             let should_insert = map
                 .get(&workspace_id)
-                .map(|(existing_gen, _)| gen > *existing_gen)
-                .unwrap_or(true);
+                .is_none_or(|(existing_gen, _)| gen > *existing_gen);
 
             if should_insert {
                 if let Some((_, old_handle)) =
@@ -3981,8 +3974,7 @@ impl Services {
             .lock()
             .expect("agent failure streak registry poisoned")
             .get(agent_id)
-            .map(|(_, n)| *n)
-            .unwrap_or(0)
+            .map_or(0, |(_, n)| *n)
     }
 
     /// Whether `session` is provably poisoned (monorepo#840): parked in
@@ -6456,7 +6448,7 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
         let ms =
             parse_iso(c).and_then(|dt| i64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok());
         if let Some(ms) = ms {
-            if best.as_ref().map(|(b, _)| ms > *b).unwrap_or(true) {
+            if best.as_ref().is_none_or(|(b, _)| ms > *b) {
                 best = Some((ms, c.to_string()));
             }
         }
@@ -6592,10 +6584,7 @@ impl Services {
             }
             if let Ok(mut map) = services.line_attribution_debouncers.lock() {
                 let existing = map.get(&(ws.clone(), nid.clone()));
-                if existing
-                    .map(tokio::task::AbortHandle::is_finished)
-                    .unwrap_or(false)
-                {
+                if existing.is_some_and(tokio::task::AbortHandle::is_finished) {
                     map.remove(&(ws, nid));
                 }
             }
@@ -7456,8 +7445,7 @@ fn checkout_parent_is_workspace_dir(checkout: &str, workspace_id: &WorkspaceId) 
     Path::new(checkout)
         .parent()
         .and_then(Path::file_name)
-        .map(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
-        .unwrap_or(false)
+        .is_some_and(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
 }
 
 /// Derive a repository display name from a local `repositoryPath` basename,
@@ -7522,8 +7510,7 @@ fn workspace_dir_candidates(
         .filter(|parent| {
             parent
                 .file_name()
-                .map(|n| n == std::ffi::OsStr::new(id.as_str()))
-                .unwrap_or(false)
+                .is_some_and(|n| n == std::ffi::OsStr::new(id.as_str()))
         })
     {
         dirs.push(parent.to_path_buf());
@@ -7553,8 +7540,7 @@ fn default_workspaces_root() -> PathBuf {
     }
     assert_hermetic_root_absent();
     std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("intent")
         .join("workspaces")
 }
@@ -7573,8 +7559,7 @@ pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     }
     Some(
         std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, PathBuf::from)
             .join("intent")
             .join("workspaces"),
     )
@@ -7764,8 +7749,7 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
         match e.file_type() {
             Ok(t) if t.is_dir() => true,
             Ok(t) if t.is_file() => std::fs::read_to_string(e.path())
-                .map(|s| s.trim_start().starts_with("gitdir:"))
-                .unwrap_or(false),
+                .is_ok_and(|s| s.trim_start().starts_with("gitdir:")),
             _ => false,
         }
     });
@@ -8626,22 +8610,18 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     flattened
         .into_iter()
         .filter(|n| {
-            all_children
-                .get(n.id.as_str())
-                .map(|kids| {
-                    kids.iter().all(|c| {
-                        c.metadata
-                            .task
-                            .as_ref()
-                            .map(|t| t.status == TaskStatus::Complete)
-                            .unwrap_or(true)
-                    })
+            all_children.get(n.id.as_str()).is_none_or(|kids| {
+                kids.iter().all(|c| {
+                    c.metadata
+                        .task
+                        .as_ref()
+                        .is_none_or(|t| t.status == TaskStatus::Complete)
                 })
-                .unwrap_or(true)
-                && n.metadata
-                    .task
-                    .as_ref()
-                    .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
+            }) && n
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
         })
         .map(|n| n.id.0.clone())
         .collect()
@@ -8804,12 +8784,7 @@ fn bounded_needle_snippet(s: &str) -> String {
     // more than EDGE chars.
     let head_end = s.char_indices().nth(EDGE).map(|(i, _)| i);
     // Byte offset of the EDGE-th char from the end.
-    let tail_start = s
-        .char_indices()
-        .rev()
-        .nth(EDGE - 1)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+    let tail_start = s.char_indices().rev().nth(EDGE - 1).map_or(0, |(i, _)| i);
     match head_end {
         Some(head_end) if head_end < tail_start => {
             format!("{}…{}", &s[..head_end], &s[tail_start..])
@@ -9804,8 +9779,7 @@ async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Opti
         ws.worktree_path
             .as_deref()
             .and_then(|p| std::fs::canonicalize(p).ok())
-            .map(|p| p == canon_target)
-            .unwrap_or(false)
+            .is_some_and(|p| p == canon_target)
     })
 }
 
@@ -13304,8 +13278,7 @@ impl WorkspaceApi for Services {
                             if target.as_os_str().is_empty()
                                 || target
                                     .file_name()
-                                    .map(std::ffi::OsStr::is_empty)
-                                    .unwrap_or(true)
+                                    .is_none_or(std::ffi::OsStr::is_empty)
                             {
                                 return Err(Error::CloneFailed {
                                     category: intent_core::CloneErrorCategory::PathInvalid,
@@ -15332,8 +15305,7 @@ impl WorkspaceApi for Services {
                     // worktree path (the old worktree is now orphaned).
                     let skip_worktree = recreated
                         .as_ref()
-                        .map(|r| r.worktree_path == ws_cleanup.worktree_path)
-                        .unwrap_or(false);
+                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
                     if !skip_worktree {
                         let repo_dir = ws_cleanup
                             .repository_path
@@ -16671,8 +16643,7 @@ impl WorkspaceApi for Services {
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_millis() as u64);
                     return Ok(SetupScript {
                         script: script_str,
                         project_type: None,
@@ -18166,8 +18137,7 @@ impl WorkspaceApi for Services {
                         .metadata
                         .task
                         .as_ref()
-                        .map(|t| status_word(t.status))
-                        .unwrap_or("unknown")
+                        .map_or("unknown", |t| status_word(t.status))
                         .to_string(),
                 })
                 .collect();
@@ -19846,18 +19816,18 @@ impl WorkspaceApi for Services {
                     Ok(content) => {
                         // Strip `gitdir:` prefix (tolerant of varied whitespace), quotes, and trim.
                         let trimmed = content.trim();
-                        let gitdir = trimmed
-                            .strip_prefix("gitdir:")
-                            .map(str::trim)
-                            .map(|s| {
-                                // If quoted, strip the quotes.
-                                if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
-                                    &s[1..s.len() - 1]
-                                } else {
-                                    s
-                                }
-                            })
-                            .unwrap_or(trimmed);
+                        let gitdir =
+                            trimmed
+                                .strip_prefix("gitdir:")
+                                .map(str::trim)
+                                .map_or(trimmed, |s| {
+                                    // If quoted, strip the quotes.
+                                    if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                                        &s[1..s.len() - 1]
+                                    } else {
+                                        s
+                                    }
+                                });
                         // Resolve relative gitdir paths against the worktree directory.
                         let gitdir_path = if std::path::Path::new(gitdir).is_relative() {
                             path.join(gitdir)
@@ -21083,7 +21053,7 @@ impl WorkspaceApi for Services {
                         // so host.status never runs (seen as bulk permit held
                         // 5-40s with "nothing else" making progress).
                         let started = std::time::Instant::now();
-                        let path_count = paths.as_ref().map(std::vec::Vec::len).unwrap_or(0);
+                        let path_count = paths.as_ref().map_or(0, std::vec::Vec::len);
                         let walk_worktree = worktree.clone();
                         let walk_paths = paths.clone();
                         let walk_commit = commit_hash.clone();
@@ -23419,11 +23389,7 @@ impl WorkspaceApi for Services {
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
             let is_configured = match pr_ops::resolve_source_control(injected).await {
-                Ok(sc) => sc
-                    .check_auth()
-                    .await
-                    .map(|s| s.authenticated)
-                    .unwrap_or(false),
+                Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
                 Err(_) => false,
             };
             let slot = state.lock().await;
@@ -25692,9 +25658,7 @@ impl Services {
             ));
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         if has_remote {
             let token = self.ac_git_token(worktree).await;
             let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
@@ -25769,9 +25733,7 @@ impl Services {
             ));
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         let trunk_ref = if has_remote {
             format!("origin/{trunk}")
         } else {
@@ -25784,8 +25746,7 @@ impl Services {
 
         let has_conflicts =
             intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
-                .map(|m| m.has_conflicts)
-                .unwrap_or(false);
+                .is_ok_and(|m| m.has_conflicts);
         if has_conflicts {
             return Err(ac_step_failure(
                 steps.clone(),
@@ -25894,9 +25855,7 @@ impl Services {
             }
         }
 
-        let has_remote = intent_git::remote::origin_url(worktree)
-            .map(|u| u.is_some())
-            .unwrap_or(false);
+        let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         let token = if has_remote {
             self.ac_git_token(worktree).await
         } else {
@@ -26016,8 +25975,7 @@ impl Services {
         if !can_fast_forward {
             let fresh_conflicts =
                 intent_git::conflicts::detect_merge_conflicts(worktree, branch, &trunk_ref)
-                    .map(|m| m.has_conflicts)
-                    .unwrap_or(false);
+                    .is_ok_and(|m| m.has_conflicts);
             if fresh_conflicts {
                 return Err(ac_step_failure(
                     steps.clone(),
@@ -26443,8 +26401,8 @@ async fn record_agent_file_mutation(
         commit_hash: None,
         old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
         new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-        additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-        deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+        additions: summary.as_ref().map_or(0, |s| s.additions),
+        deletions: summary.as_ref().map_or(0, |s| s.deletions),
     };
     let (lines_added, lines_deleted) = match crate::file_tracking::track_change(store, change).await
     {

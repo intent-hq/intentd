@@ -393,8 +393,7 @@ fn build_bundle(
             sb_repo
                 .head()
                 .ok()
-                .map(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
-                .unwrap_or(false)
+                .is_some_and(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
         };
         // The WIP commit lands on HEAD's branch while the bundler fetches
         // `sb.branch` — so only snapshot when HEAD is on `sb.branch`;

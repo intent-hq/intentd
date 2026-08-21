@@ -800,11 +800,8 @@ fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
 
 /// Derive a repository slug from the workspace (repository name, sanitized).
 fn repo_slug_from_workspace(workspace: &Workspace) -> String {
-    workspace
-        .repository_name
-        .as_ref()
-        .map(|n| slugify(n))
-        .unwrap_or_else(|| {
+    workspace.repository_name.as_ref().map_or_else(
+        || {
             workspace
                 .repository_path
                 .as_ref()
@@ -814,7 +811,9 @@ fn repo_slug_from_workspace(workspace: &Workspace) -> String {
                         .map(|n| n.to_string_lossy().to_string())
                 })
                 .unwrap_or_else(|| "repo".to_string())
-        })
+        },
+        |n| slugify(n),
+    )
 }
 
 /// Simple slugification: lowercase, replace non-alphanumeric with hyphens.

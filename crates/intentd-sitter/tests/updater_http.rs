@@ -2,6 +2,7 @@
 //! server (127.0.0.1 only — no real network access).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -71,8 +72,10 @@ fn make_tar_xz(bin_contents: &[u8]) -> Vec<u8> {
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Schema-v1 manifest with a single platform entry for this build's triple.

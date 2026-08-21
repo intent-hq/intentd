@@ -854,9 +854,8 @@ async fn workspace_duplicate_provisions_worktree_over_wss() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut settled = false;
     while tokio::time::Instant::now() < deadline {
-        let busy = std::fs::read_dir(&dup_dir)
-            .map(|entries| entries.flatten().next().is_some())
-            .unwrap_or(false);
+        let busy =
+            std::fs::read_dir(&dup_dir).is_ok_and(|entries| entries.flatten().next().is_some());
         if !busy {
             settled = true;
             break;

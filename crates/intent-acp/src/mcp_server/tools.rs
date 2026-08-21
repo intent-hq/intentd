@@ -1071,8 +1071,7 @@ mod tests {
         all_namespaces()
             .iter()
             .find(|(ns, _)| *ns == namespace)
-            .map(|(_, src)| *src)
-            .unwrap_or("")
+            .map_or("", |(_, src)| *src)
     }
 
     // Methods whose dispatch arm exists solely to surface a
@@ -1368,10 +1367,7 @@ mod tests {
                     .find("Namespaces")
                     .unwrap_or_else(|| panic!("chief={is_chief} {label}: no Namespaces index"));
                 // The index block ends at the first blank line after its header.
-                let end = desc[start..]
-                    .find("\n\n")
-                    .map(|i| start + i)
-                    .unwrap_or(desc.len());
+                let end = desc[start..].find("\n\n").map_or(desc.len(), |i| start + i);
                 assert!(
                     end <= BUDGET,
                     "chief={is_chief} {label}: description prefix through the end of the \

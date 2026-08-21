@@ -322,10 +322,10 @@ impl SpawnedAgent {
 /// Spawn the provider and wire up its [`Connection`] (§6.2 + §6.3).
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let mut cmd = build_command(opts);
-    let command_name = opts
-        .provider_binary
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| opts.provider.command.to_string());
+    let command_name = opts.provider_binary.map_or_else(
+        || opts.provider.command.to_string(),
+        |p| p.display().to_string(),
+    );
     let mut child = cmd
         .spawn()
         .map_err(|e| AcpError::Spawn(format!("{command_name}: {e}")))?;

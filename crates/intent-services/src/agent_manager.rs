@@ -115,8 +115,7 @@ fn dequeue_wait_annotation_min_ms() -> i128 {
     std::env::var("INTENTD_DEQUEUE_WAIT_MIN_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(i128::from)
-        .unwrap_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS)
+        .map_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS, i128::from)
 }
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
@@ -576,8 +575,7 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Async callback that tears down one process when the registry evicts/reaps it
@@ -832,8 +830,8 @@ impl BusEventSink {
             commit_hash: None,
             old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
             new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-            additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-            deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+            additions: summary.as_ref().map_or(0, |s| s.additions),
+            deletions: summary.as_ref().map_or(0, |s| s.deletions),
         };
         let attributed_agent = change.agent_id.clone();
         let (lines_added, lines_deleted) =
@@ -1381,8 +1379,7 @@ impl ProcessRegistry {
             .unwrap()
             .entries
             .get(agent_id)
-            .map(|e| e.is_active)
-            .unwrap_or(false)
+            .is_some_and(|e| e.is_active)
     }
 
     /// Evict idle processes in LRU order (the idle-reap hook; full
@@ -3526,9 +3523,9 @@ impl AgentManager {
         // appends trail it (the `model_changed` system notice lands after the
         // user row and before this render); with no user row fall back to
         // dropping the last message.
-        let prior = match messages.iter().rposition(|m| m.role == "user") {
+        let prior: &[_] = match messages.iter().rposition(|m| m.role == "user") {
             Some(idx) => &messages[..idx],
-            None => messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]),
+            None => messages.split_last().map_or(&[], |(_, rest)| rest),
         };
         if prior.is_empty() {
             return content.to_string();
@@ -4163,8 +4160,7 @@ impl AgentManager {
         let had_output = self
             .services
             .live_turn(agent_id)
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|live| !live.blocks.is_empty());
         let redelivery = if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
             self.derive_stop_redelivery(agent_id, None).await
         } else {
@@ -5774,8 +5770,7 @@ impl AgentManager {
         let has_output = self
             .services
             .live_turn(agent_id)
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|live| !live.blocks.is_empty());
 
         // Sender attribution for the interrupted row / `stream:end` payload:
         // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
@@ -7908,7 +7903,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
     spawn_opts.npx_fallback_package = opts.npx_fallback_package;
     spawn_opts.extra_env = opts.extra_env.clone();
-    spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
+    spawn_opts.tools_to_remove.clone_from(&opts.tools_to_remove);
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;

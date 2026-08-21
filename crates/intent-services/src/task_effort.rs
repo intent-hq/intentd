@@ -131,7 +131,7 @@ pub(crate) fn parse_effort_minutes(raw: &str) -> Option<u64> {
         if let Some((left, right)) = s.split_once(separator) {
             let range = side_minutes(right, None).and_then(|(right_minutes, right_unit)| {
                 let (left_minutes, _) = side_minutes(left, right_unit)?;
-                to_minutes((left_minutes + right_minutes) / 2.0)
+                to_minutes(f64::midpoint(left_minutes, right_minutes))
             });
             if range.is_some() {
                 return range;

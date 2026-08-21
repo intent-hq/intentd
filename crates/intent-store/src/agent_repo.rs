@@ -1915,15 +1915,14 @@ impl Store {
                 return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
             }
             let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
-                .map(|r| {
+                .map_or((None, None), |r| {
                     (
                         r.get::<Option<String>, _>("token_usage")
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         r.get::<Option<String>, _>("token_usage_baseline")
                             .and_then(|s| serde_json::from_str(&s).ok()),
                     )
-                })
-                .unwrap_or((None, None));
+                });
             let folded = match (&baseline, &snapshot) {
                 (None, None) => None,
                 (b, s) => {

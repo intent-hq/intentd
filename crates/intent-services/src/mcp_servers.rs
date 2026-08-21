@@ -57,8 +57,7 @@ const REAP_POLL: Duration = Duration::from_millis(25);
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Build a wire `McpServerStatus` (§5.22), omitting absent optional fields.
@@ -134,8 +133,10 @@ fn normalize_config(mut config: Value, forced_id: Option<&str>) -> Result<Value>
             .get("id")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| format!("srv-{}", &Uuid::new_v4().simple().to_string()[..8])),
+            .map_or_else(
+                || format!("srv-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                String::from,
+            ),
     };
     obj.insert("id".into(), json!(id));
     let transport = obj
@@ -150,15 +151,14 @@ fn normalize_config(mut config: Value, forced_id: Option<&str>) -> Result<Value>
     }
     obj.insert("transport".into(), json!(transport.clone()));
     validate_transport_fields(obj, &transport)?;
-    if !obj
+    if obj
         .get("name")
         .and_then(Value::as_str)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+        .is_none_or(str::is_empty)
     {
         obj.insert("name".into(), json!(id));
     }
-    if !obj.get("enabled").map(Value::is_boolean).unwrap_or(false) {
+    if !obj.get("enabled").is_some_and(Value::is_boolean) {
         obj.insert("enabled".into(), json!(false));
     }
     Ok(config)
@@ -170,8 +170,7 @@ fn validate_transport_fields(obj: &Map<String, Value>, transport: &str) -> Resul
         let has_cmd = obj
             .get("command")
             .and_then(Value::as_str)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|s| !s.is_empty());
         if !has_cmd {
             return Err(Error::InvalidParams(
                 "stdio server requires a non-empty command".to_string(),
@@ -181,8 +180,7 @@ fn validate_transport_fields(obj: &Map<String, Value>, transport: &str) -> Resul
         let has_url = obj
             .get("url")
             .and_then(Value::as_str)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|s| !s.is_empty());
         if !has_url {
             return Err(Error::InvalidParams(format!(
                 "{transport} server requires a url"
@@ -324,8 +322,7 @@ impl McpHub {
             .lock()
             .unwrap()
             .get(id)
-            .map(|rs| rs.status.clone())
-            .unwrap_or_else(|| status_stopped(id))
+            .map_or_else(|| status_stopped(id), |rs| rs.status.clone())
     }
 
     /// Remove + reap `id` without emitting a `stopped` event (used before a

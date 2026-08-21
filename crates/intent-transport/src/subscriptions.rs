@@ -767,8 +767,7 @@ fn rebudget_merged_page(obj: &mut Map<String, Value>) {
     if let Some(b) = boundary {
         obj.insert("truncated".to_string(), Value::Bool(true));
         let token = intent_services::pagination::remint_backward_token(b as usize)
-            .map(Value::String)
-            .unwrap_or(Value::Null);
+            .map_or(Value::Null, Value::String);
         obj.insert("nextToken".to_string(), token);
     }
 }
@@ -1343,7 +1342,7 @@ impl ChatDeltaState {
             .map(|(id, block)| {
                 let block = match block.get("type").and_then(Value::as_str) {
                     Some(t) if block.get("text").is_none() && (t == "text" || t == "thinking") => {
-                        let text = self.text_acc.get(id).map(String::as_str).unwrap_or("");
+                        let text = self.text_acc.get(id).map_or("", String::as_str);
                         json!({ "type": t, "id": id, "text": text })
                     }
                     _ => block.clone(),
@@ -1695,8 +1694,7 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         .data
         .get("workspaceId")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| event.workspace_id.as_str().to_string());
+        .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string);
     match event.event_type.as_str() {
         WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id] })),
         WORKSPACE_CREATED => {

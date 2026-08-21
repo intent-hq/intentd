@@ -1314,7 +1314,7 @@ impl ScriptManager {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
-        spec.cwd = cwd.clone();
+        spec.cwd.clone_from(cwd);
         spec.env = spawn_env_overlay(def.env.as_ref());
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;

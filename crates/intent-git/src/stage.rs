@@ -280,8 +280,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
     let p = Path::new(raw);
     if p.is_absolute() {
         p.strip_prefix(workdir)
-            .map(drop_curdir)
-            .unwrap_or_else(|_| drop_curdir(p))
+            .map_or_else(|_| drop_curdir(p), drop_curdir)
     } else {
         drop_curdir(p)
     }

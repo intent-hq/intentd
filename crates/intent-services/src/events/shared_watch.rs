@@ -256,8 +256,7 @@ impl SharedWatchHub {
         };
         let group_key = root
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.clone());
+            .map_or_else(|| root.clone(), Path::to_path_buf);
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut state = match self.state.lock() {

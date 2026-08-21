@@ -353,7 +353,7 @@ pub(crate) fn build_issue_filter(filter: IssueFilter) -> Value {
 /// authenticated; `login` prefers `name`, falling back to `email`.
 pub(crate) fn map_auth_status(data: &Value) -> AuthStatus {
     let viewer = data.get("viewer");
-    let authenticated = viewer.map(|v| !v.is_null()).unwrap_or(false);
+    let authenticated = viewer.is_some_and(|v| !v.is_null());
     let login = viewer.and_then(|v| str_field(v, "name").or_else(|| str_field(v, "email")));
     AuthStatus {
         authenticated,

@@ -8,6 +8,7 @@
 //! `errors` mapped onto [`Error::Api`]), so [`graphql_data`] only guards
 //! against a `null` payload.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -344,7 +345,7 @@ pub(crate) fn build_issue_search_query(
 ) -> String {
     let mut q = format!("is:issue repo:{}/{}", repo.owner, repo.name);
     if matches!(state, "open" | "closed") {
-        q.push_str(&format!(" state:{state}"));
+        let _ = write!(q, " state:{state}");
     }
     for label in labels
         .unwrap_or_default()
@@ -352,7 +353,7 @@ pub(crate) fn build_issue_search_query(
         .map(str::trim)
         .filter(|l| !l.is_empty())
     {
-        q.push_str(&format!(" label:\"{}\"", label.replace('"', "")));
+        let _ = write!(q, " label:\"{}\"", label.replace('"', ""));
     }
     let text = sanitize_search_text(search);
     if !text.is_empty() {
@@ -519,7 +520,9 @@ fn encode_path_segments(path: &str) -> String {
             b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 out.push(byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out

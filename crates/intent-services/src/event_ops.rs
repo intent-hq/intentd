@@ -99,7 +99,7 @@ pub(crate) fn aggregate_agent_activity(events: &[Event]) -> Vec<AgentActivity> {
             }
         });
         entry.event_count += 1;
-        entry.last_active = ev.timestamp.clone();
+        entry.last_active.clone_from(&ev.timestamp);
         if ev.event_type == AGENT_TOOL_CALL {
             entry.tool_calls += 1;
             if let Some(files) = ev.data.get("filesModified").and_then(Value::as_array) {

@@ -56,8 +56,7 @@ pub fn is_valid_proposal(value: &Value) -> bool {
         let kind_valid = obj
             .get("kind")
             .and_then(Value::as_str)
-            .map(|k| PROPOSAL_KINDS.contains(&k))
-            .unwrap_or(false);
+            .is_some_and(|k| PROPOSAL_KINDS.contains(&k));
 
         // Check preview exists and has title
         let preview_valid = obj
@@ -65,8 +64,7 @@ pub fn is_valid_proposal(value: &Value) -> bool {
             .and_then(Value::as_object)
             .and_then(|p| p.get("title"))
             .and_then(Value::as_str)
-            .map(|t| !t.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|t| !t.is_empty());
 
         // Check payload exists and is an object
         let payload_valid = obj.get("payload").and_then(Value::as_object).is_some();

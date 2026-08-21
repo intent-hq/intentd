@@ -131,7 +131,7 @@ impl SharedPrSnapshot {
             head_sha: self.head_sha.clone(),
             conversation_count: self
                 .conversation_count
-                .unwrap_or_else(|| previous.map(|p| p.conversation_count).unwrap_or(0)),
+                .unwrap_or_else(|| previous.map_or(0, |p| p.conversation_count)),
             review_comment_count: self.review_comment_count,
             requirements: self.requirements.clone(),
         }
@@ -322,16 +322,19 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
         _ if m.state == PrMonitorState::Completed => PullRequestStatus::Closed,
         _ => PullRequestStatus::Open,
     };
-    let url = snapshot.as_ref().map(|s| s.url.clone()).unwrap_or_else(|| {
-        format!(
-            "https://github.com/{}/{}/pull/{}",
-            m.repo_owner, m.repo_name, m.pr_number
-        )
-    });
-    let title = snapshot
-        .as_ref()
-        .map(|s| s.title.clone())
-        .unwrap_or_else(|| format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number));
+    let url = snapshot.as_ref().map_or_else(
+        || {
+            format!(
+                "https://github.com/{}/{}/pull/{}",
+                m.repo_owner, m.repo_name, m.pr_number
+            )
+        },
+        |s| s.url.clone(),
+    );
+    let title = snapshot.as_ref().map_or_else(
+        || format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number),
+        |s| s.title.clone(),
+    );
     PullRequestInfo {
         id: m.pr_number.to_string(),
         number: m.pr_number as u64,
@@ -1116,8 +1119,7 @@ impl Services {
         // the EMIT baseline instead, so the two diffs serve distinct roles.
         let poll_activity = previous
             .as_ref()
-            .map(|prev| !diff_snapshots(prev, &fresh).is_empty())
-            .unwrap_or(false);
+            .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -1360,8 +1362,10 @@ impl Services {
             .baseline_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
-            .map(|base| diff_snapshots(&base, snapshot))
-            .unwrap_or_else(|| monitor.pending_changes.clone());
+            .map_or_else(
+                || monitor.pending_changes.clone(),
+                |base| diff_snapshots(&base, snapshot),
+            );
         let message = render_terminal_wake(monitor, &changes, snapshot);
         let now = now_iso();
         if !self

@@ -489,10 +489,10 @@ pub(crate) async fn process_frame(
     // unknown/invalid frames use a null id), so a panic in `handle_message`
     // (which owns the -32700 reply) still yields a response instead of
     // silently hanging the client.
-    let (rpc_id, method) = parsed
-        .as_ref()
-        .map(panic_guard::request_identity)
-        .unwrap_or_else(|| (Some(Value::Null), String::new()));
+    let (rpc_id, method) = parsed.as_ref().map_or_else(
+        || (Some(Value::Null), String::new()),
+        panic_guard::request_identity,
+    );
     // A frame that fails parse/envelope validation never reaches a service:
     // `handle_message` answers it with `-32700`/`-32600` immediately. Gating it
     // on the limiter would mask those codes behind `-32011` (and would silently
@@ -907,8 +907,7 @@ async fn handle_sub_fast_path(
                         api.clone(),
                         channel,
                         workspace_id
-                            .map(WorkspaceId::from)
-                            .unwrap_or_else(|| WorkspaceId::from(String::new())),
+                            .map_or_else(|| WorkspaceId::from(String::new()), WorkspaceId::from),
                         note_id.map(NoteId::from),
                         subscription,
                         subscription_id.clone(),

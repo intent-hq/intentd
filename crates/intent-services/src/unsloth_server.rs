@@ -2142,9 +2142,7 @@ mod tests {
             let config = GENERATED_CONFIG_FIXTURE
                 .replace("127.0.0.1:8888", &format!("127.0.0.1:{port}"))
                 .replace('\'', "");
-            let run = run_behavior
-                .map(str::to_string)
-                .unwrap_or_else(|| "sleep 300".to_string());
+            let run = run_behavior.map_or_else(|| "sleep 300".to_string(), str::to_string);
             let script = format!(
                 "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) {run} ;;\n  start) mkdir -p '{cfg}' && cat > '{cfg}/opencode.json' <<'EOF'\n{config}\nEOF\n  ;;\nesac\n",
                 log = log.display(),

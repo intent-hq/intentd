@@ -12762,8 +12762,7 @@ async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> St
         .expect("contentBlocks array")
         .iter()
         .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(str::to_owned))
-        .collect::<Vec<_>>()
-        .join("")
+        .collect::<String>()
 }
 
 /// Explicit `agentInstructions` become the child's first message.

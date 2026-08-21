@@ -72,8 +72,7 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
     let end = token
         .and_then(decode_token)
         .and_then(|v| v.get("b").and_then(Value::as_u64))
-        .map(|b| (b as usize).min(len))
-        .unwrap_or(len);
+        .map_or(len, |b| (b as usize).min(len));
     let start = end.saturating_sub(limit);
     let next_token = if start > 0 {
         Some(encode_token(&json!({ "b": start })))
@@ -271,9 +270,7 @@ pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
         }
     }
     let mut sink = CountingSink(0);
-    serde_json::to_writer(&mut sink, row)
-        .map(|()| sink.0)
-        .unwrap_or(0)
+    serde_json::to_writer(&mut sink, row).map_or(0, |()| sink.0)
 }
 
 /// A page of items plus the opaque token for the next (older) page.
@@ -306,7 +303,7 @@ pub(crate) fn paginate_slice<T: Clone>(
 /// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
 pub(crate) fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
     let mut lines: Vec<&str> = text.split('\n').collect();
-    while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
     let page = paginate_slice(&lines, limit, token);
@@ -336,8 +333,7 @@ pub(crate) fn parse_offset(token: Option<&str>) -> usize {
     token
         .and_then(decode_token)
         .and_then(|v| v.get("o").and_then(Value::as_u64))
-        .map(|n| n as usize)
-        .unwrap_or(0)
+        .map_or(0, |n| n as usize)
 }
 
 #[cfg(test)]

@@ -247,7 +247,7 @@ pub(crate) fn sanitize_attachment_name(file_name: &str) -> Option<String> {
 /// `report.tar.gz` → (`report.tar`, `.gz`), `Makefile` → (`Makefile`, ``),
 /// `.env` → (`.env`, ``) — a leading dot is part of the stem, not an extension.
 fn split_name(name: &str) -> (&str, &str) {
-    let first = name.chars().next().map(char::len_utf8).unwrap_or(0);
+    let first = name.chars().next().map_or(0, char::len_utf8);
     match name[first..].rfind('.') {
         Some(i) => name.split_at(first + i),
         None => (name, ""),
@@ -588,8 +588,7 @@ pub(crate) fn stat(root: &str, path: &str) -> Result<Value> {
     let mtime = md
         .modified()
         .ok()
-        .map(mtime_iso)
-        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+        .map_or_else(|| "1970-01-01T00:00:00.000Z".to_string(), mtime_iso);
     let permissions = permissions_octal(&md);
     Ok(json!({
         "size": md.len(),
@@ -658,9 +657,7 @@ pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value
     // `symlink_metadata` (no follow): a symlink-to-directory is renamed and
     // attributed as the single symlink entry git actually tracks — walking the
     // link target would record rows for paths git never reports.
-    let is_directory = std::fs::symlink_metadata(&old_full)
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
+    let is_directory = std::fs::symlink_metadata(&old_full).is_ok_and(|m| m.is_dir());
     if let Some(parent) = new_full.parent() {
         std::fs::create_dir_all(parent).map_err(io_err)?;
     }

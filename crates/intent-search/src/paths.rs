@@ -62,7 +62,7 @@ pub fn search_file_names(
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let rel = normalize_rel(root, entry.path());

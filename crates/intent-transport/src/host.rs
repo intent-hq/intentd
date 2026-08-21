@@ -9,6 +9,7 @@
 //! can probe the daemon host's nature and gate GUI/forwarding UI accordingly.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use base64::Engine as _;
 use intent_core::WorkspaceApi;
@@ -839,7 +840,7 @@ fn append_editor_args(cmd: &mut std::process::Command, goto: bool, target: &Edit
         if let Some(line) = target.line {
             let mut spec = format!("{}:{}", target.path, line);
             if let Some(col) = target.column {
-                spec.push_str(&format!(":{col}"));
+                let _ = write!(spec, ":{col}");
             }
             cmd.args(["--goto", &spec]);
             return;

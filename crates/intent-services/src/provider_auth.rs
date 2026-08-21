@@ -282,9 +282,10 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
 /// matching spawn resolution. Today every probe-able provider owns its own
 /// primary (only unsloth remaps, and unsloth is not probe-able).
 fn override_key(provider_id: &'static str) -> &'static str {
-    intent_providers::find_provider(provider_id)
-        .map(intent_providers::ProviderConfig::primary_binary_provider_id)
-        .unwrap_or(provider_id)
+    intent_providers::find_provider(provider_id).map_or(
+        provider_id,
+        intent_providers::ProviderConfig::primary_binary_provider_id,
+    )
 }
 
 /// checkAuggie-parity validation for auggie's threaded override

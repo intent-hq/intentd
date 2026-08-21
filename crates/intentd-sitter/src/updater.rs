@@ -14,6 +14,7 @@
 //! 5. write `state.json` (`current_version`) via temp file + rename
 //! 6. prune: keep the new and previous versions, delete the rest best-effort
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -393,8 +394,10 @@ impl Updater {
             .hasher
             .finalize()
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+            .fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            });
         let expected = entry.sha256.to_ascii_lowercase();
         if actual != expected {
             let _ = fs::remove_file(dest);

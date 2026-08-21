@@ -11,6 +11,7 @@
 
 use super::{FASTPATH_METHODS, METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 /// Extract router methods from the actual source code at test runtime.
 ///
@@ -172,28 +173,30 @@ fn router_methods_match_actual_source() {
         );
 
         if !missing.is_empty() {
-            msg.push_str(&format!(
-                "\nMethods in router.rs but NOT in catalog ({}):\n",
+            let _ = writeln!(
+                msg,
+                "\nMethods in router.rs but NOT in catalog ({}):",
                 missing.len()
-            ));
+            );
             for m in missing.iter().take(10) {
-                msg.push_str(&format!("  - {m}\n"));
+                let _ = writeln!(msg, "  - {m}");
             }
             if missing.len() > 10 {
-                msg.push_str(&format!("  ... and {} more\n", missing.len() - 10));
+                let _ = writeln!(msg, "  ... and {} more", missing.len() - 10);
             }
         }
 
         if !extra.is_empty() {
-            msg.push_str(&format!(
-                "\nMethods in catalog but NOT in router.rs ({}):\n",
+            let _ = writeln!(
+                msg,
+                "\nMethods in catalog but NOT in router.rs ({}):",
                 extra.len()
-            ));
+            );
             for m in extra.iter().take(10) {
-                msg.push_str(&format!("  - {m}\n"));
+                let _ = writeln!(msg, "  - {m}");
             }
             if extra.len() > 10 {
-                msg.push_str(&format!("  ... and {} more\n", extra.len() - 10));
+                let _ = writeln!(msg, "  ... and {} more", extra.len() - 10);
             }
         }
 
@@ -226,22 +229,24 @@ fn fastpath_methods_match_actual_source() {
         );
 
         if !missing.is_empty() {
-            msg.push_str(&format!(
-                "\nMethods in source but NOT in catalog ({}):\n",
+            let _ = writeln!(
+                msg,
+                "\nMethods in source but NOT in catalog ({}):",
                 missing.len()
-            ));
+            );
             for m in &missing {
-                msg.push_str(&format!("  - {m}\n"));
+                let _ = writeln!(msg, "  - {m}");
             }
         }
 
         if !extra.is_empty() {
-            msg.push_str(&format!(
-                "\nMethods in catalog but NOT in source ({}):\n",
+            let _ = writeln!(
+                msg,
+                "\nMethods in catalog but NOT in source ({}):",
                 extra.len()
-            ));
+            );
             for m in &extra {
-                msg.push_str(&format!("  - {m}\n"));
+                let _ = writeln!(msg, "  - {m}");
             }
         }
 

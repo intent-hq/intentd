@@ -280,9 +280,7 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
 /// Count the lines the mock adapters have appended to `log` so far (each line
 /// is one adapter that actually started).
 fn started_count(log: &std::path::Path) -> usize {
-    std::fs::read_to_string(log)
-        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0)
+    std::fs::read_to_string(log).map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
 /// Poll `cond` until it holds, failing with `what` if it never does.

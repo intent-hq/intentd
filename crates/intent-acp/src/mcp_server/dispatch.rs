@@ -128,8 +128,7 @@ pub(super) fn default_workspace_api_timeout() -> Duration {
 fn workspace_api_timeout_from(raw: Option<&str>) -> Duration {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(WORKSPACE_API_TIMEOUT)
+        .map_or(WORKSPACE_API_TIMEOUT, Duration::from_millis)
 }
 
 /// Default for `workspaceApi.maxOutputChars` — mirrors the settings-catalog
@@ -344,8 +343,7 @@ impl WorkspaceMcpServer {
                 .get("value")
                 .and_then(Value::as_f64)
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+                .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| n as usize),
             Err(_) => DEFAULT_MAX_OUTPUT_CHARS,
         };
         (toon_output, max_chars)

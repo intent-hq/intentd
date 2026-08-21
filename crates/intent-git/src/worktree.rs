@@ -314,18 +314,17 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
 /// `<wt>.deleting-<nonce>` in the same parent directory, so the rename never
 /// crosses filesystems.
 fn detached_trash_path(worktree_path: &Path) -> PathBuf {
-    let name = worktree_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "worktree".to_string());
+    let name = worktree_path.file_name().map_or_else(
+        || "worktree".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let parent = worktree_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     for attempt in 0u32.. {
         let candidate = parent.join(format!("{name}.deleting-{nonce:x}-{attempt}"));
         if !candidate.exists() {

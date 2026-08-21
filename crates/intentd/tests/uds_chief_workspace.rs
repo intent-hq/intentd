@@ -91,9 +91,9 @@ async fn chief_workspace_over_uds() {
     assert_eq!(ws["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(ws["archived"], json!(false));
     // Chief has no worktree/repo/PR shape on the wire.
-    assert!(ws.get("path").map(Value::is_null).unwrap_or(true));
-    assert!(ws.get("worktreePath").map(Value::is_null).unwrap_or(true));
-    assert!(ws.get("repositoryName").map(Value::is_null).unwrap_or(true));
+    assert!(ws.get("path").is_none_or(Value::is_null));
+    assert!(ws.get("worktreePath").is_none_or(Value::is_null));
+    assert!(ws.get("repositoryName").is_none_or(Value::is_null));
 
     // (b) `workspace.list` MUST NOT include `__chief__` — Chief is only ever
     //     reachable by explicit id (TS `findAll` virtual-workspace filter).
@@ -191,8 +191,7 @@ async fn chief_workspace_over_uds() {
     // Not persisted: synthesized shape has no statusMessage.
     assert!(resp["result"]["workspace"]
         .get("statusMessage")
-        .map(Value::is_null)
-        .unwrap_or(true));
+        .is_none_or(Value::is_null));
 
     // (e) Archive / delete on Chief are safe no-ops — the seeded row is never
     //     torn down or flipped to `archived = 1` and Chief remains reachable

@@ -244,8 +244,7 @@ fn grok_models_from_value(value: &Value) -> Vec<GrokModel> {
         ]
         .iter()
         .find_map(|v| v.and_then(Value::as_array))
-        .map(std::vec::Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[], std::vec::Vec::as_slice)
     };
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

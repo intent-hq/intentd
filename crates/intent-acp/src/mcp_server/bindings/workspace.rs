@@ -97,8 +97,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| Value::String(s.to_string()))
-                .unwrap_or(Value::Null);
+                .map_or(Value::Null, |s| Value::String(s.to_string()));
             Ok(json!({
                 "id": w.id.as_str(),
                 "title": if title.is_empty() { "(untitled)" } else { title },
@@ -194,10 +193,7 @@ async fn set_status_message(
     // via `unwrap_or_default()` — that would conflate a cleared value with
     // an explicitly empty string and reintroduce the exact empty-vs-null
     // mismatch the services-side clear normalization is fixing.
-    let out = updated
-        .status_message
-        .map(Value::String)
-        .unwrap_or(Value::Null);
+    let out = updated.status_message.map_or(Value::Null, Value::String);
     Ok(json!({ "ok": true, "statusMessage": out }))
 }
 

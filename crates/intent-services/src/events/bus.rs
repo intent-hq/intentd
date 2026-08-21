@@ -630,9 +630,7 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
 
 /// Byte length of a value's serialized JSON (what `insert_events` writes).
 fn json_byte_len(v: &Value) -> usize {
-    serde_json::to_string(v)
-        .map(|s| s.len())
-        .unwrap_or(usize::MAX)
+    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
 }
 
 /// The longest prefix of `s` that is at most `max_bytes` bytes and ends on a

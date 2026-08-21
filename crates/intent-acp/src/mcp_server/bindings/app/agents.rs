@@ -193,8 +193,7 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
             // Turn-based slicing (1-based, inclusive)
             let start = start_turn.unwrap_or(1).max(1) as usize - 1; // convert to 0-based
             let end = end_turn
-                .map(|e| (e as usize).min(total_messages)) // clamp to total_messages
-                .unwrap_or(total_messages)
+                .map_or(total_messages, |e| (e as usize).min(total_messages))
                 .min(start + MAX_READ_LIMIT as usize);
             if end < start + 1 {
                 return Err("endTurn must be greater than or equal to startTurn".to_string());
@@ -341,8 +340,7 @@ fn has_returned_content(message: &Value) -> bool {
     message
         .get("contentBlocks")
         .and_then(Value::as_array)
-        .map(|blocks| !blocks.is_empty())
-        .unwrap_or(true) // If no contentBlocks field, assume it has content
+        .is_none_or(|blocks| !blocks.is_empty()) // If no contentBlocks field, assume it has content
 }
 
 #[cfg(test)]

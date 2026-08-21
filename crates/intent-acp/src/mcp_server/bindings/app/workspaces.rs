@@ -890,8 +890,7 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         .repository_name
         .as_deref()
         .or(workspace.repository_path.as_deref())
-        .map(String::from)
-        .unwrap_or_else(|| format!("{:?}", workspace.status));
+        .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
     let proposal = json!({
         "kind": "bulk-op",
@@ -936,8 +935,7 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         .repository_name
         .as_deref()
         .or(workspace.repository_path.as_deref())
-        .map(String::from)
-        .unwrap_or_else(|| format!("{:?}", workspace.status));
+        .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
     let proposal = json!({
         "kind": "bulk-op",
@@ -997,8 +995,7 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
             .repository_name
             .as_deref()
             .or(workspace.repository_path.as_deref())
-            .map(String::from)
-            .unwrap_or_else(|| format!("{:?}", workspace.status));
+            .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
         bulk_items.push(json!({
             "id": id,
@@ -1061,8 +1058,7 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
             .repository_name
             .as_deref()
             .or(workspace.repository_path.as_deref())
-            .map(String::from)
-            .unwrap_or_else(|| format!("{:?}", workspace.status));
+            .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
         bulk_items.push(json!({
             "id": id,

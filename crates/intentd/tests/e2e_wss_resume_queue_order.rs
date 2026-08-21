@@ -513,8 +513,7 @@ async fn await_drained_and_idle(
         let queue = wss_rpc(ws, 30, "agent.getQueue", json!({ "agentId": agent_id })).await;
         let empty = queue["queue"]
             .as_array()
-            .map(std::vec::Vec::is_empty)
-            .unwrap_or(false);
+            .is_some_and(std::vec::Vec::is_empty);
         let got = wss_rpc(
             ws,
             31,

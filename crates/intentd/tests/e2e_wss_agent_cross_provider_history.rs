@@ -30,6 +30,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -338,10 +339,11 @@ fn seed_grok_path_override(data_dir: &Path, wrapper: &Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
+    let _ = write!(
+        text,
         "\n[providers.paths]\ngrok = \"{}\"\n",
         wrapper.display()
-    ));
+    );
     std::fs::write(&path, text).expect("write config.toml");
 }
 
