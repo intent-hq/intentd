@@ -9219,7 +9219,8 @@ mod wsapi4_bindings_tests {
 /// `workspaceApi.maxOutputChars` knobs read live per invocation. Covers TOON
 /// on/off, under/over-limit, the oversized-output redirect into the
 /// workspace folder's `tool-outputs/` directory (a SIBLING of the repo
-/// checkout), unlimited (`0`), and the unresolvable-workspace-dir fallback.
+/// checkout), unlimited (`0`), and the unresolvable-workspace-dir inline
+/// truncation fallback.
 #[cfg(test)]
 mod workspace_api_output_limit_tests {
     use std::path::PathBuf;
@@ -9475,14 +9476,28 @@ mod workspace_api_output_limit_tests {
     }
 
     #[tokio::test]
-    async fn unresolvable_workspace_dir_falls_back_to_untruncated_output() {
+    async fn unresolvable_workspace_dir_truncates_output_inline() {
         // No on-disk checkout path: the redirect cannot be written, so the
-        // full body comes back untruncated and the call still succeeds.
+        // body comes back TRUNCATED inline — never the full payload
+        // (monorepo#3038) — and the call still succeeds.
         let srv = server(None, false, 50);
         let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
         let text = tool_text(&resp);
-        assert!(!text.contains("Output too large:"));
-        let v: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(v["data"].as_str().unwrap().len(), 200);
+
+        // The notice carries total size, limit, and the redirect-failure
+        // reason.
+        let full = serde_json::to_string_pretty(&json!({ "data": "x".repeat(200) })).unwrap();
+        let total = full.chars().count();
+        assert!(text.contains(&format!("Output too large: {total} characters (limit: 50)")));
+        assert!(text.contains("could NOT be written to a file"));
+        assert!(text.contains("workspace has no on-disk checkout path"));
+
+        // The head is the first `max_chars` characters of the output, and
+        // the message never carries more of the output than that.
+        let head: String = full.chars().take(50).collect();
+        assert!(text.contains(&head));
+        let head_plus_one: String = full.chars().take(51).collect();
+        assert!(!text.contains(&head_plus_one));
+        assert!(text.chars().count() < 500, "message must stay bounded");
     }
 }
