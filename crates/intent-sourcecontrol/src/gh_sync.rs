@@ -405,6 +405,9 @@ mod tests {
 
     /// Scripted [`GhCli`] that records whether a login/logout was attempted —
     /// no real `gh` is ever spawned from tests.
+    // Test mock: independent scenario bools, and `Option<Option<_>>` recorders
+    // distinguishing "never called" from "called with None".
+    #[allow(clippy::struct_excessive_bools, clippy::option_option)]
     struct MockGhCli {
         installed: bool,
         authenticated: bool,

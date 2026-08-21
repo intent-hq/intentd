@@ -21,6 +21,9 @@ pub fn detect_has_display() -> bool {
 /// explicit X11/Wayland display always wins; otherwise GUI platforms
 /// (macOS/Windows) assume a console unless reached over SSH; headless Unix
 /// without a display server has none.
+// The four independent env probes ARE the inputs of this pure policy fn;
+// bundling them into a struct would only obscure the truth table.
+#[allow(clippy::fn_params_excessive_bools)]
 fn has_display(display: bool, wayland: bool, over_ssh: bool, gui_platform: bool) -> bool {
     if display || wayland {
         return true;

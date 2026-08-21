@@ -15,7 +15,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::model::*;
+use crate::model::{
+    AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
+    NewPullRequest, Page, PageParams, PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo,
+    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
+    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+};
 use crate::SourceControl;
 
 /// Bounded TCP connect wait for every octocrab request. Without these
@@ -138,9 +144,8 @@ fn page_full_set<T>(all: Vec<T>, page: u64, per_page: u64) -> Page<T> {
 
 // --- JSON → model mapping (pure; unit-tested with fixtures) ---
 
-fn login_of(user: &Option<dto::User>) -> String {
-    user.as_ref()
-        .and_then(|u| u.login.clone())
+fn login_of(user: Option<&dto::User>) -> String {
+    user.and_then(|u| u.login.clone())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -203,7 +208,7 @@ pub(crate) fn map_pull(value: Value) -> Result<PullRequest> {
         draft: p.draft,
         source_branch,
         target_branch: p.base.and_then(|r| r.r#ref).unwrap_or_default(),
-        author: login_of(&p.user),
+        author: login_of(p.user.as_ref()),
         mergeable: p.mergeable,
         mergeable_state: p.mergeable_state,
         head_sha,
@@ -393,7 +398,7 @@ pub(crate) fn build_repo_search_query(input: &str) -> String {
 pub(crate) fn map_review(value: Value) -> Result<Review> {
     let r: dto::Review = serde_json::from_value(value)?;
     Ok(Review {
-        author: login_of(&r.user),
+        author: login_of(r.user.as_ref()),
         verdict: verdict_from_state(r.state.as_deref().unwrap_or_default()),
         body: r.body,
         submitted_at: r.submitted_at.unwrap_or_default(),
@@ -404,7 +409,7 @@ pub(crate) fn map_issue_comment(value: Value) -> Result<Comment> {
     let c: dto::IssueComment = serde_json::from_value(value)?;
     Ok(Comment {
         id: c.id.to_string(),
-        author: login_of(&c.user),
+        author: login_of(c.user.as_ref()),
         body: c.body.unwrap_or_default(),
         path: None,
         line: None,
@@ -420,7 +425,7 @@ pub(crate) fn map_review_comment(value: Value) -> Result<ReviewComment> {
         body: c.body.unwrap_or_default(),
         path: c.path.unwrap_or_default(),
         line: c.line,
-        author: login_of(&c.user),
+        author: login_of(c.user.as_ref()),
         created_at: c.created_at.unwrap_or_default(),
         updated_at: c.updated_at.unwrap_or_default(),
         in_reply_to_id: c.in_reply_to_id,
@@ -462,7 +467,7 @@ pub(crate) fn map_review_thread(value: Value) -> Result<ReviewThread> {
         .map(|c| ReviewThreadComment {
             id: c.id.unwrap_or_default(),
             body: c.body.unwrap_or_default(),
-            author: login_of(&c.author),
+            author: login_of(c.author.as_ref()),
             path: c.path.unwrap_or_default(),
             line: c.line,
             created_at: c.created_at.unwrap_or_default(),

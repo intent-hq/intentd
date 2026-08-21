@@ -382,7 +382,11 @@ pub fn prewarm_login_shell_path() {
 }
 
 /// Helper to push a directory to the list if it's not empty and not already seen.
-pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
+pub fn push_dir<S: std::hash::BuildHasher>(
+    dirs: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf, S>,
+    dir: PathBuf,
+) {
     if dir.as_os_str().is_empty() {
         return;
     }

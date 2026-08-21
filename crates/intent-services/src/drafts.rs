@@ -73,7 +73,7 @@ impl Services {
             )
         };
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             draft_changed_event(&workspace_id, &agent_id, &client_id, updated.is_some()),
         )
         .await;
@@ -92,7 +92,7 @@ impl Services {
             .delete_draft(&workspace_id, &agent_id, &client_id)
             .await?;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             draft_changed_event(&workspace_id, &agent_id, &client_id, false),
         )
         .await;

@@ -214,7 +214,7 @@ impl Services {
                     return;
                 };
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     transfer_event(&workspace_id, WORKSPACE_TRANSFER_READY, event_data),
                 )
                 .await;
@@ -232,7 +232,7 @@ impl Services {
                 );
                 self.cleanup_export(&export_id).await;
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     transfer_event(
                         &workspace_id,
                         WORKSPACE_TRANSFER_FAILED,
@@ -709,7 +709,7 @@ impl Services {
                 .insert("bytesWritten".to_string(), serde_json::json!(bytes));
         }
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             transfer_event(workspace_id, WORKSPACE_TRANSFER_PROGRESS, data),
         )
         .await;

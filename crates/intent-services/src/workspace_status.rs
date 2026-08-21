@@ -296,7 +296,7 @@ impl Services {
         };
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 display_status_changed_event(workspace_id, status),
             )
             .await;
@@ -345,7 +345,7 @@ impl Services {
         };
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 waiting_changed_event(workspace_id, waiting),
             )
             .await;
@@ -1282,8 +1282,8 @@ mod display_status {
     /// Monitor-signal shorthand for the tests below.
     fn monitors(open: bool, ready: bool, merged: bool) -> MonitorPrSignals {
         MonitorPrSignals {
-            open,
             ready,
+            open,
             merged,
         }
     }

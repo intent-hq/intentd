@@ -138,8 +138,8 @@ pub fn normalize_mcp_servers(servers: &Value) -> NormalizedMcpServers {
     out
 }
 
-fn headers_to_value(headers: &Option<BTreeMap<String, String>>) -> Option<Value> {
-    headers.as_ref().map(|h| {
+fn headers_to_value(headers: Option<&BTreeMap<String, String>>) -> Option<Value> {
+    headers.map(|h| {
         let mut m = Map::new();
         for (k, v) in h {
             m.insert(k.clone(), Value::String(v.clone()));
@@ -184,7 +184,7 @@ pub fn to_opencode_mcp_config(normalized: &NormalizedMcpServers) -> Value {
             NormalizedMcpServer::Http { url, headers }
             | NormalizedMcpServer::Sse { url, headers } => {
                 let mut obj = json!({ "type": "remote", "url": url, "enabled": true });
-                if let Some(h) = headers_to_value(headers) {
+                if let Some(h) = headers_to_value(headers.as_ref()) {
                     obj["headers"] = h;
                 }
                 obj
@@ -207,15 +207,17 @@ pub(crate) fn to_claude_mcp_json(normalized: &NormalizedMcpServers) -> Value {
                 "args": args,
                 "env": env_to_value(env),
             }),
-            NormalizedMcpServer::Http { url, headers } => remote_entry("http", url, headers),
-            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers),
+            NormalizedMcpServer::Http { url, headers } => {
+                remote_entry("http", url, headers.as_ref())
+            }
+            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers.as_ref()),
         };
         servers.insert(name.clone(), entry);
     }
     json!({ "mcpServers": Value::Object(servers) })
 }
 
-fn remote_entry(kind: &str, url: &str, headers: &Option<BTreeMap<String, String>>) -> Value {
+fn remote_entry(kind: &str, url: &str, headers: Option<&BTreeMap<String, String>>) -> Value {
     let mut obj = json!({ "type": kind, "url": url });
     if let Some(h) = headers_to_value(headers) {
         obj["headers"] = h;
@@ -235,8 +237,10 @@ pub fn to_auggie_mcp_config(normalized: &NormalizedMcpServers) -> Value {
                 "args": args,
                 "env": env_to_value(env),
             }),
-            NormalizedMcpServer::Http { url, headers } => remote_entry("http", url, headers),
-            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers),
+            NormalizedMcpServer::Http { url, headers } => {
+                remote_entry("http", url, headers.as_ref())
+            }
+            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers.as_ref()),
         };
         servers.insert(name.clone(), entry);
     }
@@ -258,10 +262,10 @@ pub(crate) fn to_acp_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<Value
                 "env": pairs_array(env),
             })),
             NormalizedMcpServer::Http { url, headers } => {
-                servers.push(acp_remote(name, "http", url, headers));
+                servers.push(acp_remote(name, "http", url, headers.as_ref()));
             }
             NormalizedMcpServer::Sse { url, headers } => {
-                servers.push(acp_remote(name, "sse", url, headers));
+                servers.push(acp_remote(name, "sse", url, headers.as_ref()));
             }
         }
     }
@@ -273,9 +277,9 @@ fn acp_remote(
     name: &str,
     kind: &str,
     url: &str,
-    headers: &Option<BTreeMap<String, String>>,
+    headers: Option<&BTreeMap<String, String>>,
 ) -> Value {
-    let headers = headers.clone().unwrap_or_default();
+    let headers = headers.cloned().unwrap_or_default();
     json!({ "name": name, "type": kind, "url": url, "headers": pairs_array(&headers) })
 }
 
@@ -304,12 +308,14 @@ pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpS
             }
             NormalizedMcpServer::Http { url, headers } => {
                 servers.push(McpServer::Http(
-                    McpServerHttp::new(name.clone(), url.clone()).headers(header_pairs(headers)),
+                    McpServerHttp::new(name.clone(), url.clone())
+                        .headers(header_pairs(headers.as_ref())),
                 ));
             }
             NormalizedMcpServer::Sse { url, headers } => {
                 servers.push(McpServer::Sse(
-                    McpServerSse::new(name.clone(), url.clone()).headers(header_pairs(headers)),
+                    McpServerSse::new(name.clone(), url.clone())
+                        .headers(header_pairs(headers.as_ref())),
                 ));
             }
         }
@@ -317,9 +323,8 @@ pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpS
     servers
 }
 
-fn header_pairs(headers: &Option<BTreeMap<String, String>>) -> Vec<HttpHeader> {
+fn header_pairs(headers: Option<&BTreeMap<String, String>>) -> Vec<HttpHeader> {
     headers
-        .as_ref()
         .map(|h| {
             h.iter()
                 .map(|(k, v)| HttpHeader::new(k.clone(), v.clone()))

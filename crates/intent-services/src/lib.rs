@@ -267,6 +267,7 @@ pub struct Services {
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
     /// `Some(None)` to simulate a host without npx, which cannot be arranged
     /// hermetically through the real discovery.
+    #[allow(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
@@ -1776,7 +1777,7 @@ impl Services {
                         );
                     }
                     publish_event(
-                        &this.event_bus,
+                        this.event_bus.as_ref(),
                         workspace_updated_event(
                             &ws_id,
                             &serde_json::json!({ "lastActivity": new_val }),
@@ -2139,7 +2140,7 @@ impl Services {
         self.store.update_workspace(&ws).await?;
 
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             workspace_updated_event(&ws.id, &serde_json::Value::Object(changes)),
         )
         .await;
@@ -2284,7 +2285,7 @@ impl Services {
 
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 activity_changed_event(workspace_id, WorkspaceActivity::AgentRunning),
             )
             .await;
@@ -2388,7 +2389,7 @@ impl Services {
                 }
 
                 publish_event(
-                    &this.event_bus,
+                    this.event_bus.as_ref(),
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
                 )
                 .await;
@@ -2451,7 +2452,7 @@ impl Services {
             return Ok(());
         }
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             attention_changed_event(workspace_id, level),
         )
         .await;
@@ -2893,7 +2894,11 @@ impl Services {
         } else {
             GIT_ROOT_UPDATED
         };
-        publish_event(&self.event_bus, git_root_changed_event(event_type, &stored)).await;
+        publish_event(
+            self.event_bus.as_ref(),
+            git_root_changed_event(event_type, &stored),
+        )
+        .await;
         Ok(stored)
     }
 
@@ -2904,7 +2909,7 @@ impl Services {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
         )
         .await;
@@ -3086,7 +3091,7 @@ impl Services {
                             root.registered_commit_sha = Some(sha);
                             root.updated_at = ts;
                             publish_event(
-                                &self.event_bus,
+                                self.event_bus.as_ref(),
                                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
                             )
                             .await;
@@ -3181,7 +3186,7 @@ impl Services {
                 root.updated_at = now_iso();
                 self.store.update_workspace_git_root_pr(&root).await?;
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     git_root_changed_event(GIT_ROOT_UPDATED, &root),
                 )
                 .await;
@@ -3226,7 +3231,7 @@ impl Services {
                     root.updated_at = now_iso();
                     self.store.update_workspace_git_root_pr(&root).await?;
                     publish_event(
-                        &self.event_bus,
+                        self.event_bus.as_ref(),
                         git_root_changed_event(GIT_ROOT_UPDATED, &root),
                     )
                     .await;
@@ -3244,7 +3249,7 @@ impl Services {
             root.updated_at = now_iso();
             self.store.update_workspace_git_root_pr(&root).await?;
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
             )
             .await;
@@ -3267,7 +3272,7 @@ impl Services {
                     root.updated_at = now_iso();
                     self.store.update_workspace_git_root_pr(&root).await?;
                     publish_event(
-                        &self.event_bus,
+                        self.event_bus.as_ref(),
                         git_root_changed_event(GIT_ROOT_UPDATED, &root),
                     )
                     .await;
@@ -3367,7 +3372,7 @@ impl Services {
                 ws.active_pull_request = None;
                 ws.updated_at = now_iso();
                 self.store.update_workspace_pr_linkage(&ws).await?;
-                publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
+                publish_event(self.event_bus.as_ref(), pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
                 return Ok(PrRefreshOutcome::Unlinked);
             }
@@ -3415,7 +3420,7 @@ impl Services {
                     ws.active_pull_request = Some(open_info);
                     ws.updated_at = now_iso();
                     self.store.update_workspace_pr_linkage(&ws).await?;
-                    publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                    publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     return Ok(PrRefreshOutcome::Linked);
                 }
@@ -3432,7 +3437,7 @@ impl Services {
             ws.active_pull_request = Some(info);
             ws.updated_at = now_iso();
             self.store.update_workspace_pr_linkage(&ws).await?;
-            publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+            publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
             self.maybe_emit_display_status_changed(&ws.id).await;
             Ok(PrRefreshOutcome::Updated)
         } else {
@@ -3460,7 +3465,7 @@ impl Services {
                     ws.active_pull_request = Some(info);
                     ws.updated_at = now_iso();
                     self.store.update_workspace_pr_linkage(&ws).await?;
-                    publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                    publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     Ok(PrRefreshOutcome::Linked)
                 }
@@ -3760,7 +3765,7 @@ impl Services {
         // events out of commit order. Each event still carries a committed
         // snapshot and the next event/scan converges (pre-existing).
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             token_usage_changed_event(workspace_id, &usage),
         )
         .await;
@@ -5838,7 +5843,7 @@ impl Services {
                 "canonicalHead": canonical_head,
             }),
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
 
         tracing::info!(
             agent = %agent_id.0,
@@ -6594,7 +6599,10 @@ impl Services {
             attributions: map,
         };
         self.store.upsert_note_line_attribution(&data).await?;
-        publish_event_transient(&self.event_bus, &line_attribution_updated_event(&data));
+        publish_event_transient(
+            self.event_bus.as_ref(),
+            &line_attribution_updated_event(&data),
+        );
         Ok(data)
     }
 
@@ -6662,7 +6670,7 @@ impl Services {
 /// cross-workspace collision is possible.
 async fn ensure_spec_note(
     store: &Store,
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
@@ -6899,7 +6907,7 @@ fn decorate_specialist_resolved(
 /// builder which throws `Note <id> not found`.
 async fn append_primitive(
     store: &Store,
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
     primitive: &serde_json::Value,
@@ -8464,7 +8472,7 @@ fn note_change_event(
 /// dependents' computed `unmetDependsOn`, so subscribers must refetch them.
 /// `notes` is the workspace listing the caller already holds (no extra query).
 async fn publish_dependent_note_updates(
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     changed_note_id: &NoteId,
     notes: &[Note],
@@ -9806,7 +9814,7 @@ impl MergeSweepSummary {
 
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
-pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
+pub(crate) async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     let Some(bus) = bus else {
         return;
     };
@@ -9818,8 +9826,8 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
 /// `chat:stream:delta` that do not need durable storage.
-pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: &NewEvent) -> Option<Event> {
-    bus.as_ref().map(|b| b.publish_transient(event))
+pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) -> Option<Event> {
+    bus.map(|b| b.publish_transient(event))
 }
 
 /// Best-effort workspace lookup by worktree path (§6.5). Path-scoped git
@@ -10710,7 +10718,7 @@ impl Services {
         // refresh the fence-free content live (TS parity: the reference
         // emits `note:updated` after saving the converted note).
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             note_change_event(
                 &note.workspace_id,
                 &note.id,
@@ -10778,7 +10786,7 @@ impl Services {
         // the new child task note live (TS parity: `createPrerequisiteNote`
         // routes through `createNote`, which emits `note:created`).
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             note_change_event(
                 &note.workspace_id,
                 &note.id,
@@ -10793,7 +10801,7 @@ impl Services {
         // task-ness from the `note:created` payload.
         let agent = resolve_event_agent(&self.store, caller_agent_id).await;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             task_created_event(
                 &note.workspace_id,
                 &note.id,
@@ -11066,7 +11074,7 @@ impl Services {
                 );
             }
         }
-        publish_event(&self.event_bus, settings_changed_event(&applied)).await;
+        publish_event(self.event_bus.as_ref(), settings_changed_event(&applied)).await;
     }
 
     /// Default-provider settings self-heal (monorepo#3044). When no default
@@ -11390,7 +11398,11 @@ impl WorkspaceApi for Services {
                         return Err(e);
                     }
                 }
-                publish_event(&self.event_bus, settings_changed_event(&applied.clone())).await;
+                publish_event(
+                    self.event_bus.as_ref(),
+                    settings_changed_event(&applied.clone()),
+                )
+                .await;
             }
             Ok(serde_json::json!({ "applied": applied }))
         })
@@ -11400,7 +11412,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let result = self.settings_service().reset(&path).await?;
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 settings_changed_event(std::slice::from_ref(&result)),
             )
             .await;
@@ -11525,7 +11537,7 @@ impl WorkspaceApi for Services {
                     path.as_deref(),
                 )
                 .await?;
-            publish_event(&self.event_bus, settings_changed_event(&[changed])).await;
+            publish_event(self.event_bus.as_ref(), settings_changed_event(&[changed])).await;
             Ok(rules)
         })
     }
@@ -11583,7 +11595,7 @@ impl WorkspaceApi for Services {
             let (skills, changed) =
                 skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
             if changed {
-                publish_event(&self.event_bus, skills_changed_event(&workspace_id)).await;
+                publish_event(self.event_bus.as_ref(), skills_changed_event(&workspace_id)).await;
             }
 
             // Sort by name for deterministic output
@@ -12522,7 +12534,7 @@ impl WorkspaceApi for Services {
             );
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -12555,7 +12567,7 @@ impl WorkspaceApi for Services {
             );
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -12582,7 +12594,7 @@ impl WorkspaceApi for Services {
             let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -12610,7 +12622,7 @@ impl WorkspaceApi for Services {
                 primitive_ops::agent_action(&id, &created_at, &agent_id, &goal, &description);
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -14430,12 +14442,12 @@ impl WorkspaceApi for Services {
                     // Inside the idempotency scope: a replayed create returns
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
-                    publish_event(&bus, workspace_created_event(&ws)).await;
+                    publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
                     // Seed the well-known `spec` note (reference parity with
                     // `notes.service.ts ensureSpecExists`). Idempotent under
                     // the replay guard: on retry the stored result comes back
                     // and this branch never re-runs.
-                    ensure_spec_note(&store, &bus, &ws.id).await?;
+                    ensure_spec_note(&store, bus.as_ref(), &ws.id).await?;
                     // Daemon-owned initial-agent orchestration (§5.1): when the
                     // request carries an `initialAgent`, always create the agent
                     // row (reference parity: `workspace.service.ts` persists the
@@ -14664,7 +14676,7 @@ impl WorkspaceApi for Services {
                             let Some(script) = effective_script else {
                                 // No script to execute: the setup stage is done.
                                 publish_event(
-                                    &bus_for_setup,
+                                    bus_for_setup.as_ref(),
                                     workspace_setup_completed_event(&workspace_id, false, None),
                                 )
                                 .await;
@@ -14678,7 +14690,7 @@ impl WorkspaceApi for Services {
                             );
                             // A script was resolved and a spawn will be attempted.
                             publish_event(
-                                &bus_for_setup,
+                                bus_for_setup.as_ref(),
                                 workspace_setup_started_event(&workspace_id),
                             )
                             .await;
@@ -14837,7 +14849,7 @@ impl WorkspaceApi for Services {
                             }
                             };
                             publish_event(
-                                &bus_for_setup,
+                                bus_for_setup.as_ref(),
                                 workspace_setup_completed_event(
                                     &workspace_id,
                                     ran_script,
@@ -14850,7 +14862,7 @@ impl WorkspaceApi for Services {
                         // skipWorktree / no worktree provisioned: the setup stage
                         // never runs, but the lifecycle still completes.
                         publish_event(
-                            &bus_for_setup,
+                            bus_for_setup.as_ref(),
                             workspace_setup_completed_event(&ws.id, false, None),
                         )
                         .await;
@@ -15090,7 +15102,7 @@ impl WorkspaceApi for Services {
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
-            publish_event(&bus, workspace_updated_event(&ws.id, &changes)).await;
+            publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
             // PR link/status changes feed the derived displayStatus (the
             // `pr_*` rungs sit between activity and taskStats), and so does
             // the attention flag (`unread` / `review_required` axes):
@@ -15235,7 +15247,7 @@ impl WorkspaceApi for Services {
             // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
             for session in &sessions {
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     NewEvent {
                         workspace_id: id.clone(),
                         timestamp: now_iso(),
@@ -15361,7 +15373,7 @@ impl WorkspaceApi for Services {
             // that treat it as a state transition.
             match store.delete_workspace(&id).await {
                 Ok(()) => {
-                    publish_event(&bus, workspace_deleted_event(&id)).await;
+                    publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
                 }
                 Err(Error::NotFound(_)) => {
                     tracing::debug!(
@@ -15699,7 +15711,11 @@ impl WorkspaceApi for Services {
             ) {
                 return Ok(existing);
             }
-            publish_event(&bus, workspace_delete_scheduled_event(&id, &delete_at)).await;
+            publish_event(
+                bus.as_ref(),
+                workspace_delete_scheduled_event(&id, &delete_at),
+            )
+            .await;
             Ok(delete_at)
         })
     }
@@ -15710,7 +15726,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
             if cancelled {
-                publish_event(&bus, workspace_delete_cancelled_event(&id)).await;
+                publish_event(bus.as_ref(), workspace_delete_cancelled_event(&id)).await;
             }
             Ok(cancelled)
         })
@@ -15837,7 +15853,7 @@ impl WorkspaceApi for Services {
                 // without a re-read. `archivedAt` is the same timestamp persisted
                 // on the row above.
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     workspace_updated_event(
                         &ws.id,
                         &serde_json::json!({
@@ -16416,15 +16432,19 @@ impl WorkspaceApi for Services {
                     "workspace.duplicate: failed to write .workspace/workspace.json"
                 );
             }
-            publish_event(&bus, workspace_created_event(&ws)).await;
+            publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
             // `workspace.duplicate` never runs a setup script, but the setup
             // lifecycle (§6.5) still completes so clients waiting on
             // `workspace:setup:completed` converge on every create-shaped flow.
-            publish_event(&bus, workspace_setup_completed_event(&ws.id, false, None)).await;
+            publish_event(
+                bus.as_ref(),
+                workspace_setup_completed_event(&ws.id, false, None),
+            )
+            .await;
             // Seed the default spec note for the new workspace (mirrors the
             // `workspace.create` flow so `note.list` returns the well-known
             // `spec` id immediately).
-            ensure_spec_note(&store, &bus, &ws.id).await?;
+            ensure_spec_note(&store, bus.as_ref(), &ws.id).await?;
             // Copy over every non-`spec` note from the source with a freshly
             // minted id; per-note failures are logged and skipped so a single
             // bad row does not abort the duplication.
@@ -16641,7 +16661,11 @@ impl WorkspaceApi for Services {
                 // Self-sufficient `workspace:attention-changed` so every client
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
-                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+                publish_event(
+                    bus.as_ref(),
+                    attention_changed_event(&id, WorkspaceAttention::None),
+                )
+                .await;
                 // The cleared flag feeds the derived displayStatus
                 // (`review_required` axis, §6.5): recompute-and-compare.
                 this.maybe_emit_display_status_changed(&id).await;
@@ -16684,7 +16708,11 @@ impl WorkspaceApi for Services {
             if changed {
                 // The unread flag is not a displayStatus axis (§6.5), so
                 // clearing it never moves the derived rollup — no recompute.
-                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+                publish_event(
+                    bus.as_ref(),
+                    attention_changed_event(&id, WorkspaceAttention::None),
+                )
+                .await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
@@ -16712,7 +16740,7 @@ impl WorkspaceApi for Services {
                 metadata: None,
                 data: event.data,
             };
-            publish_event(&bus, new_event).await;
+            publish_event(bus.as_ref(), new_event).await;
             Ok(())
         })
     }
@@ -16773,7 +16801,7 @@ impl WorkspaceApi for Services {
             // Self-sufficient `workspace:updated` delta (§6.5) so live
             // clients mirror the toggle without a follow-up read.
             publish_event(
-                &bus,
+                bus.as_ref(),
                 workspace_updated_event(&id, &serde_json::json!({ "autoCommitEnabled": enabled })),
             )
             .await;
@@ -16948,7 +16976,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             store.get_workspace(&id).await?;
             let persisted = store.replace_workspace_context_items(&id, &items).await?;
-            publish_event(&bus, workspace_context_changed_event(&id, &persisted)).await;
+            publish_event(
+                bus.as_ref(),
+                workspace_context_changed_event(&id, &persisted),
+            )
+            .await;
             Ok(persisted)
         })
     }
@@ -16999,7 +17031,7 @@ impl WorkspaceApi for Services {
                 created_at: now_epoch_ms().cast_signed(),
             };
             let stored = store.upsert_task_agent_link(&link).await?;
-            publish_event(&bus, task_agent_linked_event(&stored)).await;
+            publish_event(bus.as_ref(), task_agent_linked_event(&stored)).await;
             Ok(stored)
         })
     }
@@ -17019,7 +17051,7 @@ impl WorkspaceApi for Services {
                 .await?;
             if removed {
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     task_agent_unlinked_event(&workspace_id, &note_id, &task_key),
                 )
                 .await;
@@ -17063,7 +17095,7 @@ impl WorkspaceApi for Services {
             // the winning insert already committed, or the pre-existing
             // empty/other shape when the reseed genuinely could not run.
             if !id.is_chief() {
-                if let Err(e) = ensure_spec_note(&store, &bus, &id).await {
+                if let Err(e) = ensure_spec_note(&store, bus.as_ref(), &id).await {
                     tracing::warn!(
                         workspace_id = %id.0,
                         error = %e,
@@ -17159,7 +17191,7 @@ impl WorkspaceApi for Services {
                         note = refetched;
                     }
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         note_change_event(
                             &note.workspace_id,
                             &note.id,
@@ -17250,7 +17282,7 @@ impl WorkspaceApi for Services {
                 }
             }
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17315,7 +17347,7 @@ impl WorkspaceApi for Services {
                 .map(|n| n.content)
                 .unwrap_or(new_content);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17392,7 +17424,7 @@ impl WorkspaceApi for Services {
                 .map(|n| n.content)
                 .unwrap_or(new_content);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17469,7 +17501,7 @@ impl WorkspaceApi for Services {
                 .unwrap_or(new_content);
             let total_lines_after = final_content.split('\n').count();
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17575,7 +17607,7 @@ impl WorkspaceApi for Services {
                 None => (clean, now),
             };
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17655,7 +17687,7 @@ impl WorkspaceApi for Services {
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17703,7 +17735,7 @@ impl WorkspaceApi for Services {
                 .await?;
             services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
             )
             .await;
@@ -17739,7 +17771,7 @@ impl WorkspaceApi for Services {
                         .is_none_or(|b| compute_ready_task_ids(b) != ready_task_ids);
                 if ready_set_moved {
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         ready_tasks_changed_reason_event(
                             &workspace_id,
                             &ready_task_ids,
@@ -17755,7 +17787,13 @@ impl WorkspaceApi for Services {
                 // re-announce them for subscriber refetch (monorepo#1979).
                 // Other statuses were already unmet — no projection change.
                 if task.status == TaskStatus::Complete {
-                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &remaining).await;
+                    publish_dependent_note_updates(
+                        bus.as_ref(),
+                        &workspace_id,
+                        &note_id,
+                        &remaining,
+                    )
+                    .await;
                 }
                 // Deleting a task note can move the derived displayStatus
                 // rollup (§6.5), e.g. removing the last open spec-child task.
@@ -17930,7 +17968,7 @@ impl WorkspaceApi for Services {
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18016,7 +18054,7 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18084,7 +18122,7 @@ impl WorkspaceApi for Services {
                     None => None,
                 };
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     task_status_changed_event(
                         &note.workspace_id,
                         &note.id,
@@ -18101,7 +18139,7 @@ impl WorkspaceApi for Services {
                 let all = store.list_notes(&note.workspace_id).await?;
                 let ready_task_ids = compute_ready_task_ids(&all);
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     ready_tasks_changed_event(
                         &note.workspace_id,
                         &ready_task_ids,
@@ -18117,7 +18155,13 @@ impl WorkspaceApi for Services {
                 // computed `unmetDependsOn` (monorepo#1979).
                 if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete)
                 {
-                    publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
+                    publish_dependent_note_updates(
+                        bus.as_ref(),
+                        &note.workspace_id,
+                        &note.id,
+                        &all,
+                    )
+                    .await;
                 }
                 // A task-status transition can move the derived displayStatus
                 // rollup (§6.5): recompute-and-compare, emitting only on an
@@ -18180,7 +18224,7 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18430,7 +18474,7 @@ impl WorkspaceApi for Services {
             // (§6.5) — without this a task-ness flip is invisible until the
             // next unrelated note write.
             publish_event(
-                &services.event_bus,
+                services.event_bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18444,7 +18488,7 @@ impl WorkspaceApi for Services {
                 // Only a note that was not already a task is "created" as one.
                 None => {
                     publish_event(
-                        &services.event_bus,
+                        services.event_bus.as_ref(),
                         task_created_event(
                             &note.workspace_id,
                             &note.id,
@@ -18461,7 +18505,7 @@ impl WorkspaceApi for Services {
                 // `task.updateNoteStatus` publishes.
                 Some(previous) if previous != new_status => {
                     publish_event(
-                        &services.event_bus,
+                        services.event_bus.as_ref(),
                         task_status_changed_event(
                             &note.workspace_id,
                             &note.id,
@@ -18476,7 +18520,7 @@ impl WorkspaceApi for Services {
                     let all = store.list_notes(&note.workspace_id).await?;
                     let ready_task_ids = compute_ready_task_ids(&all);
                     publish_event(
-                        &services.event_bus,
+                        services.event_bus.as_ref(),
                         ready_tasks_changed_event(
                             &note.workspace_id,
                             &ready_task_ids,
@@ -18492,7 +18536,7 @@ impl WorkspaceApi for Services {
                     // computed `unmetDependsOn` (monorepo#1979).
                     if (previous == TaskStatus::Complete) != (new_status == TaskStatus::Complete) {
                         publish_dependent_note_updates(
-                            &services.event_bus,
+                            services.event_bus.as_ref(),
                             &note.workspace_id,
                             &note.id,
                             &all,
@@ -18509,7 +18553,7 @@ impl WorkspaceApi for Services {
                         let all = store.list_notes(&note.workspace_id).await?;
                         let ready_task_ids = compute_ready_task_ids(&all);
                         publish_event(
-                            &services.event_bus,
+                            services.event_bus.as_ref(),
                             ready_tasks_changed_reason_event(
                                 &note.workspace_id,
                                 &ready_task_ids,
@@ -18601,7 +18645,7 @@ impl WorkspaceApi for Services {
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
-                &services.event_bus,
+                services.event_bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18620,7 +18664,7 @@ impl WorkspaceApi for Services {
                 let all = store.list_notes(&note.workspace_id).await?;
                 let ready_task_ids = compute_ready_task_ids(&all);
                 publish_event(
-                    &services.event_bus,
+                    services.event_bus.as_ref(),
                     ready_tasks_changed_reason_event(
                         &note.workspace_id,
                         &ready_task_ids,
@@ -18781,7 +18825,7 @@ impl WorkspaceApi for Services {
             // (→ `task:status-changed` + ready-tasks recompute), so
             // subscribers see the delegation live.
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18793,7 +18837,7 @@ impl WorkspaceApi for Services {
             .await;
             if should_update_status {
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     task_status_changed_event(
                         &note.workspace_id,
                         &note.id,
@@ -18808,7 +18852,7 @@ impl WorkspaceApi for Services {
                 let all = store.list_notes(&note.workspace_id).await?;
                 let ready_task_ids = compute_ready_task_ids(&all);
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     ready_tasks_changed_event(
                         &note.workspace_id,
                         &ready_task_ids,
@@ -19067,7 +19111,7 @@ impl WorkspaceApi for Services {
                     // markdown; without it clients hold a stale rev and hit
                     // spurious conflicts on their next versioned write.
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         note_change_event(
                             &workspace_id,
                             &note_id,
@@ -19078,7 +19122,7 @@ impl WorkspaceApi for Services {
                     )
                     .await;
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         comment_added_event(&workspace_id, &note_id, &comment_id),
                     )
                     .await;
@@ -19415,7 +19459,7 @@ impl WorkspaceApi for Services {
             // `comment.add`; publish `comment:added` so the comment channel
             // pushes the new reply without a re-read (§6.5).
             publish_event(
-                &bus,
+                bus.as_ref(),
                 comment_added_event(&workspace_id, &note_id, &reply.id),
             )
             .await;
@@ -19492,7 +19536,7 @@ impl WorkspaceApi for Services {
                 .set_thread_status(&workspace_id, &target, new_status, &now_iso())
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 comment_resolved_event(&workspace_id, &note_id, &target, resolved),
             )
             .await;
@@ -20158,7 +20202,7 @@ impl WorkspaceApi for Services {
                 .await?;
             // Notify the FE bridge so the changes view refreshes without a
             // follow-up `git.status` read (parity with `git.stage`).
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20192,7 +20236,7 @@ impl WorkspaceApi for Services {
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
                 })
                 .await?;
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20255,11 +20299,11 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_push_event(&ws.id, &outcome.branch, &outcome.pushed_sha, force),
             )
             .await;
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({
                 "branch": outcome.branch,
                 "pushedSha": outcome.pushed_sha,
@@ -20310,7 +20354,7 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             // Refresh the FE change view without a follow-up `git.status` read.
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20348,12 +20392,16 @@ impl WorkspaceApi for Services {
                     created
                 })
                 .await?;
-            publish_event(&bus, git_branch_event(&ws.id, "create", &branch_name, None)).await;
+            publish_event(
+                bus.as_ref(),
+                git_branch_event(&ws.id, "create", &branch_name, None),
+            )
+            .await;
             if checkout {
                 let status = intent_git::status::status(&worktree)
                     .unwrap_or_else(|_| intent_git::status::empty_status());
                 let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+                publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             }
             Ok(serde_json::json!({ "branch": branch_name }))
         })
@@ -20389,14 +20437,14 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_branch_event(&ws.id, "checkout", &branch_name, None),
             )
             .await;
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({ "branch": branch_name }))
         })
     }
@@ -20450,7 +20498,7 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_branch_event(&ws.id, "rename", &trimmed_new, Some(&old_branch_name)),
             )
             .await;
@@ -20459,7 +20507,7 @@ impl WorkspaceApi for Services {
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({
                 "oldBranch": old_branch_name,
                 "newBranch": trimmed_new,
@@ -20577,12 +20625,16 @@ impl WorkspaceApi for Services {
                     // shape; `changes:git-status` feeds the FE bridge's
                     // `git:status-changed` relay so the UI refreshes without a
                     // follow-up `git.status` read.
-                    publish_event(&event_bus, git_pull_event(&ws.id, &branch_name)).await;
+                    publish_event(event_bus.as_ref(), git_pull_event(&ws.id, &branch_name)).await;
                     let status = intent_git::status::status(std::path::Path::new(&repo_path))
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(&event_bus, changes_git_status_event(&ws.id, &status_json)).await;
+                    publish_event(
+                        event_bus.as_ref(),
+                        changes_git_status_event(&ws.id, &status_json),
+                    )
+                    .await;
                 }
             }
             Ok(outcome)
@@ -20852,7 +20904,7 @@ impl WorkspaceApi for Services {
                     // the FE bridge's `git:status-changed` relay so the UI
                     // refreshes without a follow-up `git.status` read.
                     publish_event(
-                        &event_bus,
+                        event_bus.as_ref(),
                         git_commit_event(&ws.id, &outcome.hash, &event_message, &outcome.files),
                     )
                     .await;
@@ -20860,7 +20912,11 @@ impl WorkspaceApi for Services {
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(&event_bus, changes_git_status_event(&ws.id, &status_json)).await;
+                    publish_event(
+                        event_bus.as_ref(),
+                        changes_git_status_event(&ws.id, &status_json),
+                    )
+                    .await;
                     Ok(intent_core::GitCommitResult {
                         hash: outcome.hash,
                         files: outcome.files,
@@ -21030,14 +21086,14 @@ impl WorkspaceApi for Services {
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
             // relay so the UI refreshes without a follow-up `git.status` read.
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
             )
             .await;
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
                 files: outcome.files,
@@ -23686,7 +23742,7 @@ impl WorkspaceApi for Services {
                 *slot = None;
             }
             github_auth_ops::delete_stored_token(&secrets).await?;
-            publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
+            publish_event(bus.as_ref(), github_auth_ops::auth_changed_event("revoked")).await;
             if logout_gh {
                 // Detached + fail-soft (same pattern as the login sync): a
                 // logout failure can never fail or delay the revoke.
@@ -24807,7 +24863,7 @@ impl Services {
         if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
-        publish_event(&bus, workspace_updated_event(&ws.id, &changes)).await;
+        publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
         Ok(ws)
     }
 
@@ -25487,7 +25543,7 @@ impl Services {
         ws.active_pull_request = Some(info);
         ws.updated_at = now_iso();
         self.store.update_workspace(&ws).await?;
-        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+        publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
         self.maybe_emit_display_status_changed(workspace_id).await;
 
         let _ = worktree; // attribution move below is workspace-scoped.
@@ -25529,7 +25585,7 @@ impl Services {
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;
-                publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&workspace_id).await;
                 self.ac_move_stage(&workspace_id, "pull_request", "merged")
                     .await;
@@ -25599,7 +25655,7 @@ impl Services {
 
         let status = accept_changes::build_git_status_value(&worktree, &ws)?;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             changes_git_status_event(&workspace_id, &status.clone()),
         )
         .await;
@@ -26337,7 +26393,7 @@ impl Services {
             _ => serde_json::Value::Null,
         };
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
@@ -26356,7 +26412,7 @@ impl Services {
             if let Ok(status) = accept_changes::build_git_status_value_with(worktree, &ws, scanned)
             {
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     changes_git_status_event(workspace_id, &status),
                 )
                 .await;
@@ -26880,8 +26936,8 @@ pub(crate) fn discover_providers_with_npx() -> serde_json::Value {
 /// override flips `installed` / `secondaryResolved`, while `resolvedPath` /
 /// `secondaryResolvedPath` stay auto-detected (a `secondaryResolved: true`
 /// entry can therefore omit `secondaryResolvedPath`).
-pub fn discover_providers_with_npx_overrides(
-    provider_paths: &std::collections::HashMap<String, String>,
+pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
+    provider_paths: &std::collections::HashMap<String, String, S>,
 ) -> serde_json::Value {
     let providers = discovery_cache::discover_providers_cached(provider_paths);
     let npx_status = intent_providers::probe_npx();

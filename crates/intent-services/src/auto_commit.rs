@@ -241,7 +241,7 @@ impl Services {
         let linked_note_id = session.task_note_id.clone();
         // Attempt LLM generation; fall back to deterministic subject on any failure.
         let message = if let Some(msg) = self
-            .generate_auto_commit_message(&worktree_path, &session, &linked_note_id)
+            .generate_auto_commit_message(&worktree_path, &session, linked_note_id.as_ref())
             .await
         {
             msg
@@ -251,7 +251,7 @@ impl Services {
                 workspace = %session.workspace_id.0,
                 "auto-commit using fallback subject"
             );
-            self.build_auto_commit_subject(&session, &linked_note_id)
+            self.build_auto_commit_subject(&session, linked_note_id.as_ref())
                 .await
         };
 
@@ -302,7 +302,7 @@ impl Services {
     pub(crate) async fn build_auto_commit_subject(
         &self,
         session: &AgentSession,
-        linked_note_id: &Option<NoteId>,
+        linked_note_id: Option<&NoteId>,
     ) -> String {
         if let Some(note_id) = linked_note_id {
             if let Ok(note) = self.store().get_note(&session.workspace_id, note_id).await {
@@ -327,7 +327,7 @@ impl Services {
         &self,
         worktree_path: &std::path::Path,
         session: &AgentSession,
-        linked_note_id: &Option<NoteId>,
+        linked_note_id: Option<&NoteId>,
     ) -> Option<String> {
         // Skip generation entirely when there are no uncommitted changes.
         // Use diff_index_to_workdir (includes untracked) since auto-commit

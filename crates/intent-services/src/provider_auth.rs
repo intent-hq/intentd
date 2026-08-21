@@ -367,6 +367,7 @@ impl AuthStatusCache {
         }
     }
 
+    #[allow(clippy::option_option)] // outer = cache freshness, inner = the cached tri-state
     fn fresh(&self, provider_id: &str) -> Option<Option<bool>> {
         let entries = self.entries.lock().expect("auth cache poisoned");
         let (at, value) = entries.get(provider_id)?;
@@ -455,10 +456,10 @@ async fn resolve_auth_status(
 /// # Errors
 ///
 /// Returns an error string when `provider_id` names an unknown provider.
-pub async fn provider_auth_status(
+pub async fn provider_auth_status<S: std::hash::BuildHasher>(
     provider_id: Option<&str>,
     force: bool,
-    provider_paths: &HashMap<String, String>,
+    provider_paths: &HashMap<String, String, S>,
 ) -> Result<Value, String> {
     let selected: Vec<&'static str> = match provider_id {
         Some(requested) => match AUTH_PROBE_PROVIDERS.iter().find(|id| **id == requested) {

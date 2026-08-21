@@ -246,8 +246,8 @@ fn home_dir() -> Option<PathBuf> {
 /// serialized `specialist.list` view (ids + tier-resolved content), so an
 /// event is emitted only when the resolved set actually changed (analogous to
 /// `check_skills_changed`).
-fn specialists_fingerprint(user_dir: &Option<PathBuf>, workspace_path: &Path) -> u64 {
-    let svc = SpecialistsService::new(user_dir.clone(), None);
+fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
+    let svc = SpecialistsService::new(user_dir.cloned(), None);
     let list = svc
         .list(Some(workspace_path))
         .unwrap_or(serde_json::Value::Null);
@@ -272,7 +272,12 @@ async fn debounce_loop(
     // the set as it stood at watcher start (no spurious first event).
     let mut fingerprints: HashMap<WorkspaceId, u64> = workspace_paths
         .iter()
-        .map(|(ws_id, path)| (ws_id.clone(), specialists_fingerprint(&user_dir, path)))
+        .map(|(ws_id, path)| {
+            (
+                ws_id.clone(),
+                specialists_fingerprint(user_dir.as_ref(), path),
+            )
+        })
         .collect();
 
     loop {
@@ -297,7 +302,7 @@ async fn debounce_loop(
                 }
                 Some(SpecialistsMsg::Add(ws_id, path)) => {
                     // Prime the fingerprint like the start-time priming above.
-                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(&user_dir, &path));
+                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path));
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SpecialistsMsg::Remove(ws_id)) => {
@@ -319,12 +324,12 @@ async fn debounce_loop(
                 }
                 None => {
                     // All senders dropped: flush and exit
-                    flush_all(&bus, &workspace_paths, &user_dir, &mut fingerprints, &mut pending).await;
+                    flush_all(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
                     return;
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
-                flush_due(&bus, &workspace_paths, &user_dir, &mut fingerprints, &mut pending).await;
+                flush_due(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
             }
         }
     }
@@ -333,7 +338,7 @@ async fn debounce_loop(
 async fn flush_due(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
-    user_dir: &Option<PathBuf>,
+    user_dir: Option<&PathBuf>,
     fingerprints: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
@@ -355,7 +360,7 @@ async fn flush_due(
 async fn flush_all(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
-    user_dir: &Option<PathBuf>,
+    user_dir: Option<&PathBuf>,
     fingerprints: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
@@ -371,7 +376,7 @@ async fn emit_specialists_changed(
     bus: &EventBus,
     workspace_id: &WorkspaceId,
     workspace_path: &Path,
-    user_dir: &Option<PathBuf>,
+    user_dir: Option<&PathBuf>,
     fingerprints: &mut HashMap<WorkspaceId, u64>,
 ) {
     // Re-resolve the set to check if it actually changed

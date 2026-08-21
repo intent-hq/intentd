@@ -696,6 +696,9 @@ impl Default for HooksSettings {
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
 /// (`agentFeatures.*`). All default **on** except `taskGraph` (opt-in);
 /// changes apply to new agent sessions only.
+// One bool per independent settings toggle; the flat shape IS the settings
+// file contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {

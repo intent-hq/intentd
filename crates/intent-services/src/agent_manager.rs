@@ -4509,6 +4509,7 @@ impl AgentManager {
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
     /// removed `agent_ws` entry.
+    #[allow(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
         let mut busy = self.busy.lock().unwrap();
         if !busy.remove(agent_id) {
@@ -4739,7 +4740,7 @@ impl AgentManager {
                 "isActive": is_active,
             }),
         };
-        crate::publish_event(&self.services.event_bus, event).await;
+        crate::publish_event(self.services.event_bus.as_ref(), event).await;
         // Schedule debounced lastActivity event (§10.1).
         self.services
             .schedule_last_activity_event(workspace_id.clone());
@@ -4751,6 +4752,7 @@ impl AgentManager {
     /// untouched, `Some(None)` clears it, `Some(Some(reason))` sets it. All failures
     /// are logged and swallowed: the runtime turn is the source of truth and a
     /// transient store/bus error must not abort the in-flight slot transition.
+    #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
         agent_id: &AgentId,
@@ -4812,7 +4814,7 @@ impl AgentManager {
             metadata: None,
             data,
         };
-        crate::publish_event(&self.services.event_bus, event).await;
+        crate::publish_event(self.services.event_bus.as_ref(), event).await;
         // Schedule debounced lastActivity event (§10.1).
         self.services
             .schedule_last_activity_event(workspace_id.clone());
@@ -9933,7 +9935,7 @@ async fn publish_error_status_and_requeue(
             metadata: None,
             data,
         };
-        crate::publish_event(&mgr.services.event_bus, event).await;
+        crate::publish_event(mgr.services.event_bus.as_ref(), event).await;
     }
 
     // Requeue the failed message to the front of the queue. `persisted`

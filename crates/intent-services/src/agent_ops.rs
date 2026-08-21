@@ -691,6 +691,9 @@ fn ensure_provider_available(
 /// (write-through persistence; see [`Services::persist_queue_snapshot`]). The
 /// bool fields take `#[serde(default)]` so older payloads missing a later
 /// flag still rehydrate.
+// The independent bool flags ARE the durable payload shape; grouping them
+// would break persisted-payload rehydration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
@@ -2552,7 +2555,7 @@ impl Services {
         data: Value,
     ) {
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             intent_store::NewEvent {
                 workspace_id: workspace_id.clone(),
                 timestamp: now_iso(),
@@ -3340,7 +3343,7 @@ impl Services {
         self.remove_event_subscriptions_for_agent(&agent_id).await;
         if let Some((workspace_id, agent_name)) = session_meta {
             crate::publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 intent_store::NewEvent {
                     workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
@@ -3433,7 +3436,7 @@ impl Services {
             return Ok(existing);
         }
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             crate::agent_delete_scheduled_event(&session_ws, &agent_id, &delete_at),
         )
         .await;
@@ -3468,7 +3471,7 @@ impl Services {
         let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
         if cancelled {
             crate::publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 crate::agent_delete_cancelled_event(&session_ws, &agent_id),
             )
             .await;
@@ -5288,7 +5291,7 @@ impl Services {
             return;
         }
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             intent_store::NewEvent {
                 workspace_id: session.workspace_id.clone(),
                 timestamp: now_iso(),
@@ -6978,7 +6981,7 @@ impl Services {
 
                 // Emit sandbox:cow:created event
                 crate::publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     intent_store::NewEvent {
                         workspace_id: workspace_id.clone(),
                         timestamp: crate::now_iso(),
@@ -10425,7 +10428,7 @@ impl Services {
                 "queue": queue,
             }),
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// Publish `agent:queue:processing` for a queue entry the drain loop just
@@ -10463,7 +10466,7 @@ impl Services {
             metadata: None,
             data,
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// `agent.wakeOrCreate` wiring for

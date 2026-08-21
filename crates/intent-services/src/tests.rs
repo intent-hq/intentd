@@ -9997,6 +9997,8 @@ mod pr {
     use super::{workspace, TempDb};
     use crate::Services;
 
+    // Test stub: one independent bool per scripted scenario.
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(Default)]
     struct StubForge {
         fail_threads: bool,

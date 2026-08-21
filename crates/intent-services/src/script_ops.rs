@@ -289,7 +289,7 @@ impl ScriptManager {
             },
         );
         publish_event(
-            &self.bus,
+            self.bus.as_ref(),
             script_event(
                 &workspace_id,
                 SCRIPT_CHANGED,
@@ -504,7 +504,7 @@ impl ScriptManager {
         }
         self.store.remove_script(script_id).await?;
         publish_event(
-            &self.bus,
+            self.bus.as_ref(),
             script_event(
                 workspace_id,
                 SCRIPT_CHANGED,
@@ -855,7 +855,7 @@ impl ScriptManager {
                 return Err(e);
             }
         };
-        let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, &cwd)) {
+        let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
@@ -947,7 +947,7 @@ impl ScriptManager {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
-            let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, &cwd)) {
+            let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
                 Ok(id) => id,
                 Err(e) => {
                     self.fail(&ws, &script_id, generation, &e.to_string()).await;
@@ -1258,7 +1258,7 @@ impl ScriptManager {
     fn emit_output(&self, ws: &WorkspaceId, script_id: &str, bytes: &[u8]) {
         let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
         publish_event_transient(
-            &self.bus,
+            self.bus.as_ref(),
             &script_event(
                 ws,
                 SCRIPT_OUTPUT,
@@ -1274,7 +1274,7 @@ impl ScriptManager {
         if let Value::Object(ref mut map) = data {
             map.insert("scriptId".to_string(), json!(script_id));
         }
-        publish_event(&self.bus, script_event(ws, SCRIPT_STATE, data)).await;
+        publish_event(self.bus.as_ref(), script_event(ws, SCRIPT_STATE, data)).await;
     }
 
     /// Stream a synthetic separator line (e.g. restart notices) as `script:output`.
@@ -1308,11 +1308,11 @@ impl ScriptManager {
     /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + script env overlay,
     /// with an inherited `npm_config_prefix` scrubbed so nvm's login-shell init
     /// succeeds. An explicit script env value is preserved.
-    fn build_spec(ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
+    fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
-        spec.cwd.clone_from(cwd);
+        spec.cwd = cwd.cloned();
         spec.env = spawn_env_overlay(def.env.as_ref());
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;

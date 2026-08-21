@@ -253,8 +253,8 @@ fn truncate_middle(s: &str, max: usize) -> String {
 fn dispatch(
     value: &Value,
     pending: &PendingMap,
-    requests: &Option<mpsc::UnboundedSender<IncomingRequest>>,
-    notifications: &Option<mpsc::UnboundedSender<IncomingNotification>>,
+    requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
+    notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
     response_seq: &AtomicU64,
     response_notify: &Notify,
     client_request_seq: &AtomicU64,
@@ -380,8 +380,8 @@ impl Connection {
                     Ok(value) => dispatch(
                         &value,
                         &pending_reader,
-                        &requests,
-                        &notifications,
+                        requests.as_ref(),
+                        notifications.as_ref(),
                         &seq_reader,
                         &notify_reader,
                         &client_req_seq_reader,

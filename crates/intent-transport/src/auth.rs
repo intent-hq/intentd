@@ -107,6 +107,9 @@ struct TokenState {
 
 /// The cache slot: either an in-flight load that later resolvers can wait on,
 /// or a resolved value valid until `expires_at`.
+// Watch channels carry `Option<Option<String>>`: outer `None` = not yet
+// published, inner `Option` = the loaded token (which may be absent).
+#[allow(clippy::option_option)]
 enum Entry {
     /// A blocking load is in progress. `rx` receives `Some(value)` when the
     /// `spawn_blocking` task finishes; `started_at` lets late waiters shrink
@@ -254,6 +257,7 @@ impl AsyncTokenStore {
     /// overwrite a slot that an intervening `store_token` / newer load
     /// already refreshed: the write only happens if the slot is still the
     /// `InFlight` tagged with `load_id`.
+    #[allow(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
     fn spawn_load(&self, tx: watch::Sender<Option<Option<String>>>, load_id: u64) {
         let inner = self.inner.clone();
         let state = self.state.clone();
@@ -288,6 +292,7 @@ impl AsyncTokenStore {
     /// timeout return `None` (the current caller gives up but the underlying
     /// blocking task keeps running and will populate the cache when it
     /// eventually completes, subject to the generation guard).
+    #[allow(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
     async fn await_load(
         &self,
         rx: &mut watch::Receiver<Option<Option<String>>>,
@@ -343,6 +348,7 @@ impl AsyncTokenStore {
 }
 
 /// Internal choice returned by the entry probe in [`AsyncTokenStore::load_token`].
+#[allow(clippy::option_option)] // watch payload: unpublished vs loaded-None (see `Entry`)
 enum LoadAction {
     /// A load is already in flight; wait on the existing receiver.
     Wait {

@@ -98,6 +98,9 @@ pub enum InjectionMechanism {
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
 /// intentionally omitted — they are Electron IPC / renderer concerns and are
 /// not part of the §6.9 field list.
+// Static registry entries port the TS `ACPProviderConfig` field-for-field;
+// the independent capability bools stay flat for parity.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderConfig {
     /// Unique identifier (e.g., `auggie`, `opencode`).

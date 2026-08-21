@@ -761,7 +761,7 @@ async fn workspace_host_dispatch(
     if let Some(v) = super::bindings::try_dispatch(
         &api,
         &workspace_id,
-        &caller_agent_id,
+        caller_agent_id.as_ref(),
         turn_attachments.as_ref(),
         agent_features,
         is_sub_agent,

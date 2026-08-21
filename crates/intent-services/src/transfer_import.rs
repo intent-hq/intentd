@@ -531,12 +531,12 @@ impl Services {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
         let ws = self.store.get_workspace(&workspace_id).await?;
-        publish_event(&self.event_bus, workspace_created_event(&ws)).await;
+        publish_event(self.event_bus.as_ref(), workspace_created_event(&ws)).await;
         // Imports run no setup stage: publish the completion immediately so
         // the watcher registry starts this workspace's watchers instead of
         // holding the deferred start until the setup backstop expires.
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             workspace_setup_completed_event(&workspace_id, false, None),
         )
         .await;

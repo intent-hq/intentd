@@ -126,7 +126,7 @@ fn stringify_js_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-fn bind_host<'js>(ctx: &rquickjs::Ctx<'js>, host: HostFn) -> rquickjs::Result<()> {
+fn bind_host(ctx: &rquickjs::Ctx<'_>, host: HostFn) -> rquickjs::Result<()> {
     let host_arc = host;
     let host_raw = Function::new(
         ctx.clone(),

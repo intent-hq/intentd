@@ -376,13 +376,12 @@ fn batch_preview_col_values(messages: &[OwnedBatchMessage]) -> Result<BatchPrevi
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
-fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
-    v.as_ref()
-        .map(|value| {
-            serde_json::to_string(value)
-                .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
-        })
-        .transpose()
+fn json_col_to_db(v: Option<&serde_json::Value>) -> Result<Option<String>> {
+    v.map(|value| {
+        serde_json::to_string(value)
+            .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
+    })
+    .transpose()
 }
 
 /// Decode an optional JSON payload column back into its `serde_json::Value`.
@@ -398,9 +397,8 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
 /// staying NULL. `serde_json` string-array encoding is deterministic, so the
 /// encoded form doubles as the change-detection comparand in
 /// [`Store::set_agent_effort_levels`].
-fn effort_levels_to_db(levels: &Option<Vec<String>>) -> Result<Option<String>> {
+fn effort_levels_to_db(levels: Option<&Vec<String>>) -> Result<Option<String>> {
     levels
-        .as_ref()
         .map(|v| {
             serde_json::to_string(v)
                 .map_err(|e| Error::Internal(format!("encode effort_levels failed: {e}")))
@@ -452,9 +450,9 @@ fn bind_session_insert<'q>(
         .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
-        .bind(json_col_to_db(&s.context_references)?)
-        .bind(json_col_to_db(&s.image_blocks)?)
-        .bind(json_col_to_db(&s.file_blocks)?)
+        .bind(json_col_to_db(s.context_references.as_ref())?)
+        .bind(json_col_to_db(s.image_blocks.as_ref())?)
+        .bind(json_col_to_db(s.file_blocks.as_ref())?)
         .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
@@ -463,10 +461,10 @@ fn bind_session_insert<'q>(
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
-        .bind(effort_levels_to_db(&s.effort_levels)?)
+        .bind(effort_levels_to_db(s.effort_levels.as_ref())?)
         .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
-        .bind(json_col_to_db(&s.harness_features)?))
+        .bind(json_col_to_db(s.harness_features.as_ref())?))
 }
 
 impl Store {
@@ -1421,9 +1419,9 @@ impl Store {
         .bind(&s.completion_report_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
-        .bind(json_col_to_db(&s.context_references)?)
-        .bind(json_col_to_db(&s.image_blocks)?)
-        .bind(json_col_to_db(&s.file_blocks)?)
+        .bind(json_col_to_db(s.context_references.as_ref())?)
+        .bind(json_col_to_db(s.image_blocks.as_ref())?)
+        .bind(json_col_to_db(s.file_blocks.as_ref())?)
         .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
@@ -1910,7 +1908,7 @@ impl Store {
         levels: Option<&[String]>,
         updated_at: &str,
     ) -> Result<bool> {
-        let encoded = effort_levels_to_db(&levels.map(<[String]>::to_vec))?;
+        let encoded = effort_levels_to_db(levels.map(<[String]>::to_vec).as_ref())?;
         let rows = sqlx::query(
             "UPDATE agent_session SET effort_levels=?, updated_at=? \
              WHERE id=? AND workspace_id=? AND effort_levels IS NOT ?",

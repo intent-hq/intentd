@@ -1878,7 +1878,7 @@ impl Services {
             metadata: None,
             data,
         };
-        publish_event(&self.event_bus, event).await;
+        publish_event(self.event_bus.as_ref(), event).await;
     }
 }
 
