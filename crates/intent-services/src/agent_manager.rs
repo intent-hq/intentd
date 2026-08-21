@@ -1393,6 +1393,11 @@ impl ProcessRegistry {
 
     /// Evict idle processes in LRU order (the idle-reap hook; full
     /// timer/memory-pressure triggering is M5). Returns the number evicted.
+    ///
+    /// Emits no `agent:process:evicted` — currently caller-less in
+    /// production; add the emit (with an appropriate reason) before wiring a
+    /// production caller, or its evictions are invisible to clients
+    /// (the monorepo#3040 gap).
     pub(crate) async fn evict_idle(&self, max: Option<usize>) -> usize {
         let max = max.unwrap_or(usize::MAX);
         let mut evicted = 0;

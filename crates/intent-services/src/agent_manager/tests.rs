@@ -1712,8 +1712,11 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
     assert_eq!(ev.data["reason"], "idle-ttl", "TTL sweep eviction reason");
 
     // A user send to the reaped agent restores: the RPC succeeds, the user
-    // row is persisted (nothing silently dropped), and the turn slot is
-    // claimed — the spawned worker respawns the child on demand.
+    // row is persisted (nothing silently dropped), and `queued == false`
+    // proves `try_begin` won the turn slot (restore path engaged) — the
+    // spawned worker respawns the child on demand. No `is_busy` assertion
+    // here: the worker's spawn attempt fails in this env and releases the
+    // slot, so reading it after the send races that release (#1356 review).
     let result = mgr
         .send_message(
             id.clone(),
@@ -1745,10 +1748,6 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
             .iter()
             .any(|m| m.role == "user" && m.content.to_string().contains("are you still there?")),
         "the post-reap send's user row is persisted, not dropped"
-    );
-    assert!(
-        mgr.is_busy(&id),
-        "the turn worker claimed the slot (restore path engaged)"
     );
 }
 
