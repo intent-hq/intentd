@@ -34,6 +34,9 @@
 #
 #   INTENTD_AUTO_RESUME=auto|on|off  (or --auto-resume=<value>, on direct runs)
 #
+# The prompt and both of those accept the obvious yes/no spellings for on/off
+# (y/yes/true, n/no/false), in any case.
+#
 # The release channel the daemon is installed from — and updated on — defaults
 # to stable. Choose another with:
 #
@@ -186,14 +189,23 @@ Fix the cause reported above, then start it again with:
   warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
 }
 
-# Lowercase a flag/env auto-resume value so validation is case-insensitive,
-# matching the interactive prompt (and install.ps1).
+# Normalize an auto-resume value from the flag, the env var, or the prompt:
+# lowercase it so matching is case-insensitive, and fold the unambiguous
+# yes/no spellings onto the canonical on/off — the question reads as a yes/no
+# question, so `no` must mean off rather than being rejected in favour of the
+# opposite default. Anything else passes through lowercased, for
+# validate_auto_resume or the prompt to reject.
 normalize_auto_resume() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+  auto_resume_lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$auto_resume_lower" in
+    y | yes | true) printf 'on' ;;
+    n | no | false) printf 'off' ;;
+    *) printf '%s' "$auto_resume_lower" ;;
+  esac
 }
 
 # Fail fast on a bogus auto-resume value from the flag or env var
-# (already lowercased via normalize_auto_resume).
+# (already lowercased and folded via normalize_auto_resume).
 validate_auto_resume() {
   case "$1" in
     auto | on | off) ;;
@@ -599,18 +611,28 @@ main() {
     fi
     if [ -z "$auto_resume" ]; then
       if (exec </dev/tty) 2>/dev/null; then
-        printf 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto) ' >/dev/tty
-        reply=""
-        read -r reply </dev/tty || reply=""
-        case "$reply" in
-          [Oo][Nn]) auto_resume="on" ;;
-          [Oo][Ff][Ff]) auto_resume="off" ;;
-          '' | [Aa][Uu][Tt][Oo]) auto_resume="auto" ;;
-          *)
-            warn "unrecognized answer '$reply' — keeping the default (auto)"
-            auto_resume="auto"
-            ;;
-        esac
+        # Ask again on an answer we genuinely cannot read, rather than
+        # silently installing the default the answer may have been rejecting.
+        # Bounded, and an empty answer (including EOF, which read reports by
+        # leaving reply empty) still takes the default, so a scripted or
+        # garbage-fed terminal cannot hold the install open.
+        auto_resume_tries=0
+        while [ -z "$auto_resume" ] && [ "$auto_resume_tries" -lt 3 ]; do
+          auto_resume_tries=$((auto_resume_tries + 1))
+          printf 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto) ' >/dev/tty
+          reply=""
+          read -r reply </dev/tty || reply=""
+          case "$(normalize_auto_resume "$reply")" in
+            '' | auto) auto_resume="auto" ;;
+            on) auto_resume="on" ;;
+            off) auto_resume="off" ;;
+            *) warn "unrecognized answer '$reply' — answer auto, on, or off (yes/no also work)" ;;
+          esac
+        done
+        if [ -z "$auto_resume" ]; then
+          warn "still no recognized answer — keeping the default (auto)"
+          auto_resume="auto"
+        fi
       else
         auto_resume="auto"
       fi
