@@ -290,10 +290,10 @@ fn classified(detail: &str) -> Option<CloneErrorCategory> {
 /// environment. Factored out of [`run_clone`] so tests can assert the
 /// secret-safety invariants directly — the token (when usable) is offered via
 /// the shared [`intent_git::auth::scoped_credential_env`] builder: a
-/// github.com-scoped helper carried in `GIT_CONFIG_PARAMETERS` (appended after
-/// `inherited_config_parameters` so existing setups keep winning) whose config
-/// string carries no token bytes, with the value travelling through
-/// [`intent_git::auth::TOKEN_ENV`] only (monorepo#825, monorepo#884).
+/// github.com-scoped helper carried in `GIT_CONFIG_PARAMETERS` (ordered ahead
+/// of the configured helpers, which stay reachable behind it — monorepo#3059)
+/// whose config string carries no token bytes, with the value travelling
+/// through [`intent_git::auth::TOKEN_ENV`] only (monorepo#825, monorepo#884).
 fn build_clone_command(
     url: &str,
     target_path: &Path,
@@ -1453,7 +1453,7 @@ mod tests {
             .expect("GIT_CONFIG_PARAMETERS must be set");
         assert!(
             params.starts_with("'foo.bar=baz' "),
-            "inherited entries keep precedence: {params}"
+            "inherited entries are preserved verbatim: {params}"
         );
         assert!(params.contains("credential.https://github.com.helper="));
     }
