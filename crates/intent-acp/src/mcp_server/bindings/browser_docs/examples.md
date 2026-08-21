@@ -15,8 +15,8 @@ when targeting `http://daemon.localhost:8000`:
   ]
 }
 // A matching result may show the rewritten finalUrl instead of the requested alias.
-// Each tab carries its owner and sizing info:
-// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, ... }
+// Each tab carries its owner, sizing, and visibility info:
+// { tabId: "tab-abc123", url: "http://127.0.0.1:8000/", ownerAgentId: "<your-agent-id>", mode: "emulated", width: 1280, height: 800, visibility: "visible", ... }
 
 {
   "actions": [
@@ -45,7 +45,7 @@ Tabs are agent-owned: you can only manipulate tabs you own. To work in an unowne
   ]
 }
 // → tabs with ownerAgentId: null and native sizing:
-// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", ... }
+// { tabId: "tab-user1", url: "http://localhost:5173/", ownerAgentId: null, mode: "native", visibility: "visible", ... }
 
 // Claim it — atomic, first-claim-wins; ownership transfer and viewport emulation
 // at the given size happen in one step
@@ -85,6 +85,49 @@ creation; defaults 1280×800 when omitted):
   ]
 }
 ```
+
+## Hidden Tabs and Revealing Them
+
+Agent-issued `openTab` creates the tab hidden by default — alive, emulated, and fully
+usable (screenshot / evaluate / navigate) without appearing in the user's panel layout:
+
+```json
+// Hidden (default): work in the background without disturbing the user
+{
+  "actions": [
+    { "action": "openTab", "url": "http://localhost:5173" },
+    { "action": "screenshot" }
+  ]
+}
+// listTabs shows the tab with visibility: "hidden":
+// { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", ... }
+
+// Reveal it when the user should see it — mounted without stealing focus
+{
+  "actions": [
+    { "action": "showTab", "tabId": "tab-bg1" }
+  ]
+}
+
+// Reveal AND activate (explicit opt-in to moving focus)
+{
+  "actions": [
+    { "action": "showTab", "tabId": "tab-bg1", "focus": true }
+  ]
+}
+
+// Or open directly into the UI in the first place
+{
+  "actions": [
+    { "action": "openTab", "url": "http://localhost:5173", "visible": true }
+  ]
+}
+```
+
+`showTab` is owner-only (`not-owner` on a tab you do not own) and idempotent on an
+already-visible tab (`focus: true` still activates it); an unknown `tabId` fails as an
+action-result error. `focusTab` keeps its visible-tab semantics and fails on a hidden
+tab with an error pointing at `showTab`.
 
 ## Opening Local HTML Files
 
