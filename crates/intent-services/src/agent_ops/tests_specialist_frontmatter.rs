@@ -43,6 +43,20 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
+    // monorepo#3044: creation requires a resolvable provider (no positional
+    // fallback) — seed the pre-existing effective default explicitly. The
+    // `providers.paths` override points auggie at a deterministic executable
+    // so the delegate path's availability check passes without the real
+    // binary on the test host.
+    registry
+        .apply(&[
+            ("providers.active".into(), serde_json::json!("auggie")),
+            (
+                "providers.paths".into(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
+        .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(

@@ -99,7 +99,7 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".config.toml"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
         }
     }
@@ -110,7 +110,18 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    // monorepo#3044: delegation requires a resolvable provider (no positional
+    // fallback) — seed a configured default with a deterministic
+    // `providers.paths` override so availability checks pass hermetically.
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[
+            ("providers.active".into(), json!("auggie")),
+            ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+        ])
+        .expect("seed default provider");
+    let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 

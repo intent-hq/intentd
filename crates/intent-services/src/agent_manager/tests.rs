@@ -3246,7 +3246,10 @@ async fn seed_agent_with_task_graph(
         model: None,
         reasoning_effort: None,
         effort_levels: None,
-        provider: None,
+        // Pinned explicitly: seeded sessions predate monorepo#3044, when a
+        // `None` provider still resolved positionally to auggie; resolution
+        // now fails loudly with no provider and no configured default.
+        provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
         status: AgentStatus::Pending,
@@ -4656,14 +4659,15 @@ async fn set_session_provider(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
 }
 
 /// Slug-shaped workspace title on an agent's first turn → the naming instruction
-/// is prepended as a `<system>` block naming the daemon MCP tool as the default
-/// provider (auggie) surfaces it (`set_workspace_title_workspace-mcp`), not the
-/// FE `workspace_api` surface.
+/// is prepended as a `<system>` block naming the daemon MCP tool as the
+/// session's provider (auggie) surfaces it (`set_workspace_title_workspace-mcp`),
+/// not the FE `workspace_api` surface.
 #[tokio::test]
 async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
     let (_tmp, mgr) = manager().await;
     let (ws, id) = (WorkspaceId::from("ws-slug"), AgentId::from("a-slug"));
     seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    set_session_provider(&mgr, &ws, &id, "auggie").await;
     // Persist the current user turn so `build_turn_prompt` sees the "first
     // turn" shape (one user message, zero assistant messages).
     mgr.services
@@ -4708,6 +4712,7 @@ async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
     let (_tmp, mgr) = manager().await;
     let (ws, id) = (WorkspaceId::from("ws-empty"), AgentId::from("a-empty"));
     seed_agent_with_title(&mgr, &ws, &id, "").await;
+    set_session_provider(&mgr, &ws, &id, "auggie").await;
     mgr.services
         .store
         .append_agent_message(
@@ -10857,18 +10862,37 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 
 // --- resolve_spawn ------------------------------------------------------------
 
-/// A bare session with no `provider`/`model` resolves to the default ACP
-/// provider (auggie), no model, and the temp dir as cwd (no workspace path).
+/// Regression (monorepo#3044): a bare session with no `provider`/`model` and
+/// no settings-derived default fails loudly instead of silently spawning the
+/// positional first registered provider (auggie), which may not be installed.
 #[tokio::test]
-async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
+async fn resolve_spawn_without_provider_or_default_fails_loudly() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
+    let err = match resolve_spawn(&session, None, &settings, None) {
+        Ok(_) => panic!("no provider, no model, no configured default must not resolve"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m)
+            if m.contains("no default provider/model is configured")),
+        "loud no-default error, got: {err:?}"
+    );
+}
+
+/// A bare session with no `provider`/`model` resolves via the settings-derived
+/// default (`providers.active`), no model, and the temp dir as cwd (no
+/// workspace path).
+#[tokio::test]
+async fn resolve_spawn_uses_configured_default_and_temp_cwd() {
+    let mut settings = intent_core::settings_file::SettingsFile::default();
+    settings.providers.active = Some("mock".to_string());
+    let session = session_with_specialist(None);
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/mock-agent.js")]);
     let resolved = resolve_spawn(&session, None, &settings, None).expect("default resolves");
-    assert_eq!(resolved.provider.id, intent_providers::first_provider_id());
+    assert_eq!(resolved.provider.id, "mock");
     assert!(resolved.model.is_none(), "no model selected");
-    assert!(resolved.extra_env.is_empty());
     assert_eq!(resolved.cwd, std::env::temp_dir());
-    // provider_binary may or may not be resolved depending on what's installed
 }
 
 /// A persisted effective-model display name (legacy pre-monorepo#1534 row,
@@ -10996,7 +11020,8 @@ async fn resolve_spawn_session_provider_fallback_for_bare_model() {
 #[tokio::test]
 async fn resolve_spawn_prefers_existing_workspace_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
-    let session = session_with_specialist(None);
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
     let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&ws_dir).unwrap();
     let mut workspace = intent_core::Workspace {
@@ -11067,7 +11092,8 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
 #[tokio::test]
 async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let settings = intent_core::settings_file::SettingsFile::default();
-    let session = session_with_specialist(None);
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
     let chief = intent_core::chief_workspace();
 
     // Fresh (not-yet-created) chief cwd root → created on demand and used.
@@ -11110,7 +11136,8 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
 #[tokio::test]
 async fn resolve_spawn_falls_back_to_repository_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
-    let session = session_with_specialist(None);
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
     let repo_dir = std::env::temp_dir().join(format!("intentd-rs-repo-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&repo_dir).unwrap();
     let mut workspace = intent_core::Workspace {
