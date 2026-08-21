@@ -445,6 +445,10 @@ impl PtyHost {
     /// # Errors
     ///
     /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn try_exit(&self, id: PtyId) -> Result<Option<PtyExit>> {
         let session = self.get(id)?;
         Ok(observe_exit(&session))
@@ -462,6 +466,10 @@ impl PtyHost {
     /// # Errors
     ///
     /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
         let session = self.get(id)?;
         loop {
@@ -513,6 +521,10 @@ impl PtyHost {
     /// # Errors
     ///
     /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the session has no process id or delivering the signal fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn signal(&self, id: PtyId, sig: PtySignal) -> Result<()> {
         let session = self.get(id)?;
         #[cfg(unix)]
@@ -609,6 +621,10 @@ impl PtyHost {
     /// and latched exit status remain readable. No-op when the session is
     /// unknown, the child is still running (the group is legitimately
     /// alive), or the group is already empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn reap_group_stragglers(&self, id: PtyId) {
         let Ok(session) = self.get(id) else { return };
         #[cfg(unix)]

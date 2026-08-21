@@ -257,7 +257,7 @@ pub fn diff_head_to_index(repo_path: &Path) -> Result<Vec<FileDiff>> {
 ///
 /// # Errors
 ///
-/// Returns `Error::Internal` if `base_ref` cannot be resolved or another libgit2 operation fails.
+/// Returns `Error::Internal` if the repository cannot be opened or another libgit2 operation fails. An unresolvable `base_ref` or `HEAD` is not an error — it yields an empty vec.
 pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
@@ -330,7 +330,7 @@ pub fn diff_index_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> 
 ///
 /// # Errors
 ///
-/// Returns `Error::Internal` if either side of the range cannot be resolved or another libgit2 operation fails.
+/// Returns `Error::Internal` if the repository cannot be opened or another libgit2 operation fails. An unresolvable `from_sha` or `to_ref` is not an error — it yields an empty vec.
 pub fn diff_two_dot(repo_path: &Path, from_sha: &str, to_ref: &str) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Ok(from_obj) = repo.revparse_single(from_sha) else {

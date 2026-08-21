@@ -273,7 +273,7 @@ impl SettingsRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the config file cannot be read or parsed.
+    /// Returns `Error::InvalidInput` if the config file is malformed (fails to parse or validate in [`SettingsFile::load_or_init_with_legacy`]); `Error::Internal` if the file cannot be read or initialized.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let (file, legacy) = SettingsFile::load_or_init_with_legacy(&path)?;
@@ -464,7 +464,7 @@ impl SettingsRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` for an unknown setting path or an invalid value.
+    /// Returns `Error::InvalidParams` for an unknown setting path or an invalid value; `Error::Internal` if the atomic config rewrite fails.
     ///
     /// # Panics
     ///

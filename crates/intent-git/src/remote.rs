@@ -110,7 +110,7 @@ pub fn remote_tracking_exists(worktree_path: &Path, remote: &str, branch: &str) 
 ///
 /// # Errors
 ///
-/// Returns `Error::Internal` if `base_ref` or `HEAD` cannot be resolved or the ahead/behind computation fails.
+/// Returns `Error::Internal` if the repository cannot be opened or the ahead/behind computation fails. An unresolvable `base_ref` or `HEAD` is not an error — it yields `(0, 0)`.
 pub fn ahead_behind(worktree_path: &Path, base_ref: &str) -> Result<(i64, i64)> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {

@@ -73,7 +73,7 @@ pub(crate) fn create_worktree(repo_path: &Path, name: &str, worktree_path: &Path
 ///
 /// # Errors
 ///
-/// Returns [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::Internal` if the branch or worktree cannot be created.
+/// Returns [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::InvalidParams` if `branch` is already checked out in another worktree; `Error::Internal` if the branch or worktree cannot otherwise be created.
 pub fn provision_worktree(
     repo_path: &Path,
     name: &str,

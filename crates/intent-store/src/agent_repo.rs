@@ -473,12 +473,6 @@ impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
     /// append messages via [`Store::append_agent_message`].
     ///
-    /// A UNIQUE violation on the id (a concurrent create raced past the
-    /// service-layer availability precheck) is `Error::InvalidParams` naming
-    /// the id — the same `-32602` contract as the precheck — so the
-    /// duplicate-id behavior stays robust under concurrency instead of
-    /// degrading to an opaque `-32603`.
-    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.

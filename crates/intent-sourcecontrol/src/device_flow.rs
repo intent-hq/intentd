@@ -168,7 +168,7 @@ impl DeviceFlow {
     ///
     /// # Errors
     ///
-    /// Returns an error when the token request fails, the grant is denied or expired, or persisting the token to the secret store fails.
+    /// Returns an error when the token request fails, the response cannot be classified, or persisting the token to the secret store fails. Grant expiration and denial are not errors — they are reported as [`PollStatus::Expired`] and [`PollStatus::Denied`].
     pub async fn poll_once(&mut self) -> Result<PollStatus> {
         // GitHub's device-token endpoint reports pending/slow_down/expired/
         // denied as an `error` code in an HTTP 200 body. octocrab's
