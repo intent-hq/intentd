@@ -131,7 +131,7 @@ impl FlightFollower {
 
     pub(crate) async fn result(&mut self) -> Option<SharedStatusResult> {
         self.result
-            .wait_for(|slot| slot.is_some())
+            .wait_for(Option::is_some)
             .await
             .ok()
             .map(|slot| slot.clone().expect("wait_for guarantees Some"))

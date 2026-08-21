@@ -246,26 +246,22 @@ impl GitStatusCache {
                         worktree = %key.display(),
                         "git status: coalesced into in-flight worktree scan"
                     );
-                    match follower.result().await {
-                        Some(published) => {
-                            let result = match published {
-                                Ok(shared) => Ok(shared),
-                                Err(msg) => Err(Error::Internal(msg)),
-                            };
-                            let generation = follower.generation();
-                            if minimum_generation.is_some_and(|minimum| {
-                                generation < minimum || self.generation(key) != generation
-                            }) {
-                                follower.wait_for_retirement().await;
-                                continue;
-                            }
-                            return result;
+                    if let Some(published) = follower.result().await {
+                        let result = match published {
+                            Ok(shared) => Ok(shared),
+                            Err(msg) => Err(Error::Internal(msg)),
+                        };
+                        let generation = follower.generation();
+                        if minimum_generation.is_some_and(|minimum| {
+                            generation < minimum || self.generation(key) != generation
+                        }) {
+                            follower.wait_for_retirement().await;
+                            continue;
                         }
-                        // The leader vanished without publishing (cancelled
-                        // RPC / panicked scan): retry — the next join elects a
-                        // new leader.
-                        None => continue,
+                        return result;
                     }
+                    // The leader vanished without publishing (cancelled RPC /
+                    // panicked scan): retry — the next join elects a new leader.
                 }
             }
         }
