@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.7.32"
+version = "0.7.33"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "SQLite + file-tree persistence (repositories, migrations, locking)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.7.32" }
+intent-core = { path = "../intent-core", version = "0.7.33" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
