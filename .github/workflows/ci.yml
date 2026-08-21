@@ -137,12 +137,14 @@ jobs:
       # any age window (the 2026-08-20/08-21 exhaustions: 0 GiB free, every
       # dir <2 days old, so the stale pass freed nothing and could only
       # fail) — LRU-evict idle dirs regardless of age until this job's need
-      # is met, the same policy as tinybox-prune.yml's LRU pass and the
-      # emergency purge that recovered both incidents (intentd run
-      # 32447747968). Rails in both tiers: never anything outside
-      # /raid/ci-target (shared caches like ~/.cargo and ~/.rustup are
-      # untouched), never a dir this job may use, and recursive-mtime
-      # freshness/activity checks so a live job's dir is never deleted.
+      # is met — the same rails as tinybox-prune.yml's LRU pass, ordered
+      # like the emergency purge that recovered both incidents (intentd
+      # run 32447747968): by the dir's own top-level mtime, not the
+      # prune's recursive last-activity key. Rails in both tiers: never
+      # anything outside /raid/ci-target (shared caches like ~/.cargo and
+      # ~/.rustup are untouched), never a dir this job may use, and
+      # recursive-mtime freshness/activity checks so a dir a live job is
+      # writing to is not deleted.
       # Fails with an actionable message if space is still short.
       # Thresholds: 10 GiB here (small target dir with debuginfo off),
       # 30 GiB for the instrumented coverage jobs. Exact no-op on burst
@@ -167,20 +169,30 @@ jobs:
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
             # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            # `|| true` keeps a dir vanishing mid-check (find) or another
+            # slot's preflight racing us to the same deletion (rm) from
+            # failing the job.
             [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
-            rm -rf -- "$dir"
+            rm -rf -- "$dir" || true
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           # Escalation tier: under heavy churn everything on the volume can
           # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
           # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # (oldest dir mtime first) until this job's need is met.
-          # Concurrent preflights on other slots are safe: target dirs are
-          # warm caches (eviction costs a rebuild, not correctness), a live
-          # job's dir is protected by the recursive 15-minute activity
-          # check (a running job touches its target dir continuously), the
+          # until this job's need is met. Ordering key: the dir's own
+          # top-level mtime, matching the emergency purge — not
+          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
+          # touches the top level after creation, so this approximates
+          # creation order and a recently-used-but-idle dir can be evicted
+          # before a colder one; acceptable here, since every candidate is
+          # an idle warm cache and the ordering stays cheap for a per-job
+          # step. Concurrent preflights on other slots are safe: target
+          # dirs are warm caches (eviction costs a rebuild, not
+          # correctness), a live job's dir is shielded by the recursive
+          # 15-minute activity check (a job actively writing keeps its
+          # target dir fresh — though a >15 min quiet phase can look idle,
+          # a bounded risk: one retryable job failure, no data loss), the
           # own-slot skip covers every dir this slot may use, and `|| true`
           # on rm tolerates another slot's preflight racing us to the same
           # candidate.
@@ -498,20 +510,30 @@ jobs:
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
             # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            # `|| true` keeps a dir vanishing mid-check (find) or another
+            # slot's preflight racing us to the same deletion (rm) from
+            # failing the job.
             [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
-            rm -rf -- "$dir"
+            rm -rf -- "$dir" || true
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           # Escalation tier: under heavy churn everything on the volume can
           # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
           # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # (oldest dir mtime first) until this job's need is met.
-          # Concurrent preflights on other slots are safe: target dirs are
-          # warm caches (eviction costs a rebuild, not correctness), a live
-          # job's dir is protected by the recursive 15-minute activity
-          # check (a running job touches its target dir continuously), the
+          # until this job's need is met. Ordering key: the dir's own
+          # top-level mtime, matching the emergency purge — not
+          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
+          # touches the top level after creation, so this approximates
+          # creation order and a recently-used-but-idle dir can be evicted
+          # before a colder one; acceptable here, since every candidate is
+          # an idle warm cache and the ordering stays cheap for a per-job
+          # step. Concurrent preflights on other slots are safe: target
+          # dirs are warm caches (eviction costs a rebuild, not
+          # correctness), a live job's dir is shielded by the recursive
+          # 15-minute activity check (a job actively writing keeps its
+          # target dir fresh — though a >15 min quiet phase can look idle,
+          # a bounded risk: one retryable job failure, no data loss), the
           # own-slot skip covers every dir this slot may use, and `|| true`
           # on rm tolerates another slot's preflight racing us to the same
           # candidate.
@@ -678,20 +700,30 @@ jobs:
             # Re-check recursively: only prune if nothing inside was touched
             # within 2 days (a running job keeps its target dir fresh).
             # -mmin gives a strict 48 h window (-mtime rounds to whole days);
-            # `|| true` keeps a dir vanishing mid-check from failing the job.
+            # `|| true` keeps a dir vanishing mid-check (find) or another
+            # slot's preflight racing us to the same deletion (rm) from
+            # failing the job.
             [ -n "$(find "$dir" -mmin -2880 -print -quit 2>/dev/null || true)" ] && continue
             echo "pruning: $dir"
-            rm -rf -- "$dir"
+            rm -rf -- "$dir" || true
             [ "$(free_gib)" -ge "$NEED_GIB" ] && break
           done < <(find /raid/ci-target -mindepth 3 -maxdepth 3 -type d -mmin +2880 -printf '%T@ %p\n' 2>/dev/null | sort -n)
           # Escalation tier: under heavy churn everything on the volume can
           # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
           # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # (oldest dir mtime first) until this job's need is met.
-          # Concurrent preflights on other slots are safe: target dirs are
-          # warm caches (eviction costs a rebuild, not correctness), a live
-          # job's dir is protected by the recursive 15-minute activity
-          # check (a running job touches its target dir continuously), the
+          # until this job's need is met. Ordering key: the dir's own
+          # top-level mtime, matching the emergency purge — not
+          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
+          # touches the top level after creation, so this approximates
+          # creation order and a recently-used-but-idle dir can be evicted
+          # before a colder one; acceptable here, since every candidate is
+          # an idle warm cache and the ordering stays cheap for a per-job
+          # step. Concurrent preflights on other slots are safe: target
+          # dirs are warm caches (eviction costs a rebuild, not
+          # correctness), a live job's dir is shielded by the recursive
+          # 15-minute activity check (a job actively writing keeps its
+          # target dir fresh — though a >15 min quiet phase can look idle,
+          # a bounded risk: one retryable job failure, no data loss), the
           # own-slot skip covers every dir this slot may use, and `|| true`
           # on rm tolerates another slot's preflight racing us to the same
           # candidate.
