@@ -26394,6 +26394,131 @@ mod browser_exec_reverse {
             .expect_err("transport");
         assert!(matches!(err, Error::Internal(m) if m.contains("timeout")));
     }
+
+    // Regression (monorepo#3042): a `success: false` FE envelope that carries
+    // structured per-action errors (not-owner / already-claimed) must come
+    // back as data on the agent seam — not flattened into `Error::Internal`.
+    #[tokio::test]
+    async fn browser_exec_preserves_structured_single_action_ownership_failure() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": null,
+                "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 })],
+                None,
+                None,
+            )
+            .await
+            .expect("structured failure is data, not Err");
+        assert_eq!(out["action"], "resizeTab");
+        assert_eq!(out["success"], json!(false));
+        assert_eq!(out["errorCode"], "not-owner");
+        assert_eq!(out["ownerAgentId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn browser_exec_preserves_structured_multi_action_partial_failure() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "1 of 2 actions failed",
+            "results": [
+                { "action": "listTabs", "success": true, "result": [] },
+                {
+                    "action": "claimTab",
+                    "success": false,
+                    "errorCode": "already-claimed",
+                    "ownerAgentId": "agent-42",
+                    "error": "Tab tab-3 is owned by agent agent-42"
+                }
+            ],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "listTabs" }),
+                    json!({ "action": "claimTab", "tabId": "tab-3", "width": 1280 }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("partial failure is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results preserved");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1]["errorCode"], "already-claimed");
+        assert_eq!(results[1]["ownerAgentId"], "agent-42");
+    }
+
+    // The FE aborts a batch on the first failing action and returns the
+    // partial results collected so far: a 3-action batch failing at action 1
+    // replies with a single result. The shape must key off the request
+    // arity, so multi-action callers still get the envelope form.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_shape() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 }),
+                    json!({ "action": "screenshot" }),
+                    json!({ "action": "listTabs" }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("aborted batch is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results key present");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["errorCode"], "not-owner");
+        assert_eq!(results[0]["ownerAgentId"], "agent-7");
+    }
+
+    #[tokio::test]
+    async fn browser_exec_failure_without_results_still_errors() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "CDP not attached",
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .expect_err("no per-action detail to preserve");
+        assert!(matches!(err, Error::Internal(m) if m.contains("CDP not attached")));
+    }
 }
 
 /// `scan_workspace_token_usage` tallies agent-session token counters into the
