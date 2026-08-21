@@ -651,6 +651,50 @@ impl Store {
         }
     }
 
+    /// Batched status projection: the persisted [`AgentStatus`] of every id
+    /// in `ids`, in ONE `IN`-list query (the `agent.getSubscriptions`
+    /// `agentStatuses` map — intent-hq/monorepo#3018). Replaces a per-agent
+    /// `get_agent_session` loop that hydrated each agent's full message log
+    /// just to read `status`, so the caller stays at one statement and zero
+    /// transcript bytes regardless of how many agents are present. Ids
+    /// without a session row are simply absent from the result, and a row
+    /// whose stored `status` fails to decode (e.g. a daemon downgrade after
+    /// a newer build persisted a new variant) is skipped with a WARN — both
+    /// best-effort, matching the old loop's skip-on-error behavior; order is
+    /// unspecified. The id list is chunked well under SQLite's 32766
+    /// bind-variable cap (same defense as `bulk_upsert_scripts`), so an
+    /// implausibly large `ids` costs extra statements instead of erroring.
+    pub async fn get_agent_statuses(&self, ids: &[AgentId]) -> Result<Vec<(AgentId, AgentStatus)>> {
+        const IDS_PER_STATEMENT: usize = 32_000;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id, status FROM agent_session WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(&id.0);
+            }
+            let rows = query
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("get agent statuses failed: {e}")))?;
+            for row in &rows {
+                let id: String = row.get("id");
+                match enum_from_db::<AgentStatus>(&row.get::<String, _>("status")) {
+                    Ok(status) => out.push((AgentId(id), status)),
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %id,
+                            error = %e,
+                            "decode agent status failed; omitting agent from status batch"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Read the daemon-owned task-graph snapshot captured when this agent was
     /// created. Prefers the whole-harness `harness_features` snapshot's
     /// `taskGraph` value (0096) and falls back to the legacy
@@ -5737,6 +5781,68 @@ mod tests {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// `get_agent_statuses` returns every requested id's persisted status in
+    /// one batched query, skips ids without a session row, skips (rather
+    /// than fails on) a row whose stored status does not decode, and returns
+    /// empty for an empty id list (intent-hq/monorepo#3018 — the
+    /// `agent.getSubscriptions` `agentStatuses` projection).
+    #[tokio::test]
+    async fn get_agent_statuses_batches_ids_and_skips_missing() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-statuses".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let idle = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let active = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&idle, &ws_id, &ts, None))
+            .await
+            .expect("insert idle session");
+        let mut active_session = baseline_test_session(&active, &ws_id, &ts, None);
+        active_session.status = AgentStatus::Active;
+        store
+            .insert_agent_session(&active_session)
+            .await
+            .expect("insert active session");
+
+        // A row whose persisted status no longer decodes (e.g. a daemon
+        // downgrade after a newer build wrote a new variant) must be
+        // skipped, not fail the whole batch.
+        let corrupt = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&corrupt, &ws_id, &ts, None))
+            .await
+            .expect("insert corrupt session");
+        sqlx::query("UPDATE agent_session SET status = 'from-the-future' WHERE id = ?")
+            .bind(&corrupt.0)
+            .execute(store.write_pool())
+            .await
+            .expect("write undecodable status");
+
+        let missing = AgentId("agent-missing".to_string());
+        let mut statuses = store
+            .get_agent_statuses(&[idle.clone(), active.clone(), missing, corrupt])
+            .await
+            .expect("batched statuses");
+        statuses.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut expected = vec![(idle, AgentStatus::Idle), (active, AgentStatus::Active)];
+        expected.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        assert_eq!(statuses, expected);
+
+        assert!(store
+            .get_agent_statuses(&[])
+            .await
+            .expect("empty id list")
+            .is_empty());
     }
 
     /// `update_agent_session_metadata` writes only `metadata` + `updated_at`:
