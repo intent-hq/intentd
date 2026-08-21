@@ -1254,6 +1254,220 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert!(stored.pull_requests.is_none(), "merge must not persist");
 }
 
+/// The emit-path PR merge upgrades a stale non-terminal entry when a
+/// lower-priority duplicate carries a terminal verdict: a git-root entry
+/// still reading `open` flips to `merged` when the monitor's snapshot saw
+/// the PR merge (status + updatedAt only; identity fields keep the git-root
+/// entry), while a git-root entry already `merged` is never downgraded by
+/// the snapshotless completed-monitor `closed` fallback
+/// (intent-hq/monorepo#3127).
+#[tokio::test]
+async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
+    use intent_core::{
+        PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
+        WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let pr_info =
+        |number: u64, url: &str, title: &str, status: PullRequestStatus| PullRequestInfo {
+            id: number.to_string(),
+            number,
+            url: url.to_string(),
+            title: title.to_string(),
+            status,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        };
+    let monitor =
+        |ws: &WorkspaceId, number: i64, state: PrMonitorState, snapshot: Option<String>| {
+            PrMonitor {
+                monitor_id: PrMonitorId::new(),
+                workspace_id: ws.clone(),
+                agent_id: AgentId::from("agent-mon"),
+                repo_owner: "o".into(),
+                repo_name: "r".into(),
+                pr_number: number,
+                state,
+                last_snapshot: snapshot,
+                baseline_snapshot: None,
+                pending_changes: vec![],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: None,
+                last_error: None,
+                created_at: "2026-01-02T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:01Z".into(),
+            }
+        };
+
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from("agent-mon"),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Monitor Owner".into(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+    store.insert_agent_session(&session).await.expect("session");
+
+    // Git root: PR 1 stale-open (the sweep hasn't seen the merge yet) and
+    // PR 3 already merged.
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: "/tmp/root-a".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("o".into()),
+            repo_name: Some("r".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(vec![
+                pr_info(
+                    1,
+                    "https://github.com/o/r/pull/1",
+                    "Stale open",
+                    PullRequestStatus::Open,
+                ),
+                pr_info(
+                    3,
+                    "https://github.com/o/r/pull/3",
+                    "Already merged",
+                    PullRequestStatus::Merged,
+                ),
+            ]),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("git root");
+
+    // Monitor on PR 1 whose snapshot saw the merge, and a snapshotless
+    // completed monitor on PR 3 (synthesized URL duplicates the git-root
+    // entry; its `closed` fallback carries no merged/closed verdict).
+    let merged_snapshot = serde_json::json!({
+        "title": "Stale open",
+        "url": "https://github.com/o/r/pull/1",
+        "conversationCount": 0,
+        "reviewCommentCount": 0,
+        "requirements": {
+            "state": "merged",
+            "isDraft": false,
+            "hasConflicts": false,
+            "isBehind": false,
+            "checks": {
+                "total": 0, "passed": 0, "failed": 0, "pending": 0,
+                "items": [], "failingRequired": [], "pendingRequired": [],
+                "requiredKnown": true
+            },
+            "approvals": { "decision": "none", "have": 0, "changesRequested": 0 },
+            "threads": { "unresolved": 0 },
+            "rulesKnown": false
+        }
+    })
+    .to_string();
+    for m in [
+        monitor(&ws, 1, PrMonitorState::Completed, Some(merged_snapshot)),
+        monitor(&ws, 3, PrMonitorState::Completed, None),
+    ] {
+        store.insert_pr_monitor(&m).await.expect("monitor");
+    }
+
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+    for (list, path) in [
+        (
+            svc.list_workspaces(false).await.expect("full list"),
+            "workspace.list",
+        ),
+        (
+            svc.list_workspaces_lite(false).await.expect("lite list"),
+            "lite list",
+        ),
+    ] {
+        let row = list.iter().find(|w| w.id == ws).expect("ws row");
+        let prs = row.pull_requests.as_ref().expect("pullRequests");
+        assert_eq!(prs.len(), 2, "{path}: URL dedup keeps one entry per PR");
+        // Stale-open git-root entry: terminal monitor verdict wins the
+        // status (and updatedAt), git-root keeps the identity fields.
+        assert_eq!(prs[0].url, "https://github.com/o/r/pull/1", "{path}");
+        assert_eq!(prs[0].title, "Stale open", "{path}: git-root fields kept");
+        assert_eq!(
+            prs[0].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: monitor's merged verdict overrides the stale open status"
+        );
+        assert_eq!(
+            prs[0].updated_at, "2026-01-02T00:00:01Z",
+            "{path}: updatedAt follows the status upgrade"
+        );
+        // Already-merged git-root entry: the completed monitor's `closed`
+        // fallback must not downgrade the merged verdict.
+        assert_eq!(prs[1].url, "https://github.com/o/r/pull/3", "{path}");
+        assert_eq!(
+            prs[1].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: closed fallback never downgrades a merged entry"
+        );
+        assert_eq!(
+            prs[1].updated_at, "2026-01-01T00:00:00Z",
+            "{path}: terminal entry untouched"
+        );
+    }
+}
+
 /// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
 /// (self filtered out, other-repo filtered out) with the `PascalCase` status.
 #[tokio::test]

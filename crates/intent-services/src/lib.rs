@@ -1910,12 +1910,20 @@ impl Services {
     /// O(PR-bearing rows) regardless of workspace count). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
-    /// PRs, then git-root PRs, then monitor-derived entries. A row with
-    /// nothing to merge is left untouched (a `None` stays omitted on the
-    /// wire, and an empty git-root list contributes nothing rather than
-    /// materializing `[]`); a store read failure degrades to serving the
-    /// base rows. `include_archived` mirrors the list call's flag so the
-    /// bulk reads never pay for archived workspaces the list won't return.
+    /// PRs, then git-root PRs, then monitor-derived entries. One exception
+    /// to first-wins: a lower-priority duplicate carrying a **terminal**
+    /// status (merged/closed) upgrades a non-terminal (open/draft) present
+    /// entry's `status` + `updatedAt` in place — terminal is irreversible,
+    /// so a stale git-root/workspace entry can never shadow a monitor that
+    /// already saw the PR merge (intent-hq/monorepo#3127); a present entry
+    /// that is already terminal is never rewritten (the snapshotless
+    /// completed-monitor `closed` fallback must not downgrade a `merged`
+    /// verdict). A row with nothing to merge is left untouched (a `None`
+    /// stays omitted on the wire, and an empty git-root list contributes
+    /// nothing rather than materializing `[]`); a store read failure
+    /// degrades to serving the base rows. `include_archived` mirrors the
+    /// list call's flag so the bulk reads never pay for archived workspaces
+    /// the list won't return.
     pub(crate) async fn merge_external_pull_requests(
         &self,
         list: &mut [Workspace],
@@ -1969,14 +1977,30 @@ impl Services {
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
+        let is_terminal = |s: intent_core::PullRequestStatus| {
+            matches!(
+                s,
+                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+            )
+        };
         for ws in list.iter_mut() {
             let Some(candidates) = extras.remove(ws.id.as_str()) else {
                 continue;
             };
             let merged = ws.pull_requests.get_or_insert_with(Vec::new);
             for info in candidates {
-                if !merged.iter().any(|p| p.url == info.url) {
-                    merged.push(info);
+                match merged.iter_mut().find(|p| p.url == info.url) {
+                    None => merged.push(info),
+                    // Terminal-status upgrade: identity/fields keep the
+                    // higher-priority entry, but a terminal verdict from a
+                    // lower-priority source overrides a stale non-terminal
+                    // status (never the reverse — see the doc comment).
+                    Some(present) => {
+                        if is_terminal(info.status) && !is_terminal(present.status) {
+                            present.status = info.status;
+                            present.updated_at = info.updated_at;
+                        }
+                    }
                 }
             }
         }
