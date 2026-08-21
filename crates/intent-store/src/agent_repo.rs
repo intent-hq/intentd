@@ -651,6 +651,38 @@ impl Store {
         }
     }
 
+    /// Batched status projection: the persisted [`AgentStatus`] of every id
+    /// in `ids`, in ONE `IN`-list query (the `agent.getSubscriptions`
+    /// `agentStatuses` map — intent-hq/monorepo#3018). Replaces a per-agent
+    /// `get_agent_session` loop that hydrated each agent's full message log
+    /// just to read `status`, so the caller stays at one statement and zero
+    /// transcript bytes regardless of how many agents are present. Ids
+    /// without a session row are simply absent from the result (best-effort,
+    /// matching the old loop's skip-on-`NotFound`); order is unspecified.
+    pub async fn get_agent_statuses(&self, ids: &[AgentId]) -> Result<Vec<(AgentId, AgentStatus)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!("SELECT id, status FROM agent_session WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(&id.0);
+        }
+        let rows = query
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent statuses failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    AgentId(row.get("id")),
+                    enum_from_db::<AgentStatus>(&row.get::<String, _>("status"))?,
+                ))
+            })
+            .collect()
+    }
+
     /// Read the daemon-owned task-graph snapshot captured when this agent was
     /// created. Prefers the whole-harness `harness_features` snapshot's
     /// `taskGraph` value (0096) and falls back to the legacy
@@ -5667,6 +5699,53 @@ mod tests {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// `get_agent_statuses` returns every requested id's persisted status in
+    /// one batched query, skips ids without a session row, and returns empty
+    /// for an empty id list (intent-hq/monorepo#3018 — the
+    /// `agent.getSubscriptions` `agentStatuses` projection).
+    #[tokio::test]
+    async fn get_agent_statuses_batches_ids_and_skips_missing() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-statuses".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let idle = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let active = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&idle, &ws_id, &ts, None))
+            .await
+            .expect("insert idle session");
+        let mut active_session = baseline_test_session(&active, &ws_id, &ts, None);
+        active_session.status = AgentStatus::Active;
+        store
+            .insert_agent_session(&active_session)
+            .await
+            .expect("insert active session");
+
+        let missing = AgentId("agent-missing".to_string());
+        let mut statuses = store
+            .get_agent_statuses(&[idle.clone(), active.clone(), missing])
+            .await
+            .expect("batched statuses");
+        statuses.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let mut expected = vec![(idle, AgentStatus::Idle), (active, AgentStatus::Active)];
+        expected.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        assert_eq!(statuses, expected);
+
+        assert!(store
+            .get_agent_statuses(&[])
+            .await
+            .expect("empty id list")
+            .is_empty());
     }
 
     /// `update_agent_session_metadata` writes only `metadata` + `updated_at`:
