@@ -10473,8 +10473,16 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         let mut guard = svc.agent_queues.lock().unwrap();
         guard.get_mut(&target).expect("queue")[0].queued_at = "2020-01-01T00:00:00Z".into();
     }
-    svc.record_pending_questions_marker(&ws, &target, "q-msg-1")
-        .await;
+    let question = svc
+        .store()
+        .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append held question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &target, &question.id)
+            .await,
+        "real question row must arm the hold"
+    );
     // The marker write bumps the session's `updated_at` — re-mark the agent
     // idle so the phases below exercise the hold logic, not the
     // actively-responding skip.
