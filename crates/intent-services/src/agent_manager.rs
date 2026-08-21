@@ -588,9 +588,9 @@ pub(crate) type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 /// Async callback for process-cap lifecycle events (queueing/resuming/eviction).
 /// Invoked by the registry when a spawn queues, resumes, or an idle process is
 /// evicted; the manager wires this to log + publish workspace events. The final
-/// parameter is the machine-readable `reason` — [`REASON_SLOTS`] or
-/// [`REASON_MEMORY_BUDGET`] — naming which admission constraint drove the event
-/// (monorepo#2063).
+/// parameter is the machine-readable `reason` — [`REASON_SLOTS`],
+/// [`REASON_MEMORY_BUDGET`], or [`REASON_IDLE_TTL`] — naming which constraint
+/// drove the event (monorepo#2063, monorepo#3040).
 pub(crate) type ProcessEventFn =
     Arc<dyn Fn(&AgentId, &str, usize, usize, &str) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -601,6 +601,12 @@ pub(crate) const REASON_SLOTS: &str = "slots";
 /// `reason` value for `agent:process:*` events driven by the aggregate memory
 /// budget (monorepo#2063).
 pub(crate) const REASON_MEMORY_BUDGET: &str = "memory-budget";
+
+/// `reason` value for `agent:process:evicted` events driven by the TTL idle
+/// sweep (monorepo#3040): the process sat idle past `agents.idleReapMinutes`.
+/// Unlike the other two reasons this never labels a queue/resume — the sweep
+/// only evicts.
+pub(crate) const REASON_IDLE_TTL: &str = "idle-ttl";
 
 struct ProcessEntry {
     last_active_ms: u64,
@@ -1458,6 +1464,29 @@ impl ProcessRegistry {
             if !still_stale {
                 release(&id);
                 continue;
+            }
+            // Observable eviction (monorepo#3040): the TTL sweep was the one
+            // eviction path that emitted nothing, so an FE chat session bound
+            // to the reaped agent had no signal it was gone. Log + emit
+            // `agent:process:evicted` with reason `idle-ttl`, mirroring the
+            // slot-cap and budget eviction paths.
+            let used = self.size();
+            tracing::info!(
+                evicted = %id,
+                used = used,
+                cap = self.cap,
+                reason = REASON_IDLE_TTL,
+                "process registry: idle process evicted (TTL sweep)"
+            );
+            if let Some(ref f) = self.event_fn {
+                let fut = f(
+                    &id,
+                    "agent:process:evicted",
+                    used,
+                    self.cap,
+                    REASON_IDLE_TTL,
+                );
+                tokio::spawn(fut);
             }
             kill().await;
             self.deregister(&id);
