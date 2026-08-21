@@ -13,8 +13,10 @@ the remote daemon host. An unowned (user) tab at the target URL can be reused on
 after you claim it with `claimTab` (see Tab Ownership & Sizing below); tabs owned by
 other agents are never reused. `openTab` dedupe is likewise per-agent: re-opening the
 same `requestedUrl` reuses your own existing tab (hidden or visible — visibility does
-not affect dedupe), never another agent's tab or an unowned one — two agents opening
-the same URL get two tabs. Use `openTab` only when no
+not affect matching), never another agent's tab or an unowned one — two agents opening
+the same URL get two tabs. A dedupe hit never changes the reused tab's visibility:
+even with `visible: true`, a hidden tab stays hidden (and a visible tab stays
+visible) — revealing an existing tab is `showTab`-only. Use `openTab` only when no
 reusable tab matches the target or its `finalUrl`, or when the user explicitly asks for
 another tab, side-by-side view, or second instance of the page.
 
@@ -72,8 +74,11 @@ Agent-opened tabs start hidden: `openTab` without `visible: true` creates the ta
 hidden — alive, owned by you, emulated (the sizing invariant above is unchanged),
 returned by `listTabs` with `visibility: "hidden"`, and rendering offscreen — with no
 panel mount and no focus or active-tab change. Pass `visible: true` to open directly
-into the user's panel layout. Per-agent `openTab` dedupe is unaffected by visibility:
-a same-URL reopen reuses your tab whether it is hidden or visible.
+into the user's panel layout. Per-agent `openTab` dedupe matches regardless of
+visibility — a same-URL reopen reuses your tab whether it is hidden or visible — and a
+dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden even
+when the `openTab` carried `visible: true` (and a visible tab stays visible).
+Revealing an existing tab is `showTab`-only.
 
 - `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by mounting it into a
   panel. Owner-only: on a tab you do not own it returns the structured `not-owner`

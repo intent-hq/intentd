@@ -92,11 +92,19 @@ Agent-issued `openTab` creates the tab hidden by default — alive, emulated, an
 usable (screenshot / evaluate / navigate) without appearing in the user's panel layout:
 
 ```json
-// Hidden (default): work in the background without disturbing the user
+// Hidden (default): work in the background without disturbing the user.
+// A hidden open causes no active-tab change, so target the new tab explicitly
+// by its tabId from the openTab result — an unqualified follow-up action would
+// fall back to the call's default tab, not the hidden one.
 {
   "actions": [
-    { "action": "openTab", "url": "http://localhost:5173" },
-    { "action": "screenshot" }
+    { "action": "openTab", "url": "http://localhost:5173" }
+  ]
+}
+// → { tabId: "tab-bg1", url: "http://localhost:5173/", ... }
+{
+  "actions": [
+    { "action": "screenshot", "tabId": "tab-bg1" }
   ]
 }
 // listTabs shows the tab with visibility: "hidden":
@@ -127,7 +135,9 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 `showTab` is owner-only (`not-owner` on a tab you do not own) and idempotent on an
 already-visible tab (`focus: true` still activates it); an unknown `tabId` fails as an
 action-result error. `focusTab` keeps its visible-tab semantics and fails on a hidden
-tab with an error pointing at `showTab`.
+tab with an error pointing at `showTab`. Note that re-issuing
+`openTab { url, visible: true }` on a URL you already have hidden does NOT reveal it:
+a dedupe hit never changes the reused tab's visibility — use `showTab`.
 
 ## Opening Local HTML Files
 
