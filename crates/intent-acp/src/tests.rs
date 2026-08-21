@@ -7541,6 +7541,11 @@ mod wsapi6_bindings_tests {
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
+        /// When set, `browser_exec` shapes this raw FE envelope through the
+        /// real `intent_services::browser_ops::shape_agent_result` — the same
+        /// seam the production `Services::browser_exec` uses — so the JS
+        /// dispatch tests exercise real shaping instead of canned replies.
+        browser_exec_fe_envelope: Mutex<Option<Value>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -7644,10 +7649,18 @@ mod wsapi6_bindings_tests {
                 tab_id,
                 agent_id.map(|a| a.as_str().to_string()),
             ));
+            let fe_envelope = self.browser_exec_fe_envelope.lock().unwrap().clone();
             // Reference parity: a single-action batch yields the sole action's
             // envelope; multi-action yields `{ results: [...] }`. The fake
             // stands in for what the reverse channel would have returned.
             Box::pin(async move {
+                if let Some(envelope) = fe_envelope {
+                    return intent_services::browser_ops::shape_agent_result(
+                        envelope,
+                        actions.len(),
+                    )
+                    .map_err(|e| intent_core::Error::Internal(e.message));
+                }
                 if actions.len() == 1 {
                     Ok(json!({
                         "action": "listTabs",
@@ -7914,6 +7927,130 @@ mod wsapi6_bindings_tests {
         // Multi-action batch → { results: [...] } passthrough from the fake
         // reverse channel; matches transport `shape_result` behaviour.
         assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    }
+
+    // Regression (monorepo#3042): structured per-action ownership errors
+    // (not-owner / already-claimed) must reach the JS caller as data —
+    // `errorCode` / `ownerAgentId` readable from the returned object — not
+    // flattened into a thrown prose error.
+    #[tokio::test]
+    async fn browser_exec_single_action_ownership_failure_is_structured_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": null,
+                "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r#"
+            const r = await ws.browser.exec([{ action: 'resizeTab', tabId: 'tab-9', width: 375 }]);
+            return { code: r.errorCode, owner: r.ownerAgentId, ok: r.success };
+            "#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!(Value::Null));
+        assert_eq!(v["ok"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_multi_action_partial_failure_is_structured_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "1 of 2 actions failed",
+            "results": [
+                { "action": "listTabs", "success": true, "result": [] },
+                {
+                    "action": "claimTab",
+                    "success": false,
+                    "errorCode": "already-claimed",
+                    "ownerAgentId": "agent-42",
+                    "error": "Tab tab-3 is owned by agent agent-42"
+                }
+            ],
+        }));
+        let resp = call(
+            &srv,
+            r#"
+            const r = await ws.browser.exec([
+                { action: 'listTabs' },
+                { action: 'claimTab', tabId: 'tab-3', width: 1280 }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, code: failed.errorCode, owner: failed.ownerAgentId };
+            "#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["code"], json!("already-claimed"));
+        assert_eq!(v["owner"], json!("agent-42"));
+    }
+
+    // The FE aborts a batch on the first failing action, so the reply's
+    // partial `results` can be shorter than the request. A multi-action JS
+    // caller must still receive the `{ success, results, error }` envelope
+    // (never a bare action envelope), so `r.results.find(...)` always works.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r#"
+            const r = await ws.browser.exec([
+                { action: 'resizeTab', tabId: 'tab-9', width: 375 },
+                { action: 'screenshot' },
+                { action: 'listTabs' }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, count: r.results.length, code: failed.errorCode, owner: failed.ownerAgentId };
+            "#,
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["count"], json!(1));
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!("agent-7"));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_failure_without_results_still_throws_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "CDP not attached",
+        }));
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'listTabs' }]);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("CDP not attached"));
     }
 
     #[tokio::test]

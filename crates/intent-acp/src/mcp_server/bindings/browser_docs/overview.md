@@ -36,6 +36,13 @@ not own) and `already-claimed` (a claim lost to an earlier claim). Each names th
 owning agent when the tab has one; a `not-owner` on an unowned tab carries no owner
 info — the remedy is `claimTab`.
 
+For a single-action call the returned value is that action's envelope. A multi-action
+batch that fails returns `{ success: false, results, error }`; the batch aborts on the
+first failing action, so `results` holds only the actions executed so far (the failing
+one last). The multi-action *success* shape is `{ results }` with no `success` key, so
+test failure with `r.success === false` — a truthiness check like `!r.success`
+misclassifies every successful batch.
+
 - `{ action: "claimTab", tabId, width, height? }` - Claim an unowned (user) tab for
   yourself. `width` is required (a claim without it is a validation error); omitted
   `height` defaults to 800. Claims are atomic, first-claim-wins: a successful claim
