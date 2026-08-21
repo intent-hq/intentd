@@ -243,15 +243,6 @@ mod tests;
 /// target.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
-/// The highest migration version embedded in this build — the newest schema it
-/// can open. A database stamped past this is what makes [`Store::open`] refuse
-/// with "database schema is newer than this intentd build"; `intentd
-/// max-migration` prints this so `scripts/install.sh` can preflight an
-/// existing data dir *without* opening (or creating) the database.
-pub fn max_embedded_migration() -> i64 {
-    MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
-}
-
 /// SQLite-backed persistence handle. Cheaply cloneable (the pools are `Arc`-ed).
 ///
 /// Holds two pools over the same DB file: a single-connection **write pool**

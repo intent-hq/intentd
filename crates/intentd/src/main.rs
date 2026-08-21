@@ -92,15 +92,6 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
-    /// Print the highest schema migration version embedded in this build, as a
-    /// bare integer. Unlike `doctor` it never opens (or creates) the database,
-    /// so it is safe to run against a data dir this build cannot serve.
-    /// `scripts/install.sh` compares it against `max(version)` in the target
-    /// data dir's `_sqlx_migrations` and refuses to register a service that
-    /// would only crash-loop on a newer database — keep the output a bare
-    /// integer on stdout.
-    #[command(hide = true)]
-    MaxMigration,
     /// Read or change daemon settings (§5.12) on a running daemon. With no
     /// arguments, lists every setting with its type and current value
     /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
@@ -250,10 +241,6 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
-        Command::MaxMigration => {
-            println!("{}", intent_store::max_embedded_migration());
-            ExitCode::SUCCESS
-        }
         Command::Settings { name, value, stdin } => {
             to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
         }
