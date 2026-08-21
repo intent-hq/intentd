@@ -1911,14 +1911,16 @@ impl Services {
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
     /// PRs, then git-root PRs, then monitor-derived entries. One exception
-    /// to first-wins: a lower-priority duplicate carrying a **terminal**
-    /// status (merged/closed) upgrades a non-terminal (open/draft) present
-    /// entry's `status` + `updatedAt` in place — terminal is irreversible,
-    /// so a stale git-root/workspace entry can never shadow a monitor that
-    /// already saw the PR merge (intent-hq/monorepo#3127); a present entry
-    /// that is already terminal is never rewritten (the snapshotless
-    /// completed-monitor `closed` fallback must not downgrade a `merged`
-    /// verdict). A row with nothing to merge is left untouched (a `None`
+    /// to first-wins: a lower-priority duplicate whose status sits higher
+    /// on the lifecycle ladder (open/draft < closed < merged) upgrades the
+    /// present entry's `status` + `updatedAt` + `isDraft` in place, so a
+    /// stale git-root/workspace entry can never shadow a monitor that
+    /// already saw the PR merge (intent-hq/monorepo#3127). Status only ever
+    /// moves up the ladder: `merged` is irreversible so it wins over
+    /// everything (including a stale `closed`), while `closed` — the
+    /// snapshotless completed-monitor fallback among others — never
+    /// downgrades a `merged` verdict, and reopened-after-close is left to
+    /// the sweep re-fetch. A row with nothing to merge is left untouched (a `None`
     /// stays omitted on the wire, and an empty git-root list contributes
     /// nothing rather than materializing `[]`); a store read failure
     /// degrades to serving the base rows. `include_archived` mirrors the
@@ -1977,11 +1979,13 @@ impl Services {
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
-        let is_terminal = |s: intent_core::PullRequestStatus| {
-            matches!(
-                s,
-                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-            )
+        // Lifecycle-ladder rank: status only ever moves up (open/draft <
+        // closed < merged) — merged is irreversible, closed must never
+        // overwrite it (see the doc comment).
+        let status_rank = |s: intent_core::PullRequestStatus| match s {
+            intent_core::PullRequestStatus::Merged => 2,
+            intent_core::PullRequestStatus::Closed => 1,
+            intent_core::PullRequestStatus::Open | intent_core::PullRequestStatus::Draft => 0,
         };
         for ws in list.iter_mut() {
             let Some(candidates) = extras.remove(ws.id.as_str()) else {
@@ -1991,14 +1995,16 @@ impl Services {
             for info in candidates {
                 match merged.iter_mut().find(|p| p.url == info.url) {
                     None => merged.push(info),
-                    // Terminal-status upgrade: identity/fields keep the
-                    // higher-priority entry, but a terminal verdict from a
-                    // lower-priority source overrides a stale non-terminal
-                    // status (never the reverse — see the doc comment).
+                    // Status-ladder upgrade: identity/fields keep the
+                    // higher-priority entry, but a lower-priority source
+                    // whose status ranks higher wins the lifecycle fields —
+                    // `isDraft` moves with `status` so an upgraded entry
+                    // never reads merged/closed while still claiming draft.
                     Some(present) => {
-                        if is_terminal(info.status) && !is_terminal(present.status) {
+                        if status_rank(info.status) > status_rank(present.status) {
                             present.status = info.status;
                             present.updated_at = info.updated_at;
+                            present.is_draft = info.is_draft;
                         }
                     }
                 }

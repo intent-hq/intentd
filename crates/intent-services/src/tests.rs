@@ -1254,15 +1254,17 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert!(stored.pull_requests.is_none(), "merge must not persist");
 }
 
-/// The emit-path PR merge upgrades a stale non-terminal entry when a
-/// lower-priority duplicate carries a terminal verdict: a git-root entry
-/// still reading `open` flips to `merged` when the monitor's snapshot saw
-/// the PR merge (status + updatedAt only; identity fields keep the git-root
-/// entry), while a git-root entry already `merged` is never downgraded by
-/// the snapshotless completed-monitor `closed` fallback
+/// The emit-path PR merge moves a stale entry's status up the lifecycle
+/// ladder (open/draft < closed < merged) when a lower-priority duplicate
+/// ranks higher: a git-root entry still reading `open`/`draft`/`closed`
+/// flips to `merged` when the monitor's snapshot saw the PR merge (status +
+/// updatedAt + isDraft; identity fields keep the git-root entry — a
+/// `draft` entry upgraded to a terminal status must not keep claiming
+/// `isDraft: true`), while a git-root entry already `merged` is never
+/// downgraded by the snapshotless completed-monitor `closed` fallback
 /// (intent-hq/monorepo#3127).
 #[tokio::test]
-async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
+async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
     use intent_core::{
         PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
         WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
@@ -1359,8 +1361,15 @@ async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
     };
     store.insert_agent_session(&session).await.expect("session");
 
-    // Git root: PR 1 stale-open (the sweep hasn't seen the merge yet) and
-    // PR 3 already merged.
+    // Git root: PR 1 stale-open (the sweep hasn't seen the merge yet),
+    // PR 3 already merged, PR 4 stale-draft, PR 5 stale-closed.
+    let mut stale_draft = pr_info(
+        4,
+        "https://github.com/o/r/pull/4",
+        "Stale draft",
+        PullRequestStatus::Draft,
+    );
+    stale_draft.is_draft = Some(true);
     store
         .upsert_workspace_git_root(&WorkspaceGitRoot {
             id: WorkspaceGitRootId::new(),
@@ -1387,6 +1396,13 @@ async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
                     "Already merged",
                     PullRequestStatus::Merged,
                 ),
+                stale_draft,
+                pr_info(
+                    5,
+                    "https://github.com/o/r/pull/5",
+                    "Stale closed",
+                    PullRequestStatus::Closed,
+                ),
             ]),
             created_at: now_iso(),
             updated_at: now_iso(),
@@ -1394,33 +1410,52 @@ async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
         .await
         .expect("git root");
 
-    // Monitor on PR 1 whose snapshot saw the merge, and a snapshotless
+    // Monitors whose snapshots saw PRs 1, 4 and 5 merge, plus a snapshotless
     // completed monitor on PR 3 (synthesized URL duplicates the git-root
     // entry; its `closed` fallback carries no merged/closed verdict).
-    let merged_snapshot = serde_json::json!({
-        "title": "Stale open",
-        "url": "https://github.com/o/r/pull/1",
-        "conversationCount": 0,
-        "reviewCommentCount": 0,
-        "requirements": {
-            "state": "merged",
-            "isDraft": false,
-            "hasConflicts": false,
-            "isBehind": false,
-            "checks": {
-                "total": 0, "passed": 0, "failed": 0, "pending": 0,
-                "items": [], "failingRequired": [], "pendingRequired": [],
-                "requiredKnown": true
-            },
-            "approvals": { "decision": "none", "have": 0, "changesRequested": 0 },
-            "threads": { "unresolved": 0 },
-            "rulesKnown": false
-        }
-    })
-    .to_string();
+    let merged_snapshot = |number: u64, title: &str| {
+        serde_json::json!({
+            "title": title,
+            "url": format!("https://github.com/o/r/pull/{number}"),
+            "conversationCount": 0,
+            "reviewCommentCount": 0,
+            "requirements": {
+                "state": "merged",
+                "isDraft": false,
+                "hasConflicts": false,
+                "isBehind": false,
+                "checks": {
+                    "total": 0, "passed": 0, "failed": 0, "pending": 0,
+                    "items": [], "failingRequired": [], "pendingRequired": [],
+                    "requiredKnown": true
+                },
+                "approvals": { "decision": "none", "have": 0, "changesRequested": 0 },
+                "threads": { "unresolved": 0 },
+                "rulesKnown": false
+            }
+        })
+        .to_string()
+    };
     for m in [
-        monitor(&ws, 1, PrMonitorState::Completed, Some(merged_snapshot)),
+        monitor(
+            &ws,
+            1,
+            PrMonitorState::Completed,
+            Some(merged_snapshot(1, "Stale open")),
+        ),
         monitor(&ws, 3, PrMonitorState::Completed, None),
+        monitor(
+            &ws,
+            4,
+            PrMonitorState::Completed,
+            Some(merged_snapshot(4, "Stale draft")),
+        ),
+        monitor(
+            &ws,
+            5,
+            PrMonitorState::Completed,
+            Some(merged_snapshot(5, "Stale closed")),
+        ),
     ] {
         store.insert_pr_monitor(&m).await.expect("monitor");
     }
@@ -1439,9 +1474,10 @@ async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
     ] {
         let row = list.iter().find(|w| w.id == ws).expect("ws row");
         let prs = row.pull_requests.as_ref().expect("pullRequests");
-        assert_eq!(prs.len(), 2, "{path}: URL dedup keeps one entry per PR");
-        // Stale-open git-root entry: terminal monitor verdict wins the
-        // status (and updatedAt), git-root keeps the identity fields.
+        assert_eq!(prs.len(), 4, "{path}: URL dedup keeps one entry per PR");
+        // Stale-open git-root entry: the monitor's merged verdict wins the
+        // lifecycle fields (status, updatedAt, isDraft), git-root keeps the
+        // identity fields.
         assert_eq!(prs[0].url, "https://github.com/o/r/pull/1", "{path}");
         assert_eq!(prs[0].title, "Stale open", "{path}: git-root fields kept");
         assert_eq!(
@@ -1464,6 +1500,31 @@ async fn merged_pr_pool_terminal_status_overrides_stale_open_entry() {
         assert_eq!(
             prs[1].updated_at, "2026-01-01T00:00:00Z",
             "{path}: terminal entry untouched"
+        );
+        // Stale-draft git-root entry: isDraft moves with the status so the
+        // upgraded entry can't read merged while still claiming draft.
+        assert_eq!(prs[2].url, "https://github.com/o/r/pull/4", "{path}");
+        assert_eq!(
+            prs[2].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: monitor's merged verdict overrides the stale draft status"
+        );
+        assert_eq!(
+            prs[2].is_draft,
+            Some(false),
+            "{path}: isDraft follows the status upgrade"
+        );
+        // Stale-closed git-root entry: merged is irreversible, so it
+        // overrides even a terminal `closed`.
+        assert_eq!(prs[3].url, "https://github.com/o/r/pull/5", "{path}");
+        assert_eq!(
+            prs[3].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: merged verdict overrides a stale closed status"
+        );
+        assert_eq!(
+            prs[3].updated_at, "2026-01-02T00:00:01Z",
+            "{path}: updatedAt follows the closed→merged upgrade"
         );
     }
 }
