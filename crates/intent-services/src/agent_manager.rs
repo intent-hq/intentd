@@ -7952,9 +7952,10 @@ fn rebuild_spawn_opts<'a>(
 /// `intentd git-credential` helper entry — **no token bytes ever enter the
 /// child environment** (the helper fetches the credential from the daemon
 /// over UDS on demand). The daemon's own `GIT_CONFIG_PARAMETERS` (which the
-/// child would inherit) is preserved by appending after it, so existing
-/// setups keep winning. Setting off or an unresolvable daemon binary path ⇒
-/// no changes; pre-existing caller keys are never clobbered.
+/// child would inherit) is preserved by appending after it, and the helper is
+/// ordered ahead of the configured ones, which stay reachable behind it
+/// (monorepo#3059). Setting off or an unresolvable daemon binary path ⇒ no
+/// changes; pre-existing caller keys are never clobbered.
 fn inject_git_credential_env(extra_env: &mut BTreeMap<String, String>, expose: bool) {
     if !expose {
         return;

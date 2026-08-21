@@ -16,6 +16,9 @@
 //! before returning `Err`, mirroring the TS handler's `GIT_TERMINAL_PROMPT=0`
 //! fail-fast semantics for the remaining libgit2 network paths.
 
+use std::path::Path;
+use std::process::{Command, Stdio};
+
 use git2::{Cred, RemoteCallbacks};
 
 /// Maximum number of times the credential callback is entered per fetch/push
@@ -35,6 +38,19 @@ pub const TOKEN_USERNAME: &str = "x-access-token";
 /// The value never appears on the command line.
 pub const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
 
+/// The config key every intentd credential-helper entry is written under, and
+/// the key whose accumulated value list [`GITHUB_HELPER_RESET`] clears. Every
+/// credential lookup for an HTTPS `github.com` remote consults it; no other
+/// host's lookup does.
+const GITHUB_HELPER_KEY: &str = "credential.https://github.com.helper";
+
+/// Config entry clearing the credential helpers git has accumulated so far for
+/// `https://github.com`: an empty `helper` value resets the list (git's
+/// documented behaviour — `credential.c` clears the accumulated string list).
+/// Keyed to the same scope as the intentd entries, so helpers for every other
+/// host are left exactly as configured.
+const GITHUB_HELPER_RESET: &str = "credential.https://github.com.helper=";
+
 /// The `git -c` config entry offering the resolved token as a github.com-scoped
 /// credential helper, shared by the shell-git paths (`fetch`, and the
 /// `intent-services` clone pipeline). Note the `{{`/`}}`/`{TOKEN_ENV}` are
@@ -44,26 +60,211 @@ pub const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
 /// `store`/`erase` ops git may also invoke.
 pub(crate) fn token_helper_config() -> String {
     format!(
-        "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username={TOKEN_USERNAME}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
+        "{GITHUB_HELPER_KEY}=!f() {{ test \"$1\" = get || exit 0; printf 'username={TOKEN_USERNAME}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
     )
+}
+
+/// The ordered `-c` entries the shell-git token paths pass so the resolved
+/// token is offered *ahead* of the configured helpers (see
+/// [`github_helper_entries`]). `cwd` is the repository the child git will run
+/// in, so a repository-local helper is preserved as a fallback.
+pub(crate) fn token_helper_entries(
+    cwd: Option<&Path>,
+    inherited_config_parameters: Option<&str>,
+) -> Vec<String> {
+    github_helper_entries(
+        token_helper_config(),
+        discover_github_helpers(cwd, inherited_config_parameters).as_deref(),
+    )
+}
+
+/// Compose the ordered `credential.https://github.com.helper` entries a spawn
+/// site emits so intentd's helper is consulted **first**, with the helpers git
+/// would otherwise use kept behind it as fallbacks (monorepo#3059).
+///
+/// Appending intentd's entry *after* the configured helpers — every `git -c` /
+/// [`GIT_CONFIG_PARAMETERS_ENV`] entry ranks as command-line scope, which git
+/// applies after all config files — was a deliberate "existing setups keep
+/// winning" choice, and it is still the right instinct for a helper the user
+/// chose. It backfires on macOS, where the helper that wins is
+/// `credential.helper = osxkeychain` from the Command Line Tools' system
+/// gitconfig: an OS default present on essentially every dev machine that
+/// nobody opted into. Any stale github.com keychain entry then shadows the
+/// daemon's working token, and GitHub renders the resulting 403 as
+/// `Repository not found` — so every HTTPS git operation fails while looking
+/// like a missing repository.
+///
+/// Hence ordering, not replacement: reset, intentd, then the
+/// previously-configured helpers — still consulted, just after intentd rather
+/// than instead of it. `intentd git-credential` prints nothing and exits 0
+/// whenever it has no credential to offer (wrong host, gate off, daemon down,
+/// no token), which is what keeps those fallbacks reachable.
+///
+/// `fallbacks` is the list git would consult without this injection (see
+/// [`discover_github_helpers`]). `None` means the list could not be
+/// determined, and then no reset is emitted and `entry` is simply appended as
+/// before: losing precedence is far cheaper than clearing a list we cannot
+/// restore.
+fn github_helper_entries(entry: String, fallbacks: Option<&[String]>) -> Vec<String> {
+    let Some(fallbacks) = fallbacks else {
+        return vec![entry];
+    };
+    // Our own helper value, so an entry an outer agent shell already injected
+    // (visible through the inherited parameters) is not re-added behind us.
+    let seen_head = entry.strip_prefix(GITHUB_HELPER_RESET).unwrap_or_default();
+    let mut seen: Vec<&str> = vec![seen_head];
+    let mut entries = vec![GITHUB_HELPER_RESET.to_string(), entry.clone()];
+    for fallback in fallbacks {
+        // Duplicates would only grow the list on every nesting level; a helper
+        // consulted twice answers identically anyway.
+        if seen.contains(&fallback.as_str()) {
+            continue;
+        }
+        seen.push(fallback);
+        entries.push(format!("{GITHUB_HELPER_KEY}={fallback}"));
+    }
+    entries
+}
+
+/// Ask git which credential helpers it would consult for `https://github.com`,
+/// in the order it would consult them, as the child about to be spawned will
+/// see them: `git config --list` reports entries in config order, and
+/// `inherited_config_parameters` is applied so an entry an outer agent shell
+/// already injected is visible rather than re-added as a duplicate.
+///
+/// `cwd` is the directory the lookup runs in, so a repository-local helper is
+/// included; `None` runs at the filesystem root, reading the system, global
+/// and environment scopes only. Returns `None` when git could not be run or
+/// exited non-zero — an *unknown* list, which callers must not reset.
+pub fn discover_github_helpers(
+    cwd: Option<&Path>,
+    inherited_config_parameters: Option<&str>,
+) -> Option<Vec<String>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(cwd.unwrap_or(Path::new("/")));
+    cmd.args(["config", "--list", "-z"]);
+    match inherited_config_parameters {
+        Some(prev) if !prev.trim().is_empty() => {
+            cmd.env(GIT_CONFIG_PARAMETERS_ENV, prev);
+        }
+        // Not inheriting: this process's own value must not leak into a lookup
+        // that is meant to describe the child's view.
+        _ => {
+            cmd.env_remove(GIT_CONFIG_PARAMETERS_ENV);
+        }
+    }
+    let out = cmd
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(github_helpers_from_config_list(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+/// Fold `git config --list -z` output (`key\nvalue\0` records, or a bare
+/// `key\0` for a valueless entry, in config order) into the credential-helper
+/// list git would consult for `https://github.com`: every applicable entry in
+/// order, with an empty value clearing what came before — the same reset
+/// semantics [`GITHUB_HELPER_RESET`] relies on.
+fn github_helpers_from_config_list(list: &str) -> Vec<String> {
+    let mut helpers: Vec<String> = Vec::new();
+    for record in list.split('\0') {
+        // A valueless (implicit-true) entry carries no helper command.
+        let Some((key, value)) = record.split_once('\n') else {
+            continue;
+        };
+        if !credential_key_targets_github(key) {
+            continue;
+        }
+        if value.is_empty() {
+            helpers.clear();
+        } else {
+            helpers.push(value.to_string());
+        }
+    }
+    helpers
+}
+
+/// Whether `key` is a credential-helper key git applies to a bare
+/// `https://github.com` request: either the unscoped `credential.helper`, or a
+/// `credential.<url>.helper` whose url matches the way git's urlmatch does for
+/// that request — scheme `https` or absent (a pattern without a scheme matches
+/// any protocol), host `github.com` case-insensitively, the default port
+/// optional, and no path or userinfo (the request carries neither, and both
+/// must match exactly). `http://…`, `https://*.github.com`,
+/// `https://github.com/owner` and other hosts correctly do not match: git
+/// would not consult those helpers for this request either.
+fn credential_key_targets_github(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("credential.") else {
+        return false;
+    };
+    if rest == "helper" {
+        return true;
+    }
+    let Some(pattern) = rest.strip_suffix(".helper") else {
+        return false;
+    };
+    let authority = match pattern.split_once("://") {
+        Some((scheme, rest)) => {
+            if !scheme.eq_ignore_ascii_case("https") {
+                return false;
+            }
+            rest
+        }
+        None => pattern,
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.contains('/') || authority.contains('@') {
+        return false;
+    }
+    let host = authority.strip_suffix(":443").unwrap_or(authority);
+    host.eq_ignore_ascii_case("github.com")
+}
+
+/// Join `entries` — sq-quoted the way git's `sq_dequote` parser expects — onto
+/// any non-blank `inherited` value, producing a [`GIT_CONFIG_PARAMETERS_ENV`]
+/// value. Inherited entries stay first so nothing the caller configured is
+/// dropped; the helper ordering the entries themselves encode is what puts
+/// intentd ahead (see [`github_helper_entries`]).
+fn config_parameters(inherited: Option<&str>, entries: &[String]) -> String {
+    let mut params = String::new();
+    if let Some(prev) = inherited {
+        if !prev.trim().is_empty() {
+            params.push_str(prev);
+        }
+    }
+    for entry in entries {
+        if !params.is_empty() {
+            params.push(' ');
+        }
+        params.push_str(&sq_quote(entry));
+    }
+    params
 }
 
 /// Environment variable git reads for command-line-scoped config entries —
 /// the same mechanism `git -c` uses to reach child processes. Entries here
-/// rank as "command line" config: applied after every config file, so an
-/// appended helper never displaces a user-configured one.
+/// rank as "command line" config: applied after every config file, so a helper
+/// added here is consulted *last* and cannot displace a config-file one. Git
+/// has no prepend, which is why the credential-helper ordering is expressed as
+/// a reset plus a re-add (see [`github_helper_entries`]).
 pub const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
 
 /// Build the environment pairs a spawn site injects to offer `token` as a
 /// github.com-scoped credential helper (monorepo#884): the sq-quoted
-/// [`token_helper_config`] entry **appended** to any
-/// `inherited_config_parameters` (the caller's pre-existing
-/// [`GIT_CONFIG_PARAMETERS_ENV`] value, so inherited entries — and the user's
-/// configured helpers, which git applies first — keep winning), plus
-/// [`TOKEN_ENV`] carrying the token itself. The config value never contains
-/// token bytes; the token travels only under [`TOKEN_ENV`]. Returns no pairs
-/// when the token is unusable (see [`usable_token`]), leaving the child env
-/// untouched.
+/// [`token_helper_config`] entry ordered **ahead** of the helpers git would
+/// otherwise consult, which are re-added behind it as fallbacks (see
+/// [`github_helper_entries`]), appended to any `inherited_config_parameters`
+/// (the caller's pre-existing [`GIT_CONFIG_PARAMETERS_ENV`] value, which is
+/// never dropped), plus [`TOKEN_ENV`] carrying the token itself. The config
+/// value never contains token bytes; the token travels only under
+/// [`TOKEN_ENV`]. Returns no pairs when the token is unusable (see
+/// [`usable_token`]), leaving the child env untouched.
 pub fn scoped_credential_env(
     token: Option<&str>,
     inherited_config_parameters: Option<&str>,
@@ -71,13 +272,15 @@ pub fn scoped_credential_env(
     let Some(token) = usable_token(token) else {
         return Vec::new();
     };
-    let entry = sq_quote(&token_helper_config());
-    let params = match inherited_config_parameters {
-        Some(prev) if !prev.trim().is_empty() => format!("{prev} {entry}"),
-        _ => entry,
-    };
+    let entries = github_helper_entries(
+        token_helper_config(),
+        discover_github_helpers(None, inherited_config_parameters).as_deref(),
+    );
     vec![
-        (GIT_CONFIG_PARAMETERS_ENV.to_string(), params),
+        (
+            GIT_CONFIG_PARAMETERS_ENV.to_string(),
+            config_parameters(inherited_config_parameters, &entries),
+        ),
         (TOKEN_ENV.to_string(), token.to_string()),
     ]
 }
@@ -90,7 +293,7 @@ pub fn scoped_credential_env(
 /// the helper fetches the credential from the daemon over UDS on demand.
 pub(crate) fn daemon_helper_config(intentd_path: &str) -> String {
     format!(
-        "credential.https://github.com.helper=!{} git-credential",
+        "{GITHUB_HELPER_KEY}=!{} git-credential",
         sh_quote(intentd_path)
     )
 }
@@ -98,21 +301,24 @@ pub(crate) fn daemon_helper_config(intentd_path: &str) -> String {
 /// Build the environment pairs a spawn site injects to offer the
 /// daemon-backed `intentd git-credential` helper to a child's git
 /// (monorepo#884 Phase 2.2): the single [`GIT_CONFIG_PARAMETERS_ENV`] pair
-/// carrying the sq-quoted [`daemon_helper_config`] entry **appended** to any
-/// `inherited_config_parameters` (the caller's pre-existing value, so
-/// inherited entries — and the user's configured helpers, which git applies
-/// first — keep winning). Unlike [`scoped_credential_env`] there is no token
-/// pair at all: no token bytes ever enter the child environment.
+/// carrying the sq-quoted [`daemon_helper_config`] entry ordered **ahead** of
+/// the helpers git would otherwise consult, which are re-added behind it as
+/// fallbacks (see [`github_helper_entries`]), appended to any
+/// `inherited_config_parameters` so the caller's pre-existing value is never
+/// dropped. Unlike [`scoped_credential_env`] there is no token pair at all: no
+/// token bytes ever enter the child environment.
 pub fn daemon_helper_env(
     intentd_path: &str,
     inherited_config_parameters: Option<&str>,
 ) -> Vec<(String, String)> {
-    let entry = sq_quote(&daemon_helper_config(intentd_path));
-    let params = match inherited_config_parameters {
-        Some(prev) if !prev.trim().is_empty() => format!("{prev} {entry}"),
-        _ => entry,
-    };
-    vec![(GIT_CONFIG_PARAMETERS_ENV.to_string(), params)]
+    let entries = github_helper_entries(
+        daemon_helper_config(intentd_path),
+        discover_github_helpers(None, inherited_config_parameters).as_deref(),
+    );
+    vec![(
+        GIT_CONFIG_PARAMETERS_ENV.to_string(),
+        config_parameters(inherited_config_parameters, &entries),
+    )]
 }
 
 /// Single-quote `src` for the POSIX shell git hands a `!`-prefixed helper
@@ -521,25 +727,39 @@ mod tests {
         );
         assert_eq!(pairs[1], (TOKEN_ENV.to_string(), token.to_string()));
 
-        // Round-trip through real git: the command-line-scoped entry must
-        // dequote back to the exact helper snippet.
-        let out = std::process::Command::new("git")
+        // Round-trip through real git: the command-line-scoped entries must
+        // dequote back to a reset followed by the exact helper snippet.
+        let values = helper_values_via_git(params);
+        let expected = token_helper_config();
+        let expected_value = expected.strip_prefix(GITHUB_HELPER_RESET).unwrap();
+        assert_eq!(
+            &values[..2],
+            &["".to_string(), expected_value.to_string()],
+            "reset then the token helper, ahead of any fallbacks: {values:?}"
+        );
+    }
+
+    /// Read back the ordered `credential.https://github.com.helper` values a
+    /// `GIT_CONFIG_PARAMETERS` value produces, using real git as the parser.
+    fn helper_values_via_git(params: &str) -> Vec<String> {
+        let out = Command::new("git")
             .env(GIT_CONFIG_PARAMETERS_ENV, params)
-            .args(["config", "--get", "credential.https://github.com.helper"])
+            .args(["config", "--get-all", GITHUB_HELPER_KEY])
             .output()
             .expect("git must be runnable");
         assert!(out.status.success(), "git must parse the quoted parameters");
-        let value = String::from_utf8_lossy(&out.stdout);
-        let expected = token_helper_config();
-        let expected_value = expected
-            .strip_prefix("credential.https://github.com.helper=")
-            .unwrap();
-        assert_eq!(value.trim_end_matches('\n'), expected_value);
+        String::from_utf8_lossy(&out.stdout)
+            .strip_suffix('\n')
+            .unwrap_or_default()
+            .split('\n')
+            .map(str::to_string)
+            .collect()
     }
 
-    /// A pre-existing `GIT_CONFIG_PARAMETERS` value is preserved and the
-    /// helper entry is appended after it (space-separated), so inherited
-    /// entries keep their precedence and both remain parseable by git.
+    /// A pre-existing `GIT_CONFIG_PARAMETERS` value is preserved verbatim and
+    /// the helper entries are appended after it (space-separated), so
+    /// unrelated inherited config still applies and both remain parseable by
+    /// git.
     #[test]
     fn scoped_credential_env_appends_to_inherited_parameters() {
         let inherited = "'foo.bar=baz'";
@@ -596,29 +816,20 @@ mod tests {
             let (key, params) = &pairs[0];
             assert_eq!(key, GIT_CONFIG_PARAMETERS_ENV);
 
-            let out = std::process::Command::new("git")
-                .env(GIT_CONFIG_PARAMETERS_ENV, params)
-                .args(["config", "--get", "credential.https://github.com.helper"])
-                .output()
-                .expect("git must be runnable");
-            assert!(out.status.success(), "git must parse the quoted parameters");
-            let value = String::from_utf8_lossy(&out.stdout);
+            let values = helper_values_via_git(params);
             let expected = daemon_helper_config(path);
-            let expected_value = expected
-                .strip_prefix("credential.https://github.com.helper=")
-                .unwrap();
+            let expected_value = expected.strip_prefix(GITHUB_HELPER_RESET).unwrap();
             assert_eq!(
-                value.trim_end_matches('\n'),
-                expected_value,
-                "path {path:?}"
+                &values[..2],
+                &["".to_string(), expected_value.to_string()],
+                "reset then the daemon helper, ahead of any fallbacks; path {path:?}"
             );
         }
     }
 
-    /// A pre-existing `GIT_CONFIG_PARAMETERS` value is preserved and the
-    /// daemon-helper entry is appended after it, mirroring the
-    /// [`scoped_credential_env`] composition rule; blank inherited values are
-    /// treated as absent.
+    /// A pre-existing `GIT_CONFIG_PARAMETERS` value is preserved verbatim and
+    /// the daemon-helper entries are appended after it, so unrelated inherited
+    /// config still applies; blank inherited values are treated as absent.
     #[test]
     fn daemon_helper_env_appends_to_inherited_parameters() {
         let pairs = daemon_helper_env("/usr/local/bin/intentd", Some("'foo.bar=baz'"));
@@ -650,15 +861,7 @@ mod tests {
     #[test]
     fn daemon_helper_shell_invocation_survives_quoted_path() {
         use std::os::unix::fs::PermissionsExt;
-        // Guard-cleaned scratch dir (no tempfile dev-dep in this crate).
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir =
-            Scratch(std::env::temp_dir().join(format!("intent-git-helper-{}", std::process::id())));
+        let dir = Scratch::new("shell-invocation");
         let bin_dir = dir.0.join("in tent'd");
         std::fs::create_dir_all(&bin_dir).expect("mkdir quoted bin dir");
         let stub = bin_dir.join("intentd");
@@ -685,5 +888,308 @@ mod tests {
         assert!(status.success());
         let argv = std::fs::read_to_string(&capture).expect("stub captured argv");
         assert_eq!(argv, "git-credential\nget\n");
+    }
+
+    /// The key matcher reproduces git's urlmatch verdicts for a bare
+    /// `https://github.com` credential request — each case below was checked
+    /// against real `git credential fill` (monorepo#3059). Over-matching would
+    /// hand another host's helper a github.com request; under-matching would
+    /// drop a helper the user configured, since the reset clears the list.
+    #[test]
+    fn credential_key_targets_github_matches_gits_urlmatch() {
+        for key in [
+            "credential.helper",
+            "credential.https://github.com.helper",
+            "credential.github.com.helper",
+            "credential.https://github.com/.helper",
+            "credential.https://github.com:443.helper",
+            "credential.HTTPS://GitHub.com.helper",
+        ] {
+            assert!(credential_key_targets_github(key), "must match: {key}");
+        }
+        for key in [
+            "credential.http://github.com.helper",
+            "credential.https://*.github.com.helper",
+            "credential.https://github.com/intent-hq.helper",
+            "credential.https://gitlab.com.helper",
+            "credential.https://github.com.username",
+            "credential.https://alice@github.com.helper",
+            "credential.useHttpPath",
+            "url.https://github.com.insteadOf",
+        ] {
+            assert!(!credential_key_targets_github(key), "must not match: {key}");
+        }
+    }
+
+    /// The `git config --list -z` fold keeps config order, ignores entries for
+    /// other hosts and non-helper keys, skips valueless entries, and treats an
+    /// empty value as the list reset git implements.
+    #[test]
+    fn github_helpers_from_config_list_orders_and_honours_reset() {
+        let list = concat!(
+            "credential.helper\nosxkeychain\0",
+            "credential.https://gitlab.com.helper\nglab\0",
+            "credential.https://github.com.helper\n!gh auth git-credential\0",
+            "credential.usehttppath\ntrue\0",
+            "core.bare\0",
+        );
+        assert_eq!(
+            github_helpers_from_config_list(list),
+            vec!["osxkeychain", "!gh auth git-credential"]
+        );
+
+        // An empty value clears everything accumulated so far, including
+        // entries contributed by earlier config files.
+        let list = concat!(
+            "credential.helper\nosxkeychain\0",
+            "credential.helper\n\0",
+            "credential.https://github.com.helper\nstore\0",
+        );
+        assert_eq!(github_helpers_from_config_list(list), vec!["store"]);
+        assert!(github_helpers_from_config_list("").is_empty());
+    }
+
+    /// The composed entries put intentd first and re-add the discovered
+    /// helpers behind it — including a generic one an OS default contributed —
+    /// while dropping our own entry (an outer agent shell's) and duplicates so
+    /// nesting cannot grow the list.
+    #[test]
+    fn github_helper_entries_puts_intentd_first_and_keeps_fallbacks() {
+        let entry = daemon_helper_config("/usr/local/bin/intentd");
+        let own_value = entry.strip_prefix(GITHUB_HELPER_RESET).unwrap().to_string();
+        let fallbacks = vec![
+            own_value,
+            "osxkeychain".to_string(),
+            "!gh auth git-credential".to_string(),
+            "osxkeychain".to_string(),
+        ];
+        assert_eq!(
+            github_helper_entries(entry.clone(), Some(&fallbacks)),
+            vec![
+                GITHUB_HELPER_RESET.to_string(),
+                entry,
+                format!("{GITHUB_HELPER_KEY}=osxkeychain"),
+                format!("{GITHUB_HELPER_KEY}=!gh auth git-credential"),
+            ]
+        );
+    }
+
+    /// Discovery failure means the helper list is *unknown*, so no reset is
+    /// emitted: the entry is appended exactly as it was before monorepo#3059.
+    /// Resetting a list we cannot restore would strip the user's helpers
+    /// outright — strictly worse than losing precedence.
+    #[test]
+    fn github_helper_entries_without_discovery_appends_as_before() {
+        let entry = daemon_helper_config("/usr/local/bin/intentd");
+        assert_eq!(
+            github_helper_entries(entry.clone(), None),
+            vec![entry.clone()]
+        );
+        // An empty (but known) list still resets: nothing to preserve.
+        assert_eq!(
+            github_helper_entries(entry.clone(), Some(&[])),
+            vec![GITHUB_HELPER_RESET.to_string(), entry]
+        );
+    }
+
+    /// Discovery reports what git itself would consult, in config order, for
+    /// the directory the child will run in: a repository-local helper is
+    /// included (local config is read after system/global, so it lands last)
+    /// and another host's scoped helper is not.
+    #[cfg(unix)]
+    #[test]
+    fn discover_github_helpers_sees_repository_local_helpers() {
+        let dir = Scratch::new("discover");
+        let repo = dir.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init")
+            .success());
+        for (key, value) in [
+            ("credential.helper", "local-generic"),
+            ("credential.https://github.com.helper", "local-scoped"),
+            ("credential.https://gitlab.com.helper", "other-host"),
+        ] {
+            assert!(Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(&repo)
+                .status()
+                .expect("git config")
+                .success());
+        }
+
+        let helpers = discover_github_helpers(Some(&repo), None).expect("git must be runnable");
+        assert!(
+            helpers.ends_with(&["local-generic".to_string(), "local-scoped".to_string()]),
+            "repo-local helpers, in config order, at the end: {helpers:?}"
+        );
+        assert!(
+            !helpers.iter().any(|h| h == "other-host"),
+            "another host's helper must not be re-added for github.com: {helpers:?}"
+        );
+
+        // Entries the child would inherit are visible too, so an outer agent
+        // shell's injection is recognised rather than duplicated.
+        let inherited = config_parameters(None, &["credential.helper=inherited".to_string()]);
+        let helpers =
+            discover_github_helpers(Some(&repo), Some(&inherited)).expect("git must be runnable");
+        assert_eq!(helpers.last().map(String::as_str), Some("inherited"));
+    }
+
+    /// The defect this ordering exists to fix (monorepo#3059), driven through
+    /// real git: a github.com credential that authenticates but is dead for
+    /// the org — Apple's `osxkeychain` default holding a stale token — sits in
+    /// a config file, so git consults it before any command-line-scoped entry.
+    ///
+    /// The `None` half is the pre-fix composition verbatim (append, no reset):
+    /// it must still hand back the stale credential, which is what made every
+    /// HTTPS git operation in an agent shell fail with `Repository not found`.
+    /// The `Some` half is the fix: the daemon's token wins while the stale
+    /// helper stays configured.
+    #[cfg(unix)]
+    #[test]
+    fn stale_config_helper_cannot_shadow_the_daemon_helper() {
+        let dir = Scratch::new("shadow");
+        let stale = dir.stub(
+            "stale",
+            "printf 'username=keychain\\npassword=stale-403\\n'\n",
+        );
+        let intentd = dir.stub(
+            "intentd",
+            "printf 'username=x-access-token\\npassword=daemon-token\\n'\n",
+        );
+        let global = dir.global_config(&stale);
+        let entry = daemon_helper_config(&intentd.to_string_lossy());
+        let fallbacks = vec![stale.to_string_lossy().to_string()];
+
+        let before = config_parameters(None, &github_helper_entries(entry.clone(), None));
+        assert_eq!(
+            fill_github_password(&global, &before),
+            Some("stale-403".to_string()),
+            "appending after the config files is exactly how the daemon token got shadowed"
+        );
+
+        let after = config_parameters(None, &github_helper_entries(entry, Some(&fallbacks)));
+        assert_eq!(
+            fill_github_password(&global, &after),
+            Some("daemon-token".to_string()),
+            "the daemon helper must be consulted before the config-file helper"
+        );
+    }
+
+    /// The fallback the ordering is careful to preserve: when intentd declines
+    /// (silent, exit 0 — no daemon, gate off, no token), git falls through to
+    /// the helper the user actually configured. Without the re-add, the reset
+    /// would leave github.com with no helper at all.
+    #[cfg(unix)]
+    #[test]
+    fn configured_helper_still_answers_when_the_daemon_helper_declines() {
+        let dir = Scratch::new("fallback");
+        let configured = dir.stub(
+            "configured",
+            "printf 'username=alice\\npassword=user-pat\\n'\n",
+        );
+        // Exactly what `intentd git-credential` does with nothing to offer.
+        let silent = dir.stub("intentd", "exit 0\n");
+        let global = dir.global_config(&configured);
+
+        let params = config_parameters(
+            None,
+            &github_helper_entries(
+                daemon_helper_config(&silent.to_string_lossy()),
+                Some(&[configured.to_string_lossy().to_string()]),
+            ),
+        );
+        assert_eq!(
+            fill_github_password(&global, &params),
+            Some("user-pat".to_string()),
+            "a user-configured helper must stay reachable behind intentd's"
+        );
+    }
+
+    /// Resolve a github.com credential through real git with `global` as the
+    /// only config file and `params` as the command-line scope, returning the
+    /// password git settled on. Hermetic: the system gitconfig (the very file
+    /// that ships `credential.helper = osxkeychain`) is excluded, and prompts
+    /// are disabled so an unanswered request fails instead of blocking.
+    #[cfg(unix)]
+    fn fill_github_password(global: &std::path::Path, params: &str) -> Option<String> {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("git must be runnable");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+        let out = child.wait_with_output().expect("git credential fill");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("password=").map(str::to_string))
+    }
+
+    /// Guard-cleaned scratch dir (no tempfile dev-dep in this crate), unique
+    /// per test so the suite can run them in parallel.
+    #[cfg(unix)]
+    struct Scratch(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("intent-git-auth-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir scratch");
+            Self(dir)
+        }
+
+        /// An executable credential-helper stub answering `get` with `body`
+        /// and staying silent (exit 0) for every other operation, the way a
+        /// well-behaved helper must.
+        fn stub(&self, name: &str, body: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(name);
+            // git passes the operation last, whether it invokes the helper
+            // directly (`<path> get`) or through `sh -c` (`… git-credential get`).
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nfor a in \"$@\"; do op=$a; done\ntest \"$op\" = get || exit 0\n{body}"),
+            )
+            .expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        /// A global gitconfig whose only setting is `credential.helper`,
+        /// standing in for the config file an OS default lands in.
+        fn global_config(&self, helper: &std::path::Path) -> std::path::PathBuf {
+            let path = self.0.join("gitconfig");
+            std::fs::write(
+                &path,
+                format!("[credential]\n\thelper = {}\n", helper.display()),
+            )
+            .expect("write gitconfig");
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
