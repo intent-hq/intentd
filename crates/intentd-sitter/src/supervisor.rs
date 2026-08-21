@@ -437,6 +437,8 @@ impl Supervisor {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(e) => {
+                    // "failed to spawn" is part of the install-script log
+                    // contract (see the `what` match in the wait arm below).
                     let what = format!("failed to spawn {}: {e}", binary.display());
                     if !supervised {
                         eprintln!("intentd-sitter: {what}");
@@ -470,6 +472,15 @@ impl Supervisor {
             loop {
                 tokio::select! {
                     status = child.wait() => {
+                        // The failure phrasings built here ("exited
+                        // unexpectedly", "failed waiting on intentd", plus
+                        // "failed to spawn" above) and the give-up banner in
+                        // `report_give_up` are a detection contract with
+                        // scripts/install.sh and scripts/install.ps1: their
+                        // post-timeout diagnosis greps this run's service log
+                        // for these substrings. Reword only in lockstep with
+                        // both scripts and the `install_log_contract_*` tests
+                        // in tests/supervisor_e2e.rs.
                         let what = match status {
                             Ok(status) if status.success() => return 0,
                             Ok(status) if !supervised => return exit_code(status),
@@ -636,6 +647,12 @@ impl Supervisor {
     /// The daemon inherits the sitter's stdio, so its own error message is
     /// already in the same log directly above this banner — point at it
     /// rather than trying to guess the cause.
+    ///
+    /// "times in a row without ever staying up" is how `scripts/install.sh`
+    /// and `scripts/install.ps1` recognize this banner (the install-script
+    /// log contract; see the wait arm in [`Supervisor::supervise`]): reword
+    /// only in lockstep with both scripts and the `install_log_contract_*`
+    /// tests in `tests/supervisor_e2e.rs`.
     fn report_give_up(&self, what: &str, failures: u32) {
         eprintln!("intentd-sitter: {what}");
         eprintln!(
