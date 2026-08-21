@@ -758,6 +758,73 @@ async fn note_round_trip() {
     assert_eq!(fetched.id, note.id);
 }
 
+/// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per
+/// workspace as a single aggregate — `None` for a workspace with no notes,
+/// the max across notes otherwise, matching what folding hydrated
+/// `list_notes` rows would produce. Backs the `lastActivity` derivation on
+/// the hot list/get emit paths without note-body hydration.
+#[tokio::test]
+async fn max_note_updated_at_matches_list_notes_fold() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // No notes: the aggregate reads None (SQL MAX over zero rows is NULL).
+    assert_eq!(
+        store.max_note_updated_at(&ws_id).await.expect("empty max"),
+        None
+    );
+
+    let mk_note = |id: &str, updated_at: &str| Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: id.to_string(),
+        content: "body".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: updated_at.to_string(),
+        rev: 0,
+        updated_at: updated_at.to_string(),
+    };
+    for (id, ts) in [
+        ("n-old", "2026-01-01T00:00:00Z"),
+        ("n-new", "2026-03-01T00:00:00Z"),
+        ("n-mid", "2026-02-01T00:00:00Z"),
+    ] {
+        store.insert_note(&mk_note(id, ts)).await.expect("insert");
+    }
+
+    let max = store.max_note_updated_at(&ws_id).await.expect("max");
+    assert_eq!(max.as_deref(), Some("2026-03-01T00:00:00Z"));
+
+    // Parity with the old fold over hydrated rows.
+    let notes = store.list_notes(&ws_id).await.expect("list");
+    let folded = notes.iter().map(|n| n.updated_at.as_str()).max();
+    assert_eq!(max.as_deref(), folded);
+
+    // Scoped per workspace: another workspace's notes never leak in.
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .expect("insert other ws");
+    assert_eq!(
+        store.max_note_updated_at(&other).await.expect("other max"),
+        None
+    );
+}
+
 #[tokio::test]
 async fn note_version_append_list_get_and_prune() {
     let tmp = TempDb::new();
