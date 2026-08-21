@@ -727,7 +727,7 @@ async fn removed_pr_methods_return_method_not_found_over_wss() {
     {
         let resp = wss_rpc_raw(
             &mut rpc,
-            id as i64 + 1,
+            i64::try_from(id).expect("value fits in i64") + 1,
             method,
             json!({ "workspaceId": fx.ws_id.as_str() }),
         )

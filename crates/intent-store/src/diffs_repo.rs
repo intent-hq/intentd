@@ -60,7 +60,7 @@ impl Store {
             .bind(&id)
             .bind(&d.workspace_id.0)
             .bind(&d.file_path)
-            .bind(d.staged as i64)
+            .bind(i64::from(d.staged))
             .bind(&d.old_content)
             .bind(&d.new_content)
             .bind(&d.hunks_json)

@@ -284,11 +284,13 @@ impl Store {
     }
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
+    #[must_use]
     pub fn write_pool(&self) -> &SqlitePool {
         &self.write_pool
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
+    #[must_use]
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
     }
@@ -296,6 +298,7 @@ impl Store {
     /// Deprecated alias for `read_pool()`. External callers should migrate to
     /// explicit `read_pool()` / `write_pool()` usage.
     #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
+    #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.read_pool
     }
@@ -306,6 +309,7 @@ impl Store {
     ///
     /// Call this after `open()` in the daemon composition root; the task will run
     /// every ~60s until the returned handle is dropped or aborted.
+    #[must_use]
     pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
         let write_pool = self.write_pool.clone();
         tokio::spawn(async move {
@@ -411,7 +415,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
         let after = self.freelist_count().await?;
-        Ok((before - after).max(0) as u64)
+        Ok((before - after).max(0).cast_unsigned())
     }
 
     /// Run `PRAGMA optimize` on the write connection. Cheap when called
@@ -489,6 +493,7 @@ pub struct MigrationStatus {
 
 impl MigrationStatus {
     /// True when every embedded migration version has been applied.
+    #[must_use]
     pub fn is_current(&self) -> bool {
         self.expected.iter().all(|v| self.applied.contains(v))
     }

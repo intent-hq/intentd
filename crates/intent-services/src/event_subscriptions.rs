@@ -329,7 +329,9 @@ impl Services {
                 Vec::new()
             },
             workspace_id: Some(record.workspace_id.0.clone()),
-            batch_window: Some(Duration::from_millis(record.batch_window_ms as u64)),
+            batch_window: Some(Duration::from_millis(
+                record.batch_window_ms.cast_unsigned(),
+            )),
             // Match-time guard (monorepo#1229): agent-owned subscriptions —
             // including rehydrated rows persisted before the subscribe-time
             // guard existed — never match agent events or `chat:stream:delta`.

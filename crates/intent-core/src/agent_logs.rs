@@ -16,12 +16,14 @@ pub(crate) const AGENT_LOGS_DIR_NAME: &str = "agent-logs";
 pub const AGENT_LOG_RETENTION_DAYS: u64 = 7;
 
 /// The agent-logs root for a data dir: `<data_dir>/agent-logs`.
+#[must_use]
 pub fn agent_logs_root(data_dir: &Path) -> PathBuf {
     data_dir.join(AGENT_LOGS_DIR_NAME)
 }
 
 /// Today's (UTC) log file name for the daily-rotated per-agent stderr log,
 /// e.g. `2026-07-16.log`.
+#[must_use]
 pub fn current_agent_log_file_name() -> String {
     let now = time::OffsetDateTime::now_utc();
     format!(

@@ -1337,8 +1337,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Daemon-wide cap on concurrently live ephemeral ACP adapters (one-shot completions and model probes). Each costs ~610 MB and holds no agent slot; over-limit calls queue and fail with error.data.code \"adapter-busy\" if their own timeout expires first (changes apply on daemon restart)",
             "agents",
             Some(1.0),
-            Some(intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT as f64),
-            intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS as f64,
+            Some(f64::from(intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT)),
+            f64::from(intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS),
         ),
         number(
             "agents.idleReapMinutes",
@@ -1347,7 +1347,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agents",
             Some(0.0),
             None,
-            intent_core::config::DEFAULT_IDLE_REAP_MINUTES as f64,
+            f64::from(intent_core::config::DEFAULT_IDLE_REAP_MINUTES),
         ),
         enumerated(
             "agents.flushQueuedMessages",
@@ -1512,6 +1512,7 @@ pub(crate) fn worktrees_location(settings: &SettingsFile) -> String {
 /// explicit cap; 0 (the default) means "auto" (RAM-based cap via
 /// `default_process_cap`). The typed schema already rejects negative /
 /// out-of-range / garbled values.
+#[must_use]
 pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
     let n = settings.agents.max_concurrent;
     (n > 0).then_some(n as usize)
@@ -1522,13 +1523,14 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// explicit `0` is off; an absent key (`None`, the default) resolves to the
 /// recommended budget derived from `total_memory_bytes`
 /// ([`intent_services::recommended_memory_budget_bytes`]).
+#[must_use]
 pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u64) -> Option<u64> {
     match settings.agents.memory_budget_mb {
         None => Some(crate::agent_manager::recommended_memory_budget_bytes(
             total_memory_bytes,
         )),
         Some(0) => None,
-        Some(mb) => Some(mb as u64 * 1024 * 1024),
+        Some(mb) => Some(u64::from(mb) * 1024 * 1024),
     }
 }
 
@@ -1538,6 +1540,7 @@ pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u6
 /// yields a usable bound — a `0` that predates the schema bound (or survived a
 /// hand-edited file) falls back to the default rather than admitting an
 /// unbounded spawn.
+#[must_use]
 pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
     let n = settings.agents.max_concurrent_adapters;
     if n == 0 {

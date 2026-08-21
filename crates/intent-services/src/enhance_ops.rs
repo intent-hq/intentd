@@ -245,7 +245,7 @@ pub(crate) async fn run_auggie_print(
             if let Some(pid) = pid {
                 use nix::sys::signal::{killpg, Signal};
                 use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
             }
             #[cfg(not(unix))]
             let _ = pid;

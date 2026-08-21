@@ -526,7 +526,7 @@ async fn reap_child_group(child: &mut tokio::process::Child) {
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Parse `git clone --progress` stderr line-by-line and publish one

@@ -133,7 +133,7 @@ impl WorkspaceAggregateCache {
                     cache.cow.lock().unwrap().insert(key, supported);
                     tracing::debug!(
                         supported,
-                        total_ms = started.elapsed().as_millis() as u64,
+                        total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "workspace aggregates: cow probe"
                     );
                     Some(supported)
@@ -169,7 +169,7 @@ impl WorkspaceAggregateCache {
                 // Over budget: the detached probe keeps running and backfills
                 // the cache for the next poll.
                 tracing::debug!(
-                    budget_ms = self.budget.as_millis() as u64,
+                    budget_ms = u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
                     "workspace aggregates: cow probe over budget; omitting cowSupported"
                 );
                 None

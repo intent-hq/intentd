@@ -165,7 +165,9 @@ fn capture(duration_ms: i64, frequency_hz: i64) -> Result<serde_json::Value> {
         .build()
         .map_err(|e| Error::Internal(format!("failed to start stack sampler: {e}")))?;
 
-    std::thread::sleep(std::time::Duration::from_millis(duration_ms as u64));
+    std::thread::sleep(std::time::Duration::from_millis(
+        duration_ms.cast_unsigned(),
+    ));
 
     let report = guard
         .report()

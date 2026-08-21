@@ -924,7 +924,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &to)?;
         } else {
-            copy_dir_entry(&entry, &ty, &to)?;
+            copy_dir_entry(&entry, ty, &to)?;
         }
     }
     Ok(())
@@ -933,7 +933,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Copy one non-directory dir entry (file or symlink) to `to`.
 fn copy_dir_entry(
     entry: &std::fs::DirEntry,
-    ty: &std::fs::FileType,
+    ty: std::fs::FileType,
     to: &Path,
 ) -> std::io::Result<()> {
     if ty.is_symlink() {
@@ -1099,7 +1099,7 @@ fn copy_modules_subdir(
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
         if !ty.is_dir() {
-            copy_dir_entry(&entry, &ty, &to)?;
+            copy_dir_entry(&entry, ty, &to)?;
             continue;
         }
         let child_rel = rel.join(entry.file_name());
@@ -1130,7 +1130,7 @@ fn copy_module_dir(src: &Path, dst: &Path, nested: &ModuleLiveness) -> std::io::
         } else if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &to)?;
         } else {
-            copy_dir_entry(&entry, &ty, &to)?;
+            copy_dir_entry(&entry, ty, &to)?;
         }
     }
     Ok(())

@@ -95,7 +95,7 @@ impl GitMetadataWatcher {
             let git_dir = root.join(".git");
             let task = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
-                    if is_mutation_kind(&event.kind)
+                    if is_mutation_kind(event.kind)
                         && event
                             .paths
                             .iter()
@@ -132,7 +132,7 @@ impl GitMetadataWatcher {
         let gitdir_refresher = Arc::clone(&refresher);
         let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if is_mutation_kind(&event.kind)
+                if is_mutation_kind(event.kind)
                     && event
                         .paths
                         .iter()
@@ -262,7 +262,7 @@ impl GitCommonDirWatches {
             let fan_out = Arc::clone(&workspaces);
             let task = tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
-                    if is_mutation_kind(&event.kind)
+                    if is_mutation_kind(event.kind)
                         && event
                             .paths
                             .iter()
@@ -332,7 +332,7 @@ impl GitCommonDirWatches {
 
 /// Event kinds that carry a mutation (mirrors the main watcher's `action_for`:
 /// access/other kinds are dropped).
-fn is_mutation_kind(kind: &EventKind) -> bool {
+fn is_mutation_kind(kind: EventKind) -> bool {
     !matches!(kind, EventKind::Access(_) | EventKind::Other)
 }
 
@@ -687,11 +687,11 @@ mod tests {
 
     #[test]
     fn mutation_kind_filter_drops_access_and_other() {
-        assert!(is_mutation_kind(&EventKind::Create(CreateKind::File)));
-        assert!(is_mutation_kind(&EventKind::Modify(ModifyKind::Any)));
-        assert!(is_mutation_kind(&EventKind::Any));
-        assert!(!is_mutation_kind(&EventKind::Access(AccessKind::Any)));
-        assert!(!is_mutation_kind(&EventKind::Other));
+        assert!(is_mutation_kind(EventKind::Create(CreateKind::File)));
+        assert!(is_mutation_kind(EventKind::Modify(ModifyKind::Any)));
+        assert!(is_mutation_kind(EventKind::Any));
+        assert!(!is_mutation_kind(EventKind::Access(AccessKind::Any)));
+        assert!(!is_mutation_kind(EventKind::Other));
     }
 
     #[tokio::test]

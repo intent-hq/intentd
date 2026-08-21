@@ -35,6 +35,7 @@ pub const DEFAULT_MANIFEST_BASE_URLS: &[&str] = &[
 pub const TARGET_TRIPLE: &str = env!("SITTER_TARGET_TRIPLE");
 
 /// URL of the manifest for `channel` under `base_url`.
+#[must_use]
 pub fn manifest_url(base_url: &str, channel: Channel) -> String {
     let base = base_url.trim_end_matches('/');
     format!("{base}/channel-{channel}/{channel}.json")

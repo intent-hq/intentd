@@ -120,7 +120,10 @@ pub fn ahead_behind(worktree_path: &Path, base_ref: &str) -> Result<(i64, i64)> 
         return Ok((0, 0));
     };
     match repo.graph_ahead_behind(head_oid, base_obj.id()) {
-        Ok((ahead, behind)) => Ok((ahead as i64, behind as i64)),
+        Ok((ahead, behind)) => Ok((
+            i64::try_from(ahead).unwrap_or(i64::MAX),
+            i64::try_from(behind).unwrap_or(i64::MAX),
+        )),
         Err(_) => Ok((0, 0)),
     }
 }

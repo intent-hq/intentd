@@ -89,6 +89,7 @@ pub(crate) fn build_baseline_mcp_env(parent_env: &EnvMap) -> EnvMap {
 }
 
 /// Build the baseline from the current process environment.
+#[must_use]
 pub fn build_baseline_mcp_env_from_process() -> EnvMap {
     let parent: EnvMap = std::env::vars().collect();
     build_baseline_mcp_env(&parent)

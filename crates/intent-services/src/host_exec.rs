@@ -299,6 +299,7 @@ fn cwd_within_root(root: &Path, full: &Path) -> bool {
 /// assembles the child env per the precedence contract in the module doc
 /// (caller `env` > daemon process env > captured login-shell credential vars;
 /// enhanced PATH with caller `env["PATH"]` winning). Exposed for tests.
+#[must_use]
 pub fn build_command(args: &HostExecArgs, cwd_resolved: Option<&Path>) -> Command {
     build_command_with_captured(
         args,
@@ -363,7 +364,7 @@ fn captured_env_to_apply<'a>(
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Execute one `host.exec` request end-to-end: validate policy + `cwd`, spawn,

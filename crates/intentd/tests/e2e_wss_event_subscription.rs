@@ -164,7 +164,7 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     {
         let err = wss_rpc_raw(
             &mut rpc,
-            200 + i as i64,
+            200 + i64::try_from(i).expect("value fits in i64"),
             "agent.subscribe",
             json!({
                 "workspaceId": ws_id,

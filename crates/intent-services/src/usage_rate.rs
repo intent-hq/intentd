@@ -72,7 +72,9 @@ pub(crate) fn split_delta_across_minutes(
     // always-non-negative fractional second, i.e. floors to the whole second.
     let end_min = end.unix_timestamp().div_euclid(60);
     let start_min = start.unix_timestamp().div_euclid(60);
-    let m = ((end_min - start_min) + 1).clamp(1, i64::from(MAX_RATE_HISTORY_LIMIT)) as usize;
+    let m =
+        usize::try_from(((end_min - start_min) + 1).clamp(1, i64::from(MAX_RATE_HISTORY_LIMIT)))
+            .expect("value fits in usize");
 
     let split = |total: u64| -> (u64, u64) { (total / m as u64, total % m as u64) };
     let (in_base, in_rem) = split(delta.input_tokens);
@@ -85,7 +87,9 @@ pub(crate) fn split_delta_across_minutes(
         .map(|i| {
             // Earliest `rem` buckets each receive one extra token.
             let extra = |rem: u64| u64::from((i as u64) < rem);
-            let bucket = minute_bucket_utc(end - Duration::minutes((m - 1 - i) as i64));
+            let bucket = minute_bucket_utc(
+                end - Duration::minutes(i64::try_from(m - 1 - i).expect("value fits in i64")),
+            );
             let part = UsageRateDelta {
                 input_tokens: in_base + extra(in_rem),
                 output_tokens: out_base + extra(out_rem),

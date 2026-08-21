@@ -30,6 +30,7 @@ pub struct UsageRateDelta {
 impl UsageRateDelta {
     /// True when every counter is zero — such deltas are skipped by writers
     /// (an all-zero turn adds nothing and would only churn the table).
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         *self == Self::default()
     }
@@ -70,11 +71,11 @@ impl Store {
                 thought_tokens = thought_tokens + excluded.thought_tokens",
         )
         .bind(bucket_utc)
-        .bind(delta.input_tokens as i64)
-        .bind(delta.output_tokens as i64)
-        .bind(delta.cache_read_tokens as i64)
-        .bind(delta.cache_creation_tokens as i64)
-        .bind(delta.thought_tokens as i64)
+        .bind(delta.input_tokens.cast_signed())
+        .bind(delta.output_tokens.cast_signed())
+        .bind(delta.cache_read_tokens.cast_signed())
+        .bind(delta.cache_creation_tokens.cast_signed())
+        .bind(delta.thought_tokens.cast_signed())
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("add usage rate failed: {e}")))?;
@@ -104,11 +105,11 @@ impl Store {
             .iter()
             .map(|row| UsageRateRow {
                 bucket_utc: row.get("bucket_utc"),
-                input_tokens: row.get::<i64, _>("input_tokens") as u64,
-                output_tokens: row.get::<i64, _>("output_tokens") as u64,
-                cache_read_tokens: row.get::<i64, _>("cache_read_tokens") as u64,
-                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens") as u64,
-                thought_tokens: row.get::<i64, _>("thought_tokens") as u64,
+                input_tokens: row.get::<i64, _>("input_tokens").cast_unsigned(),
+                output_tokens: row.get::<i64, _>("output_tokens").cast_unsigned(),
+                cache_read_tokens: row.get::<i64, _>("cache_read_tokens").cast_unsigned(),
+                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens").cast_unsigned(),
+                thought_tokens: row.get::<i64, _>("thought_tokens").cast_unsigned(),
             })
             .collect())
     }

@@ -206,6 +206,7 @@ pub(crate) async fn ensure_intent_dir(repo_path: &Path) -> Result<()> {
 }
 
 /// Check if a repo has an `.intent/config.json` file.
+#[must_use]
 pub fn has_repo_config(repo_path: &Path) -> bool {
     get_config_file_path(repo_path).exists()
 }

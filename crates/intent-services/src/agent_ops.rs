@@ -116,6 +116,8 @@ pub(crate) struct AgentSnapshot {
     pub(crate) pending_attention: Option<String>,
 }
 
+// serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -2362,7 +2364,8 @@ impl Services {
         // log is insert-only (appends only extend the tail, so existing row
         // positions never shift — a racing `replace_agent_messages` degrades
         // no worse than an already-stale page token).
-        let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
+        let total = usize::try_from(self.store.count_agent_messages(&agent_id).await?.max(0))
+            .expect("value fits in usize");
         // Seek resolution: `aroundMessageId` / `aroundIndex` win over any
         // token (mutual exclusivity is enforced at the transport boundary);
         // a forward (`prevToken`-minted) cursor is recognized next; otherwise
@@ -2382,7 +2385,7 @@ impl Services {
                 .get_agent_message_index(&agent_id, &mid)
                 .await?
                 .ok_or_else(|| Error::InvalidParams(format!("unknown message id: {mid}")))?;
-            let index = index.max(0) as usize;
+            let index = usize::try_from(index.max(0)).expect("value fits in usize");
             slim_anchor = crate::pagination::BudgetAnchor::Target(index);
             Some(crate::pagination::page_window_around(total, limit, index))
         } else if let Some(idx) = around_index {
@@ -2410,7 +2413,11 @@ impl Services {
         };
         let mut page: Vec<AgentMessage> = self
             .store
-            .get_agent_messages_page(&agent_id, start as i64, (end - start) as i64)
+            .get_agent_messages_page(
+                &agent_id,
+                i64::try_from(start).expect("value fits in i64"),
+                i64::try_from(end - start).expect("value fits in i64"),
+            )
             .await?
             .into_iter()
             .map(strip_anonymous_tool_blocks)
@@ -5355,7 +5362,7 @@ impl Services {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        let report_len = report_text.chars().count() as i64;
+        let report_len = i64::try_from(report_text.chars().count()).expect("value fits in i64");
         // Persist the completion report on the child so `agent.get`/`agent.list`
         // (and `ws.agent.summary`) can re-serve it after restarts.
         let saved_at = now_iso();
@@ -7875,11 +7882,13 @@ impl Services {
         let agent_id = &session.id;
         // Count-only aggregate: `active_hooks_for_agent` would hydrate every
         // hook row the agent ever owned (code + lastState blobs included).
-        let hooks = self
-            .store
-            .count_active_hooks_by_agent(agent_id)
-            .await
-            .unwrap_or(0) as usize;
+        let hooks = usize::try_from(
+            self.store
+                .count_active_hooks_by_agent(agent_id)
+                .await
+                .unwrap_or(0),
+        )
+        .expect("value fits in usize");
         let agent_watches = self.list_watches_for_parent(agent_id).len();
         // Length-only registry read: `queue_snapshot` materializes each
         // entry's wire JSON (image/file blocks included) just to be counted.
@@ -7894,11 +7903,13 @@ impl Services {
         // the `parent_agent_id` index, unscoped by workspace so a Chief
         // parent's cross-workspace delegates count too — O(this agent's
         // children), never O(workspace sessions). Fails open to 0.
-        let running_sub_agents = self
-            .store
-            .count_unsettled_child_agents(agent_id)
-            .await
-            .unwrap_or(0) as usize;
+        let running_sub_agents = usize::try_from(
+            self.store
+                .count_unsettled_child_agents(agent_id)
+                .await
+                .unwrap_or(0),
+        )
+        .expect("value fits in usize");
         let num_questions_asked = self.pending_question_count(agent_id).await;
         // Per-agent indexed read over this agent's monitor rows; labels only,
         // no snapshot hydration. Fails open to empty.
@@ -10291,7 +10302,7 @@ impl Services {
                     .map(|(i, m)| intent_store::AgentQueueRow {
                         id: m.id.clone(),
                         agent_id: agent_id.clone(),
-                        position: i as i64,
+                        position: i64::try_from(i).expect("value fits in i64"),
                         payload: serde_json::to_value(m).unwrap_or(Value::Null),
                         created_at: m.queued_at.clone(),
                         turn_id: m.turn_id.clone(),

@@ -381,7 +381,8 @@ pub(crate) fn read_output(
 
     let clean = strip_ansi(&raw);
     let lines: Vec<&str> = clean.split('\n').collect();
-    let max_line_count = max_lines.unwrap_or(200).clamp(1, 10000) as usize;
+    let max_line_count =
+        usize::try_from(max_lines.unwrap_or(200).clamp(1, 10000)).expect("value fits in usize");
     let mut output_lines: Vec<&str> = if lines.len() > max_line_count {
         lines[lines.len() - max_line_count..].to_vec()
     } else {

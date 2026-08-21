@@ -830,6 +830,7 @@ pub(crate) const PR_REFRESH_FETCH_TIMEOUT: std::time::Duration = std::time::Dura
 
 impl Services {
     /// Wire the services surface over a persistence handle.
+    #[must_use]
     pub fn new(store: Store) -> Self {
         Self {
             store,
@@ -943,6 +944,7 @@ impl Services {
     /// Pin the PR-monitor debounce window, bypassing the live
     /// `prMonitor.debounceSeconds` setting (test wiring). Values below the
     /// floor are clamped when read.
+    #[must_use]
     pub fn with_pr_monitor_debounce_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_debounce_seconds = Some(seconds);
         self
@@ -976,6 +978,7 @@ impl Services {
     /// [`Services::run_prompt_turn`] can recognize a sleep-induced turn failure
     /// and enroll it as interrupted for wake-triggered resume. Left unset,
     /// transient upstream disconnects keep today's terminal behavior.
+    #[must_use]
     pub fn with_suspend_tracker(
         mut self,
         tracker: Arc<dyn agent_session::SuspendOverlapQuery>,
@@ -986,6 +989,7 @@ impl Services {
 
     /// Override the per-agent active-hook cap (`[hooks] maxPerAgent`); wired
     /// from `Config` by the composition root.
+    #[must_use]
     pub fn with_hooks_max_per_agent(mut self, cap: u32) -> Self {
         self.hooks_max_per_agent = cap;
         self
@@ -1023,6 +1027,7 @@ impl Services {
     /// [`AgentManager`] hands this to each agent's `WorkspaceMcpServer` so
     /// tool dispatch registers into the same registry the transcript writer
     /// claims from.
+    #[must_use]
     pub fn turn_attachments(&self) -> Arc<intent_core::TurnAttachmentRegistry> {
         self.turn_attachments.clone()
     }
@@ -1030,6 +1035,7 @@ impl Services {
     /// Override the GitHub login host the device flow talks to (§5.27 test
     /// seam). Production wiring keeps `None` (env override → github.com);
     /// tests inject a mock/unroutable URI so `github.connect` is hermetic.
+    #[must_use]
     pub fn with_github_login_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.github_login_base_uri = Some(base_uri.into());
         self
@@ -1039,6 +1045,7 @@ impl Services {
     /// composition root keeps the `auggie`-backed default; tests inject a fake
     /// engine to exercise the engine-available and graceful-degradation paths
     /// (§8.3).
+    #[must_use]
     pub fn with_context_engine(mut self, engine: Arc<dyn intent_context::ContextEngine>) -> Self {
         self.context_engine = engine;
         self
@@ -1050,6 +1057,7 @@ impl Services {
     /// they never read/write the real secrets file. The injected store
     /// is wrapped in an [`AsyncSecretStore`](settings::AsyncSecretStore) so the
     /// same timeout / single-flight guarantees apply in tests.
+    #[must_use]
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
         self.secrets = Arc::new(settings::AsyncSecretStore::new(secrets));
         self
@@ -1059,6 +1067,7 @@ impl Services {
     /// TOML-backed subset of `settings.*` ([`KNOWN_PATHS`]). The composition
     /// root always wires the registry it loaded at boot; test/read-only
     /// wiring may leave it unset, keeping the legacy SQLite-only behavior.
+    #[must_use]
     pub fn with_settings_registry(mut self, registry: Arc<SettingsRegistry>) -> Self {
         self.settings_registry = Some(registry);
         self
@@ -1066,6 +1075,7 @@ impl Services {
 
     /// Borrow the wired [`SettingsRegistry`], if any (composition-root /
     /// live-reload watcher use).
+    #[must_use]
     pub fn settings_registry(&self) -> Option<Arc<SettingsRegistry>> {
         self.settings_registry.clone()
     }
@@ -1114,6 +1124,7 @@ impl Services {
     /// The composition root keeps the env/HOME defaults; tests inject temp dirs
     /// so the 3-tier resolution is hermetic. The project tier always comes from
     /// each call's `workspacePath`.
+    #[must_use]
     pub fn with_specialist_dirs(
         mut self,
         user_dir: Option<PathBuf>,
@@ -1368,6 +1379,7 @@ impl Services {
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
+    #[must_use]
     pub fn pty(&self) -> Arc<intent_pty::PtyHost> {
         self.pty.clone()
     }
@@ -1518,6 +1530,7 @@ impl Services {
     /// handed to the composition root so the [`GitStatusRefresher`]'s
     /// watcher-driven recompute repopulates the same entries the read path
     /// serves instead of running a competing scan.
+    #[must_use]
     pub fn git_status_cache(&self) -> Arc<git_status_cache::GitStatusCache> {
         Arc::clone(&self.git_status_cache)
     }
@@ -2447,6 +2460,7 @@ impl Services {
 
     /// Wire the active source-control provider used by the `pr.*` methods (§7).
     /// The composition root builds it from settings; tests inject a stub.
+    #[must_use]
     pub fn with_source_control(
         mut self,
         source_control: Arc<dyn intent_sourcecontrol::SourceControl>,
@@ -2458,6 +2472,7 @@ impl Services {
     /// Wire the active Linear engine used by the `linear.*` methods (§5.28).
     /// The composition root builds it from settings; tests inject a stub so the
     /// `linear.*` handlers never touch the network.
+    #[must_use]
     pub fn with_linear_engine(
         mut self,
         linear_engine: Arc<dyn intent_linear::LinearEngine>,
@@ -2469,6 +2484,7 @@ impl Services {
     /// Wire the active Sentry engine used by the `sentry.*` methods (§5.29).
     /// The composition root builds it from settings; tests inject a stub so the
     /// `sentry.*` handlers never touch the network.
+    #[must_use]
     pub fn with_sentry_engine(
         mut self,
         sentry_engine: Arc<dyn intent_sentry::SentryEngine>,
@@ -2481,6 +2497,7 @@ impl Services {
     /// a stub so the handler never touches the network; production leaves it
     /// unset and the handler builds the provider engine per call from the
     /// `voice.provider` setting.
+    #[must_use]
     pub fn with_voice_engine(mut self, voice_engine: Arc<dyn intent_voice::VoiceEngine>) -> Self {
         self.voice_engine = Some(voice_engine);
         self
@@ -2687,6 +2704,7 @@ impl Services {
         out
     }
 
+    #[must_use]
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
         self
@@ -2695,6 +2713,7 @@ impl Services {
     /// Persist the per-provider `models.list` cache (PROTOCOL §5.30) under
     /// `dir` (the daemon data dir), reloading any current-version snapshot.
     /// Composition-root only — call before the surface is shared/cloned.
+    #[must_use]
     pub fn with_models_cache_dir(mut self, dir: PathBuf) -> Self {
         self.models_catalog = Arc::new(model_catalog::ModelCatalogCache::new(Some(
             dir.join(model_catalog::MODELS_CACHE_FILE),
@@ -2705,6 +2724,7 @@ impl Services {
     /// Override the root directory `workspace.create` provisions git worktrees
     /// under. The composition root keeps the default (`$INTENTD_WORKSPACES_DIR`,
     /// else `~/intent/workspaces`); tests inject a temp dir.
+    #[must_use]
     pub fn with_workspaces_root(mut self, root: PathBuf) -> Self {
         self.workspaces_root = Some(root);
         self
@@ -2724,6 +2744,7 @@ impl Services {
     /// §5.31, `agent.completeOnce` §5.32) spawn. The composition root keeps
     /// the discovery default (`find_auggie`); tests inject a fixture script
     /// so the one-shot CLI path is deterministic.
+    #[must_use]
     pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
         self.auggie_bin = Some(bin);
         self
@@ -2733,6 +2754,7 @@ impl Services {
     /// ls-remote fallback targets (production: `https://github.com`). Tests
     /// point it at a `file://` directory of `<owner>/<repo>.git` fixtures so
     /// the fallback path never touches the network.
+    #[must_use]
     pub fn with_branches_ls_remote_base(mut self, base: String) -> Self {
         self.branches_ls_remote_base = Some(base);
         self
@@ -2761,6 +2783,7 @@ impl Services {
     /// Wire the event bus so CRUD mutations publish change events (§10). The bus
     /// must share the same [`Store`] as this services handle so the broadcast and
     /// the durable log stay consistent.
+    #[must_use]
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         // The MCP hub publishes `mcp.servers:status-changed` onto the same bus.
         self.mcp_hub.set_event_bus(bus.clone());
@@ -2774,6 +2797,7 @@ impl Services {
     /// composition root builds one [`intent_transport::PrimaryReverseRegistry`]
     /// and hands it to both this method and every listener; test / read-only
     /// wiring leaves it unset and `browser_exec` surfaces `no client connected`.
+    #[must_use]
     pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
         self.reverse_dispatch = Some(dispatch);
         self
@@ -2789,6 +2813,7 @@ impl Services {
 
     /// Borrow the shared [`McpHub`] (composition root: spawn the health monitor
     /// + reap external MCP servers on shutdown, §18.3).
+    #[must_use]
     pub fn mcp_hub(&self) -> Arc<McpHub> {
         self.mcp_hub.clone()
     }
@@ -2818,6 +2843,7 @@ impl Services {
     }
 
     /// Borrow the underlying store (composition-root / diagnostics use).
+    #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
     }
@@ -3550,6 +3576,7 @@ impl Services {
     /// returns; an all-idle tick returns silently before resolving the
     /// provider). Returns the task handle so the composition root can
     /// hold/abort it.
+    #[must_use]
     pub fn spawn_pr_refresh_loop(
         &self,
         interval: std::time::Duration,
@@ -3576,6 +3603,7 @@ impl Services {
     /// per-note session state indefinitely. The first sweep runs after one
     /// interval; missed ticks are skipped (no pile-up). Returns the task handle
     /// so the composition root can hold/abort it.
+    #[must_use]
     pub fn spawn_crdt_session_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
         let crdt_notes = self.crdt_notes.clone();
         tokio::spawn(async move {
@@ -3779,6 +3807,7 @@ impl Services {
     /// monopolizes `SQLite` pool slots. The first sweep runs after one
     /// `interval`; missed ticks are skipped (no pile-up). Returns the task
     /// handle so the composition root can hold/abort it.
+    #[must_use]
     pub fn spawn_token_usage_scan_loop(
         &self,
         interval: std::time::Duration,
@@ -7616,6 +7645,7 @@ pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
 /// never errors (a relative location — which would fail the create — falls
 /// back to the default root), and never fires the hermetic guard (`None` via
 /// [`try_default_workspaces_root`] in that posture).
+#[must_use]
 pub fn try_workspaces_provisioning_parent(
     root_pinned: bool,
     worktrees_location: &str,
@@ -9783,6 +9813,7 @@ pub struct MergeSweepSummary {
 
 impl MergeSweepSummary {
     /// True when the sweep did nothing at all (no pending sandboxes touched).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -10717,7 +10748,7 @@ impl Services {
         }
         Ok(TaskConvertBlocksResult {
             ok: true,
-            converted_count: created_note_ids.len() as i64,
+            converted_count: i64::try_from(created_note_ids.len()).expect("value fits in i64"),
             created_note_ids,
             created_tasks,
             warnings,
@@ -12882,7 +12913,7 @@ impl WorkspaceApi for Services {
             }
             tracing::debug!(
                 workspaces = count,
-                total_ms = started.elapsed().as_millis() as u64,
+                total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "workspace.list: aggregate enrichment"
             );
             // Emit-path PR merge: fold git-root + monitor PRs into each
@@ -14254,8 +14285,8 @@ impl WorkspaceApi for Services {
                                                 tracing::info!(
                                                     repository_path = %repo_for_log.display(),
                                                     mode = ?mode,
-                                                    lock_wait_ms = lock_wait.as_millis() as u64,
-                                                    provision_ms = provision_started.elapsed().as_millis() as u64,
+                                                    lock_wait_ms = u64::try_from(lock_wait.as_millis()).unwrap_or(u64::MAX),
+                                                    provision_ms = u64::try_from(provision_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                                                     ok = result.is_ok(),
                                                     "workspace.create: checkout provisioning lock wait + duration"
                                                 );
@@ -16246,8 +16277,8 @@ impl WorkspaceApi for Services {
                                     tracing::info!(
                                         repository_path = %repo_for_log.display(),
                                         mode = ?mode,
-                                        lock_wait_ms = lock_wait.as_millis() as u64,
-                                        provision_ms = provision_started.elapsed().as_millis() as u64,
+                                        lock_wait_ms = u64::try_from(lock_wait.as_millis()).unwrap_or(u64::MAX),
+                                        provision_ms = u64::try_from(provision_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                                         ok = matches!(&result, Ok(Ok(_))),
                                         "workspace.duplicate: checkout provisioning lock wait + duration"
                                     );
@@ -16803,7 +16834,7 @@ impl WorkspaceApi for Services {
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_millis() as u64);
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
                     return Ok(SetupScript {
                         script: script_str,
                         project_type: None,
@@ -16998,7 +17029,7 @@ impl WorkspaceApi for Services {
                 task_key: task_key.clone(),
                 task_text,
                 agent_id,
-                created_at: now_epoch_ms() as i64,
+                created_at: now_epoch_ms().cast_signed(),
             };
             let stored = store.upsert_task_agent_link(&link).await?;
             publish_event(&bus, task_agent_linked_event(&stored)).await;
@@ -19636,8 +19667,8 @@ impl WorkspaceApi for Services {
             // already orders newest→oldest, so the page is in contract order.
             let limit = pagination::clamp_limit(params.limit);
             let offset = pagination::parse_offset(params.page_token.as_deref());
-            q.limit = Some((limit + 1) as i64);
-            q.offset = Some(offset as i64);
+            q.limit = Some(i64::try_from(limit + 1).expect("value fits in i64"));
+            q.offset = Some(i64::try_from(offset).expect("value fits in i64"));
             let mut events = store.query_events(&q).await?;
             let has_more = events.len() > limit;
             if has_more {
@@ -19762,7 +19793,7 @@ impl WorkspaceApi for Services {
                 tracing::debug!(
                     workspace_id = %workspace_id.as_str(),
                     files = s.files.len(),
-                    total_ms = started.elapsed().as_millis() as u64,
+                    total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "git.status: working-tree status scan"
                 );
             }
@@ -21028,7 +21059,7 @@ impl WorkspaceApi for Services {
             // requested set — with a pathspec-limited commit they match, and
             // for an explicit `files` list the delta is the truth (a named
             // but unchanged path is not part of the commit).
-            let file_count = outcome.files.len() as i64;
+            let file_count = i64::try_from(outcome.files.len()).expect("value fits in i64");
             // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
             // relay so the UI refreshes without a follow-up `git.status` read.
@@ -21239,7 +21270,7 @@ impl WorkspaceApi for Services {
                             if slow_warns.should_warn(&workspace_id) {
                                 tracing::warn!(
                                     workspace_id = %workspace_id.as_str(),
-                                    total_ms = elapsed.as_millis() as u64,
+                                    total_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                                     staged,
                                     path_count,
                                     "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
@@ -21247,7 +21278,7 @@ impl WorkspaceApi for Services {
                             } else {
                                 tracing::debug!(
                                     workspace_id = %workspace_id.as_str(),
-                                    total_ms = elapsed.as_millis() as u64,
+                                    total_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                                     staged,
                                     path_count,
                                     "git.diffs: slow worktree hunk walk (WARN rate-limited; offloaded to blocking pool)"
@@ -22826,7 +22857,7 @@ impl WorkspaceApi for Services {
             // The conversation-comment count is not part of the checklist; a
             // failing read reports zero rather than failing the snapshot.
             let conversation_count = match sc.list_comments(&repo_ref, pr_number).await {
-                Ok(comments) => comments.len() as i64,
+                Ok(comments) => i64::try_from(comments.len()).expect("value fits in i64"),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -24240,7 +24271,8 @@ impl WorkspaceApi for Services {
                     base_ref.as_deref(),
                     base_commit_sha.as_deref(),
                 )?;
-                let boundary_ms = boundary_started.elapsed().as_millis() as u64;
+                let boundary_ms =
+                    u64::try_from(boundary_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                 // If boundary info exists but nothing resolved, return empty (safety net
                 // to avoid showing arbitrary base-branch commits). This holds regardless
@@ -24260,7 +24292,7 @@ impl WorkspaceApi for Services {
                     include_older,
                     false,
                 )?;
-                let walk_ms = walk_started.elapsed().as_millis() as u64;
+                let walk_ms = u64::try_from(walk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
             })
             .await

@@ -166,7 +166,7 @@ impl Store {
         .await
         .map_err(|e| intent_core::Error::Internal(format!("count active hooks failed: {e}")))?
         .get::<i64, _>("n");
-        Ok(n as u64)
+        Ok(n.cast_unsigned())
     }
 
     /// Number of ACTIVE (`scheduled`/`running`) hooks in a workspace — the
@@ -191,7 +191,7 @@ impl Store {
             intent_core::Error::Internal(format!("count workspace active hooks failed: {e}"))
         })?
         .get::<i64, _>("n");
-        Ok(n as u64)
+        Ok(n.cast_unsigned())
     }
 
     /// List all hooks owned by an agent, oldest first.

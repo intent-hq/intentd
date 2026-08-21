@@ -340,7 +340,7 @@ async fn seed_conversation(data_dir: &Path) -> (String, String, Vec<Value>) {
         expected.push(json!({
             "id": m[seq],
             "agentId": agent_id.0,
-            "seq": seq as i64,
+            "seq": i64::try_from(seq).expect("value fits in i64"),
             "role": role,
             "contentBlocks": blocks,
             "timestamp": ts,
@@ -369,7 +369,8 @@ async fn seeded_conversation_rehydrates_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

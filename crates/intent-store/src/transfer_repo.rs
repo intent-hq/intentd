@@ -442,7 +442,7 @@ fn bind_json_value<'q>(
 ) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
     Ok(match value {
         serde_json::Value::Null => query.bind(Option::<String>::None),
-        serde_json::Value::Bool(b) => query.bind(*b as i64),
+        serde_json::Value::Bool(b) => query.bind(i64::from(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 query.bind(i)

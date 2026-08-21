@@ -130,6 +130,7 @@ pub enum SettingOrigin {
 
 impl SettingOrigin {
     /// Wire spelling of the origin (`default` | `file` | `flag`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             SettingOrigin::Default => "default",

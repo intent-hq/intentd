@@ -63,6 +63,7 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 /// drift). Mirrors `WorkspaceMcpServer::effective_agent_features`; used by
 /// the background hook scheduler for hooks owned by background/delegated
 /// sessions.
+#[must_use]
 pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
     let forced;
     let features = if is_sub_agent && features.structured_questions {

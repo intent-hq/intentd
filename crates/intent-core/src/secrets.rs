@@ -64,6 +64,7 @@ impl Default for FileSecretStore {
 
 impl FileSecretStore {
     /// Store backed by the default path ([`default_secrets_path`]).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_path(default_secrets_path())
     }
@@ -75,6 +76,7 @@ impl FileSecretStore {
     }
 
     /// The backing file path.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }

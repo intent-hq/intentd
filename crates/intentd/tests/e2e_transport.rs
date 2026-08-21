@@ -323,7 +323,8 @@ async fn e2e_transport_full() {
     assert_eq!(r["listenMode"], "both");
     assert_eq!(r["transports"], json!(["uds", "tcp"]));
     assert_eq!(r["host"]["locality"], "local", "UDS control ⇒ local");
-    let bound_port = r["port"].as_u64().expect("bound tcp port") as u16;
+    let bound_port =
+        u16::try_from(r["port"].as_u64().expect("bound tcp port")).expect("value fits in u16");
     let fingerprint = r["fingerprint"]
         .as_str()
         .expect("cert fingerprint")

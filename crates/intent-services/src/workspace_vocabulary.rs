@@ -61,7 +61,9 @@ pub(crate) fn parse_max_terms_setting(raw: Option<&str>) -> usize {
         Some(s) => serde_json::from_str::<serde_json::Value>(s)
             .ok()
             .and_then(|v| v.as_u64())
-            .map_or(DEFAULT_MAX_TERMS, |n| n as usize),
+            .map_or(DEFAULT_MAX_TERMS, |n| {
+                usize::try_from(n).expect("value fits in usize")
+            }),
     }
 }
 

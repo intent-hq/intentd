@@ -44,7 +44,7 @@ pub(crate) fn parse_period(period: &str, key: Option<&str>) -> Result<UsagePerio
             })?;
             key.split_once('-')
                 .and_then(|(y, m)| {
-                    let year = parse_digits(y, 4)? as i32;
+                    let year = parse_digits(y, 4)?.cast_signed();
                     let month = parse_digits(m, 2)?;
                     (1..=12).contains(&month).then_some(UsagePeriod::Month {
                         year,
@@ -60,7 +60,9 @@ pub(crate) fn parse_period(period: &str, key: Option<&str>) -> Result<UsagePerio
                 Error::InvalidParams("key (\"YYYY\") is required for period \"year\"".into())
             })?;
             parse_digits(key, 4)
-                .map(|y| UsagePeriod::Year { year: y as i32 })
+                .map(|y| UsagePeriod::Year {
+                    year: y.cast_signed(),
+                })
                 .ok_or_else(|| {
                     Error::InvalidParams(format!("invalid year key {key:?}: expected \"YYYY\""))
                 })
@@ -84,7 +86,7 @@ fn parse_digits(s: &str, len: usize) -> Option<u32> {
 /// calendar-validated) since only `(year, month)` are consumed.
 fn parse_local_date(s: &str) -> Option<(i32, u8)> {
     let mut it = s.split('-');
-    let year = parse_digits(it.next()?, 4)? as i32;
+    let year = parse_digits(it.next()?, 4)?.cast_signed();
     let month = parse_digits(it.next()?, 2)?;
     let day = parse_digits(it.next()?, 2)?;
     (it.next().is_none() && (1..=12).contains(&month) && (1..=31).contains(&day))
@@ -232,7 +234,8 @@ pub(crate) fn aggregate_usage(
                 } else {
                     (
                         true,
-                        (utc - window_start).whole_hours().clamp(0, 23) as usize,
+                        usize::try_from((utc - window_start).whole_hours().clamp(0, 23))
+                            .expect("value fits in usize"),
                     )
                 }
             }
@@ -294,7 +297,8 @@ pub(crate) fn aggregate_usage(
         .map(|(i, cell)| {
             let hour = match period {
                 UsagePeriod::Last24h => {
-                    let bucket = window_start + Duration::hours(i as i64);
+                    let bucket = window_start
+                        + Duration::hours(i64::try_from(i).expect("value fits in i64"));
                     u64::from(bucket.to_offset(tz).hour())
                 }
                 _ => i as u64,

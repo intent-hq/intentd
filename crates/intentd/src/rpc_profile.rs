@@ -284,7 +284,8 @@ where
             return;
         };
         let elapsed = profile.started.elapsed();
-        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         let statement_threshold = self.statement_threshold_for(&profile.method);
         if profile.statements > statement_threshold {
             tracing::warn!(
@@ -302,7 +303,7 @@ where
                 target: WARN_TARGET,
                 method = %profile.method,
                 statements = profile.statements,
-                threshold_ms = duration_threshold.as_millis().min(u128::from(u64::MAX)) as u64,
+                threshold_ms = u64::try_from(duration_threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
                 elapsed_ms,
                 "rpc dispatch exceeded duration budget"
             );

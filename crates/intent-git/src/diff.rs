@@ -73,12 +73,14 @@ pub struct FileDiff {
 
 impl FileDiff {
     /// Whether either side of the delta is a `160000` gitlink entry.
+    #[must_use]
     pub fn is_gitlink(&self) -> bool {
         self.old_is_gitlink || self.new_is_gitlink
     }
 
     /// The old-side submodule pin SHA — `old_blob` only when that side is a
     /// gitlink (never a regular file's blob OID).
+    #[must_use]
     pub fn gitlink_old_sha(&self) -> Option<&str> {
         if self.old_is_gitlink {
             self.old_blob.as_deref()
@@ -89,6 +91,7 @@ impl FileDiff {
 
     /// The new-side submodule pin SHA — `new_blob` only when that side is a
     /// gitlink (never a regular file's blob OID).
+    #[must_use]
     pub fn gitlink_new_sha(&self) -> Option<&str> {
         if self.new_is_gitlink {
             self.new_blob.as_deref()
@@ -510,7 +513,7 @@ pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
         tracing::warn!(
             repo_path = %repo_path.display(),
             total_files,
-            total_ms = total.as_millis() as u64,
+            total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
             "head_diff_rollup: slow HEAD→workdir diff rollup"
         );
     }
@@ -558,6 +561,7 @@ fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
 /// are commit SHAs in the **submodule's** odb, not blobs in this repository —
 /// so this builds the same one-line pseudo-diff without any object lookups.
 /// Either side may be `None` (added / deleted submodule).
+#[must_use]
 pub fn gitlink_hunks(old_sha: Option<&str>, new_sha: Option<&str>) -> Vec<DiffHunk> {
     let mut lines = Vec::new();
     if let Some(old) = old_sha {

@@ -180,7 +180,7 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
     if hook.state == HookState::Running {
         return (
             next_run_at_iso(hook.delay_ms),
-            Duration::from_millis(hook.delay_ms.max(0) as u64),
+            Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()),
         );
     }
     match hook
@@ -197,7 +197,7 @@ fn resumed_next_run(hook: &Hook) -> (String, Duration) {
         }
         _ => (
             next_run_at_iso(hook.delay_ms),
-            Duration::from_millis(hook.delay_ms.max(0) as u64),
+            Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()),
         ),
     }
 }
@@ -1092,7 +1092,7 @@ impl Services {
             loop {
                 let delay = initial_delay
                     .take()
-                    .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0) as u64));
+                    .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
                 // Race the inter-run sleep against the time to `expiresAt`
                 // (deadline-free legacy rows never take the expiry arm).
                 let to_expiry =

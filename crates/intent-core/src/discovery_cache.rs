@@ -46,6 +46,7 @@ pub struct DiscoveryCache<T> {
 }
 
 impl<T: Clone> DiscoveryCache<T> {
+    #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),

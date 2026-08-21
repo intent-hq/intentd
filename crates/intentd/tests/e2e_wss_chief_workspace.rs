@@ -325,7 +325,8 @@ async fn chief_workspace_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -537,7 +538,8 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -646,7 +648,8 @@ async fn ws_app_surface_events_and_gating_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -833,7 +836,8 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1251,7 +1255,8 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1396,7 +1401,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
         let resp = wss_rpc_envelope(
             &mut rpc,
-            20 + i as i64,
+            20 + i64::try_from(i).expect("value fits in i64"),
             "agent.sendMessage",
             json!({ "workspaceId": wsid, "agentId": tid, "content": "please finish" }),
         )
@@ -1638,7 +1643,8 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1751,7 +1757,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
     for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
         let resp = wss_rpc_envelope(
             &mut rpc,
-            20 + i as i64,
+            20 + i64::try_from(i).expect("value fits in i64"),
             "agent.sendMessage",
             json!({ "workspaceId": wsid, "agentId": tid, "content": "please finish" }),
         )
@@ -1843,7 +1849,8 @@ async fn chief_scoped_group_cancel_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2013,7 +2020,8 @@ async fn non_chief_waitfor_gated_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2135,7 +2143,8 @@ async fn workspace_archive_unarchive_bridge_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2284,7 +2293,8 @@ async fn chief_workspace_archive_gated_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

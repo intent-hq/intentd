@@ -433,18 +433,18 @@ fn bind_session_insert<'q>(
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
         .bind(&s.name)
-        .bind(s.name_explicitly_set as i64)
+        .bind(i64::from(s.name_explicitly_set))
         .bind(&s.model)
         .bind(&s.provider)
         .bind(enum_to_db(&s.status)?)
-        .bind(s.is_active as i64)
+        .bind(i64::from(s.is_active))
         .bind(&s.system_prompt)
         .bind(&s.created_at)
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.specialist)
         .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-        .bind(s.skip_auto_commit as i64)
+        .bind(i64::from(s.skip_auto_commit))
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
         .bind(&s.attention_request_kind)
@@ -455,7 +455,7 @@ fn bind_session_insert<'q>(
         .bind(json_col_to_db(&s.context_references)?)
         .bind(json_col_to_db(&s.image_blocks)?)
         .bind(json_col_to_db(&s.file_blocks)?)
-        .bind(s.is_background as i64)
+        .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
@@ -464,7 +464,7 @@ fn bind_session_insert<'q>(
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
         .bind(effort_levels_to_db(&s.effort_levels)?)
-        .bind(task_graph_enabled as i64)
+        .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
         .bind(json_col_to_db(&s.harness_features)?))
 }
@@ -586,7 +586,7 @@ impl Store {
                 sqlx::query(&insert_sql)
                     .bind(&id)
                     .bind(&s.id.0)
-                    .bind(idx as i64)
+                    .bind(i64::try_from(idx).unwrap_or(i64::MAX))
                     .bind(role)
                     .bind(&content_json)
                     .bind(metadata_json.as_deref())
@@ -922,9 +922,9 @@ impl Store {
             stats.insert(
                 agent_id,
                 (
-                    message_count as u64,
+                    message_count.cast_unsigned(),
                     assistant_count != 0,
-                    conversation_bytes.max(0) as u64,
+                    conversation_bytes.max(0).cast_unsigned(),
                 ),
             );
         }
@@ -969,7 +969,7 @@ impl Store {
             projections.insert(
                 agent_id,
                 SessionMessageProjection {
-                    message_count: message_count as u64,
+                    message_count: message_count.cast_unsigned(),
                     last_assistant_text_blocks: decode_preview_col(
                         row.get("last_assistant_preview"),
                     ),
@@ -1011,7 +1011,7 @@ impl Store {
         };
         let message_count: i64 = row.get("message_count");
         Ok(SessionMessageProjection {
-            message_count: message_count as u64,
+            message_count: message_count.cast_unsigned(),
             last_assistant_text_blocks: decode_preview_col(row.get("last_assistant_preview")),
             last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
             last_message_role: row.get("last_message_role"),
@@ -1042,7 +1042,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("get workspace message watermark failed: {e}")))?;
         let count: i64 = row.get("count");
-        Ok(count as u64)
+        Ok(count.cast_unsigned())
     }
 
     /// Upsert one session's cumulative end-of-turn token-usage snapshot
@@ -1406,17 +1406,17 @@ impl Store {
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.acp_session_id)
         .bind(&s.name)
-        .bind(s.name_explicitly_set as i64)
+        .bind(i64::from(s.name_explicitly_set))
         .bind(&s.model)
         .bind(&s.provider)
         .bind(enum_to_db(&s.status)?)
-        .bind(s.is_active as i64)
+        .bind(i64::from(s.is_active))
         .bind(&s.system_prompt)
         .bind(&s.updated_at)
         .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
         .bind(&s.specialist)
         .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-        .bind(s.skip_auto_commit as i64)
+        .bind(i64::from(s.skip_auto_commit))
         .bind(&s.completion_report)
         .bind(&s.completion_report_timestamp)
         .bind(s.delegation_depth)
@@ -1424,7 +1424,7 @@ impl Store {
         .bind(json_col_to_db(&s.context_references)?)
         .bind(json_col_to_db(&s.image_blocks)?)
         .bind(json_col_to_db(&s.file_blocks)?)
-        .bind(s.is_background as i64)
+        .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
@@ -1607,7 +1607,7 @@ impl Store {
         .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
-        .bind(guarded as i64)
+        .bind(i64::from(guarded))
         .bind(key)
         .bind(expected_value)
         .execute(self.write_pool())
@@ -1672,7 +1672,7 @@ impl Store {
                      WHERE id=? AND workspace_id=?",
                 )
                 .bind(enum_to_db(&status)?)
-                .bind(is_active as i64)
+                .bind(i64::from(is_active))
                 .bind(updated_at)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
@@ -1692,7 +1692,7 @@ impl Store {
                      WHERE id=? AND workspace_id=?",
                 )
                 .bind(enum_to_db(&status)?)
-                .bind(is_active as i64)
+                .bind(i64::from(is_active))
                 .bind(updated_at)
                 .bind(reason)
                 .bind(stop_reason_timestamp)
@@ -1957,7 +1957,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("reset active flags failed: {e}")))?
             .rows_affected();
-        Ok(rows as usize)
+        Ok(usize::try_from(rows).unwrap_or(usize::MAX))
     }
 
     /// Set `acp_session_id` write-once (the provider `session:created` path).
@@ -2814,7 +2814,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("count unsettled child agents failed: {e}")))?
         .get::<i64, _>("n");
-        Ok(n as u64)
+        Ok(n.cast_unsigned())
     }
 
     /// Total number of messages logged for an agent (`agent.getConversation`
@@ -3007,7 +3007,7 @@ impl Store {
                 "INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?)"
             );
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
-                let seq = idx as i64;
+                let seq = i64::try_from(idx).unwrap_or(i64::MAX);
                 let id = Uuid::now_v7().to_string();
                 if role == "user" || role == "assistant" {
                     last_message_id = Some(id.clone());
@@ -5842,7 +5842,8 @@ mod tests {
                 .await
                 .expect("page read");
             let start = (offset as usize).min(full.len());
-            let end = (start + limit as usize).min(full.len());
+            let end =
+                (start + usize::try_from(limit).expect("value fits in usize")).min(full.len());
             let expected: Vec<_> = full[start..end].iter().map(|m| (m.seq, &m.id)).collect();
             let got: Vec<_> = page.iter().map(|m| (m.seq, &m.id)).collect();
             assert_eq!(got, expected, "window offset={offset} limit={limit}");
@@ -7076,7 +7077,7 @@ mod tests {
             )
             .bind(Uuid::now_v7().to_string())
             .bind(&full.0)
-            .bind(seq as i64)
+            .bind(i64::try_from(seq).expect("value fits in i64"))
             .bind(*role)
             .bind(serde_json::to_string(content).expect("encode"))
             .bind(&ts)
@@ -8588,7 +8589,7 @@ mod tests {
             )
             .bind(Uuid::now_v7().to_string())
             .bind(&agent.0)
-            .bind(seq as i64)
+            .bind(i64::try_from(seq).expect("value fits in i64"))
             .bind(*role)
             .bind(*content)
             .bind(&ts)

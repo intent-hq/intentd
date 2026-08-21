@@ -149,6 +149,7 @@ pub struct HostExecStreamRegistry {
 
 impl HostExecStreamRegistry {
     /// Empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -158,11 +159,13 @@ impl HostExecStreamRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.lock().expect("registry poisoned").len()
     }
 
     /// Whether the registry has no live streams.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -231,6 +234,7 @@ impl HostExecStreamRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn cancel(&self, request_id: &str) -> bool {
         let map = self.inner.lock().expect("registry poisoned");
         match map.get(request_id) {
@@ -256,6 +260,7 @@ pub fn registry() -> &'static HostExecStreamRegistry {
 }
 
 /// Mint a fresh `requestId` for streams that omit one.
+#[must_use]
 pub fn mint_request_id() -> String {
     format!("hexec-{}", uuid::Uuid::new_v4())
 }
@@ -465,7 +470,7 @@ async fn run_wait_loop(
         .as_ref()
         .ok()
         .and_then(std::process::ExitStatus::code)
-        .map(|c| c as i64);
+        .map(i64::from);
     let ok = matches!(
         status.as_ref().ok().map(std::process::ExitStatus::success),
         Some(true)
@@ -531,7 +536,7 @@ async fn reap_child_group(child: &mut tokio::process::Child, pid: Option<u32>) {
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Build a `host:exec:{stdout,stderr}` event with the base64 chunk payload.

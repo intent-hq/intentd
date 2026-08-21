@@ -109,6 +109,7 @@ fn name_candidates_for(command: &str, is_windows: bool) -> Vec<String> {
 }
 
 /// Resolve `command` to an executable path by scanning `PATH`, or `None`.
+#[must_use]
 pub fn resolve_on_path(command: &str) -> Option<PathBuf> {
     // An explicit path (rare in the registry) is honored directly.
     let as_path = PathBuf::from(command);
@@ -135,6 +136,7 @@ pub fn resolve_on_path(command: &str) -> Option<PathBuf> {
 /// This is the single source of the env-var/feature-code gate shared by
 /// discovery (`gatedOff`), `providers.catalog` (`visible`), and the
 /// `models.list` cortex source.
+#[must_use]
 pub fn gated_reason(provider: &ProviderConfig) -> Option<String> {
     gated_reason_with_env(provider, &|var| std::env::var_os(var).is_some())
 }
@@ -321,6 +323,7 @@ fn installed_with_secondary(
 /// unavailability to whichever binary failed to resolve — e.g. unsloth with
 /// opencode present but the `unsloth` CLI absent reports the unsloth CLI,
 /// not opencode (monorepo#935). Pure, so every combination is unit-testable.
+#[must_use]
 pub fn not_installed_detail(
     command: &str,
     primary_resolved: bool,
@@ -348,6 +351,7 @@ pub fn not_installed_detail(
 /// Probe npx availability (path only, no spawning). Returns the resolved path
 /// when npx is found on PATH. Version probing requires spawning `npx --version`
 /// and is handled at the transport layer where a tokio runtime is available.
+#[must_use]
 pub fn probe_npx() -> NpxStatus {
     let resolved_path = find_npx();
     NpxStatus {
@@ -375,6 +379,7 @@ pub fn probe_npx() -> NpxStatus {
 /// version-gate the result (the auggie ACP spawn path) use
 /// [`find_auggie_candidates`] instead, which returns every tier in precedence
 /// order so an incompatible hit can be skipped.
+#[must_use]
 pub fn find_provider_binary(
     provider_id: &str,
     command: &str,
@@ -401,6 +406,7 @@ pub fn find_provider_binary(
 /// skipped rather than launched with flags it does not understand
 /// (monorepo#1045 regression). `find_provider_binary("auggie", …)` returns the
 /// first element of this list.
+#[must_use]
 pub fn find_auggie_candidates(explicit_path: Option<&str>) -> Vec<PathBuf> {
     let home = home_dir();
     find_auggie_candidates_with_home_and_dirs(
@@ -707,6 +713,7 @@ fn find_in_dirs_for(dirs: &[PathBuf], command: &str, is_windows: bool) -> Option
 
 /// Resolve `npx` to an absolute path using the same enhanced PATH scanning that
 /// `find_provider_binary` uses. Returns `None` when npx cannot be found.
+#[must_use]
 pub fn find_npx() -> Option<PathBuf> {
     find_in_enhanced_dirs("npx")
 }
@@ -720,6 +727,7 @@ pub fn find_npx() -> Option<PathBuf> {
 /// `~/.augment/bin` ahead of the enriched/inherited dirs), so the probe
 /// resolves the same `pi` the wrapper will actually exec, not merely one
 /// visible to the daemon.
+#[must_use]
 pub fn find_pi_cli(command: &str) -> Option<PathBuf> {
     let as_path = PathBuf::from(command);
     if as_path.is_absolute() || command.contains(std::path::MAIN_SEPARATOR) {

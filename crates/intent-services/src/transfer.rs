@@ -151,7 +151,7 @@ impl Services {
 
         let db_row_bytes: u64 = tables
             .iter()
-            .map(|t: &TransferTableStat| t.approx_bytes.max(0) as u64)
+            .map(|t: &TransferTableStat| t.approx_bytes.max(0).cast_unsigned())
             .sum();
         let asset_bytes: u64 = assets.iter().map(|a| a.size_bytes).sum();
         let attachment_bytes: u64 = attachments.iter().map(|a| a.size_bytes).sum();

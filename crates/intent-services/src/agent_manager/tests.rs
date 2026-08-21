@@ -2304,7 +2304,7 @@ async fn child_exit_watcher_reaps_idle_agent_on_external_kill() {
     assert!(mgr.contains(&id));
     assert!(mgr.registry().is_registered(&id));
 
-    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("external SIGKILL");
+    kill(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL).expect("external SIGKILL");
 
     let fired = timeout(Duration::from_secs(5), watcher)
         .await
@@ -2430,7 +2430,7 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
 
     // Kill ONLY the leader, then reap it via `try_wait` — same-group
     // grandchild survives and `Child::id()` reads `None` afterwards.
-    kill(Pid::from_raw(spawn_pid as i32), Signal::SIGKILL).expect("kill leader");
+    kill(Pid::from_raw(spawn_pid.cast_signed()), Signal::SIGKILL).expect("kill leader");
     let mut reaped = false;
     for _ in 0..100 {
         if child.try_wait().expect("try_wait ok").is_some() {
@@ -2600,7 +2600,7 @@ fn pid_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
     matches!(
-        kill(Pid::from_raw(pid as i32), None),
+        kill(Pid::from_raw(pid.cast_signed()), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
 }

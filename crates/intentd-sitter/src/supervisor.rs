@@ -144,6 +144,7 @@ impl Default for SupervisorConfig {
 impl SupervisorConfig {
     /// Defaults with any test-only `INTENTD_SITTER_*_MS` env overrides
     /// applied.
+    #[must_use]
     pub fn from_env() -> Self {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -185,12 +186,13 @@ impl SupervisorConfig {
 /// Delay until the next update check: uniformly distributed in
 /// [`min`, `max`) driven by `random` (pure, so tests can assert the
 /// distribution). Degenerate ranges (`max <= min`) collapse to `min`.
+#[must_use]
 pub fn next_check_delay(min: Duration, max: Duration, random: u64) -> Duration {
     let span = max.saturating_sub(min).as_nanos();
     if span == 0 {
         return min;
     }
-    let offset = (random as u128) % span;
+    let offset = u128::from(random) % span;
     min + Duration::from_nanos(u64::try_from(offset).unwrap_or(u64::MAX))
 }
 
@@ -206,6 +208,7 @@ fn random_u64() -> u64 {
 /// Returns the pid only when the file holds one and that process is alive;
 /// a missing, unparsable, or stale (dead pid) file is treated as absent.
 #[cfg(unix)]
+#[must_use]
 pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
     let contents = std::fs::read_to_string(path).ok()?;
     let pid = contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0)?;
@@ -281,6 +284,7 @@ fn effective_channel(startup: ResolvedChannel, config_path: &Path) -> Channel {
 
 /// Build a tokio runtime and drive the supervisor to completion, returning
 /// the sitter's process exit code.
+#[must_use]
 pub fn run(
     paths: SitterPaths,
     channel: ResolvedChannel,
@@ -700,7 +704,7 @@ impl Supervisor {
         #[cfg(unix)]
         if let Some(id) = child.id() {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(id as i32),
+                nix::unistd::Pid::from_raw(id.cast_signed()),
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
@@ -796,7 +800,7 @@ fn forward_signal(child: &tokio::process::Child, signal: i32) {
     let Ok(signal) = nix::sys::signal::Signal::try_from(signal) else {
         return;
     };
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id as i32), signal);
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id.cast_signed()), signal);
 }
 
 /// On windows the child shares the sitter's console, so ctrl-c is already
@@ -939,7 +943,7 @@ mod tests {
     fn jitter_edge_draws_hit_window_bounds() {
         let (min, max) = (12 * HOUR, 24 * HOUR);
         assert_eq!(next_check_delay(min, max, 0), min);
-        let span_nanos = (max - min).as_nanos() as u64;
+        let span_nanos = u64::try_from((max - min).as_nanos()).unwrap_or(u64::MAX);
         assert_eq!(
             next_check_delay(min, max, span_nanos - 1),
             max - Duration::from_nanos(1)
@@ -969,7 +973,7 @@ mod tests {
         std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
         assert_eq!(
             read_live_pid(&path),
-            Some(nix::unistd::Pid::from_raw(std::process::id() as i32))
+            Some(nix::unistd::Pid::from_raw(std::process::id().cast_signed()))
         );
 
         // A stale pid (spawned and already reaped) is treated as absent.

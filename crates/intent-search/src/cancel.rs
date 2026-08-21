@@ -17,6 +17,7 @@ pub struct CancelToken(Arc<AtomicBool>);
 
 impl CancelToken {
     /// Mint a fresh, un-cancelled token.
+    #[must_use]
     pub fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
@@ -28,6 +29,7 @@ impl CancelToken {
     }
 
     /// Whether cancellation has been requested.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
@@ -42,6 +44,7 @@ pub struct CancelRegistry {
 
 impl CancelRegistry {
     /// Create an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -53,6 +56,7 @@ impl CancelRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn register(&self, request_id: &str) -> CancelToken {
         let token = CancelToken::new();
         self.inner
@@ -68,6 +72,7 @@ impl CancelRegistry {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn cancel(&self, request_id: &str) -> bool {
         match self
             .inner
@@ -97,6 +102,7 @@ impl CancelRegistry {
 }
 
 /// Mint a fresh `requestId` for searches that omit one (`srch-<uuidv4>`).
+#[must_use]
 pub fn mint_request_id() -> String {
     format!("srch-{}", uuid::Uuid::new_v4())
 }

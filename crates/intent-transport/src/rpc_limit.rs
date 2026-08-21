@@ -50,6 +50,7 @@ pub struct RpcLimiter {
 impl RpcLimiter {
     /// Build a limiter capping outstanding slow-path RPCs at
     /// `max_outstanding`; `0` means unlimited (`server.maxOutstandingRpcs`).
+    #[must_use]
     pub fn new(max_outstanding: u32) -> Self {
         if max_outstanding == 0 {
             return Self::unlimited();
@@ -62,6 +63,7 @@ impl RpcLimiter {
 
     /// A limiter that never rejects — the explicit opt-out for lightweight
     /// wrappers (e.g. `serve_uds`) that deliberately run without a cap.
+    #[must_use]
     pub fn unlimited() -> Self {
         Self {
             semaphore: None,

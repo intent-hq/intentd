@@ -26,6 +26,7 @@ pub const CANONICAL_BASE_REF_REMOTES: &[&str] = &["origin/", "upstream/", "fork/
 /// Shared by the apply-time write path (`intent-services` workspace create)
 /// and the propose-time base-ref validation (`intent-acp`, monorepo#761) so
 /// both sides probe/persist the same canonical value.
+#[must_use]
 pub fn canonicalise_base_ref(raw: &str) -> String {
     for prefix in CANONICAL_BASE_REF_REMOTES {
         if let Some(rest) = raw.strip_prefix(prefix) {

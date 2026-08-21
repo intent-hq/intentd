@@ -298,7 +298,7 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         #[cfg(not(unix))]
@@ -626,7 +626,8 @@ async fn boot_restart_daemon(
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let ws = connect_ws(port, client_config(&fp)).await;
     (daemon, ws)
 }

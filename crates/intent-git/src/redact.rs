@@ -11,6 +11,7 @@
 /// Two passes: an authority pass anchored on `://`, then a scheme-less pass
 /// masking bare `user[:pass]@host` fragments — a front-truncated stderr tail
 /// or an scp-like remote carries no `://` anchor to find (monorepo#836).
+#[must_use]
 pub fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;

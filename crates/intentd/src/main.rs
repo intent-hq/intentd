@@ -1018,7 +1018,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             pages_before,
             pages_after,
         }) => tracing::info!(
-            duration_ms = duration.as_millis() as u64,
+            duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             pages_before,
             pages_after,
             "auto_vacuum activated: one-time VACUUM converted the database to incremental mode"
@@ -1171,9 +1171,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // resume-event stream further down).
     let suspend_tracker: Option<Arc<suspend::SuspendTracker>> =
         config.wake_resume_enabled.then(|| {
-            suspend::spawn_suspend_detector(Duration::from_secs(
-                config.wake_resume_threshold_seconds as u64,
-            ))
+            suspend::spawn_suspend_detector(Duration::from_secs(u64::from(
+                config.wake_resume_threshold_seconds,
+            )))
         });
 
     let services = Services::new(store)
@@ -1904,7 +1904,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(_) => {}
         Err(_) => {
             tracing::warn!(
-                grace_ms = MCP_START_JOIN_GRACE.as_millis() as u64,
+                grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
                 "deferred MCP start sweep did not settle within the shutdown grace; \
                  aborting it — a server mid-handshake may leave orphan grandchildren"
             );
@@ -3206,7 +3206,7 @@ fn pid_is_alive(pid: u32) -> bool {
     use nix::unistd::Pid;
     // `EPERM` means the process exists but we may not signal it — still alive.
     matches!(
-        kill(Pid::from_raw(pid as i32), None),
+        kill(Pid::from_raw(pid.cast_signed()), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
 }
@@ -3406,15 +3406,15 @@ fn spawn_idle_reap_loop(
                 interval
             };
             tracing::info!(
-                ttl_ms = ttl.as_millis() as u64,
-                interval_ms = interval.as_millis() as u64,
+                ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+                interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
                 "idle agent reaping enabled"
             );
             interval
         }
         None => {
             tracing::info!(
-                interval_ms = budget_floor.as_millis() as u64,
+                interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
                 "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
             );
             budget_floor
@@ -3458,7 +3458,7 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     if idle_reap_minutes == 0 {
         return None;
     }
-    let ttl = Duration::from_secs(idle_reap_minutes as u64 * 60);
+    let ttl = Duration::from_secs(u64::from(idle_reap_minutes) * 60);
     let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
     Some((ttl, interval))
 }
@@ -3503,7 +3503,7 @@ fn spawn_stream_retention_loop(
         tracing::info!("event retention sweep disabled (events.streamRetentionHours = 0)");
         return None;
     }
-    let ttl = Duration::from_secs(stream_retention_hours as u64 * 3600);
+    let ttl = Duration::from_secs(u64::from(stream_retention_hours) * 3600);
     let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
     tracing::info!(
         ttl_hours = stream_retention_hours,
@@ -3516,7 +3516,7 @@ fn spawn_stream_retention_loop(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let cutoff = intent_core::iso_minutes_ago(stream_retention_hours as i64 * 60);
+            let cutoff = intent_core::iso_minutes_ago(i64::from(stream_retention_hours) * 60);
             match store.delete_ephemeral_events_before(&cutoff).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(
@@ -3528,7 +3528,8 @@ fn spawn_stream_retention_loop(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
             }
-            let tool_cutoff = intent_core::iso_minutes_ago(TOOL_CALL_RETENTION_HOURS as i64 * 60);
+            let tool_cutoff =
+                intent_core::iso_minutes_ago(i64::from(TOOL_CALL_RETENTION_HOURS) * 60);
             match store.delete_tool_call_events_before(&tool_cutoff).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(
@@ -3734,7 +3735,7 @@ fn spawn_watcher_registry_init(
                         .as_deref(),
                 ) {
                     tracing::warn!(
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "watcher registry startup: artificial delay (test seam)"
                     );
                     // A *blocking* sleep, standing in for the synchronous
@@ -4506,12 +4507,12 @@ impl Signaller for NixSignaller {
     fn term(&self, pid: u32) {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        let _ = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM);
     }
     fn kill(&self, pid: u32) {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
     }
 }
 

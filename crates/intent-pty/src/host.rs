@@ -289,6 +289,7 @@ pub struct PtyHost {
 
 impl PtyHost {
     /// Create an empty host.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -902,7 +903,7 @@ fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::E
         PtySignal::Terminate => Signal::SIGTERM,
         PtySignal::Kill => Signal::SIGKILL,
     };
-    killpg(Pid::from_raw(pid as i32), signal)
+    killpg(Pid::from_raw(pid.cast_signed()), signal)
 }
 
 /// Whether the process group led by `pid` (pgid == pid via `setsid`) has no
@@ -914,7 +915,7 @@ fn process_group_empty(pid: u32) -> bool {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
     matches!(
-        killpg(Pid::from_raw(pid as i32), None),
+        killpg(Pid::from_raw(pid.cast_signed()), None),
         Err(nix::errno::Errno::ESRCH)
     )
 }
@@ -992,7 +993,7 @@ mod tests {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
         matches!(
-            kill(Pid::from_raw(pid as i32), None),
+            kill(Pid::from_raw(pid.cast_signed()), None),
             Ok(()) | Err(nix::errno::Errno::EPERM)
         )
     }

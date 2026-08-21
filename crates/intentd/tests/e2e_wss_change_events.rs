@@ -277,7 +277,8 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2872,7 +2873,7 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
     .iter()
     .enumerate()
     {
-        let id = i as i64 * 2 + 2;
+        let id = i64::try_from(i).expect("value fits in i64") * 2 + 2;
         let created = wss_rpc(
             &mut rpc,
             id,
@@ -3282,7 +3283,7 @@ async fn ready_tasks_gate_on_depends_on_over_wss() {
     // all not_started.
     let mut ids = Vec::new();
     for (i, title) in ["DepX", "DepY", "Gated"].iter().enumerate() {
-        let id = i as i64 * 2 + 2;
+        let id = i64::try_from(i).expect("value fits in i64") * 2 + 2;
         let created = wss_rpc(
             &mut rpc,
             id,
@@ -3429,7 +3430,7 @@ async fn ready_tasks_recompute_on_relations_write_and_deletion_over_wss() {
         .iter()
         .enumerate()
     {
-        let id = i as i64 * 2 + 2;
+        let id = i64::try_from(i).expect("value fits in i64") * 2 + 2;
         let created = wss_rpc(
             &mut rpc,
             id,
@@ -3539,7 +3540,7 @@ async fn ready_tasks_recompute_on_task_note_delete_over_wss() {
     ids.push(parent.clone());
     for (i, title) in ["Child", "Loner"].iter().enumerate() {
         let (id, params) = mk(
-            4 + i as i64 * 2,
+            4 + i64::try_from(i).expect("value fits in i64") * 2,
             title,
             (*title == "Child").then_some(parent.as_str()),
         );
@@ -3549,7 +3550,7 @@ async fn ready_tasks_recompute_on_task_note_delete_over_wss() {
     for (i, note_id) in ids.iter().enumerate() {
         wss_rpc(
             &mut rpc,
-            10 + i as i64,
+            10 + i64::try_from(i).expect("value fits in i64"),
             "task.markAsTask",
             json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
         )
@@ -3649,7 +3650,7 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
     for (i, id) in [&parent, &child, &sibling].iter().enumerate() {
         wss_rpc(
             &mut rpc,
-            i as i64 + 5,
+            i64::try_from(i).expect("value fits in i64") + 5,
             "task.markAsTask",
             json!({ "workspaceId": ws_id, "noteId": id, "status": "not_started" }),
         )
@@ -3788,7 +3789,7 @@ async fn note_payloads_project_unmet_depends_on_over_wss() {
     .iter()
     .enumerate()
     {
-        let id = i as i64 * 2 + 2;
+        let id = i64::try_from(i).expect("value fits in i64") * 2 + 2;
         let created = wss_rpc(
             &mut rpc,
             id,
@@ -4067,7 +4068,7 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
         let child_id = row["taskNoteId"].as_str().expect("child id");
         let del = wss_rpc(
             &mut rpc,
-            5 + i as i64,
+            5 + i64::try_from(i).expect("value fits in i64"),
             "note.delete",
             json!({ "workspaceId": ws_id, "noteId": child_id }),
         )

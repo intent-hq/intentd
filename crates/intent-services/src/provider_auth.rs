@@ -153,7 +153,7 @@ pub async fn check_provider_auth_cli(
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
             match tokio::time::timeout(OPENCODE_READY_TIMEOUT, cmd.output()).await {
-                Ok(Ok(output)) if could_not_run(&output.status) => CliAuthProbe::Failed,
+                Ok(Ok(output)) if could_not_run(output.status) => CliAuthProbe::Failed,
                 Ok(Ok(output)) if !output.status.success() => CliAuthProbe::NotAuthenticated,
                 Ok(Ok(output)) => {
                     if opencode_models_ready(&String::from_utf8_lossy(&output.stdout)) {
@@ -175,7 +175,7 @@ pub async fn check_provider_auth_cli(
                 .kill_on_drop(true);
             match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.status()).await {
                 Ok(Ok(status)) if status.success() => CliAuthProbe::Authenticated,
-                Ok(Ok(status)) if could_not_run(&status) => CliAuthProbe::Failed,
+                Ok(Ok(status)) if could_not_run(status) => CliAuthProbe::Failed,
                 Ok(Ok(_)) => CliAuthProbe::NotAuthenticated,
                 Ok(Err(_)) => CliAuthProbe::Failed,
                 Err(_) => CliAuthProbe::TimedOut,
@@ -217,7 +217,7 @@ fn probe_command(program: &OsStr) -> tokio::process::Command {
 /// code (127 — e.g. `env: 'node': No such file or directory` from a
 /// Node-shebang CLI). Such a probe never ran the CLI's auth check, so it
 /// carries no auth verdict.
-fn could_not_run(status: &std::process::ExitStatus) -> bool {
+fn could_not_run(status: std::process::ExitStatus) -> bool {
     status.code() == Some(127)
 }
 

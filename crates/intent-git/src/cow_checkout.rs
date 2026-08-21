@@ -126,14 +126,14 @@ pub fn provision_cow_checkout(
     )?;
     tracing::info!(
         checkout = %checkout_path.display(),
-        total_ms = timings.total.as_millis() as u64,
-        cow_clone_ms = timings.cow_clone.as_millis() as u64,
+        total_ms = u64::try_from(timings.total.as_millis()).unwrap_or(u64::MAX),
+        cow_clone_ms = u64::try_from(timings.cow_clone.as_millis()).unwrap_or(u64::MAX),
         whole_tree_clone = timings.whole_tree_clone,
         slowest_subtrees = %timings.slowest_subtrees_display(),
         skipped_excluded = timings.skipped_excluded,
-        strip_registrations_ms = timings.strip_registrations.as_millis() as u64,
-        checkout_ms = timings.checkout.as_millis() as u64,
-        submodule_update_ms = timings.submodule_update.as_millis() as u64,
+        strip_registrations_ms = u64::try_from(timings.strip_registrations.as_millis()).unwrap_or(u64::MAX),
+        checkout_ms = u64::try_from(timings.checkout.as_millis()).unwrap_or(u64::MAX),
+        submodule_update_ms = u64::try_from(timings.submodule_update.as_millis()).unwrap_or(u64::MAX),
         "provision_cow_checkout: provisioning phase timings"
     );
     Ok(sha)

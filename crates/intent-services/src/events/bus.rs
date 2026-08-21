@@ -101,6 +101,7 @@ pub struct EventBus {
 
 impl EventBus {
     /// Wire a bus over a persistence handle and spawn the writer task.
+    #[must_use]
     pub fn new(store: Store) -> Self {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
@@ -114,6 +115,7 @@ impl EventBus {
     }
 
     /// Borrow the underlying store.
+    #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
     }
@@ -122,6 +124,7 @@ impl EventBus {
     /// observability used to assert per-connection subscription cleanup; each
     /// [`EventBus::subscribe`] adds one and dropping the [`Subscription`]
     /// removes it.
+    #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
     }
@@ -173,6 +176,7 @@ impl EventBus {
     /// publisher A calls `publish_transient(ev1)` and publisher B calls
     /// `publish(ev2).await` concurrently, A's transient event may broadcast before
     /// B's persisted event commits, even if B's call started first.
+    #[must_use]
     pub fn publish_transient(&self, ev: &NewEvent) -> Event {
         let id = Uuid::now_v7().to_string();
         let event = Event {
@@ -196,6 +200,7 @@ impl EventBus {
     /// Subscribe with `filter`. The returned [`Subscription`] yields batches of
     /// matched events; when `filter.batch_window` is `None` each matched event
     /// is delivered immediately as a single-element batch.
+    #[must_use]
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
         let rx = self.tx.subscribe();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);

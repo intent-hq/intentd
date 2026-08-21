@@ -174,7 +174,7 @@ impl Action {
 /// Map a `notify` event kind to an [`Action`]; `None` for access/other kinds
 /// that carry no mutation (they are dropped, matching the TS adapter which only
 /// forwards add/change/unlink).
-fn action_for(kind: &EventKind) -> Option<Action> {
+fn action_for(kind: EventKind) -> Option<Action> {
     match kind {
         EventKind::Create(_) => Some(Action::Create),
         EventKind::Remove(_) => Some(Action::Delete),
@@ -636,7 +636,7 @@ fn ingest(
     event: &notify::Event,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
-    let Some(action) = action_for(&event.kind) else {
+    let Some(action) = action_for(event.kind) else {
         return;
     };
     let deadline = tokio::time::Instant::now() + DEBOUNCE;
@@ -857,24 +857,24 @@ mod tests {
     #[test]
     fn action_for_maps_notify_kinds() {
         assert_eq!(
-            action_for(&EventKind::Create(CreateKind::File)),
+            action_for(EventKind::Create(CreateKind::File)),
             Some(Action::Create)
         );
         assert_eq!(
-            action_for(&EventKind::Remove(RemoveKind::File)),
+            action_for(EventKind::Remove(RemoveKind::File)),
             Some(Action::Delete)
         );
         assert_eq!(
-            action_for(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
+            action_for(EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
             Some(Action::Rename)
         );
         assert_eq!(
-            action_for(&EventKind::Modify(ModifyKind::Data(
+            action_for(EventKind::Modify(ModifyKind::Data(
                 notify::event::DataChange::Content
             ))),
             Some(Action::Modify)
         );
-        assert_eq!(action_for(&EventKind::Other), None);
+        assert_eq!(action_for(EventKind::Other), None);
     }
 
     #[test]

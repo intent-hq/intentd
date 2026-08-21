@@ -67,7 +67,7 @@ fn root_from_row(r: &SqliteRow) -> Result<WorkspaceGitRoot> {
         pr_number: r
             .try_get::<Option<i64>, _>("pr_number")
             .map_err(err)?
-            .map(|n| n as u64),
+            .map(i64::cast_unsigned),
         pr_url: get_opt("pr_url")?,
         pr_status,
         pull_requests: pull_requests_from_db(get_opt("pull_requests")?)?,
@@ -180,7 +180,7 @@ impl Store {
                         .bind(&fresh.repo_name)
                         .bind(agent_ids_to_db(&fresh.registered_by_agent_ids)?)
                         .bind(&fresh.registered_commit_sha)
-                        .bind(fresh.pr_number.map(|n| n as i64))
+                        .bind(fresh.pr_number.map(u64::cast_signed))
                         .bind(&fresh.pr_url)
                         .bind(fresh.pr_status.map(|s| enum_to_db(&s)).transpose()?)
                         .bind(pull_requests_to_db(fresh.pull_requests.as_ref())?)
@@ -328,7 +328,7 @@ impl Store {
             "UPDATE workspace_git_root SET pr_number = ?, pr_url = ?, pr_status = ?, \
              pull_requests = ?, updated_at = ? WHERE id = ?",
         )
-        .bind(root.pr_number.map(|n| n as i64))
+        .bind(root.pr_number.map(u64::cast_signed))
         .bind(&root.pr_url)
         .bind(root.pr_status.map(|s| enum_to_db(&s)).transpose()?)
         .bind(pull_requests_to_db(root.pull_requests.as_ref())?)

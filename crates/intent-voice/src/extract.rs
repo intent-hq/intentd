@@ -133,6 +133,7 @@ impl TermStats {
 /// Deterministic for identical input. At most `max_terms` terms; each term
 /// is 3..=[`MAX_KEYTERM_CHARS`] chars; no case-insensitive duplicates (the
 /// most frequent spelling wins).
+#[must_use]
 pub fn extract_vocabulary(sources: &[(SourceKind, &str)], max_terms: usize) -> Vec<String> {
     if max_terms == 0 {
         return Vec::new();

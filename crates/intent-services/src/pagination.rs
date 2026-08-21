@@ -29,10 +29,12 @@ pub(crate) const MAX_PAGE_LIMIT: usize = 200;
 /// Clamp a client-supplied `limit` into the contract range. `None` yields the
 /// default (50); zero/negative clamp up to 1; values over the cap clamp down to
 /// 200.
+#[must_use]
 pub fn clamp_limit(limit: Option<i64>) -> usize {
     match limit {
         None => DEFAULT_PAGE_LIMIT,
-        Some(l) => l.clamp(1, MAX_PAGE_LIMIT as i64) as usize,
+        Some(l) => usize::try_from(l.clamp(1, i64::try_from(MAX_PAGE_LIMIT).unwrap_or(i64::MAX)))
+            .unwrap_or(MAX_PAGE_LIMIT),
     }
 }
 
@@ -136,7 +138,8 @@ pub(crate) fn forward_page_window(
     limit: Option<i64>,
     token: &str,
 ) -> Option<SeekPageWindow> {
-    let f = decode_token(token)?.get("f").and_then(Value::as_u64)? as usize;
+    let f = usize::try_from(decode_token(token)?.get("f").and_then(Value::as_u64)?)
+        .expect("value fits in usize");
     let limit = clamp_limit(limit);
     let start = f.min(len);
     let end = (start + limit).min(len);
@@ -169,6 +172,7 @@ pub enum BudgetAnchor {
 /// contiguous; rows are never skipped over). `Target` grows outward
 /// alternating older-first (mirroring the unbudgeted half-older split);
 /// each direction stops independently at its first non-fitting row.
+#[must_use]
 pub fn budget_page(sizes: &[usize], anchor: BudgetAnchor, budget: usize) -> (usize, usize) {
     let n = sizes.len();
     if n == 0 {
@@ -239,6 +243,7 @@ pub fn budget_page(sizes: &[usize], anchor: BudgetAnchor, budget: usize) -> (usi
 /// page's effective start: `{"b": start}` while older rows remain. Same
 /// cursor shape as [`page_window`], so the resumed page picks up exactly at
 /// the first excluded (older) row.
+#[must_use]
 pub fn remint_backward_token(start: usize) -> Option<String> {
     (start > 0).then(|| encode_token(&json!({ "b": start })))
 }
@@ -333,7 +338,7 @@ pub(crate) fn parse_offset(token: Option<&str>) -> usize {
     token
         .and_then(decode_token)
         .and_then(|v| v.get("o").and_then(Value::as_u64))
-        .map_or(0, |n| n as usize)
+        .map_or(0, |n| usize::try_from(n).expect("value fits in usize"))
 }
 
 #[cfg(test)]

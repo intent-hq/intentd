@@ -73,7 +73,7 @@ impl Store {
                 )
                 .bind(&workspace_id.0)
                 .bind(&item.id)
-                .bind(idx as i64)
+                .bind(i64::try_from(idx).unwrap_or(i64::MAX))
                 .bind(payload)
                 .execute(&mut *tx)
                 .await

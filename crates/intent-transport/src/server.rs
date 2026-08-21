@@ -201,6 +201,7 @@ fn collect_local_ipv6s() -> Vec<String> {
 /// bind-address picker: loopback included (listed first), virtual/container
 /// interfaces skipped (same prefixes as [`collect_local_ips`]), one entry per
 /// distinct address.
+#[must_use]
 pub fn collect_bind_interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
     let mut out: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
@@ -226,6 +227,7 @@ pub fn collect_bind_interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
 /// from `tls::collect_san` but returns only the local IPs (no localhost/loopback).
 /// Shared with the `pairing.getInfo` fast-path and the `system.status` snapshot
 /// (composition root) so all surfaces report the same hosts.
+#[must_use]
 pub fn collect_local_ips() -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {

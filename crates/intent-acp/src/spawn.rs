@@ -70,6 +70,7 @@ impl<'a> SpawnOptions<'a> {
     /// both npx fields set. Single source of truth for the program selection,
     /// the `-y <pkg>` arg prepend, and the Node-child env decisions (heap cap,
     /// #555 codex env scrub).
+    #[must_use]
     pub fn via_npx(&self) -> bool {
         self.provider_binary.is_none()
             && self.npx_fallback_binary.is_some()
@@ -77,6 +78,7 @@ impl<'a> SpawnOptions<'a> {
     }
 
     /// Construct options for a provider with all optional inputs unset.
+    #[must_use]
     pub fn new(provider: &'a ProviderConfig) -> Self {
         Self {
             provider,
@@ -100,6 +102,7 @@ impl<'a> SpawnOptions<'a> {
 /// Assemble the launch arguments, including the Codex `-c` config overrides
 /// (which read `CODEX_REASONING_EFFORT` / `CODEX_MODEL_REASONING_EFFORT`).
 /// When spawning via npx fallback, prepends `-y <package>` before the provider's args.
+#[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -144,6 +147,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 /// that path directly; otherwise, when `opts.npx_fallback_binary` is set,
 /// spawns npx; otherwise falls back to the bare `opts.provider.command`
 /// and relies on the enriched `PATH`.
+#[must_use]
 pub fn build_command(opts: &SpawnOptions) -> Command {
     build_command_with_captured_env(opts, captured_credential_env())
 }
@@ -298,7 +302,7 @@ impl SpawnedAgent {
         if let Some(pid) = self.child.id() {
             use nix::sys::signal::{killpg, Signal};
             use nix::unistd::Pid;
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
         }
         // The group SIGKILL above may already have terminated the direct child,
         // making `start_kill` report a spurious "already exited" error
@@ -545,7 +549,7 @@ mod kill_tests {
         // Prove the grandchild actually escaped the child's process group —
         // otherwise killpg would reach it and the test would be vacuous.
         let child_pid = agent.child_mut().id().expect("child pid");
-        let child_pgid = getpgid(Some(Pid::from_raw(child_pid as i32))).expect("child pgid");
+        let child_pgid = getpgid(Some(Pid::from_raw(child_pid.cast_signed()))).expect("child pgid");
         let grandchild_pgid =
             getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
         assert_ne!(

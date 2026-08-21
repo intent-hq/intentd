@@ -88,7 +88,7 @@ fn rest_page(cursor: Option<&str>) -> u64 {
 
 /// Per-page size sent to GitHub for a requested `limit` (`1..=100`).
 fn rest_per_page(limit: u8) -> u64 {
-    limit.clamp(1, REST_MAX_PER_PAGE) as u64
+    u64::from(limit.clamp(1, REST_MAX_PER_PAGE))
 }
 
 /// The next REST cursor when the fetched page filled the per-page window — the
@@ -127,8 +127,8 @@ fn page_full_set<T>(all: Vec<T>, page: u64, per_page: u64) -> Page<T> {
     let has_more = (all.len() as u64) > page.saturating_mul(per_page);
     let items = all
         .into_iter()
-        .skip(offset as usize)
-        .take(per_page as usize)
+        .skip(usize::try_from(offset).expect("value fits in usize"))
+        .take(usize::try_from(per_page).expect("value fits in usize"))
         .collect();
     Page {
         items,
@@ -1435,7 +1435,7 @@ impl SourceControl for GitHubSourceControl {
         page: PageParams,
     ) -> Result<Page<ReviewThread>> {
         // GraphQL caps `first` at 100; the cursor is the native `endCursor`.
-        let first = page.limit.clamp(1, 100) as i64;
+        let first = i64::from(page.limit.clamp(1, 100));
         let after = page.cursor.clone();
         let payload = json!({
             "query": REVIEW_THREADS_QUERY,
@@ -1584,7 +1584,7 @@ impl GitHubSourceControl {
         extract: impl Fn(Value) -> Value,
         map: impl Fn(Value) -> Result<T>,
     ) -> Result<Vec<T>> {
-        let per_page = REST_MAX_PER_PAGE as u64;
+        let per_page = u64::from(REST_MAX_PER_PAGE);
         let mut page = 1u64;
         let mut out = Vec::new();
         loop {

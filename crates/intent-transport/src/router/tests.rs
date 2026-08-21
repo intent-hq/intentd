@@ -1253,7 +1253,7 @@ impl WorkspaceApi for FakeApi {
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         Box::pin(async move {
             let files = files.unwrap_or_else(|| vec!["src/a.ts".to_string()]);
-            let file_count = files.len() as i64;
+            let file_count = i64::try_from(files.len()).expect("value fits in i64");
             Ok(GitAgentCommitResult {
                 hash: "def456".to_string(),
                 files,

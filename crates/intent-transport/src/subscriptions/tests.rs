@@ -677,7 +677,10 @@ fn chat_tool_delta_slims_live_blocks_under_slim_projection() {
     assert!(served_input.len() <= SLIM_PROJECTION_BUDGET_BYTES * 2);
     let tr = &added[1]["block"];
     assert_eq!(tr["outputTruncated"], true);
-    assert_eq!(tr["outputBytes"].as_u64().unwrap() as usize, big.len());
+    assert_eq!(
+        usize::try_from(tr["outputBytes"].as_u64().unwrap()).expect("value fits in usize"),
+        big.len()
+    );
     assert!(tr["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES);
     assert_eq!(tr["tool_use_id"], "tc-9");
     assert_eq!(tr["is_error"], false);

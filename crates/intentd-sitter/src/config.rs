@@ -63,6 +63,7 @@ struct ConfigFile {
 /// Load the pinned channel from `path`. Missing, unreadable, or invalid
 /// (unparsable TOML, unknown channel value) files all yield `None` — no
 /// pin — with a warning for everything except a missing file.
+#[must_use]
 pub fn load_channel(path: &Path) -> Option<Channel> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -110,6 +111,7 @@ pub fn save_channel(path: &Path, channel: Channel) -> io::Result<()> {
 /// `explicit` is the flag/env selection from CLI parsing
 /// ([`crate::cli::SitterArgs::channel`]); `config` is the `config.toml` pin
 /// from [`load_channel`].
+#[must_use]
 pub fn resolve_channel(
     explicit: Option<ResolvedChannel>,
     config: Option<Channel>,

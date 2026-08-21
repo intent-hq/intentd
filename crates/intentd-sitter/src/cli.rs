@@ -238,6 +238,7 @@ impl SitterArgs {
     /// token is `sitter`, `restart`, or `update`. After a bare `--` the
     /// first passthrough token is the `--` itself, so `intentd -- sitter …`,
     /// `intentd -- restart`, and `intentd -- update` still forward verbatim.
+    #[must_use]
     pub fn sitter_command(&self) -> Option<Result<SitterCommand, CliError>> {
         let first = self.passthrough.first()?;
         match first.to_str() {

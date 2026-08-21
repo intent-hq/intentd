@@ -57,7 +57,7 @@ const REAP_POLL: Duration = Duration::from_millis(25);
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Build a wire `McpServerStatus` (§5.22), omitting absent optional fields.
@@ -946,7 +946,7 @@ fn kill_group(
 ) -> std::result::Result<(), nix::errno::Errno> {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    killpg(Pid::from_raw(pid as i32), sig)
+    killpg(Pid::from_raw(pid.cast_signed()), sig)
 }
 
 /// Stateless executor for the `mcp.servers.*` namespace (PROTOCOL §5.22) over

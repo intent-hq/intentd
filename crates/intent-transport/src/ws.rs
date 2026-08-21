@@ -341,6 +341,7 @@ impl WsApiServer {
     /// # Panics
     ///
     /// Panics if the client-set mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn client_count(&self) -> usize {
         self.inner
             .clients
@@ -351,6 +352,7 @@ impl WsApiServer {
 
     /// The pinned SHA-256 certificate fingerprint (colon-separated hex), or
     /// `None` when running in insecure dev mode without a TLS certificate.
+    #[must_use]
     pub fn fingerprint(&self) -> Option<&str> {
         self.inner.fingerprint.as_deref()
     }
@@ -358,6 +360,7 @@ impl WsApiServer {
     /// Whether the listener is running in insecure (plain-`ws://`, no bearer
     /// auth) dev mode. Used by `system.status` so remote clients see the
     /// real TLS posture rather than a phantom fingerprint.
+    #[must_use]
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
     }

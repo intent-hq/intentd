@@ -29,6 +29,7 @@ pub struct WorktreeLocks {
 
 impl WorktreeLocks {
     /// Create an empty lock registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

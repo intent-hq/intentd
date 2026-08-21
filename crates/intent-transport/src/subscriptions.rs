@@ -766,8 +766,10 @@ fn rebudget_merged_page(obj: &mut Map<String, Value>) {
     arr.drain(..lo);
     if let Some(b) = boundary {
         obj.insert("truncated".to_string(), Value::Bool(true));
-        let token = intent_services::pagination::remint_backward_token(b as usize)
-            .map_or(Value::Null, Value::String);
+        let token = intent_services::pagination::remint_backward_token(
+            usize::try_from(b).expect("value fits in usize"),
+        )
+        .map_or(Value::Null, Value::String);
         obj.insert("nextToken".to_string(), token);
     }
 }

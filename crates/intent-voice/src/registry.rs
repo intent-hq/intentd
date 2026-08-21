@@ -29,6 +29,7 @@ pub enum VoiceProvider {
 
 impl VoiceProvider {
     /// Wire spelling (`elevenlabs` | `openai`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             VoiceProvider::ElevenLabs => "elevenlabs",
@@ -37,6 +38,7 @@ impl VoiceProvider {
     }
 
     /// Parse a wire spelling; `None` for anything unknown.
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "elevenlabs" => Some(VoiceProvider::ElevenLabs),

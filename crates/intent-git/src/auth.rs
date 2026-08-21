@@ -328,6 +328,7 @@ pub const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
 /// whose child git has no repository to read local config from — the target
 /// does not exist yet, and `git clone` ignores any repository surrounding its
 /// cwd. There is therefore no repository-local helper for the reset to drop.
+#[must_use]
 pub fn scoped_credential_env(
     token: Option<&str>,
     inherited_config_parameters: Option<&str>,
@@ -375,6 +376,7 @@ pub(crate) fn daemon_helper_config(intentd_path: &str) -> String {
 /// an agent or terminal — so a repository-local helper configured there is
 /// discovered and re-added. Passing `None` where the child does have a
 /// repository would let the reset clear that helper without restoring it.
+#[must_use]
 pub fn daemon_helper_env(
     intentd_path: &str,
     cwd: Option<&Path>,
@@ -433,6 +435,7 @@ fn sq_quote(src: &str) -> String {
 /// the authority; subdomains and other hosts do not match. Exposed so callers
 /// (e.g. `intent-services`) can skip token resolution entirely for remotes the
 /// fallback would never apply to.
+#[must_use]
 pub fn is_https_github_url(url: &str) -> bool {
     let Some(scheme) = url.get(..8) else {
         return false;

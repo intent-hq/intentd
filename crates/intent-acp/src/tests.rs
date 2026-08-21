@@ -4000,7 +4000,8 @@ mod mcp_bridge_tests {
                         guard.armed = false;
                     }
                     let payload_len =
-                        message["params"]["payload_len"].as_u64().unwrap_or(0) as usize;
+                        usize::try_from(message["params"]["payload_len"].as_u64().unwrap_or(0))
+                            .expect("value fits in usize");
                     Some(json!({
                         "jsonrpc": "2.0", "id": id,
                         "result": { "ok": true, "payload": "x".repeat(payload_len) }
@@ -4120,7 +4121,7 @@ mod mcp_bridge_tests {
             for _ in 0..n {
                 let resp = read_response(&mut reader).await;
                 let id = resp["id"].as_i64().expect("id must survive intact");
-                let expected_len = (64 * 1024 + id) as usize;
+                let expected_len = usize::try_from(64 * 1024 + id).expect("value fits in usize");
                 assert_eq!(
                     resp["result"]["payload"].as_str().unwrap().len(),
                     expected_len,
@@ -4128,7 +4129,7 @@ mod mcp_bridge_tests {
                 );
                 assert!(seen.insert(id), "duplicate response for id {id}");
             }
-            assert_eq!(seen.len(), n as usize);
+            assert_eq!(seen.len(), usize::try_from(n).expect("value fits in usize"));
         }
 
         #[tokio::test]

@@ -62,7 +62,7 @@ impl Drop for Daemon {
             // `<data_dir>/intentd.<date>.log` after the TempDir sweep,
             // leaving `itd-delgrp-*` residue under /tmp.
             let descendants = descendant_pids(self.child.id());
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
             let _ = self.child.wait();
             for &d in &descendants {
@@ -159,7 +159,7 @@ fn descendant_pids(root: u32) -> Vec<i32> {
         );
     }
     let mut pids = Vec::new();
-    let mut queue = vec![root as i32];
+    let mut queue = vec![root.cast_signed()];
     let mut seen: std::collections::HashSet<i32> = queue.iter().copied().collect();
     while let Some(parent) = queue.pop() {
         for &(pid, ppid) in &table {
@@ -537,7 +537,8 @@ async fn baseline_plus_aggregated_wake() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -757,7 +758,8 @@ async fn baseline_plus_aggregated_wake() {
 
     // Get daemon2 port + fingerprint
     let status2 = common::await_wss_status(&socket).await;
-    let port2 = status2["result"]["port"].as_u64().expect("port2") as u16;
+    let port2 = u16::try_from(status2["result"]["port"].as_u64().expect("port2"))
+        .expect("value fits in u16");
     let fp2 = status2["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint2")

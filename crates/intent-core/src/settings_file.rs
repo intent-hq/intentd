@@ -584,6 +584,7 @@ pub enum ResumeInterruptedOnStart {
 
 impl ResumeInterruptedOnStart {
     /// The wire/TOML string for this value.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             ResumeInterruptedOnStart::Auto => "auto",

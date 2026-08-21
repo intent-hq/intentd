@@ -25,6 +25,7 @@ pub enum FileAction {
 
 impl FileAction {
     /// Lowercase wire value carried on `file:changed.data.action`.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             FileAction::Create => "create",

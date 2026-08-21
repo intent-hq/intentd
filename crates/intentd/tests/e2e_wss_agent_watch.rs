@@ -399,7 +399,8 @@ async fn boot_daemon(
     let status = tokio::time::timeout_at(budget.step(60), common::await_wss_status(&socket))
         .await
         .expect("daemon wss status not ready within budget");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

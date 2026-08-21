@@ -47,6 +47,7 @@ pub struct PiCliStatus {
 /// scan mirroring the pi-acp child's PATH, or direct validation for explicit
 /// paths), then run `--version` with a short timeout. Blocking (subprocess
 /// wait) — call from a blocking context.
+#[must_use]
 pub fn probe_pi_cli() -> PiCliStatus {
     let command = resolve_real_pi_command();
     let resolved_path = intent_providers::find_pi_cli(&command);

@@ -101,6 +101,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<BrowserExecArgs, Browse
 /// Build the params object the daemon dispatches on the FE-served reverse
 /// intent (`browser.exec`). Optional envelope fields are omitted when absent
 /// so the wire payload stays minimal.
+#[must_use]
 pub fn build_forward_params(args: &BrowserExecArgs) -> Value {
     let mut out = Map::new();
     out.insert("actions".to_string(), Value::Array(args.actions.clone()));

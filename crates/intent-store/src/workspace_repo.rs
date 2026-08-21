@@ -61,15 +61,15 @@ impl Store {
             .bind(&ws.repository_name)
             .bind(&ws.worktree_path)
             .bind(&ws.scope)
-            .bind(ws.skip_worktree as i64)
-            .bind(ws.is_remote as i64)
+            .bind(i64::from(ws.skip_worktree))
+            .bind(i64::from(ws.is_remote))
             .bind(&ws.default_model)
-            .bind(ws.pr_number.map(|n| n as i64))
+            .bind(ws.pr_number.map(u64::cast_signed))
             .bind(&ws.pr_url)
             .bind(pr_status_to_db(ws)?)
             .bind(active_pr_to_db(ws)?)
             .bind(pull_requests_to_db(ws)?)
-            .bind(ws.archived as i64)
+            .bind(i64::from(ws.archived))
             .bind(&ws.archived_at)
             .bind(tags_to_db(&ws.tags)?)
             .bind(&ws.created_at)
@@ -78,7 +78,7 @@ impl Store {
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
-            .bind(auto_commit.map(|v| v as i64))
+            .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
@@ -145,15 +145,15 @@ impl Store {
         .bind(&ws.repository_name)
         .bind(&ws.worktree_path)
         .bind(&ws.scope)
-        .bind(ws.skip_worktree as i64)
-        .bind(ws.is_remote as i64)
+        .bind(i64::from(ws.skip_worktree))
+        .bind(i64::from(ws.is_remote))
         .bind(&ws.default_model)
-        .bind(ws.pr_number.map(|n| n as i64))
+        .bind(ws.pr_number.map(u64::cast_signed))
         .bind(&ws.pr_url)
         .bind(pr_status_to_db(ws)?)
         .bind(active_pr_to_db(ws)?)
         .bind(pull_requests_to_db(ws)?)
-        .bind(ws.archived as i64)
+        .bind(i64::from(ws.archived))
         .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
@@ -193,7 +193,7 @@ impl Store {
             "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
              active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
         )
-        .bind(ws.pr_number.map(|n| n as i64))
+        .bind(ws.pr_number.map(u64::cast_signed))
         .bind(&ws.pr_url)
         .bind(pr_status_to_db(ws)?)
         .bind(active_pr_to_db(ws)?)
@@ -512,7 +512,7 @@ impl Store {
         auto_generated: bool,
     ) -> Result<()> {
         let res = sqlx::query("UPDATE workspace SET branch_auto_generated = ? WHERE id = ?")
-            .bind(auto_generated as i64)
+            .bind(i64::from(auto_generated))
             .bind(&id.0)
             .execute(self.write_pool())
             .await
@@ -551,7 +551,7 @@ impl Store {
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
         let res = sqlx::query("UPDATE workspace SET auto_commit_enabled = ? WHERE id = ?")
-            .bind(enabled as i64)
+            .bind(i64::from(enabled))
             .bind(&id.0)
             .execute(self.write_pool())
             .await
@@ -744,7 +744,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         setup_script,
         is_remote: col::<i64>(row, "is_remote")? != 0,
         default_model: col(row, "default_model")?,
-        pr_number: pr_number.map(|n| n as u64),
+        pr_number: pr_number.map(i64::cast_unsigned),
         pr_url: col(row, "pr_url")?,
         pr_status,
         active_pull_request,

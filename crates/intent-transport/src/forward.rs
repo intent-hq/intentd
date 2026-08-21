@@ -212,7 +212,7 @@ pub(crate) fn classify(value: &Value) -> Option<ForwardRequest> {
 
 /// Coerce a JSON port number to a valid `u16` TCP port (1..=65535).
 fn as_port(value: u64) -> Option<u16> {
-    if (1..=u16::MAX as u64).contains(&value) {
+    if (1..=u64::from(u16::MAX)).contains(&value) {
         Some(value as u16)
     } else {
         None

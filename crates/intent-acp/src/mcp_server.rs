@@ -147,6 +147,7 @@ impl WorkspaceMcpServer {
 
     /// Set the calling agent this server front-doors for (the spawn-time wiring
     /// point). Caller-aware tools attribute their actions to this id.
+    #[must_use]
     pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
         self.caller_agent_id = caller;
         self
@@ -155,6 +156,7 @@ impl WorkspaceMcpServer {
     /// Wire the daemon-wide turn-attachment registry (§7.1 deterministic
     /// attach). Registration only activates when a `caller_agent_id` is also
     /// set — the registry keys pending attachments by agent.
+    #[must_use]
     pub fn with_turn_attachments(mut self, registry: Option<Arc<TurnAttachmentRegistry>>) -> Self {
         self.turn_attachments = registry;
         self
@@ -164,6 +166,7 @@ impl WorkspaceMcpServer {
     /// wiring point — settings are read once at bridge creation so live
     /// sessions keep their original surface). Disabled features are pruned
     /// from the tool description and JS prelude and denied at dispatch.
+    #[must_use]
     pub fn with_agent_features(mut self, features: AgentFeaturesSettings) -> Self {
         self.agent_features = features;
         self
@@ -173,6 +176,7 @@ impl WorkspaceMcpServer {
     /// `workspace_api` description (the spawn-time wiring point — resolved
     /// once at bridge creation, like `agent_features`). Pass only specialists
     /// that carry options; an empty list keeps the default description.
+    #[must_use]
     pub fn with_specialist_model_options(
         mut self,
         options: Vec<tools::SpecialistModelOptions>,
@@ -186,6 +190,7 @@ impl WorkspaceMcpServer {
     /// `parent_agent_id.is_some() || is_background`). Sub-agent bridges prune
     /// `ws.app.question.*` from the tool description and JS prelude and deny
     /// it at dispatch with a redirect to the attention-request methods.
+    #[must_use]
     pub fn with_sub_agent(mut self, is_sub_agent: bool) -> Self {
         self.is_sub_agent = is_sub_agent;
         self

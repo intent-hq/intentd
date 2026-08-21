@@ -57,6 +57,7 @@ pub(crate) fn map_git_err(e: git2::Error) -> Error {
 /// worktree). Read-only probe backing the `repoPath` validation of the
 /// path-based branch reads (`git.getBranches`, `git.branchStatus`) in
 /// `intent-services`.
+#[must_use]
 pub fn is_repository(path: &std::path::Path) -> bool {
     git2::Repository::open(path).is_ok()
 }

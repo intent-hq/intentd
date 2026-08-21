@@ -463,7 +463,8 @@ async fn setup_script_repo_config_sole_source() {
 
     // Get server fingerprint and connect via WSS
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().unwrap() as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().unwrap()).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .unwrap()
@@ -603,7 +604,8 @@ async fn setup_script_executes_on_create() {
     let fingerprint = status_resp["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");
-    let actual_port = status_resp["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port = u16::try_from(status_resp["result"]["port"].as_u64().expect("port"))
+        .expect("value fits in u16");
 
     let mut wss = wss_connect(actual_port, fingerprint).await;
 

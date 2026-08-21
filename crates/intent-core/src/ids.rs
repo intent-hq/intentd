@@ -84,11 +84,13 @@ pub const CHIEF_WORKSPACE_ID: &str = "__chief__";
 
 impl WorkspaceId {
     /// The reserved [`CHIEF_WORKSPACE_ID`] as a strongly-typed id.
+    #[must_use]
     pub fn chief() -> Self {
         Self(CHIEF_WORKSPACE_ID.to_string())
     }
 
     /// Whether this id is the reserved [`CHIEF_WORKSPACE_ID`].
+    #[must_use]
     pub fn is_chief(&self) -> bool {
         self.0 == CHIEF_WORKSPACE_ID
     }

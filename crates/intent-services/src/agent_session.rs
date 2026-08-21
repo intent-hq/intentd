@@ -2249,7 +2249,7 @@ impl Services {
                         agent = %agent_id,
                         error = %e,
                         attempt = fetch_retry_attempt,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
                     );
                     tokio::time::sleep(delay).await;
@@ -3362,9 +3362,9 @@ impl Services {
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
             thought_tokens: tokens.thought_tokens,
-            runs: run_completed as u64,
+            runs: u64::from(run_completed),
             longest_run_ms: if run_completed {
-                turn_duration.as_millis() as u64
+                u64::try_from(turn_duration.as_millis()).unwrap_or(u64::MAX)
             } else {
                 0
             },

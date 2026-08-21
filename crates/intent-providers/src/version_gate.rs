@@ -50,6 +50,7 @@ pub enum PiCliGate {
 impl PiCliGate {
     /// Whether this decision gates the pi provider off. Only [`Self::TooOld`]
     /// and [`Self::Missing`] gate; [`Self::Unknown`] is permissive.
+    #[must_use]
     pub fn gates(&self) -> bool {
         matches!(self, Self::TooOld(_) | Self::Missing)
     }
@@ -60,6 +61,7 @@ impl PiCliGate {
 /// [`PiCliGate::Unknown`]). Shared by discovery (`unavailableReason`),
 /// doctor, and the spawn fail-fast so every surface names the same found
 /// version, requirement, and adapter pin.
+#[must_use]
 pub fn pi_gate_reason(gate: &PiCliGate) -> Option<String> {
     match gate {
         PiCliGate::TooOld(found) => Some(format!(
@@ -74,6 +76,7 @@ pub fn pi_gate_reason(gate: &PiCliGate) -> Option<String> {
 
 /// Decide the pi version gate from a probe result. Pure — no filesystem,
 /// PATH, or subprocess access.
+#[must_use]
 pub fn pi_cli_gate(probe: &PiCliProbe) -> PiCliGate {
     match probe {
         PiCliProbe::Missing => PiCliGate::Missing,
@@ -94,6 +97,7 @@ pub fn pi_cli_gate(probe: &PiCliProbe) -> PiCliGate {
 /// [`PiCliGate::Unknown`]). Names the found version, the requirement, and the
 /// remedy (record the newer install in `~/.augment/auggie-path` or set
 /// `context.auggiePath`) so the spawn fail-fast and doctor share one message.
+#[must_use]
 pub fn auggie_gate_reason(gate: &PiCliGate) -> Option<String> {
     match gate {
         PiCliGate::TooOld(found) => Some(format!(
@@ -113,6 +117,7 @@ pub fn auggie_gate_reason(gate: &PiCliGate) -> Option<String> {
 /// PATH, or subprocess access. Shares the [`PiCliProbe`]/[`PiCliGate`] shapes
 /// and tolerant parser with the pi gate; only the minimum version differs
 /// ([`AUGGIE_CLI_MIN_VERSION`]).
+#[must_use]
 pub fn auggie_cli_gate(probe: &PiCliProbe) -> PiCliGate {
     match probe {
         PiCliProbe::Missing => PiCliGate::Missing,

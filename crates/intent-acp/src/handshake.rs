@@ -171,6 +171,7 @@ pub(crate) async fn set_session_mode(
 /// 2. Otherwise [`BYPASS_PERMISSIONS_MODE`] if present in `available_modes`.
 /// 3. Otherwise `None` — the caller skips the call so we never ask a provider
 ///    for a mode it never offered.
+#[must_use]
 pub fn select_preferred_mode<'a>(
     mode_map: Option<&'a [(&'a str, &'a str)]>,
     available_modes: &'a [agent_client_protocol::schema::v1::SessionMode],

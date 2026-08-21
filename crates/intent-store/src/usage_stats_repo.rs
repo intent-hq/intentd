@@ -126,16 +126,16 @@ impl Store {
         .bind(provider)
         .bind(local.map(|l| l.date.as_str()))
         .bind(local.map(|l| i64::from(l.hour)))
-        .bind(delta.input_tokens as i64)
-        .bind(delta.output_tokens as i64)
-        .bind(delta.cache_read_tokens as i64)
-        .bind(delta.cache_creation_tokens as i64)
-        .bind(delta.thought_tokens as i64)
-        .bind(delta.runs as i64)
-        .bind(delta.sessions_started as i64)
-        .bind(delta.longest_run_ms as i64)
-        .bind(delta.lines_added as i64)
-        .bind(delta.lines_deleted as i64)
+        .bind(delta.input_tokens.cast_signed())
+        .bind(delta.output_tokens.cast_signed())
+        .bind(delta.cache_read_tokens.cast_signed())
+        .bind(delta.cache_creation_tokens.cast_signed())
+        .bind(delta.thought_tokens.cast_signed())
+        .bind(delta.runs.cast_signed())
+        .bind(delta.sessions_started.cast_signed())
+        .bind(delta.longest_run_ms.cast_signed())
+        .bind(delta.lines_added.cast_signed())
+        .bind(delta.lines_deleted.cast_signed())
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("add usage stats failed: {e}")))?;
@@ -169,16 +169,16 @@ impl Store {
                     .get::<Option<i64>, _>("local_hour")
                     .and_then(|h| u8::try_from(h).ok())
                     .filter(|h| *h < 24),
-                input_tokens: row.get::<i64, _>("input_tokens") as u64,
-                output_tokens: row.get::<i64, _>("output_tokens") as u64,
-                cache_read_tokens: row.get::<i64, _>("cache_read_tokens") as u64,
-                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens") as u64,
-                thought_tokens: row.get::<i64, _>("thought_tokens") as u64,
-                runs: row.get::<i64, _>("runs") as u64,
-                sessions_started: row.get::<i64, _>("sessions_started") as u64,
-                longest_run_ms: row.get::<i64, _>("longest_run_ms") as u64,
-                lines_added: row.get::<i64, _>("lines_added") as u64,
-                lines_deleted: row.get::<i64, _>("lines_deleted") as u64,
+                input_tokens: row.get::<i64, _>("input_tokens").cast_unsigned(),
+                output_tokens: row.get::<i64, _>("output_tokens").cast_unsigned(),
+                cache_read_tokens: row.get::<i64, _>("cache_read_tokens").cast_unsigned(),
+                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens").cast_unsigned(),
+                thought_tokens: row.get::<i64, _>("thought_tokens").cast_unsigned(),
+                runs: row.get::<i64, _>("runs").cast_unsigned(),
+                sessions_started: row.get::<i64, _>("sessions_started").cast_unsigned(),
+                longest_run_ms: row.get::<i64, _>("longest_run_ms").cast_unsigned(),
+                lines_added: row.get::<i64, _>("lines_added").cast_unsigned(),
+                lines_deleted: row.get::<i64, _>("lines_deleted").cast_unsigned(),
             })
             .collect())
     }

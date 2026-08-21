@@ -23,6 +23,7 @@ pub struct Scrollback {
 
 impl Scrollback {
     /// Create a ring buffer that retains at most `max_bytes` of recent output.
+    #[must_use]
     pub fn new(max_bytes: usize) -> Self {
         Self {
             buf: VecDeque::new(),
@@ -51,16 +52,19 @@ impl Scrollback {
     }
 
     /// Snapshot the retained history as a contiguous, oldest-first byte vector.
+    #[must_use]
     pub fn snapshot(&self) -> Vec<u8> {
         self.buf.iter().copied().collect()
     }
 
     /// Number of bytes currently retained.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
     /// Whether the buffer holds no bytes.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }

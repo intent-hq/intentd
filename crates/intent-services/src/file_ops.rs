@@ -203,7 +203,7 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
     let len = if offset >= size {
         0
     } else {
-        (size - offset).min(length) as usize
+        usize::try_from((size - offset).min(length)).expect("value fits in usize")
     };
     let mut buf = vec![0u8; len];
     if len > 0 {
@@ -605,7 +605,7 @@ pub(crate) fn stat(root: &str, path: &str) -> Result<Value> {
 /// to the epoch when the timestamp is outside the representable range.
 fn mtime_iso(t: std::time::SystemTime) -> String {
     let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let secs = dur.as_secs() as i64;
+    let secs = dur.as_secs().cast_signed();
     let ms = dur.subsec_millis();
     match time::OffsetDateTime::from_unix_timestamp(secs) {
         Ok(dt) => format!(

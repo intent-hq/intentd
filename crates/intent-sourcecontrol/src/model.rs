@@ -67,6 +67,7 @@ pub struct PageParams {
 
 impl PageParams {
     /// A first-page request of `limit` items (no continuation cursor).
+    #[must_use]
     pub fn first(limit: u8) -> Self {
         Self {
             limit,

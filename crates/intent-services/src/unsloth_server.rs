@@ -984,7 +984,7 @@ impl UnslothServerManager {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 return Err(stop_requested_error());
             }
-            let server = self.start_server(&binary, repo_id, &quant, port)?;
+            let server = Self::start_server(&binary, repo_id, &quant, port)?;
             self.set_identity(Some(ServerIdentity {
                 repo_id: server.repo_id.clone(),
                 pid: server.pid(),
@@ -1123,13 +1123,7 @@ impl UnslothServerManager {
     /// as its own process-group leader with captured output. `port` is the
     /// resolved listen port (the configured one, or a picked free one when
     /// the configured port was busy).
-    fn start_server(
-        &self,
-        binary: &Path,
-        repo_id: &str,
-        quant: &str,
-        port: u16,
-    ) -> Result<ManagedServer> {
+    fn start_server(binary: &Path, repo_id: &str, quant: &str, port: u16) -> Result<ManagedServer> {
         let mut cmd = Command::new(binary);
         cmd.arg("run")
             .arg("--model")
@@ -1660,7 +1654,7 @@ fn redact_key_material(text: &str) -> String {
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok()
     }
     #[cfg(not(unix))]
     {
@@ -1744,7 +1738,7 @@ async fn kill_server_child(child: &mut Child) {
     use nix::unistd::Pid;
     if let Some(pid) = child.id() {
         let descendants = intent_acp::descendant_pids(pid).await;
-        let pgid = Pid::from_raw(pid as i32);
+        let pgid = Pid::from_raw(pid.cast_signed());
         let _ = killpg(pgid, Signal::SIGTERM);
         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         let _ = killpg(pgid, Signal::SIGKILL);
@@ -2693,7 +2687,7 @@ mod tests {
 
         /// `kill(pid, 0)` liveness probe via nix.
         unsafe fn libc_kill_probe(pid: u32) -> bool {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None).is_ok()
         }
 
         #[tokio::test]
@@ -2888,7 +2882,7 @@ mod tests {
             // Reap the child directly (this test process is its true OS
             // parent), forcing the terminal "exited and reaped" state that a
             // signal-0 probe can actually observe.
-            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid.cast_signed()), None);
 
             assert!(
                 mgr.status_snapshot().await.is_none(),

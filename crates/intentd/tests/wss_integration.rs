@@ -7020,7 +7020,10 @@ async fn wss_note_version_history_round_trip() {
     let versions = sess[2]["result"].as_array().expect("versions array");
     assert_eq!(versions.len(), 3, "create+setContent+add: {}", sess[2]);
     for (i, entry) in versions.iter().enumerate() {
-        assert_eq!(entry["v"].as_i64(), Some(i as i64 + 1));
+        assert_eq!(
+            entry["v"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 1)
+        );
         assert_eq!(entry["type"], "snapshot");
         // JSON-RPC (FE) note mutations resolve the version author to `user`
         // (reference parity with `notes.service.ts`); the `system` author is
@@ -7126,7 +7129,11 @@ async fn wss_note_set_content_non_ascii_merge_round_trip() {
     .await;
     for (i, resp) in sess.iter().enumerate() {
         assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
-        assert_eq!(resp["id"].as_i64(), Some(i as i64 + 3), "envelope: {resp}");
+        assert_eq!(
+            resp["id"].as_i64(),
+            Some(i64::try_from(i).expect("value fits in i64") + 3),
+            "envelope: {resp}"
+        );
         assert!(
             resp.get("error").is_none(),
             "all frames must be success envelopes: {resp}"
@@ -8564,7 +8571,7 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
         assert_eq!(img_block["dataTruncated"], true, "{label}");
         assert_eq!(img_block["dataIsThumbnail"], true, "{label}");
         assert_eq!(
-            img_block["dataBytes"].as_u64().unwrap() as usize,
+            usize::try_from(img_block["dataBytes"].as_u64().unwrap()).expect("value fits in usize"),
             img_b64.len(),
             "{label}"
         );

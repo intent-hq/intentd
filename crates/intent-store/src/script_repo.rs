@@ -39,7 +39,7 @@ impl Store {
             .bind(enum_to_db(&s.mode)?)
             .bind(&s.category)
             .bind(&s.source)
-            .bind(s.auto_start.map(|b| b as i64))
+            .bind(s.auto_start.map(i64::from))
             .bind(&s.created_at)
             .bind(&s.updated_at)
             .execute(self.write_pool())
@@ -88,7 +88,7 @@ impl Store {
                     .bind(enum_to_db(&s.mode)?)
                     .bind(&s.category)
                     .bind(&s.source)
-                    .bind(s.auto_start.map(|b| b as i64))
+                    .bind(s.auto_start.map(i64::from))
                     .bind(&s.created_at)
                     .bind(&s.updated_at);
             }
@@ -150,7 +150,7 @@ impl Store {
         was_running: bool,
     ) -> Result<()> {
         sqlx::query("UPDATE script SET was_running = ? WHERE id = ? AND workspace_id = ?")
-            .bind(was_running as i64)
+            .bind(i64::from(was_running))
             .bind(id)
             .bind(workspace_id)
             .execute(self.write_pool())

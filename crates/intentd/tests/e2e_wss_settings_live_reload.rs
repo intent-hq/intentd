@@ -325,9 +325,12 @@ async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")

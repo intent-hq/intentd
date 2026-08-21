@@ -855,7 +855,7 @@ impl ScriptManager {
                 return Err(e);
             }
         };
-        let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
+        let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, &cwd)) {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
@@ -888,7 +888,7 @@ impl ScriptManager {
             let timed_out = match timeout_seconds.filter(|s| *s > 0) {
                 Some(s) => {
                     let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
-                    match tokio::time::timeout(Duration::from_secs(s as u64), fut).await {
+                    match tokio::time::timeout(Duration::from_secs(s.cast_unsigned()), fut).await {
                         Ok(_) => false,
                         Err(_) => {
                             mgr.pty.kill(pty_id).await;
@@ -918,10 +918,10 @@ impl ScriptManager {
         let bytes = self.pty.scrollback(pty_id).unwrap_or_default();
         let mut output = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(n) = max_lines.filter(|n| *n > 0) {
-            output = last_n_lines(&output, n as usize);
+            output = last_n_lines(&output, usize::try_from(n).expect("value fits in usize"));
         }
         Ok(json!({
-            "exitCode": exit.map(|e| e.exit_code as i64),
+            "exitCode": exit.map(|e| i64::from(e.exit_code)),
             "output": output,
             "timedOut": timed_out,
         }))
@@ -948,7 +948,7 @@ impl ScriptManager {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
-            let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
+            let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, &cwd)) {
                 Ok(id) => id,
                 Err(e) => {
                     self.fail(&ws, &script_id, generation, &e.to_string()).await;
@@ -1198,7 +1198,7 @@ impl ScriptManager {
                 .get_mut(&(ws.clone(), script_id.to_string()))
                 .filter(|m| m.generation == generation)?;
             m.state.status = ScriptStatus::Exited;
-            m.state.exit_code = exit.as_ref().map(|e| e.exit_code as i64);
+            m.state.exit_code = exit.as_ref().map(|e| i64::from(e.exit_code));
             m.state.stopped_at = Some(now_iso());
             (
                 m.state.clone(),
@@ -1310,7 +1310,7 @@ impl ScriptManager {
     /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + script env overlay,
     /// with an inherited `npm_config_prefix` scrubbed so nvm's login-shell init
     /// succeeds. An explicit script env value is preserved.
-    fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
+    fn build_spec(ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
@@ -1361,7 +1361,12 @@ fn enhanced_shell_path() -> Option<String> {
 /// Clamp a caller-supplied `maxLines` to a sane positive count (mirrors
 /// `clampLineCount`): use `fallback` when absent, then bound to `1..=10_000`.
 fn clamp_line_count(max_lines: Option<i64>, fallback: usize) -> usize {
-    max_lines.unwrap_or(fallback as i64).clamp(1, 10_000) as usize
+    usize::try_from(
+        max_lines
+            .unwrap_or(i64::try_from(fallback).expect("value fits in i64"))
+            .clamp(1, 10_000),
+    )
+    .expect("value fits in usize")
 }
 
 /// The trailing `n` newline-delimited lines of `text` (mirrors `getLastText`).
@@ -3220,7 +3225,12 @@ mod tests {
         // only has to outlast a login-shell spawn stall under parallel load.
         let out = h
             .services
-            .script_run(h.ws.clone(), id, Some(2), Some(LIVENESS.as_secs() as i64))
+            .script_run(
+                h.ws.clone(),
+                id,
+                Some(2),
+                Some(LIVENESS.as_secs().cast_signed()),
+            )
             .await
             .expect("run");
         let text = out["output"].as_str().unwrap_or("");
@@ -3238,7 +3248,7 @@ mod tests {
                 h.ws.clone(),
                 id.clone(),
                 None,
-                Some(LIVENESS.as_secs() as i64),
+                Some(LIVENESS.as_secs().cast_signed()),
             )
             .await
             .expect("run");
@@ -3266,7 +3276,7 @@ mod tests {
                 h.ws.clone(),
                 id.clone(),
                 None,
-                Some(LIVENESS.as_secs() as i64),
+                Some(LIVENESS.as_secs().cast_signed()),
             )
             .await
             .expect("run");

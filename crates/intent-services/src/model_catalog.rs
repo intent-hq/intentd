@@ -322,7 +322,7 @@ impl ModelCatalogCache {
     pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     }
 
     /// The last successfully fetched rows for `provider_id` regardless of
@@ -522,7 +522,8 @@ impl ModelCatalogCache {
             return None;
         }
         let age = now_ms - entry.failed_at_ms;
-        (age < MODELS_NEGATIVE_TTL.as_millis() as u64).then(|| entry.reason.clone())
+        (age < u64::try_from(MODELS_NEGATIVE_TTL.as_millis()).unwrap_or(u64::MAX))
+            .then(|| entry.reason.clone())
     }
 
     /// Record a probe failure so non-forced reads within
