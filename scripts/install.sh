@@ -490,11 +490,12 @@ main() {
       validate_channel "$channel"
     fi
   fi
-  # Every intentd call below inherits this environment, and the sitter parses
-  # INTENTD_CHANNEL case-sensitively (and lets the flag lose to it only when no
-  # flag is given). Re-export the normalized, effective value so a `--channel`
-  # flag is not undercut by a stale env var, and so a case-insensitive spelling
-  # this script accepts cannot make the sitter reject its own environment.
+  # Every intentd call below inherits this environment. The current sitter
+  # parses INTENTD_CHANNEL case-insensitively (and lets the flag lose to it
+  # only when no flag is given), but re-exporting the normalized, effective
+  # value stays as defense in depth: it keeps a `--channel` flag from being
+  # undercut by a stale env var, and protects sitters that predate the
+  # case-insensitive parse from rejecting their own environment.
   if [ -n "$channel" ]; then
     INTENTD_CHANNEL="$channel"
     export INTENTD_CHANNEL
