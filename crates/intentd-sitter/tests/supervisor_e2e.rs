@@ -26,7 +26,7 @@ use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::{
     BACKOFF_CAP_ENV, BACKOFF_INITIAL_ENV, BACKOFF_RESET_ENV, CHECK_MAX_ENV, CHECK_MIN_ENV,
-    KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
+    GIVE_UP_AFTER_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
 };
 
 const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
@@ -218,6 +218,17 @@ fn long_running_script(version: &str) -> String {
 /// Fake daemon: log one line and crash with `code`.
 fn crash_script(code: i32) -> String {
     format!("#!/bin/sh\necho run >> \"${FAKE_DAEMON_LOG}\"\nexit {code}\n")
+}
+
+/// Fake daemon: log one line, stay up `secs`, then crash with `code` — a
+/// daemon that serves for a while and dies, not one that can never start.
+fn long_lived_crash_script(secs: &str, code: i32) -> String {
+    format!(
+        "#!/bin/sh\n\
+         echo run >> \"${FAKE_DAEMON_LOG}\"\n\
+         sleep {secs}\n\
+         exit {code}\n"
+    )
 }
 
 /// Sitter command wired to a temp data dir, a manifest base URL, and the
@@ -595,6 +606,11 @@ fn crash_respawn_backs_off_exponentially() {
         .env(BACKOFF_INITIAL_ENV, "50")
         .env(BACKOFF_CAP_ENV, "400")
         .env(BACKOFF_RESET_ENV, "60000")
+        // This test measures the backoff curve, not the give-up threshold:
+        // raise the threshold out of reach so the loop runs for the whole
+        // window (`permanent_startup_failure_gives_up_and_exits_zero` owns
+        // the give-up behaviour).
+        .env(GIVE_UP_AFTER_ENV, "10000")
         .arg("serve")
         .spawn()
         .unwrap();
@@ -630,6 +646,108 @@ fn crash_respawn_backs_off_exponentially() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("respawning intentd in"), "stderr: {stderr}");
+}
+
+/// The bug this guards: a daemon that can never start (e.g. its data dir was
+/// written by a newer intentd) used to be respawned forever, so the service
+/// burned CPU and the user saw nothing but a timeout. After
+/// `give_up_after_failures` failed starts the sitter must stop — with exit
+/// **0**, because launchd (`KeepAlive`/`SuccessfulExit: false`) and systemd
+/// (`Restart=on-failure`) both relaunch a non-zero exit.
+#[test]
+fn permanent_startup_failure_gives_up_and_exits_zero() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(9));
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        // No start can ever reach this uptime, so nothing resets the count.
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "4")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+
+    // Nothing signals the sitter: it must exit on its own.
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "giving up must exit 0 or the service manager relaunches the crash loop"
+    );
+
+    let runs = read_or_empty(&daemon_log_path(dir.path()))
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 4, "must stop at the give-up threshold, not before it");
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("intentd 0.1.0 exited unexpectedly (exit code 9)"),
+        "the daemon's actual failure must be logged: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed 4 times in a row")
+            && stderr.contains("giving up instead of respawning it forever"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The other half of the contract: a daemon that keeps serving for a while
+/// before dying is transiently, not permanently, broken — every start that
+/// outlives `backoff_reset_after` clears the counter, so it is respawned
+/// forever exactly as before.
+#[test]
+fn crashes_after_a_healthy_run_never_trip_the_give_up() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Up for ~500ms (well past the 200ms reset window), then exit 1.
+    preinstall(&paths, "0.1.0", &long_lived_crash_script("0.5", 1));
+
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "200")
+        .env(GIVE_UP_AFTER_ENV, "4")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+
+    // Six runs is past the threshold of 4: without the reset the sitter
+    // would already have given up and this would time out.
+    wait_until(
+        "six respawns of the long-lived daemon",
+        Duration::from_secs(30),
+        || {
+            read_or_empty(&daemon_log_path(dir.path()))
+                .lines()
+                .filter(|line| *line == "run")
+                .count()
+                >= 6
+        },
+    );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must still be supervising a daemon that keeps recovering"
+    );
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        !stderr.contains("giving up"),
+        "a recovering daemon must never trigger give-up: {stderr}"
+    );
+
+    send_signal(&sitter, "TERM");
+    wait_exit(&mut sitter, Duration::from_secs(10));
 }
 
 #[test]
