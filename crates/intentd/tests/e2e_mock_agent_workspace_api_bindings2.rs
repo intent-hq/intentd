@@ -101,6 +101,7 @@ async fn event_bindings_query_and_subscribe() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -215,6 +216,7 @@ async fn file_bindings_read_write_list() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -379,6 +381,7 @@ async fn agent_bindings_list_and_status() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -499,6 +502,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).
@@ -801,6 +805,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).
@@ -1200,6 +1205,7 @@ async fn git_bindings_commit() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(repo_dir.clone())
+        .with_settings_registry(common::registry_with_default_provider(&repo_dir))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -1349,6 +1355,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(repo_dir.clone())
+        .with_settings_registry(common::registry_with_default_provider(&repo_dir))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -1499,6 +1506,7 @@ async fn note_bindings_edit_and_edit_lines() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();

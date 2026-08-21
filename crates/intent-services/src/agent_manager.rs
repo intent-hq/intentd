@@ -3372,14 +3372,15 @@ impl AgentManager {
             return None;
         }
         // Spell the rename tool the way this session's provider surfaces it;
-        // a failed session lookup falls back to the generic phrasing.
+        // a failed session lookup (or an unresolvable provider) falls back to
+        // the generic phrasing.
         let configured_default =
             crate::agent_session::derived_default_provider(&self.services.effective_settings());
         let tool_ref = match self.services.store.get_agent_session(agent_id).await {
-            Ok(s) => workspace_naming_tool_reference(&session_provider_id(
-                &s,
-                configured_default.as_deref(),
-            )),
+            Ok(s) => session_provider_id(&s, configured_default.as_deref())
+                .map_or(GENERIC_NAMING_TOOL_REFERENCE, |p| {
+                    workspace_naming_tool_reference(&p)
+                }),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -7632,12 +7633,14 @@ fn derive_agent_type(
 /// prefix wins over `session.provider`, because a cross-provider model switch
 /// should spawn the new provider's binary. `session.provider` is only used as
 /// a fallback for bare model ids, then `configured_default` (the settings-
-/// derived default — `model.default` prefix, else `providers.active`), then
-/// the first registered provider (neutral positional last resort).
+/// derived default — `model.default` prefix, else `providers.active`).
 /// Delegates to [`crate::agent_session::resolve_provider_id`], which also
 /// guards against malformed compound ids like `:sonnet` (empty prefixes fall
-/// through to the provider field / configured default / last resort).
-fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> String {
+/// through to the provider field / configured default). `None` when nothing
+/// resolves (monorepo#3044): the spawn must fail loudly instead of running
+/// the positional first registered provider (auggie), which may not be
+/// installed.
+fn session_provider_id(session: &AgentSession, configured_default: Option<&str>) -> Option<String> {
     crate::agent_session::resolve_provider_id(
         session.model.as_deref(),
         session.provider.as_deref(),
@@ -7678,7 +7681,8 @@ fn resolve_spawn(
     let provider_id = session_provider_id(
         session,
         crate::agent_session::derived_default_provider(settings).as_deref(),
-    );
+    )
+    .ok_or_else(|| crate::agent_session::no_default_provider_error("agent spawn"))?;
     // Whitespace-bearing bare ids are effective-model display names persisted
     // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows, e.g.
     // `claude-code:Opus 4.8`) — stats/attribution values, not spawnable model

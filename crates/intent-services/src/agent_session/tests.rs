@@ -689,7 +689,10 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         model: None,
         reasoning_effort: None,
         effort_levels: None,
-        provider: None,
+        // Pinned explicitly: seeded sessions predate monorepo#3044, when a
+        // `None` provider still resolved positionally to auggie; resolution
+        // now fails loudly with no provider and no configured default.
+        provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
         status: AgentStatus::Pending,

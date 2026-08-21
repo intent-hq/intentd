@@ -95,10 +95,26 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".config.toml"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
         }
     }
+}
+
+/// A settings registry (backed by a config file next to the temp db, removed
+/// by [`TempDb`]'s drop) seeding `providers.active = "auggie"`: since
+/// monorepo#3044 there is no positional provider fallback, so tests that
+/// create/delegate agents without an explicit provider or model need a
+/// configured default to resolve to.
+pub(crate) fn test_registry_with_default_provider(
+    tmp: &TempDb,
+) -> std::sync::Arc<crate::SettingsRegistry> {
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
+    registry
 }
 
 /// Drop-cleanup wrapper around a per-test workspaces root, paired with the
@@ -21845,10 +21861,13 @@ mod worktree_provisioning {
                 .expect("load registry"),
         );
         registry
-            .apply(&[(
-                "workspace.branchPrefix".to_string(),
-                serde_json::json!("aw/"),
-            )])
+            .apply(&[
+                (
+                    "workspace.branchPrefix".to_string(),
+                    serde_json::json!("aw/"),
+                ),
+                ("providers.active".to_string(), serde_json::json!("auggie")),
+            ])
             .expect("set prefix");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
         let root = unique_dir("intentd-wtslug-root");
@@ -22200,7 +22219,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idslug-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let make = |prompt: &str| WorkspaceCreate {
             skip_isolation: Some(true),
@@ -22236,7 +22257,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idrecycle-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let make = |prompt: &str| WorkspaceCreate {
             skip_isolation: Some(true),
@@ -22286,7 +22309,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-iddir-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         std::fs::create_dir_all(root.0.join("auth-fix")).expect("seed leftover dir");
 
@@ -22406,7 +22431,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleempty-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -22452,7 +22479,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titlenone-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -22481,7 +22510,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titlewsp-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -22510,7 +22541,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleexpl-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -23543,7 +23576,8 @@ mod file_ops_service {
         let expect_sandbox = matches!(probe, CowSupport::Supported);
 
         // Create services with workspaces_root configured
-        let mut svc = Services::new(store.clone());
+        let mut svc = Services::new(store.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
         svc.workspaces_root = Some(workspaces_root);
 
         // Delegate with isolation=cow
@@ -24527,7 +24561,7 @@ mod initial_agent_orchestration {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{TempDb, WorkspacesRoot};
+    use super::{test_registry_with_default_provider, TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, SubscriptionFilter};
 
     fn create_input(agent: Option<WorkspaceCreateInitialAgent>) -> WorkspaceCreate {
@@ -24561,6 +24595,7 @@ mod initial_agent_orchestration {
         let ws_root = WorkspacesRoot::new();
         let services = Services::new(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp))
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
@@ -24644,8 +24679,9 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
         let key = Some("ws-agent-idem-1".to_string());
 
         let input = || {
@@ -24698,8 +24734,9 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
         let key = Some("ws-agent-no-prompt-idem-1".to_string());
 
         let input = || {
@@ -24757,8 +24794,9 @@ mod initial_agent_orchestration {
             let tmp = TempDb::new();
             let store = Store::open(&tmp.path).await.expect("open store");
             let ws_root = WorkspacesRoot::new();
-            let services =
-                Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+            let services = Services::new(store.clone())
+                .with_workspaces_root(ws_root.path().to_path_buf())
+                .with_settings_registry(test_registry_with_default_provider(&tmp));
 
             let res = services
                 .create_workspace(
@@ -24841,8 +24879,9 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let res = services
             .create_workspace(
@@ -29453,6 +29492,272 @@ mod provider_discovery_payload {
     }
 }
 
+/// Default-provider settings self-heal (monorepo#3044,
+/// `Services::heal_default_provider_settings`): with no derivable default and
+/// an installed registered provider, the first installed provider is
+/// persisted as `providers.active` plus its cached catalog default (or first)
+/// model as a compound `model.default`; existing values are never
+/// overwritten, and with nothing installed nothing is written.
+mod default_provider_self_heal {
+    use super::*;
+
+    /// Services with an EMPTY settings registry (no default provider) — the
+    /// precondition the heal exists for.
+    async fn setup() -> (TempDb, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        let services = Services::new(store).with_settings_registry(registry);
+        (tmp, services)
+    }
+
+    fn setting(svc: &Services, path: &str) -> Option<serde_json::Value> {
+        svc.settings_registry()
+            .expect("registry wired")
+            .get(path)
+            .filter(|v| !v.is_null())
+    }
+
+    /// Unset settings + installed provider with a cached `isDefault` row ⇒
+    /// both keys healed; a second sweep is a no-op (idempotent).
+    #[tokio::test]
+    async fn unset_settings_heal_provider_and_catalog_default_model() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![
+                serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
+                serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5", "isDefault": true }),
+            ],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("auggie:sonnet5"))
+        );
+
+        // Idempotent: the healed values now derive a default, so a repeat
+        // sweep (restart / later discovery call) writes nothing.
+        let again = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal again");
+        assert_eq!(again["healed"], false, "{again}");
+        assert_eq!(again["reason"], "already-configured", "{again}");
+    }
+
+    /// No `isDefault` row in the cached catalog ⇒ the FIRST row is used.
+    #[tokio::test]
+    async fn catalog_without_default_row_heals_first_model() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![
+                serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
+                serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5" }),
+            ],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["model"], "auggie:fable-5", "{result}");
+    }
+
+    /// A cached row id with a FOREIGN compound prefix (`grok:foo` in the
+    /// auggie catalog) is not an ownership claim (monorepo#607) — persisting
+    /// it would let the prefix override the healed `providers.active`. The
+    /// provider is healed alone; a self-prefixed row is kept as-is.
+    #[tokio::test]
+    async fn foreign_prefixed_catalog_row_heals_provider_only() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "grok:foo", "name": "Foreign", "isDefault": true })],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+
+        // A self-prefixed row id IS trusted and kept verbatim.
+        let (_tmp2, svc2) = setup().await;
+        svc2.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "auggie:sonnet5", "isDefault": true })],
+        );
+        let result = svc2
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+    }
+
+    /// Cold catalog cache (no models known) ⇒ the provider is persisted
+    /// alone; `model.default` stays unset.
+    #[tokio::test]
+    async fn no_cached_models_heals_provider_only() {
+        let (_tmp, svc) = setup().await;
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// A configured `providers.active` is never overwritten — the heal is a
+    /// no-op even when discovery reports a different installed provider.
+    #[tokio::test]
+    async fn configured_active_provider_is_never_overwritten() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("providers.active".into(), serde_json::json!("codex"))])
+            .expect("seed active provider");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "already-configured", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("codex"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// A compound `model.default` alone already derives a default provider —
+    /// the heal never touches either key.
+    #[tokio::test]
+    async fn compound_default_model_alone_blocks_heal() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.default".into(), serde_json::json!("codex:gpt-5"))])
+            .expect("seed default model");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "already-configured", "{result}");
+        assert_eq!(setting(&svc, "providers.active"), None);
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("codex:gpt-5"))
+        );
+    }
+
+    /// Nothing installed (empty list, or only ids the registry doesn't know)
+    /// ⇒ nothing is written; the keys stay unset for the next discovery pass.
+    #[tokio::test]
+    async fn nothing_installed_writes_nothing() {
+        let (_tmp, svc) = setup().await;
+
+        for installed in [vec![], vec!["not-a-provider".to_string()]] {
+            let result = svc
+                .heal_default_provider_settings(&installed)
+                .await
+                .expect("heal");
+            assert_eq!(result["healed"], false, "{result}");
+            assert_eq!(result["reason"], "no-installed-provider", "{result}");
+        }
+        assert_eq!(setting(&svc, "providers.active"), None);
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// Both keys hold raw values that don't resolve to a registered provider
+    /// (e.g. ids from a foreign build): no derivable default, but the
+    /// no-overwrite rule still wins — nothing is rewritten.
+    #[tokio::test]
+    async fn unresolvable_existing_values_are_not_overwritten() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[
+                ("providers.active".into(), serde_json::json!("mystery")),
+                ("model.default".into(), serde_json::json!("mystery:m1")),
+            ])
+            .expect("seed unresolvable values");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "values-already-set", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("mystery"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("mystery:m1"))
+        );
+    }
+
+    /// The first INSTALLED provider wins in the order discovery reported,
+    /// skipping ids the registry doesn't know.
+    #[tokio::test]
+    async fn first_registered_installed_provider_wins() {
+        let (_tmp, svc) = setup().await;
+
+        let result = svc
+            .heal_default_provider_settings(&[
+                "not-a-provider".into(),
+                "codex".into(),
+                "auggie".into(),
+            ])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "codex", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("codex"))
+        );
+    }
+}
+
 /// `workspace.create` parent-dir resolution: startup pin > non-empty
 /// `workspace.worktreesLocation` (created when missing, failure = error) >
 /// boot-time root (see `resolve_workspaces_parent`).
@@ -30623,7 +30928,9 @@ mod harness_versioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (tmp, Services::new(store), ws)
+        let registry = test_registry_with_default_provider(&tmp);
+        let services = Services::new(store).with_settings_registry(registry);
+        (tmp, services, ws)
     }
 
     async fn create_agent(

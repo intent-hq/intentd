@@ -30,6 +30,11 @@ async fn setup() -> (TempDb, Services, WorkspaceId, tempfile::TempDir) {
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
+    // monorepo#3044: creation requires a resolvable provider (no positional
+    // fallback) — seed the pre-existing effective default explicitly.
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws, config_dir)
 }

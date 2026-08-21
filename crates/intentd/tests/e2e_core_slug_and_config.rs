@@ -19,8 +19,11 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 async fn workspace_id_derived_from_initial_agent_prompt() {
     let db = std::env::temp_dir().join(format!("intentd-e2e-core-{}.db", uuid::Uuid::new_v4()));
     let ws_root = std::env::temp_dir().join(format!("itd-e2e-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws_root).expect("create ws root");
     let store = Store::open(&db).await.expect("open store");
-    let services = Services::new(store.clone()).with_workspaces_root(ws_root.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(ws_root.clone())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root));
 
     // Workspace create with an initialAgent prompt that should extract to "auth-fix"
     let result = services
