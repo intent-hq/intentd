@@ -7949,10 +7949,10 @@ mod wsapi6_bindings_tests {
         }));
         let resp = call(
             &srv,
-            r#"
+            r"
             const r = await ws.browser.exec([{ action: 'resizeTab', tabId: 'tab-9', width: 375 }]);
             return { code: r.errorCode, owner: r.ownerAgentId, ok: r.success };
-            "#,
+            ",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7981,14 +7981,14 @@ mod wsapi6_bindings_tests {
         }));
         let resp = call(
             &srv,
-            r#"
+            r"
             const r = await ws.browser.exec([
                 { action: 'listTabs' },
                 { action: 'claimTab', tabId: 'tab-3', width: 1280 }
             ]);
             const failed = r.results.find(x => !x.success);
             return { ok: r.success, code: failed.errorCode, owner: failed.ownerAgentId };
-            "#,
+            ",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -8018,7 +8018,7 @@ mod wsapi6_bindings_tests {
         }));
         let resp = call(
             &srv,
-            r#"
+            r"
             const r = await ws.browser.exec([
                 { action: 'resizeTab', tabId: 'tab-9', width: 375 },
                 { action: 'screenshot' },
@@ -8026,7 +8026,7 @@ mod wsapi6_bindings_tests {
             ]);
             const failed = r.results.find(x => !x.success);
             return { ok: r.success, count: r.results.length, code: failed.errorCode, owner: failed.ownerAgentId };
-            "#,
+            ",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
