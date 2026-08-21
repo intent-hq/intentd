@@ -962,7 +962,7 @@ jobs:
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
 
   # Release-script regression tests: runs the stubbed-gh harness for
-  # scripts/aggregate-stable-notes.sh (an idempotent re-promotion must
+  # scripts/aggregate-channel-notes.sh (an idempotent re-promotion must
   # rebuild the aggregate from the notes-base marker, and a legacy body
   # without a marker is left untouched — never collapsed to one section).
   # Seconds-long like the other utility jobs, so it runs directly on
@@ -972,8 +972,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - name: Test aggregate-stable-notes.sh
-        run: ./scripts/test-aggregate-stable-notes.sh
+      - name: Test aggregate-channel-notes.sh
+        run: ./scripts/test-aggregate-channel-notes.sh
 
   # Single required status check for branch protection: fans in check, build,
   # coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging,
