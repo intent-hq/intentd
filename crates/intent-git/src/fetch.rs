@@ -11,10 +11,12 @@
 //! `Child::kill` if the remote hangs.
 //!
 //! A caller-resolved GitHub token (if any) is offered to the child as a
-//! `credential.https://github.com.helper` scoped to github.com only, appended
-//! after any configured helpers so existing setups keep winning. The token
-//! value travels via an environment variable — never argv, so it cannot leak
-//! through process listings or error messages.
+//! `credential.https://github.com.helper` scoped to github.com only, ordered
+//! ahead of the configured helpers with those re-added behind it as fallbacks
+//! (monorepo#3059 — see `auth::github_helper_entries` for why deferring to
+//! them outright backfires on macOS). The token value travels via an
+//! environment variable — never argv, so it cannot leak through process
+//! listings or error messages.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -33,7 +35,7 @@ const SHELL_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
 /// stays negligible for a long-running remote.
 const SHELL_FETCH_POLL: Duration = Duration::from_millis(50);
 
-use crate::auth::{token_helper_config, TOKEN_ENV};
+use crate::auth::TOKEN_ENV;
 
 /// Fetch a single `branch` from `remote` (typically `origin`), updating the local
 /// remote-tracking ref `refs/remotes/<remote>/<branch>`. `token` is an optional
@@ -71,12 +73,18 @@ pub(crate) fn fetch_with_timeout(
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(worktree_path);
     // Offer the resolved token as an extra credential helper scoped to
-    // github.com HTTPS only. `-c` helpers are appended after the configured
-    // ones, so an existing credential helper still wins (ssh-agent → helper →
-    // token order, matching `crate::auth`). The helper reads the secret from
-    // the environment — the argv below carries no token bytes.
+    // github.com HTTPS only, consulted *ahead* of the configured helpers
+    // (which stay reachable behind it) so an OS-default helper holding a stale
+    // github.com credential cannot shadow the resolved token — monorepo#3059,
+    // see `auth::github_helper_entries`. `-c` entries are applied after the
+    // inherited `GIT_CONFIG_PARAMETERS`, so the reset they carry covers both.
+    // The helper reads the secret from the environment — the argv below
+    // carries no token bytes.
     if let Some(token) = crate::auth::usable_token(token) {
-        cmd.arg("-c").arg(token_helper_config());
+        let inherited = std::env::var(crate::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+        for entry in crate::auth::token_helper_entries(Some(worktree_path), inherited.as_deref()) {
+            cmd.arg("-c").arg(entry);
+        }
         cmd.env(TOKEN_ENV, token);
     }
     let mut child = cmd
@@ -140,6 +148,7 @@ fn read_stderr(child: &mut std::process::Child) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::token_helper_config;
     use crate::testutil::{commit_file, init_repo};
     use git2::Repository;
 

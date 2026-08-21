@@ -6705,7 +6705,7 @@ impl AgentManager {
             .source_control
             .github
             .expose_git_credential_to_children;
-        inject_git_credential_env(&mut opts.extra_env, git_credential_expose);
+        inject_git_credential_env(&mut opts.extra_env, opts.cwd, git_credential_expose);
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -7950,10 +7950,17 @@ fn rebuild_spawn_opts<'a>(
 /// `intentd git-credential` helper entry — **no token bytes ever enter the
 /// child environment** (the helper fetches the credential from the daemon
 /// over UDS on demand). The daemon's own `GIT_CONFIG_PARAMETERS` (which the
-/// child would inherit) is preserved by appending after it, so existing
-/// setups keep winning. Setting off or an unresolvable daemon binary path ⇒
-/// no changes; pre-existing caller keys are never clobbered.
-fn inject_git_credential_env(extra_env: &mut BTreeMap<String, String>, expose: bool) {
+/// child would inherit) is preserved by appending after it, and the helper is
+/// ordered ahead of the configured ones, which stay reachable behind it
+/// (monorepo#3059). `cwd` is the directory the provider is spawned in, so the
+/// helpers configured *there* — a repository-local one included — are the ones
+/// re-added behind intentd's. Setting off or an unresolvable daemon binary
+/// path ⇒ no changes; pre-existing caller keys are never clobbered.
+fn inject_git_credential_env(
+    extra_env: &mut BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    expose: bool,
+) {
     if !expose {
         return;
     }
@@ -7961,7 +7968,7 @@ fn inject_git_credential_env(extra_env: &mut BTreeMap<String, String>, expose: b
         return;
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-    for (key, value) in intent_git::auth::daemon_helper_env(&intentd, inherited.as_deref()) {
+    for (key, value) in intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref()) {
         extra_env.entry(key).or_insert(value);
     }
 }
@@ -12320,7 +12327,7 @@ mod rebuild_spawn_opts_tests {
     #[test]
     fn inject_git_credential_env_on_off_matrix() {
         let mut env = BTreeMap::new();
-        inject_git_credential_env(&mut env, true);
+        inject_git_credential_env(&mut env, None, true);
         assert_eq!(
             env.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![intent_git::auth::GIT_CONFIG_PARAMETERS_ENV]
@@ -12337,7 +12344,7 @@ mod rebuild_spawn_opts_tests {
         );
 
         let mut env = BTreeMap::new();
-        inject_git_credential_env(&mut env, false);
+        inject_git_credential_env(&mut env, None, false);
         assert!(env.is_empty(), "setting off must not inject");
     }
 
@@ -12349,7 +12356,7 @@ mod rebuild_spawn_opts_tests {
             intent_git::auth::GIT_CONFIG_PARAMETERS_ENV.to_string(),
             "caller-set".to_string(),
         )]);
-        inject_git_credential_env(&mut env, true);
+        inject_git_credential_env(&mut env, None, true);
         assert_eq!(
             env[intent_git::auth::GIT_CONFIG_PARAMETERS_ENV],
             "caller-set"
