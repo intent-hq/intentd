@@ -1555,14 +1555,11 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
-/// H2 regression: a session stamped `harnessVersion: "1.0"` (every session
-/// H1 has created) resolves the v1 doctrine set and assembles the exact
-/// bytes the pre-versioned layout produced — pinned here as equality with
-/// the session-less (latest) assembly, whose layers are themselves
-/// byte-pinned by the goldens above and the doctrine hashes below. An
-/// unknown/corrupt stamp falls back to the latest instead of failing.
+/// A session stamped `harnessVersion: "1.0"` keeps the v1 doctrine after v2
+/// becomes latest. An unknown or corrupt stamp falls back to latest instead
+/// of failing.
 #[tokio::test]
-async fn golden_v1_session_assembles_identical_to_latest() {
+async fn golden_v1_session_remains_pinned_after_v2() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-h2-pin");
     seed_agent(&svc, &ws, &owner).await;
@@ -1571,7 +1568,7 @@ async fn golden_v1_session_assembles_identical_to_latest() {
         .get_agent_session(&owner)
         .await
         .expect("session");
-    assert_eq!(session.harness_version, "1.0", "H1 stamps 1.0");
+    assert_eq!(session.harness_version, "2.0", "new sessions stamp v2");
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
@@ -1600,9 +1597,12 @@ async fn golden_v1_session_assembles_identical_to_latest() {
             .expect("assembled prompt")
         }
     };
-    let latest = assemble(None).await;
+    session.harness_version = "1.0".to_string();
     let pinned_v1 = assemble(Some(session.clone())).await;
-    assert_eq!(pinned_v1, latest, "1.0 session == pre-change assembly");
+    let latest = assemble(None).await;
+    assert!(!pinned_v1.contains("ws.workspace.proposeSibling"));
+    assert!(latest.contains("ws.workspace.proposeSibling"));
+    assert_ne!(pinned_v1, latest, "v1 remains distinct from latest v2");
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
     let unknown = assemble(Some(session)).await;
@@ -1612,7 +1612,7 @@ async fn golden_v1_session_assembles_identical_to_latest() {
 /// The bundled doctrine layers are large; pin them by SHA-256 so any change
 /// to the shipped instruction markdown (or the feature-gating composition)
 /// fails here and forces a harness-version decision. The hashes are of
-/// `get_instruction_with_common` output with all-default agent features.
+/// v1 `get_instruction_with_common_for` output with all-default agent features.
 #[test]
 fn golden_bundled_doctrine_hashes() {
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
@@ -1630,8 +1630,10 @@ fn golden_bundled_doctrine_hashes() {
             format!(
                 "{}: {}",
                 agent_type,
-                sha256_hex(&crate::instructions::get_instruction_with_common(
-                    agent_type, &features
+                sha256_hex(&crate::instructions::get_instruction_with_common_for(
+                    &crate::instructions::V1,
+                    agent_type,
+                    &features,
                 ))
             )
         })

@@ -40,6 +40,7 @@ macro_rules! instr {
 
 const CHAT: &str = instr!("v1", "chat");
 const COMMON: &str = instr!("v1", "common");
+const V2_COMMON: &str = instr!("v2", "common");
 const DEBUG: &str = instr!("v1", "debug");
 const WORKSPACE: &str = instr!("v1", "workspace");
 const TASK_BREAKDOWN: &str = instr!("v1", "task-breakdown");
@@ -107,6 +108,13 @@ pub(crate) static V1: InstructionSet = InstructionSet {
     code_walkthrough: CODE_WALKTHROUGH,
     commit_message: COMMIT_MESSAGE,
     pr_description: PR_DESCRIPTION,
+};
+
+/// Harness v2 keeps every v1 instruction body except the common guidance,
+/// which adds scoped sibling-workspace handoffs.
+pub(crate) static V2: InstructionSet = InstructionSet {
+    common: V2_COMMON,
+    ..V1
 };
 
 /// Utility agents that don't get the workspace instruction layer (port of
@@ -400,12 +408,39 @@ mod tests {
 
     #[test]
     fn common_only_is_not_self_wrapped() {
-        assert_eq!(get_instruction_with_common("common", &all_on()), COMMON);
+        assert_eq!(
+            get_instruction_with_common_for(&V1, "common", &all_on()),
+            COMMON
+        );
+    }
+
+    #[test]
+    fn v2_common_teaches_scoped_sibling_handoffs() {
+        let common = get_instruction_with_common_for(&V2, "common", &all_on());
+        assert!(common.contains(
+            "ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? })"
+        ));
+        assert!(common.contains("clearly separate from the current request"));
+        assert!(common.contains("Make the `initialPrompt` self-contained"));
+        assert!(common.contains("The current repository is inherited and locked"));
+        assert!(common.contains("The user must approve it"));
+        assert!(common.contains("before Apply succeeds"));
+        assert!(common.contains("delegated or background agent"));
+        assert!(common.contains("ws.agent.reportToParent"));
+        assert!(!COMMON.contains("ws.workspace.proposeSibling"));
+        assert_eq!(
+            remove_between(
+                V2_COMMON,
+                "## Follow-up Workspaces",
+                "## GitHub & Git Operations",
+            ),
+            COMMON
+        );
     }
 
     #[test]
     fn workspace_gets_common_prepended_once() {
-        let out = get_instruction_with_common("workspace", &all_on());
+        let out = get_instruction_with_common_for(&V1, "workspace", &all_on());
         assert_eq!(out, format!("{COMMON}\n\n---\n\n{WORKSPACE}"));
     }
 
@@ -443,7 +478,7 @@ mod tests {
 
     #[test]
     fn workspace_agent_gets_common_workspace_specific() {
-        let out = get_instruction_with_common("task-loop", &all_on());
+        let out = get_instruction_with_common_for(&V1, "task-loop", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{TASK_LOOP}")
@@ -453,7 +488,7 @@ mod tests {
     #[test]
     fn unknown_type_falls_back_to_workspace_specific() {
         // The spawn default agent type is unknown → fallbackToWorkspace.
-        let out = get_instruction_with_common("interactive", &all_on());
+        let out = get_instruction_with_common_for(&V1, "interactive", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{WORKSPACE}")
@@ -462,7 +497,7 @@ mod tests {
 
     #[test]
     fn fix_alias_resolves_to_debug() {
-        let out = get_instruction_with_common("fix", &all_on());
+        let out = get_instruction_with_common_for(&V1, "fix", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{DEBUG}")
@@ -475,11 +510,11 @@ mod tests {
         // membership checks use the raw id ("review"/"walkthrough"), which are not
         // in those sets — so they take the full common+workspace+specific path.
         assert_eq!(
-            get_instruction_with_common("review", &all_on()),
+            get_instruction_with_common_for(&V1, "review", &all_on()),
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_REVIEW}")
         );
         assert_eq!(
-            get_instruction_with_common("walkthrough", &all_on()),
+            get_instruction_with_common_for(&V1, "walkthrough", &all_on()),
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_WALKTHROUGH}")
         );
     }

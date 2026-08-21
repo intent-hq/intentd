@@ -1,4 +1,4 @@
-//! Harness **v1**: today's post-#2457 text set, byte-pinned by
+//! Harness **v1**: the original post-#2457 text set, byte-pinned by
 //! `crate::v1_goldens` and `agent_manager::v1_turn_envelope_goldens`. Every
 //! string here was moved verbatim from `rules.rs` / `agent_manager.rs` /
 //! `lib.rs` / `agent_ops.rs` (H5 byte-neutral refactor); any edit MUST fail
@@ -24,11 +24,10 @@ static DOCTRINE: Doctrine = Doctrine {
     specialists: crate::specialists::EMBEDDED_BUNDLED_V1,
 };
 
-/// The v1 registry row. `version` is intent-core's stamped `"1.0"` (asserted
-/// equal to `CURRENT_HARNESS_VERSION` by registry tests); the feature
-/// defaults are the `[agentFeatures]` defaults this doctrine was written
-/// against (all on), used to gate legacy NULL-snapshot sessions the way a
-/// live read would have when v1 was current.
+/// The v1 registry row. `version` is the original intent-core stamp `"1.0"`;
+/// the feature defaults are the `[agentFeatures]` defaults this doctrine was
+/// written against (all on), used to gate legacy NULL-snapshot sessions the
+/// way a live read would have when v1 was current.
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
     version: "1.0",
     harness: &V1,
@@ -38,7 +37,7 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 };
 
 /// Human-readable labels for every `agentFeatures` toggle v1 knows about.
-const FEATURE_LABELS: &[(&str, &str)] = &[
+pub(super) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("backgroundHooks", "Background hooks (ws.hook.*)"),
     ("hostExec", "Host command execution (ws.host.exec)"),
     ("scripts", "Saved scripts (ws.script.*)"),

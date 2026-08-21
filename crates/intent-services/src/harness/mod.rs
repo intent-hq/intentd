@@ -26,6 +26,7 @@
 //! the binary ships a newer set. All past versions stay bundled.
 
 pub(crate) mod v1;
+pub(crate) mod v2;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -347,7 +348,7 @@ pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 /// bundled so an old session keeps resolving the doctrine it was created
 /// with. Adding a version = a `resources/**/<ver>/` directory + a module +
 /// one row here.
-static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY];
+static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY, &v2::ENTRY];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
 /// exists; the tail fallback is unreachable and only avoids a panic path.
@@ -390,7 +391,7 @@ mod tests {
     }
 
     /// The registry keys on the exact version string sessions are stamped
-    /// with (intent-core's `CURRENT_HARNESS_VERSION`, "1.0"): the stamp and
+    /// with (intent-core's `CURRENT_HARNESS_VERSION`): the stamp and
     /// the resolved harness can never drift.
     #[test]
     fn registry_resolves_stamped_current_version() {
@@ -436,64 +437,20 @@ mod tests {
         }
     }
 
-    /// Adding a hypothetical v2 is a directory + registry entry: a fixture
-    /// registry with a second row resolves each version to its own doctrine
-    /// and still falls back to its latest for unknown stamps.
+    /// The v2 registry row selects new doctrine while v1 remains available.
     #[test]
-    fn hypothetical_v2_is_a_directory_plus_registry_entry() {
-        // A future set would `include_str!` from
-        // `resources/agent-instructions/v2/`; the fixture only needs
-        // distinct bytes.
-        static V2_INSTRUCTIONS: crate::instructions::InstructionSet =
-            crate::instructions::InstructionSet {
-                chat: "v2",
-                common: "v2 common",
-                debug: "v2",
-                workspace: "v2",
-                setup_script_generator: "v2",
-                task_breakdown: "v2",
-                task_debug: "v2",
-                task_focused: "v2",
-                task_loop: "v2",
-                ralph_loop: "v2",
-                workspace_agent: "v2",
-                notes_system_guide: "v2",
-                code_review: "v2",
-                code_walkthrough: "v2",
-                commit_message: "v2",
-                pr_description: "v2",
-            };
-        static V2_DOCTRINE: Doctrine = Doctrine {
-            instructions: &V2_INSTRUCTIONS,
-            specialists: &[("implementor", "v2 implementor body")],
-        };
-        static V2_ENTRY: HarnessEntry = HarnessEntry {
-            version: "2.0",
-            harness: &v1::V1,
-            doctrine: &V2_DOCTRINE,
-            default_features: intent_core::settings_file::AgentFeaturesSettings::default,
-            feature_labels: &[("taskGraph", "Task-graph workflow teaching")],
-        };
-        let fixture: &[&HarnessEntry] = &[&v1::ENTRY, &V2_ENTRY];
-        let find = |v: &str| {
-            fixture
-                .iter()
-                .find(|e| e.version == v)
-                .copied()
-                .unwrap_or(fixture[fixture.len() - 1])
-        };
+    fn v2_selects_new_doctrine_without_changing_v1() {
         assert_eq!(
-            find("1.0").doctrine.instructions.common,
+            resolve_entry("1.0").doctrine.instructions.common,
             v1::ENTRY.doctrine.instructions.common
         );
-        assert_eq!(find("2.0").doctrine.instructions.common, "v2 common");
-        // Unknown stamps fall back to the fixture's latest row.
-        assert_eq!(find("9.9").version, "2.0");
-        // An old session pinned to 1.0 keeps its original doctrine even
-        // though 2.0 exists.
+        assert_eq!(
+            resolve_entry("2.0").doctrine.instructions.common,
+            crate::instructions::V2.common
+        );
         assert_ne!(
-            find("1.0").doctrine.instructions.common,
-            find("2.0").doctrine.instructions.common
+            resolve_entry("1.0").doctrine.instructions.common,
+            resolve_entry("2.0").doctrine.instructions.common
         );
     }
 }
