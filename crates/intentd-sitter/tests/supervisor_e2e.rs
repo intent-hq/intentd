@@ -614,7 +614,7 @@ fn crash_respawn_backs_off_exponentially() {
         .arg("serve")
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(5000));
+    thread::sleep(Duration::from_secs(5));
     send_signal(&sitter, "TERM");
     let status = wait_exit(&mut sitter, Duration::from_secs(10));
     assert_ne!(

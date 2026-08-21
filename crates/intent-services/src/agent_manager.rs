@@ -1844,7 +1844,7 @@ impl Drop for WakeGateGuard {
 /// Quiescence settle window for implicit harness-wake turns (monorepo#855):
 /// an implicit turn finalizes once no `session/update` arrived for this long.
 #[cfg(not(test))]
-const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(2000);
+const HARNESS_WAKE_SETTLE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(200);
 
@@ -7455,7 +7455,10 @@ mod kill_sweep_tests {
         // The children ignored SIGTERM, so the full shared grace must have
         // elapsed (proves the window ran once, not that children died early).
         assert!(
-            elapsed >= PROCESS_GROUP_TERM_GRACE - Duration::from_millis(500),
+            elapsed
+                >= PROCESS_GROUP_TERM_GRACE
+                    .checked_sub(Duration::from_millis(500))
+                    .unwrap(),
             "sweep returned after {elapsed:?}, before the shared grace window elapsed"
         );
     }

@@ -394,8 +394,7 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
     // scaled like the other waits, so a load-delayed debounce cannot slip
     // past the drain).
     let drain_window_ms =
-        u64::try_from(common::test_timeout(Duration::from_millis(1000)).as_millis())
-            .unwrap_or(u64::MAX);
+        u64::try_from(common::test_timeout(Duration::from_secs(1)).as_millis()).unwrap_or(u64::MAX);
     while drain_extra(&mut sub, "specialists:changed", drain_window_ms)
         .await
         .is_some()

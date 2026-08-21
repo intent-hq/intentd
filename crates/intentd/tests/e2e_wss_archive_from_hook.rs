@@ -583,7 +583,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
         // stall could elapse before `hook.runNow`'s archive lands — the wake
         // then takes the idle delivery-time gate instead and the test
         // silently stops covering the end-of-turn drain path.
-        "firstTurnDelayMs": u64::try_from(common::test_timeout(Duration::from_millis(4000)).as_millis()).unwrap_or(u64::MAX),
+        "firstTurnDelayMs": u64::try_from(common::test_timeout(Duration::from_secs(4)).as_millis()).unwrap_or(u64::MAX),
         "response": "acknowledged",
     })
     .to_string();

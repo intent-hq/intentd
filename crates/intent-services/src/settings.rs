@@ -2477,6 +2477,7 @@ mod tests {
     /// always succeeds; a zero reading is treated as undetected so the max
     /// never collapses onto the minimum.
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
         assert_eq!(
             memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
@@ -3476,6 +3477,7 @@ mod tests {
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
     /// config.toml (never `SQLite`) and rejects out-of-range values.
     #[tokio::test]
+    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
         let path = "voice.workspaceVocabulary.maxTerms";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

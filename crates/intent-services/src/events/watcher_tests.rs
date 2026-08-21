@@ -258,7 +258,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         // longer than the overall deadline), then exit. Otherwise keep polling
         // until the deadline.
         let poll_timeout = if seen_burst {
-            Duration::from_millis(1000).min(remaining)
+            Duration::from_secs(1).min(remaining)
         } else {
             remaining
         };

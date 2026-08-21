@@ -1025,7 +1025,7 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
     // its silent no-op (the baseline is already `needs_attention`) before
     // mutating, so every displayStatus event the loops below consume is
     // attributable to the transcript-mutation ops alone.
-    tokio::time::sleep(Duration::from_millis(4000)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Capture the question row's blocks so replaceMessages can rebuild the
     // tail below — and pin the hold prerequisite while at it.

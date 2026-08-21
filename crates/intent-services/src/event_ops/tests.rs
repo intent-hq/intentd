@@ -117,6 +117,7 @@ fn aggregate_skips_events_without_actor_id() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
 fn workspace_summary_rate_recent_and_top_changed() {
     let events = vec![
         ev(

@@ -32,7 +32,7 @@ impl std::fmt::Debug for ElevenLabsEngine {
         f.debug_struct("ElevenLabsEngine")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

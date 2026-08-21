@@ -3054,7 +3054,9 @@ impl Services {
             if elapsed >= settle {
                 break;
             }
-            let tick = (settle - elapsed).min(std::time::Duration::from_millis(50));
+            let tick = settle
+                .saturating_sub(elapsed)
+                .min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(tick, notifications.recv()).await {
                 Ok(Some(note)) => {
                     updates_applied |= self

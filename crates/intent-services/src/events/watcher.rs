@@ -57,7 +57,7 @@ const BURST_THRESHOLD: usize = 100;
 /// cooldown-only collapses consume the window rather than extend it, so
 /// unrelated small activity after a churn returns to per-file events within
 /// one cooldown instead of staying in summary mode indefinitely.
-const BURST_COOLDOWN: Duration = Duration::from_millis(1000);
+const BURST_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Upper bound on raw events ingested per [`drain_ready`] call. `ingest` is
 /// cheap and never awaits, but the raw channel is unbounded; the cap keeps a

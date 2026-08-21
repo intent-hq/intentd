@@ -1451,6 +1451,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn defaults_match_catalog() {
         let d = SettingsFile::default();
         assert_eq!(d.providers.active, None);
@@ -1763,6 +1764,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn floats_accept_integer_literals() {
         let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);

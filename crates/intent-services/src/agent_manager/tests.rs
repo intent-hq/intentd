@@ -2503,7 +2503,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     // The children ignored SIGTERM, so the full shared grace must have
     // elapsed (proves the window ran once, not that children died early).
     assert!(
-        elapsed >= grace - Duration::from_millis(500),
+        elapsed >= grace.checked_sub(Duration::from_millis(500)).unwrap(),
         "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
     );
     // Per-agent `stop()` semantics applied to every agent in the batch.

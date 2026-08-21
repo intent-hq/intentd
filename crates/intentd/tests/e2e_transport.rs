@@ -705,7 +705,7 @@ async fn e2e_auto_vacuum_activation_on_legacy_db() {
     // connection so the daemon's own pragma-carrying pools are not involved.
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(&db_path)
-        .busy_timeout(Duration::from_millis(5000));
+        .busy_timeout(Duration::from_secs(5));
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(opts)

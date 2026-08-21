@@ -896,7 +896,7 @@ mod timeout_override_tests {
     fn positive_millis_override() {
         assert_eq!(
             workspace_api_timeout_from(Some("120000")),
-            Duration::from_millis(120_000)
+            Duration::from_secs(120)
         );
         assert_eq!(
             workspace_api_timeout_from(Some(" 500 ")),

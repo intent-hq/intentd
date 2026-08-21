@@ -190,10 +190,10 @@ fn user_db_shell() -> Option<String> {
         let rc = unsafe {
             libc::getpwuid_r(
                 libc::getuid(),
-                &mut pwd,
+                &raw mut pwd,
                 buf.as_mut_ptr(),
                 buf.len(),
-                &mut result,
+                &raw mut result,
             )
         };
         if rc == libc::ERANGE && buf.len() < (1 << 20) {

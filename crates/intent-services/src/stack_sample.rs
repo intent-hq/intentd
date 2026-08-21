@@ -107,10 +107,10 @@ fn snapshot_sigprof() -> Option<SigprofSnapshot> {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         let mut timer: libc::itimerval = std::mem::zeroed();
-        if libc::sigaction(libc::SIGPROF, std::ptr::null(), &mut action) != 0 {
+        if libc::sigaction(libc::SIGPROF, std::ptr::null(), &raw mut action) != 0 {
             return None;
         }
-        if libc::getitimer(libc::ITIMER_PROF, &mut timer) != 0 {
+        if libc::getitimer(libc::ITIMER_PROF, &raw mut timer) != 0 {
             return None;
         }
         Some(SigprofSnapshot { action, timer })
@@ -141,9 +141,13 @@ impl Drop for RestoreSigprof {
         // process moments ago; handler before timer so no SIGPROF is
         // delivered to a not-yet-restored handler.
         unsafe {
-            let _ = libc::sigaction(libc::SIGPROF, &snap.action, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGPROF, &raw const snap.action, std::ptr::null_mut());
             if timer_armed {
-                let _ = libc::setitimer(libc::ITIMER_PROF, &snap.timer, std::ptr::null_mut());
+                let _ = libc::setitimer(
+                    libc::ITIMER_PROF,
+                    &raw const snap.timer,
+                    std::ptr::null_mut(),
+                );
             }
         }
     }
@@ -312,7 +316,7 @@ mod tests {
             external.sa_sigaction = external_handler as *const () as usize;
             let mut previous: libc::sigaction = std::mem::zeroed();
             assert_eq!(
-                libc::sigaction(libc::SIGPROF, &external, &mut previous),
+                libc::sigaction(libc::SIGPROF, &raw const external, &raw mut previous),
                 0,
                 "install external handler"
             );
@@ -323,12 +327,12 @@ mod tests {
 
             let mut after: libc::sigaction = std::mem::zeroed();
             assert_eq!(
-                libc::sigaction(libc::SIGPROF, std::ptr::null(), &mut after),
+                libc::sigaction(libc::SIGPROF, std::ptr::null(), &raw mut after),
                 0,
                 "read disposition after sampling"
             );
             // Put the original disposition back before asserting.
-            libc::sigaction(libc::SIGPROF, &previous, std::ptr::null_mut());
+            libc::sigaction(libc::SIGPROF, &raw const previous, std::ptr::null_mut());
 
             assert_eq!(
                 after.sa_sigaction, external_handler as *const () as usize,

@@ -372,7 +372,7 @@ mod tests {
     use super::*;
 
     fn data_ptr(h: &'static dyn Harness) -> *const () {
-        h as *const dyn Harness as *const ()
+        std::ptr::from_ref::<dyn Harness>(h).cast::<()>()
     }
 
     /// The registry keys on the exact version string sessions are stamped

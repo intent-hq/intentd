@@ -960,7 +960,7 @@ async fn grok_cli_timeout_flows_into_attributed_warning() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "grok",
-        super::run_grok_models_cli(bin, std::time::Duration::from_millis(5000))
+        super::run_grok_models_cli(bin, std::time::Duration::from_secs(5))
             .await
             .unwrap_err(),
     );
@@ -1316,7 +1316,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let start = std::time::Instant::now();
-    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_millis(5000))
+    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
         .await
         .unwrap_err();
     assert!(
@@ -1361,7 +1361,7 @@ async fn opencode_timeout_flows_into_attributed_warning() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "opencode",
-        super::run_opencode_models_cli(bin, std::time::Duration::from_millis(5000))
+        super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
             .await
             .unwrap_err(),
     );

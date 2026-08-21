@@ -890,6 +890,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn precedence_is_default_then_file_then_flag() {
         let (_dir, path) = temp_config(Some("[server.wsApi]\nenabled = true\nport = 6000\n"));
         let reg = SettingsRegistry::load(&path).expect("load");

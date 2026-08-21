@@ -32,7 +32,7 @@ use crate::shell::{default_shell, scrubbed_env_vars_except, shell_args};
 use crate::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
-const AUTO_RESTART_DELAY: Duration = Duration::from_millis(1000);
+const AUTO_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Max consecutive auto-restarts for a service (mirrors `AUTO_RESTART_MAX_RETRIES`).
 const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 /// A run shorter than this is treated as a config error — do not auto-restart.

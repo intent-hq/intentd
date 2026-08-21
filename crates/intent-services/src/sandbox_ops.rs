@@ -1088,7 +1088,7 @@ mod test_hook_tests {
     fn positive_millis_enable_delay() {
         assert_eq!(
             test_provision_delay_from(Some("10000")),
-            Some(Duration::from_millis(10_000))
+            Some(Duration::from_secs(10))
         );
         assert_eq!(
             test_provision_delay_from(Some(" 500 ")),

@@ -4037,12 +4037,12 @@ fn read_line_no_echo() -> anyhow::Result<String> {
 
     let mut noecho = orig;
     noecho.c_lflag &= !libc::ECHO;
-    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const noecho) } != 0 {
         Err(anyhow::Error::from(std::io::Error::last_os_error()))
     } else {
         let mut line = String::new();
         let read = std::io::stdin().lock().read_line(&mut line);
-        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
+        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const orig) };
         eprintln!();
         match read {
             Err(e) => Err(e.into()),
@@ -5190,7 +5190,7 @@ mod tests {
     #[test]
     fn bind_choices_list_interfaces_then_all_interfaces_option() {
         let ifaces = vec![
-            ("lo".to_string(), std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
         ];
         let choices = build_bind_choices(&ifaces);
@@ -5649,7 +5649,7 @@ mod tests {
         );
         assert_eq!(
             test_watcher_init_delay(Some(" 5000 ")),
-            Some(Duration::from_millis(5000))
+            Some(Duration::from_secs(5))
         );
     }
 

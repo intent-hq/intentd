@@ -21,16 +21,7 @@ too_many_lines = "allow"
 large_futures = "allow"
 # TEMPORARY(burndown): the allows below are removed as their findings are fixed.
 unnecessary_wraps = "allow"
-duration_suboptimal_units = "allow"
-borrow_as_ptr = "allow"
 unused_async = "allow"
-float_cmp = "allow"
-case_sensitive_file_extension_comparisons = "allow"
-missing_fields_in_debug = "allow"
-unchecked_time_subtraction = "allow"
-ptr_as_ptr = "allow"
-ref_as_ptr = "allow"
-ip_constant = "allow"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
