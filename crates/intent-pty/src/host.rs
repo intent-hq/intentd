@@ -950,15 +950,13 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !contains(&acc, needle) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(broadcast::error::RecvError::Closed)) => break,
-                Err(_) => break,
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
             }
         }
         acc
@@ -975,15 +973,13 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !needles.iter().all(|n| contains(&acc, n)) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(broadcast::error::RecvError::Closed)) => break,
-                Err(_) => break,
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
             }
         }
         acc
@@ -1237,20 +1233,18 @@ mod tests {
                         if contains(&out, marker.as_bytes()) {
                             break;
                         }
-                        if drained {
-                            panic!(
-                                "{marker}: fast-exiting child's output was lost; \
-                                 exit 0 and reader drained to EOF but scrollback stayed {:?}",
-                                String::from_utf8_lossy(&out)
-                            );
-                        }
-                        if Instant::now() >= deadline {
-                            panic!(
-                                "{marker}: output drain never completed within deadline; \
-                                 scrollback so far {:?}",
-                                String::from_utf8_lossy(&out)
-                            );
-                        }
+                        assert!(
+                            !drained,
+                            "{marker}: fast-exiting child's output was lost; \
+                             exit 0 and reader drained to EOF but scrollback stayed {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
+                        assert!(
+                            Instant::now() < deadline,
+                            "{marker}: output drain never completed within deadline; \
+                             scrollback so far {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
 
@@ -1343,9 +1337,10 @@ mod tests {
             if let Some(pid) = text.split_whitespace().find_map(|t| t.parse().ok()) {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("grandchild pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -1401,9 +1396,10 @@ mod tests {
             {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -1454,9 +1450,10 @@ mod tests {
             {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert!(pid_alive(descendant), "descendant alive before kill_all");
@@ -1559,9 +1556,10 @@ mod tests {
             {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("straggler pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "straggler pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert!(pid_alive(straggler), "straggler outlives the shell");

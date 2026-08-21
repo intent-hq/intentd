@@ -346,7 +346,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
     eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
     let child1 = spawn_serve(&data_dir, "both", &env, false);
-    let _daemon1 = Daemon {
+    let daemon1 = Daemon {
         child: child1,
         data_dir: data_dir.clone(),
     };
@@ -418,7 +418,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     }
 
     eprintln!("Killing daemon1 to simulate interruption");
-    drop(_daemon1); // Kill daemon1
+    drop(daemon1); // Kill daemon1
 
     // Phase 2: Boot daemon2 with --resume-all and subscribe to agent events
     eprintln!("Phase 2: Boot daemon2 with --resume-all");
@@ -527,7 +527,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
     // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
     eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
     let child1 = spawn_serve(&data_dir, "both", &env, false);
-    let _daemon1 = Daemon {
+    let daemon1 = Daemon {
         child: child1,
         data_dir: data_dir.clone(),
     };
@@ -623,7 +623,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
     }
 
     eprintln!("Killing daemon1 to simulate interruption");
-    drop(_daemon1);
+    drop(daemon1);
 
     // Phase 2: Boot daemon2 WITHOUT --resume-all. DISPLAY is set so
     // `detect_has_display()` is true: `auto` would skip the sweep, proving a

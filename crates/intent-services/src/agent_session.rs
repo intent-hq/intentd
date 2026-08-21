@@ -421,29 +421,26 @@ impl Transcript {
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
-                match self.tool_result_index.get(&tc.tool_call_id) {
-                    Some(&ri) => {
-                        result_index = Some(ri);
-                        if let Some(obj) = self.blocks[ri].as_object_mut() {
-                            obj.insert("output".to_string(), output.clone());
-                            obj.insert("is_error".to_string(), Value::Bool(is_error));
-                        }
+                if let Some(&ri) = self.tool_result_index.get(&tc.tool_call_id) {
+                    result_index = Some(ri);
+                    if let Some(obj) = self.blocks[ri].as_object_mut() {
+                        obj.insert("output".to_string(), output.clone());
+                        obj.insert("is_error".to_string(), Value::Bool(is_error));
                     }
-                    None => {
-                        self.flush_text();
-                        let rindex = self.blocks.len();
-                        let rid = self.block_id(rindex);
-                        self.blocks.push(json!({
-                            "type": "tool_result",
-                            "id": rid,
-                            "tool_use_id": tc.tool_call_id,
-                            "output": output,
-                            "is_error": is_error,
-                        }));
-                        self.tool_result_index
-                            .insert(tc.tool_call_id.clone(), rindex);
-                        result_index = Some(rindex);
-                    }
+                } else {
+                    self.flush_text();
+                    let rindex = self.blocks.len();
+                    let rid = self.block_id(rindex);
+                    self.blocks.push(json!({
+                        "type": "tool_result",
+                        "id": rid,
+                        "tool_use_id": tc.tool_call_id,
+                        "output": output,
+                        "is_error": is_error,
+                    }));
+                    self.tool_result_index
+                        .insert(tc.tool_call_id.clone(), rindex);
+                    result_index = Some(rindex);
                 }
                 // §7.1: attach the standalone resource block(s) so the FE can
                 // render them directly (the items also stay in
@@ -469,29 +466,26 @@ impl Transcript {
                         // on re-completion); batch extras append. A claim
                         // consumes its registry batch, so extras cannot
                         // re-attach on a re-completion echo.
-                        match (i == 0)
+                        if let Some(&pi) = (i == 0)
                             .then(|| self.proposal_index.get(&tc.tool_call_id))
                             .flatten()
                         {
-                            Some(&pi) => {
-                                let id = self.block_id(pi);
-                                self.blocks[pi] =
-                                    crate::tool_block::build_proposal_resource_block(&id, &item);
-                                proposal_indices.push(pi);
+                            let id = self.block_id(pi);
+                            self.blocks[pi] =
+                                crate::tool_block::build_proposal_resource_block(&id, &item);
+                            proposal_indices.push(pi);
+                        } else {
+                            self.flush_text();
+                            let pindex = self.blocks.len();
+                            let pid = self.block_id(pindex);
+                            self.blocks
+                                .push(crate::tool_block::build_proposal_resource_block(
+                                    &pid, &item,
+                                ));
+                            if i == 0 {
+                                self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                             }
-                            None => {
-                                self.flush_text();
-                                let pindex = self.blocks.len();
-                                let pid = self.block_id(pindex);
-                                self.blocks
-                                    .push(crate::tool_block::build_proposal_resource_block(
-                                        &pid, &item,
-                                    ));
-                                if i == 0 {
-                                    self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
-                                }
-                                proposal_indices.push(pindex);
-                            }
+                            proposal_indices.push(pindex);
                         }
                     }
                 }
@@ -2100,9 +2094,9 @@ impl Services {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => {}  // a straggler arrived → keep draining
-                Ok(None) => break, // channel closed
-                Err(_) => break,   // quiet for the settle window → done
+                Ok(Some(_)) => {} // a straggler arrived → keep draining
+                Ok(None) | Err(_) => break, // channel closed
+                                   // quiet for the settle window → done
             }
         }
     }
@@ -3060,7 +3054,9 @@ impl Services {
             if elapsed >= settle {
                 break;
             }
-            let tick = (settle - elapsed).min(std::time::Duration::from_millis(50));
+            let tick = settle
+                .saturating_sub(elapsed)
+                .min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(tick, notifications.recv()).await {
                 Ok(Some(note)) => {
                     updates_applied |= self
@@ -3451,20 +3447,17 @@ impl Services {
                 // thought↔text switch or a non-text block starts a new one.
                 // Thought chunks flush as `thinking` blocks (Zed's model) and
                 // ride the same `chat:stream:delta` shape.
-                let (block_index, block_type) = match &text {
-                    Some(t) => {
-                        let index = transcript.push_chunk(t, thought);
-                        let block_type = if thought { "thinking" } else { "text" };
-                        (index, block_type.to_string())
-                    }
-                    None => {
-                        let block_type = content
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        (transcript.push_block(content.clone()), block_type)
-                    }
+                let (block_index, block_type) = if let Some(t) = &text {
+                    let index = transcript.push_chunk(t, thought);
+                    let block_type = if thought { "thinking" } else { "text" };
+                    (index, block_type.to_string())
+                } else {
+                    let block_type = content
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (transcript.push_block(content.clone()), block_type)
                 };
                 // Internal chat-channel delta (§7.1): the full content-bearing
                 // payload the per-agent `chat.subscribe` forwarder accumulates
@@ -3748,9 +3741,9 @@ impl Services {
         // only); persist all other agent events (stream:status, stream:end,
         // tool:call, lifecycle, etc.) for durable audit trail.
         if event_type == CHAT_STREAM_DELTA || event_type == AGENT_STREAM_ACTIVITY {
-            crate::publish_event_transient(&self.event_bus, &event);
+            crate::publish_event_transient(self.event_bus.as_ref(), &event);
         } else {
-            crate::publish_event(&self.event_bus, event).await;
+            crate::publish_event(self.event_bus.as_ref(), event).await;
         }
     }
 

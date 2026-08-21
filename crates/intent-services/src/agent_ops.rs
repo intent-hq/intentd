@@ -200,12 +200,11 @@ fn resolve_default_model_from_settings(
     // providers.active); with neither, there is no provider to key on
     // (monorepo#3044: no positional last resort) and the step is skipped.
     let derived;
-    let provider_key = match provider {
-        Some(p) => Some(p),
-        None => {
-            derived = crate::agent_session::derived_default_provider(&settings);
-            derived.as_deref()
-        }
+    let provider_key = if let Some(p) = provider {
+        Some(p)
+    } else {
+        derived = crate::agent_session::derived_default_provider(&settings);
+        derived.as_deref()
     };
     if let Some(model) = provider_key.and_then(|k| settings.model.provider_defaults.get(k)) {
         if !model.is_empty() {
@@ -295,15 +294,13 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // provider-keyed steps below are skipped and ownership guards pass
     // compound ids through on their own prefix.
     let derived;
-    let effective_provider: Option<&str> = match provider {
-        Some(p) => Some(intent_providers::provider_config(p).id),
-        None => {
-            derived =
-                crate::agent_session::derived_default_provider(&services.effective_settings());
-            derived
-                .as_deref()
-                .map(|p| intent_providers::provider_config(p).id)
-        }
+    let effective_provider: Option<&str> = if let Some(p) = provider {
+        Some(intent_providers::provider_config(p).id)
+    } else {
+        derived = crate::agent_session::derived_default_provider(&services.effective_settings());
+        derived
+            .as_deref()
+            .map(|p| intent_providers::provider_config(p).id)
     };
 
     if let Some(spec_id) = specialist {
@@ -694,6 +691,9 @@ fn ensure_provider_available(
 /// (write-through persistence; see [`Services::persist_queue_snapshot`]). The
 /// bool fields take `#[serde(default)]` so older payloads missing a later
 /// flag still rehydrate.
+// The independent bool flags ARE the durable payload shape; grouping them
+// would break persisted-payload rehydration.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
@@ -860,12 +860,11 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     while let Some(i) = rest.find(start) {
         out.push_str(&rest[..i]);
         let after = &rest[i + start.len()..];
-        match after.find(end) {
-            Some(j) => rest = &after[j + end.len()..],
-            None => {
-                rest = "";
-                break;
-            }
+        if let Some(j) = after.find(end) {
+            rest = &after[j + end.len()..];
+        } else {
+            rest = "";
+            break;
         }
     }
     out.push_str(rest);
@@ -2406,12 +2405,11 @@ impl Services {
             }
             w
         };
-        let (start, end, mut next_token, mut prev_token) = match seek_win {
-            Some(w) => (w.start, w.end, w.next_token, Some(w.prev_token)),
-            None => {
-                let w = crate::pagination::page_window(total, limit, page_token.as_deref());
-                (w.start, w.end, w.next_token, None)
-            }
+        let (start, end, mut next_token, mut prev_token) = if let Some(w) = seek_win {
+            (w.start, w.end, w.next_token, Some(w.prev_token))
+        } else {
+            let w = crate::pagination::page_window(total, limit, page_token.as_deref());
+            (w.start, w.end, w.next_token, None)
         };
         let mut page: Vec<AgentMessage> = self
             .store
@@ -2557,7 +2555,7 @@ impl Services {
         data: Value,
     ) {
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             intent_store::NewEvent {
                 workspace_id: workspace_id.clone(),
                 timestamp: now_iso(),
@@ -2811,14 +2809,14 @@ impl Services {
         // and only when a specialist tier is actually consulted (model
         // resolution, the specialist reasoning-effort rungs, and/or the
         // specialist prompt snapshot below).
-        let spec_wp = match model.is_none() || specialist.is_some() {
-            true => self
-                .store
+        let spec_wp = if model.is_none() || specialist.is_some() {
+            self.store
                 .get_workspace(&workspace_id)
                 .await
                 .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w)),
-            false => None,
+                .and_then(|w| crate::git_ops::worktree_path(&w))
+        } else {
+            None
         };
         let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
@@ -2922,15 +2920,16 @@ impl Services {
         // effort and pass it down as a param, so this only fires for callers
         // that did not (`reasoning_effort_decided == false`) — which is also
         // what keeps the specialist rungs ahead of the settings default below.
-        let reasoning_effort = match reasoning_effort_decided {
-            true => reasoning_effort,
-            false => resolve_delegate_reasoning_effort(
+        let reasoning_effort = if reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_delegate_reasoning_effort(
                 self,
                 None,
                 specialist.as_deref(),
                 resolved_model.as_deref(),
                 spec_wp.as_deref(),
-            ),
+            )
         };
         // Validate the requested level (PROTOCOL §5.5) against the *resolved*
         // model's cached `effortLevels`, with the same probe-free,
@@ -2949,13 +2948,10 @@ impl Services {
         // Last rung: the settings default effort, applied only when no rung
         // above decided the effort AND the model itself came from the settings
         // default chain (see `resolve_settings_default_reasoning_effort`).
-        let reasoning_effort = match reasoning_effort.is_some() || reasoning_effort_decided {
-            true => reasoning_effort,
-            false => resolve_settings_default_reasoning_effort(
-                self,
-                model_source,
-                resolved_model.as_deref(),
-            ),
+        let reasoning_effort = if reasoning_effort.is_some() || reasoning_effort_decided {
+            reasoning_effort
+        } else {
+            resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
         };
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
@@ -3213,16 +3209,15 @@ impl Services {
             // instead of validating against a positional default
             // (monorepo#3044).
             let derived;
-            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
-                Some(p) => p,
-                None => {
-                    derived =
-                        crate::agent_session::derived_default_provider(&self.effective_settings())
-                            .ok_or_else(|| {
-                                crate::agent_session::no_default_provider_error("agent.setModel")
-                            })?;
-                    derived.as_str()
-                }
+            let effective = if let Some(p) = session.provider.as_deref().filter(|p| !p.is_empty()) {
+                p
+            } else {
+                derived =
+                    crate::agent_session::derived_default_provider(&self.effective_settings())
+                        .ok_or_else(|| {
+                            crate::agent_session::no_default_provider_error("agent.setModel")
+                        })?;
+                derived.as_str()
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
@@ -3348,7 +3343,7 @@ impl Services {
         self.remove_event_subscriptions_for_agent(&agent_id).await;
         if let Some((workspace_id, agent_name)) = session_meta {
             crate::publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 intent_store::NewEvent {
                     workspace_id: workspace_id.clone(),
                     timestamp: now_iso(),
@@ -3441,7 +3436,7 @@ impl Services {
             return Ok(existing);
         }
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             crate::agent_delete_scheduled_event(&session_ws, &agent_id, &delete_at),
         )
         .await;
@@ -3476,7 +3471,7 @@ impl Services {
         let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
         if cancelled {
             crate::publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 crate::agent_delete_cancelled_event(&session_ws, &agent_id),
             )
             .await;
@@ -3524,13 +3519,10 @@ impl Services {
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
     /// mutated) so subscribed clients invalidate their cached projection.
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
-        let obj = match changes {
-            Value::Object(m) => m,
-            _ => {
-                return Err(Error::InvalidParams(
-                    "agent.update: `changes` must be an object".to_string(),
-                ))
-            }
+        let Value::Object(obj) = changes else {
+            return Err(Error::InvalidParams(
+                "agent.update: `changes` must be an object".to_string(),
+            ));
         };
         let mut session = self.store.get_agent_session(&agent_id).await?;
         let prior_model = session.model.clone();
@@ -3832,6 +3824,12 @@ impl Services {
         agent_id: AgentId,
         messages: Value,
     ) -> Result<Value> {
+        struct Parsed {
+            role: String,
+            content: Value,
+            metadata: Option<Value>,
+            created_at: String,
+        }
         let session = self.store.get_agent_session(&agent_id).await?;
         if self.agent_is_busy(agent_id.clone()) {
             return Err(Error::InvalidParams(format!(
@@ -3842,12 +3840,6 @@ impl Services {
         let raw = messages.as_array().ok_or_else(|| {
             Error::InvalidParams("agent.replaceMessages: `messages` must be an array".to_string())
         })?;
-        struct Parsed {
-            role: String,
-            content: Value,
-            metadata: Option<Value>,
-            created_at: String,
-        }
         let mut parsed: Vec<Parsed> = Vec::with_capacity(raw.len());
         let fallback_ts = now_iso();
         for (i, entry) in raw.iter().enumerate() {
@@ -4860,20 +4852,17 @@ impl Services {
                 _ => {}
             }
         }
-        match pending {
-            Some(id) => {
-                let id = id.to_string();
-                self.record_pending_questions_marker(workspace_id, agent_id, &id)
+        if let Some(id) = pending {
+            let id = id.to_string();
+            self.record_pending_questions_marker(workspace_id, agent_id, &id)
+                .await;
+        } else {
+            self.clear_pending_questions_marker(workspace_id, agent_id)
+                .await;
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
                     .await;
-            }
-            None => {
-                self.clear_pending_questions_marker(workspace_id, agent_id)
-                    .await;
-                if let Some(manager) = self.agent_manager() {
-                    manager
-                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                        .await;
-                }
             }
         }
         self.maybe_emit_display_status_changed(workspace_id).await;
@@ -5055,6 +5044,13 @@ impl Services {
         agent_id: AgentId,
         message_id: String,
     ) -> Result<Value> {
+        // Bounded CAS retry: each iteration re-reads the current marker,
+        // re-applies the monotonicity gate, and attempts a guarded write. A
+        // miss means another writer moved the marker between our read and
+        // write; the loop converges because the marker only ever advances.
+        // The cap is defensive — two racing debounced FE triggers settle in
+        // one retry.
+        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
         let message_id = message_id.trim().to_string();
         if message_id.is_empty() {
             return Err(Error::InvalidParams("messageId is required".to_string()));
@@ -5064,13 +5060,6 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
-        // Bounded CAS retry: each iteration re-reads the current marker,
-        // re-applies the monotonicity gate, and attempts a guarded write. A
-        // miss means another writer moved the marker between our read and
-        // write; the loop converges because the marker only ever advances.
-        // The cap is defensive — two racing debounced FE triggers settle in
-        // one retry.
-        const MARK_SEEN_CAS_ATTEMPTS: u32 = 4;
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -5266,17 +5255,17 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {session_id}")));
             }
         }
-        let stats = match fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
-            Some(cli) => cli,
-            None => {
+        let stats =
+            if let Some(cli) = fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
+                cli
+            } else {
                 let (message_count, tool_count) = transcript_counts(&session.messages);
                 SessionStats {
                     credits_used: None,
                     message_count,
                     tool_count,
                 }
-            }
-        };
+            };
         self.cache_and_emit_session_stats(&session, &stats).await;
         Ok(json!({ "stats": stats }))
     }
@@ -5302,7 +5291,7 @@ impl Services {
             return;
         }
         crate::publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             intent_store::NewEvent {
                 workspace_id: session.workspace_id.clone(),
                 timestamp: now_iso(),
@@ -5935,6 +5924,48 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // Resolve the child's first message up front so it can be persisted as
+        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
+        // stored it so a wake-up can resume). Source priority mirrors the TS
+        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
+        // then the linked task note's content (falling back to its title).
+        fn first_nonempty(s: &str) -> Option<String> {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        // Resolve the child agent's name to match the reference `DelegateTaskTool`
+        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
+        // taskNoteId path uses the note's title. Both truncate to 100 chars
+        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
+        // child inherits the generic `Agent xxxxxx` fallback from
+        // `agent_create_op`, which then leaks into the waiting panel, agent
+        // cards, and `agent:idle` wake reports (NAME-1).
+        fn truncate_agent_name(name: String) -> String {
+            // The reference uses JS `.length` / `.substring(0, 97)`, which
+            // count UTF-16 code units — non-BMP characters (e.g. emoji)
+            // count as 2. Match that to avoid off-by-one divergences on
+            // emoji-heavy task titles (Copilot #84 review).
+            let u16_len = name.encode_utf16().count();
+            if u16_len > 100 {
+                let units: Vec<u16> = name.encode_utf16().take(97).collect();
+                // `substring(0, 97)` can split a surrogate pair; drop a
+                // trailing lone high surrogate so the resulting Rust string
+                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
+                let cutoff = if units
+                    .last()
+                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
+                {
+                    units.len() - 1
+                } else {
+                    units.len()
+                };
+                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
+                truncated.push_str("...");
+                truncated
+            } else {
+                name
+            }
+        }
         // `greedy` was a batch-level conflict override; it is REMOVED. Any
         // supplied value — `true`, `false`, or an explicit `null` — rejects
         // on BOTH forms (the check sits before the batch routing so a
@@ -5967,15 +5998,6 @@ impl Services {
         // the `git_ops` gate and the idle subscriber, never in prompts.
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
-        // Resolve the child's first message up front so it can be persisted as
-        // `metadata.initialMessage` on the created session (P3-1.2b; the FE
-        // stored it so a wake-up can resume). Source priority mirrors the TS
-        // `DelegateTaskTool`: explicit `agentInstructions`, then `taskText`,
-        // then the linked task note's content (falling back to its title).
-        fn first_nonempty(s: &str) -> Option<String> {
-            let trimmed = s.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        }
         let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
         let mut message = input
             .agent_instructions
@@ -6013,39 +6035,6 @@ impl Services {
                 &title,
                 &note_id.0,
             ));
-        }
-        // Resolve the child agent's name to match the reference `DelegateTaskTool`
-        // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
-        // taskNoteId path uses the note's title. Both truncate to 100 chars
-        // (`len > 100 ? substring(0,97) + "..." : text`). Without this the
-        // child inherits the generic `Agent xxxxxx` fallback from
-        // `agent_create_op`, which then leaks into the waiting panel, agent
-        // cards, and `agent:idle` wake reports (NAME-1).
-        fn truncate_agent_name(name: String) -> String {
-            // The reference uses JS `.length` / `.substring(0, 97)`, which
-            // count UTF-16 code units — non-BMP characters (e.g. emoji)
-            // count as 2. Match that to avoid off-by-one divergences on
-            // emoji-heavy task titles (Copilot #84 review).
-            let u16_len = name.encode_utf16().count();
-            if u16_len > 100 {
-                let units: Vec<u16> = name.encode_utf16().take(97).collect();
-                // `substring(0, 97)` can split a surrogate pair; drop a
-                // trailing lone high surrogate so the resulting Rust string
-                // stays valid UTF-8 instead of embedding a U+FFFD replacement.
-                let cutoff = if units
-                    .last()
-                    .is_some_and(|&u| (0xD800..=0xDBFF).contains(&u))
-                {
-                    units.len() - 1
-                } else {
-                    units.len()
-                };
-                let mut truncated = String::from_utf16_lossy(&units[..cutoff]);
-                truncated.push_str("...");
-                truncated
-            } else {
-                name
-            }
         }
         let child_name = task_text_msg
             .or_else(|| task_note.as_ref().and_then(|n| first_nonempty(&n.title)))
@@ -6286,27 +6275,9 @@ impl Services {
                     && ws.repository_path.is_some();
                 let is_standalone_checkout = matches!(
                     ws.checkout_mode,
-                    Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                    Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                 ) && ws.worktree_path.is_some();
                 if is_direct_mode || is_standalone_checkout {
-                    // Same root fallback as `workspace.create` (the intentd
-                    // binary configures the root via INTENTD_WORKSPACES_DIR /
-                    // `workspaces.root` rather than `.with_workspaces_root`).
-                    let root = self
-                        .workspaces_root
-                        .clone()
-                        .unwrap_or_else(crate::default_workspaces_root);
-                    let aid = AgentId::from(agent_id.as_str());
-                    // The CoW clone runs OFF the delegate critical path
-                    // (monorepo#871): on large checkouts it takes tens of
-                    // seconds, which previously blew through the 30s
-                    // `workspace_api` budget and the harness's own MCP client
-                    // timeout. Register the settlement gate BEFORE returning
-                    // so the child's turn worker (`ensure_started`) blocks its
-                    // first ACP spawn until the clone settles — the child
-                    // never spawns against a half-copied sandbox.
-                    let settled = self.begin_sandbox_provisioning(&aid);
-                    effective_isolation = Some("pending");
                     // Drop guard: settles the gate even if provisioning
                     // panics, so the gate map never accumulates stale
                     // entries. Constructed BEFORE the spawn (and moved into
@@ -6328,6 +6299,24 @@ impl Services {
                             self.services.settle_sandbox_provisioning(&self.aid);
                         }
                     }
+                    // Same root fallback as `workspace.create` (the intentd
+                    // binary configures the root via INTENTD_WORKSPACES_DIR /
+                    // `workspaces.root` rather than `.with_workspaces_root`).
+                    let root = self
+                        .workspaces_root
+                        .clone()
+                        .unwrap_or_else(crate::default_workspaces_root);
+                    let aid = AgentId::from(agent_id.as_str());
+                    // The CoW clone runs OFF the delegate critical path
+                    // (monorepo#871): on large checkouts it takes tens of
+                    // seconds, which previously blew through the 30s
+                    // `workspace_api` budget and the harness's own MCP client
+                    // timeout. Register the settlement gate BEFORE returning
+                    // so the child's turn worker (`ensure_started`) blocks its
+                    // first ACP spawn until the clone settles — the child
+                    // never spawns against a half-copied sandbox.
+                    let settled = self.begin_sandbox_provisioning(&aid);
+                    effective_isolation = Some("pending");
                     let guard = SettleGuard {
                         services: self.clone(),
                         aid,
@@ -6992,7 +6981,7 @@ impl Services {
 
                 // Emit sandbox:cow:created event
                 crate::publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     intent_store::NewEvent {
                         workspace_id: workspace_id.clone(),
                         timestamp: crate::now_iso(),
@@ -8510,18 +8499,17 @@ impl Services {
             if stale.is_empty() {
                 continue;
             }
-            let archived = match workspace_archived {
-                Some(v) => v,
-                None => {
-                    let v = !workspace_id.is_chief()
-                        && self
-                            .store
-                            .get_workspace(&workspace_id)
-                            .await
-                            .is_ok_and(|w| w.archived);
-                    workspace_archived = Some(v);
-                    v
-                }
+            let archived = if let Some(v) = workspace_archived {
+                v
+            } else {
+                let v = !workspace_id.is_chief()
+                    && self
+                        .store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .is_ok_and(|w| w.archived);
+                workspace_archived = Some(v);
+                v
             };
             if archived {
                 break;
@@ -10440,7 +10428,7 @@ impl Services {
                 "queue": queue,
             }),
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// Publish `agent:queue:processing` for a queue entry the drain loop just
@@ -10478,7 +10466,7 @@ impl Services {
             metadata: None,
             data,
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// `agent.wakeOrCreate` wiring for

@@ -355,16 +355,15 @@ pub(crate) fn latest() -> &'static dyn Harness {
 /// versions fall back to the latest with a WARN (never fail a turn over a
 /// stale or corrupt stamp).
 pub(crate) fn resolve_entry(version: &str) -> &'static HarnessEntry {
-    match REGISTRY.iter().find(|e| e.version == version) {
-        Some(e) => e,
-        None => {
-            tracing::warn!(
-                version = %version,
-                latest = LATEST_VERSION,
-                "unknown harness version; falling back to latest"
-            );
-            latest_entry()
-        }
+    if let Some(e) = REGISTRY.iter().find(|e| e.version == version) {
+        e
+    } else {
+        tracing::warn!(
+            version = %version,
+            latest = LATEST_VERSION,
+            "unknown harness version; falling back to latest"
+        );
+        latest_entry()
     }
 }
 
@@ -373,7 +372,7 @@ mod tests {
     use super::*;
 
     fn data_ptr(h: &'static dyn Harness) -> *const () {
-        h as *const dyn Harness as *const ()
+        std::ptr::from_ref::<dyn Harness>(h).cast::<()>()
     }
 
     /// The registry keys on the exact version string sessions are stamped

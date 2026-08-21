@@ -43,10 +43,9 @@ impl SandboxStatus {
             "merging" => Ok(SandboxStatus::Merging),
             "merged" => Ok(SandboxStatus::Merged),
             "discarded" => Ok(SandboxStatus::Discarded),
-            "conflict_bounced" => Ok(SandboxStatus::ConflictBounced),
+            "conflict_bounced" | "conflict" => Ok(SandboxStatus::ConflictBounced),
             "merge_pending" => Ok(SandboxStatus::MergePending),
             // Handle legacy "conflict" status from migration 0038
-            "conflict" => Ok(SandboxStatus::ConflictBounced),
             _ => Err(intent_core::Error::Internal(format!(
                 "invalid sandbox status: {s}"
             ))),

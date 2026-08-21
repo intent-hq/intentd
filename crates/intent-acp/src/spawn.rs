@@ -499,6 +499,7 @@ mod kill_tests {
         panic!("grandchild pid {grandchild_pid} still alive after group kill");
     }
 
+    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms; preset/present name distinct env sets
     /// Regression for the killpg-escape vector: an MCP-server-style grandchild
     /// that moves into its OWN process group survives the group SIGKILL in
     /// `kill()` (observed live: codex-acp's auggie ran with pgid == its own
@@ -933,6 +934,7 @@ mod captured_env_tests {
         assert_eq!(env_value(&cmd, &name).as_deref(), Some("captured-value"));
     }
 
+    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms; preset/present name distinct env sets
     #[test]
     fn captured_var_never_overrides_daemon_process_env() {
         let provider = intent_providers::find_provider("auggie").unwrap();

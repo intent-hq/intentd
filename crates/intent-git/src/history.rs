@@ -251,6 +251,7 @@ pub struct CommitDetails {
     pub files: Vec<CommitFileChange>,
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Resolve `commit_hash` (full SHA or short ref) against `worktree_path` and
 /// return its metadata plus the per-file `(additions, deletions)` diff against
 /// the first parent. A root commit (no parent) diffs against the empty tree, so
@@ -355,9 +356,9 @@ fn resolve_workspace_boundary_inner(
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
 
     // Get HEAD first - if unavailable, no boundary can be resolved
-    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
-        Some(oid) => oid,
-        None => return Ok(None), // Detached/missing HEAD → no boundary
+    let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
+        // Detached/missing HEAD → no boundary
+        return Ok(None);
     };
 
     // Try merge-base first (rebase-resilient)

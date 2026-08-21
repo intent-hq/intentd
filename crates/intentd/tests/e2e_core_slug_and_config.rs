@@ -103,7 +103,7 @@ async fn config_resolve_fills_defaults() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
     let tmp_cfg = tmp_dir.join("nonexistent-config.toml");
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
     std::env::set_var("INTENTD_CONFIG", &tmp_cfg);
 
@@ -118,7 +118,7 @@ async fn config_resolve_fills_defaults() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    drop(_guard);
+    drop(guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
@@ -138,7 +138,7 @@ idleReapMinutes = 50
     )
     .expect("write config");
 
-    let _guard = ENV_LOCK.lock().unwrap();
+    let guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
     std::env::set_var("INTENTD_CONFIG", &cfg_path);
 
@@ -147,6 +147,6 @@ idleReapMinutes = 50
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    drop(_guard);
+    drop(guard);
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

@@ -76,9 +76,8 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
         .map(str::to_string)
         .filter(|s| !s.is_empty());
     let stdin = match (params.get("stdin"), params.get("stdinBase64")) {
-        (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => None,
-        (Some(Value::Null), Some(Value::Null)) => None,
-        (Some(text), None) | (Some(text), Some(Value::Null)) => match text {
+        (None | Some(Value::Null), None | Some(Value::Null)) => None,
+        (Some(text), None | Some(Value::Null)) => match text {
             Value::String(s) => Some(s.as_bytes().to_vec()),
             _ => {
                 return Err(HostExecError {
@@ -87,7 +86,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
                 });
             }
         },
-        (None, Some(b64)) | (Some(Value::Null), Some(b64)) => match b64 {
+        (None | Some(Value::Null), Some(b64)) => match b64 {
             Value::String(s) => Some(decode_base64_field(s, "stdinBase64")?),
             _ => {
                 return Err(HostExecError {
@@ -415,13 +414,12 @@ fn spawn_reader<R>(
         let mut buf = vec![0u8; READ_BUF_SIZE];
         loop {
             match reader.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                     let ev = chunk_event(&workspace_id, &request_id, event_type, &chunk);
                     let _ = bus.publish_transient(&ev);
                 }
-                Err(_) => break,
             }
         }
     });

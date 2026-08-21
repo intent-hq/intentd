@@ -213,9 +213,8 @@ pub(crate) fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
 pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
     let repo = git2::Repository::open(repo_path)
         .map_err(|e| Error::Internal(format!("open repo for WIP unwind failed: {e}")))?;
-    let head_commit = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
-        Some(c) => c,
-        None => return Ok(false),
+    let Some(head_commit) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
+        return Ok(false);
     };
     let message = head_commit.message().unwrap_or("").to_string();
     if !message.starts_with(TRANSFER_WIP_SENTINEL) {

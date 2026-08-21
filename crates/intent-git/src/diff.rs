@@ -110,6 +110,7 @@ pub struct FileDiffWithHunks {
     pub hunks: Vec<DiffHunk>,
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Summaries for the index→workdir diff (staged + unstaged + untracked), without
 /// hunks. Use [`hunks_between`] with each file's blob SHAs to expand on demand.
 ///
@@ -160,6 +161,7 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
     Ok(out)
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Per-file summaries **and** hunks for the index→workdir diff (staged +
 /// unstaged + untracked), from a **single** diff traversal — unlike the
 /// two-pass combination of [`diff_index_to_workdir`] +
@@ -273,9 +275,8 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
         Ok(mb) => repo.find_commit(mb).ok().and_then(|c| c.tree().ok()),
         Err(_) => None,
     };
-    let head_tree = match repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) {
-        Some(t) => t,
-        None => return Ok(Vec::new()),
+    let Some(head_tree) = repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) else {
+        return Ok(Vec::new());
     };
     let diff = repo
         .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), None)
@@ -520,6 +521,7 @@ pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
     Ok((total_files, total_additions, total_deletions))
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Build per-file [`FileDiff`] summaries (path + line stats + blob SHAs) from a
 /// computed [`git2::Diff`].
 fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
@@ -614,6 +616,7 @@ pub fn hunks_between(
     patch_to_hunks(&patch)
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Compute hunks for a single file directly from the index→workdir diff, reading
 /// the workdir content rather than looking up a post-image blob in the object DB
 /// (an unstaged change's new content is not yet a blob, so [`hunks_between`]

@@ -696,44 +696,41 @@ async fn forward_subscription(
                     return;
                 };
                 for event in batch {
-                    match conflate::event_key(&event) {
-                        Some(key) => {
-                            let item = EventItem::new(&key, event);
-                            let sid = &subscription_id;
-                            match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
-                                item.into_frame(sid)
-                            }) {
-                                Enqueue::Closed => return,
-                                Enqueue::Sent | Enqueue::Buffered => {}
-                                // Buffer at capacity (too many distinct keys /
-                                // bytes pending): fall back to the original
-                                // blocking backpressure — flush, then send.
-                                Enqueue::Overflow(item) => {
-                                    if !buffer
-                                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                                        .await
-                                    {
-                                        return;
-                                    }
-                                    if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
-                                        return;
-                                    }
+                    if let Some(key) = conflate::event_key(&event) {
+                        let item = EventItem::new(&key, event);
+                        let sid = &subscription_id;
+                        match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
+                            item.into_frame(sid)
+                        }) {
+                            Enqueue::Closed => return,
+                            Enqueue::Sent | Enqueue::Buffered => {}
+                            // Buffer at capacity (too many distinct keys /
+                            // bytes pending): fall back to the original
+                            // blocking backpressure — flush, then send.
+                            Enqueue::Overflow(item) => {
+                                if !buffer
+                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                                    .await
+                                {
+                                    return;
+                                }
+                                if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
+                                    return;
                                 }
                             }
                         }
-                        None => {
-                            // Barrier: flush conflated frames first, then block.
-                            if !buffer
-                                .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                                .await
-                            {
-                                return;
-                            }
-                            let frame =
-                                events::build_event_notification(&subscription_id, &event);
-                            if out_tx.send(frame).await.is_err() {
-                                return;
-                            }
+                    } else {
+                        // Barrier: flush conflated frames first, then block.
+                        if !buffer
+                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                            .await
+                        {
+                            return;
+                        }
+                        let frame =
+                            events::build_event_notification(&subscription_id, &event);
+                        if out_tx.send(frame).await.is_err() {
+                            return;
                         }
                     }
                 }
@@ -1486,7 +1483,7 @@ mod tests {
                 None => false,
                 Some(frame) => {
                     let v: Value = serde_json::from_str(&frame).expect("valid json response");
-                    matches!(v["error"]["code"].as_i64(), Some(-32700) | Some(-32600))
+                    matches!(v["error"]["code"].as_i64(), Some(-32700 | -32600))
                 }
             };
             assert_eq!(

@@ -547,7 +547,7 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
         .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000))
+        .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
@@ -597,7 +597,7 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
         .create_if_missing(false)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000))
+        .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
@@ -627,7 +627,7 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000))
+        .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()

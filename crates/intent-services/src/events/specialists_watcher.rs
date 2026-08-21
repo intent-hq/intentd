@@ -121,6 +121,7 @@ impl SpecialistsWatcher {
     /// rides the shared stream and needs no separate sync point — subscribing is
     /// synchronous bookkeeping.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
@@ -246,8 +247,8 @@ fn home_dir() -> Option<PathBuf> {
 /// serialized `specialist.list` view (ids + tier-resolved content), so an
 /// event is emitted only when the resolved set actually changed (analogous to
 /// `check_skills_changed`).
-fn specialists_fingerprint(user_dir: &Option<PathBuf>, workspace_path: &Path) -> u64 {
-    let svc = SpecialistsService::new(user_dir.clone(), None);
+fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
+    let svc = SpecialistsService::new(user_dir.cloned(), None);
     let list = svc
         .list(Some(workspace_path))
         .unwrap_or(serde_json::Value::Null);
@@ -272,7 +273,12 @@ async fn debounce_loop(
     // the set as it stood at watcher start (no spurious first event).
     let mut fingerprints: HashMap<WorkspaceId, u64> = workspace_paths
         .iter()
-        .map(|(ws_id, path)| (ws_id.clone(), specialists_fingerprint(&user_dir, path)))
+        .map(|(ws_id, path)| {
+            (
+                ws_id.clone(),
+                specialists_fingerprint(user_dir.as_ref(), path),
+            )
+        })
         .collect();
 
     loop {
@@ -297,7 +303,7 @@ async fn debounce_loop(
                 }
                 Some(SpecialistsMsg::Add(ws_id, path)) => {
                     // Prime the fingerprint like the start-time priming above.
-                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(&user_dir, &path));
+                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path));
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SpecialistsMsg::Remove(ws_id)) => {
@@ -319,12 +325,12 @@ async fn debounce_loop(
                 }
                 None => {
                     // All senders dropped: flush and exit
-                    flush_all(&bus, &workspace_paths, &user_dir, &mut fingerprints, &mut pending).await;
+                    flush_all(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
                     return;
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
-                flush_due(&bus, &workspace_paths, &user_dir, &mut fingerprints, &mut pending).await;
+                flush_due(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
             }
         }
     }
@@ -333,7 +339,7 @@ async fn debounce_loop(
 async fn flush_due(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
-    user_dir: &Option<PathBuf>,
+    user_dir: Option<&PathBuf>,
     fingerprints: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
@@ -355,7 +361,7 @@ async fn flush_due(
 async fn flush_all(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
-    user_dir: &Option<PathBuf>,
+    user_dir: Option<&PathBuf>,
     fingerprints: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
@@ -371,7 +377,7 @@ async fn emit_specialists_changed(
     bus: &EventBus,
     workspace_id: &WorkspaceId,
     workspace_path: &Path,
-    user_dir: &Option<PathBuf>,
+    user_dir: Option<&PathBuf>,
     fingerprints: &mut HashMap<WorkspaceId, u64>,
 ) {
     // Re-resolve the set to check if it actually changed
@@ -527,13 +533,13 @@ mod tests {
         std::fs::write(proj.join("doomed.md"), specialist_md("Doomed", "body"))
             .expect("seed specialist");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
@@ -562,7 +568,7 @@ mod tests {
         let proj = project_dir(&ws.path);
         // The project tier does NOT exist when the watcher starts.
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
@@ -576,7 +582,7 @@ mod tests {
         // (monorepo#1630) with a generous quiet window, so only the headroom
         // before the "no event" verdict widens — behavior under test is
         // unchanged.
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
@@ -613,13 +619,13 @@ mod tests {
         let proj = project_dir(&ws.path);
         std::fs::create_dir_all(&proj).expect("mk project tier");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -657,7 +663,7 @@ mod tests {
         let ws1_id = WorkspaceId::from("ws-fanout-1");
         let ws2_id = WorkspaceId::from("ws-fanout-2");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![
@@ -666,7 +672,7 @@ mod tests {
             ],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(
@@ -703,13 +709,13 @@ mod tests {
         // includes this specialist.
         std::fs::write(&file, &content).expect("seed specialist");
 
-        let _watcher = SpecialistsWatcher::start_with_user_dir(
+        let watcher = SpecialistsWatcher::start_with_user_dir(
             &SharedWatchHub::new(),
             bus.clone(),
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rewrite the identical bytes: the file event fires but the resolved

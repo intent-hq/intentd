@@ -130,13 +130,13 @@ pub(crate) async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMeta
     let changed = match old_skills {
         None => !new_skills.is_empty(), // Changed if we now have skills
         Some(old) => {
-            if old.len() != new_skills.len() {
-                true
-            } else {
+            if old.len() == new_skills.len() {
                 // Compare sorted skill names
                 let old_names: Vec<_> = old.iter().map(|s| &s.name).collect();
                 let new_names: Vec<_> = new_skills.iter().map(|s| &s.name).collect();
                 old_names != new_names
+            } else {
+                true
             }
         }
     };

@@ -488,9 +488,8 @@ fn all_bases_failing_reports_the_last_error() {
 fn empty_base_url_list_is_a_soft_error() {
     let dir = tempfile::tempdir().unwrap();
     let paths = paths_in(dir.path());
-    let err = match Updater::with_base_urls(paths, Vec::<String>::new()) {
-        Ok(_) => panic!("expected an error for an empty base URL list"),
-        Err(err) => err,
+    let Err(err) = Updater::with_base_urls(paths, Vec::<String>::new()) else {
+        panic!("expected an error for an empty base URL list")
     };
     assert!(
         matches!(err, UpdateError::NoBaseUrls),

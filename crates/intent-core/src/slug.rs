@@ -58,9 +58,8 @@ pub(crate) fn extract_base_slug(slug: &str) -> &str {
 #[must_use]
 pub fn is_workspace_slug(s: &str) -> bool {
     let base = extract_base_slug(s);
-    let (adj, animal) = match base.split_once('-') {
-        Some(pair) => pair,
-        None => return false,
+    let Some((adj, animal)) = base.split_once('-') else {
+        return false;
     };
     if animal.contains('-') || !is_valid_slug_word(adj) || !is_valid_slug_word(animal) {
         return false;

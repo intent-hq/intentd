@@ -93,10 +93,7 @@ pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
         Some((_, rest)) => rest,
         None => trimmed,
     };
-    let path = match after_scheme.split_once(['/', ':']) {
-        Some((_host, rest)) => rest,
-        None => return None,
-    };
+    let (_host, path) = after_scheme.split_once(['/', ':'])?;
     let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.len() < 2 {
         return None;
@@ -435,17 +432,14 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             });
         }
     };
-    let stderr = match child.stderr.take() {
-        Some(s) => s,
-        None => {
-            let _ = child.kill().await;
-            let msg = "git stderr not piped".to_string();
-            sink.done(false, Some(&msg), None).await;
-            return Err(CloneFailure {
-                category: None,
-                detail: msg,
-            });
-        }
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        let msg = "git stderr not piped".to_string();
+        sink.done(false, Some(&msg), None).await;
+        return Err(CloneFailure {
+            category: None,
+            detail: msg,
+        });
     };
 
     let sink_reader = sink.clone();
@@ -546,9 +540,8 @@ where
         // Git emits carriage-returned progress; split on either \r or \n so we
         // observe each in-place update, not just terminal lines.
         let n = match read_until_any(&mut reader, b"\r\n", &mut buf).await {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
-            Err(_) => break,
         };
         let text = String::from_utf8_lossy(&buf[..n]);
         for (phase, percent, message) in parser.parse(&text) {
@@ -628,15 +621,12 @@ where
             if available.is_empty() {
                 return Ok(total);
             }
-            match available.iter().position(|b| delims.contains(b)) {
-                Some(i) => {
-                    out.extend_from_slice(&available[..=i]);
-                    (true, i + 1)
-                }
-                None => {
-                    out.extend_from_slice(available);
-                    (false, available.len())
-                }
+            if let Some(i) = available.iter().position(|b| delims.contains(b)) {
+                out.extend_from_slice(&available[..=i]);
+                (true, i + 1)
+            } else {
+                out.extend_from_slice(available);
+                (false, available.len())
             }
         };
         reader.consume(used);

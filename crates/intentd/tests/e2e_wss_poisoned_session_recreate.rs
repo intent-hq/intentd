@@ -399,6 +399,7 @@ where
     panic!("agent session never settled to idle; last: {last}");
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// POISONED-RECREATE (monorepo#940): a `session/load`-resumed session that
 /// deterministically rejects prompts with the chat-stream 400 `invalidArgument`
 /// payload parks the agent in `error` with `sessionCorrupted: true`, and

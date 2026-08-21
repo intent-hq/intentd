@@ -86,7 +86,7 @@ impl SentryEngine for SentryEngineImpl {
         let path = format!("/organizations/{}/", self.client.organization());
         match self.client.get(&path).await {
             Ok(data) => Ok(map_auth_status_ok(self.client.organization(), &data)),
-            Err(Error::Auth(msg)) | Err(Error::NotFound(msg)) => Ok(SentryAuthState {
+            Err(Error::Auth(msg) | Error::NotFound(msg)) => Ok(SentryAuthState {
                 authenticated: false,
                 organization: None,
                 error: Some(msg),

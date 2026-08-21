@@ -273,9 +273,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => return None,
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(v) => v,
-            Err(_) => return None,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {

@@ -41,7 +41,7 @@ fn uuid_like() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("{nanos}-{:p}", &nanos as *const _)
+    format!("{nanos}-{:p}", &raw const nanos)
 }
 
 #[test]

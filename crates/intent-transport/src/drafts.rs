@@ -101,6 +101,16 @@ async fn resolve_for_write(
 /// JSON array, an empty array is normalized to `None` (nothing stored), and a
 /// serialized payload above [`MAX_ATTACHMENTS_BYTES`] is rejected (`-32602`).
 fn validate_attachments(attachments: Option<Value>) -> Result<Option<Value>, (i32, String)> {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let Some(value) = attachments else {
         return Ok(None);
     };
@@ -112,16 +122,6 @@ fn validate_attachments(attachments: Option<Value>) -> Result<Option<Value>, (i3
     };
     if items.is_empty() {
         return Ok(None);
-    }
-    struct CountingWriter(usize);
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
     let mut counter = CountingWriter(0);
     serde_json::to_writer(&mut counter, &value).map_err(|e| (-32603, e.to_string()))?;

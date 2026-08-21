@@ -141,6 +141,7 @@ pub fn profile_filter() -> Targets {
 
 /// Tracing layer that counts SQL statements and times each RPC dispatch,
 /// warning when either exceeds its budget. See the module docs.
+#[allow(clippy::struct_field_names)] // each field is a distinct named threshold; the suffix is the meaning
 pub struct RpcProfileLayer {
     statement_threshold: u64,
     compound_statement_threshold: u64,

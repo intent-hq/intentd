@@ -40,7 +40,7 @@ impl std::fmt::Debug for OpenAiEngine {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

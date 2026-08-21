@@ -47,11 +47,10 @@ const DEFAULT_TERM: &str = "xterm-256color";
 fn ensure_terminal_term(env: &mut Vec<(String, String)>, inherited_term: Option<&str>) {
     match env.iter_mut().rev().find(|(name, _)| name == "TERM") {
         Some((_, value)) if value.is_empty() => *value = DEFAULT_TERM.to_string(),
-        Some(_) => {}
         None if inherited_term.is_none_or(str::is_empty) => {
             env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
         }
-        None => {}
+        Some(_) | None => {}
     }
 }
 
@@ -305,6 +304,7 @@ pub(crate) fn get_buffer(
 /// `isExecutingCommand` is the child's liveness (the spawned process is the
 /// running command). `daemon_boot_id` is the daemon's per-process boot id, so
 /// clients can tell which daemon lifetime a (possibly empty) list belongs to.
+#[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
 pub(crate) fn list(
     pty: &PtyHost,
     workspace_id: &WorkspaceId,
@@ -481,21 +481,25 @@ pub(crate) fn spawn_output_stream(
     pty_id: PtyId,
     terminal_id: String,
 ) {
-    let attachment = match pty.attach(pty_id) {
-        Ok(a) => a,
-        Err(_) => return,
+    let Ok(attachment) = pty.attach(pty_id) else {
+        return;
     };
     tokio::spawn(async move {
         let mut live = attachment.live;
         // Emit any output captured between spawn and attach exactly once, then
         // tail live chunks (the host guarantees history XOR live, never both).
         if !attachment.backlog.is_empty() {
-            emit_data(&bus, &workspace_id, &terminal_id, &attachment.backlog);
+            emit_data(
+                bus.as_ref(),
+                &workspace_id,
+                &terminal_id,
+                &attachment.backlog,
+            );
         }
         loop {
             tokio::select! {
                 recv = live.recv() => match recv {
-                    Ok(chunk) => emit_data(&bus, &workspace_id, &terminal_id, &chunk),
+                    Ok(chunk) => emit_data(bus.as_ref(), &workspace_id, &terminal_id, &chunk),
                     Err(RecvError::Lagged(_)) => {},
                     // A `terminal.kill` tore down the session and dropped the
                     // sender; the process is gone.
@@ -505,14 +509,14 @@ pub(crate) fn spawn_output_stream(
                     if matches!(pty.try_exit(pty_id), Ok(Some(_))) {
                         // Reaped: drain any output the reader flushed just before
                         // EOF, then stop tailing.
-                        drain_pending(&mut live, &bus, &workspace_id, &terminal_id);
+                        drain_pending(&mut live, bus.as_ref(), &workspace_id, &terminal_id);
                         break;
                     }
                 }
             }
         }
         let exit = pty.try_exit(pty_id).ok().flatten();
-        emit_exit(&bus, &workspace_id, &terminal_id, exit).await;
+        emit_exit(bus.as_ref(), &workspace_id, &terminal_id, exit).await;
     });
 }
 
@@ -520,7 +524,7 @@ pub(crate) fn spawn_output_stream(
 /// child has exited so trailing output still streams before `terminal:exit`).
 fn drain_pending(
     live: &mut tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     terminal_id: &str,
 ) {
@@ -528,7 +532,7 @@ fn drain_pending(
         match live.try_recv() {
             Ok(chunk) => emit_data(bus, workspace_id, terminal_id, &chunk),
             Err(TryRecvError::Lagged(_)) => {}
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
 }
@@ -543,7 +547,7 @@ fn drain_pending(
 /// `terminal:data` rows. Ordering vs `terminal:exit` is preserved: the stream
 /// task broadcasts every chunk synchronously before it awaits the durable
 /// `emit_exit`, so exit can never overtake data.
-fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
+fn emit_data(bus: Option<&EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes: &[u8]) {
     let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
     publish_event_transient(
         bus,
@@ -558,7 +562,7 @@ fn emit_data(bus: &Option<EventBus>, ws: &WorkspaceId, terminal_id: &str, bytes:
 /// Publish a self-sufficient `terminal:exit` event (durable, emitted after the
 /// stream task has broadcast every `terminal:data` chunk).
 async fn emit_exit(
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     ws: &WorkspaceId,
     terminal_id: &str,
     exit: Option<PtyExit>,
@@ -883,9 +887,8 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !contains_sub(&acc, needle) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, sub.recv()).await {
                 Ok(Some(batch)) => {

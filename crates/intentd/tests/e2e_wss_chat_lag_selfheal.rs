@@ -231,7 +231,6 @@ async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
                         return v;
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
                 Message::Close(_) => panic!("connection closed mid-stream"),
                 _ => {}
             }

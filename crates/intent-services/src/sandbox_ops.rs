@@ -1088,7 +1088,7 @@ mod test_hook_tests {
     fn positive_millis_enable_delay() {
         assert_eq!(
             test_provision_delay_from(Some("10000")),
-            Some(Duration::from_millis(10_000))
+            Some(Duration::from_secs(10))
         );
         assert_eq!(
             test_provision_delay_from(Some(" 500 ")),
@@ -2489,9 +2489,11 @@ mod tests {
         let provision_outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
             .await
             .unwrap();
-        let sandbox_path = match provision_outcome {
-            ProvisionOutcome::Supported { path, .. } => path,
-            _ => panic!("Expected Supported"),
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = provision_outcome
+        else {
+            panic!("Expected Supported")
         };
 
         // In the sandbox, make a commit with a specific author (simulating the agent)
@@ -3255,7 +3257,7 @@ mod tests {
         // errno may skip — anything else (permissions, ENOSPC) must surface.
         if let Err(err) = fs::create_dir(repo_path.join(name)) {
             assert!(
-                matches!(err.raw_os_error(), Some(libc::EILSEQ) | Some(libc::EINVAL)),
+                matches!(err.raw_os_error(), Some(libc::EILSEQ | libc::EINVAL)),
                 "unexpected error creating non-UTF-8 fixture: {err}"
             );
             eprintln!(

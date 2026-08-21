@@ -213,7 +213,7 @@ struct Server {
     bus: EventBus,
     store: Store,
     registry: Arc<intent_services::SettingsRegistry>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Server {
@@ -265,7 +265,7 @@ async fn start_with_auggie_and_models_cache(
         bus,
         store,
         registry,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -479,6 +479,25 @@ async fn wss_client_hello_and_drafts_round_trip() {
 /// wrong-typed `enabled` and an unknown workspace all surface `-32602`.
 #[tokio::test]
 async fn wss_workspace_auto_commit_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
     let srv = start(WsOptions::default()).await;
     let created = wss_call(
         srv.port,
@@ -506,25 +525,6 @@ async fn wss_workspace_auto_commit_round_trip() {
     // One persistent connection: subscribe first so the `workspace:updated`
     // notification from the toggle below is delivered to this client.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    async fn send_and_wait(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        frame: String,
-        id: i64,
-    ) -> Value {
-        ws.send(Message::Text(frame.into())).await.expect("send");
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(id)) {
-                        return v;
-                    }
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
-            }
-        }
-    }
     let sub = send_and_wait(
         &mut ws,
         format!(
@@ -766,7 +766,7 @@ async fn wss_oversized_message_terminates_connection() {
     let closed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match ws.next().await {
-                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                None | Some(Err(_) | Ok(Message::Close(_))) => break,
                 Some(Ok(_)) => {}
             }
         }
@@ -1367,6 +1367,7 @@ async fn wss_agent_queue_message_rejects_unknown_agent() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `agent.diagnostics` reports real pending-message queue snapshots over the
 /// WSS wire: after `agent.queueMessage`, `diagnostics.queues` carries the
 /// target's queue (drain-order entries with `queuedAt`, content truncated to
@@ -2382,6 +2383,25 @@ async fn wss_agent_create_widened_params_round_trip() {
 /// an older message, and rejects missing params with `-32602`.
 #[tokio::test]
 async fn wss_agent_mark_seen_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.active", serde_json::json!("auggie"));
     let created_ws = wss_call(
@@ -2433,25 +2453,6 @@ async fn wss_agent_mark_seen_round_trip() {
     // One persistent connection: subscribe first so the `agent:updated`
     // notification from the markSeen below is delivered to this client.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    async fn send_and_wait(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
-        frame: String,
-        id: i64,
-    ) -> Value {
-        ws.send(Message::Text(frame.into())).await.expect("send");
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(id)) {
-                        return v;
-                    }
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
-            }
-        }
-    }
     let sub = send_and_wait(
         &mut ws,
         format!(
@@ -2559,34 +2560,6 @@ async fn wss_agent_mark_seen_round_trip() {
 /// state) and `agent.get` drops the field.
 #[tokio::test]
 async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
-    let srv = start(WsOptions::default()).await;
-    srv.set_setting("providers.active", serde_json::json!("auggie"));
-    let created_ws = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS LastToolUse"}}"#,
-    )
-    .await;
-    let ws_id = created_ws["result"]["workspace"]["id"]
-        .as_str()
-        .expect("workspace id")
-        .to_string();
-    let sess = wss_session(
-        srv.port,
-        srv.cfg.clone(),
-        vec![format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"ToolUse Agent"}}}}"#
-        )],
-    )
-    .await;
-    let agent_id = sess[0]["result"]["agent"]["id"]
-        .as_str()
-        .expect("agent id")
-        .to_string();
-
-    // One persistent connection: subscribe BEFORE the persists so both
-    // event notifications are delivered to this client.
-    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         frame: String,
@@ -2632,6 +2605,34 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS LastToolUse"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"ToolUse Agent"}}}}"#
+        )],
+    )
+    .await;
+    let agent_id = sess[0]["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // One persistent connection: subscribe BEFORE the persists so both
+    // event notifications are delivered to this client.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let sub = send_and_wait(
         &mut ws,
         format!(
@@ -3671,7 +3672,7 @@ async fn wss_jsonrpc_roundtrip_matches_uds() {
     // Serve UDS on the SAME shared services + bus so the wire result is
     // produced by one router; only the framing differs. The socket lives in
     // the harness TempDir so it is cleaned up with the rest of the fixture.
-    let socket = srv._dir.path().join("intentd-wss.sock");
+    let socket = srv.dir.path().join("intentd-wss.sock");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let (api, bus, sock) = (srv.api.clone(), srv.bus.clone(), socket.clone());
     let uds = tokio::spawn(async move {
@@ -3740,16 +3741,16 @@ async fn wss_models_list_returns_catalog_with_source() {
 
 #[tokio::test]
 async fn wss_stats_get_usage_round_trip_with_seeded_store() {
+    // The current hour bucket is inside both the current month and the
+    // trailing-24h window; a bucket 48h back is outside the 24h window.
+    // Bucket keys are the store's RFC-3339 UTC hour floors.
+    use chrono::{Datelike, Timelike, Utc};
     // stats.getUsage: the global usage-stats read behind the agentic
     // usage-stats cards. Seed two hourly buckets straight into the store,
     // then drive both a "month" and a "24h" read over the real WSS path and
     // assert the documented result shape.
     let srv = start(WsOptions::default()).await;
 
-    // The current hour bucket is inside both the current month and the
-    // trailing-24h window; a bucket 48h back is outside the 24h window.
-    // Bucket keys are the store's RFC-3339 UTC hour floors.
-    use chrono::{Datelike, Timelike, Utc};
     let now = Utc::now();
     let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:00:00Z").to_string();
     let stamp = |t: chrono::DateTime<Utc>, hour: u8| intent_store::LocalStamp {
@@ -3898,6 +3899,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
 
 #[tokio::test]
 async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
+    use chrono::{Duration as ChronoDuration, Utc};
     // stats.getRateHistory (§5.39): the global per-minute token-rate history
     // behind the HUD TOK/MIN chart. Seed minute buckets straight into the
     // store — current minute, two minutes back, and one outside a 5-sample
@@ -3905,7 +3907,6 @@ async fn wss_stats_get_rate_history_round_trip_with_seeded_store() {
     // zero-filled, chronological result shape.
     let srv = start(WsOptions::default()).await;
 
-    use chrono::{Duration as ChronoDuration, Utc};
     let now = Utc::now();
     let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:00Z").to_string();
     srv.store
@@ -4699,6 +4700,13 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
+    // Adapters that hold their slot for ~10s before answering the turn, so the
+    // bound is saturated for a wide, non-racy window. The wrapper records one
+    // line per adapter actually launched: the assertions below count it rather
+    // than inferring from the response which branch ran, so a queue timeout
+    // that quietly spawned (or a `-32603` arriving from some unrelated
+    // failure) cannot pass as a bound that held.
+    use std::os::unix::fs::PermissionsExt;
     // The daemon-wide ephemeral-adapter bound over the real wire (§5.32,
     // monorepo#2062). With the bound saturated by parked adapters, a call
     // whose own `timeoutMs` expires while queued comes back as -32603 with
@@ -4712,13 +4720,6 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
         eprintln!("skipping adapter-busy e2e: node not on PATH");
         return;
     }
-    // Adapters that hold their slot for ~10s before answering the turn, so the
-    // bound is saturated for a wide, non-racy window. The wrapper records one
-    // line per adapter actually launched: the assertions below count it rather
-    // than inferring from the response which branch ran, so a queue timeout
-    // that quietly spawned (or a `-32603` arriving from some unrelated
-    // failure) cannot pass as a bound that held.
-    use std::os::unix::fs::PermissionsExt;
     let adapter_dir = test_tempdir("intentd-wss-acp-busy-");
     let spawn_log = adapter_dir.path().join("spawns.log");
     let bin = adapter_dir.path().join("codex-acp");
@@ -5195,8 +5196,8 @@ async fn bind_fails_fast_on_occupied_port() {
     // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
     // Bind the hog listener first, keep it open, and use its port for the test
     // to avoid TOCTOU (no free_port() release-then-rebind window).
-    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let base = _hog.local_addr().unwrap().port();
+    let hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = hog.local_addr().unwrap().port();
     let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -5271,6 +5272,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
+    const MAX_ATTEMPTS: u32 = 10;
     // Verifies fixed-port restart semantics: a graceful `stop()` fully releases
     // the listen port (it awaits the accept loop) so the SAME listener can
     // immediately rebind it. `free_port()` hands back a port from the kernel's
@@ -5286,7 +5288,6 @@ async fn graceful_shutdown_allows_immediate_restart() {
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
-    const MAX_ATTEMPTS: u32 = 10;
     for _ in 0..MAX_ATTEMPTS {
         let fixed_port = free_port();
         let opts = WsOptions {
@@ -5623,21 +5624,6 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
 /// the returned `Workspace` payload per `skip_serializing_if`).
 #[tokio::test]
 async fn wss_workspace_update_status_image_asset_id_round_trip() {
-    let srv = start(WsOptions::default()).await;
-
-    let ws_id = WorkspaceId::new();
-    srv.store
-        .insert_workspace(&fixture_workspace(&ws_id))
-        .await
-        .expect("insert workspace");
-
-    // One persistent connection: subscribe first so the `workspace:updated`
-    // notification from the mutation below is delivered to this client.
-    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
-    let rpc = |id: i64, method: &str, params: Value| {
-        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-            .to_string()
-    };
     async fn send_and_wait(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         frame: String,
@@ -5657,6 +5643,21 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
             }
         }
     }
+    let srv = start(WsOptions::default()).await;
+
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+
+    // One persistent connection: subscribe first so the `workspace:updated`
+    // notification from the mutation below is delivered to this client.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    let rpc = |id: i64, method: &str, params: Value| {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .to_string()
+    };
 
     let sub = send_and_wait(
         &mut ws,
@@ -6464,6 +6465,7 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
 /// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
 /// the `includeOlder` parameter fetches pre-boundary commits.
@@ -6841,6 +6843,7 @@ async fn wss_git_branch_status_round_trip() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `git.pull` over WSS — the workspace-create auto-pull seam (§5.6).
 /// Path-based like `git.getBranches`: the repo is never registered as a
 /// workspace. Drives the checked-out fast-forward pull (`{ ok: true }`), the
@@ -7464,6 +7467,7 @@ async fn wss_git_gitlink_status_and_diffs_wire_shape() {
 /// returns `{ assetId, path, url }` and the asset round-trips back through
 /// `note.readAsset`; a missing `data` param is -32602.
 #[tokio::test]
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
 async fn wss_note_save_asset_round_trip() {
     let srv = start(WsOptions::default()).await;
 
@@ -7802,6 +7806,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#958 — the bounded agent read paths over the real WSS transport:
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
@@ -9834,6 +9839,7 @@ async fn wss_file_attachment_upload_round_trip() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;
@@ -10137,6 +10143,7 @@ async fn wss_workspace_import_lifecycle() {
     srv.ws.stop().await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// `workspace.export.start` / `.read` / `.finalize` / `.abort` (§5.1): the
 /// source-side export lifecycle over the real WSS transport. A subscriber
 /// receives the `workspace:transfer:progress` and `:ready` events (§6.5)
@@ -10375,9 +10382,10 @@ async fn wss_workspace_export_lifecycle() {
                     {
                         return;
                     }
-                    if v["params"]["event"]["type"] == "workspace:transfer:failed" {
-                        panic!("second export failed: {v}");
-                    }
+                    assert!(
+                        v["params"]["event"]["type"] != "workspace:transfer:failed",
+                        "second export failed: {v}"
+                    );
                 }
                 Some(Ok(Message::Ping(p))) => {
                     let _ = sub2.send(Message::Pong(p)).await;
@@ -10569,7 +10577,7 @@ async fn wss_workspace_import_commit_materializes_git() {
     // (PROTOCOL §5.1: the workspace envelope after import transforms).
     let ws_payload = &committed["result"]["workspace"];
     let checkout = srv
-        ._dir
+        .dir
         .path()
         .join("workspaces")
         .join(ws_id)

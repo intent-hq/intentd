@@ -250,9 +250,8 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
 /// deadline, asserting the notification envelope; `None` on deadline.
 async fn wss_event_until(ws: &mut TlsWs, deadline: tokio::time::Instant) -> Option<Value> {
     loop {
-        let next = match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -492,9 +491,8 @@ async fn discussion_request_promotes_and_user_message_retires_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(raised && attention && idle) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out: raised={raised} attention={attention} idle={idle}"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out: raised={raised} attention={attention} idle={idle}")
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
@@ -566,9 +564,8 @@ async fn discussion_request_promotes_and_user_message_retires_over_wss() {
     // in_progress while the follow-up turn runs, or straight to idle).
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out waiting for the retire transition"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the retire transition")
         };
         if ev["type"] == "workspace:displayStatus-changed" {
             assert_ne!(
@@ -656,9 +653,8 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(raised && idle) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out: raised={raised} idle={idle}"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out: raised={raised} idle={idle}")
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
@@ -726,9 +722,8 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
 
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out waiting for the plain turn to go idle"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the plain turn to go idle")
         };
         assert_ne!(
             ev["type"], "workspace:displayStatus-changed",
@@ -771,9 +766,8 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
 
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out waiting for the dismissal transition"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the dismissal transition")
         };
         if ev["type"] == "workspace:displayStatus-changed" {
             assert_ne!(
@@ -876,11 +870,8 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(attention && task_blocked && idle) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => {
-                panic!("timed out: attention={attention} task_blocked={task_blocked} idle={idle}")
-            }
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out: attention={attention} task_blocked={task_blocked} idle={idle}")
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
@@ -1017,9 +1008,8 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !(raised && idle) {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out: raised={raised} idle={idle}"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out: raised={raised} idle={idle}")
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
@@ -1035,7 +1025,7 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
     // its silent no-op (the baseline is already `needs_attention`) before
     // mutating, so every displayStatus event the loops below consume is
     // attributable to the transcript-mutation ops alone.
-    tokio::time::sleep(Duration::from_millis(4000)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Capture the question row's blocks so replaceMessages can rebuild the
     // tail below — and pin the hold prerequisite while at it.
@@ -1091,9 +1081,8 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
     // The op's own recompute emits the retire transition …
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out waiting for the appendMessage retire transition"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the appendMessage retire transition")
         };
         if ev["type"] == "workspace:displayStatus-changed" {
             assert_ne!(
@@ -1123,9 +1112,8 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
 
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
-        let ev = match wss_event_until(&mut sub, deadline).await {
-            Some(ev) => ev,
-            None => panic!("timed out waiting for the replaceMessages raise transition"),
+        let Some(ev) = wss_event_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the replaceMessages raise transition")
         };
         if ev["type"] == "workspace:displayStatus-changed" {
             assert_eq!(

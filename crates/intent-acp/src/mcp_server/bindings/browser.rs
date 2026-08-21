@@ -33,7 +33,7 @@ pub(crate) const PRELUDE: &str = r"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
-    caller_agent_id: &Option<AgentId>,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -47,7 +47,7 @@ pub(crate) async fn dispatch(
 async fn exec(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
-    caller_agent_id: &Option<AgentId>,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     // Reference parity (`buildBrowserApi.exec`): `actions` must be present and
@@ -64,7 +64,7 @@ async fn exec(
         .get("tabId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    api.browser_exec(ws.clone(), actions, tab_id, caller_agent_id.clone())
+    api.browser_exec(ws.clone(), actions, tab_id, caller_agent_id.cloned())
         .await
         .map_err(map_err)
 }

@@ -1319,9 +1319,10 @@ fn run_git_os_streamed(
     // forever — the poll loop below would then kill a healthy child at the
     // deadline.
     let drain = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || match on_chunk {
-            Some(cb) => drain_chunks(stderr, &cb),
-            None => {
+        std::thread::spawn(move || {
+            if let Some(cb) = on_chunk {
+                drain_chunks(stderr, &cb)
+            } else {
                 use std::io::Read;
                 let mut stderr = stderr;
                 let mut buf = String::new();
@@ -1439,16 +1440,13 @@ fn take_valid_utf8(bytes: &mut Vec<u8>) -> String {
             Err(e) => {
                 let (valid, rest) = input.split_at(e.valid_up_to());
                 out.push_str(std::str::from_utf8(valid).expect("validated prefix"));
-                match e.error_len() {
-                    Some(len) => {
-                        out.push(char::REPLACEMENT_CHARACTER);
-                        input = &rest[len..];
-                    }
-                    None => {
-                        // Incomplete trailing sequence: keep for the next read.
-                        input = rest;
-                        break;
-                    }
+                if let Some(len) = e.error_len() {
+                    out.push(char::REPLACEMENT_CHARACTER);
+                    input = &rest[len..];
+                } else {
+                    // Incomplete trailing sequence: keep for the next read.
+                    input = rest;
+                    break;
                 }
             }
         }

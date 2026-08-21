@@ -910,7 +910,14 @@ impl UnslothServerManager {
         let binary =
             (self.config.resolve_binary)(unsloth_cli_override).ok_or_else(missing_binary_error)?;
 
-        if !attach {
+        if attach {
+            status(
+                StatusLevel::Info,
+                format!(
+                    "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
+                ),
+            );
+        } else {
             status(
                 StatusLevel::Info,
                 format!("Starting Unsloth server for {repo_id}…"),
@@ -993,13 +1000,6 @@ impl UnslothServerManager {
             }));
             *state = Some(server);
             self.set_phase(Some("starting"));
-        } else {
-            status(
-                StatusLevel::Info,
-                format!(
-                    "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
-                ),
-            );
         }
 
         match self
@@ -1207,10 +1207,9 @@ impl UnslothServerManager {
             ProbeOutcome::UpNotReady => {}
             // 200 unauthenticated is NOT the managed server's shape (it
             // requires auth even on /v1/models) — treat as foreign.
-            ProbeOutcome::Ready => return None,
+            ProbeOutcome::Ready | ProbeOutcome::Down => return None,
             // The port is bind-busy but nothing answers HTTP: not an
             // Unsloth server (e.g. a raw TCP service).
-            ProbeOutcome::Down => return None,
         }
 
         let mut server = ManagedServer {

@@ -213,9 +213,8 @@ where
         if remaining.is_zero() {
             return out;
         }
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(x) => x,
-            Err(_) => return out,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return out;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -241,8 +240,7 @@ where
                 let _ = ws.send(Message::Pong(p)).await;
             }
             Some(Ok(_)) => {}
-            None => return out,
-            Some(Err(_)) => return out,
+            None | Some(Err(_)) => return out,
         }
     }
 }

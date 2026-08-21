@@ -460,6 +460,8 @@ mod tests {
     /// `SQLite`'s own `'localtime'` conversion.
     #[tokio::test]
     async fn migration_backfill_stamps_pre_d12_rows_from_system_timezone() {
+        // (bucket_utc, local_date, local_hour, expected_date, expected_hour)
+        type BackfillCheckRow = (String, Option<String>, Option<i64>, Option<String>, i64);
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         for bucket in ["2026-07-25T00:00:00Z", "2026-07-25T23:00:00Z"] {
@@ -509,8 +511,6 @@ mod tests {
                 .expect("run backfill statement");
         }
 
-        // (bucket_utc, local_date, local_hour, expected_date, expected_hour)
-        type BackfillCheckRow = (String, Option<String>, Option<i64>, Option<String>, i64);
         let checked: Vec<BackfillCheckRow> = sqlx::query_as(
             "SELECT bucket_utc, local_date, local_hour,
                         date(bucket_utc, 'localtime'),

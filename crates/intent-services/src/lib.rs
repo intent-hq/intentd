@@ -267,6 +267,7 @@ pub struct Services {
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
     /// `Some(None)` to simulate a host without npx, which cannot be arranged
     /// hermetically through the real discovery.
+    #[allow(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
@@ -1776,7 +1777,7 @@ impl Services {
                         );
                     }
                     publish_event(
-                        &this.event_bus,
+                        this.event_bus.as_ref(),
                         workspace_updated_event(
                             &ws_id,
                             &serde_json::json!({ "lastActivity": new_val }),
@@ -2139,7 +2140,7 @@ impl Services {
         self.store.update_workspace(&ws).await?;
 
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             workspace_updated_event(&ws.id, &serde_json::Value::Object(changes)),
         )
         .await;
@@ -2228,7 +2229,7 @@ impl Services {
         if !is_dir {
             return Ok(serde_json::json!({ "refreshing": false }));
         }
-        let (usage, refreshing) = self.disk_usage.poll(dir).await;
+        let (usage, refreshing) = self.disk_usage.poll(dir);
         let mut result = serde_json::json!({ "refreshing": refreshing });
         if let Some(usage) = usage {
             result["diskUsage"] = serde_json::to_value(usage)
@@ -2284,7 +2285,7 @@ impl Services {
 
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 activity_changed_event(workspace_id, WorkspaceActivity::AgentRunning),
             )
             .await;
@@ -2298,7 +2299,7 @@ impl Services {
     /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
     /// within the window cancels the idle flip. A decrement with no tracked session
     /// is a no-op.
-    pub(crate) async fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
             match map.get_mut(workspace_id) {
@@ -2388,7 +2389,7 @@ impl Services {
                 }
 
                 publish_event(
-                    &this.event_bus,
+                    this.event_bus.as_ref(),
                     activity_changed_event(&ws_id, WorkspaceActivity::Idle),
                 )
                 .await;
@@ -2451,7 +2452,7 @@ impl Services {
             return Ok(());
         }
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             attention_changed_event(workspace_id, level),
         )
         .await;
@@ -2676,13 +2677,12 @@ impl Services {
         };
         let mut out: Vec<(String, String)> = Vec::new();
         for note_id in note_ids {
-            let note = match self
+            let Ok(note) = self
                 .store
                 .get_note(workspace_id, &NoteId::from(note_id.as_str()))
                 .await
-            {
-                Ok(n) => n,
-                _ => continue,
+            else {
+                continue;
             };
             for url in extract_markdown_image_urls(&note.content) {
                 if !url.starts_with("workspace-asset://") {
@@ -2894,7 +2894,11 @@ impl Services {
         } else {
             GIT_ROOT_UPDATED
         };
-        publish_event(&self.event_bus, git_root_changed_event(event_type, &stored)).await;
+        publish_event(
+            self.event_bus.as_ref(),
+            git_root_changed_event(event_type, &stored),
+        )
+        .await;
         Ok(stored)
     }
 
@@ -2905,7 +2909,7 @@ impl Services {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
         )
         .await;
@@ -3087,7 +3091,7 @@ impl Services {
                             root.registered_commit_sha = Some(sha);
                             root.updated_at = ts;
                             publish_event(
-                                &self.event_bus,
+                                self.event_bus.as_ref(),
                                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
                             )
                             .await;
@@ -3167,117 +3171,114 @@ impl Services {
         .ok()
         .flatten()
         .unwrap_or_default();
-        match root.pr_number {
-            Some(number) => {
-                let pr = sc
-                    .get_pr(&repo_ref, number)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive mismatch against the
-                // root's current branch; an unreadable HEAD (empty branch)
-                // never unlinks.
-                if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
-                    root.pr_number = None;
-                    root.pr_url = None;
-                    root.pr_status = None;
-                    root.updated_at = now_iso();
-                    self.store.update_workspace_git_root_pr(&root).await?;
-                    publish_event(
-                        &self.event_bus,
-                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                    )
-                    .await;
-                    return Ok(PrRefreshOutcome::Unlinked);
-                }
-                let info = pr_ops::build_pr_info(&pr);
-                let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
-                // A merged/closed linked PR stays recorded in `pull_requests`
-                // but no longer blocks discovery: relink to a newer open PR on
-                // the same branch. A discovery failure degrades to the plain
-                // update path below so the status delta is never lost.
-                if matches!(
-                    info.status,
-                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-                ) && !branch.is_empty()
-                {
-                    let discovered = match pr_ops::discover_matching_open_pr(
-                        sc.as_ref(),
-                        &repo_ref,
-                        &branch,
-                        None,
-                        Some(number),
-                    )
-                    .await
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            tracing::warn!(
-                                git_root = %root.id.as_str(),
-                                error = %e,
-                                "git root refresh: relink discovery failed, persisting status only"
-                            );
-                            None
-                        }
-                    };
-                    if let Some(open_pr) = discovered {
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
-                        root.pr_number = Some(open_pr.number);
-                        root.pr_url = Some(open_pr.url.clone());
-                        root.pr_status = Some(open_info.status);
-                        root.updated_at = now_iso();
-                        self.store.update_workspace_git_root_pr(&root).await?;
-                        publish_event(
-                            &self.event_bus,
-                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                        )
-                        .await;
-                        return Ok(PrRefreshOutcome::Linked);
-                    }
-                }
-                let changed = list_changed
-                    || root.pr_status != Some(info.status)
-                    || root.pr_url.as_deref() != Some(pr.url.as_str());
-                if !changed {
-                    return Ok(PrRefreshOutcome::Unchanged);
-                }
-                root.pr_status = Some(info.status);
-                root.pr_url = Some(pr.url.clone());
+        if let Some(number) = root.pr_number {
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            // Clear a stale link only on a positive mismatch against the
+            // root's current branch; an unreadable HEAD (empty branch)
+            // never unlinks.
+            if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
+                root.pr_number = None;
+                root.pr_url = None;
+                root.pr_status = None;
                 root.updated_at = now_iso();
                 self.store.update_workspace_git_root_pr(&root).await?;
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     git_root_changed_event(GIT_ROOT_UPDATED, &root),
                 )
                 .await;
-                Ok(PrRefreshOutcome::Updated)
+                return Ok(PrRefreshOutcome::Unlinked);
             }
-            None => {
-                if branch.is_empty() {
-                    return Ok(PrRefreshOutcome::Skipped);
-                }
-                let found =
-                    pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?;
-                match found {
-                    Some(pr) => {
-                        let info = pr_ops::build_pr_info(&pr);
-                        pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
-                        root.pr_number = Some(pr.number);
-                        root.pr_url = Some(pr.url.clone());
-                        root.pr_status = Some(info.status);
-                        root.updated_at = now_iso();
-                        self.store.update_workspace_git_root_pr(&root).await?;
-                        publish_event(
-                            &self.event_bus,
-                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
-                        )
-                        .await;
-                        Ok(PrRefreshOutcome::Linked)
+            let info = pr_ops::build_pr_info(&pr);
+            let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+            // A merged/closed linked PR stays recorded in `pull_requests`
+            // but no longer blocks discovery: relink to a newer open PR on
+            // the same branch. A discovery failure degrades to the plain
+            // update path below so the status delta is never lost.
+            if matches!(
+                info.status,
+                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+            ) && !branch.is_empty()
+            {
+                let discovered = match pr_ops::discover_matching_open_pr(
+                    sc.as_ref(),
+                    &repo_ref,
+                    &branch,
+                    None,
+                    Some(number),
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::warn!(
+                            git_root = %root.id.as_str(),
+                            error = %e,
+                            "git root refresh: relink discovery failed, persisting status only"
+                        );
+                        None
                     }
-                    None => Ok(PrRefreshOutcome::Unchanged),
+                };
+                if let Some(open_pr) = discovered {
+                    let open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                    root.pr_number = Some(open_pr.number);
+                    root.pr_url = Some(open_pr.url.clone());
+                    root.pr_status = Some(open_info.status);
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await?;
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    )
+                    .await;
+                    return Ok(PrRefreshOutcome::Linked);
                 }
+            }
+            let changed = list_changed
+                || root.pr_status != Some(info.status)
+                || root.pr_url.as_deref() != Some(pr.url.as_str());
+            if !changed {
+                return Ok(PrRefreshOutcome::Unchanged);
+            }
+            root.pr_status = Some(info.status);
+            root.pr_url = Some(pr.url.clone());
+            root.updated_at = now_iso();
+            self.store.update_workspace_git_root_pr(&root).await?;
+            publish_event(
+                self.event_bus.as_ref(),
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
+            Ok(PrRefreshOutcome::Updated)
+        } else {
+            if branch.is_empty() {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
+            let found =
+                pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
+                    .await
+                    .map_err(pr_ops::map_sc_err)?;
+            match found {
+                Some(pr) => {
+                    let info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                    root.pr_number = Some(pr.number);
+                    root.pr_url = Some(pr.url.clone());
+                    root.pr_status = Some(info.status);
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await?;
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    )
+                    .await;
+                    Ok(PrRefreshOutcome::Linked)
+                }
+                None => Ok(PrRefreshOutcome::Unchanged),
             }
         }
     }
@@ -3350,129 +3351,125 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let (owner, repo) = match pr_ops::repo_of(&ws) {
-            Ok(pair) => pair,
-            Err(_) => return Ok(PrRefreshOutcome::Skipped),
+        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+            return Ok(PrRefreshOutcome::Skipped);
         };
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
-        match ws.pr_number {
-            Some(number) => {
-                let pr = sc
-                    .get_pr(&repo_ref, number)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive mismatch against BOTH
-                // the workspace's branch and its baseRef (review workspaces
-                // link PRs whose head equals the workspace's `baseRef`, §7.6);
-                // unknown inputs never unlink.
-                if pr_ops::pr_workspace_mismatch(&pr, &ws.branch, ws.base_ref.as_deref()) {
-                    ws.pr_number = None;
-                    ws.pr_url = None;
-                    ws.pr_status = None;
-                    ws.active_pull_request = None;
-                    ws.updated_at = now_iso();
-                    self.store.update_workspace_pr_linkage(&ws).await?;
-                    publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
-                    self.maybe_emit_display_status_changed(&ws.id).await;
-                    return Ok(PrRefreshOutcome::Unlinked);
-                }
-                let info = pr_ops::build_pr_info(&pr);
-                // Keep the daemon-owned PR list current on every linked refresh.
-                let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
-                // A merged/closed linked PR stays recorded in `pull_requests`
-                // but no longer blocks discovery: relink to a newer open PR
-                // matching the branch (or, failing that, the baseRef), so the
-                // workspace follows the latest PR without waiting for an
-                // unlink. A discovery failure degrades to the plain update
-                // path below so the merged/closed status delta is never lost
-                // to a transient `list_prs` error (the next sweep retries
-                // discovery).
-                if matches!(
-                    info.status,
-                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-                ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
-                {
-                    let discovered = match pr_ops::discover_matching_open_pr(
-                        sc.as_ref(),
-                        &repo_ref,
-                        &ws.branch,
-                        ws.base_ref.as_deref(),
-                        Some(number),
-                    )
-                    .await
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            tracing::warn!(
-                                workspace_id = %ws.id.as_str(),
-                                error = %e,
-                                "pr refresh: relink discovery failed, persisting status only"
-                            );
-                            None
-                        }
-                    };
-                    if let Some(open_pr) = discovered {
-                        let open_info = pr_ops::build_pr_info(&open_pr);
-                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
-                        ws.pr_number = Some(open_pr.number);
-                        ws.pr_url = Some(open_pr.url.clone());
-                        ws.pr_status = Some(open_info.status);
-                        ws.active_pull_request = Some(open_info);
-                        ws.updated_at = now_iso();
-                        self.store.update_workspace_pr_linkage(&ws).await?;
-                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
-                        self.maybe_emit_display_status_changed(&ws.id).await;
-                        return Ok(PrRefreshOutcome::Linked);
-                    }
-                }
-                let changed = list_changed
-                    || ws.pr_status != Some(info.status)
-                    || ws.active_pull_request.as_ref() != Some(&info)
-                    || ws.pr_url.as_deref() != Some(pr.url.as_str());
-                if !changed {
-                    return Ok(PrRefreshOutcome::Unchanged);
-                }
-                ws.pr_status = Some(info.status);
-                ws.pr_url = Some(pr.url.clone());
-                ws.active_pull_request = Some(info);
+        if let Some(number) = ws.pr_number {
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            // Clear a stale link only on a positive mismatch against BOTH
+            // the workspace's branch and its baseRef (review workspaces
+            // link PRs whose head equals the workspace's `baseRef`, §7.6);
+            // unknown inputs never unlink.
+            if pr_ops::pr_workspace_mismatch(&pr, &ws.branch, ws.base_ref.as_deref()) {
+                ws.pr_number = None;
+                ws.pr_url = None;
+                ws.pr_status = None;
+                ws.active_pull_request = None;
                 ws.updated_at = now_iso();
                 self.store.update_workspace_pr_linkage(&ws).await?;
-                publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                publish_event(self.event_bus.as_ref(), pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
-                Ok(PrRefreshOutcome::Updated)
+                return Ok(PrRefreshOutcome::Unlinked);
             }
-            None => {
-                // Discovery: link an open PR matching the branch, or —
-                // failing that — the workspace's baseRef (§7.6).
-                if ws.branch.is_empty() && ws.base_ref.is_none() {
-                    return Ok(PrRefreshOutcome::Skipped);
-                }
-                let found = pr_ops::discover_matching_open_pr(
+            let info = pr_ops::build_pr_info(&pr);
+            // Keep the daemon-owned PR list current on every linked refresh.
+            let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // A merged/closed linked PR stays recorded in `pull_requests`
+            // but no longer blocks discovery: relink to a newer open PR
+            // matching the branch (or, failing that, the baseRef), so the
+            // workspace follows the latest PR without waiting for an
+            // unlink. A discovery failure degrades to the plain update
+            // path below so the merged/closed status delta is never lost
+            // to a transient `list_prs` error (the next sweep retries
+            // discovery).
+            if matches!(
+                info.status,
+                intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+            ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
+            {
+                let discovered = match pr_ops::discover_matching_open_pr(
                     sc.as_ref(),
                     &repo_ref,
                     &ws.branch,
                     ws.base_ref.as_deref(),
-                    None,
+                    Some(number),
                 )
                 .await
-                .map_err(pr_ops::map_sc_err)?;
-                match found {
-                    Some(pr) => {
-                        let info = pr_ops::build_pr_info(&pr);
-                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
-                        ws.pr_number = Some(pr.number);
-                        ws.pr_url = Some(pr.url.clone());
-                        ws.pr_status = Some(info.status);
-                        ws.active_pull_request = Some(info);
-                        ws.updated_at = now_iso();
-                        self.store.update_workspace_pr_linkage(&ws).await?;
-                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
-                        self.maybe_emit_display_status_changed(&ws.id).await;
-                        Ok(PrRefreshOutcome::Linked)
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace_id = %ws.id.as_str(),
+                            error = %e,
+                            "pr refresh: relink discovery failed, persisting status only"
+                        );
+                        None
                     }
-                    None => Ok(PrRefreshOutcome::Unchanged),
+                };
+                if let Some(open_pr) = discovered {
+                    let open_info = pr_ops::build_pr_info(&open_pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                    ws.pr_number = Some(open_pr.number);
+                    ws.pr_url = Some(open_pr.url.clone());
+                    ws.pr_status = Some(open_info.status);
+                    ws.active_pull_request = Some(open_info);
+                    ws.updated_at = now_iso();
+                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
+                    self.maybe_emit_display_status_changed(&ws.id).await;
+                    return Ok(PrRefreshOutcome::Linked);
                 }
+            }
+            let changed = list_changed
+                || ws.pr_status != Some(info.status)
+                || ws.active_pull_request.as_ref() != Some(&info)
+                || ws.pr_url.as_deref() != Some(pr.url.as_str());
+            if !changed {
+                return Ok(PrRefreshOutcome::Unchanged);
+            }
+            ws.pr_status = Some(info.status);
+            ws.pr_url = Some(pr.url.clone());
+            ws.active_pull_request = Some(info);
+            ws.updated_at = now_iso();
+            self.store.update_workspace_pr_linkage(&ws).await?;
+            publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
+            self.maybe_emit_display_status_changed(&ws.id).await;
+            Ok(PrRefreshOutcome::Updated)
+        } else {
+            // Discovery: link an open PR matching the branch, or —
+            // failing that — the workspace's baseRef (§7.6).
+            if ws.branch.is_empty() && ws.base_ref.is_none() {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
+            let found = pr_ops::discover_matching_open_pr(
+                sc.as_ref(),
+                &repo_ref,
+                &ws.branch,
+                ws.base_ref.as_deref(),
+                None,
+            )
+            .await
+            .map_err(pr_ops::map_sc_err)?;
+            match found {
+                Some(pr) => {
+                    let info = pr_ops::build_pr_info(&pr);
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                    ws.pr_number = Some(pr.number);
+                    ws.pr_url = Some(pr.url.clone());
+                    ws.pr_status = Some(info.status);
+                    ws.active_pull_request = Some(info);
+                    ws.updated_at = now_iso();
+                    self.store.update_workspace_pr_linkage(&ws).await?;
+                    publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
+                    self.maybe_emit_display_status_changed(&ws.id).await;
+                    Ok(PrRefreshOutcome::Linked)
+                }
+                None => Ok(PrRefreshOutcome::Unchanged),
             }
         }
     }
@@ -3768,7 +3765,7 @@ impl Services {
         // events out of commit order. Each event still carries a committed
         // snapshot and the next event/scan converges (pre-existing).
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             token_usage_changed_event(workspace_id, &usage),
         )
         .await;
@@ -4984,13 +4981,12 @@ impl Services {
                             triggers.push((s.workspace_id.0.clone(), n.0.clone()));
                         }
                     }
-                    let flips = match &taken_flip_triggers {
-                        Some(f) => f.clone(),
-                        None => {
-                            let f = self.take_flipped_completion_triggers(child_id).await;
-                            taken_flip_triggers = Some(f.clone());
-                            f
-                        }
+                    let flips = if let Some(f) = &taken_flip_triggers {
+                        f.clone()
+                    } else {
+                        let f = self.take_flipped_completion_triggers(child_id).await;
+                        taken_flip_triggers = Some(f.clone());
+                        f
                     };
                     for pair in flips {
                         if !triggers.contains(&pair) {
@@ -5280,13 +5276,12 @@ impl Services {
             // and deletion wakes never attribute triggers.
             let mut stamped_triggers = trigger_tasks.clone();
             if event.event_type == AGENT_IDLE && !interim_idle {
-                let flips = match &taken_flip_triggers {
-                    Some(f) => f.clone(),
-                    None => {
-                        let f = self.take_flipped_completion_triggers(child_id).await;
-                        taken_flip_triggers = Some(f.clone());
-                        f
-                    }
+                let flips = if let Some(f) = &taken_flip_triggers {
+                    f.clone()
+                } else {
+                    let f = self.take_flipped_completion_triggers(child_id).await;
+                    taken_flip_triggers = Some(f.clone());
+                    f
                 };
                 for pair in flips {
                     if !stamped_triggers.contains(&pair) {
@@ -5481,6 +5476,8 @@ impl Services {
         agent_id: &AgentId,
         session: &AgentSession,
     ) -> bool {
+        // Check retry count (cap at 2 bounces)
+        const MAX_RETRIES: i64 = 2;
         use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
         use intent_store::SandboxStatus;
 
@@ -5504,8 +5501,6 @@ impl Services {
             }
         };
 
-        // Check retry count (cap at 2 bounces)
-        const MAX_RETRIES: i64 = 2;
         let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
 
         // Claim the merge atomically (current status → merging) so this path
@@ -5848,7 +5843,7 @@ impl Services {
                 "canonicalHead": canonical_head,
             }),
         };
-        crate::publish_event(&self.event_bus, event).await;
+        crate::publish_event(self.event_bus.as_ref(), event).await;
 
         tracing::info!(
             agent = %agent_id.0,
@@ -6141,84 +6136,81 @@ impl Services {
         content: String,
         message_metadata: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        match self.agent_manager() {
-            Some(manager) => {
-                manager
-                    .send_message(
-                        parent_agent_id,
-                        workspace_id.clone(),
-                        content,
-                        None,
-                        crate::agent_manager::TurnOptions {
-                            message_metadata,
-                            ..Default::default()
-                        },
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .send_message(
+                    parent_agent_id,
+                    workspace_id.clone(),
+                    content,
+                    None,
+                    crate::agent_manager::TurnOptions {
+                        message_metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+        } else {
+            // Question hold (PROTOCOL §5.5): parent wakes are automatic —
+            // an active hold parks the wake in the queue instead of
+            // appending a user row that would bury the pending Q&A
+            // (mirrors the manager path's `send_message` gate).
+            if self.question_hold_active(&parent_agent_id).await {
+                let (queued, position) = self.enqueue_message(
+                    &parent_agent_id,
+                    content,
+                    None,
+                    None,
+                    message_metadata,
+                    None,
+                    false,
+                );
+                let result = serde_json::json!({
+                    "success": true,
+                    "queued": true,
+                    "heldForQuestions": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.publish_queue_updated(&parent_agent_id).await;
+                // Race close (hold-check → enqueue vs a concurrent
+                // `dismissQuestions`/answer): this branch is only taken
+                // when no `AgentManager` is attached (see the `match`
+                // above), so there is no drain to kick here — a manager
+                // attaching later re-derives the hold on its own next
+                // trigger.
+                return Ok(result);
+            }
+            // Delivery-time unblocked hints (monorepo#2044): the
+            // store-only persist IS this path's delivery, so the section
+            // is resolved here — matching the manager path's direct-send
+            // arm.
+            let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+                message_metadata.as_ref(),
+            ) {
+                match self
+                    .unblocked_section_for_delivery(
+                        &parent_agent_id,
+                        std::iter::once(message_metadata.as_ref()),
                     )
                     .await
-            }
-            None => {
-                // Question hold (PROTOCOL §5.5): parent wakes are automatic —
-                // an active hold parks the wake in the queue instead of
-                // appending a user row that would bury the pending Q&A
-                // (mirrors the manager path's `send_message` gate).
-                if self.question_hold_active(&parent_agent_id).await {
-                    let (queued, position) = self.enqueue_message(
-                        &parent_agent_id,
-                        content,
-                        None,
-                        None,
-                        message_metadata,
-                        None,
-                        false,
-                    );
-                    let result = serde_json::json!({
-                        "success": true,
-                        "queued": true,
-                        "heldForQuestions": true,
-                        "queuedMessage": queued.to_value(position),
-                    });
-                    self.publish_queue_updated(&parent_agent_id).await;
-                    // Race close (hold-check → enqueue vs a concurrent
-                    // `dismissQuestions`/answer): this branch is only taken
-                    // when no `AgentManager` is attached (see the `match`
-                    // above), so there is no drain to kick here — a manager
-                    // attaching later re-derives the hold on its own next
-                    // trigger.
-                    return Ok(result);
+                {
+                    Some(section) => format!("{content}\n\n{section}"),
+                    None => content,
                 }
-                // Delivery-time unblocked hints (monorepo#2044): the
-                // store-only persist IS this path's delivery, so the section
-                // is resolved here — matching the manager path's direct-send
-                // arm.
-                let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+            } else {
+                content
+            };
+            let blocks = serde_json::json!([{ "type": "text", "text": content }]);
+            self.store
+                .append_agent_message_with_metadata(
+                    &parent_agent_id,
+                    "user",
+                    &blocks,
                     message_metadata.as_ref(),
-                ) {
-                    match self
-                        .unblocked_section_for_delivery(
-                            &parent_agent_id,
-                            std::iter::once(message_metadata.as_ref()),
-                        )
-                        .await
-                    {
-                        Some(section) => format!("{content}\n\n{section}"),
-                        None => content,
-                    }
-                } else {
-                    content
-                };
-                let blocks = serde_json::json!([{ "type": "text", "text": content }]);
-                self.store
-                    .append_agent_message_with_metadata(
-                        &parent_agent_id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &now_iso(),
-                    )
-                    .await?;
-                self.invalidate_agent_list_cache(workspace_id);
-                Ok(serde_json::json!({ "success": true, "queued": false }))
-            }
+                    &now_iso(),
+                )
+                .await?;
+            self.invalidate_agent_list_cache(workspace_id);
+            Ok(serde_json::json!({ "success": true, "queued": false }))
         }
     }
 }
@@ -6607,7 +6599,10 @@ impl Services {
             attributions: map,
         };
         self.store.upsert_note_line_attribution(&data).await?;
-        publish_event_transient(&self.event_bus, &line_attribution_updated_event(&data));
+        publish_event_transient(
+            self.event_bus.as_ref(),
+            &line_attribution_updated_event(&data),
+        );
         Ok(data)
     }
 
@@ -6675,7 +6670,7 @@ impl Services {
 /// cross-workspace collision is possible.
 async fn ensure_spec_note(
     store: &Store,
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
@@ -6885,14 +6880,13 @@ fn decorate_specialist_resolved(
         return;
     };
     let own;
-    let provider = match provider {
-        Some(p) => p,
-        None => {
-            own = agent_ops::resolve_delegate_provider_preview(services, Some(&id), workspace_path);
-            match own.as_deref() {
-                Some(p) => p,
-                None => return,
-            }
+    let provider = if let Some(p) = provider {
+        p
+    } else {
+        own = agent_ops::resolve_delegate_provider_preview(services, Some(&id), workspace_path);
+        match own.as_deref() {
+            Some(p) => p,
+            None => return,
         }
     };
     let Some(model) =
@@ -6913,7 +6907,7 @@ fn decorate_specialist_resolved(
 /// builder which throws `Note <id> not found`.
 async fn append_primitive(
     store: &Store,
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
     primitive: &serde_json::Value,
@@ -7179,22 +7173,19 @@ fn find_dependency_cycle(
     let mut path: Vec<&str> = vec![target];
     while let Some((node, idx)) = stack.last_mut() {
         let next = graph.get(*node).and_then(|edges| edges.get(*idx).copied());
-        match next {
-            Some(next) => {
-                *idx += 1;
-                if next == target {
-                    path.push(next);
-                    return Some(path.into_iter().map(str::to_string).collect());
-                }
-                if visited.insert(next) {
-                    stack.push((next, 0));
-                    path.push(next);
-                }
+        if let Some(next) = next {
+            *idx += 1;
+            if next == target {
+                path.push(next);
+                return Some(path.into_iter().map(str::to_string).collect());
             }
-            None => {
-                stack.pop();
-                path.pop();
+            if visited.insert(next) {
+                stack.push((next, 0));
+                path.push(next);
             }
+        } else {
+            stack.pop();
+            path.pop();
         }
     }
     None
@@ -7261,9 +7252,8 @@ fn note_to_workspace_task(
     status_by_id: &HashMap<String, TaskStatus>,
     spec_linked: bool,
 ) -> Result<WorkspaceTask> {
-    let task = match &note.metadata.task {
-        Some(t) => t,
-        None => return Err(Error::Internal("Note is not a task".to_string())),
+    let Some(task) = &note.metadata.task else {
+        return Err(Error::Internal("Note is not a task".to_string()));
     };
     Ok(WorkspaceTask {
         id: note.id.clone(),
@@ -7356,9 +7346,8 @@ fn parse_comment_type(opt: Option<&str>) -> CommentType {
 
 /// Validate an `agent-{uuid}` id, mirroring the TS `agentIdPattern`.
 fn is_valid_agent_id(s: &str) -> bool {
-    let rest = match s.strip_prefix("agent-") {
-        Some(r) => r,
-        None => return false,
+    let Some(rest) = s.strip_prefix("agent-") else {
+        return false;
     };
     let groups = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = rest.split('-').collect();
@@ -7685,13 +7674,12 @@ fn assert_hermetic_root_absent() {
 
 #[cfg(not(test))]
 fn assert_hermetic_root_absent() {
-    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
-        panic!(
-            "hermetic-tests: intentd process reached default_workspaces_root() with \
-             INTENTD_ASSERT_HERMETIC_ROOT set but no INTENTD_WORKSPACES_DIR — the \
-             spawning test harness must set INTENTD_WORKSPACES_DIR to a tempdir"
-        );
-    }
+    assert!(
+        std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_none(),
+        "hermetic-tests: intentd process reached default_workspaces_root() with \
+         INTENTD_ASSERT_HERMETIC_ROOT set but no INTENTD_WORKSPACES_DIR — the \
+         spawning test harness must set INTENTD_WORKSPACES_DIR to a tempdir"
+    );
 }
 
 /// Resolve a workspace-id slug for `workspace.create`, porting the TS
@@ -7818,9 +7806,8 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 3 {
         return;
     }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     let entries: Vec<_> = entries.flatten().collect();
     let is_git_repo = entries.iter().any(|e| {
@@ -7841,17 +7828,13 @@ fn scan_for_repositories(dir: &Path, depth: usize, out: &mut Vec<String>) {
         return;
     }
     for entry in entries {
-        let ft = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() {
             continue;
         }
         let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => continue,
+        let Some(name_str) = name.to_str() else {
+            continue;
         };
         if name_str.starts_with('.') {
             continue;
@@ -8489,7 +8472,7 @@ fn note_change_event(
 /// dependents' computed `unmetDependsOn`, so subscribers must refetch them.
 /// `notes` is the workspace listing the caller already holds (no extra query).
 async fn publish_dependent_note_updates(
-    bus: &Option<EventBus>,
+    bus: Option<&EventBus>,
     workspace_id: &WorkspaceId,
     changed_note_id: &NoteId,
     notes: &[Note],
@@ -8628,6 +8611,19 @@ fn is_terminal_task_status(status: TaskStatus) -> bool {
 /// (every dep names a `complete` task note — missing and cancelled deps count
 /// as unmet, same rule as `unmet_depends_on_ids`).
 fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
+    // Post-order DFS (children before parent), starting at the root level.
+    fn traverse<'a>(
+        parent: Option<&'a str>,
+        children: &HashMap<Option<&'a str>, Vec<&'a Note>>,
+        out: &mut Vec<&'a Note>,
+    ) {
+        if let Some(level) = children.get(&parent) {
+            for child in level {
+                traverse(Some(child.id.as_str()), children, out);
+                out.push(child);
+            }
+        }
+    }
     // flattenTaskTree: only non-terminal task notes participate, keyed by parent.
     let mut children: HashMap<Option<&str>, Vec<&Note>> = HashMap::new();
     for n in notes {
@@ -8660,19 +8656,6 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
                 .unwrap_or(0);
             ao.cmp(&bo).then_with(|| a.created_at.cmp(&b.created_at))
         });
-    }
-    // Post-order DFS (children before parent), starting at the root level.
-    fn traverse<'a>(
-        parent: Option<&'a str>,
-        children: &HashMap<Option<&'a str>, Vec<&'a Note>>,
-        out: &mut Vec<&'a Note>,
-    ) {
-        if let Some(level) = children.get(&parent) {
-            for child in level {
-                traverse(Some(child.id.as_str()), children, out);
-                out.push(child);
-            }
-        }
     }
     let mut flattened: Vec<&Note> = Vec::new();
     traverse(None, &children, &mut flattened);
@@ -9831,7 +9814,7 @@ impl MergeSweepSummary {
 
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
-pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
+pub(crate) async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     let Some(bus) = bus else {
         return;
     };
@@ -9843,8 +9826,8 @@ pub(crate) async fn publish_event(bus: &Option<EventBus>, event: NewEvent) {
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
 /// `chat:stream:delta` that do not need durable storage.
-pub(crate) fn publish_event_transient(bus: &Option<EventBus>, event: &NewEvent) -> Option<Event> {
-    bus.as_ref().map(|b| b.publish_transient(event))
+pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) -> Option<Event> {
+    bus.map(|b| b.publish_transient(event))
 }
 
 /// Best-effort workspace lookup by worktree path (§6.5). Path-scoped git
@@ -10051,15 +10034,12 @@ fn replace_request_id_values(text: &str) -> String {
     while let Some(rel) = lower[pos..].find(KEY) {
         let value_start = pos + rel + KEY.len();
         out.push_str(&text[pos..value_start]);
-        match text[value_start..].find('"') {
-            Some(end_rel) => {
-                out.push_str("<redacted>");
-                pos = value_start + end_rel;
-            }
-            None => {
-                pos = value_start;
-                break;
-            }
+        if let Some(end_rel) = text[value_start..].find('"') {
+            out.push_str("<redacted>");
+            pos = value_start + end_rel;
+        } else {
+            pos = value_start;
+            break;
         }
     }
     out.push_str(&text[pos..]);
@@ -10539,43 +10519,40 @@ impl Services {
                 format!("# {}\n\n{}", task.title, task.content)
             };
             let normalized = task.title.trim().to_lowercase();
-            let task_note_id = match existing_by_title.get(&normalized) {
-                Some(existing_id) => {
-                    // Reused child: `effort=` only applies at creation — it
-                    // never overwrites a possibly user-edited estimate on the
-                    // existing note — so an explicit attribute is surfaced as
-                    // dropped rather than silently ignored.
-                    if task.effort.is_some() {
-                        warnings.push(format!(
-                            "task block {}: effort= ignored — a task note with this \
-                             title already exists and its estimate is preserved",
-                            task_block_label(task)
-                        ));
-                    }
-                    existing_id.clone()
+            let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
+                // Reused child: `effort=` only applies at creation — it
+                // never overwrites a possibly user-edited estimate on the
+                // existing note — so an explicit attribute is surfaced as
+                // dropped rather than silently ignored.
+                if task.effort.is_some() {
+                    warnings.push(format!(
+                        "task block {}: effort= ignored — a task note with this \
+                         title already exists and its estimate is preserved",
+                        task_block_label(task)
+                    ));
                 }
-                None => {
-                    let child = self
-                        .create_child_task_note(
-                            &workspace_id,
-                            &note.id,
-                            &task.title,
-                            body,
-                            TaskStatus::NotStarted,
-                            Some(peer_order),
-                            task.effort.clone(),
-                            caller_agent_id,
-                        )
-                        .await?;
-                    existing_by_title.insert(normalized, child.id.clone());
-                    created_note_ids.push(child.id.0.clone());
-                    created_tasks.push(CreatedTaskEntry {
-                        key: task.key.clone(),
-                        title: task.title.clone(),
-                        note_id: child.id.0.clone(),
-                    });
-                    child.id
-                }
+                existing_id.clone()
+            } else {
+                let child = self
+                    .create_child_task_note(
+                        &workspace_id,
+                        &note.id,
+                        &task.title,
+                        body,
+                        TaskStatus::NotStarted,
+                        Some(peer_order),
+                        task.effort.clone(),
+                        caller_agent_id,
+                    )
+                    .await?;
+                existing_by_title.insert(normalized, child.id.clone());
+                created_note_ids.push(child.id.0.clone());
+                created_tasks.push(CreatedTaskEntry {
+                    key: task.key.clone(),
+                    title: task.title.clone(),
+                    note_id: child.id.0.clone(),
+                });
+                child.id
             };
             let placeholder = format!("<!-- task-block-placeholder-{i} -->");
             let linked = format!(
@@ -10741,7 +10718,7 @@ impl Services {
         // refresh the fence-free content live (TS parity: the reference
         // emits `note:updated` after saving the converted note).
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             note_change_event(
                 &note.workspace_id,
                 &note.id,
@@ -10809,7 +10786,7 @@ impl Services {
         // the new child task note live (TS parity: `createPrerequisiteNote`
         // routes through `createNote`, which emits `note:created`).
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             note_change_event(
                 &note.workspace_id,
                 &note.id,
@@ -10824,7 +10801,7 @@ impl Services {
         // task-ness from the `note:created` payload.
         let agent = resolve_event_agent(&self.store, caller_agent_id).await;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             task_created_event(
                 &note.workspace_id,
                 &note.id,
@@ -11097,7 +11074,7 @@ impl Services {
                 );
             }
         }
-        publish_event(&self.event_bus, settings_changed_event(&applied)).await;
+        publish_event(self.event_bus.as_ref(), settings_changed_event(&applied)).await;
     }
 
     /// Default-provider settings self-heal (monorepo#3044). When no default
@@ -11421,7 +11398,11 @@ impl WorkspaceApi for Services {
                         return Err(e);
                     }
                 }
-                publish_event(&self.event_bus, settings_changed_event(&applied.clone())).await;
+                publish_event(
+                    self.event_bus.as_ref(),
+                    settings_changed_event(&applied.clone()),
+                )
+                .await;
             }
             Ok(serde_json::json!({ "applied": applied }))
         })
@@ -11431,7 +11412,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let result = self.settings_service().reset(&path).await?;
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 settings_changed_event(std::slice::from_ref(&result)),
             )
             .await;
@@ -11556,7 +11537,7 @@ impl WorkspaceApi for Services {
                     path.as_deref(),
                 )
                 .await?;
-            publish_event(&self.event_bus, settings_changed_event(&[changed])).await;
+            publish_event(self.event_bus.as_ref(), settings_changed_event(&[changed])).await;
             Ok(rules)
         })
     }
@@ -11614,7 +11595,7 @@ impl WorkspaceApi for Services {
             let (skills, changed) =
                 skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
             if changed {
-                publish_event(&self.event_bus, skills_changed_event(&workspace_id)).await;
+                publish_event(self.event_bus.as_ref(), skills_changed_event(&workspace_id)).await;
             }
 
             // Sort by name for deterministic output
@@ -11752,15 +11733,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let opts = search_ops::parse_opts(opts)?;
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
-                Some(root) => root,
-                None => {
-                    return Ok(serde_json::json!({
-                        "requestId": request_id,
-                        "matches": [],
-                        "truncated": false,
-                    }))
-                }
+            let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
+                return Ok(serde_json::json!({
+                    "requestId": request_id,
+                    "matches": [],
+                    "truncated": false,
+                }));
             };
             // Validate opts (incl. regex) before registering, so a bad regex is
             // surfaced as InvalidParams without leaving a stale cancel token.
@@ -11795,15 +11773,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
             let limit = limit.and_then(|n| usize::try_from(n).ok());
-            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
-                Some(root) => root,
-                None => {
-                    return Ok(serde_json::json!({
-                        "requestId": request_id,
-                        "files": [],
-                        "truncated": false,
-                    }))
-                }
+            let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
+                return Ok(serde_json::json!({
+                    "requestId": request_id,
+                    "files": [],
+                    "truncated": false,
+                }));
             };
             let token = registry.register(&request_id);
             let outcome = {
@@ -11929,9 +11904,8 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(intent_search::mint_request_id);
-            let root = match search_ops::search_root(&store, &workspace_id, None).await? {
-                Some(root) => root,
-                None => return Ok(serde_json::json!({ "requestId": request_id, "matches": [] })),
+            let Some(root) = search_ops::search_root(&store, &workspace_id, None).await? else {
+                return Ok(serde_json::json!({ "requestId": request_id, "matches": [] }));
             };
             let token = registry.register(&request_id);
 
@@ -12560,7 +12534,7 @@ impl WorkspaceApi for Services {
             );
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -12593,7 +12567,7 @@ impl WorkspaceApi for Services {
             );
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -12620,7 +12594,7 @@ impl WorkspaceApi for Services {
             let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -12648,7 +12622,7 @@ impl WorkspaceApi for Services {
                 primitive_ops::agent_action(&id, &created_at, &agent_id, &goal, &description);
             append_primitive(
                 &store,
-                &bus,
+                bus.as_ref(),
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -13411,44 +13385,41 @@ impl WorkspaceApi for Services {
                                         });
                                     }
                                 };
-                                match progress.as_deref() {
-                                    Some(reporter) => {
-                                        reporter
-                                            .milestone(
-                                                "cache",
-                                                create_progress::CLONE_SEGMENT_END,
-                                                "Repository cache ready",
-                                            )
-                                            .await;
-                                    }
-                                    None => {
-                                        clone_ops::publish(
-                                            &bus_ref,
-                                            &id,
-                                            clone_ops::progress_event(
-                                                &id,
-                                                &request_id,
-                                                "checkout",
-                                                90,
-                                                "Repository cache ready",
-                                                None,
-                                            ),
+                                if let Some(reporter) = progress.as_deref() {
+                                    reporter
+                                        .milestone(
+                                            "cache",
+                                            create_progress::CLONE_SEGMENT_END,
+                                            "Repository cache ready",
                                         )
                                         .await;
-                                        clone_ops::publish(
-                                            &bus_ref,
+                                } else {
+                                    clone_ops::publish(
+                                        &bus_ref,
+                                        &id,
+                                        clone_ops::progress_event(
                                             &id,
-                                            clone_ops::done_event(
-                                                &id,
-                                                &request_id,
-                                                true,
-                                                None,
-                                                None,
-                                                None,
-                                            ),
-                                        )
-                                        .await;
-                                    }
+                                            &request_id,
+                                            "checkout",
+                                            90,
+                                            "Repository cache ready",
+                                            None,
+                                        ),
+                                    )
+                                    .await;
+                                    clone_ops::publish(
+                                        &bus_ref,
+                                        &id,
+                                        clone_ops::done_event(
+                                            &id,
+                                            &request_id,
+                                            true,
+                                            None,
+                                            None,
+                                            None,
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
@@ -13655,55 +13626,52 @@ impl WorkspaceApi for Services {
                     // existing local/remote branches with a `-N` suffix.
                     let branch_auto_generated =
                         input.branch.as_deref().is_none_or(str::is_empty);
-                    let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
-                        Some(explicit) => explicit,
-                        None => {
-                            let slug = input
-                                .initial_agent
-                                .as_ref()
-                                .and_then(|a| a.prompt.as_deref())
-                                .and_then(intent_core::slug::extract_local_slug)
-                                .unwrap_or_else(intent_core::slug::generate_workspace_slug);
-                            // Branch prefix fallback: repo config > global setting
-                            // (FE parity: workspace.service.ts L1215-1219).
-                            let prefix = if let Some(repo_path) = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                            {
-                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                                match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
-                                    Some(p) => p,
-                                    None => settings_branch_prefix,
-                                }
-                            } else {
-                                settings_branch_prefix
-                            };
-                            let desired = format!("{prefix}{slug}");
-                            let git_repo = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                                .filter(|p| p.join(".git").exists());
-                            match git_repo {
-                                Some(repo) => {
-                                    let want = desired;
-                                    tokio::task::spawn_blocking(move || {
-                                        intent_git::branches::ensure_unique_branch_name(
-                                            &repo, &want,
-                                        )
-                                    })
-                                    .await
-                                    .map_err(|e| {
-                                        Error::Internal(format!(
-                                            "branch uniquification task failed: {e}"
-                                        ))
-                                    })??
-                                }
-                                None => desired,
+                    let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
+                        let slug = input
+                            .initial_agent
+                            .as_ref()
+                            .and_then(|a| a.prompt.as_deref())
+                            .and_then(intent_core::slug::extract_local_slug)
+                            .unwrap_or_else(intent_core::slug::generate_workspace_slug);
+                        // Branch prefix fallback: repo config > global setting
+                        // (FE parity: workspace.service.ts L1215-1219).
+                        let prefix = if let Some(repo_path) = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                        {
+                            let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                            match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
+                                Some(p) => p,
+                                None => settings_branch_prefix,
                             }
+                        } else {
+                            settings_branch_prefix
+                        };
+                        let desired = format!("{prefix}{slug}");
+                        let git_repo = input
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from)
+                            .filter(|p| p.join(".git").exists());
+                        match git_repo {
+                            Some(repo) => {
+                                let want = desired;
+                                tokio::task::spawn_blocking(move || {
+                                    intent_git::branches::ensure_unique_branch_name(
+                                        &repo, &want,
+                                    )
+                                })
+                                .await
+                                .map_err(|e| {
+                                    Error::Internal(format!(
+                                        "branch uniquification task failed: {e}"
+                                    ))
+                                })??
+                            }
+                            None => desired,
                         }
                     };
                     // Normalise the caller-supplied title: trim surrounding
@@ -14474,12 +14442,12 @@ impl WorkspaceApi for Services {
                     // Inside the idempotency scope: a replayed create returns
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
-                    publish_event(&bus, workspace_created_event(&ws)).await;
+                    publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
                     // Seed the well-known `spec` note (reference parity with
                     // `notes.service.ts ensureSpecExists`). Idempotent under
                     // the replay guard: on retry the stored result comes back
                     // and this branch never re-runs.
-                    ensure_spec_note(&store, &bus, &ws.id).await?;
+                    ensure_spec_note(&store, bus.as_ref(), &ws.id).await?;
                     // Daemon-owned initial-agent orchestration (§5.1): when the
                     // request carries an `initialAgent`, always create the agent
                     // row (reference parity: `workspace.service.ts` persists the
@@ -14705,17 +14673,14 @@ impl WorkspaceApi for Services {
                                         })
                                     }),
                             };
-                            let script = match effective_script {
-                                Some(s) => s,
-                                None => {
-                                    // No script to execute: the setup stage is done.
-                                    publish_event(
-                                        &bus_for_setup,
-                                        workspace_setup_completed_event(&workspace_id, false, None),
-                                    )
-                                    .await;
-                                    return;
-                                }
+                            let Some(script) = effective_script else {
+                                // No script to execute: the setup stage is done.
+                                publish_event(
+                                    bus_for_setup.as_ref(),
+                                    workspace_setup_completed_event(&workspace_id, false, None),
+                                )
+                                .await;
+                                return;
                             };
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
@@ -14725,7 +14690,7 @@ impl WorkspaceApi for Services {
                             );
                             // A script was resolved and a spawn will be attempted.
                             publish_event(
-                                &bus_for_setup,
+                                bus_for_setup.as_ref(),
                                 workspace_setup_started_event(&workspace_id),
                             )
                             .await;
@@ -14884,7 +14849,7 @@ impl WorkspaceApi for Services {
                             }
                             };
                             publish_event(
-                                &bus_for_setup,
+                                bus_for_setup.as_ref(),
                                 workspace_setup_completed_event(
                                     &workspace_id,
                                     ran_script,
@@ -14897,7 +14862,7 @@ impl WorkspaceApi for Services {
                         // skipWorktree / no worktree provisioned: the setup stage
                         // never runs, but the lifecycle still completes.
                         publish_event(
-                            &bus_for_setup,
+                            bus_for_setup.as_ref(),
                             workspace_setup_completed_event(&ws.id, false, None),
                         )
                         .await;
@@ -15137,7 +15102,7 @@ impl WorkspaceApi for Services {
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
-            publish_event(&bus, workspace_updated_event(&ws.id, &changes)).await;
+            publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
             // PR link/status changes feed the derived displayStatus (the
             // `pr_*` rungs sit between activity and taskStats), and so does
             // the attention flag (`unread` / `review_required` axes):
@@ -15282,7 +15247,7 @@ impl WorkspaceApi for Services {
             // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
             for session in &sessions {
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     NewEvent {
                         workspace_id: id.clone(),
                         timestamp: now_iso(),
@@ -15408,7 +15373,7 @@ impl WorkspaceApi for Services {
             // that treat it as a state transition.
             match store.delete_workspace(&id).await {
                 Ok(()) => {
-                    publish_event(&bus, workspace_deleted_event(&id)).await;
+                    publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
                 }
                 Err(Error::NotFound(_)) => {
                     tracing::debug!(
@@ -15496,8 +15461,7 @@ impl WorkspaceApi for Services {
                 let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
                     matches!(
                         w.checkout_mode,
-                        Some(intent_core::CheckoutMode::Cow)
-                            | Some(intent_core::CheckoutMode::Direct)
+                        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
                     )
                 });
                 let sweep_worktree_path = deleted_worktree_path
@@ -15536,8 +15500,10 @@ impl WorkspaceApi for Services {
                                 // workspace's).
                                 let is_standalone = matches!(
                                     ws_cleanup.checkout_mode,
-                                    Some(intent_core::CheckoutMode::Cow)
-                                        | Some(intent_core::CheckoutMode::Direct)
+                                    Some(
+                                        intent_core::CheckoutMode::Cow
+                                            | intent_core::CheckoutMode::Direct
+                                    )
                                 );
                                 // Standalone-checkout removal is gated on the
                                 // root-anchored `checkout_owned` proof above
@@ -15745,7 +15711,11 @@ impl WorkspaceApi for Services {
             ) {
                 return Ok(existing);
             }
-            publish_event(&bus, workspace_delete_scheduled_event(&id, &delete_at)).await;
+            publish_event(
+                bus.as_ref(),
+                workspace_delete_scheduled_event(&id, &delete_at),
+            )
+            .await;
             Ok(delete_at)
         })
     }
@@ -15756,7 +15726,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
             if cancelled {
-                publish_event(&bus, workspace_delete_cancelled_event(&id)).await;
+                publish_event(bus.as_ref(), workspace_delete_cancelled_event(&id)).await;
             }
             Ok(cancelled)
         })
@@ -15883,7 +15853,7 @@ impl WorkspaceApi for Services {
                 // without a re-read. `archivedAt` is the same timestamp persisted
                 // on the row above.
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     workspace_updated_event(
                         &ws.id,
                         &serde_json::json!({
@@ -16069,7 +16039,7 @@ impl WorkspaceApi for Services {
             // source's `repositoryPath` — is the clone source.
             let source_standalone = matches!(
                 source.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             );
             // For a hydrated standalone source the checkout is `worktreePath`;
             // for an `isNewRepo` `direct` source there is none and the
@@ -16462,15 +16432,19 @@ impl WorkspaceApi for Services {
                     "workspace.duplicate: failed to write .workspace/workspace.json"
                 );
             }
-            publish_event(&bus, workspace_created_event(&ws)).await;
+            publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
             // `workspace.duplicate` never runs a setup script, but the setup
             // lifecycle (§6.5) still completes so clients waiting on
             // `workspace:setup:completed` converge on every create-shaped flow.
-            publish_event(&bus, workspace_setup_completed_event(&ws.id, false, None)).await;
+            publish_event(
+                bus.as_ref(),
+                workspace_setup_completed_event(&ws.id, false, None),
+            )
+            .await;
             // Seed the default spec note for the new workspace (mirrors the
             // `workspace.create` flow so `note.list` returns the well-known
             // `spec` id immediately).
-            ensure_spec_note(&store, &bus, &ws.id).await?;
+            ensure_spec_note(&store, bus.as_ref(), &ws.id).await?;
             // Copy over every non-`spec` note from the source with a freshly
             // minted id; per-note failures are logged and skipped so a single
             // bad row does not abort the duplication.
@@ -16687,7 +16661,11 @@ impl WorkspaceApi for Services {
                 // Self-sufficient `workspace:attention-changed` so every client
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
-                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+                publish_event(
+                    bus.as_ref(),
+                    attention_changed_event(&id, WorkspaceAttention::None),
+                )
+                .await;
                 // The cleared flag feeds the derived displayStatus
                 // (`review_required` axis, §6.5): recompute-and-compare.
                 this.maybe_emit_display_status_changed(&id).await;
@@ -16730,7 +16708,11 @@ impl WorkspaceApi for Services {
             if changed {
                 // The unread flag is not a displayStatus axis (§6.5), so
                 // clearing it never moves the derived rollup — no recompute.
-                publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
+                publish_event(
+                    bus.as_ref(),
+                    attention_changed_event(&id, WorkspaceAttention::None),
+                )
+                .await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
@@ -16758,7 +16740,7 @@ impl WorkspaceApi for Services {
                 metadata: None,
                 data: event.data,
             };
-            publish_event(&bus, new_event).await;
+            publish_event(bus.as_ref(), new_event).await;
             Ok(())
         })
     }
@@ -16819,7 +16801,7 @@ impl WorkspaceApi for Services {
             // Self-sufficient `workspace:updated` delta (§6.5) so live
             // clients mirror the toggle without a follow-up read.
             publish_event(
-                &bus,
+                bus.as_ref(),
                 workspace_updated_event(&id, &serde_json::json!({ "autoCommitEnabled": enabled })),
             )
             .await;
@@ -16994,7 +16976,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             store.get_workspace(&id).await?;
             let persisted = store.replace_workspace_context_items(&id, &items).await?;
-            publish_event(&bus, workspace_context_changed_event(&id, &persisted)).await;
+            publish_event(
+                bus.as_ref(),
+                workspace_context_changed_event(&id, &persisted),
+            )
+            .await;
             Ok(persisted)
         })
     }
@@ -17045,7 +17031,7 @@ impl WorkspaceApi for Services {
                 created_at: now_epoch_ms().cast_signed(),
             };
             let stored = store.upsert_task_agent_link(&link).await?;
-            publish_event(&bus, task_agent_linked_event(&stored)).await;
+            publish_event(bus.as_ref(), task_agent_linked_event(&stored)).await;
             Ok(stored)
         })
     }
@@ -17065,7 +17051,7 @@ impl WorkspaceApi for Services {
                 .await?;
             if removed {
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     task_agent_unlinked_event(&workspace_id, &note_id, &task_key),
                 )
                 .await;
@@ -17109,7 +17095,7 @@ impl WorkspaceApi for Services {
             // the winning insert already committed, or the pre-existing
             // empty/other shape when the reseed genuinely could not run.
             if !id.is_chief() {
-                if let Err(e) = ensure_spec_note(&store, &bus, &id).await {
+                if let Err(e) = ensure_spec_note(&store, bus.as_ref(), &id).await {
                     tracing::warn!(
                         workspace_id = %id.0,
                         error = %e,
@@ -17205,7 +17191,7 @@ impl WorkspaceApi for Services {
                         note = refetched;
                     }
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         note_change_event(
                             &note.workspace_id,
                             &note.id,
@@ -17296,7 +17282,7 @@ impl WorkspaceApi for Services {
                 }
             }
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17361,7 +17347,7 @@ impl WorkspaceApi for Services {
                 .map(|n| n.content)
                 .unwrap_or(new_content);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17438,7 +17424,7 @@ impl WorkspaceApi for Services {
                 .map(|n| n.content)
                 .unwrap_or(new_content);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17515,7 +17501,7 @@ impl WorkspaceApi for Services {
                 .unwrap_or(new_content);
             let total_lines_after = final_content.split('\n').count();
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17621,7 +17607,7 @@ impl WorkspaceApi for Services {
                 None => (clean, now),
             };
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17701,7 +17687,7 @@ impl WorkspaceApi for Services {
             note.updated_at = now.clone();
             store.update_note_versioned(&note, expected_version).await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -17749,7 +17735,7 @@ impl WorkspaceApi for Services {
                 .await?;
             services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
             )
             .await;
@@ -17785,7 +17771,7 @@ impl WorkspaceApi for Services {
                         .is_none_or(|b| compute_ready_task_ids(b) != ready_task_ids);
                 if ready_set_moved {
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         ready_tasks_changed_reason_event(
                             &workspace_id,
                             &ready_task_ids,
@@ -17801,7 +17787,13 @@ impl WorkspaceApi for Services {
                 // re-announce them for subscriber refetch (monorepo#1979).
                 // Other statuses were already unmet — no projection change.
                 if task.status == TaskStatus::Complete {
-                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &remaining).await;
+                    publish_dependent_note_updates(
+                        bus.as_ref(),
+                        &workspace_id,
+                        &note_id,
+                        &remaining,
+                    )
+                    .await;
                 }
                 // Deleting a task note can move the derived displayStatus
                 // rollup (§6.5), e.g. removing the last open spec-child task.
@@ -17976,7 +17968,7 @@ impl WorkspaceApi for Services {
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18062,7 +18054,7 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18095,13 +18087,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
-            let mut task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => {
-                    return Err(Error::Internal(
-                        "Note is not a task. Use markAsTask() first.".to_string(),
-                    ))
-                }
+            let Some(mut task) = note.metadata.task.clone() else {
+                return Err(Error::Internal(
+                    "Note is not a task. Use markAsTask() first.".to_string(),
+                ));
             };
             let previous_status = task.status;
             let now = now_iso();
@@ -18133,7 +18122,7 @@ impl WorkspaceApi for Services {
                     None => None,
                 };
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     task_status_changed_event(
                         &note.workspace_id,
                         &note.id,
@@ -18150,7 +18139,7 @@ impl WorkspaceApi for Services {
                 let all = store.list_notes(&note.workspace_id).await?;
                 let ready_task_ids = compute_ready_task_ids(&all);
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     ready_tasks_changed_event(
                         &note.workspace_id,
                         &ready_task_ids,
@@ -18166,7 +18155,13 @@ impl WorkspaceApi for Services {
                 // computed `unmetDependsOn` (monorepo#1979).
                 if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete)
                 {
-                    publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
+                    publish_dependent_note_updates(
+                        bus.as_ref(),
+                        &note.workspace_id,
+                        &note.id,
+                        &all,
+                    )
+                    .await;
                 }
                 // A task-status transition can move the derived displayStatus
                 // rollup (§6.5): recompute-and-compare, emitting only on an
@@ -18229,7 +18224,7 @@ impl WorkspaceApi for Services {
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18255,6 +18250,7 @@ impl WorkspaceApi for Services {
         })
     }
 
+    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -18336,9 +18332,8 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => return Err(Error::Internal("Note is not a task".to_string())),
+            let Some(task) = note.metadata.task.clone() else {
+                return Err(Error::Internal("Note is not a task".to_string()));
             };
             let all = store.list_notes(&workspace_id).await?;
             let subtasks = all
@@ -18480,7 +18475,7 @@ impl WorkspaceApi for Services {
             // (§6.5) — without this a task-ness flip is invisible until the
             // next unrelated note write.
             publish_event(
-                &services.event_bus,
+                services.event_bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18494,7 +18489,7 @@ impl WorkspaceApi for Services {
                 // Only a note that was not already a task is "created" as one.
                 None => {
                     publish_event(
-                        &services.event_bus,
+                        services.event_bus.as_ref(),
                         task_created_event(
                             &note.workspace_id,
                             &note.id,
@@ -18511,7 +18506,7 @@ impl WorkspaceApi for Services {
                 // `task.updateNoteStatus` publishes.
                 Some(previous) if previous != new_status => {
                     publish_event(
-                        &services.event_bus,
+                        services.event_bus.as_ref(),
                         task_status_changed_event(
                             &note.workspace_id,
                             &note.id,
@@ -18526,7 +18521,7 @@ impl WorkspaceApi for Services {
                     let all = store.list_notes(&note.workspace_id).await?;
                     let ready_task_ids = compute_ready_task_ids(&all);
                     publish_event(
-                        &services.event_bus,
+                        services.event_bus.as_ref(),
                         ready_tasks_changed_event(
                             &note.workspace_id,
                             &ready_task_ids,
@@ -18542,7 +18537,7 @@ impl WorkspaceApi for Services {
                     // computed `unmetDependsOn` (monorepo#1979).
                     if (previous == TaskStatus::Complete) != (new_status == TaskStatus::Complete) {
                         publish_dependent_note_updates(
-                            &services.event_bus,
+                            services.event_bus.as_ref(),
                             &note.workspace_id,
                             &note.id,
                             &all,
@@ -18559,7 +18554,7 @@ impl WorkspaceApi for Services {
                         let all = store.list_notes(&note.workspace_id).await?;
                         let ready_task_ids = compute_ready_task_ids(&all);
                         publish_event(
-                            &services.event_bus,
+                            services.event_bus.as_ref(),
                             ready_tasks_changed_reason_event(
                                 &note.workspace_id,
                                 &ready_task_ids,
@@ -18596,9 +18591,8 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let mut task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => return Err(Error::Internal("Note is not a task".to_string())),
+            let Some(mut task) = note.metadata.task.clone() else {
+                return Err(Error::Internal("Note is not a task".to_string()));
             };
             let depends_on = depends_on.map(normalize_relation_ids);
             let conflicts_with = conflicts_with.map(normalize_relation_ids);
@@ -18652,7 +18646,7 @@ impl WorkspaceApi for Services {
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
-                &services.event_bus,
+                services.event_bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18671,7 +18665,7 @@ impl WorkspaceApi for Services {
                 let all = store.list_notes(&note.workspace_id).await?;
                 let ready_task_ids = compute_ready_task_ids(&all);
                 publish_event(
-                    &services.event_bus,
+                    services.event_bus.as_ref(),
                     ready_tasks_changed_reason_event(
                         &note.workspace_id,
                         &ready_task_ids,
@@ -18779,9 +18773,8 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let mut task = match note.metadata.task.clone() {
-                Some(t) => t,
-                None => return Err(Error::Internal(format!("Note {note_id} is not a task"))),
+            let Some(mut task) = note.metadata.task.clone() else {
+                return Err(Error::Internal(format!("Note {note_id} is not a task")));
             };
             let agent = AgentId::from(agent_id.as_str());
             let already_assigned = task.assigned_agent_ids.contains(&agent);
@@ -18833,7 +18826,7 @@ impl WorkspaceApi for Services {
             // (→ `task:status-changed` + ready-tasks recompute), so
             // subscribers see the delegation live.
             publish_event(
-                &bus,
+                bus.as_ref(),
                 note_change_event(
                     &note.workspace_id,
                     &note.id,
@@ -18845,7 +18838,7 @@ impl WorkspaceApi for Services {
             .await;
             if should_update_status {
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     task_status_changed_event(
                         &note.workspace_id,
                         &note.id,
@@ -18860,7 +18853,7 @@ impl WorkspaceApi for Services {
                 let all = store.list_notes(&note.workspace_id).await?;
                 let ready_task_ids = compute_ready_task_ids(&all);
                 publish_event(
-                    &bus,
+                    bus.as_ref(),
                     ready_tasks_changed_event(
                         &note.workspace_id,
                         &ready_task_ids,
@@ -19119,7 +19112,7 @@ impl WorkspaceApi for Services {
                     // markdown; without it clients hold a stale rev and hit
                     // spurious conflicts on their next versioned write.
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         note_change_event(
                             &workspace_id,
                             &note_id,
@@ -19130,7 +19123,7 @@ impl WorkspaceApi for Services {
                     )
                     .await;
                     publish_event(
-                        &bus,
+                        bus.as_ref(),
                         comment_added_event(&workspace_id, &note_id, &comment_id),
                     )
                     .await;
@@ -19305,14 +19298,13 @@ impl WorkspaceApi for Services {
             }
             fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let all = store.list_comments(&note_id).await?;
-            let target = match thread_id {
-                Some(t) => t,
-                None => {
-                    let cid = comment_id.unwrap();
-                    match all.iter().find(|c| c.id == cid) {
-                        Some(c) => c.thread_id.clone(),
-                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
-                    }
+            let target = if let Some(t) = thread_id {
+                t
+            } else {
+                let cid = comment_id.unwrap();
+                match all.iter().find(|c| c.id == cid) {
+                    Some(c) => c.thread_id.clone(),
+                    None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
                 }
             };
             let mut group: Vec<Comment> =
@@ -19404,14 +19396,13 @@ impl WorkspaceApi for Services {
             let all = store
                 .list_comments_in_workspace(&workspace_id, &note_id)
                 .await?;
-            let (target, parent_from_id) = match thread_id {
-                Some(t) => (t, None),
-                None => {
-                    let cid = comment_id.unwrap();
-                    match all.iter().find(|c| c.id == cid).cloned() {
-                        Some(c) => (c.thread_id.clone(), Some(c)),
-                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
-                    }
+            let (target, parent_from_id) = if let Some(t) = thread_id {
+                (t, None)
+            } else {
+                let cid = comment_id.unwrap();
+                match all.iter().find(|c| c.id == cid).cloned() {
+                    Some(c) => (c.thread_id.clone(), Some(c)),
+                    None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
                 }
             };
             let mut group: Vec<Comment> = all
@@ -19469,7 +19460,7 @@ impl WorkspaceApi for Services {
             // `comment.add`; publish `comment:added` so the comment channel
             // pushes the new reply without a re-read (§6.5).
             publish_event(
-                &bus,
+                bus.as_ref(),
                 comment_added_event(&workspace_id, &note_id, &reply.id),
             )
             .await;
@@ -19524,14 +19515,13 @@ impl WorkspaceApi for Services {
             }
             fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let all = store.list_comments(&note_id).await?;
-            let target = match thread_id {
-                Some(t) => t,
-                None => {
-                    let cid = comment_id.unwrap();
-                    match all.iter().find(|c| c.id == cid) {
-                        Some(c) => c.thread_id.clone(),
-                        None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
-                    }
+            let target = if let Some(t) = thread_id {
+                t
+            } else {
+                let cid = comment_id.unwrap();
+                match all.iter().find(|c| c.id == cid) {
+                    Some(c) => c.thread_id.clone(),
+                    None => return Err(Error::Internal(format!("Comment not found: {cid}"))),
                 }
             };
             let count = all.iter().filter(|c| c.thread_id == target).count();
@@ -19547,7 +19537,7 @@ impl WorkspaceApi for Services {
                 .set_thread_status(&workspace_id, &target, new_status, &now_iso())
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 comment_resolved_event(&workspace_id, &note_id, &target, resolved),
             )
             .await;
@@ -20064,29 +20054,27 @@ impl WorkspaceApi for Services {
             } else {
                 git_path.join("config")
             };
-            match tokio::fs::read_to_string(&config_path).await {
-                Ok(content) => Ok(content),
-                Err(_) => {
-                    // If direct read fails, try parent directories (mirroring the FE
-                    // `readGitConfig` fallback logic for nested repos). Limit the walk
-                    // to prevent data exposure from climbing too far.
-                    const MAX_PARENT_LEVELS: usize = 5;
-                    let mut current = path.as_path();
-                    for _ in 0..MAX_PARENT_LEVELS {
-                        if let Some(parent) = current.parent() {
-                            let parent_git_config = parent.join(".git").join("config");
-                            if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await
-                            {
-                                return Ok(content);
-                            }
-                            current = parent;
-                        } else {
-                            break;
+            if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
+                Ok(content)
+            } else {
+                // If direct read fails, try parent directories (mirroring the FE
+                // `readGitConfig` fallback logic for nested repos). Limit the walk
+                // to prevent data exposure from climbing too far.
+                const MAX_PARENT_LEVELS: usize = 5;
+                let mut current = path.as_path();
+                for _ in 0..MAX_PARENT_LEVELS {
+                    if let Some(parent) = current.parent() {
+                        let parent_git_config = parent.join(".git").join("config");
+                        if let Ok(content) = tokio::fs::read_to_string(&parent_git_config).await {
+                            return Ok(content);
                         }
+                        current = parent;
+                    } else {
+                        break;
                     }
-                    // No config found in the parent chain (or hit depth limit).
-                    Ok(String::new())
                 }
+                // No config found in the parent chain (or hit depth limit).
+                Ok(String::new())
             }
         })
     }
@@ -20215,7 +20203,7 @@ impl WorkspaceApi for Services {
                 .await?;
             // Notify the FE bridge so the changes view refreshes without a
             // follow-up `git.status` read (parity with `git.stage`).
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20249,7 +20237,7 @@ impl WorkspaceApi for Services {
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
                 })
                 .await?;
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20312,11 +20300,11 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_push_event(&ws.id, &outcome.branch, &outcome.pushed_sha, force),
             )
             .await;
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({
                 "branch": outcome.branch,
                 "pushedSha": outcome.pushed_sha,
@@ -20367,7 +20355,7 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             // Refresh the FE change view without a follow-up `git.status` read.
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(())
         })
     }
@@ -20405,12 +20393,16 @@ impl WorkspaceApi for Services {
                     created
                 })
                 .await?;
-            publish_event(&bus, git_branch_event(&ws.id, "create", &branch_name, None)).await;
+            publish_event(
+                bus.as_ref(),
+                git_branch_event(&ws.id, "create", &branch_name, None),
+            )
+            .await;
             if checkout {
                 let status = intent_git::status::status(&worktree)
                     .unwrap_or_else(|_| intent_git::status::empty_status());
                 let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+                publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             }
             Ok(serde_json::json!({ "branch": branch_name }))
         })
@@ -20446,14 +20438,14 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_branch_event(&ws.id, "checkout", &branch_name, None),
             )
             .await;
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({ "branch": branch_name }))
         })
     }
@@ -20507,7 +20499,7 @@ impl WorkspaceApi for Services {
                 })
                 .await?;
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_branch_event(&ws.id, "rename", &trimmed_new, Some(&old_branch_name)),
             )
             .await;
@@ -20516,7 +20508,7 @@ impl WorkspaceApi for Services {
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(serde_json::json!({
                 "oldBranch": old_branch_name,
                 "newBranch": trimmed_new,
@@ -20634,12 +20626,16 @@ impl WorkspaceApi for Services {
                     // shape; `changes:git-status` feeds the FE bridge's
                     // `git:status-changed` relay so the UI refreshes without a
                     // follow-up `git.status` read.
-                    publish_event(&event_bus, git_pull_event(&ws.id, &branch_name)).await;
+                    publish_event(event_bus.as_ref(), git_pull_event(&ws.id, &branch_name)).await;
                     let status = intent_git::status::status(std::path::Path::new(&repo_path))
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(&event_bus, changes_git_status_event(&ws.id, &status_json)).await;
+                    publish_event(
+                        event_bus.as_ref(),
+                        changes_git_status_event(&ws.id, &status_json),
+                    )
+                    .await;
                 }
             }
             Ok(outcome)
@@ -20765,6 +20761,21 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         Box::pin(async move {
+            // RAII clear for the single-flight slot: `Drop` runs even when
+            // the detached task panics mid-ensure, so the flag can never
+            // leak into a permanently-busy state. Poisoned locks recover via
+            // `into_inner` — the guarded Option is trivially valid — so a
+            // panic while the tiny critical section is held cannot brick the
+            // method either.
+            struct WarmSlotClear(Arc<Mutex<Option<(String, String)>>>);
+            impl Drop for WarmSlotClear {
+                fn drop(&mut self) {
+                    *self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+            }
             let url = github_url.trim().to_string();
             let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
                 return Err(Error::InvalidParams(format!(
@@ -20795,21 +20806,6 @@ impl WorkspaceApi for Services {
                 &worktrees_location,
             )?
             .join(".repo-cache");
-            // RAII clear for the single-flight slot: `Drop` runs even when
-            // the detached task panics mid-ensure, so the flag can never
-            // leak into a permanently-busy state. Poisoned locks recover via
-            // `into_inner` — the guarded Option is trivially valid — so a
-            // panic while the tiny critical section is held cannot brick the
-            // method either.
-            struct WarmSlotClear(Arc<Mutex<Option<(String, String)>>>);
-            impl Drop for WarmSlotClear {
-                fn drop(&mut self) {
-                    *self
-                        .0
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                }
-            }
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {
@@ -20909,7 +20905,7 @@ impl WorkspaceApi for Services {
                     // the FE bridge's `git:status-changed` relay so the UI
                     // refreshes without a follow-up `git.status` read.
                     publish_event(
-                        &event_bus,
+                        event_bus.as_ref(),
                         git_commit_event(&ws.id, &outcome.hash, &event_message, &outcome.files),
                     )
                     .await;
@@ -20917,7 +20913,11 @@ impl WorkspaceApi for Services {
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
                         serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(&event_bus, changes_git_status_event(&ws.id, &status_json)).await;
+                    publish_event(
+                        event_bus.as_ref(),
+                        changes_git_status_event(&ws.id, &status_json),
+                    )
+                    .await;
                     Ok(intent_core::GitCommitResult {
                         hash: outcome.hash,
                         files: outcome.files,
@@ -21087,14 +21087,14 @@ impl WorkspaceApi for Services {
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
             // relay so the UI refreshes without a follow-up `git.status` read.
             publish_event(
-                &bus,
+                bus.as_ref(),
                 git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
             )
             .await;
             let status = intent_git::status::status(&worktree)
                 .unwrap_or_else(|_| intent_git::status::empty_status());
             let status_json = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            publish_event(&bus, changes_git_status_event(&ws.id, &status_json)).await;
+            publish_event(bus.as_ref(), changes_git_status_event(&ws.id, &status_json)).await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
                 files: outcome.files,
@@ -21405,9 +21405,8 @@ impl WorkspaceApi for Services {
             let limit = pagination::clamp_limit(limit);
             let skip = pagination::parse_offset(page_token.as_deref());
             let empty = serde_json::json!({ "items": [], "nextToken": serde_json::Value::Null });
-            let ws = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(_) => return Ok(empty),
+            let Ok(ws) = store.get_workspace(&workspace_id).await else {
+                return Ok(empty);
             };
             // `gitRootId` is validated before the remote early-return (same
             // policy as `git_status`).
@@ -21864,83 +21863,80 @@ impl WorkspaceApi for Services {
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
-            match self.agent_manager() {
-                Some(manager) => {
-                    // Construct TurnOptions only when the manager is attached
-                    // to avoid cloning large payloads on the fallback path.
-                    let options = crate::agent_manager::TurnOptions {
-                        stdin_context,
-                        note_ids,
-                        context_references,
-                        image_blocks,
-                        file_blocks,
-                        message_metadata,
-                        origin,
-                        ..crate::agent_manager::TurnOptions::default()
-                    };
-                    if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
-                        manager
-                            .interrupt_send_message(
-                                agent_id,
-                                workspace_id,
-                                content,
-                                message_id,
-                                options,
-                            )
-                            .await
-                    } else {
-                        manager
-                            .send_message(agent_id, workspace_id, content, message_id, options)
-                            .await
-                    }
-                }
-                None => {
-                    // Question hold (PROTOCOL §5.5): the store-only fallback
-                    // must honor the automatic-delivery gate too — the row it
-                    // persists would bury the pending Q&A. User-originated
-                    // sends pass through (never held; only an answer-tagged
-                    // row or `agent.dismissQuestions` releases the hold).
-                    if !origin.is_user() && self.question_hold_active(&agent_id).await {
-                        self.require_agent_session(&agent_id).await?;
-                        let (queued, position) = self.enqueue_message(
-                            &agent_id,
+            if let Some(manager) = self.agent_manager() {
+                // Construct TurnOptions only when the manager is attached
+                // to avoid cloning large payloads on the fallback path.
+                let options = crate::agent_manager::TurnOptions {
+                    stdin_context,
+                    note_ids,
+                    context_references,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                    origin,
+                    ..crate::agent_manager::TurnOptions::default()
+                };
+                if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
+                    manager
+                        .interrupt_send_message(
+                            agent_id,
+                            workspace_id,
                             content,
-                            image_blocks,
-                            file_blocks,
-                            message_metadata,
-                            None,
-                            crate::agent_ops::is_interrupt_priority(priority.as_deref()),
-                        );
-                        let result = serde_json::json!({
-                            "success": true,
-                            "queued": true,
-                            "heldForQuestions": true,
-                            "queuedMessage": queued.to_value(position),
-                            "turnId": queued.turn_id,
-                        });
-                        self.publish_queue_updated(&agent_id).await;
-                        // Race close (hold-check → enqueue vs a concurrent
-                        // `dismissQuestions`/answer): this `None` arm only
-                        // runs with no `AgentManager` attached, so there is
-                        // no drain to kick here — same as the other
-                        // store-only fallbacks.
-                        return Ok(result);
-                    }
-                    // Read-only fallback (no `agent_manager` wired): plumb
-                    // `messageMetadata` through the store-only append so the
-                    // persisted row matches the production
-                    // `AgentManager::send_message` path above.
-                    // STAB-7: image_blocks and file_blocks ARE forwarded now.
-                    self.agent_send_message_op(
-                        agent_id,
+                            message_id,
+                            options,
+                        )
+                        .await
+                } else {
+                    manager
+                        .send_message(agent_id, workspace_id, content, message_id, options)
+                        .await
+                }
+            } else {
+                // Question hold (PROTOCOL §5.5): the store-only fallback
+                // must honor the automatic-delivery gate too — the row it
+                // persists would bury the pending Q&A. User-originated
+                // sends pass through (never held; only an answer-tagged
+                // row or `agent.dismissQuestions` releases the hold).
+                if !origin.is_user() && self.question_hold_active(&agent_id).await {
+                    self.require_agent_session(&agent_id).await?;
+                    let (queued, position) = self.enqueue_message(
+                        &agent_id,
                         content,
-                        message_id,
                         image_blocks,
                         file_blocks,
                         message_metadata,
-                    )
-                    .await
+                        None,
+                        crate::agent_ops::is_interrupt_priority(priority.as_deref()),
+                    );
+                    let result = serde_json::json!({
+                        "success": true,
+                        "queued": true,
+                        "heldForQuestions": true,
+                        "queuedMessage": queued.to_value(position),
+                        "turnId": queued.turn_id,
+                    });
+                    self.publish_queue_updated(&agent_id).await;
+                    // Race close (hold-check → enqueue vs a concurrent
+                    // `dismissQuestions`/answer): this `None` arm only
+                    // runs with no `AgentManager` attached, so there is
+                    // no drain to kick here — same as the other
+                    // store-only fallbacks.
+                    return Ok(result);
                 }
+                // Read-only fallback (no `agent_manager` wired): plumb
+                // `messageMetadata` through the store-only append so the
+                // persisted row matches the production
+                // `AgentManager::send_message` path above.
+                // STAB-7: image_blocks and file_blocks ARE forwarded now.
+                self.agent_send_message_op(
+                    agent_id,
+                    content,
+                    message_id,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                )
+                .await
             }
         })
     }
@@ -22015,52 +22011,48 @@ impl WorkspaceApi for Services {
                 file_blocks,
                 ..Default::default()
             };
-            match self.agent_manager() {
-                Some(manager) => {
-                    manager
-                        .edit_and_regenerate(
-                            agent_id,
-                            workspace_id,
-                            message_id,
-                            content,
-                            model,
-                            options,
-                        )
-                        .await
-                }
-                None => {
-                    // Store-level fallback (no `agent_manager` wired — UDS unit
-                    // harnesses): validate + optional model switch + truncate +
-                    // persist the edited message, without the runtime
-                    // stop/recreate/regenerate orchestration (which requires a
-                    // live manager).
-                    self.agent_validate_edit_target_op(&agent_id, &message_id)
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .edit_and_regenerate(
+                        agent_id,
+                        workspace_id,
+                        message_id,
+                        content,
+                        model,
+                        options,
+                    )
+                    .await
+            } else {
+                // Store-level fallback (no `agent_manager` wired — UDS unit
+                // harnesses): validate + optional model switch + truncate +
+                // persist the edited message, without the runtime
+                // stop/recreate/regenerate orchestration (which requires a
+                // live manager).
+                self.agent_validate_edit_target_op(&agent_id, &message_id)
+                    .await?;
+                if let Some(model_id) = model {
+                    self.agent_set_model_op(agent_id.clone(), model_id, None)
                         .await?;
-                    if let Some(model_id) = model {
-                        self.agent_set_model_op(agent_id.clone(), model_id, None)
-                            .await?;
-                    }
-                    let truncated_count =
-                        self.agent_edit_truncate_op(&agent_id, &message_id).await?;
-                    let result = self
-                        .agent_send_message_op(
-                            agent_id,
-                            content,
-                            None,
-                            options.image_blocks,
-                            options.file_blocks,
-                            None,
-                        )
-                        .await?;
-                    let mut result = result;
-                    if let Some(obj) = result.as_object_mut() {
-                        obj.insert(
-                            "truncatedCount".to_string(),
-                            serde_json::json!(truncated_count),
-                        );
-                    }
-                    Ok(result)
                 }
+                let truncated_count = self.agent_edit_truncate_op(&agent_id, &message_id).await?;
+                let result = self
+                    .agent_send_message_op(
+                        agent_id,
+                        content,
+                        None,
+                        options.image_blocks,
+                        options.file_blocks,
+                        None,
+                    )
+                    .await?;
+                let mut result = result;
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "truncatedCount".to_string(),
+                        serde_json::json!(truncated_count),
+                    );
+                }
+                Ok(result)
             }
         })
     }
@@ -23490,53 +23482,52 @@ impl WorkspaceApi for Services {
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
             let cache_root = cache_parent.join(".repo-cache");
-            match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
-                Some(cached) => {
-                    let mut result = serde_json::json!({
-                        "cached": true,
-                        "source": "cache",
-                        "branches": cached.branches,
-                    });
-                    // `defaultBranch` is optional on the wire: omitted (not
-                    // null) when `origin/HEAD` is unresolvable.
-                    if let Some(default) = cached.default_branch {
-                        result["defaultBranch"] = serde_json::Value::String(default);
-                    }
-                    Ok(result)
+            if let Some(cached) =
+                intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
+            {
+                let mut result = serde_json::json!({
+                    "cached": true,
+                    "source": "cache",
+                    "branches": cached.branches,
+                });
+                // `defaultBranch` is optional on the wire: omitted (not
+                // null) when `origin/HEAD` is unresolvable.
+                if let Some(default) = cached.default_branch {
+                    result["defaultBranch"] = serde_json::Value::String(default);
                 }
+                Ok(result)
+            } else {
                 // Cold cache: fall back to one `git ls-remote` against the
                 // GitHub remote (monorepo#1955) — one child process, one
                 // round-trip, token offered via env exactly like the clone
                 // pipeline. Any failure (offline, missing repo, no access)
                 // folds to the pre-fallback `{ cached: false, branches: [] }`
                 // — this method never errors for the FE seam.
-                None => {
-                    let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
-                    let url = format!("{base}/{owner}/{repo}.git");
-                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
-                    match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
-                        Ok(remote) => {
-                            let mut result = serde_json::json!({
-                                "cached": false,
-                                "source": "ls-remote",
-                                "branches": remote.branches,
-                            });
-                            if let Some(default) = remote.default_branch {
-                                result["defaultBranch"] = serde_json::Value::String(default);
-                            }
-                            Ok(result)
+                let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
+                let url = format!("{base}/{owner}/{repo}.git");
+                let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
+                    Ok(remote) => {
+                        let mut result = serde_json::json!({
+                            "cached": false,
+                            "source": "ls-remote",
+                            "branches": remote.branches,
+                        });
+                        if let Some(default) = remote.default_branch {
+                            result["defaultBranch"] = serde_json::Value::String(default);
                         }
-                        Err(e) => {
-                            tracing::debug!(
-                                owner = %owner,
-                                repo = %repo,
-                                "branches.listCached ls-remote fallback failed: {e}"
-                            );
-                            Ok(serde_json::json!({
-                                "cached": false,
-                                "branches": [],
-                            }))
-                        }
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            owner = %owner,
+                            repo = %repo,
+                            "branches.listCached ls-remote fallback failed: {e}"
+                        );
+                        Ok(serde_json::json!({
+                            "cached": false,
+                            "branches": [],
+                        }))
                     }
                 }
             }
@@ -23752,7 +23743,7 @@ impl WorkspaceApi for Services {
                 *slot = None;
             }
             github_auth_ops::delete_stored_token(&secrets).await?;
-            publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
+            publish_event(bus.as_ref(), github_auth_ops::auth_changed_event("revoked")).await;
             if logout_gh {
                 // Detached + fail-soft (same pattern as the login sync): a
                 // logout failure can never fail or delay the revoke.
@@ -24225,9 +24216,8 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let parsed = file_tracking_ops::parse_filter(filter.as_ref());
             let worktree = ft_worktree(&store, &workspace_id).await;
-            let rows = match store.list_tracked_changes(&workspace_id).await {
-                Ok(r) => r,
-                Err(_) => return Ok(empty_changes_result()),
+            let Ok(rows) = store.list_tracked_changes(&workspace_id).await else {
+                return Ok(empty_changes_result());
             };
             Ok(file_tracking_ops::build_changes_result(
                 rows,
@@ -24270,9 +24260,8 @@ impl WorkspaceApi for Services {
             else {
                 return Ok(empty);
             };
-            let ws = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(_) => return Ok(empty),
+            let Ok(ws) = store.get_workspace(&workspace_id).await else {
+                return Ok(empty);
             };
             if ws.is_remote {
                 return Ok(empty);
@@ -24875,7 +24864,7 @@ impl Services {
         if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
-        publish_event(&bus, workspace_updated_event(&ws.id, &changes)).await;
+        publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
         Ok(ws)
     }
 
@@ -25130,9 +25119,8 @@ impl Services {
         files: Option<Vec<String>>,
     ) -> Result<serde_json::Value> {
         accept_changes::validate_action(&action)?;
-        let ws = match self.store.get_workspace(&workspace_id).await {
-            Ok(w) => w,
-            Err(_) => return Ok(accept_changes::prepare_invalid("Workspace not found")),
+        let Ok(ws) = self.store.get_workspace(&workspace_id).await else {
+            return Ok(accept_changes::prepare_invalid("Workspace not found"));
         };
         let Some(worktree) = git_ops::worktree_path(&ws) else {
             return Ok(accept_changes::prepare_invalid("Workspace has no path"));
@@ -25556,7 +25544,7 @@ impl Services {
         ws.active_pull_request = Some(info);
         ws.updated_at = now_iso();
         self.store.update_workspace(&ws).await?;
-        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+        publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
         self.maybe_emit_display_status_changed(workspace_id).await;
 
         let _ = worktree; // attribution move below is workspace-scoped.
@@ -25598,7 +25586,7 @@ impl Services {
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;
-                publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&workspace_id).await;
                 self.ac_move_stage(&workspace_id, "pull_request", "merged")
                     .await;
@@ -25668,7 +25656,7 @@ impl Services {
 
         let status = accept_changes::build_git_status_value(&worktree, &ws)?;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             changes_git_status_event(&workspace_id, &status.clone()),
         )
         .await;
@@ -25752,9 +25740,8 @@ impl Services {
         if metadata.is_empty() {
             return;
         }
-        let status = match intent_git::status::status(worktree) {
-            Ok(s) => s,
-            Err(_) => return,
+        let Ok(status) = intent_git::status::status(worktree) else {
+            return;
         };
         let mut by_path: HashMap<String, (bool, &'static str)> = HashMap::new();
         for f in &status.files {
@@ -25857,18 +25844,14 @@ impl Services {
         steps: &mut Vec<serde_json::Value>,
         result: &mut serde_json::Map<String, serde_json::Value>,
     ) -> std::result::Result<(), serde_json::Value> {
-        let status = match intent_git::status::status(worktree) {
-            Ok(s) => s,
-            Err(_) => {
-                return Err(ac_step_failure(
-                    steps.clone(),
-                    "reset-to-trunk",
-                    "Reset to trunk",
-                    Some("Failed to verify worktree state"),
-                    "Unable to verify worktree is clean before reset. Please try again."
-                        .to_string(),
-                ));
-            }
+        let Ok(status) = intent_git::status::status(worktree) else {
+            return Err(ac_step_failure(
+                steps.clone(),
+                "reset-to-trunk",
+                "Reset to trunk",
+                Some("Failed to verify worktree state"),
+                "Unable to verify worktree is clean before reset. Please try again.".to_string(),
+            ));
         };
         if !status.files.is_empty() {
             return Err(ac_step_failure(
@@ -26300,16 +26283,13 @@ impl Services {
                     ));
                 }
             };
-            if let Err(e) = self
-                .ac_advance_trunk(
-                    worktree,
-                    trunk,
-                    &commit_hash,
-                    has_remote_trunk,
-                    token.as_deref(),
-                )
-                .await
-            {
+            if let Err(e) = self.ac_advance_trunk(
+                worktree,
+                trunk,
+                &commit_hash,
+                has_remote_trunk,
+                token.as_deref(),
+            ) {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -26332,16 +26312,13 @@ impl Services {
                     ));
                 }
             };
-            if let Err(e) = self
-                .ac_advance_trunk(
-                    worktree,
-                    trunk,
-                    &current,
-                    has_remote_trunk,
-                    token.as_deref(),
-                )
-                .await
-            {
+            if let Err(e) = self.ac_advance_trunk(
+                worktree,
+                trunk,
+                &current,
+                has_remote_trunk,
+                token.as_deref(),
+            ) {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -26377,7 +26354,8 @@ impl Services {
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
     /// `token` is the caller-resolved GitHub token (the merge flow resolves it
     /// once via [`Self::ac_git_token`] and threads it through).
-    async fn ac_advance_trunk(
+    #[allow(clippy::unused_self)] // instance method for parity with the other ac_* steps
+    fn ac_advance_trunk(
         &self,
         worktree: &Path,
         trunk: &str,
@@ -26411,7 +26389,7 @@ impl Services {
             _ => serde_json::Value::Null,
         };
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
@@ -26430,7 +26408,7 @@ impl Services {
             if let Ok(status) = accept_changes::build_git_status_value_with(worktree, &ws, scanned)
             {
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     changes_git_status_event(workspace_id, &status),
                 )
                 .await;
@@ -26954,8 +26932,8 @@ pub(crate) fn discover_providers_with_npx() -> serde_json::Value {
 /// override flips `installed` / `secondaryResolved`, while `resolvedPath` /
 /// `secondaryResolvedPath` stay auto-detected (a `secondaryResolved: true`
 /// entry can therefore omit `secondaryResolvedPath`).
-pub fn discover_providers_with_npx_overrides(
-    provider_paths: &std::collections::HashMap<String, String>,
+pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
+    provider_paths: &std::collections::HashMap<String, String, S>,
 ) -> serde_json::Value {
     let providers = discovery_cache::discover_providers_cached(provider_paths);
     let npx_status = intent_providers::probe_npx();

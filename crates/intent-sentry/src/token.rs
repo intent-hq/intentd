@@ -89,7 +89,7 @@ async fn file_store_credentials() -> Option<Credentials> {
     });
     let pair = match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(pair)))) => pair,
-        Ok(Ok(Ok(None))) => return None,
+        Ok(Ok(Ok(None)) | Err(_)) => return None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 error = %e,
@@ -97,7 +97,6 @@ async fn file_store_credentials() -> Option<Credentials> {
             );
             return None;
         }
-        Ok(Err(_)) => return None,
         Err(_) => {
             tracing::warn!("secrets-store load timed out for sentry credentials");
             return None;

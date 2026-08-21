@@ -610,19 +610,18 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
             line: c.line,
             created_at: c.created_at,
         };
-        match map.get_mut(&root) {
-            Some(thread) => thread.comments.push(tc),
-            None => {
-                order.push(root);
-                map.insert(
-                    root,
-                    ReviewThread {
-                        id: format!("rest-thread-{root}"),
-                        is_resolved: false,
-                        comments: vec![tc],
-                    },
-                );
-            }
+        if let Some(thread) = map.get_mut(&root) {
+            thread.comments.push(tc);
+        } else {
+            order.push(root);
+            map.insert(
+                root,
+                ReviewThread {
+                    id: format!("rest-thread-{root}"),
+                    is_resolved: false,
+                    comments: vec![tc],
+                },
+            );
         }
     }
     order.into_iter().filter_map(|id| map.remove(&id)).collect()
@@ -700,6 +699,9 @@ pub struct MergeRequirementsThreads {
 /// [`merge_requirements`] from a [`PullRequest`] snapshot, the host's
 /// [`MergeRequirementSignals`], and the already-aggregated review / thread
 /// rollups.
+// The bool fields mirror the wire checklist shape; grouping them would
+// change the serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirements {

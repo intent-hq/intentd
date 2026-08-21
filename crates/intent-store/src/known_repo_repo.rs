@@ -77,6 +77,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_known_repo_row(r: &SqliteRow) -> Result<KnownRepo> {
     Ok(KnownRepo {
         path: r.get("path"),

@@ -287,9 +287,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => return None,
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -1098,6 +1097,7 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
     );
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Session-status lifecycle persistence (P0 — chat-spinner clear). A normal
 /// `agent.sendMessage` turn must drive the persisted `agent_session.status`
 /// through `Idle → active → idle` and emit the matching
@@ -2811,17 +2811,17 @@ async fn agent_diagnostics_reports_subtree_memory_over_wss() {
 /// and parks the child so the watch persists for observation.
 #[tokio::test]
 async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
+    // Parent fires `delegate_task` with instructions carrying a marker; the
+    // delegated child sees the marker in its first prompt and parks. The
+    // parent then returns end_turn and goes idle — the watch persists because
+    // the child never completes.
+    const CHILD_MARK: &str = "AUDIT_P2_1B_PARK_CHILD";
     let Some(script) = gate("WSS waitingForAgentIds E2E") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    // Parent fires `delegate_task` with instructions carrying a marker; the
-    // delegated child sees the marker in its first prompt and parks. The
-    // parent then returns end_turn and goes idle — the watch persists because
-    // the child never completes.
-    const CHILD_MARK: &str = "AUDIT_P2_1B_PARK_CHILD";
     // Post-WSAPI-8: replace discrete `delegate_task` with the unified
     // `workspace_api` tool routing through `ws.agent.delegate`.
     let delegate_js = format!(
@@ -3121,6 +3121,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     );
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// WAKE-1: `after_all` delegation fan-in over WSS, end to end. A parent fires
 /// TWO MCP `delegate_task` calls with `waitMode: "after_all"`; each child
 /// reports via `report_to_parent` (suppressed — no immediate parent message)
@@ -3134,17 +3135,17 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
 ///   events observed on the wire for both transitions.
 #[tokio::test]
 async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
+    const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
+    const CHILD_B: &str = "WAKE1_CHILD_BETA";
+    const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
+    const REPORT_B: &str = "REPORT_BETA finished the beta task";
+    const PARENT_GO: &str = "WAKE1_PARENT_GO";
     let Some(script) = gate("WSS after_all aggregated wake E2E") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
-    const CHILD_B: &str = "WAKE1_CHILD_BETA";
-    const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
-    const REPORT_B: &str = "REPORT_BETA finished the beta task";
-    const PARENT_GO: &str = "WAKE1_PARENT_GO";
     // Post-WSAPI-8: agents drive the workspace through the unified
     // `workspace_api` tool + `ws.*` bindings; the discrete
     // `delegate_task` / `report_to_parent` tools are gone.
@@ -3456,15 +3457,15 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
 /// milestone independently and never gate one on the other.
 #[tokio::test]
 async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss() {
+    const CHILD_TAG: &str = "SUB2_WSS_CHILD";
+    const REPORT: &str = "SUB2_WSS_REPORT shipped the thing";
+    const PARENT_GO: &str = "SUB2_WSS_PARENT_GO";
     let Some(script) = gate("WSS reportToParent SUB-2 E2E") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    const CHILD_TAG: &str = "SUB2_WSS_CHILD";
-    const REPORT: &str = "SUB2_WSS_REPORT shipped the thing";
-    const PARENT_GO: &str = "SUB2_WSS_PARENT_GO";
     // The child reports via the unified `workspace_api` tool + `ws.*` binding
     // (post-WSAPI-8: discrete `report_to_parent` MCP tool is gone).
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
@@ -3582,12 +3583,11 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let mut parent_wake_ends = 0u32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out waiting for wake milestones: parent_idle_count={parent_idle_count} \
                  parent_wake_ends={parent_wake_ends} child_idle={child_idle} child_id={child_id:?}"
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
@@ -3723,12 +3723,11 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
 ///    `attention_request_foreground_automatic_delivery_negative_over_wss`.)
 #[tokio::test]
 async fn attention_request_discussion_over_wss() {
+    const CHILD_MARKER: &str = "ATTN_DISCUSS_CHILD";
+    const REASON: &str = "ATTN_WSS need a decision on the migration approach";
     let Some(script) = gate("WSS attention-request discussion E2E") else {
         return;
     };
-
-    const CHILD_MARKER: &str = "ATTN_DISCUSS_CHILD";
-    const REASON: &str = "ATTN_WSS need a decision on the migration approach";
 
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
@@ -3826,14 +3825,13 @@ async fn attention_request_discussion_over_wss() {
         && task_changed.is_some()
         && idle)
     {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} raise_updated={raise_updated} \
                  system_message={system_message} task_changed={t} idle={idle}",
                 a = attention.is_some(),
                 t = task_changed.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -3977,9 +3975,8 @@ async fn attention_request_discussion_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for attentionRequestCleared"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for attentionRequestCleared")
         };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:updated"
@@ -4029,9 +4026,8 @@ async fn attention_request_discussion_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(re_raised && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the re-raise: re_raised={re_raised} idle={idle}"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the re-raise: re_raised={re_raised} idle={idle}")
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4062,11 +4058,8 @@ async fn attention_request_discussion_over_wss() {
     assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => {
-                panic!("timed out waiting for the automatic delivery's attentionRequestCleared")
-            }
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the automatic delivery's attentionRequestCleared")
         };
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:updated"
@@ -4112,12 +4105,11 @@ async fn attention_request_discussion_over_wss() {
 /// `attention_request_clear_gates` suite.
 #[tokio::test]
 async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
+    const RAISE_MARKER: &str = "ATTN_FG_RAISE";
+    const REASON: &str = "ATTN_WSS foreground needs the user's decision";
     let Some(script) = gate("WSS attention-request foreground negative E2E") else {
         return;
     };
-
-    const RAISE_MARKER: &str = "ATTN_FG_RAISE";
-    const REASON: &str = "ATTN_WSS foreground needs the user's decision";
 
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
@@ -4225,9 +4217,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(raised && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the raise: raised={raised} idle={idle}"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the raise: raised={raised} idle={idle}")
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4279,9 +4270,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!("timed out waiting for the automatic nudge turn's agent:idle"),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the automatic nudge turn's agent:idle")
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4330,14 +4320,13 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
 /// (no linked task = the transition is skipped).
 #[tokio::test]
 async fn attention_request_blocker_and_taskless_caller_over_wss() {
-    let Some(script) = gate("WSS attention-request blocker/taskless E2E") else {
-        return;
-    };
-
     const BLOCKER_MARKER: &str = "ATTN_BLOCKER_CHILD";
     const TASKLESS_MARKER: &str = "ATTN_TASKLESS_AGENT";
     const BLOCK_REASON: &str = "ATTN_WSS sandbox filesystem is read-only";
     const TASKLESS_REASON: &str = "ATTN_WSS which provider should I target?";
+    let Some(script) = gate("WSS attention-request blocker/taskless E2E") else {
+        return;
+    };
 
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
@@ -4435,13 +4424,12 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let mut idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(attention.is_some() && task_changed.is_some() && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} task_changed={t} idle={idle}",
                 a = attention.is_some(),
                 t = task_changed.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4540,12 +4528,11 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let mut task_events = 0u32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(attention.is_some() && idle) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} idle={idle}",
                 a = attention.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4610,14 +4597,13 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
 /// suite in `e2e_wss_agent_midturn_failure.rs` (failed).
 #[tokio::test]
 async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() {
-    let Some(script) = gate("WSS parented attention/failed parentAgentId E2E") else {
-        return;
-    };
-
     const PARENT_GO: &str = "PARENTID_PARENT_GO";
     const CHILD_ATTN: &str = "PARENTID_CHILD_ATTN";
     const CHILD_DIE: &str = "PARENTID_CHILD_DIE";
     const REASON: &str = "PARENTID need a decision from the coordinator";
+    let Some(script) = gate("WSS parented attention/failed parentAgentId E2E") else {
+        return;
+    };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
@@ -4733,13 +4719,12 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
     let mut failed: Option<Value> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while !(attention.is_some() && failed.is_some()) {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out: attention={a} failed={f}",
                 a = attention.is_some(),
                 f = failed.is_some(),
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let data = &ev["data"];
@@ -4927,9 +4912,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = match timeout(dur, ws.next()).await {
-            Ok(v) => v,
-            Err(_) => return None,
+        let Ok(next) = timeout(dur, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -5342,9 +5326,8 @@ async fn terminal_create_env_over_wss() {
         if remaining.is_zero() {
             break;
         }
-        let next = match timeout(remaining, sub.next()).await {
-            Ok(next) => next,
-            Err(_) => break,
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -5446,6 +5429,9 @@ async fn terminal_create_env_over_wss() {
 /// serializing paste echo behind the writer batch window.
 #[tokio::test]
 async fn terminal_data_many_chunks_transient_over_wss() {
+    // 200 fixed-width markers; the command echo carries the literal
+    // `CHUNK-%03d-END` template, which never collides with an expanded marker.
+    const CHUNKS: usize = 200;
     use base64::Engine as _;
 
     let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
@@ -5480,9 +5466,6 @@ async fn terminal_data_many_chunks_transient_over_wss() {
         .expect("terminalId in terminal.create result")
         .to_string();
 
-    // 200 fixed-width markers; the command echo carries the literal
-    // `CHUNK-%03d-END` template, which never collides with an expanded marker.
-    const CHUNKS: usize = 200;
     let script =
         format!("for i in $(seq 1 {CHUNKS}); do printf 'CHUNK-%03d-END\\n' \"$i\"; done; exit\n");
     let written = wss_rpc(
@@ -5510,9 +5493,8 @@ async fn terminal_data_many_chunks_transient_over_wss() {
         if remaining.is_zero() {
             break;
         }
-        let next = match timeout(remaining, sub.next()).await {
-            Ok(next) => next,
-            Err(_) => break,
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -5978,10 +5960,8 @@ async fn oversized_request_head_rejected_over_wss() {
     let deadline = Duration::from_secs(2);
     loop {
         match timeout(deadline, tls.read(&mut buf)).await {
-            Ok(Ok(0)) => break,
+            Ok(Ok(0) | Err(_)) | Err(_) => break,
             Ok(Ok(n)) => total.extend_from_slice(&buf[..n]),
-            Ok(Err(_)) => break,
-            Err(_) => break,
         }
         if total.len() > 4096 {
             break;
@@ -7549,6 +7529,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     assert_eq!(user_count, 1, "replay delivered no second prompt: {conv}");
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Regression for the composite `(id, workspace_id)` note PK (migration 0030
 /// + `feat(services): workspace-scope note lookups + seed spec per workspace`):
 /// two `workspace.create` calls each seed their own `spec` note. Over the
@@ -8149,6 +8130,7 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     .await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// STAB-118 (SUB-1 `after_all` duplicate wake): when a coordinator delegates
 /// two `after_all` children, sends follow-up messages to both via
 /// `agent.sendMessage` (which triggers SUB-1 auto-watch), and both children
@@ -8161,17 +8143,17 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
 /// stack including JSON-RPC routing and client-visible transcript reads).
 #[tokio::test]
 async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
+    const CHILD_A_TAG: &str = "SUB1_WSS_CHILD_A";
+    const CHILD_B_TAG: &str = "SUB1_WSS_CHILD_B";
+    const PARENT_GO: &str = "SUB1_WSS_PARENT_GO";
+    const FOLLOWUP_A: &str = "SUB1_WSS_FOLLOWUP_A";
+    const FOLLOWUP_B: &str = "SUB1_WSS_FOLLOWUP_B";
     let Some(script) = gate("WSS SUB-1 after_all E2E") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    const CHILD_A_TAG: &str = "SUB1_WSS_CHILD_A";
-    const CHILD_B_TAG: &str = "SUB1_WSS_CHILD_B";
-    const PARENT_GO: &str = "SUB1_WSS_PARENT_GO";
-    const FOLLOWUP_A: &str = "SUB1_WSS_FOLLOWUP_A";
-    const FOLLOWUP_B: &str = "SUB1_WSS_FOLLOWUP_B";
 
     // The parent delegates two after_all children, sends follow-ups to each.
     let delegate_js = format!(
@@ -8763,16 +8745,16 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
 /// fires at turn-end before the next turn begins).
 #[tokio::test]
 async fn completion_report_cleared_when_new_turn_begins_over_wss() {
+    const CHILD_TAG: &str = "CLEAR_REPORT_CHILD";
+    const REPORT: &str = "CLEAR_REPORT shipped the thing";
+    const SECOND_WORK: &str = "CLEAR_REPORT_SECOND do more work";
+    const PARENT_GO: &str = "CLEAR_REPORT_PARENT_GO";
     let Some(script) = gate("WSS clear completion report on new turn") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    const CHILD_TAG: &str = "CLEAR_REPORT_CHILD";
-    const REPORT: &str = "CLEAR_REPORT shipped the thing";
-    const SECOND_WORK: &str = "CLEAR_REPORT_SECOND do more work";
-    const PARENT_GO: &str = "CLEAR_REPORT_PARENT_GO";
     // Child behavior: first turn reports back, second turn acknowledges.
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
@@ -8984,12 +8966,6 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
 /// `completion_report_cleared_when_new_turn_begins_over_wss` above).
 #[tokio::test]
 async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
-    let Some(script) = gate("WSS stale queued-message redrive (#576)") else {
-        return;
-    };
-
-    let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
     const CHILD_TAG: &str = "STALE576_CHILD";
     const REPORT: &str = "STALE576_REPORT shipped the thing";
     const STALE_MSG: &str = "STALE576_QUEUED follow-up sent while the child was mid-turn";
@@ -8997,6 +8973,12 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     // Stable prefix of the daemon's stale-redrive annotation (#576) — see
     // `STALE_REDRIVE_NOTE_PREFIX` in `intent-services`'s agent_manager.
     const NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued before you completed";
+    let Some(script) = gate("WSS stale queued-message redrive (#576)") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
     let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
     let delegate_js = format!(
         "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
@@ -9103,11 +9085,8 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let mut child_mid_turn = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !child_mid_turn {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
-                "timed out waiting for the child's report turn to begin: child_id={child_id:?}"
-            ),
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the child's report turn to begin: child_id={child_id:?}")
         };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
@@ -9164,13 +9143,12 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_stream_ends >= 2 && child_idle)
     {
-        let frame = match wss_event_opt_until(&mut sub, deadline).await {
-            Some(frame) => frame,
-            None => panic!(
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!(
                 "timed out waiting for redrive milestones: parent_idle_count={parent_idle_count} \
                  parent_wake_ends={parent_wake_ends} child_stream_ends={child_stream_ends} \
                  child_idle={child_idle}"
-            ),
+            )
         };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
@@ -9284,6 +9262,12 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
 /// after a busy turn, (3) wake delivery to an idle agent.
 #[tokio::test]
 async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
+    // Dequeue-wait note: the drained entry's delivered content (persisted
+    // user row == provider prompt) carries the enqueue-time annotation;
+    // the direct send was never queued, so its row stays untouched. Stable
+    // prefix of `DEQUEUE_WAIT_NOTE_PREFIX` in `intent-services`'s
+    // agent_manager.
+    const DEQUEUE_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
     let Some(script) = gate("WSS agent:message queue+wake E2E") else {
         return;
     };
@@ -9454,12 +9438,6 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "dequeued agent:message event ID matches the second (queued) user message"
     );
 
-    // Dequeue-wait note: the drained entry's delivered content (persisted
-    // user row == provider prompt) carries the enqueue-time annotation;
-    // the direct send was never queued, so its row stays untouched. Stable
-    // prefix of `DEQUEUE_WAIT_NOTE_PREFIX` in `intent-services`'s
-    // agent_manager.
-    const DEQUEUE_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
     let direct_text = serde_json::to_string(&user_messages[0]["contentBlocks"]).unwrap_or_default();
     assert!(
         !direct_text.contains(DEQUEUE_NOTE_PREFIX),
@@ -12897,12 +12875,11 @@ async fn usage_update_cost_captured_over_wss() {
 ///     live one (§7.1 parity), richer title included.
 #[tokio::test]
 async fn status_only_tool_update_preserves_richer_title_over_wss() {
+    const SPARSE_TITLE: &str = "Run";
+    const RICH_TITLE: &str = "Run: cargo test --workspace";
     let Some(script) = gate("WSS title-preserving tool-update E2E") else {
         return;
     };
-
-    const SPARSE_TITLE: &str = "Run";
-    const RICH_TITLE: &str = "Run: cargo test --workspace";
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;

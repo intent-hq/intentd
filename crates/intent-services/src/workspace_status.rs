@@ -183,18 +183,17 @@ impl Services {
         // list/get reads cost one in-memory lookup, no per-row store
         // fan-out); only a cache miss — first touch after startup — probes
         // the store and seeds the `workspace:waiting-changed` baseline.
-        ws.waiting = match self.last_waiting_statuses.get(&ws.id) {
-            Some(waiting) => waiting,
-            None => {
-                // Pre-read generation snapshot: a `workspace.delete`
-                // eviction racing the probe must not have this seed
-                // resurrect the baseline.
-                let waiting_generation = self.last_waiting_statuses.generation();
-                let waiting = self.workspace_is_waiting(&ws.id).await;
-                self.last_waiting_statuses
-                    .seed(&ws.id, waiting, waiting_generation);
-                waiting
-            }
+        ws.waiting = if let Some(waiting) = self.last_waiting_statuses.get(&ws.id) {
+            waiting
+        } else {
+            // Pre-read generation snapshot: a `workspace.delete`
+            // eviction racing the probe must not have this seed
+            // resurrect the baseline.
+            let waiting_generation = self.last_waiting_statuses.generation();
+            let waiting = self.workspace_is_waiting(&ws.id).await;
+            self.last_waiting_statuses
+                .seed(&ws.id, waiting, waiting_generation);
+            waiting
         };
         if ws.task_stats.is_none() {
             return;
@@ -297,7 +296,7 @@ impl Services {
         };
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 display_status_changed_event(workspace_id, status),
             )
             .await;
@@ -346,7 +345,7 @@ impl Services {
         };
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 waiting_changed_event(workspace_id, waiting),
             )
             .await;
@@ -1283,8 +1282,8 @@ mod display_status {
     /// Monitor-signal shorthand for the tests below.
     fn monitors(open: bool, ready: bool, merged: bool) -> MonitorPrSignals {
         MonitorPrSignals {
-            open,
             ready,
+            open,
             merged,
         }
     }
@@ -2029,7 +2028,7 @@ mod display_status_events {
         // End the run: during the grace window the status stays in_progress
         // (workspace_activity still reports AgentRunning) — no event yet
         // (assert_silent's 300ms watch sits inside the 500ms window).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_silent(&mut sub).await;
 
         // After the debounce window the demotion to idle emits.
@@ -2617,7 +2616,7 @@ mod display_status_events {
 
         let mut sub = subscribe(&h);
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // Wait out the debounced idle recompute: blocked outranks both
         // transitions, so nothing emits (assert_silent's 300ms watch
         // covers the 100ms debounce window).
@@ -2655,7 +2654,7 @@ mod display_status_events {
         // End then immediately begin again: the second begin cancels the
         // pending idle debounce, so no demotion ever emits (assert_silent's
         // 300ms watch covers the 100ms window).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         h.services.agent_activity_begin(&h.ws).await;
         assert_silent(&mut sub).await;
     }

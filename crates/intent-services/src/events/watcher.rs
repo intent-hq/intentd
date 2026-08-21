@@ -57,7 +57,7 @@ const BURST_THRESHOLD: usize = 100;
 /// cooldown-only collapses consume the window rather than extend it, so
 /// unrelated small activity after a churn returns to per-file events within
 /// one cooldown instead of staying in summary mode indefinitely.
-const BURST_COOLDOWN: Duration = Duration::from_millis(1000);
+const BURST_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Upper bound on raw events ingested per [`drain_ready`] call. `ingest` is
 /// cheap and never awaits, but the raw channel is unbounded; the cap keeps a
@@ -179,8 +179,7 @@ fn action_for(kind: EventKind) -> Option<Action> {
         EventKind::Create(_) => Some(Action::Create),
         EventKind::Remove(_) => Some(Action::Delete),
         EventKind::Modify(ModifyKind::Name(_)) => Some(Action::Rename),
-        EventKind::Modify(_) => Some(Action::Modify),
-        EventKind::Any => Some(Action::Modify),
+        EventKind::Modify(_) | EventKind::Any => Some(Action::Modify),
         EventKind::Access(_) | EventKind::Other => None,
     }
 }
@@ -565,6 +564,7 @@ impl FileWatcher {
     /// established. Registration is deferred off the caller's thread
     /// (monorepo#1572), so tests must wait for it before mutating the tree.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     pub(super) async fn wait_established(&self, timeout: Duration) {
         self._sub.wait_established(timeout).await;
     }
@@ -585,13 +585,12 @@ async fn debounce_loop(
     loop {
         let next_deadline = pending.values().map(|(_, at)| *at).min();
         tokio::select! {
-            maybe = raw_rx.recv() => match maybe {
-                Some(event) => {
+            maybe = raw_rx.recv() => {
+                if let Some(event) = maybe {
                     ingest(&root, &mut matcher, &event, &mut pending);
                     drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
-                }
-                // Watcher dropped: flush whatever is pending, then stop.
-                None => {
+                } else {
+                    // Watcher dropped: flush whatever is pending, then stop.
                     flush_all(&bus, &workspace_id, &mut pending).await;
                     return;
                 }

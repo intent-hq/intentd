@@ -640,17 +640,7 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
         match event["type"].as_str() {
             Some("chat:stream:delta") => {
                 let data = serde_json::to_string(&event["data"]).unwrap_or_default();
-                if !saw_wake_end {
-                    assert_eq!(
-                        event["data"]["messageId"].as_str(),
-                        Some(wake_message_id.as_str()),
-                        "pre-end chunks belong to the wake turn: {frame}"
-                    );
-                    assert!(
-                        !data.contains("racing turn response"),
-                        "racing response must not interleave with the wake turn: {frame}"
-                    );
-                } else {
+                if saw_wake_end {
                     let mid = event["data"]["messageId"]
                         .as_str()
                         .expect("racing chunk messageId")
@@ -661,23 +651,33 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
                     );
                     racing_message_id = Some(mid);
                     racing_text.push_str(&data);
-                }
-            }
-            Some("agent:stream:end") => {
-                if !saw_wake_end {
+                } else {
                     assert_eq!(
                         event["data"]["messageId"].as_str(),
                         Some(wake_message_id.as_str()),
-                        "wake turn's terminal stream:end carries its messageId: {frame}"
+                        "pre-end chunks belong to the wake turn: {frame}"
                     );
-                    saw_wake_end = true;
-                } else {
+                    assert!(
+                        !data.contains("racing turn response"),
+                        "racing response must not interleave with the wake turn: {frame}"
+                    );
+                }
+            }
+            Some("agent:stream:end") => {
+                if saw_wake_end {
                     assert_eq!(
                         event["data"]["messageId"].as_str(),
                         racing_message_id.as_deref(),
                         "racing turn's stream:end carries its own messageId: {frame}"
                     );
                     saw_racing_end = true;
+                } else {
+                    assert_eq!(
+                        event["data"]["messageId"].as_str(),
+                        Some(wake_message_id.as_str()),
+                        "wake turn's terminal stream:end carries its messageId: {frame}"
+                    );
+                    saw_wake_end = true;
                 }
             }
             Some("agent:idle") => {

@@ -1289,24 +1289,22 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         sys.total_memory()
     };
     let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
-    let budget_enabled =
-        match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
-            Some(budget_bytes) => {
-                manager
-                    .registry()
-                    .set_memory_budget(budget_bytes, child_usage.clone());
-                tracing::info!(
-                    budget_bytes,
-                    recommended_bytes,
-                    "aggregate agent memory budget enabled"
-                );
-                true
-            }
-            None => {
-                tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
-                false
-            }
-        };
+    let budget_enabled = if let Some(budget_bytes) =
+        agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes)
+    {
+        manager
+            .registry()
+            .set_memory_budget(budget_bytes, child_usage.clone());
+        tracing::info!(
+            budget_bytes,
+            recommended_bytes,
+            "aggregate agent memory budget enabled"
+        );
+        true
+    } else {
+        tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
+        false
+    };
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1549,12 +1547,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // monorepo#2900). An unparseable persisted value falls back to loopback
     // with a warning rather than silently widening the bind (defense in
     // depth — SettingsFile::validate rejects non-IP values at load time).
-    match boot_settings.effective.server.bind_address.parse() {
-        Ok(addr) => ws_options.bind_address = addr,
-        Err(_) => tracing::warn!(
+    if let Ok(addr) = boot_settings.effective.server.bind_address.parse() {
+        ws_options.bind_address = addr;
+    } else {
+        tracing::warn!(
             value = %boot_settings.effective.server.bind_address,
             "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
-        ),
+        );
     }
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
@@ -1675,9 +1674,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
     // serve system.status (§5.7). This breaks the circular Arc dependency between
     // DaemonControl and WsRuntimeControl.
-    if runtime.control.set(control.clone()).is_err() {
-        panic!("control OnceLock should only be set once");
-    }
+    assert!(
+        runtime.control.set(control.clone()).is_ok(),
+        "control OnceLock should only be set once"
+    );
 
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
     // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
@@ -1806,10 +1806,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
     // wakeResume is disabled (no tracker exists), honoring the config gate.
     if let Some(tracker) = suspend_tracker.clone() {
-        let services_clone = services.clone();
-        let mut resume_rx = tracker.subscribe();
         // Coalesce wake events landing within this window into one sweep.
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
+        let services_clone = services.clone();
+        let mut resume_rx = tracker.subscribe();
         tokio::spawn(async move {
             use tokio::sync::broadcast::error::RecvError;
             loop {
@@ -1900,16 +1900,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // survive (`kill_on_drop` only covers the direct child). Letting the sweep
     // settle first puts every child it spawned in the map, so `shutdown` reaps
     // them. Only if the grace expires do we abort and accept the drop path.
-    match tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await {
-        Ok(_) => {}
-        Err(_) => {
-            tracing::warn!(
-                grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
-                "deferred MCP start sweep did not settle within the shutdown grace; \
-                 aborting it — a server mid-handshake may leave orphan grandchildren"
-            );
-            mcp_start_task.abort();
-        }
+    if tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
+            "deferred MCP start sweep did not settle within the shutdown grace; \
+             aborting it — a server mid-handshake may leave orphan grandchildren"
+        );
+        mcp_start_task.abort();
     }
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
@@ -3161,7 +3161,7 @@ fn env_flag(name: &str) -> bool {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("1" | "true" | "yes")
     )
 }
 
@@ -3177,7 +3177,6 @@ fn parse_permission_policy(raw: Option<&str>) -> PermissionPolicy {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("interactive") => PermissionPolicy::Interactive,
         Some("auto") => PermissionPolicy::AutoByRisk,
-        Some("allow") => PermissionPolicy::AllowAll,
         Some("deny") => PermissionPolicy::DenyAll,
         _ => PermissionPolicy::AllowAll,
     }
@@ -3411,27 +3410,24 @@ fn spawn_idle_reap_loop(
     // time below the budget-only cadence (an early TTL sweep is harmless: it
     // just finds nothing old enough).
     let budget_floor = Duration::from_secs(30);
-    let interval = match timings {
-        Some((ttl, interval)) => {
-            let interval = if budget_enabled {
-                interval.min(budget_floor)
-            } else {
-                interval
-            };
-            tracing::info!(
-                ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
-                interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
-                "idle agent reaping enabled"
-            );
+    let interval = if let Some((ttl, interval)) = timings {
+        let interval = if budget_enabled {
+            interval.min(budget_floor)
+        } else {
             interval
-        }
-        None => {
-            tracing::info!(
-                interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
-                "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
-            );
-            budget_floor
-        }
+        };
+        tracing::info!(
+            ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+            "idle agent reaping enabled"
+        );
+        interval
+    } else {
+        tracing::info!(
+            interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
+            "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+        );
+        budget_floor
     };
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -4016,15 +4012,6 @@ extern "C" fn restore_echo_on_signal(sig: libc::c_int) {
 /// echo, so print one to keep output aligned.
 #[cfg(unix)]
 fn read_line_no_echo() -> anyhow::Result<String> {
-    use std::io::BufRead;
-    use std::sync::atomic::Ordering;
-    let fd = libc::STDIN_FILENO;
-    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let orig = unsafe { orig.assume_init() };
-
     // Publish the saved attrs and install the restoring handlers BEFORE
     // disabling echo, so no window exists where a signal skips the restore.
     const SIGNALS: [libc::c_int; 5] = [
@@ -4034,6 +4021,15 @@ fn read_line_no_echo() -> anyhow::Result<String> {
         libc::SIGHUP,
         libc::SIGTSTP,
     ];
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let fd = libc::STDIN_FILENO;
+    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let orig = unsafe { orig.assume_init() };
+
     unsafe { (&raw mut HIDDEN_READ_ORIG).write(std::mem::MaybeUninit::new(orig)) };
     HIDDEN_READ_ACTIVE.store(true, Ordering::SeqCst);
     let handler = restore_echo_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -4041,12 +4037,12 @@ fn read_line_no_echo() -> anyhow::Result<String> {
 
     let mut noecho = orig;
     noecho.c_lflag &= !libc::ECHO;
-    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const noecho) } != 0 {
         Err(anyhow::Error::from(std::io::Error::last_os_error()))
     } else {
         let mut line = String::new();
         let read = std::io::stdin().lock().read_line(&mut line);
-        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
+        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const orig) };
         eprintln!();
         match read {
             Err(e) => Err(e.into()),
@@ -4128,6 +4124,7 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
 
 /// Print one setting (`settings.get` output shape) from the already-fetched
 /// `settings.get` result: value, type, default, origin, description.
+#[allow(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
 fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");
@@ -5171,12 +5168,9 @@ async fn report_db_health(store: &Store) {
 #[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -5197,7 +5191,7 @@ mod tests {
     #[test]
     fn bind_choices_list_interfaces_then_all_interfaces_option() {
         let ifaces = vec![
-            ("lo".to_string(), std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
         ];
         let choices = build_bind_choices(&ifaces);
@@ -5656,7 +5650,7 @@ mod tests {
         );
         assert_eq!(
             test_watcher_init_delay(Some(" 5000 ")),
-            Some(Duration::from_millis(5000))
+            Some(Duration::from_secs(5))
         );
     }
 

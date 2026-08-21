@@ -195,9 +195,8 @@ async fn wss_rpc(ws: &mut common::TlsWs, id: i64, method: &str, params: Value) -
 /// asserting the notification envelope; `None` on deadline.
 async fn wss_event_until(ws: &mut common::TlsWs, deadline: tokio::time::Instant) -> Option<Value> {
     loop {
-        let next = match tokio::time::timeout_at(deadline, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => return None,
+        let Ok(next) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            return None;
         };
         match next {
             Some(Ok(Message::Text(text))) => {

@@ -416,19 +416,16 @@ fn resolve_inherited_origin(source_repo: &Path, checkout_path: &Path) -> Result<
     let push_url = remote.pushurl().ok().flatten().map(str::to_owned);
     drop(remote);
     if let Some(url) = fetch_url {
-        match resolve_source_origin(source_repo, &url) {
-            Some(resolved) => {
-                if resolved != url {
-                    clone
-                        .remote_set_url("origin", &resolved)
-                        .map_err(map_git_err)?;
-                }
+        if let Some(resolved) = resolve_source_origin(source_repo, &url) {
+            if resolved != url {
+                clone
+                    .remote_set_url("origin", &resolved)
+                    .map_err(map_git_err)?;
             }
-            None => {
-                // Deleting the remote drops its pushurl with it.
-                clone.remote_delete("origin").map_err(map_git_err)?;
-                return Ok(());
-            }
+        } else {
+            // Deleting the remote drops its pushurl with it.
+            clone.remote_delete("origin").map_err(map_git_err)?;
+            return Ok(());
         }
     }
     if let Some(url) = push_url {
@@ -625,12 +622,11 @@ mod tests {
     /// may run on non-CoW filesystems). Returns `true` when supported.
     fn cow_available(src: &std::path::Path) -> bool {
         let dst = std::env::temp_dir();
-        match cow_probe(src, &dst) {
-            Ok(CowSupport::Supported) => true,
-            _ => {
-                eprintln!("Skipping test: CoW not supported under {dst:?}");
-                false
-            }
+        if let Ok(CowSupport::Supported) = cow_probe(src, &dst) {
+            true
+        } else {
+            eprintln!("Skipping test: CoW not supported under {dst:?}");
+            false
         }
     }
 

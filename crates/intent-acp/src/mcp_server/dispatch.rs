@@ -761,7 +761,7 @@ async fn workspace_host_dispatch(
     if let Some(v) = super::bindings::try_dispatch(
         &api,
         &workspace_id,
-        &caller_agent_id,
+        caller_agent_id.as_ref(),
         turn_attachments.as_ref(),
         agent_features,
         is_sub_agent,
@@ -896,7 +896,7 @@ mod timeout_override_tests {
     fn positive_millis_override() {
         assert_eq!(
             workspace_api_timeout_from(Some("120000")),
-            Duration::from_millis(120_000)
+            Duration::from_secs(120)
         );
         assert_eq!(
             workspace_api_timeout_from(Some(" 500 ")),

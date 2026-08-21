@@ -405,6 +405,9 @@ mod tests {
 
     /// Scripted [`GhCli`] that records whether a login/logout was attempted —
     /// no real `gh` is ever spawned from tests.
+    // Test mock: independent scenario bools, and `Option<Option<_>>` recorders
+    // distinguishing "never called" from "called with None".
+    #[allow(clippy::struct_excessive_bools, clippy::option_option)]
     struct MockGhCli {
         installed: bool,
         authenticated: bool,
@@ -489,6 +492,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn token() -> Option<SecretString> {
         Some(SecretString::from("gho_test_sync"))
     }
@@ -555,6 +559,7 @@ mod tests {
         sync_token_to_gh(store).await;
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn revoked() -> Option<SecretString> {
         Some(SecretString::from("gho_test_revoked"))
     }

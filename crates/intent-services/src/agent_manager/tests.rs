@@ -1432,7 +1432,7 @@ fn mock_handle() -> AgentHandle {
         connection,
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
-        _child: None,
+        child: None,
         child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
@@ -2280,7 +2280,7 @@ fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::Join
     let child = cmd.spawn().expect("spawn sleeper child");
     let pid = child.id().expect("live child has a pid");
     let mut handle = mock_handle();
-    handle._child = Some(child);
+    handle.child = Some(child);
     handle.child_pid = Some(pid);
     mgr.handles.lock().unwrap().insert(id.clone(), handle);
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
@@ -2480,7 +2480,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         let child = cmd.spawn().expect("spawn slow child");
         let pid = child.id().expect("live child has a pid");
         let mut handle = mock_handle();
-        handle._child = Some(child);
+        handle.child = Some(child);
         handle.child_pid = Some(pid);
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
@@ -2503,7 +2503,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     // The children ignored SIGTERM, so the full shared grace must have
     // elapsed (proves the window ran once, not that children died early).
     assert!(
-        elapsed >= grace - Duration::from_millis(500),
+        elapsed >= grace.checked_sub(Duration::from_millis(500)).unwrap(),
         "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
     );
     // Per-agent `stop()` semantics applied to every agent in the batch.
@@ -2926,7 +2926,7 @@ fn track_mock_agent_inner(
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -3003,7 +3003,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": MGR_ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3043,7 +3042,7 @@ fn track_mock_agent_prompt_rpc_error(
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -5178,7 +5177,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             connection: conn,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -11025,9 +11024,8 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 async fn resolve_spawn_without_provider_or_default_fails_loudly() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
-    let err = match resolve_spawn(&session, None, &settings, None) {
-        Ok(_) => panic!("no provider, no model, no configured default must not resolve"),
-        Err(e) => e,
+    let Err(err) = resolve_spawn(&session, None, &settings, None) else {
+        panic!("no provider, no model, no configured default must not resolve")
     };
     assert!(
         matches!(&err, intent_core::Error::InvalidParams(m)
@@ -13324,7 +13322,7 @@ mod harness_wake_tests {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: None,
+            child: None,
             child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,

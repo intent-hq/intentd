@@ -19,6 +19,8 @@ use serde_json::{json, Value};
 
 use crate::WorkspaceMcpServer;
 
+// `status_message_state` is `Option<Option<_>>`: no-override vs landed value.
+#[allow(clippy::option_option)]
 #[derive(Default)]
 struct FakeApi {
     /// Recorded `git_agent_commit` calls: (message, `agent_id`, `user_requested`).

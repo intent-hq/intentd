@@ -218,6 +218,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_workspace_metrics_row(r: &SqliteRow) -> Result<WorkspaceMetricsRow> {
     Ok(WorkspaceMetricsRow {
         workspace_id: WorkspaceId(r.get("workspace_id")),
@@ -228,6 +229,7 @@ fn map_workspace_metrics_row(r: &SqliteRow) -> Result<WorkspaceMetricsRow> {
     })
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_agent_metrics_row(r: &SqliteRow) -> Result<AgentMetricsRow> {
     Ok(AgentMetricsRow {
         agent_id: r.get("agent_id"),

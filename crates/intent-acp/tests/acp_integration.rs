@@ -271,12 +271,11 @@ fn spawn_mock(
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => {
-                    r_state.interleave.store(true, Ordering::SeqCst);
-                    continue;
-                }
+            let value: Value = if let Ok(v) = serde_json::from_str(&line) {
+                v
+            } else {
+                r_state.interleave.store(true, Ordering::SeqCst);
+                continue;
             };
             let method = value
                 .get("method")

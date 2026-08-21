@@ -887,6 +887,7 @@ fn grok_outcome_rows_win_over_failed_exit() {
 // concurrently and starve one another.
 #[allow(clippy::await_holding_lock)]
 async fn opencode_models_cli_child_path_includes_binary_dir() {
+    use std::os::unix::fs::PermissionsExt;
     // A fake opencode whose success is gated on its own parent dir being on
     // the child's $PATH — the enhanced-path contract shared with the ACP
     // probe spawns. The temp dir is not on the process PATH, so the run only
@@ -900,7 +901,6 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     let _serial = CHILD_SPAWN_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
     let script = format!(
@@ -919,13 +919,13 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_models_cli_child_path_includes_binary_dir() {
+    use std::os::unix::fs::PermissionsExt;
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
     // only succeeds when its own parent dir is on the child's $PATH. Same
     // generous timeout rationale as the opencode analog above (monorepo#921).
     let _serial = CHILD_SPAWN_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
     let script = format!(
@@ -945,6 +945,7 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_cli_timeout_flows_into_attributed_warning() {
+    use std::os::unix::fs::PermissionsExt;
     // A wedged `grok models` must be cut short and the timeout reason must
     // surface through the fetch attribution (`grok: ...`). No wall-clock
     // bound (parity with the opencode analog): a first-exec Gatekeeper scan
@@ -953,14 +954,13 @@ async fn grok_cli_timeout_flows_into_attributed_warning() {
     let _serial = CHILD_SPAWN_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
     std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "grok",
-        super::run_grok_models_cli(bin, std::time::Duration::from_millis(5000))
+        super::run_grok_models_cli(bin, std::time::Duration::from_secs(5))
             .await
             .unwrap_err(),
     );
@@ -1296,6 +1296,7 @@ async fn probe_rpc_error_survives_dead_child() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
+    use std::os::unix::fs::PermissionsExt;
     // A wedged `opencode models` must be reaped when the timeout elapses and
     // the failure must be attributable as a timeout. The fake CLI records its
     // PID first thing, then sleeps far past the injected timeout — a ~5s
@@ -1304,7 +1305,6 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     let _serial = CHILD_SPAWN_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("pid");
     let bin = dir.path().join("opencode");
@@ -1316,7 +1316,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let start = std::time::Instant::now();
-    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_millis(5000))
+    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
         .await
         .unwrap_err();
     assert!(
@@ -1349,19 +1349,19 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_timeout_flows_into_attributed_warning() {
+    use std::os::unix::fs::PermissionsExt;
     // The timeout reason must surface through the fetch result attribution
     // (`opencode: ...`), matching what models.list callers see.
     let _serial = CHILD_SPAWN_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
     std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "opencode",
-        super::run_opencode_models_cli(bin, std::time::Duration::from_millis(5000))
+        super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
             .await
             .unwrap_err(),
     );

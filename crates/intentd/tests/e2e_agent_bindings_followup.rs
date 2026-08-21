@@ -170,6 +170,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
 
 #[tokio::test]
 async fn agent_status_returns_full_metadata() {
+    use intent_core::AgentStatus;
     let (services, ws, ws_root, db) = setup().await;
 
     let agent_val = services
@@ -196,7 +197,6 @@ async fn agent_status_returns_full_metadata() {
     assert_eq!(result.id, agent_id);
     assert_eq!(result.workspace_id, ws);
     assert_eq!(result.name, "StatusTest");
-    use intent_core::AgentStatus;
     assert_eq!(result.status, AgentStatus::Idle);
     assert!(!result.metadata.is_background);
 

@@ -28,7 +28,7 @@ pub(crate) const PROPOSAL_KINDS: &[&str] = &[
     "bulk-op",
 ];
 
-pub(crate) async fn dispatch(
+pub(crate) fn dispatch(
     _api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     method: &str,

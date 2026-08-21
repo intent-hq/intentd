@@ -386,6 +386,8 @@ pub struct AuthStatus {
 }
 
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
+// One bool per independent capability; the flat shape IS the wire contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScCapabilities {

@@ -138,6 +138,9 @@ pub enum WorkspaceDisplayStatus {
 }
 
 /// Workspace entity (§9.1).
+// The bool fields mirror the protocol's wire shape; grouping them would
+// change the serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -976,6 +979,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
+#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -2532,6 +2536,9 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// the provider's `session:created`), `nameExplicitlySet`, `systemPrompt`, etc.
 /// `messages` is the append-only conversation log; `stats` is a derived snapshot
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
+// The bool fields mirror the TS wire shape; grouping them would change the
+// serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -2862,6 +2869,9 @@ pub struct AgentMetadata {
 /// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
 /// transcript, a nested `metadata` object, and the runtime activity flags the
 /// iOS coverflow reads.
+// The bool fields mirror the TS wire shape; grouping them would change the
+// serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -3981,7 +3991,7 @@ mod tests {
                 assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
                 assert!(o.agent_instructions.is_none());
             }
-            other => panic!("expected Options, got {other:?}"),
+            other @ BatchTaskEntry::Id(_) => panic!("expected Options, got {other:?}"),
         }
         assert_eq!(tasks[2].task_note_id().0, "min-id");
 

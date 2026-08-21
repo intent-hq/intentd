@@ -1266,21 +1266,22 @@ impl ProcessRegistry {
                     inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
                     inner.wait_queue.push((agent_id.clone(), tx, reason));
                     let used = inner.entries.len();
-                    match over_budget {
-                        Some(charged) => tracing::info!(
+                    if let Some(charged) = over_budget {
+                        tracing::info!(
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
                             charged_memory_bytes = charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
                             "process registry: spawn queued (aggregate memory budget)"
-                        ),
-                        None => tracing::info!(
+                        );
+                    } else {
+                        tracing::info!(
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
                             "process registry: spawn queued (all slots active)"
-                        ),
+                        );
                     }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
@@ -1783,7 +1784,7 @@ struct AgentHandle {
     connection: Arc<Connection>,
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     serve_task: JoinHandle<()>,
-    _child: Option<Child>,
+    child: Option<Child>,
     /// The child's pid captured at spawn: `Child::id()` reads `None` once a
     /// `try_wait` liveness probe reaps the exit status, and the pgid-based
     /// teardown (`kill_child_tree`) still needs it to sweep same-group
@@ -1843,7 +1844,7 @@ impl Drop for WakeGateGuard {
 /// Quiescence settle window for implicit harness-wake turns (monorepo#855):
 /// an implicit turn finalizes once no `session/update` arrived for this long.
 #[cfg(not(test))]
-const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(2000);
+const HARNESS_WAKE_SETTLE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(200);
 
@@ -2229,7 +2230,7 @@ impl AgentManager {
             .iter_mut()
             .filter_map(|(agent_id, handle)| {
                 let pid = handle.child_pid?;
-                if let Some(child) = handle._child.as_mut() {
+                if let Some(child) = handle.child.as_mut() {
                     if !matches!(child.try_wait(), Ok(None)) {
                         return None;
                     }
@@ -2581,7 +2582,7 @@ impl AgentManager {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task,
-            _child: Some(child),
+            child: Some(child),
             child_pid,
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
@@ -2605,7 +2606,7 @@ impl AgentManager {
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
             let stale_pid = stale.child_pid;
-            if let Some(child) = stale._child.take() {
+            if let Some(child) = stale.child.take() {
                 kill_child_tree(child, stale_pid).await;
             }
         }
@@ -2633,7 +2634,7 @@ impl AgentManager {
         if let Some(mut handle) = fenced {
             self.registry.deregister(&agent_id);
             let spawn_pid = handle.child_pid;
-            if let Some(child) = handle._child.take() {
+            if let Some(child) = handle.child.take() {
                 kill_child_tree(child, spawn_pid).await;
             }
             return Err(Error::NotFound(format!(
@@ -3860,7 +3861,7 @@ impl AgentManager {
         let removed = handle.is_some();
         let child = handle.and_then(|mut h| {
             let spawn_pid = h.child_pid;
-            h._child.take().map(|c| (c, spawn_pid))
+            h.child.take().map(|c| (c, spawn_pid))
         });
         self.registry.deregister(agent_id);
         (removed, child)
@@ -4495,12 +4496,12 @@ impl AgentManager {
     /// Release the in-flight slot without persisting agent status (used when
     /// terminal spawn failure already persisted Error status and we only need
     /// to release `busy/agent_ws` so a future message can restart the worker).
-    async fn release_in_flight_slot(&self, agent_id: &AgentId) {
+    fn release_in_flight_slot(&self, agent_id: &AgentId) {
         let Some(workspace_id) = self.release_slot_sync(agent_id) else {
             return;
         };
         if let Some(workspace_id) = workspace_id {
-            self.services.agent_activity_end(&workspace_id).await;
+            self.services.agent_activity_end(&workspace_id);
         }
     }
 
@@ -4508,6 +4509,7 @@ impl AgentManager {
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
     /// removed `agent_ws` entry.
+    #[allow(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
         let mut busy = self.busy.lock().unwrap();
         if !busy.remove(agent_id) {
@@ -4526,7 +4528,7 @@ impl AgentManager {
             return;
         };
         if let Some(workspace_id) = workspace_id {
-            self.services.agent_activity_end(&workspace_id).await;
+            self.services.agent_activity_end(&workspace_id);
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
                 .await;
         }
@@ -4716,9 +4718,8 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status");
             return;
         }
-        let serialized_status = match serde_json::to_value(status) {
-            Ok(Value::String(s)) => s,
-            _ => return,
+        let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
+            return;
         };
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
@@ -4739,7 +4740,7 @@ impl AgentManager {
                 "isActive": is_active,
             }),
         };
-        crate::publish_event(&self.services.event_bus, event).await;
+        crate::publish_event(self.services.event_bus.as_ref(), event).await;
         // Schedule debounced lastActivity event (§10.1).
         self.services
             .schedule_last_activity_event(workspace_id.clone());
@@ -4751,6 +4752,7 @@ impl AgentManager {
     /// untouched, `Some(None)` clears it, `Some(Some(reason))` sets it. All failures
     /// are logged and swallowed: the runtime turn is the source of truth and a
     /// transient store/bus error must not abort the in-flight slot transition.
+    #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
         agent_id: &AgentId,
@@ -4771,9 +4773,8 @@ impl AgentManager {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status + stop_reason");
             return;
         }
-        let serialized_status = match serde_json::to_value(status) {
-            Ok(Value::String(s)) => s,
-            _ => return,
+        let Ok(Value::String(serialized_status)) = serde_json::to_value(status) else {
+            return;
         };
         // Build the event data. When stop_reason is Some(_) — i.e. the call sets or
         // clears the persisted value — include "stopReason" in the event: the string
@@ -4813,7 +4814,7 @@ impl AgentManager {
             metadata: None,
             data,
         };
-        crate::publish_event(&self.services.event_bus, event).await;
+        crate::publish_event(self.services.event_bus.as_ref(), event).await;
         // Schedule debounced lastActivity event (§10.1).
         self.services
             .schedule_last_activity_event(workspace_id.clone());
@@ -5103,13 +5104,12 @@ impl AgentManager {
         // the user-row `agent:message` echo, the RPC result, and the turn
         // worker (via `options`) all carry the SAME id. `spawn_worker` keeps
         // an already-set id, so this is the direct-send mint point.
-        let turn_id = match options.turn_id.clone() {
-            Some(id) => id,
-            None => {
-                let id = new_message_id();
-                options.turn_id = Some(id.clone());
-                id
-            }
+        let turn_id = if let Some(id) = options.turn_id.clone() {
+            id
+        } else {
+            let id = new_message_id();
+            options.turn_id = Some(id.clone());
+            id
         };
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
@@ -5371,7 +5371,7 @@ impl AgentManager {
                         // Release the slot without overwriting the Error
                         // status just persisted, so `agent.retry` (or a
                         // future message) can redrive.
-                        self.release_in_flight_slot(&agent_id).await;
+                        self.release_in_flight_slot(&agent_id);
                     }
                 }
                 return;
@@ -5384,24 +5384,21 @@ impl AgentManager {
         } else {
             self.services.dequeue_message(&agent_id)
         };
-        let mut next = match dequeued {
-            Some(msg) => msg,
-            None => {
-                // Raced with another mutation (e.g. remove) that emptied the
-                // ready-to-send queue between the check above and the dequeue.
-                self.end_turn(&agent_id).await;
-                // monorepo#1280: the racing retraction saw this drain's
-                // in-flight slot (`agent_is_busy` true) and skipped its own
-                // redelivery, expecting a turn to end with a terminal
-                // `agent:idle` — but this arm emits none. Re-run the
-                // mutation-path redelivery now that the slot is released;
-                // its guards (marker set, queue empty, not busy) make it a
-                // no-op in every other interleaving.
-                self.services
-                    .redeliver_completion_after_queue_mutation(&agent_id)
-                    .await;
-                return;
-            }
+        let Some(mut next) = dequeued else {
+            // Raced with another mutation (e.g. remove) that emptied the
+            // ready-to-send queue between the check above and the dequeue.
+            self.end_turn(&agent_id).await;
+            // monorepo#1280: the racing retraction saw this drain's
+            // in-flight slot (`agent_is_busy` true) and skipped its own
+            // redelivery, expecting a turn to end with a terminal
+            // `agent:idle` — but this arm emits none. Re-run the
+            // mutation-path redelivery now that the slot is released;
+            // its guards (marker set, queue empty, not busy) make it a
+            // no-op in every other interleaving.
+            self.services
+                .redeliver_completion_after_queue_mutation(&agent_id)
+                .await;
+            return;
         };
         self.services
             .publish_queue_updated_for(
@@ -5478,7 +5475,7 @@ impl AgentManager {
                 .await;
             // Release the slot without overwriting the Error status just
             // persisted, so `agent.retry` (or a future message) can redrive.
-            self.release_in_flight_slot(&agent_id).await;
+            self.release_in_flight_slot(&agent_id);
             return;
         }
         self.spawn_worker(
@@ -6417,7 +6414,7 @@ impl AgentManager {
         // episode too (monorepo#2863): drop the streak and any stale arm.
         self.services.clear_truncation_redrives(&agent_id);
         self.services.take_truncation_redrive(&agent_id);
-        self.release_in_flight_slot(&agent_id).await;
+        self.release_in_flight_slot(&agent_id);
 
         // Tear down any stale child handle (use kill_child_only to avoid
         // overwriting the status we just set)
@@ -6517,7 +6514,7 @@ impl AgentManager {
         if !handle.connection.is_alive() {
             return false;
         }
-        match handle._child.as_mut() {
+        match handle.child.as_mut() {
             Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
             None => true,
         }
@@ -6913,9 +6910,9 @@ impl AgentManager {
                 continue;
             }
             // Read the workspace from agent_ws (stop() will clear it via end_turn).
-            let workspace_id = match self.agent_ws.lock().unwrap().get(id).cloned() {
-                Some(ws) => ws,
-                None => continue, // Stale busy entry (should not happen).
+            let Some(workspace_id) = self.agent_ws.lock().unwrap().get(id).cloned() else {
+                // Stale busy entry (should not happen).
+                continue;
             };
             // Pin the live-turn slot BEFORE aborting the worker: the abort
             // drops the worker future and with it the LiveTurnGuard, so an
@@ -7131,7 +7128,7 @@ impl AgentManager {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
             let spawn_pid = handle.child_pid;
-            if let Some(child) = handle._child.take() {
+            if let Some(child) = handle.child.take() {
                 kill_child_tree(child, spawn_pid).await;
             }
         }
@@ -7152,7 +7149,7 @@ impl AgentManager {
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
                     let spawn_pid = handle.child_pid;
-                    if let Some(child) = handle._child.take() {
+                    if let Some(child) = handle.child.take() {
                         kill_child_tree(child, spawn_pid).await;
                     }
                 }
@@ -7211,7 +7208,7 @@ impl AgentManager {
                     let Some(handle) = map.get_mut(&agent_id) else {
                         return false;
                     };
-                    let Some(child) = handle._child.as_mut() else {
+                    let Some(child) = handle.child.as_mut() else {
                         return false;
                     };
                     // A respawn installed a NEWER child under this agent id
@@ -7247,24 +7244,25 @@ impl AgentManager {
                             } else {
                                 let dead = map.remove(&agent_id);
                                 registry.deregister(&agent_id);
-                                Some((status, dead.and_then(|mut h| h._child.take())))
+                                Some((status, dead.and_then(|mut h| h.child.take())))
                             }
                         }
                     }
                 };
                 if let Some((status, dead_child)) = exited {
-                    match &stderr_dir {
-                        Some(dir) => tracing::warn!(
+                    if let Some(dir) = &stderr_dir {
+                        tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped (agent stderr captured at {})",
                             dir.display()
-                        ),
-                        None => tracing::warn!(
+                        );
+                    } else {
+                        tracing::warn!(
                             agent = %agent_id,
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped"
-                        ),
+                        );
                     }
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
@@ -7296,6 +7294,7 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 
+#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
@@ -7334,6 +7333,7 @@ async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
 
+#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Parallel shutdown kill sweep: terminate MANY provider process trees under
 /// ONE shared grace window. Every group is `SIGTERMed` up-front, then a single
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
@@ -7455,7 +7455,10 @@ mod kill_sweep_tests {
         // The children ignored SIGTERM, so the full shared grace must have
         // elapsed (proves the window ran once, not that children died early).
         assert!(
-            elapsed >= PROCESS_GROUP_TERM_GRACE - Duration::from_millis(500),
+            elapsed
+                >= PROCESS_GROUP_TERM_GRACE
+                    .checked_sub(Duration::from_millis(500))
+                    .unwrap(),
             "sweep returned after {elapsed:?}, before the shared grace window elapsed"
         );
     }
@@ -7506,10 +7509,7 @@ fn build_stdin_context_from_context_references(refs: Option<&Value>) -> Option<S
     }
     let mut parts: Vec<String> = Vec::new();
     for r in arr {
-        let obj = match r.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
+        let Some(obj) = r.as_object() else { continue };
         // Content resolution mirrors the FE: `content` → `selectedText` →
         // `taskText` → `codeChunk` (first non-empty wins).
         let content = ["content", "selectedText", "taskText", "codeChunk"]
@@ -7642,8 +7642,7 @@ fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Val
             a.extend(b);
             Some(Value::Array(a))
         }
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (Some(a), Some(_)) => Some(a),
+        (Some(a), None | Some(_)) | (None, Some(a)) => Some(a),
         (None, None) => None,
     }
 }
@@ -8331,7 +8330,7 @@ async fn run_message_worker(
                                     &options,
                                 )
                                 .await;
-                                mgr.release_in_flight_slot(&agent_id).await;
+                                mgr.release_in_flight_slot(&agent_id);
                                 break 'outer;
                             }
                             continue 'outer;
@@ -8426,9 +8425,7 @@ async fn run_message_worker(
                                 } else {
                                     false
                                 };
-                                if !boundary_landed {
-                                    mgr.kill_child_only(&agent_id).await;
-                                } else {
+                                if boundary_landed {
                                     // Hold the notifications lock across the
                                     // drain so the warning turn cannot start
                                     // consuming the channel mid-sweep.
@@ -8442,6 +8439,8 @@ async fn run_message_worker(
                                         let mut guard = notes.lock().await;
                                         Services::drain_replay_notifications(&mut guard).await;
                                     }
+                                } else {
+                                    mgr.kill_child_only(&agent_id).await;
                                 }
                                 tracing::warn!(
                                     agent = %agent_id,
@@ -8490,7 +8489,7 @@ async fn run_message_worker(
                                         &options,
                                     )
                                     .await;
-                                    mgr.release_in_flight_slot(&agent_id).await;
+                                    mgr.release_in_flight_slot(&agent_id);
                                     break 'outer;
                                 }
                                 continue 'outer;
@@ -8546,7 +8545,7 @@ async fn run_message_worker(
                                 &e,
                             )
                             .await;
-                            mgr.release_in_flight_slot(&agent_id).await;
+                            mgr.release_in_flight_slot(&agent_id);
                             break 'outer;
                         } else if suspend_interrupt_error(&e) {
                             // Sleep-induced interruption (Task C):
@@ -8628,7 +8627,7 @@ async fn run_message_worker(
                             // Release the in-flight slot without overwriting the
                             // Error status just persisted, so `agent.retry` (or a
                             // future message) can restart the worker.
-                            mgr.release_in_flight_slot(&agent_id).await;
+                            mgr.release_in_flight_slot(&agent_id);
                             break 'outer;
                         }
                     }
@@ -8659,7 +8658,7 @@ async fn run_message_worker(
                 // Release the in-flight slot without overwriting the Error status
                 // that handle_terminal_spawn_failure just persisted. This allows
                 // a future message (or agent.retry) to restart the worker.
-                mgr.release_in_flight_slot(&agent_id).await;
+                mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
         }
@@ -8771,7 +8770,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id).await;
+                        mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
                     }
                 }
@@ -8860,7 +8859,7 @@ async fn run_message_worker(
             if !user_persisted {
                 handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
                     .await;
-                mgr.release_in_flight_slot(&agent_id).await;
+                mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
             continue;
@@ -8994,7 +8993,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id).await;
+                        mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
                     }
                 }
@@ -9049,7 +9048,7 @@ async fn run_message_worker(
                         continue 'outer;
                     }
                     FlushPrep::Parked => {
-                        mgr.release_in_flight_slot(&agent_id).await;
+                        mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
                     }
                 }
@@ -9116,7 +9115,7 @@ async fn run_message_worker(
             if !user_persisted {
                 handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
                     .await;
-                mgr.release_in_flight_slot(&agent_id).await;
+                mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
             continue 'outer;
@@ -9941,7 +9940,7 @@ async fn publish_error_status_and_requeue(
             metadata: None,
             data,
         };
-        crate::publish_event(&mgr.services.event_bus, event).await;
+        crate::publish_event(mgr.services.event_bus.as_ref(), event).await;
     }
 
     // Requeue the failed message to the front of the queue. `persisted`
@@ -11642,7 +11641,7 @@ mod dead_child_respawn_tests {
             connection,
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
-            _child: child,
+            child,
             child_pid,
             _mcp_bridge: None,
             _mcp_config: None,
@@ -11678,7 +11677,7 @@ mod dead_child_respawn_tests {
         assert_eq!(acp, "acp-cached", "live child reuses the cached session");
         // No respawn happened: the fake handle (no owned child) is untouched.
         let handles = mgr.handles.lock().unwrap();
-        assert!(handles.get(&agent_id).unwrap()._child.is_none());
+        assert!(handles.get(&agent_id).unwrap().child.is_none());
     }
 
     /// Handle present but the child already exited → `ensure_started` must
@@ -11714,7 +11713,7 @@ mod dead_child_respawn_tests {
         {
             let handles = mgr.handles.lock().unwrap();
             assert!(
-                handles.get(&agent_id).unwrap()._child.is_some(),
+                handles.get(&agent_id).unwrap().child.is_some(),
                 "respawn installed a real child-owning handle"
             );
         }
@@ -12531,6 +12530,7 @@ mod rebuild_spawn_opts_tests {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::used_underscore_binding)] // tests read the RAII `_extension` field; underscore documents production intent
 mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn

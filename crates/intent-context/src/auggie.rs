@@ -167,22 +167,21 @@ async fn run_auggie(
         }
     }
 
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|e| ContextError::Spawn(e.to_string()))?,
-        Err(_) => {
-            // Kill the whole process group (pgid == pid via `process_group`);
-            // the dropped `wait_with_output` future's `kill_on_drop` covers
-            // the direct child on non-unix.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            return Err(ContextError::Timeout);
+    let output = if let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await {
+        result.map_err(|e| ContextError::Spawn(e.to_string()))?
+    } else {
+        // Kill the whole process group (pgid == pid via `process_group`);
+        // the dropped `wait_with_output` future's `kill_on_drop` covers
+        // the direct child on non-unix.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
         }
+        #[cfg(not(unix))]
+        let _ = pid;
+        return Err(ContextError::Timeout);
     };
 
     Ok(CommandOutput {
@@ -373,10 +372,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn availability_available_via_fake_binary() {
+        use std::os::unix::fs::PermissionsExt;
         let _serial = CHILD_SPAWN_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("avail");
         let bin = dir.path().join("auggie");
         std::fs::write(&bin, "#!/bin/sh\necho 'auggie 2.5.1'\n").unwrap();
@@ -399,10 +398,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_auggie_timeout_group_kills_grandchildren() {
+        use std::os::unix::fs::PermissionsExt;
         let _serial = CHILD_SPAWN_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        use std::os::unix::fs::PermissionsExt;
         let dir = unique_temp_dir("groupkill");
         let bin = dir.path().join("auggie");
         let pidfile = dir.path().join("grandchild.pid");

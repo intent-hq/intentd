@@ -594,9 +594,8 @@ mod tests {
             MAX_CREDENTIAL_ATTEMPTS,
             None,
         );
-        let err = match res {
-            Ok(_) => panic!("attempt == max must fail regardless of environment"),
-            Err(e) => e,
+        let Err(err) = res else {
+            panic!("attempt == max must fail regardless of environment")
         };
         assert!(
             err.message().contains("exhausted"),
@@ -626,9 +625,8 @@ mod tests {
             None,
             git2::CredentialType::empty(),
         );
-        let err = match res {
-            Ok(_) => panic!("callback must error after MAX_CREDENTIAL_ATTEMPTS"),
-            Err(e) => e,
+        let Err(err) = res else {
+            panic!("callback must error after MAX_CREDENTIAL_ATTEMPTS")
         };
         assert!(
             err.message().contains("exhausted"),
@@ -649,9 +647,8 @@ mod tests {
             None,
             git2::CredentialType::USER_PASS_PLAINTEXT,
         );
-        let err = match res {
-            Ok(_) => panic!("max_attempts=0 must error on the first call"),
-            Err(e) => e,
+        let Err(err) = res else {
+            panic!("max_attempts=0 must error on the first call")
         };
         assert!(err.message().contains("exhausted"));
     }

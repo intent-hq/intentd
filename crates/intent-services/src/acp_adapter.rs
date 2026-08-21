@@ -654,6 +654,7 @@ mod reap_tests {
     // `intent_acp::descendant_sweep`; this module keeps the adapter-level
     // integration regression.
 
+    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
     /// Regression for the live escape: an MCP-server-style grandchild that
     /// moves into its OWN process group survives `killpg` on the adapter
     /// group (observed: codex-acp's auggie ran with pgid == its own pid); the

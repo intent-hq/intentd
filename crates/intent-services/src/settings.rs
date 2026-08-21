@@ -605,9 +605,8 @@ impl SettingDefinition {
                 }
             },
             SettingType::Number { min, max } => {
-                let n = match value.as_f64() {
-                    Some(n) => n,
-                    None => return invalid(format!("{}: expected a number", self.path)),
+                let Some(n) = value.as_f64() else {
+                    return invalid(format!("{}: expected a number", self.path));
                 };
                 if let Some(min) = min {
                     if n < min {
@@ -1635,6 +1634,7 @@ pub async fn import_legacy_settings(
 ///
 /// Never errors today: migration failures are logged and skipped. The `Result` keeps parity with the other startup migrations.
 pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
+    const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
     let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
         return Ok(());
     };
@@ -1643,7 +1643,6 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
         return Ok(());
     };
     let mut migrated: Vec<String> = Vec::new();
-    const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
     let unknown: Vec<&str> = table
         .keys()
         .map(String::as_str)
@@ -1834,18 +1833,18 @@ impl<'a> SettingsService<'a> {
     /// `tokio::select!` on all `load` futures concurrently through a `join!`
     /// analog so a stalled account never blocks the others.
     pub(crate) async fn list(&self) -> Result<Value> {
-        let defs = definitions();
-        let sensitive: Vec<&'static str> = defs
-            .iter()
-            .filter(|d| d.sensitive)
-            .map(|d| d.path)
-            .collect();
         // Drive every load future concurrently on the current task: a single
         // stalled account never blocks the others because `join_all_pinned`
         // polls every future on each wake-up. Best-effort: errors treated as absent.
         type LoadFuture<'a> = std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>,
         >;
+        let defs = definitions();
+        let sensitive: Vec<&'static str> = defs
+            .iter()
+            .filter(|d| d.sensitive)
+            .map(|d| d.path)
+            .collect();
         let futs: Vec<LoadFuture<'_>> = sensitive
             .iter()
             .map(|path| {
@@ -2478,6 +2477,7 @@ mod tests {
     /// always succeeds; a zero reading is treated as undetected so the max
     /// never collapses onto the minimum.
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
         assert_eq!(
             memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
@@ -3477,6 +3477,7 @@ mod tests {
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
     /// config.toml (never `SQLite`) and rejects out-of-range values.
     #[tokio::test]
+    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
         let path = "voice.workspaceVocabulary.maxTerms";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

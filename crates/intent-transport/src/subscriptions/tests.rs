@@ -1437,6 +1437,7 @@ fn merge_live_turn_slims_in_flight_blocks_under_slim_projection() {
 /// pages the evicted history back via `agent.getConversation`.
 #[test]
 fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
+    use base64::Engine as _;
     use intent_core::{SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
     // Persisted page: 8 rows of ~128KB each (~1MB total mimics a page that
     // arrived at/near budget from the budgeted read).
@@ -1500,7 +1501,6 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         token, "tok-old",
         "cursor must move to the eviction boundary"
     );
-    use base64::Engine as _;
     let cursor: Value = serde_json::from_slice(
         &base64::engine::general_purpose::STANDARD_NO_PAD
             .decode(token)

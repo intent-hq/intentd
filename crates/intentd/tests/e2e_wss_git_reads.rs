@@ -528,7 +528,7 @@ async fn git_get_config_over_wss() {
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
-    let (ws_id, _wt) = create_workspace(&mut ws, &repo, "Git Read E2E — getConfig").await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Read E2E — getConfig").await;
 
     // Success: should return raw .git/config content.
     let resp = wss_rpc(&mut ws, 3, "git.getConfig", json!({ "workspaceId": ws_id })).await;
@@ -580,7 +580,7 @@ async fn git_get_config_over_wss() {
     assert_eq!(config_resp["result"]["config"], json!(""));
 
     // Non-repo workspace: remove .git file/directory → empty string.
-    let git_path = _wt.join(".git");
+    let git_path = wt.join(".git");
     if git_path.is_file() {
         std::fs::remove_file(&git_path).expect("remove .git file");
     } else if git_path.is_dir() {

@@ -249,7 +249,7 @@ where
     // whichever client connected first. The guard drops when this function
     // returns (normal exit, error, or panic-unwind) so failover is exactly the
     // connection arrival order.
-    let _reverse_guard = reverse_registry.register(reverse.clone());
+    let reverse_guard = reverse_registry.register(reverse.clone());
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = Vec::new();
@@ -321,7 +321,7 @@ where
     // EOF after a server-initiated close (e.g. an oversized frame).
     drop(subs);
     drop(forwards);
-    drop(_reverse_guard);
+    drop(reverse_guard);
     drop(reverse);
     drop(out_tx);
     let _ = writer.await;
@@ -362,24 +362,20 @@ where
                 BoundedLine::Line
             });
         }
-        match available.iter().position(|&b| b == b'\n') {
-            Some(pos) => {
-                if buf.len() + pos > limit {
-                    return Ok(BoundedLine::TooLong);
-                }
-                buf.extend_from_slice(&available[..pos]);
-                reader.consume(pos + 1);
-                return Ok(BoundedLine::Line);
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > limit {
+                return Ok(BoundedLine::TooLong);
             }
-            None => {
-                let len = available.len();
-                if buf.len() + len > limit {
-                    return Ok(BoundedLine::TooLong);
-                }
-                buf.extend_from_slice(available);
-                reader.consume(len);
-            }
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(BoundedLine::Line);
         }
+        let len = available.len();
+        if buf.len() + len > limit {
+            return Ok(BoundedLine::TooLong);
+        }
+        buf.extend_from_slice(available);
+        reader.consume(len);
     }
 }
 

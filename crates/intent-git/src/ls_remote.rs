@@ -146,18 +146,16 @@ where
         .wait_for(std::option::Option::is_some)
         .await
         .map(|o| o.clone());
-    let outcome = match published {
-        Ok(published) => published.expect("guarded by wait_for"),
+    let Ok(published) = published else {
         // The driver vanished without publishing (panic). Evict the dead
         // flight so later callers do not join it, then surface the failure.
-        Err(_) => {
-            let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
-            if map.get(key).is_some_and(|f| f.same_channel(&flight)) {
-                map.remove(key);
-            }
-            return Err(Error::Internal("ls-remote flight abandoned".to_string()));
+        let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
+        if map.get(key).is_some_and(|f| f.same_channel(&flight)) {
+            map.remove(key);
         }
+        return Err(Error::Internal("ls-remote flight abandoned".to_string()));
     };
+    let outcome = published.expect("guarded by wait_for");
     outcome.map_err(Error::Internal)
 }
 

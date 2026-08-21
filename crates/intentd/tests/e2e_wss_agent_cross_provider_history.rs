@@ -347,6 +347,7 @@ fn seed_grok_path_override(data_dir: &Path, wrapper: &Path) {
     std::fs::write(&path, text).expect("write config.toml");
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Cross-provider `agent.setModel` regression: switching a live `mock` agent
 /// to `grok:grok-4-fast` must respawn onto the (hermetically wrapped) grok
 /// binary, open a fresh `session/new` there, and prepend the prior
@@ -690,6 +691,7 @@ async fn load_session_harness(script: &str, tag: &str, model: &str) -> LoadSessi
     harness
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// monorepo#907 regression: a committed cross-provider switch must NEVER
 /// issue `session/load` with the old provider's session id against the new
 /// provider's binary — even when that provider advertises `loadSession: true`
@@ -757,6 +759,7 @@ async fn cross_provider_switch_skips_foreign_session_load() {
     );
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Same-provider model switches keep the `session/load` resume: the respawned
 /// child is offered the ORIGINAL session id (its owner provider is unchanged)
 /// and no history replay happens. Runs on the grok wrapper (not `mock:` — the
@@ -821,6 +824,7 @@ async fn same_provider_model_switch_resumes_via_session_load() {
     );
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Deferred-commit semantics: a cross-provider switch REVERTED before the
 /// next message is a no-op — the live child and its original session are
 /// reused untouched (no respawn, no session/load, no replay, no notice).

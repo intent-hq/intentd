@@ -216,7 +216,7 @@ pub(crate) async fn run_poll_loop(
     }
     let status = outcome.map_or("authorized", FlowPhase::as_wire);
     tracing::info!(status, "github device flow finished");
-    publish_event(&bus, auth_changed_event(status)).await;
+    publish_event(bus.as_ref(), auth_changed_event(status)).await;
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.

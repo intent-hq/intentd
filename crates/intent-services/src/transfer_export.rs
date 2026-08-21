@@ -214,7 +214,7 @@ impl Services {
                     return;
                 };
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     transfer_event(&workspace_id, WORKSPACE_TRANSFER_READY, event_data),
                 )
                 .await;
@@ -232,7 +232,7 @@ impl Services {
                 );
                 self.cleanup_export(&export_id).await;
                 publish_event(
-                    &self.event_bus,
+                    self.event_bus.as_ref(),
                     transfer_event(
                         &workspace_id,
                         WORKSPACE_TRANSFER_FAILED,
@@ -320,7 +320,7 @@ impl Services {
         // while they are being captured. Held through the git bundle (stage
         // 3) so the bundle is built against the same quiesced state as the
         // rows.
-        let _teardown_fence = match manager.as_ref() {
+        let teardown_fence = match manager.as_ref() {
             Some(manager) => {
                 let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
                 Some(manager.stop_many(&ids).await)
@@ -422,7 +422,7 @@ impl Services {
         } else {
             None
         };
-        drop(_teardown_fence);
+        drop(teardown_fence);
         if self.export_aborted(export_id) {
             return Ok(None);
         }
@@ -664,9 +664,9 @@ impl Services {
     /// dir. Best-effort.
     pub(crate) async fn sweep_stale_export_staging_dirs(&self) {
         let root = self.export_staging_root();
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(entries) => entries,
-            Err(_) => return, // no staging root yet — nothing to sweep
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+            // no staging root yet — nothing to sweep
+            return;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -709,7 +709,7 @@ impl Services {
                 .insert("bytesWritten".to_string(), serde_json::json!(bytes));
         }
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             transfer_event(workspace_id, WORKSPACE_TRANSFER_PROGRESS, data),
         )
         .await;
@@ -1036,7 +1036,7 @@ mod tests {
         let exports = svc.transfer_exports.lock().unwrap();
         match &exports.get(export_id).expect("session").state {
             ExportState::Ready(r) => (r.size_bytes, r.sha256.clone()),
-            _ => panic!("session not ready"),
+            ExportState::Building { .. } => panic!("session not ready"),
         }
     }
 

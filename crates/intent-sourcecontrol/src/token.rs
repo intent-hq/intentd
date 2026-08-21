@@ -75,7 +75,7 @@ async fn file_store_token() -> Option<String> {
         tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(v)))) => non_empty(&v),
-        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Ok(None)) | Err(_)) => None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,
@@ -84,7 +84,6 @@ async fn file_store_token() -> Option<String> {
             );
             None
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,
@@ -127,7 +126,7 @@ async fn gh_cli_token() -> Option<String> {
     });
     match timeout(GH_CLI_TIMEOUT, handle).await {
         Ok(Ok(Some(v))) => non_empty(&v),
-        Ok(Ok(None)) | Ok(Err(_)) => None,
+        Ok(Ok(None) | Err(_)) => None,
         Err(_) => {
             tracing::warn!("`gh auth token` timed out");
             None

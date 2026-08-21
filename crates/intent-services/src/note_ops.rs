@@ -289,7 +289,7 @@ fn match_task_line(line: &str) -> Option<(char, String)> {
         chars.next();
     }
     match chars.next() {
-        Some('-') | Some('*') => {}
+        Some('-' | '*') => {}
         _ => return None,
     }
     while matches!(chars.peek(), Some(c) if is_js_space_char(*c)) {
@@ -298,9 +298,8 @@ fn match_task_line(line: &str) -> Option<(char, String)> {
     if chars.next() != Some('[') {
         return None;
     }
-    let checkbox = match chars.next() {
-        Some(c @ (' ' | 'x' | 'X' | '/')) => c,
-        _ => return None,
+    let Some(checkbox @ (' ' | 'x' | 'X' | '/')) = chars.next() else {
+        return None;
     };
     if chars.next() != Some(']') {
         return None;
@@ -472,19 +471,16 @@ pub(crate) fn apply_task_line_update(
     }
     let current = lines[usize::try_from(line - 1).expect("value fits in usize")].clone();
     let parsed = parse_dash_checkbox(&current);
-    let (box_start, after_idx, cb) = match parsed {
-        Some(v) => v,
-        None => {
-            let trunc: String = current.chars().take(50).collect();
-            let ellipsis = if current.chars().count() > 50 {
-                "..."
-            } else {
-                ""
-            };
-            return Err(Error::Internal(format!(
-                "Line {line} is not a task. Expected format: \"- [ ] task text\". Found: \"{trunc}{ellipsis}\""
-            )));
-        }
+    let Some((box_start, after_idx, cb)) = parsed else {
+        let trunc: String = current.chars().take(50).collect();
+        let ellipsis = if current.chars().count() > 50 {
+            "..."
+        } else {
+            ""
+        };
+        return Err(Error::Internal(format!(
+            "Line {line} is not a task. Expected format: \"- [ ] task text\". Found: \"{trunc}{ellipsis}\""
+        )));
     };
     let prefix = &current[..box_start];
     let current_task_text = current[after_idx..].trim_start();
@@ -570,13 +566,10 @@ pub(crate) fn find_and_anchor_text(
         return Ok((from, to, line_of(content, from)));
     }
     let ctx_from = ctx[0];
-    let rel = match search_context.find(comment_target) {
-        Some(r) => r,
-        None => {
-            return Err(Error::InvalidParams(
-                "The comment target was not found within the search context.".to_string(),
-            ))
-        }
+    let Some(rel) = search_context.find(comment_target) else {
+        return Err(Error::InvalidParams(
+            "The comment target was not found within the search context.".to_string(),
+        ));
     };
     if count_occurrences(search_context, comment_target) > 1 {
         return Err(Error::InvalidParams(
@@ -623,7 +616,7 @@ fn list_marker_len(line: &str) -> Option<usize> {
         b'-' | b'*' | b'+' => (b.get(1) == Some(&b' ')).then_some(2),
         b'0'..=b'9' => {
             let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
-            (matches!(b.get(digits), Some(b'.') | Some(b')')) && b.get(digits + 1) == Some(&b' '))
+            (matches!(b.get(digits), Some(b'.' | b')')) && b.get(digits + 1) == Some(&b' '))
                 .then_some(digits + 2)
         }
         _ => None,
@@ -655,7 +648,7 @@ fn plaintext_projection(md: &str) -> PlaintextProjection {
             let body = &line[indent..];
             let hashes = body.bytes().take_while(|b| *b == b'#').count();
             let skip = if (1..=6).contains(&hashes)
-                && matches!(body.as_bytes().get(hashes), Some(b' ') | Some(b'\t'))
+                && matches!(body.as_bytes().get(hashes), Some(b' ' | b'\t'))
             {
                 hashes + 1
             } else if body.starts_with("> ") {
@@ -1519,25 +1512,22 @@ fn strip_paired(s: &str, delim: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     loop {
-        match rest.find(delim) {
-            Some(open) => {
-                let after = &rest[open + delim.len()..];
-                match after.find(delim) {
-                    Some(close) if close > 0 => {
-                        out.push_str(&rest[..open]);
-                        out.push_str(&after[..close]);
-                        rest = &after[close + delim.len()..];
-                    }
-                    _ => {
-                        out.push_str(&rest[..open + delim.len()]);
-                        rest = after;
-                    }
+        if let Some(open) = rest.find(delim) {
+            let after = &rest[open + delim.len()..];
+            match after.find(delim) {
+                Some(close) if close > 0 => {
+                    out.push_str(&rest[..open]);
+                    out.push_str(&after[..close]);
+                    rest = &after[close + delim.len()..];
+                }
+                _ => {
+                    out.push_str(&rest[..open + delim.len()]);
+                    rest = after;
                 }
             }
-            None => {
-                out.push_str(rest);
-                break;
-            }
+        } else {
+            out.push_str(rest);
+            break;
         }
     }
     out
@@ -1590,7 +1580,6 @@ fn strip_leading_headers(s: &str) -> String {
 /// inverse of [`mime_from_extension`], per the TS `getExtensionFromMimeType`.
 pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
     match mime_type {
-        "image/png" => ".png",
         "image/jpeg" | "image/jpg" => ".jpg",
         "image/gif" => ".gif",
         "image/webp" => ".webp",
@@ -1655,7 +1644,6 @@ pub(crate) fn mime_from_extension(asset_id: &str) -> String {
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
@@ -2415,6 +2403,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
     fn save_asset_helpers() {
         assert_eq!(extension_from_mime("image/jpeg"), ".jpg");
         assert_eq!(extension_from_mime("image/webp"), ".webp");
@@ -2511,7 +2500,7 @@ mod tests {
         let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
             RecoveryOutcome::Recovered(m) => m,
-            other => panic!("expected Recovered, got {other:?}"),
+            other @ RecoveryOutcome::Failed(_) => panic!("expected Recovered, got {other:?}"),
         };
         assert!(
             recovered.contains("<!--anchor:c1:start-->target<!--anchor:c1:end--> post"),
@@ -2531,7 +2520,7 @@ mod tests {
         let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
             RecoveryOutcome::Recovered(m) => m,
-            other => panic!("expected Recovered, got {other:?}"),
+            other @ RecoveryOutcome::Failed(_) => panic!("expected Recovered, got {other:?}"),
         };
         assert!(
             recovered.contains("pre <!--anchor:c1:start-->target<!--anchor:c1:end--> post"),

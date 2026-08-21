@@ -29,7 +29,7 @@ impl std::fmt::Debug for LinearClient {
         f.debug_struct("LinearClient")
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

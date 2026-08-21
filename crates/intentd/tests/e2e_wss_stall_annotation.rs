@@ -347,6 +347,8 @@ async fn seed_workspace_and_task_note(data_dir: &Path) -> String {
 /// message metadata carries `stallSuspected: true` + `taskStatus`.
 #[tokio::test]
 async fn stall_annotated_wake_reaches_parent_over_wss() {
+    const CHILD_MARK: &str = "STALL_E2E_CHILD_TURN";
+    const PARENT_GO: &str = "STALL_E2E_PARENT_GO";
     let Some(script) = gate("WSS stall-annotation E2E") else {
         return;
     };
@@ -354,8 +356,6 @@ async fn stall_annotated_wake_reaches_parent_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_and_task_note(&data_dir).await;
 
-    const CHILD_MARK: &str = "STALL_E2E_CHILD_TURN";
-    const PARENT_GO: &str = "STALL_E2E_PARENT_GO";
     // The child idles WITHOUT reportToParent and WITHOUT completing the task
     // note — the exact monorepo#1016 stall shape.
     let delegate_js = format!(

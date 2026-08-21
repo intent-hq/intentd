@@ -190,10 +190,10 @@ fn user_db_shell() -> Option<String> {
         let rc = unsafe {
             libc::getpwuid_r(
                 libc::getuid(),
-                &mut pwd,
+                &raw mut pwd,
                 buf.as_mut_ptr(),
                 buf.len(),
-                &mut result,
+                &raw mut result,
             )
         };
         if rc == libc::ERANGE && buf.len() < (1 << 20) {
@@ -382,7 +382,11 @@ pub fn prewarm_login_shell_path() {
 }
 
 /// Helper to push a directory to the list if it's not empty and not already seen.
-pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
+pub fn push_dir<S: std::hash::BuildHasher>(
+    dirs: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf, S>,
+    dir: PathBuf,
+) {
     if dir.as_os_str().is_empty() {
         return;
     }
@@ -449,6 +453,7 @@ pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
+#[allow(clippy::similar_names)] // path vs the semver patch component - both domain terms
 fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64, bool)> {
     let version = path.file_name()?.to_str()?.strip_prefix('v')?;
     let core = version.split(['-', '+']).next()?;

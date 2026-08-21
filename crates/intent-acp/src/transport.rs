@@ -130,14 +130,13 @@ impl StderrLogSink {
     /// error) the line is dropped — capture is best-effort by design.
     fn send_line(&mut self, line: &str) {
         match self.tx.try_send(line.to_string()) {
-            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !self.drop_warned {
                     self.drop_warned = true;
                     tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }
@@ -254,8 +253,8 @@ fn truncate_middle(s: &str, max: usize) -> String {
 fn dispatch(
     value: &Value,
     pending: &PendingMap,
-    requests: &Option<mpsc::UnboundedSender<IncomingRequest>>,
-    notifications: &Option<mpsc::UnboundedSender<IncomingNotification>>,
+    requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
+    notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
     response_seq: &AtomicU64,
     response_notify: &Notify,
     client_request_seq: &AtomicU64,
@@ -381,8 +380,8 @@ impl Connection {
                     Ok(value) => dispatch(
                         &value,
                         &pending_reader,
-                        &requests,
-                        &notifications,
+                        requests.as_ref(),
+                        notifications.as_ref(),
                         &seq_reader,
                         &notify_reader,
                         &client_req_seq_reader,

@@ -10,49 +10,14 @@ homepage = "https://github.com/intent-hq/intentd"
 license = "Apache-2.0"
 
 # Pedantic ratchet: `clippy::pedantic` is enabled workspace-wide at `warn` (enforced by
-# the `-D warnings` gate). Every lint below currently fires somewhere in the workspace
-# and is explicitly allowed so the gate stays green. TEMPORARY(burndown) allows are
-# removed one by one as their findings are fixed; PERMANENT allows stay, with rationale.
+# the `-D warnings` gate). The burndown is complete — new findings are fixed or given a
+# per-site `#[allow]` with a one-line justification. PERMANENT allows stay, with rationale.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # PERMANENT: splitting hundreds of long functions is a risky mass refactor, not a warnings pass.
 too_many_lines = "allow"
 # PERMANENT: fixing means boxing futures broadly; a perf/architecture decision, out of scope.
 large_futures = "allow"
-# TEMPORARY(burndown): the allows below are removed as their findings are fixed.
-items_after_statements = "allow"
-single_match_else = "allow"
-manual_let_else = "allow"
-used_underscore_binding = "allow"
-similar_names = "allow"
-match_same_arms = "allow"
-unnested_or_patterns = "allow"
-ref_option = "allow"
-unnecessary_wraps = "allow"
-manual_assert = "allow"
-option_option = "allow"
-duration_suboptimal_units = "allow"
-borrow_as_ptr = "allow"
-struct_excessive_bools = "allow"
-if_not_else = "allow"
-unused_async = "allow"
-float_cmp = "allow"
-case_sensitive_file_extension_comparisons = "allow"
-missing_fields_in_debug = "allow"
-match_wildcard_for_single_variants = "allow"
-implicit_hasher = "allow"
-match_bool = "allow"
-unchecked_time_subtraction = "allow"
-struct_field_names = "allow"
-match_wild_err_arm = "allow"
-elidable_lifetime_names = "allow"
-many_single_char_names = "allow"
-fn_params_excessive_bools = "allow"
-wildcard_imports = "allow"
-ptr_as_ptr = "allow"
-ref_as_ptr = "allow"
-inconsistent_struct_constructor = "allow"
-ip_constant = "allow"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

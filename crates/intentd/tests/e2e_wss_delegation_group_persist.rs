@@ -434,37 +434,21 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Increment 6: full restart scenario - wait for the aggregated wake with both reports.
 #[tokio::test]
 async fn baseline_plus_aggregated_wake() {
-    let Some(script) = gate("WSS after_all baseline (no restart)") else {
-        return;
-    };
-
-    let data_dir_guard = temp_data_dir();
-    let data_dir = data_dir_guard.path().to_path_buf();
-    let ws_id = seed_workspace_only(&data_dir).await;
     const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
     const CHILD_B: &str = "WAKE1_CHILD_BETA";
     const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
     const REPORT_B: &str = "REPORT_BETA finished the beta task";
     const PARENT_GO: &str = "WAKE1_PARENT_GO";
-    let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
-    let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
-    let delegate_a_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
-        json!(CHILD_A),
-    );
-    let delegate_b_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
-        json!(CHILD_B),
-    );
-
-    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
-    // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
-    // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
-    // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
-    // the correct delayMs for child2.
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+                                    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
+                                    // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
+                                    // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
+                                    // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
+                                    // the correct delayMs for child2.
     fn build_behavior(
         child2_delay_ms: u64,
         report_a_js: &str,
@@ -514,6 +498,23 @@ async fn baseline_plus_aggregated_wake() {
         })
         .to_string()
     }
+    let Some(script) = gate("WSS after_all baseline (no restart)") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
+    let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
+    let delegate_a_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!(CHILD_A),
+    );
+    let delegate_b_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!(CHILD_B),
+    );
 
     let behavior_daemon1 = build_behavior(
         60000,
@@ -530,7 +531,7 @@ async fn baseline_plus_aggregated_wake() {
         ("RUST_LOG", "intent_services=info"),
     ];
     let child = spawn_serve(&data_dir, "both", &env_daemon1);
-    let _daemon = Daemon {
+    let daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
@@ -701,7 +702,7 @@ async fn baseline_plus_aggregated_wake() {
     eprintln!("Killing daemon1 and all mock processes...");
     drop(sub);
     drop(rpc);
-    drop(_daemon);
+    drop(daemon);
     tokio::time::sleep(Duration::from_millis(500)).await;
     eprintln!("Daemon1 killed.");
 

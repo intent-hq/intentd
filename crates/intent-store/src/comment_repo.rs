@@ -45,6 +45,7 @@ struct ExtraFields {
 /// Tolerate wrong-typed legacy `isOrphaned` values preserved verbatim in
 /// `extra_json` by the legacy importer: anything but a JSON boolean decodes
 /// as `None` instead of failing the whole row.
+#[allow(clippy::unnecessary_wraps)] // serde deserialize_with requires the Result shape
 fn lenient_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,

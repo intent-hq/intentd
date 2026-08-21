@@ -391,7 +391,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 
     // STEP 1: Boot UDS-only, persist server.wsApi.enabled=true
     let child = spawn_serve(&data_dir, "uds", &env);
-    let mut _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
         cleanup_data_dir: false, // Don't cleanup - we'll reuse this data_dir for second boot
@@ -508,7 +508,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let exit_deadline = tokio::time::Instant::now() + exit_budget;
     let mut exited = false;
     while tokio::time::Instant::now() < exit_deadline {
-        if matches!(_daemon.child.try_wait(), Ok(Some(_))) {
+        if matches!(daemon.child.try_wait(), Ok(Some(_))) {
             exited = true;
             break;
         }
@@ -519,7 +519,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
         "daemon did not exit within {exit_budget:?} after system.shutdown"
     );
     // Drop the first daemon without cleanup; process already exited
-    drop(_daemon);
+    drop(daemon);
 
     // STEP 3: Boot again UDS-only (same data dir, persisted setting is true)
     let child2 = spawn_serve(&data_dir, "uds", &env);

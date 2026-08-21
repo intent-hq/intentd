@@ -191,15 +191,14 @@ pub(crate) fn build_git_status_value_with(
     // `status_ms` only attributes a scan this call actually ran; with an
     // injected status the scan was paid by (or shared with) another caller's
     // flight, so it logs as absent rather than a misleading ~0.
-    let (status, status_ms) = match scanned {
-        Some(s) => (s, None),
-        None => {
-            let s = std::sync::Arc::new(intent_git::status::status(worktree)?);
-            (
-                s,
-                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-            )
-        }
+    let (status, status_ms) = if let Some(s) = scanned {
+        (s, None)
+    } else {
+        let s = std::sync::Arc::new(intent_git::status::status(worktree)?);
+        (
+            s,
+            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        )
     };
     let branch = if status.branch.is_empty() {
         ws.branch.clone()

@@ -58,7 +58,7 @@ async fn file_store_key(provider: VoiceProvider) -> Option<String> {
         tokio::task::spawn_blocking(move || intent_core::FileSecretStore::new().load(account));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
         Ok(Ok(Ok(Some(v)))) => non_empty(&v),
-        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Ok(None)) | Err(_)) => None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 account = %account,
@@ -67,7 +67,6 @@ async fn file_store_key(provider: VoiceProvider) -> Option<String> {
             );
             None
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
                 account = %account,

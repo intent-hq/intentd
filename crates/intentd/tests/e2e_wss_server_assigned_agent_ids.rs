@@ -124,8 +124,7 @@ async fn next_event(ws: &mut PlainWs, types: &[&str], secs: u64) -> Value {
                     }
                 }
             }
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-            Some(Ok(_)) => {}
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | _)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }

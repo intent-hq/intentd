@@ -441,6 +441,8 @@ async fn test_script_list_bootstrap_from_repo() {
 /// those instructions are included in the agent's system prompt.
 #[tokio::test]
 async fn test_repo_instructions_in_system_prompt() {
+    // Simulate what rules.rs does at lines 381-386
+    use intent_services::repo_config::read_repo_config;
     let db = TempDb::new();
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
@@ -479,8 +481,6 @@ async fn test_repo_instructions_in_system_prompt() {
         create_test_repo_with_config(r#"{"instructions": "Always use TypeScript for new files"}"#);
     let repo_path_buf = repo.0.clone();
 
-    // Simulate what rules.rs does at lines 381-386
-    use intent_services::repo_config::read_repo_config;
     let repo_config = read_repo_config(&repo_path_buf).await;
     assert_eq!(
         repo_config.instructions.as_deref(),
@@ -497,6 +497,7 @@ async fn test_repo_instructions_in_system_prompt() {
 /// (`WorkspaceScriptLocks`) to serialize bootstrap operations.
 #[tokio::test]
 async fn concurrent_script_list_no_duplicates() {
+    use intent_core::WorkspaceCreate;
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
@@ -516,7 +517,6 @@ async fn concurrent_script_list_no_duplicates() {
     );
 
     // Create a workspace with the repo
-    use intent_core::WorkspaceCreate;
     let input: WorkspaceCreate = serde_json::from_value(json!({
         "repositoryPath": repo.0.to_string_lossy(),
         "skipWorktree": true

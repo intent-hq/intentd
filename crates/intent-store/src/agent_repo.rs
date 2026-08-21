@@ -135,7 +135,9 @@ pub(crate) async fn fetch_agent_usage_rows(
         // (monorepo#738) — and when it does run it projects usage metadata in
         // SQL rather than message bodies (monorepo#1571).
         let contents: Vec<serde_json::Value> =
-            if !intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+            if intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref()) {
+                Vec::new()
+            } else {
                 let message_sql = format!(
                     "SELECT {MESSAGE_USAGE_JSON_SQL} AS usage_json FROM agent_message \
                      WHERE agent_id = ? AND {MESSAGE_USAGE_PRESENT_SQL} ORDER BY seq ASC"
@@ -154,8 +156,6 @@ pub(crate) async fn fetch_agent_usage_rows(
                         usage_json.and_then(|s| serde_json::from_str(&s).ok())
                     })
                     .collect()
-            } else {
-                Vec::new()
             };
 
         result.push((agent_id, model, snapshot, baseline, contents));
@@ -376,13 +376,12 @@ fn batch_preview_col_values(messages: &[OwnedBatchMessage]) -> Result<BatchPrevi
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
-fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
-    v.as_ref()
-        .map(|value| {
-            serde_json::to_string(value)
-                .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
-        })
-        .transpose()
+fn json_col_to_db(v: Option<&serde_json::Value>) -> Result<Option<String>> {
+    v.map(|value| {
+        serde_json::to_string(value)
+            .map_err(|e| Error::Internal(format!("encode session json column failed: {e}")))
+    })
+    .transpose()
 }
 
 /// Decode an optional JSON payload column back into its `serde_json::Value`.
@@ -398,9 +397,8 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
 /// staying NULL. `serde_json` string-array encoding is deterministic, so the
 /// encoded form doubles as the change-detection comparand in
 /// [`Store::set_agent_effort_levels`].
-fn effort_levels_to_db(levels: &Option<Vec<String>>) -> Result<Option<String>> {
+fn effort_levels_to_db(levels: Option<&Vec<String>>) -> Result<Option<String>> {
     levels
-        .as_ref()
         .map(|v| {
             serde_json::to_string(v)
                 .map_err(|e| Error::Internal(format!("encode effort_levels failed: {e}")))
@@ -452,9 +450,9 @@ fn bind_session_insert<'q>(
         .bind(&s.attention_request_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
-        .bind(json_col_to_db(&s.context_references)?)
-        .bind(json_col_to_db(&s.image_blocks)?)
-        .bind(json_col_to_db(&s.file_blocks)?)
+        .bind(json_col_to_db(s.context_references.as_ref())?)
+        .bind(json_col_to_db(s.image_blocks.as_ref())?)
+        .bind(json_col_to_db(s.file_blocks.as_ref())?)
         .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
@@ -463,10 +461,10 @@ fn bind_session_insert<'q>(
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
-        .bind(effort_levels_to_db(&s.effort_levels)?)
+        .bind(effort_levels_to_db(s.effort_levels.as_ref())?)
         .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
-        .bind(json_col_to_db(&s.harness_features)?))
+        .bind(json_col_to_db(s.harness_features.as_ref())?))
 }
 
 impl Store {
@@ -1421,9 +1419,9 @@ impl Store {
         .bind(&s.completion_report_timestamp)
         .bind(s.delegation_depth)
         .bind(&s.initial_message)
-        .bind(json_col_to_db(&s.context_references)?)
-        .bind(json_col_to_db(&s.image_blocks)?)
-        .bind(json_col_to_db(&s.file_blocks)?)
+        .bind(json_col_to_db(s.context_references.as_ref())?)
+        .bind(json_col_to_db(s.image_blocks.as_ref())?)
+        .bind(json_col_to_db(s.file_blocks.as_ref())?)
         .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
@@ -1910,7 +1908,7 @@ impl Store {
         levels: Option<&[String]>,
         updated_at: &str,
     ) -> Result<bool> {
-        let encoded = effort_levels_to_db(&levels.map(<[String]>::to_vec))?;
+        let encoded = effort_levels_to_db(levels.map(<[String]>::to_vec).as_ref())?;
         let rows = sqlx::query(
             "UPDATE agent_session SET effort_levels=?, updated_at=? \
              WHERE id=? AND workspace_id=? AND effort_levels IS NOT ?",
@@ -3721,6 +3719,7 @@ mod tests {
     /// serves the block with data omitted.
     #[tokio::test]
     async fn append_persists_image_thumbnails_and_page_getter_reads_them() {
+        use base64::Engine as _;
         use intent_core::now_iso;
 
         let tmp = TempDb::new("test-thumbnails");
@@ -3746,7 +3745,6 @@ mod tests {
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
             .expect("encode test png");
-        use base64::Engine as _;
         let data = base64::engine::general_purpose::STANDARD.encode(&buf);
 
         let with_image = store
@@ -4266,6 +4264,7 @@ mod tests {
         assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
     }
 
+    #[allow(clippy::similar_names)] // snap(shot)/swap future are both domain terms
     /// Stress loop for the `BEGIN IMMEDIATE` conversion (monorepo#783,
     /// mirroring the #738 verification loop shape): each iteration races
     /// `replace_acp_session_id` (fold + id swap) against a concurrent

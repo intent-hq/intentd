@@ -177,6 +177,7 @@ fn sample_issue() -> Issue {
 /// Branch listings record the `(prefix, cursor)` pair the engine saw so the
 /// `github.branches.list` `prefix` threading is assertable end-to-end.
 #[derive(Default)]
+#[allow(clippy::struct_field_names)] // fields mirror the recorded query kinds
 struct RecordingForge {
     pr_queries: Mutex<Vec<PrQuery>>,
     issue_queries: Mutex<Vec<IssueQuery>>,

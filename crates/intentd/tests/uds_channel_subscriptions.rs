@@ -115,7 +115,7 @@ async fn subscribe(
     (reader, sub_write, sub_id, arr)
 }
 
-async fn boot(
+fn boot(
     bus: &EventBus,
 ) -> (
     PathBuf,
@@ -158,7 +158,7 @@ async fn agent_channel_snapshot_then_removed_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
@@ -215,7 +215,7 @@ async fn task_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
@@ -298,7 +298,7 @@ async fn comment_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
@@ -366,7 +366,7 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);

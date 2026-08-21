@@ -211,6 +211,7 @@ pub(crate) fn parse_subscribe_params(
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
 /// optional `replaceGroup` is read (§6.2).
+#[allow(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
@@ -993,19 +994,18 @@ impl ChatDeltaState {
             // reaching here id-less so re-delivery still upserts by id
             // instead of duplicating.
             let mut block = block.clone();
-            let bid = match block
+            let bid = if let Some(id) = block
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
             {
-                Some(id) => id.to_string(),
-                None => {
-                    let id = format!("{message_id}:{index}");
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.insert("id".to_string(), Value::String(id.clone()));
-                    }
-                    id
+                id.to_string()
+            } else {
+                let id = format!("{message_id}:{index}");
+                if let Some(obj) = block.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.clone()));
                 }
+                id
             };
             let is_added = !self.seen_ids.contains(&bid);
             self.seen_ids.insert(bid.clone());
@@ -1486,12 +1486,11 @@ pub(crate) async fn channel_delta(
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task => None,
+        Channel::Task | Channel::Chat => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is
         // unreachable for `Chat`.
-        Channel::Chat => None,
     }
 }
 

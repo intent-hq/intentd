@@ -278,9 +278,10 @@ where
         if buffer.contains(needle) {
             return buffer;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("buffer never contained {needle:?}: {buffer:?}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "buffer never contained {needle:?}: {buffer:?}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -311,9 +312,10 @@ async fn await_terminal_omitted<S>(
         if terminals.iter().all(|entry| entry["id"] != terminal_id) {
             return;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("exited setup terminal {terminal_id} remained in terminal.list");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "exited setup terminal {terminal_id} remained in terminal.list"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

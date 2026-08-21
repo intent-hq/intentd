@@ -279,7 +279,7 @@ fn meaningful_name_requires_explicit_set_and_nonempty() {
     assert!(!is_meaningful_agent_name(&blank));
 }
 
-async fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<String>, String) {
+fn last_commit_trailers(dir: &std::path::Path) -> (Option<String>, Option<String>, String) {
     let commits = intent_git::history::history(dir, 1).unwrap();
     let head = commits.into_iter().next().expect("at least one commit");
     (head.agent_id, head.linked_note_id, head.message)
@@ -325,7 +325,7 @@ async fn task_linked_idle_commits_with_both_trailers() {
     let event = idle_event(&ws_id, "agent-a1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
 
-    let (agent_id, linked_note_id, message) = last_commit_trailers(&repo.dir).await;
+    let (agent_id, linked_note_id, message) = last_commit_trailers(&repo.dir);
     assert_eq!(agent_id.as_deref(), Some("agent-a1"));
     assert_eq!(linked_note_id.as_deref(), Some("task-1"));
     // Subject falls back to the task note title.
@@ -403,7 +403,7 @@ async fn workspace_override_enabled_beats_global_disabled() {
     attribute_dirty_change(&svc, &ws_id, "agent-w2").await;
     let event = idle_event(&ws_id, "agent-w2", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (agent_id, _, _) = last_commit_trailers(&repo.dir).await;
+    let (agent_id, _, _) = last_commit_trailers(&repo.dir);
     assert_eq!(
         agent_id.as_deref(),
         Some("agent-w2"),
@@ -449,7 +449,7 @@ async fn non_task_agent_commits_with_agent_id_only() {
     attribute_dirty_change(&svc, &ws_id, "agent-n1").await;
     let event = idle_event(&ws_id, "agent-n1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (agent_id, linked, message) = last_commit_trailers(&repo.dir).await;
+    let (agent_id, linked, message) = last_commit_trailers(&repo.dir);
     assert_eq!(agent_id.as_deref(), Some("agent-n1"));
     assert!(
         linked.is_none(),
@@ -491,7 +491,7 @@ async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     attribute_dirty_change(&svc, &ws_id, "agent-f1").await;
     let event = idle_event(&ws_id, "agent-f1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
     assert!(message.starts_with("Agent changes"), "subject: {message}");
 }
 
@@ -680,7 +680,7 @@ async fn generated_message_replaces_fallback_subject() {
     attribute_dirty_change(&svc, &ws_id, "agent-g1").await;
     let event = idle_event(&ws_id, "agent-g1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
     assert!(
         message.starts_with("feat: implement auto-commit"),
         "got: {message}"
@@ -715,7 +715,7 @@ printf '{"subject": "feat: %s"}' "$args""#,
     attribute_dirty_change(&svc, &ws_id, "agent-q1").await;
     let event = idle_event(&ws_id, "agent-q1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
     assert!(
         message.contains("--model haiku4.5"),
         "the commit quick-action override must reach the CLI, got: {message}"
@@ -740,7 +740,7 @@ async fn generation_timeout_falls_back_to_subject() {
     attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
     // Fell back to the agent name.
     assert!(message.starts_with("Timeout Agent"), "got: {message}");
 }
@@ -758,7 +758,7 @@ async fn malformed_output_falls_back_to_subject() {
     attribute_dirty_change(&svc, &ws_id, "agent-m1").await;
     let event = idle_event(&ws_id, "agent-m1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
     assert!(message.starts_with("Malformed Agent"), "got: {message}");
 }
 
@@ -801,7 +801,7 @@ async fn generated_message_preserves_trailers() {
     attribute_dirty_change(&svc, &ws_id, "agent-tr").await;
     let event = idle_event(&ws_id, "agent-tr", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
-    let (agent_id, linked_note_id, message) = last_commit_trailers(&repo.dir).await;
+    let (agent_id, linked_note_id, message) = last_commit_trailers(&repo.dir);
     assert_eq!(agent_id.as_deref(), Some("agent-tr"));
     assert_eq!(linked_note_id.as_deref(), Some("task-gen"));
     assert!(

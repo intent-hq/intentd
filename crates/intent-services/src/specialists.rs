@@ -176,14 +176,12 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
     let mut found_end = false;
     let mut body_lines: Vec<&str> = Vec::new();
     for line in lines {
-        if !found_end {
-            if line.trim() == "---" {
-                found_end = true;
-            } else {
-                fm_lines.push(line);
-            }
-        } else {
+        if found_end {
             body_lines.push(line);
+        } else if line.trim() == "---" {
+            found_end = true;
+        } else {
+            fm_lines.push(line);
         }
     }
     if !found_end {
@@ -433,7 +431,6 @@ fn build_def_inheriting(
             }
             // Explicit empty value: clears any inherited value (nothing
             // emitted). For `roleReminder` this matches the absent case.
-            Some(_) => {}
             // Absent key: the config scalars inherit the lower tiers'
             // effective value; `roleReminder` does not.
             None if INHERITED_CONFIG_KEYS.contains(&key) => {
@@ -445,7 +442,7 @@ fn build_def_inheriting(
                     def.insert(key.into(), json!(v));
                 }
             }
-            None => {}
+            Some(_) | None => {}
         }
     }
     // `modelOptions` (PROTOCOL §5.11): same inherit-on-omit fold as the config
@@ -875,6 +872,7 @@ impl SpecialistsService {
     /// lower ones for the same id while `hidden` and the config scalars
     /// inherit across tiers (PROTOCOL §5.11). `workspace_path` adds the
     /// project tier.
+    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {

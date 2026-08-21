@@ -696,6 +696,9 @@ impl Default for HooksSettings {
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
 /// (`agentFeatures.*`). All default **on** except `taskGraph` (opt-in);
 /// changes apply to new agent sessions only.
+// One bool per independent settings toggle; the flat shape IS the settings
+// file contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {
@@ -1448,6 +1451,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn defaults_match_catalog() {
         let d = SettingsFile::default();
         assert_eq!(d.providers.active, None);
@@ -1760,6 +1764,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn floats_accept_integer_literals() {
         let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);

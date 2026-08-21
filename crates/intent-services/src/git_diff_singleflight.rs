@@ -133,12 +133,11 @@ impl SlowWalkWarnLimiter {
         // workspaces that warned within the current window (workspaces come
         // and go; a grow-only map would leak).
         last_warn.retain(|_, prev| now.duration_since(*prev) < window);
-        match last_warn.get(workspace_id) {
-            Some(_) => false,
-            None => {
-                last_warn.insert(workspace_id.clone(), now);
-                true
-            }
+        if last_warn.get(workspace_id).is_some() {
+            false
+        } else {
+            last_warn.insert(workspace_id.clone(), now);
+            true
         }
     }
 }

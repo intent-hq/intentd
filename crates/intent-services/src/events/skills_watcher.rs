@@ -106,6 +106,7 @@ impl SkillsWatcher {
     /// ride the shared stream and need no separate sync point — subscribing is
     /// synchronous bookkeeping.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
