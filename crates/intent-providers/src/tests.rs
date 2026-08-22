@@ -194,14 +194,15 @@ fn session_mcp_servers_partition() {
     }
 }
 
-/// Exactly claude-code and pi apply the stored model post-session via
+/// Exactly claude-code, pi, and codex apply the stored model post-session via
 /// `session/set_config_option { configId: "model" }` (their pinned adapters
-/// expose the model as a `configOptions[id="model"]` select and have no CLI
-/// model flag). Asserted over the full registry so a newly added provider
-/// can't accidentally opt in without updating this partition.
+/// expose the model as a `configOptions[id="model"]` select; claude-code and
+/// pi have no CLI model flag, and codex's npx-fallback adapter ignores the
+/// `-c model=…` argv overrides). Asserted over the full registry so a newly
+/// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "pi"];
+    let opted_in = ["claude-code", "codex", "pi"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -215,6 +216,19 @@ fn config_option_model_partition() {
         assert!(
             !(p.supports_set_model && p.supports_config_option_model),
             "{id}: supports_set_model and supports_config_option_model are mutually exclusive"
+        );
+        // Only codex embeds a reasoning effort in its stored model ids
+        // (`{base}/{effort}`), so only codex needs the daemon-side strip
+        // before the config-option value is sent — and the strip flag is
+        // meaningless without the config-option path itself.
+        assert_eq!(
+            p.config_option_model_strips_effort,
+            id == "codex",
+            "{id}: config_option_model_strips_effort is a codex-only quirk"
+        );
+        assert!(
+            !p.config_option_model_strips_effort || p.supports_config_option_model,
+            "{id}: config_option_model_strips_effort requires supports_config_option_model"
         );
     }
     // claude-code and pi additionally have no CLI model flag and no
@@ -1332,14 +1346,17 @@ fn grok_arg_assembly_has_no_model_or_rules_flags() {
     );
 }
 
-/// Exactly codex and grok apply the stored model post-session via
-/// `session/set_model` (grok's `agent stdio` subcommand has no CLI model
-/// flag; codex's npx-fallback adapter ignores `-c model=…` argv overrides).
+/// Exactly grok applies the stored model post-session via
+/// `session/set_model` (its `agent stdio` subcommand has no CLI model flag).
+/// codex is NOT in this set: its pinned npx-fallback adapter's
+/// `session/set_model` handler accepts only `{base}[{effort}]` ids (effort
+/// required) and rejects both bare and `{base}/{effort}` ids, so codex rides
+/// the config-option path instead (see `config_option_model_partition`).
 /// Asserted over the full registry so a newly added provider can't
 /// accidentally opt in without updating this partition.
 #[test]
 fn set_model_provider_partition() {
-    let opted_in = ["codex", "grok"];
+    let opted_in = ["grok"];
     for p in ACP_PROVIDERS {
         assert_eq!(
             p.supports_set_model,

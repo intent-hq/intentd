@@ -871,8 +871,8 @@ async function dispatch(msg) {
       // Accept any mode change request (no-op for the mock).
       return result(msg.id, {});
     case 'session/set_model': {
-      // Post-session model application for set_model providers (grok/
-      // codex-like). Record the exact wire params — one JSON line per call
+      // Post-session model application for set_model providers (grok-like).
+      // Record the exact wire params — one JSON line per call
       // ({ sessionId, modelId }) — when MOCK_AGENT_CONFIG_LOG points at a
       // file, so e2e tests can assert the daemon issued the call with the
       // stored model. The daemon only checks for success; an empty result

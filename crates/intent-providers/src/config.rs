@@ -134,6 +134,13 @@ pub struct ProviderConfig {
     /// it via `session/set_config_option` after session establishment
     /// (claude-code's pinned adapter).
     pub supports_config_option_model: bool,
+    /// Whether the provider's stored model ids may embed a reasoning effort
+    /// as a `{base}/{effort}` suffix that must be stripped before the id is
+    /// sent as the post-session `session/set_config_option` model value
+    /// (codex: the adapter's `configOptions[id="model"]` select values are
+    /// bare base ids, and the effort rides the separate `reasoning_effort`
+    /// option). Only meaningful alongside `supports_config_option_model`.
+    pub config_option_model_strips_effort: bool,
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
@@ -224,6 +231,7 @@ impl ProviderConfig {
             supports_set_mode: false,
             supports_set_model: false,
             supports_config_option_model: false,
+            config_option_model_strips_effort: false,
             supports_mcp_config: false,
             supports_session_mcp_servers: false,
             mcp_via_pi_extension: false,
@@ -344,13 +352,21 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // rides the ACP request rather than `-c mcp_servers.*` overrides.
         supports_session_mcp_servers: true,
         // The npx fallback adapter ignores `-c model=…` argv overrides (its
-        // CLI parses no config flags), so the stored model is applied
-        // post-session via `session/set_model` — the adapter's
-        // `ModelId.fromString` accepts both bare and compound
-        // `{base}/{effort}` ids. The `-c` args (`apply_codex_config_args`)
-        // are kept for the native Rust codex-acp binary path, which does
-        // consume them; set_model is idempotent on top of them.
-        supports_set_model: true,
+        // CLI parses no config flags), and its `session/set_model` handler
+        // (1.1.14) is unusable for our ids — `ModelId.fromString` accepts
+        // only `{base}[{effort}]` with the effort REQUIRED, rejecting both
+        // bare and `{base}/{effort}` ids. The stored model is instead
+        // applied post-session via `session/set_config_option`: the adapter
+        // advertises the model as a `configOptions[id="model"]` select over
+        // bare base ids (`createModelConfigOption`), falling back to the
+        // current/default reasoning effort when the model changes. A
+        // `{base}/{effort}` suffix is stripped daemon-side before sending
+        // (`config_option_model_target`); the effort itself rides the
+        // generic `thought_level` option (`reasoning_effort`). The `-c`
+        // args (`apply_codex_config_args`) are kept for the native Rust
+        // codex-acp binary path, which does consume them.
+        supports_config_option_model: true,
+        config_option_model_strips_effort: true,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
