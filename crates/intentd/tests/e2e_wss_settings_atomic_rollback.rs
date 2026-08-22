@@ -423,12 +423,57 @@ async fn retired_workspace_overrides_over_wss() {
     );
 }
 
+/// Pump a subscriber connection until a `settings:changed` `events.event`
+/// frame arrives; returns the event's `data.changes` array. Bounded wait so
+/// a missing event fails the test instead of hanging it.
+async fn next_settings_changed<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let next = timeout(remaining, ws.next())
+            .await
+            .expect("timed out waiting for settings:changed");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == json!("events.event")
+                    && v["params"]["event"]["type"] == json!("settings:changed")
+                {
+                    return v["params"]["event"]["data"]["changes"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// The `model.default` values carried by a `settings:changed` `data.changes`
+/// array — collected (not just found) so a duplicated injected entry fails
+/// the exactly-once assertions.
+fn model_default_values(changes: &Value) -> Vec<Value> {
+    changes
+        .as_array()
+        .expect("data.changes array")
+        .iter()
+        .filter(|c| c["path"] == json!("model.default"))
+        .map(|c| c["value"].clone())
+        .collect()
+}
+
 /// Default-provider switch over WSS (monorepo#3177): a `settings.update`
 /// batch that switches `providers.active` re-resolves `model.default` for the
 /// new provider — the cached catalog default as a compound id when the cache
 /// is warm (seeded `models-cache.json`), a blank clearing value when it is
-/// cold — and the injected entry rides the same response `applied` list. An
-/// explicit `model.default` in the batch is never overridden.
+/// cold — and the injected entry rides the same response `applied` list AND
+/// the emitted `settings:changed` event (§6.5), exactly once. An explicit
+/// `model.default` in the batch is never overridden.
 #[tokio::test]
 async fn provider_switch_reresolves_default_model_over_wss() {
     let data_dir = temp_data_dir();
@@ -473,7 +518,18 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         .expect("fingerprint should be set")
         .to_string();
     let cfg = client_config(&fingerprint);
-    let mut ws = connect_ws(port, cfg).await;
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    // Dedicated subscriber: the injected entry must ride the emitted
+    // `settings:changed` event too (§6.5), not just the RPC response.
+    let mut sub = connect_ws(port, cfg).await;
+    let ack = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["settings:changed"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
     // Baseline: an explicit model pick in the same batch is authoritative —
     // the side effect must not run even though providers.active is written.
@@ -492,6 +548,12 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert_success_envelope(&resp, 1);
     let applied = resp["result"]["applied"].as_array().expect("applied array");
     assert_eq!(applied.len(), 2, "explicit batch applies verbatim: {resp}");
+    let changes = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        model_default_values(&changes),
+        vec![json!("auggie:fable-5")],
+        "explicit pick rides the event verbatim, exactly once: {changes}"
+    );
     let resp = wss_rpc(&mut ws, 2, "settings.get", json!({"path": "model.default"})).await;
     assert_eq!(resp["result"]["value"], json!("auggie:fable-5"));
 
@@ -518,6 +580,12 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert_eq!(applied[0]["path"], json!("providers.active"), "{resp}");
     assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
     assert_eq!(applied[1]["value"], json!("grok:grok-code-fast"), "{resp}");
+    let changes = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        model_default_values(&changes),
+        vec![json!("grok:grok-code-fast")],
+        "injected re-resolved model rides the event exactly once: {changes}"
+    );
     let resp = wss_rpc(&mut ws, 4, "settings.get", json!({"path": "model.default"})).await;
     assert_eq!(resp["result"]["value"], json!("grok:grok-code-fast"));
 
@@ -539,6 +607,12 @@ async fn provider_switch_reresolves_default_model_over_wss() {
     assert_eq!(applied.len(), 2, "{resp}");
     assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
     assert_eq!(applied[1]["value"], json!(""), "{resp}");
+    let changes = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        model_default_values(&changes),
+        vec![json!("")],
+        "injected clearing value rides the event exactly once: {changes}"
+    );
     let resp = wss_rpc(&mut ws, 6, "settings.get", json!({"path": "model.default"})).await;
     assert_eq!(resp["result"]["value"], json!(""));
     let resp = wss_rpc(
