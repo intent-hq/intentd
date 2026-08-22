@@ -105,14 +105,21 @@ impl Drop for TempDb {
 /// by [`TempDb`]'s drop) seeding `providers.active = "auggie"`: since
 /// monorepo#3044 there is no positional provider fallback, so tests that
 /// create/delegate agents without an explicit provider or model need a
-/// configured default to resolve to.
+/// configured default to resolve to. The path override makes the provider
+/// available without depending on a host-installed Auggie binary.
 pub(crate) fn test_registry_with_default_provider(
     tmp: &TempDb,
 ) -> std::sync::Arc<crate::SettingsRegistry> {
     let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
     let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
     registry
-        .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
+        .apply(&[
+            ("providers.active".to_string(), serde_json::json!("auggie")),
+            (
+                "providers.paths".to_string(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
         .expect("seed default provider");
     registry
 }
