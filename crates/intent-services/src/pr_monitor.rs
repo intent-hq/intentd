@@ -230,10 +230,12 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
 /// only means "no merge conflicts": a PR blocked by required checks,
 /// missing reviews, or branch protection still reports `mergeable: true`,
 /// so every checklist blocker must be clear — no failing/pending required
-/// checks, no changes-requested/review-required approvals decision, no
-/// unresolved threads when resolution is required, no
-/// `merge_blocked_reason`, and no blocked/behind/dirty
-/// `merge_state_status`.
+/// checks, no changes-requested/review-required approvals decision (nor a
+/// `none` decision while the branch rules still demand approvals the PR
+/// does not have), no unresolved threads when resolution is required, no
+/// `merge_blocked_reason`, and no blocked/behind/dirty/unknown
+/// `merge_state_status` (`UNKNOWN` means the forge has not established
+/// mergeability yet, so it never promotes).
 fn requirements_ready(req: &MergeRequirements) -> bool {
     req.state == "open"
         && !req.is_draft
@@ -247,10 +249,15 @@ fn requirements_ready(req: &MergeRequirements) -> bool {
             req.approvals.decision.as_str(),
             "changes_requested" | "review_required"
         )
+        && !(req.approvals.decision == "none"
+            && req
+                .approvals
+                .needed
+                .is_some_and(|needed| req.approvals.have < i64::from(needed)))
         && !(req.threads.unresolved > 0 && req.threads.resolution_required == Some(true))
         && !matches!(
             req.merge_state_status.as_deref(),
-            Some("BLOCKED" | "BEHIND" | "DIRTY")
+            Some("BLOCKED" | "BEHIND" | "DIRTY" | "UNKNOWN")
         )
 }
 
@@ -4228,7 +4235,10 @@ mod tests {
             .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
             .await
             .expect("insert task");
-        forge.edit(|s| s.checks[0].state = CheckState::Success);
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         let monitor = register(&svc, &ws, &owner).await;
 
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
@@ -4338,7 +4348,32 @@ mod tests {
             snap(|s| s.requirements.mergeable = Some(false)),
         );
         let blocked = mk(PrMonitorState::Active, snap(|_| {}));
-        for m in [&draft, &unmergeable, &blocked] {
+        // A `none` decision (provider reviewDecision unavailable) while the
+        // branch rules still demand an approval the PR does not have.
+        let missing_required_approval = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.requirements.approvals.decision = "none".into();
+                s.requirements.approvals.have = 0;
+                s.requirements.approvals.needed = Some(1);
+            }),
+        );
+        // GraphQL `UNKNOWN` merge state: mergeability not yet established.
+        let unknown_state = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.requirements.merge_state_status = Some("UNKNOWN".into());
+            }),
+        );
+        for m in [
+            &draft,
+            &unmergeable,
+            &blocked,
+            &missing_required_approval,
+            &unknown_state,
+        ] {
             assert_eq!(
                 fold_monitor_pr_signals(std::slice::from_ref(m)),
                 MonitorPrSignals {
@@ -4517,7 +4552,10 @@ mod tests {
     #[tokio::test]
     async fn monitor_transitions_emit_display_status_through_the_pr_rungs() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
-        forge.edit(|s| s.checks[0].state = CheckState::Success);
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
@@ -4555,7 +4593,10 @@ mod tests {
     #[tokio::test]
     async fn completion_and_rehydration_cancel_drop_the_waiting_flag() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
-        forge.edit(|s| s.checks[0].state = CheckState::Success);
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         svc.maybe_emit_display_status_changed(&ws).await;
 
         register(&svc, &ws, &owner).await;
@@ -4651,7 +4692,10 @@ mod tests {
     async fn archive_cancels_active_pr_monitors_and_drops_waiting() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
-        forge.edit(|s| s.checks[0].state = CheckState::Success);
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         // A terminal (`completed`, not `cancelled`) monitor first — merged
