@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.39] - 2026-08-22
+
+### 🚀 Features
+
+- Add mcp.testConnection connection/auth probe RPC (protocol 7.3) ([#1408](https://github.com/intent-hq/intentd/pull/1408))
+- *(rpc)* Add agent.listUserMessages returning a bounded user-message index ([#1407](https://github.com/intent-hq/intentd/pull/1407))
+
+
 ## [0.7.38] - 2026-08-22
 
 ### 🚀 Features

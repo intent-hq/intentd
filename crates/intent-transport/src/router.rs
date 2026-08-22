@@ -1260,6 +1260,19 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.listUserMessages" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let preview_chars = opt_int(params, "previewChars");
+            match api
+                .agent_list_user_messages(agent_id, ws, preview_chars)
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "agent.getMessageBlock" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -3657,6 +3670,19 @@ async fn dispatch(
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(Error::NotFound(m)) => Err(not_found(m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "mcp.testConnection" => {
+            let url = require_str_param(params, "url")?;
+            if url.trim().is_empty() {
+                return Err(invalid_params("url is required"));
+            }
+            let headers = params.get("headers").cloned().filter(|v| !v.is_null());
+            let server_name = opt_str(params, "serverName");
+            match api.mcp_test_connection(url, headers, server_name).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }

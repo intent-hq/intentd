@@ -2966,6 +2966,56 @@ impl Store {
         rows.iter().map(map_message_row).collect()
     }
 
+    /// Read an agent's user-role messages as lightweight index items in
+    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
+    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
+    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
+    /// the same expression the FTS index uses), and the preview truncated to
+    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
+    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
+    /// never transferred out of the database or decoded. `metadata` is
+    /// passed through verbatim when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation or a row decode
+    /// fails.
+    pub async fn get_agent_user_message_index(
+        &self,
+        agent_id: &AgentId,
+        preview_chars: usize,
+    ) -> Result<Vec<UserMessageIndexItem>> {
+        let sql = format!(
+            "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
+                    m.metadata, m.created_at \
+             FROM agent_message m \
+             WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
+            .bind(&agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                let metadata: Option<serde_json::Value> =
+                    match col::<Option<String>>(row, "metadata")? {
+                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+                            Error::Internal(format!("decode message metadata failed: {e}"))
+                        })?),
+                        None => None,
+                    };
+                Ok(UserMessageIndexItem {
+                    id: col(row, "id")?,
+                    preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
+                    metadata,
+                    created_at: col(row, "created_at")?,
+                })
+            })
+            .collect()
+    }
+
     /// Read the persisted image-thumbnail maps (0097) for the message ids in
     /// `message_ids`, keyed by message id. Only rows with a non-NULL
     /// `thumbnails` column appear in the result — the common all-text page
@@ -3324,6 +3374,18 @@ pub struct ReplaceMessage<'a> {
     pub content: &'a serde_json::Value,
     pub metadata: Option<&'a serde_json::Value>,
     pub created_at: &'a str,
+}
+
+/// One row of the `agent.listUserMessages` index
+/// ([`Store::get_agent_user_message_index`]): the message id, a bounded
+/// plain-text preview, the verbatim metadata (when present), and the
+/// creation timestamp — never the full content blob.
+#[derive(Debug, Clone)]
+pub struct UserMessageIndexItem {
+    pub id: String,
+    pub preview: String,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: String,
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
@@ -5965,6 +6027,203 @@ mod tests {
                 .expect("count empty"),
             0
         );
+    }
+
+    /// `get_agent_user_message_index` (`agent.listUserMessages`, §5.5)
+    /// returns only user-role rows, oldest→newest, with previews bounded to
+    /// the requested char count and metadata passed through verbatim; other
+    /// roles are excluded in SQL and an empty/unknown agent yields an empty
+    /// index.
+    #[tokio::test]
+    async fn get_agent_user_message_index_filters_roles_and_bounds_previews() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-user-index".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        // Interleave user rows with other roles; one user row carries
+        // metadata, one has multi-block content, one is oversized.
+        let long_text = "a".repeat(500);
+        let first = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "first question"}]),
+                &ts,
+            )
+            .await
+            .expect("append user 1");
+        store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{"type": "text", "text": "an answer"}]),
+                &ts,
+            )
+            .await
+            .expect("append assistant");
+        let second = store
+            .append_agent_message_with_metadata(
+                &agent_id,
+                "user",
+                &serde_json::json!([
+                    {"type": "text", "text": "second"},
+                    {"type": "image", "data": "zzz"},
+                    {"type": "text", "text": "part"},
+                ]),
+                Some(&serde_json::json!({"automated": true, "source": "hook"})),
+                &ts,
+            )
+            .await
+            .expect("append user 2");
+        store
+            .append_agent_message(
+                &agent_id,
+                "system",
+                &serde_json::json!([{"type": "text", "text": "system row"}]),
+                &ts,
+            )
+            .await
+            .expect("append system");
+        let third = store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": long_text}]),
+                &ts,
+            )
+            .await
+            .expect("append user 3");
+
+        let items = store
+            .get_agent_user_message_index(&agent_id, 300)
+            .await
+            .expect("user index");
+        assert_eq!(items.len(), 3, "only user rows are included");
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec![first.id.as_str(), second.id.as_str(), third.id.as_str()],
+            "oldest→newest order"
+        );
+        assert_eq!(items[0].preview, "first question");
+        assert_eq!(items[0].metadata, None);
+        assert_eq!(
+            items[1].preview, "second part",
+            "text blocks join; non-text blocks contribute nothing"
+        );
+        assert_eq!(
+            items[1].metadata,
+            Some(serde_json::json!({"automated": true, "source": "hook"})),
+            "metadata passes through verbatim"
+        );
+        assert_eq!(
+            items[2].preview.chars().count(),
+            300,
+            "preview bounded to the requested chars"
+        );
+        assert!(items[2].preview.chars().all(|c| c == 'a'));
+
+        // A tighter bound applies per call.
+        let tight = store
+            .get_agent_user_message_index(&agent_id, 3)
+            .await
+            .expect("tight index");
+        assert_eq!(tight[0].preview, "fir");
+
+        // An agent with no messages (or an unknown id) yields an empty index.
+        let empty_agent = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&empty_agent, &ws_id, &ts, None))
+            .await
+            .expect("insert empty session");
+        assert!(store
+            .get_agent_user_message_index(&empty_agent, 300)
+            .await
+            .expect("empty index")
+            .is_empty());
+    }
+
+    /// The SQL preview extraction (`MESSAGE_FTS_TEXT_SQL` + `substr`) shapes:
+    /// bare strings pass through, block arrays join their `text` fields,
+    /// non-string/array shapes fall back to compact JSON, and truncation is
+    /// char-boundary safe on multi-byte text (`SQLite` `substr` counts
+    /// characters, not bytes).
+    #[tokio::test]
+    async fn user_message_preview_shapes_and_truncation() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-shapes".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        // Each case gets its own agent so one call reads one shape.
+        let preview_of = |content: serde_json::Value, chars: usize| {
+            let store = &store;
+            let ws_id = ws_id.clone();
+            let ts = ts.clone();
+            async move {
+                let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+                store
+                    .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+                    .await
+                    .expect("insert session");
+                store
+                    .append_agent_message(&agent_id, "user", &content, &ts)
+                    .await
+                    .expect("append");
+                let items = store
+                    .get_agent_user_message_index(&agent_id, chars)
+                    .await
+                    .expect("index");
+                items[0].preview.clone()
+            }
+        };
+
+        assert_eq!(
+            preview_of(serde_json::json!("plain string"), 300).await,
+            "plain string"
+        );
+        assert_eq!(
+            preview_of(serde_json::json!("plain string"), 5).await,
+            "plain"
+        );
+        assert_eq!(
+            preview_of(
+                serde_json::json!([
+                    {"type": "text", "text": "one"},
+                    {"type": "tool_use", "name": "t"},
+                    {"type": "text", "text": "two"},
+                ]),
+                300
+            )
+            .await,
+            "one two"
+        );
+        assert_eq!(
+            preview_of(serde_json::json!({"weird": "shape"}), 300).await,
+            r#"{"weird":"shape"}"#
+        );
+        // Char-boundary-safe truncation on multi-byte text.
+        let multibyte = "é".repeat(10);
+        assert_eq!(preview_of(serde_json::json!(multibyte), 4).await, "éééé");
     }
 
     /// `get_agent_session_summary` returns the session row with `messages`
