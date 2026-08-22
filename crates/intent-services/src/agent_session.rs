@@ -83,6 +83,13 @@ pub(crate) fn trace_stream_lifecycle(
     );
 }
 
+/// Content-free correlation carried from a completed harness-wake turn to its
+/// separately published idle stage.
+pub(crate) struct HarnessWakeLifecycle {
+    pub(crate) correlation_id: String,
+    pub(crate) block_count: usize,
+}
+
 /// Join the assistant-message correlation used by content stages to the
 /// turn-only correlation available to worker fallback paths. Both values are
 /// fixed-size opaque hashes; neither raw id enters the diagnostic bundle.
@@ -924,6 +931,8 @@ pub(crate) struct HarnessWakeOutcome {
     /// signature of a failed post-interrupt recovery wake (a single bare
     /// newline accepted as `harness_wake_complete`).
     pub empty_response: bool,
+    /// Content-free correlation for the separately published idle stage.
+    pub lifecycle: HarnessWakeLifecycle,
 }
 
 /// Extract the `type: "text"` block strings from content blocks — the input
@@ -3077,6 +3086,8 @@ impl Services {
         turn_id: Option<&str>,
         err: AcpError,
     ) -> Result<StopReason> {
+        let correlation_id = message_id.clone();
+        let block_count = blocks.len();
         // Final live-preview values from the partial turn (same contract as the
         // interrupt terminal emit in `agent_manager`).
         let preview_text_blocks = text_block_strings(&blocks);
@@ -3179,6 +3190,14 @@ impl Services {
             end_data["turnId"] = json!(tid);
         }
         stamp_preview_fields(&mut end_data, &preview_text_blocks);
+        trace_stream_lifecycle(
+            Some(correlation_id.as_str()),
+            "message",
+            "agent_stream_end",
+            None,
+            block_count,
+            "interrupted",
+        );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
         tracing::info!(
@@ -3216,11 +3235,9 @@ impl Services {
     /// which owns the single-flight slot.
     ///
     /// Returns a [`HarnessWakeOutcome`]: the persisted assistant `messageId`
-    /// (`None` when the burst persisted nothing) plus the empty-response
-    /// classification (intent-hq/monorepo#3262) — `true` when the turn
-    /// OPENED but its finalized transcript carried no meaningful content
-    /// (whitespace-only text/thinking blocks), the signature of a failed
-    /// recovery wake the caller must not accept as a successful completion.
+    /// (`None` when the burst persisted nothing), the empty-response
+    /// classification (intent-hq/monorepo#3262), and the content-free
+    /// correlation needed by the caller's later idle diagnostic.
     pub(crate) async fn run_harness_wake_turn(
         &self,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
@@ -3229,6 +3246,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         settle: std::time::Duration,
     ) -> HarnessWakeOutcome {
+        let turn_started = Instant::now();
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone());
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
@@ -3286,6 +3304,7 @@ impl Services {
                 .await;
         }
         let blocks = transcript.into_blocks();
+        let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
         // Empty-response classification (intent-hq/monorepo#3262): the wake
@@ -3310,6 +3329,14 @@ impl Services {
                 .await
             {
                 Ok(message) => {
+                    trace_stream_lifecycle(
+                        Some(message_id.as_str()),
+                        "message",
+                        "assistant_persisted",
+                        Some(turn_started.elapsed()),
+                        block_count,
+                        "complete",
+                    );
                     self.invalidate_agent_list_cache(workspace_id);
                     // Same persisted-row event pair as the prompt-turn flush
                     // (§6.5); wake turns carry no turn correlation id.
@@ -3347,11 +3374,23 @@ impl Services {
         // Final live-preview values, same contract as the prompt-turn
         // terminal `agent:stream:end` above.
         stamp_preview_fields(&mut end_data, &preview_text_blocks);
+        trace_stream_lifecycle(
+            Some(message_id.as_str()),
+            "message",
+            "agent_stream_end",
+            Some(turn_started.elapsed()),
+            block_count,
+            "complete",
+        );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
         HarnessWakeOutcome {
-            message_id: message_persisted.then_some(message_id),
+            message_id: message_persisted.then_some(message_id.clone()),
             empty_response,
+            lifecycle: HarnessWakeLifecycle {
+                correlation_id: message_id,
+                block_count,
+            },
         }
     }
 
@@ -3460,6 +3499,7 @@ impl Services {
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
+        lifecycle: &HarnessWakeLifecycle,
         empty_wake_response: bool,
     ) {
         if self.has_ready_to_send(agent_id) {
@@ -3503,6 +3543,14 @@ impl Services {
             .await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
+        trace_stream_lifecycle(
+            Some(lifecycle.correlation_id.as_str()),
+            "message",
+            "agent_idle",
+            None,
+            lifecycle.block_count,
+            "complete",
+        );
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
             .await;
     }

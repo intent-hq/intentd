@@ -3430,6 +3430,52 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
     );
 }
 
+#[tokio::test]
+async fn harness_wake_logs_persist_end_and_idle_with_one_private_correlation() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (_tx, mut notifications) = mpsc::unbounded_channel();
+    let capture = LifecycleCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let outcome = services
+        .run_harness_wake_turn(
+            &mut notifications,
+            message_note("private wake response"),
+            &agent_id,
+            &workspace_id,
+            Duration::ZERO,
+        )
+        .await;
+    services
+        .publish_harness_wake_idle(
+            &agent_id,
+            &workspace_id,
+            &outcome.lifecycle,
+            outcome.empty_response,
+        )
+        .await;
+
+    let expected = crate::agent_session::opaque_stream_ref(&outcome.lifecycle.correlation_id);
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 3, "persist + stream:end + idle: {lines:?}");
+    for (line, stage) in lines
+        .iter()
+        .zip(["assistant_persisted", "agent_stream_end", "agent_idle"])
+    {
+        assert!(line.contains(&format!("stage=\"{stage}\"")), "{line}");
+        assert!(
+            line.contains(&format!("turnCorrelation={expected}")),
+            "{line}"
+        );
+        assert!(line.contains("block_count=1"), "{line}");
+        assert!(
+            !line.contains(&outcome.lifecycle.correlation_id),
+            "raw message id: {line}"
+        );
+        assert!(!line.contains("private wake response"), "content: {line}");
+    }
+}
+
 #[test]
 fn turn_mapping_joins_idle_timeout_cap_records_without_raw_ids() {
     let capture = LifecycleCapture::default();
@@ -4208,6 +4254,8 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     let (conn, mut note_rx, _agent) =
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let capture = LifecycleCapture::default();
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
 
     let err = services
         .run_prompt_turn(
@@ -4244,6 +4292,31 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
         .expect("interrupted terminal stream:end emitted");
     assert_eq!(end.data["stopReason"], json!("interrupted"));
     assert_eq!(end.data["interruptReason"], json!("system_suspend"));
+
+    let message_id = end.data["messageId"]
+        .as_str()
+        .expect("interrupted partial persisted");
+    let expected = crate::agent_session::opaque_stream_ref(message_id);
+    let lifecycle = capture.lines();
+    assert_eq!(
+        lifecycle.len(),
+        2,
+        "persist + interrupted stream:end: {lifecycle:?}"
+    );
+    for (line, stage) in lifecycle
+        .iter()
+        .zip(["assistant_persisted", "agent_stream_end"])
+    {
+        assert!(line.contains(&format!("stage=\"{stage}\"")), "{line}");
+        assert!(
+            line.contains(&format!("turnCorrelation={expected}")),
+            "{line}"
+        );
+        assert!(line.contains("block_count=1"), "{line}");
+        assert!(line.contains("outcome=\"interrupted\""), "{line}");
+        assert!(!line.contains(message_id), "raw message id: {line}");
+        assert!(!line.contains("partial"), "content: {line}");
+    }
 
     // The partial turn persisted, tagged with the interrupt reason.
     let messages = bus

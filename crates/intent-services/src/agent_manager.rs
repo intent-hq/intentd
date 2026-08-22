@@ -6592,7 +6592,7 @@ impl AgentManager {
             mgr.clear_worker(&id);
             mgr.end_turn(&id).await;
             mgr.services
-                .publish_harness_wake_idle(&id, &ws, outcome.empty_response)
+                .publish_harness_wake_idle(&id, &ws, &outcome.lifecycle, outcome.empty_response)
                 .await;
             // A user send that raced in queued behind this turn's slot (or
             // the recovery nudge above); with the slot released, kick the
