@@ -870,6 +870,33 @@ async function dispatch(msg) {
     case 'session/set_mode':
       // Accept any mode change request (no-op for the mock).
       return result(msg.id, {});
+    case 'session/set_model': {
+      // Post-session model application for set_model providers (grok/
+      // codex-like). Record the exact wire params — one JSON line per call
+      // ({ sessionId, modelId }) — when MOCK_AGENT_CONFIG_LOG points at a
+      // file, so e2e tests can assert the daemon issued the call with the
+      // stored model. The daemon only checks for success; an empty result
+      // suffices.
+      const setModelLog = process.env.MOCK_AGENT_CONFIG_LOG;
+      if (setModelLog) {
+        try {
+          fs.appendFileSync(setModelLog, JSON.stringify(msg.params || {}) + '\n');
+        } catch (err) {
+          log(`config log write failed: ${err.message}`);
+        }
+      }
+      // Deterministic failure mode: reject the call (unknown model id) so
+      // tests can assert the daemon logs a warning and the turn still
+      // completes on the provider's default model.
+      if (behavior.rejectSetModel) {
+        return send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32602, message: 'unknown model id' },
+        });
+      }
+      return result(msg.id, {});
+    }
     case 'session/set_config_option': {
       // Post-session model application for config-option-model providers
       // (claude-code-like). Record the exact wire params — one JSON line per

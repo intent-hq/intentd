@@ -1332,13 +1332,19 @@ fn grok_arg_assembly_has_no_model_or_rules_flags() {
     );
 }
 
+/// Exactly codex and grok apply the stored model post-session via
+/// `session/set_model` (grok's `agent stdio` subcommand has no CLI model
+/// flag; codex's npx-fallback adapter ignores `-c model=…` argv overrides).
+/// Asserted over the full registry so a newly added provider can't
+/// accidentally opt in without updating this partition.
 #[test]
-fn grok_is_the_only_set_model_provider() {
+fn set_model_provider_partition() {
+    let opted_in = ["codex", "grok"];
     for p in ACP_PROVIDERS {
         assert_eq!(
             p.supports_set_model,
-            p.id == "grok",
-            "{} supports_set_model mismatch",
+            opted_in.contains(&p.id),
+            "{}: supports_set_model must match the pinned opt-in set {opted_in:?}",
             p.id
         );
     }

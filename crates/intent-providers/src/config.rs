@@ -343,6 +343,14 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // session config (`build_session_config`), so the workspace bridge
         // rides the ACP request rather than `-c mcp_servers.*` overrides.
         supports_session_mcp_servers: true,
+        // The npx fallback adapter ignores `-c model=…` argv overrides (its
+        // CLI parses no config flags), so the stored model is applied
+        // post-session via `session/set_model` — the adapter's
+        // `ModelId.fromString` accepts both bare and compound
+        // `{base}/{effort}` ids. The `-c` args (`apply_codex_config_args`)
+        // are kept for the native Rust codex-acp binary path, which does
+        // consume them; set_model is idempotent on top of them.
+        supports_set_model: true,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),

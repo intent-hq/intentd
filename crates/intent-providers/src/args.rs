@@ -185,6 +185,12 @@ pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) 
 /// into base + reasoning effort; the base is written as `model`, and the effort
 /// (from the model id, else the `env_effort` fallback) as `model_reasoning_effort`.
 /// `env_effort` is supplied by the spawn layer (e.g. `CODEX_REASONING_EFFORT`).
+///
+/// These argv overrides are consumed only by the native Rust `codex-acp`
+/// binary path. The npx fallback (`@agentclientprotocol/codex-acp`) parses no
+/// config flags and ignores them; on that path the stored model takes effect
+/// via the post-session `session/set_model` call (`supports_set_model` on the
+/// codex `ProviderConfig`), which is idempotent on top of these args.
 #[must_use]
 pub fn apply_codex_config_args(
     args: Vec<String>,

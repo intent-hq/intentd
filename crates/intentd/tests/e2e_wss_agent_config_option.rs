@@ -21,6 +21,13 @@
 //! the LIVE session after an `agent.update` change, so it lands before the
 //! next prompt without a respawn.
 //!
+//! It also covers the sibling `session/set_model` path
+//! (`supports_set_model`; grok and codex — codex's npx-fallback adapter
+//! ignores `-c model=…` argv overrides, so the stored model rides this call):
+//! with the mock flipped into that mode (`MOCK_AGENT_SET_MODEL=1`), the
+//! daemon issues `session/set_model { sessionId, modelId }` once on the
+//! fresh session, with the bare model id.
+//!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
 #![cfg(unix)]
@@ -401,6 +408,230 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
         log.len(),
         1,
         "no re-issue on a reused live session: {log:?}"
+    );
+}
+
+/// The stored model reaches a `set_model` provider (grok/codex-like) as
+/// `session/set_model { sessionId, modelId }` once per fresh session — with
+/// the bare model id, `{base}/{effort}` suffix intact (codex-acp's
+/// ModelId.fromString parses the effort itself) — and is not re-issued on a
+/// second turn over the same live child.
+#[tokio::test]
+async fn stored_model_applied_via_set_model_over_wss() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok" }).to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_SET_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "SetModel E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    // Compound stored model with a `{base}/{effort}` suffix — the daemon
+    // strips the `mock:` provider prefix and sends the rest intact.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "SetModel",
+            "model": "mock:gpt-5.3-codex/high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // Exactly one session/set_model on the fresh session, with the wire
+    // shape { sessionId, modelId } and the effort suffix preserved.
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "one set_model after turn 1: {log:?}");
+    assert_eq!(
+        log[0]["modelId"], "gpt-5.3-codex/high",
+        "bare id with effort suffix intact: {:?}",
+        log[0]
+    );
+    assert!(
+        log[0]["sessionId"].is_string(),
+        "sessionId present: {:?}",
+        log[0]
+    );
+
+    // Turn 2 reuses the live session — no re-application.
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second turn" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "second sendMessage ok: {sent2}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    let log = read_config_log(&config_log);
+    assert_eq!(
+        log.len(),
+        1,
+        "no re-issue on a reused live session: {log:?}"
+    );
+}
+
+/// A rejected `session/set_model` (e.g. an unknown model id) is best-effort:
+/// the daemon logs a warning, the provider keeps its default model, and the
+/// turn still completes.
+#[tokio::test]
+async fn set_model_failure_does_not_fail_the_turn() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok", "rejectSetModel": true }).to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_SET_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "SetModel Reject E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SetModelReject", "model": "mock:bogus-model" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "turn despite rejection" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    // The turn must still complete (stream:end) even though the provider
+    // rejected the set_model call.
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // The daemon did attempt the call (with the bare stored id) …
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "set_model was attempted: {log:?}");
+    assert_eq!(log[0]["modelId"], "bogus-model", "modelId: {:?}", log[0]);
+
+    // … and the agent is still healthy: transcript has the mock's response.
+    let messages = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let rendered = messages.to_string();
+    assert!(
+        rendered.contains("\"ok\""),
+        "assistant response landed despite the rejected set_model: {rendered}"
     );
 }
 

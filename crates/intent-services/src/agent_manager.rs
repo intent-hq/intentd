@@ -2947,9 +2947,10 @@ impl AgentManager {
             .collect();
 
         // The persisted model (bare part of a compound id) feeds the
-        // post-session model application for providers with no CLI model
-        // flag — `session/set_model` (grok) or `session/set_config_option`
-        // (claude-code) — see `maybe_apply_session_model`.
+        // post-session model application for providers whose adapter takes
+        // the model over ACP — `session/set_model` (grok, codex) or
+        // `session/set_config_option` (claude-code) — see
+        // `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
         // The persisted `reasoningEffort` (PROTOCOL §5.5) feeds the generic
@@ -3223,8 +3224,9 @@ impl AgentManager {
 
     /// Best-effort post-session model application, gated per provider
     /// capability (parity with the reference acp-provider): `session/set_model`
-    /// for providers whose ACP subcommand has no CLI model flag
-    /// (`supports_set_model`; grok today), and
+    /// for providers whose adapter takes the model over ACP rather than argv
+    /// (`supports_set_model`; grok and codex today — codex's npx-fallback
+    /// adapter ignores `-c model=…` argv overrides), and
     /// `session/set_config_option { configId: "model" }` for providers that
     /// expose the model as a session config option
     /// (`supports_config_option_model`; claude-code today). Compound ids are
@@ -7934,6 +7936,10 @@ fn resolve_spawn(
         // application against the real daemon.
         let config_option_model =
             std::env::var("MOCK_AGENT_CONFIG_OPTION_MODEL").is_ok_and(|v| v == "1");
+        // `MOCK_AGENT_SET_MODEL=1` marks the mock as a set_model provider
+        // (grok/codex-like), so the E2E suite can exercise the post-session
+        // `session/set_model` application against the real daemon.
+        let set_model = std::env::var("MOCK_AGENT_SET_MODEL").is_ok_and(|v| v == "1");
         let provider = ProviderConfig {
             command: "node",
             base_args,
@@ -7946,6 +7952,7 @@ fn resolve_spawn(
             },
             supports_session_mcp_servers: session_mcp,
             supports_config_option_model: config_option_model,
+            supports_set_model: set_model,
             ..*base
         };
         return Ok(ResolvedSpawn {
@@ -11465,6 +11472,25 @@ mod role_reminder_tests {
         // switch) must not be sent to grok.
         assert_eq!(
             AgentManager::set_model_target(grok, Some("opencode:kimi-k3")),
+            None
+        );
+
+        // Codex opted into session/set_model (its npx-fallback adapter
+        // ignores `-c model=…` argv overrides). `{base}/{effort}` ids pass
+        // through intact — the adapter's ModelId.fromString parses the
+        // effort suffix itself.
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert_eq!(
+            AgentManager::set_model_target(codex, Some("gpt-5.6-sol")),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            AgentManager::set_model_target(codex, Some("codex:gpt-5.3-codex/high")),
+            Some("gpt-5.3-codex/high")
+        );
+        assert_eq!(AgentManager::set_model_target(codex, Some("default")), None);
+        assert_eq!(
+            AgentManager::set_model_target(codex, Some("grok:grok-4.5")),
             None
         );
     }
