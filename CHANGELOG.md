@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.36] - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- *(providers)* Apply codex model via session/set_config_option ([#1395](https://github.com/intent-hq/intentd/pull/1395))
+- Make pending question markers authoritative ([#1350](https://github.com/intent-hq/intentd/pull/1350))
+- *(services)* Derive pr_ready only when the PR is truly mergeable ([#1402](https://github.com/intent-hq/intentd/pull/1402))
+
+
 ## [0.7.35] - 2026-08-22
 
 ### 🚀 Features
