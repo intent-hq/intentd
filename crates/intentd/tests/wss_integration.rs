@@ -9029,9 +9029,10 @@ async fn wss_agent_get_message_block_serves_full_block() {
 /// messages of one agent as lightweight index items, oldest→newest —
 /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`.
 /// Non-user rows are never included; previews are bounded to
-/// `previewChars` (default 300, server-clamped); `metadata` passes through
-/// verbatim when present; a workspace mismatch and an unknown agent are
-/// not-found; a missing `agentId` is `-32602`.
+/// `previewChars` (default 300, server-clamped into [1, 2000], with the
+/// lenient `opt_int` parsing: non-numeric → absent, floats truncate);
+/// `metadata` passes through verbatim when present; a workspace mismatch
+/// and an unknown agent are not-found; a missing `agentId` is `-32602`.
 #[tokio::test]
 async fn wss_agent_list_user_messages_serves_bounded_index() {
     use intent_core::AgentId;
@@ -9148,7 +9149,9 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     let preview = items[2]["preview"].as_str().expect("preview");
     assert_eq!(preview.chars().count(), 300, "default previewChars bound");
 
-    // Explicit previewChars applies; a non-positive value clamps to 1.
+    // Explicit previewChars applies; a non-positive value clamps to 1 and
+    // an over-cap value clamps to 2000 (the 500-char third row passes
+    // through whole under the clamped bound).
     let tight = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -9167,6 +9170,54 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     )
     .await;
     assert_eq!(clamped["result"]["items"][0]["preview"], "f");
+    let upper = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","previewChars":999999}}}}"#
+        ),
+    )
+    .await;
+    let upper_preview = upper["result"]["items"][2]["preview"]
+        .as_str()
+        .expect("preview");
+    assert_eq!(
+        upper_preview.chars().count(),
+        500,
+        "over-cap previewChars clamps to 2000, so the 500-char row is whole"
+    );
+
+    // Lenient previewChars parsing (the opt_int convention, unlike the
+    // strict v7.1 aroundIndex): a non-numeric value is treated as absent
+    // (default 300) and a float is truncated toward zero.
+    let lenient_string = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","previewChars":"nope"}}}}"#
+        ),
+    )
+    .await;
+    let default_preview = lenient_string["result"]["items"][2]["preview"]
+        .as_str()
+        .expect("preview");
+    assert_eq!(
+        default_preview.chars().count(),
+        300,
+        "non-numeric previewChars falls back to the 300 default"
+    );
+    let lenient_float = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","previewChars":5.9}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        lenient_float["result"]["items"][0]["preview"], "first",
+        "float previewChars truncates toward zero (5.9 → 5)"
+    );
 
     // Cross-workspace mismatch and unknown agent: not-found, fail closed.
     let other_ws = wss_call(
