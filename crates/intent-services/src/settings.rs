@@ -1470,7 +1470,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Task graph teaching",
             "Teach agents the task-graph workflow (batch delegate, dependsOn/conflictsWith, @@@task fence attributes, unblocked-wake hints); docs/prompt only, APIs always work; applies to new sessions only",
             "agentFeatures",
-            false,
+            true,
         ),
         number(
             "prMonitor.debounceSeconds",
@@ -2965,10 +2965,9 @@ mod tests {
     }
 
     /// The `agentFeatures.*` toggles are TOML-backed booleans — all default
-    /// `true` except `taskGraph` (opt-in, defaults `false`): each has a
-    /// catalog entry in the `agentFeatures` category and a `KNOWN_PATHS`
-    /// entry, and each round-trips through the registry-wired service
-    /// (default origin → file override → reset).
+    /// `true`: each has a catalog entry in the `agentFeatures` category and a
+    /// `KNOWN_PATHS` entry, and each round-trips through the registry-wired
+    /// service (default origin → file override → reset).
     #[tokio::test]
     async fn agent_features_toggles_round_trip_via_registry() {
         let paths = [
@@ -2982,7 +2981,7 @@ mod tests {
             ("agentFeatures.attentionRequests", true),
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
-            ("agentFeatures.taskGraph", false),
+            ("agentFeatures.taskGraph", true),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

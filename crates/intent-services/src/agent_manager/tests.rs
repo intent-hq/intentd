@@ -13187,8 +13187,8 @@ mod unblocked_hints_tests {
     /// once, not per-wake).
     #[tokio::test]
     async fn batch_coalesces_triggers_into_one_section_on_last_entry() {
-        // The section is gated behind the opt-in `agentFeatures.taskGraph`
-        // (intent-hq/monorepo#2445), so wire a registry with it on.
+        // The section is gated behind `agentFeatures.taskGraph`
+        // (intent-hq/monorepo#2445), so wire a registry with it explicitly on.
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());

@@ -5802,13 +5802,9 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Byte-identity needs every gate open, `taskGraph` (opt-in) included.
-        let all_on_srv = server("amber-forest", None).with_agent_features(
-            intent_core::settings_file::AgentFeaturesSettings {
-                task_graph: true,
-                ..Default::default()
-            },
-        );
+        // Byte-identity needs every gate open (the defaults).
+        let all_on_srv = server("amber-forest", None)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -5989,14 +5985,11 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A top-level bridge with every gate open (`taskGraph` opted in)
-        // stays byte-identical to the static const.
+        // A top-level bridge with every gate open (the defaults) stays
+        // byte-identical to the static const.
         let top = server("amber-forest", None)
             .with_sub_agent(false)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
-                task_graph: true,
-                ..Default::default()
-            });
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await

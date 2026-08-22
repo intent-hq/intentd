@@ -687,9 +687,9 @@ pub(super) fn denied_feature(
 /// variants, pruning the doc lines of every feature disabled in
 /// `[agentFeatures]` (a method line and its indented continuation lines drop
 /// together; doubled blank lines left by a removed namespace paragraph
-/// collapse to one). With every toggle on — including the opt-in `taskGraph`
-/// — this returns the static const unchanged, so the every-gate-open
-/// description is byte-identical to today's by construction.
+/// collapse to one). With every toggle on (the defaults) this returns the
+/// static const unchanged, so the every-gate-open description is
+/// byte-identical to today's by construction.
 pub fn workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
@@ -1561,17 +1561,14 @@ mod tests {
         ]
     }
 
-    // Every gate open: the defaults plus the opt-in `taskGraph`.
+    // Every gate open: the defaults (all toggles on, `taskGraph` included
+    // since the default flip).
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings {
-            task_graph: true,
-            ..AgentFeaturesSettings::default()
-        }
+        AgentFeaturesSettings::default()
     }
 
-    // Hard requirement: with every gate open (the defaults plus the opt-in
-    // `taskGraph`), the assembled description IS the static const —
-    // byte-identical, both variants.
+    // Hard requirement: with every gate open (the defaults), the assembled
+    // description IS the static const — byte-identical, both variants.
     #[test]
     fn all_gates_open_description_is_byte_identical() {
         let features = all_gates_open();
@@ -1631,14 +1628,16 @@ mod tests {
         }
     }
 
-    // `taskGraph` off (the default) scrubs the teaching text — batch-delegate
-    // params/line, unblocked-wake advisory, fence-attribute grammar — while
-    // every method line survives (docs-only gate: nothing joins
-    // `gated_prefixes`, so no method is pruned or denied).
+    // `taskGraph` off (explicit opt-out; it defaults on) scrubs the teaching
+    // text — batch-delegate params/line, unblocked-wake advisory,
+    // fence-attribute grammar — while every method line survives (docs-only
+    // gate: nothing joins `gated_prefixes`, so no method is pruned or denied).
     #[test]
     fn task_graph_off_scrubs_teaching_but_keeps_methods() {
-        let features = AgentFeaturesSettings::default();
-        assert!(!features.task_graph, "taskGraph must be opt-in");
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..AgentFeaturesSettings::default()
+        };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
             for gone in [
@@ -1685,7 +1684,10 @@ mod tests {
     // `taskGraph` is docs-only: it must never join the dispatch-deny table.
     #[test]
     fn task_graph_off_never_denies_dispatch() {
-        let features = AgentFeaturesSettings::default();
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..AgentFeaturesSettings::default()
+        };
         for method in ["agent.delegate", "task.convertBlocks", "task.setRelations"] {
             assert_eq!(
                 denied_feature(&features, method),

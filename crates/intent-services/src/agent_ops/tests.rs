@@ -147,11 +147,9 @@ async fn setup_with_task_graph(
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
-    if enabled {
-        registry
-            .apply(&[("agentFeatures.taskGraph".into(), json!(true))])
-            .expect("enable taskGraph");
-    }
+    registry
+        .apply(&[("agentFeatures.taskGraph".into(), json!(enabled))])
+        .expect("set taskGraph");
     let services = Services::new(store).with_settings_registry(Arc::clone(&registry));
     (tmp, services, ws, registry, config_dir)
 }
@@ -28461,13 +28459,12 @@ async fn no_manager_send_now_resolves_unblocked_section() {
 }
 
 /// `agentFeatures.taskGraph` gates the advisory section
-/// (intent-hq/monorepo#2445): with the toggle at its default (off), the same
-/// trigger stamp that would render a section yields `None` — the wake
-/// delivers unannotated. The default-off value is captured when the session is
-/// created.
+/// (intent-hq/monorepo#2445): with the toggle opted out, the same trigger
+/// stamp that would render a section yields `None` — the wake delivers
+/// unannotated. The opted-out value is captured when the session is created.
 #[tokio::test]
 async fn task_graph_off_suppresses_unblocked_section() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _registry, _config) = setup_with_task_graph(false).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let done = seed_task(&svc, &ws, "Done task").await;
     let gated = seed_task(&svc, &ws, "Gated task").await;
@@ -28486,7 +28483,7 @@ async fn task_graph_off_suppresses_unblocked_section() {
         svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
-        "taskGraph off (the default) must suppress the section"
+        "taskGraph off must suppress the section"
     );
 }
 

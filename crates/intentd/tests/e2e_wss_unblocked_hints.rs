@@ -386,9 +386,9 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
-    // The unblocked-wake section is gated behind the opt-in
-    // `agentFeatures.taskGraph` (intent-hq/monorepo#2445): seed the toggle on
-    // in the daemon's config before it boots.
+    // The unblocked-wake section is gated behind `agentFeatures.taskGraph`
+    // (intent-hq/monorepo#2445): seed the toggle explicitly on in the
+    // daemon's config before it boots.
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::write(
         data_dir.join("config.toml"),
@@ -583,13 +583,13 @@ async fn run_verifier_flip_flow(script: &str, taskgraph_enabled: bool) -> (Daemo
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
-    if taskgraph_enabled {
-        std::fs::write(
-            data_dir.join("config.toml"),
-            "[agentFeatures]\ntaskGraph = true\n",
-        )
-        .expect("seed config.toml with agentFeatures.taskGraph");
-    }
+    // Seed the toggle explicitly (it defaults on, so the disabled flow needs
+    // an explicit opt-out).
+    std::fs::write(
+        data_dir.join("config.toml"),
+        format!("[agentFeatures]\ntaskGraph = {taskgraph_enabled}\n"),
+    )
+    .expect("seed config.toml with agentFeatures.taskGraph");
 
     let delegate_js = format!(
         "return await ws.agent.delegate({{ taskNoteId: {}, agentInstructions: {}, model: 'mock:default' }});",

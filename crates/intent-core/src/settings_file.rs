@@ -694,8 +694,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on** except `taskGraph` (opt-in);
-/// changes apply to new agent sessions only.
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[allow(clippy::struct_excessive_bools)]
@@ -743,8 +743,8 @@ pub struct AgentFeaturesSettings {
     /// APIs are never dispatch-denied. Prompt/help gating and unblocked-wake
     /// teaching use the value captured when the parent session is created;
     /// changing the live setting does not affect existing sessions' wakes.
-    /// Defaults **off** (opt-in), unlike the other toggles
-    /// (intent-hq/monorepo#2445).
+    /// Defaults **on** like the other toggles (originally opt-in —
+    /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
 }
 
@@ -761,7 +761,7 @@ impl Default for AgentFeaturesSettings {
             attention_requests: true,
             state_snapshot: true,
             pr_monitor: true,
-            task_graph: false,
+            task_graph: true,
         }
     }
 }
@@ -1124,9 +1124,9 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// The fully-commented default `config.toml` written by
 /// [`SettingsFile::load_or_init`] when no file exists. Every key appears with
 /// its default value (or a commented-out example when there is no default),
-/// annotated with its catalog label and description — except the opt-in
+/// annotated with its catalog label and description — except
 /// `agentFeatures.taskGraph`, deliberately not seeded so configs without the
-/// key pick up a future default flip automatically (intent-hq/monorepo#2643).
+/// key track default flips automatically (intent-hq/monorepo#2643).
 /// Parsing this template must yield exactly [`SettingsFile::default`]
 /// (enforced by a unit test).
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret settings).
@@ -1565,8 +1565,7 @@ mod tests {
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
-        // `taskGraph` is the one opt-in toggle: absent → off.
-        assert!(!parsed.agent_features.task_graph);
+        assert!(parsed.agent_features.task_graph);
     }
 
     #[test]
@@ -1578,16 +1577,16 @@ mod tests {
     }
 
     #[test]
-    fn task_graph_defaults_off_and_opts_in() {
-        // Opt-in (intent-hq/monorepo#2445): empty file resolves to off, and
-        // the shipped template no longer seeds the key (monorepo#2643), so
-        // first-boot configs pick up a future default flip automatically; an
-        // explicit `taskGraph = true` opts in.
+    fn task_graph_defaults_on_and_opts_out() {
+        // Default on (flipped from the intent-hq/monorepo#2445 opt-in): empty
+        // file resolves to on, and the shipped template does not seed the key
+        // (monorepo#2643), so configs without it track the default; an
+        // explicit `taskGraph = false` opts out.
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
-        assert!(!parsed.agent_features.task_graph);
+        assert!(parsed.agent_features.task_graph);
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("taskGraph"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
-        assert!(!templated.agent_features.task_graph);
+        assert!(templated.agent_features.task_graph);
         let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = true\n")
             .expect("override parses");
         assert!(parsed.agent_features.task_graph);
