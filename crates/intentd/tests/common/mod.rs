@@ -410,8 +410,11 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
 /// `[providers] active = "auggie"`: since monorepo#3044 there is no
 /// positional provider fallback, so spawned-daemon suites whose tests
 /// create/delegate agents without an explicit provider or model must seed a
-/// configured default before boot. Appends to an existing seeded config;
-/// no-op if a `[providers]` table is already present.
+/// configured default before boot. Also seeds a `providers.paths` override
+/// pointing `auggie` at `/bin/sh` so availability checks (e.g.
+/// `agent.delegate`'s `ensure_provider_available`) stay hermetic — no real
+/// auggie binary required on the test host (monorepo#3162). Appends to an
+/// existing seeded config; no-op if a `[providers]` table is already present.
 pub fn seed_default_provider(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
@@ -429,7 +432,9 @@ pub fn seed_default_provider(data_dir: &std::path::Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str("\n[providers]\nactive = \"auggie\"\n");
+    text.push_str(
+        "\n[providers]\nactive = \"auggie\"\n\n[providers.paths]\nauggie = \"/bin/sh\"\n",
+    );
     std::fs::write(&path, text).expect("seed config.toml with providers.active");
 }
 
