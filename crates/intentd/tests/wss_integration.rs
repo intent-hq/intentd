@@ -39,6 +39,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+/// Persisted cache key for the current Auggie catalog wire shape.
+/// Keep in sync with intent-services/src/model_catalog.rs; that constant is crate-private.
+const AUGGIE_CATALOG_VERSION: &str = "preserve-legacy-v1";
 
 /// Lowercase hex sha256 digest of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1842,12 +1845,13 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
 async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     let dir = test_tempdir("intentd-wss-bare-mismatch-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
-    // version key must match each provider's current one ("" — no pin).
+    // version key must match each provider's current one (Auggie is shape-versioned;
+    // Grok has no pin).
     let cache = serde_json::json!({
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
             },
@@ -1992,12 +1996,13 @@ async fn wss_agent_set_model_provider_id_param() {
     }
     let dir = test_tempdir("intentd-wss-setmodel-pid-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
-    // version key must match each provider's current one ("" — no pin).
+    // version key must match each provider's current one (Auggie is shape-versioned;
+    // Grok has no pin).
     let cache = serde_json::json!({
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" } ]
             },
@@ -2174,12 +2179,13 @@ async fn wss_agent_set_model_provider_id_param() {
 async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
     let dir = test_tempdir("intentd-wss-bare-cache-");
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
-    // version key must match each provider's current one ("" — no pin).
+    // version key must match each provider's current one (Auggie is shape-versioned;
+    // Grok has no pin).
     let cache = serde_json::json!({
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "fable-5", "name": "Fable 5", "provider": "auggie" } ]
             },
@@ -3094,7 +3100,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [
                     { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
@@ -3193,7 +3199,7 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [
                     { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
@@ -3306,7 +3312,7 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [
                     { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
@@ -3743,6 +3749,97 @@ async fn wss_models_list_returns_catalog_with_source() {
     }
     let source = resp["result"]["source"].as_str().expect("source");
     assert!(source == "auggie" || source == "static", "source: {source}");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_preserves_legacy_metadata_through_cache() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = test_tempdir("intentd-wss-models-legacy-");
+    let calls = dir.path().join("calls");
+    let bin = dir.path().join("auggie");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$*" != "model list --json" ]; then
+  exit 1
+fi
+cat <<'JSON'
+{{"models":[{{"shortName":"current","displayName":"Current","modelGroupPriority":1,"priority":1,"isLegacyModel":false}},{{"shortName":"legacy","displayName":"Legacy","modelGroupPriority":2,"priority":1,"isLegacyModel":true}}]}}
+JSON
+"#,
+        calls.display()
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let request =
+        r#"{"jsonrpc":"2.0","id":47,"method":"models.list","params":{"providerId":"auggie"}}"#;
+    let response = wss_call(srv.port, srv.cfg.clone(), request).await;
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 47,
+            "result": {
+                "providerId": "auggie",
+                "models": [
+                    { "id": "current", "name": "Current", "provider": "auggie",
+                      "modelGroupPriority": 1, "priority": 1 },
+                    { "id": "legacy", "name": "Legacy", "provider": "auggie",
+                      "modelGroupPriority": 2, "priority": 1, "isLegacyModel": true }
+                ],
+                "source": "auggie"
+            }
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "model list --json\n"
+    );
+
+    let cached_request = r#"{"jsonrpc":"2.0","id":48,"method":"models.list"}"#;
+    let cached = wss_call(srv.port, srv.cfg.clone(), cached_request).await;
+    assert_eq!(cached["result"]["models"], response["result"]["models"]);
+    assert_eq!(cached["result"]["source"], response["result"]["source"]);
+    assert!(cached["result"].get("providerId").is_none());
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "model list --json\n"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_provider_auggie_failure_includes_warning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = test_tempdir("intentd-wss-models-provider-failure-");
+    let bin = dir.path().join("auggie");
+    std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+
+    let request =
+        r#"{"jsonrpc":"2.0","id":49,"method":"models.list","params":{"providerId":"auggie"}}"#;
+    let response = wss_call(srv.port, srv.cfg.clone(), request).await;
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 49,
+            "result": {
+                "providerId": "auggie",
+                "models": [],
+                "source": "static",
+                "warning": "auggie CLI unavailable or returned no models"
+            }
+        })
+    );
     srv.ws.stop().await;
 }
 
@@ -4264,7 +4361,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
         "version": 2,
         "entries": {
             "auggie": {
-                "versionKey": "",
+                "versionKey": AUGGIE_CATALOG_VERSION,
                 "fetchedAtMs": 0,
                 "models": [ { "id": "lg", "name": "LG", "provider": "auggie" } ]
             }

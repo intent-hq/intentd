@@ -65,6 +65,13 @@ const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 /// so an entry this old must still be served without a probe.
 const OLD_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
 
+#[test]
+fn auggie_catalog_version_invalidates_pre_legacy_cache() {
+    let source = source_for("auggie").expect("auggie source");
+    assert_eq!((source.version_key)(), AUGGIE_CATALOG_VERSION);
+    assert_ne!((source.version_key)(), "");
+}
+
 #[tokio::test]
 async fn cache_hit_skips_fetch() {
     let cache = ModelCatalogCache::new(None);
@@ -187,6 +194,24 @@ fn persistence_roundtrips_across_instances() {
     assert!(corrupt.last_good("p", "v1").is_none());
 }
 
+#[test]
+fn persistence_roundtrips_model_metadata_without_transform() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MODELS_CACHE_FILE);
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let models = vec![json!({
+        "id": "legacy", "name": "Legacy", "provider": "auggie",
+        "isLegacyModel": true
+    })];
+    cache.store("auggie", AUGGIE_CATALOG_VERSION, models.clone(), 1_000);
+
+    let reloaded = ModelCatalogCache::new(Some(path));
+    assert_eq!(
+        reloaded.last_good("auggie", AUGGIE_CATALOG_VERSION),
+        Some(models)
+    );
+}
+
 /// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
 /// list with no warning — the provider CLI owns model selection.
 #[tokio::test]
@@ -217,7 +242,7 @@ fn registry_covers_all_nine_providers() {
 #[test]
 fn registry_version_keys_follow_adapter_pins() {
     let key = |provider: &str| (source_for(provider).unwrap().version_key)();
-    assert_eq!(key("auggie"), "");
+    assert_eq!(key("auggie"), AUGGIE_CATALOG_VERSION);
     assert_eq!(key("cortex"), "");
     // Keyed on the full npx package spec (name + version), not just the
     // version constant, so a package rename also invalidates cache entries.
@@ -445,14 +470,14 @@ async fn negative_entry_is_version_key_scoped() {
 
 // --- cached-catalog ownership evidence (monorepo#607) ---
 // These use real registry provider ids (`source_for` gates the lookup):
-// auggie and grok are both version-pin-free (`no_version` → "").
+// auggie uses a wire-shape version; grok remains version-pin-free.
 
 #[test]
 fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
     let cache = ModelCatalogCache::new(None);
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "auggie:fable-6", "name": "Fable 6", "provider": "auggie" }),
@@ -483,7 +508,7 @@ fn cached_effort_levels_reads_matching_row() {
     let cache = ModelCatalogCache::new(None);
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -533,7 +558,7 @@ fn cached_default_model_reads_is_default_row() {
     let cache = ModelCatalogCache::new(None);
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
@@ -555,7 +580,7 @@ fn cached_default_model_none_without_usable_entry() {
     // Catalog without an isDefault row (including an explicit false) → None.
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
@@ -592,7 +617,7 @@ fn providers_claiming_model_cached_walks_registry() {
     assert!(cache.providers_claiming_model_cached("fable-5").is_empty());
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         1_000,
     );

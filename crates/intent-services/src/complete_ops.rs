@@ -980,12 +980,11 @@ rl.on('line', (line) => {
             "no cached evidence must not drop a bare id"
         );
 
-        // auggie and grok are both version-pin-free, so a "" version key
-        // makes each entry current evidence.
+        // Use each provider's current catalog version key for ownership evidence.
         let catalog = empty_catalog();
         catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![serde_json::json!({ "id": "sonnet4.5", "provider": "auggie" })],
         );
         catalog.store_for_test(
