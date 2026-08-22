@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.37] - 2026-08-22
+
+### 🚀 Features
+
+- *(agents)* Fail fast on disabled or unavailable providers at create/delegate ([#1403](https://github.com/intent-hq/intentd/pull/1403))
+
+### 🐛 Bug Fixes
+
+- *(services)* Re-resolve model.default when providers.active switches ([#1401](https://github.com/intent-hq/intentd/pull/1401))
+
+
 ## [0.7.36] - 2026-08-22
 
 ### 🐛 Bug Fixes
