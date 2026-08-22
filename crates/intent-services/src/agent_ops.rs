@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_PROCESSING,
@@ -69,6 +70,24 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::Services;
+
+/// Per-agent ordering gate for pending-question marker writes and their
+/// matching `agent:updated` events. Different agents never contend.
+#[derive(Clone, Default)]
+pub(crate) struct PendingQuestionMutationLocks {
+    locks: Arc<Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl PendingQuestionMutationLocks {
+    fn lock_for(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("pending-question lock map poisoned")
+            .entry(agent_id.clone())
+            .or_default()
+            .clone()
+    }
+}
 
 /// The concise per-agent state digest behind `ws.agent.snapshot()` and the
 /// per-turn prompt injection (`current ws.agent.snapshot() => {...}`).
@@ -3770,8 +3789,7 @@ impl Services {
         // it pending — so they also gate the displayStatus recompute below.
         let hold_moved = if role == "assistant" && has_question_blocks(&content) {
             self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
-                .await;
-            true
+                .await
         } else if role == "user"
             && self
                 .resolve_pending_questions_for_answer(
@@ -4764,54 +4782,194 @@ impl Services {
     /// message whose just-persisted content carries question resource blocks
     /// (called from the turn-end persist paths). Single-slot: a newer
     /// question-bearing turn overwrites an older marker, which is exactly the
-    /// spec's "newest set supersedes" rule. Atomic single-key `json_set` so
+    /// spec's "newest set supersedes" rule. The persisted message `seq` orders
+    /// competing completions, and the per-agent mutation lock keeps the write
+    /// plus its event in that same order. Atomic single-key `json_set` so
     /// sibling metadata keys (`dismissedQuestionsMessageId`,
-    /// `lastSeenMessageId`) are preserved. Best-effort: a failure is logged
-    /// and never fails the turn (the hold simply stays as it was).
+    /// `lastSeenMessageId`) are preserved. A successful write emits
+    /// `agent:updated` with the marker so clients re-read the `AgentLite`
+    /// projection. Returns `true` only when this call committed the latest
+    /// marker. Best-effort: a failure is logged and never fails the turn (the
+    /// hold simply stays as it was).
     pub(crate) async fn record_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         message_id: &str,
-    ) {
-        if let Err(e) = self
+    ) -> bool {
+        self.park_pending_marker_mutation("set", message_id).await;
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+
+        let candidate = match self
             .store
-            .set_agent_session_metadata_key(
+            .get_agent_message_by_id(agent_id, message_id)
+            .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to order pending-questions marker");
+                return false;
+            }
+        };
+        let session = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read pending-questions marker");
+                return false;
+            }
+        };
+        if session.pending_questions_message_id() == Some(message_id) {
+            return false;
+        }
+        if let Some(current_id) = session.pending_questions_message_id() {
+            match self
+                .store
+                .get_agent_message_by_id(agent_id, current_id)
+                .await
+            {
+                Ok(Some(current)) if current.seq >= candidate.seq => return false,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to order pending-questions marker");
+                    return false;
+                }
+            }
+        }
+        let current_value = session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY));
+        if current_value.is_some_and(|value| !value.is_string()) {
+            tracing::warn!(
+                agent = %agent_id,
+                "pending-questions marker has a non-string value"
+            );
+            return false;
+        }
+        let current_value = current_value.and_then(Value::as_str).map(str::to_string);
+        let expected = if session.pending_questions_marker_written() {
+            current_value.as_deref().map(Some)
+        } else {
+            Some(None)
+        };
+        match self
+            .store
+            .set_pending_questions_marker_if_unanswered(
                 workspace_id,
                 agent_id,
-                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
-                message_id,
-                None,
+                expected,
+                &candidate,
                 &now_iso(),
             )
             .await
         {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+            Ok(true) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingQuestionsMessageId": message_id,
+                    }),
+                )
+                .await;
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+                false
+            }
         }
     }
 
     /// Clear the pending-questions marker (written as the empty string, which
     /// reads back as "no pending questions" while still marking the session as
-    /// marker-aware so the pre-upgrade tail-walk fallback stays off).
-    /// Best-effort: a failure is logged and never fails the caller.
+    /// marker-aware so the pre-upgrade tail-walk fallback stays off). A
+    /// successful write emits `agent:updated` with the written empty string so
+    /// clients can distinguish the clear from a legacy-absent marker. When
+    /// `expected` is set, the existing per-key CAS clears only that exact
+    /// marker. Returns `true` only when the clear committed. Best-effort: a
+    /// failure is logged and never fails the caller.
     pub(crate) async fn clear_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-    ) {
-        if let Err(e) = self
+        expected: Option<&str>,
+    ) -> bool {
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+        self.clear_pending_questions_marker_locked(workspace_id, agent_id, expected)
+            .await
+    }
+
+    async fn clear_pending_questions_marker_locked(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        expected: Option<&str>,
+    ) -> bool {
+        let expected_owned = match expected {
+            Some(value) => Some(Some(value.to_string())),
+            None => match self.store.get_agent_session_summary(agent_id).await {
+                Ok(session) => {
+                    let current = session
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| {
+                            metadata.get(intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY)
+                        })
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if current.as_deref() == Some("") {
+                        return false;
+                    }
+                    if session.pending_questions_marker_written() {
+                        current.map(Some)
+                    } else {
+                        Some(None)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to read pending-questions marker");
+                    return false;
+                }
+            },
+        };
+        let expected_guard = expected_owned.as_ref().map(|value| value.as_deref());
+        match self
             .store
             .set_agent_session_metadata_key(
                 workspace_id,
                 agent_id,
                 intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
                 "",
-                None,
+                expected_guard,
                 &now_iso(),
             )
             .await
         {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+            Ok(true) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingQuestionsMessageId": "",
+                    }),
+                )
+                .await;
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+                false
+            }
         }
     }
 
@@ -4870,7 +5028,7 @@ impl Services {
             self.record_pending_questions_marker(workspace_id, agent_id, &id)
                 .await;
         } else {
-            self.clear_pending_questions_marker(workspace_id, agent_id)
+            self.clear_pending_questions_marker(workspace_id, agent_id, None)
                 .await;
             if let Some(manager) = self.agent_manager() {
                 manager
@@ -4902,15 +5060,17 @@ impl Services {
         let Some(answered) = answered_questions_message_id(message_metadata) else {
             return false;
         };
+        self.park_pending_marker_mutation("clear", answered).await;
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         if session.pending_questions_message_id() != Some(answered) {
             return false;
         }
-        self.clear_pending_questions_marker(workspace_id, agent_id)
-            .await;
-        true
+        self.clear_pending_questions_marker_locked(workspace_id, agent_id, Some(answered))
+            .await
     }
 
     /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker

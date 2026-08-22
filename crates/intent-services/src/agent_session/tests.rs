@@ -2219,6 +2219,218 @@ fn question_blocks() -> Value {
     }])
 }
 
+fn marker_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["agent:updated".to_string()],
+        ..Default::default()
+    })
+}
+
+async fn assert_only_marker_event(sub: &mut crate::events::Subscription, expected: &str) {
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("marker event delivered")
+        .expect("subscription open");
+    let markers: Vec<&str> = batch
+        .iter()
+        .filter_map(|event| event.data["pendingQuestionsMessageId"].as_str())
+        .collect();
+    assert_eq!(markers, vec![expected]);
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "stale marker mutation must not emit a later event"
+    );
+}
+
+/// A tagged answer can observe question A and then pause before its clear.
+/// Question B commits in that window; the answer's exact-value CAS must lose,
+/// leave B pending, and emit no stale clear event.
+#[tokio::test]
+async fn old_answer_cannot_clear_newer_pending_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let asked = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append question A");
+    let asked_id = asked["message"]["id"].as_str().unwrap().to_string();
+
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("clear"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let answering = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let asked_id = asked_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(
+                    agent_id,
+                    "user".to_string(),
+                    json!([{ "type": "text", "text": "late answer" }]),
+                    Some(json!({
+                        "type": "question_answers",
+                        "answeredQuestionsMessageId": asked_id,
+                    })),
+                )
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("old answer reached clear window");
+
+    let newer = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append question B");
+    let newer_id = newer["message"]["id"].as_str().unwrap().to_string();
+    park.release.notify_waiters();
+    answering
+        .await
+        .unwrap()
+        .expect("old answer append succeeds");
+
+    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(newer_id.as_str())
+    );
+    assert_only_marker_event(&mut sub, &newer_id).await;
+}
+
+/// Question A persists first, then pauses before its marker write. Question B
+/// persists and commits its marker. When A resumes, transcript `seq` ordering
+/// must reject it and suppress its stale event.
+#[tokio::test]
+async fn older_question_completion_cannot_overwrite_newer_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("set"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let older = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(agent_id, "assistant".to_string(), question_blocks(), None)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("older question reached marker window");
+
+    let newer = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append newer question");
+    let newer_id = newer["message"]["id"].as_str().unwrap().to_string();
+    park.release.notify_waiters();
+    older
+        .await
+        .unwrap()
+        .expect("older question append succeeds");
+
+    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(newer_id.as_str())
+    );
+    assert_only_marker_event(&mut sub, &newer_id).await;
+}
+
+/// A question row can persist and pause before its marker lock. When its exact
+/// tagged answer persists and observes no marker in that window, the delayed
+/// set must observe the later answer atomically and emit no stale marker event.
+#[tokio::test]
+async fn delayed_question_set_cannot_resurrect_answered_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("set"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let asking = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(agent_id, "assistant".to_string(), question_blocks(), None)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("question reached the pre-lock marker window");
+
+    let question = bus
+        .store()
+        .get_last_non_system_message(&agent_id)
+        .await
+        .expect("read persisted question")
+        .expect("question row exists");
+    assert_eq!(question.role, "assistant");
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "answer before marker set" }]),
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": question.id,
+            })),
+        )
+        .await
+        .expect("answer persists while marker is absent");
+    assert_eq!(
+        bus.store()
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session before delayed set")
+            .pending_questions_message_id(),
+        None
+    );
+
+    park.release.notify_waiters();
+    let asked = asking
+        .await
+        .expect("question task joins")
+        .expect("question append succeeds");
+    assert_eq!(asked["message"]["id"], question.id);
+    assert_eq!(
+        bus.store()
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session after delayed set")
+            .pending_questions_message_id(),
+        None,
+        "delayed set must not resurrect the answered marker"
+    );
+    assert!(!services.question_hold_active(&agent_id).await);
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "a rejected delayed set must not emit a marker event"
+    );
+}
+
 /// The `workspace:displayStatus-changed`-only subscription the monorepo#1266
 /// regression tests below assert against.
 fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
