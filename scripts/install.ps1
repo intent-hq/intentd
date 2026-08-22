@@ -69,6 +69,24 @@ if ($env:INTENTD_AUTO_RESUME) {
     }
 }
 
+# >>> BEGIN resolve-data-dir (extracted verbatim and executed by
+# crates/intentd-sitter/tests/install_ps1_owner.rs — keep these markers).
+#
+# Anchor a relative INTENTD_DATA_DIR to the directory the installer runs in,
+# once, before anything reads it — the same normalization install.sh's
+# resolve_data_dir does. The override is carried verbatim into the Scheduled
+# Task action, and a task has no working directory of its own, so a bare
+# `.\data` would otherwise name one dir here — where the ownership check below
+# looks, and where this run's `intentd` calls read — and a different one once
+# the task starts. GetUnresolvedProviderPathFromPSPath resolves against the
+# current location without requiring the dir to exist yet, and leaves an
+# already-absolute path unchanged.
+if ($env:INTENTD_DATA_DIR) {
+    $env:INTENTD_DATA_DIR =
+        $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:INTENTD_DATA_DIR)
+}
+# <<< END resolve-data-dir
+
 $installDir = if ($env:INTENTD_INSTALL_DIR) {
     $env:INTENTD_INSTALL_DIR
 } else {
@@ -158,6 +176,10 @@ if (-not $serviceMode) {
 }
 
 if ($serviceMode -eq 'yes') {
+    # >>> BEGIN data-dir-owner-check (extracted verbatim and executed by
+    # crates/intentd-sitter/tests/install_ps1_owner.rs — keep these markers,
+    # and keep the block self-contained: its only inputs are the environment).
+    #
     # Before anything is asked or registered: refuse a data dir a live daemon
     # already owns (install.sh's check_data_dir_not_owned). The daemon holds an
     # exclusive lock on its data dir for as long as it runs, so a second task on
@@ -168,15 +190,25 @@ if ($serviceMode -eq 'yes') {
     # crash or a hard reboot leaves behind - all mean "not owned". The default
     # data dir mirrors
     # intent_core::Config::resolve (the `directories` crate's roaming data dir).
+    #
+    # "Malformed" is read exactly as the daemon's read_pid
+    # (crates/intentd/src/main.rs) reads it: the *whole* file, trimmed, parsed
+    # as a u32 - so `123\nnot-a-pid` and `1 23` are malformed, not pid 123.
+    # Taking only the first line would find an owner where the daemon finds
+    # none, and an unrelated live pid would then abort a legitimate install
+    # with nothing the user could do about it. [uint32]::TryParse accepts the
+    # same leading `+`, leading zeros and surrounding whitespace u32::from_str
+    # does, and rejects the same negatives and overflows.
     $dataDir = if ($env:INTENTD_DATA_DIR) { $env:INTENTD_DATA_DIR } else { Join-Path $env:APPDATA 'intentd\data' }
     $ownerPid = 0
     $pidFile = Join-Path $dataDir 'intentd.pid'
     try {
         if (Test-Path $pidFile) {
-            $firstLine = @(Get-Content $pidFile -TotalCount 1 -ErrorAction Stop)[0]
-            $parsed = 0
-            if ([int]::TryParse(("$firstLine").Trim(), [ref]$parsed) -and $parsed -gt 0) {
-                if (Get-Process -Id $parsed -ErrorAction SilentlyContinue) { $ownerPid = $parsed }
+            $pidText = [string](Get-Content $pidFile -Raw -ErrorAction Stop)
+            $parsed = [uint32]0
+            if ([uint32]::TryParse($pidText.Trim(), [ref]$parsed) -and
+                $parsed -gt 0 -and $parsed -le [int]::MaxValue) {
+                if (Get-Process -Id ([int]$parsed) -ErrorAction SilentlyContinue) { $ownerPid = [int]$parsed }
             }
         }
     } catch {
@@ -199,6 +231,7 @@ if ($serviceMode -eq 'yes') {
             "  * give this task its own data dir: `$env:INTENTD_DATA_DIR = `"`$env:LOCALAPPDATA\intentd\service-data`"`n" +
             "  * install just the binary, with no task: re-run with `$env:INTENTD_INSTALL_SERVICE = '0'")
     }
+    # <<< END data-dir-owner-check
     # Auto-resume choice: parameter beats the env var beats the prompt (both
     # validated up front); 'auto' — or a non-interactive run — is the daemon
     # default and writes nothing. Applied via `intentd settings` after the

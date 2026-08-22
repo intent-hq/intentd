@@ -54,7 +54,9 @@
 #
 # INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
-# serves the same data dir the install-time CLI used.
+# serves the same data dir the install-time CLI used. A relative value is
+# anchored to the directory this installer runs in, since the service has no
+# working directory of its own — see resolve_data_dir.
 #
 # Idempotent: re-running replaces the installed binary atomically, and
 # service setup restarts an already-registered service instead of
@@ -371,15 +373,26 @@ report_installed_version() {
   fi
 }
 
-# The data dir the service registered below would serve: the explicit
+# The absolute data dir the service registered below would serve: the explicit
 # override, else the daemon's own platform default. Kept in step with
 # intent_core::Config::resolve (crates/intent-core/src/config.rs), which reads
 # INTENTD_DATA_DIR first and otherwise takes the `directories` crate's per-app
 # data dir — `~/Library/Application Support/intentd` on macOS,
 # `$XDG_DATA_HOME/intentd` (default `~/.local/share/intentd`) elsewhere.
+#
+# A relative override is anchored to the directory the installer runs in. The
+# override is carried into the unit/plist, and neither a systemd user unit nor
+# a LaunchAgent inherits this shell's working directory, so a bare `./data`
+# would otherwise name one dir here — where the ownership check looks — and a
+# different one once the service starts. Anchoring it leaves a single dir that
+# this check, the unit/plist and the `intentd` calls below all agree on.
+# Idempotent, so it stays the same dir however many times it is resolved.
 resolve_data_dir() {
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
-    printf '%s' "$INTENTD_DATA_DIR"
+    case "$INTENTD_DATA_DIR" in
+      /*) printf '%s' "$INTENTD_DATA_DIR" ;;
+      *) printf '%s' "$(pwd)/${INTENTD_DATA_DIR#./}" ;;
+    esac
   elif [ "$os" = "Darwin" ]; then
     printf '%s' "$HOME/Library/Application Support/intentd"
   else
@@ -401,15 +414,50 @@ pid_is_alive() {
 # `<data_dir>/intentd.pid` names the owner, and only a live owner counts: a
 # missing, unreadable or malformed pidfile — and the stale pidfile a crash or a
 # hard reboot leaves behind — all mean "not owned", exactly as the daemon
-# itself reads them (it deletes a stale pidfile and starts). Pid 0 is rejected
-# because `kill -0 0` probes our own process group.
+# itself reads them (it deletes a stale pidfile and starts).
+#
+# "Malformed" has to mean the same thing on both sides, so this mirrors the
+# daemon's read_pid (crates/intentd/src/main.rs) literally: the *whole* file,
+# trimmed of surrounding whitespace, parsed as a u32. Reading just the first
+# line, or deleting whitespace from anywhere in the file, would find an owner
+# where the daemon finds none — `123\nnot-a-pid` and `1 23` are both malformed
+# to it, not pid 123 — and an unrelated live pid would then abort a legitimate
+# install with nothing the user could do about it. A false "not owned" only
+# costs the crash-loop this check is a shortcut around, so where the two
+# cannot agree, err that way:
+#
+#   * leading `+` is accepted, as u32::from_str accepts it;
+#   * leading zeros are stripped, so the pid probed here is the number the
+#     daemon read and never what a `kill` reading octal would make of it;
+#   * pid 0 is refused outright — `kill -0 0` probes our own process group, so
+#     it would look alive whatever wrote it, and no daemon ever writes it;
+#   * `.trim()` also strips non-ASCII whitespace, which `[:space:]` in the C
+#     locale does not; such a pidfile reads as unowned here.
 data_dir_owner_pid() {
   pid_file="$1/intentd.pid"
   [ -r "$pid_file" ] || return 0
-  owner=$(head -n 1 "$pid_file" 2>/dev/null | tr -d '[:space:]') || owner=""
+  owner=$(cat "$pid_file" 2>/dev/null) || owner=""
+  # Trim surrounding whitespace only: any left inside is what makes the file
+  # unparseable for the daemon, and must stay visible to the digit check.
+  owner=${owner#"${owner%%[![:space:]]*}"}
+  owner=${owner%"${owner##*[![:space:]]}"}
   case "$owner" in
-    '' | 0 | *[!0-9]*) return 0 ;;
+    +*) owner=${owner#+} ;;
   esac
+  case "$owner" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  while :; do
+    case "$owner" in
+      0?*) owner=${owner#0} ;;
+      *) break ;;
+    esac
+  done
+  # Past u32 the daemon's own parse fails; the length guard keeps the numeric
+  # comparison itself inside what a shell can represent.
+  [ "${#owner}" -le 10 ] || return 0
+  [ "$owner" -le 4294967295 ] || return 0
+  [ "$owner" != 0 ] || return 0
   pid_is_alive "$owner" || return 0
   printf '%s' "$owner"
 }
@@ -471,10 +519,12 @@ setup_service_linux() {
   unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir" || fail "cannot create $unit_dir"
   # Carry a custom data dir into the service so it serves the same data dir
-  # the install-time CLI used.
+  # the install-time CLI used — resolved, so a relative override names the same
+  # dir the ownership check tested and not whatever the unit's own working
+  # directory happens to be.
   env_line=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
-    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$INTENTD_DATA_DIR")\""
+    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$(resolve_data_dir)")\""
   fi
   # Same unit the .deb ships (packaging/deb/intentd.service), pointed at the
   # installed binary. ExecStart/ExecStop are quoted: install dirs can contain
@@ -549,13 +599,15 @@ setup_service_macos() {
   xml_bin=$(xml_escape "$install_dir/intentd")
   xml_home=$(xml_escape "$HOME")
   # Carry a custom data dir into the service so it serves the same data dir
-  # the install-time CLI used.
+  # the install-time CLI used — resolved, so a relative override names the same
+  # dir the ownership check tested and not whatever working directory launchd
+  # gives the agent.
   env_block=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
     env_block="	<key>EnvironmentVariables</key>
 	<dict>
 		<key>INTENTD_DATA_DIR</key>
-		<string>$(xml_escape "$INTENTD_DATA_DIR")</string>
+		<string>$(xml_escape "$(resolve_data_dir)")</string>
 	</dict>
 "
   fi
@@ -677,6 +729,15 @@ main() {
   powershell -c \"irm $BASE_URL/install.ps1 | iex\"" ;;
     *) fail "unsupported operating system '$os' (supported: Linux, Darwin/macOS)" ;;
   esac
+
+  # Anchor a relative override once, here, so every `intentd` invoked below
+  # inherits the same absolute dir the ownership check tests and the
+  # unit/plist carries. resolve_data_dir is idempotent, so this only ever
+  # rewrites the relative case.
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    INTENTD_DATA_DIR=$(resolve_data_dir)
+    export INTENTD_DATA_DIR
+  fi
 
   arch=$(uname -m)
   case "$arch" in
