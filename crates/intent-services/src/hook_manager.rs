@@ -333,12 +333,14 @@ async fn run_hook_script(
          }};\n\
          const console = {{ log: __hook_log, info: __hook_log, warn: __hook_log, error: __hook_log }};\n\
          const __hook_exec_failures = [];\n\
+         let __hook_exec_failed_total = 0;\n\
          if (globalThis.ws && ws.host && typeof ws.host.exec === 'function') {{\n\
            const __hook_exec_inner = ws.host.exec;\n\
            ws.host.exec = async (opts) => {{\n\
              const r = await __hook_exec_inner(opts);\n\
              try {{\n\
                if (r && (r.timedOut === true || (typeof r.exitCode === 'number' && r.exitCode !== 0))) {{\n\
+                 __hook_exec_failed_total += 1;\n\
                  const argc = ((opts && opts.args) || []).length;\n\
                  const cmd = ((opts && opts.command) || '?') + (argc ? ' (' + argc + ' args)' : '');\n\
                  const why = r.timedOut === true ? 'timed out' : 'exit code ' + r.exitCode;\n\
@@ -363,8 +365,8 @@ async fn run_hook_script(
          }}\n\
          const __logs = __hook_logs.length === 0 ? '' :\n\
            (__hook_logs_dropped ? '[earlier log lines truncated]\\n' : '') + __hook_logs.join('\\n');\n\
-         if (__hook_threw) return {{ __k: 'e', __v: __hook_err, __logs, __execFailures: __hook_exec_failures }};\n\
-         return {{ __k: __hook_user === undefined ? 'u' : 'v', __v: __hook_user, __logs, __execFailures: __hook_exec_failures }};"
+         if (__hook_threw) return {{ __k: 'e', __v: __hook_err, __logs, __execFailures: __hook_exec_failures, __execFailedTotal: __hook_exec_failed_total }};\n\
+         return {{ __k: __hook_user === undefined ? 'u' : 'v', __v: __hook_user, __logs, __execFailures: __hook_exec_failures, __execFailedTotal: __hook_exec_failed_total }};"
     );
     let opts = intent_js::EvalOptions {
         timeout,
@@ -377,7 +379,8 @@ async fn run_hook_script(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            let exec_error = parse_exec_failures(v.get("__execFailures"));
+            let exec_error =
+                parse_exec_failures(v.get("__execFailures"), v.get("__execFailedTotal"));
             match v.get("__k").and_then(Value::as_str) {
                 Some("u") => RunOutcome::Continue {
                     logs,
@@ -441,12 +444,14 @@ fn parse_outcome(v: &Value, logs: Option<String>, exec_error: Option<String>) ->
 /// from the eval envelope) into the diagnostic summary persisted to
 /// `last_error` on non-evicting runs (monorepo#3231): `None` when the run
 /// had no failed execs. The harness owns the wording; the line count and
-/// per-line length are already capped in the envelope. `lastError` is
-/// workspace-visible via `hook.list`, so the capture is secret-conscious:
-/// the envelope records only the command name + arg count (never raw args),
-/// and any URL-embedded `user[:pass]@` credential a tool echoes to stderr is
-/// redacted here (monorepo#836 helper).
-fn parse_exec_failures(v: Option<&Value>) -> Option<String> {
+/// per-line length are already capped in the envelope, while
+/// `__execFailedTotal` carries the uncapped failure count so the summary
+/// names the true total instead of silently understating past the cap.
+/// `lastError` is workspace-visible via `hook.list`, so the capture is
+/// secret-conscious: the envelope records only the command name + arg count
+/// (never raw args), and any URL-embedded `user[:pass]@` credential a tool
+/// echoes to stderr is redacted here (monorepo#836 helper).
+fn parse_exec_failures(v: Option<&Value>, total: Option<&Value>) -> Option<String> {
     let lines: Vec<String> = v?
         .as_array()?
         .iter()
@@ -457,8 +462,12 @@ fn parse_exec_failures(v: Option<&Value>) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
+    let total = total
+        .and_then(Value::as_u64)
+        .map_or(lines.len(), |t| usize::try_from(t).unwrap_or(usize::MAX))
+        .max(lines.len());
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    Some(crate::harness::latest().hook_exec_failures_warning(&lines))
+    Some(crate::harness::latest().hook_exec_failures_warning(&lines, total))
 }
 
 /// Interpret a returned `state` field: absent keeps the previous carry-over
@@ -3840,6 +3849,20 @@ mod tests {
         .await;
         assert_eq!(hook.last_error, None);
         assert_eq!(hook.state, HookState::Scheduled);
+    }
+
+    /// The summary names the uncapped failure total and flags the lines the
+    /// per-run capture cap omitted, so >cap failures never read as exactly
+    /// cap; an absent total (defensive) falls back to the captured count.
+    #[test]
+    fn exec_failure_summary_flags_over_cap_total() {
+        let lines = json!(["a -> exit code 1", "b -> exit code 1"]);
+        let out = parse_exec_failures(Some(&lines), Some(&json!(8))).unwrap();
+        assert!(out.contains("8 host exec calls failed"), "{out}");
+        assert!(out.contains("…and 6 more not shown"), "{out}");
+        let out = parse_exec_failures(Some(&lines), None).unwrap();
+        assert!(out.contains("2 host exec calls failed"), "{out}");
+        assert!(!out.contains("more not shown"), "{out}");
     }
 
     #[tokio::test]

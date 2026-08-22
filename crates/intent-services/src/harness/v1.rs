@@ -654,12 +654,19 @@ impl Harness for V1 {
         )
     }
 
-    fn hook_exec_failures_warning(&self, lines: &[&str]) -> String {
+    fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
+        let omitted = total.saturating_sub(lines.len());
+        let more = if omitted > 0 {
+            format!("; …and {omitted} more not shown")
+        } else {
+            String::new()
+        };
         format!(
-            "last run: {} host exec call{} failed (the run itself completed): {}",
-            lines.len(),
-            plural(i64::try_from(lines.len()).unwrap_or(i64::MAX)),
-            lines.join("; ")
+            "last run: {} host exec call{} failed (the run itself completed): {}{}",
+            total,
+            plural(i64::try_from(total).unwrap_or(i64::MAX)),
+            lines.join("; "),
+            more
         )
     }
 

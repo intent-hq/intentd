@@ -219,7 +219,9 @@ pub(crate) trait Harness: Send + Sync {
     /// Diagnostic summary for a run whose `ws.host.exec` calls failed
     /// (nonzero exit / timeout) without the script throwing — persisted to
     /// `lastError` so silent check failures stay observable (monorepo#3231).
-    fn hook_exec_failures_warning(&self, lines: &[&str]) -> String;
+    /// `total` is the uncapped failure count; when it exceeds `lines.len()`
+    /// (the per-run capture cap) the summary flags the omitted rest.
+    fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String;
     /// `[Background hook "{name}"] {message}` framing plus the optional
     /// trailing state note.
     fn hook_wake_framing(&self, hook_name: &str, message: &str, state_note: Option<&str>)
