@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.40] - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- Default host.exec cwd to the workspace root and surface in-hook exec failures
+
+
 ## [0.7.39] - 2026-08-22
 
 ### 🚀 Features
