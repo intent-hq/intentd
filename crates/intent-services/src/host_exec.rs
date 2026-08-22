@@ -294,6 +294,36 @@ fn cwd_within_root(root: &Path, full: &Path) -> bool {
     full.starts_with(root)
 }
 
+/// Default `cwd` for an exec that names a workspace but supplies no explicit
+/// `cwd`: the workspace's filesystem root, so relative paths in the command
+/// (e.g. `git -C .worktrees/x`) resolve against the workspace instead of the
+/// daemon's own process cwd (intent-hq/monorepo#3231 — in-hook `git fetch`
+/// silently ran from the daemon's cwd). Falls back to `None` (daemon cwd)
+/// when the workspace cannot be loaded, has no filesystem root (remote /
+/// skip-worktree rows), or the root no longer exists on disk (`current_dir`
+/// on a missing path would fail the spawn outright), preserving the previous
+/// behavior for rootless workspaces — there is no caller-supplied `cwd`
+/// here, so the fallback is a functional default, not a containment escape.
+pub(crate) async fn default_cwd_for_workspace(
+    api: &dyn WorkspaceApi,
+    workspace_id: &str,
+) -> Option<PathBuf> {
+    let ws = api
+        .get_workspace(WorkspaceId::from(workspace_id))
+        .await
+        .ok()?;
+    let root = file_ops::workspace_root(&ws);
+    if root.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(root);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Assemble the tokio `Command` for a validated exec request. Pipes stdio,
 /// sets `kill_on_drop`, puts the child in its own process group (unix), and
 /// assembles the child env per the precedence contract in the module doc
@@ -387,6 +417,9 @@ pub async fn run(
         (Some(cwd), Some(ws_id)) => {
             Some(resolve_cwd_within_workspace(api, ws_id, cwd, None).await?)
         }
+        // No explicit `cwd` but a workspace caller: default to the workspace
+        // root (monorepo#3231) instead of inheriting the daemon's cwd.
+        (None, Some(ws_id)) => default_cwd_for_workspace(api, ws_id).await,
         _ => None,
     };
 
