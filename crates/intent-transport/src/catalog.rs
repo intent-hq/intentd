@@ -168,6 +168,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "mcp.servers.restart",
     "mcp.servers.toggle",
     "mcp.servers.update",
+    "mcp.testConnection",
     "metrics.clearAgentStats",
     "metrics.getAgentStats",
     "metrics.getAllWorkspaceStats",

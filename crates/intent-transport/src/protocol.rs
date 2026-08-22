@@ -199,13 +199,21 @@
 //! user/assistant message's LAST `tool_use` block preview
 //! (`{ name, input?, inputTruncated?, inputBytes? }`, input bounded by the
 //! §5.5 slim budget), denormalized at message-write time
-//! (migration 0098) — 294 router methods, 333 total.
+//! (migration 0098) — 294 router methods, 333 total. Version 7.3 adds the
+//! `mcp.testConnection` router method (additive; §5.22.2): a one-shot
+//! connection/auth probe of an HTTP/SSE MCP endpoint run from the daemon
+//! host — a single JSON-RPC `initialize` POST with optional caller headers
+//! plus the stored `mcp.oauth.*` bag injected as the `Authorization` header
+//! when available — returning
+//! `{ status: "connected"|"auth_required"|"error", statusCode?,
+//! errorMessage? }`, so the FE no longer contacts MCP server URLs directly —
+//! 295 router methods, 334 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.2";
+pub const PROTOCOL_VERSION: &str = "7.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

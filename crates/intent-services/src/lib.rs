@@ -11978,6 +11978,33 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.mcp_oauth_service().delete(&server_id).await })
     }
 
+    fn mcp_test_connection(
+        &self,
+        url: String,
+        headers: Option<serde_json::Value>,
+        server_name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let mut headers = mcp_servers::header_pairs(headers.as_ref());
+            // Inject the stored OAuth bag as the Authorization header when the
+            // caller names a server and did not supply one explicitly (the raw
+            // bag never crosses the wire — §5.22.1 internal-consumer seam).
+            let has_auth = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+            if !has_auth {
+                if let Some(name) = server_name.as_deref().filter(|s| !s.is_empty()) {
+                    if let Ok(Some(value)) =
+                        self.mcp_oauth_service().authorization_header(name).await
+                    {
+                        headers.push(("Authorization".to_string(), value));
+                    }
+                }
+            }
+            Ok(mcp_servers::test_connection(&url, &headers).await)
+        })
+    }
+
     fn search_in_files(
         &self,
         workspace_id: WorkspaceId,

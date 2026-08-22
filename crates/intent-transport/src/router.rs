@@ -3660,6 +3660,19 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "mcp.testConnection" => {
+            let url = require_str_param(params, "url")?;
+            if url.trim().is_empty() {
+                return Err(invalid_params("url is required"));
+            }
+            let headers = params.get("headers").cloned().filter(|v| !v.is_null());
+            let server_name = opt_str(params, "serverName");
+            match api.mcp_test_connection(url, headers, server_name).await {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         _ => Err(rpc(METHOD_NOT_FOUND, "Method not found")),
     }
 }
