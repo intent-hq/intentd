@@ -617,7 +617,7 @@ fn resolve_delegate_provider(
             });
         if let Some(provider_id) = explicit {
             ensure_known_provider("agent.delegate", &provider_id)?;
-            ensure_provider_available("agent.delegate", &provider_id, &settings.providers.paths)?;
+            ensure_provider_available("agent.delegate", &provider_id, &settings.providers)?;
             return Ok(Some(provider_id));
         }
     }
@@ -625,7 +625,7 @@ fn resolve_delegate_provider(
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
             ensure_known_provider("agent.delegate", &derived)?;
-            ensure_provider_available("agent.delegate", &derived, &settings.providers.paths)?;
+            ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
             Ok(Some(derived))
         }
         None => Err(crate::agent_session::no_default_provider_error(
@@ -669,31 +669,86 @@ pub(crate) fn resolve_delegate_provider_preview(
     crate::agent_session::derived_default_provider(&services.effective_settings())
 }
 
-/// Reject a known provider id that the daemon's own provider discovery
-/// reports as unavailable (not installed, or gated off by a missing env
-/// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE
-/// can toast it — instead of letting the delegate succeed and the spawn fail
-/// later with a raw "No such file or directory" (spec Decision D2 step 3).
-/// Mirrors `resolve_spawn`'s override-aware resolution (monorepo#1065) via
-/// [`intent_providers::discover_providers_with_overrides`], keyed by the
-/// same `providers.paths` settings.
+/// Reject a known provider id that the user explicitly disabled in the
+/// `providers.enabled` settings map (`enabled[id] == false`, for providers
+/// with [`intent_providers::ProviderConfig::can_be_disabled`]) with a
+/// distinct "not enabled" `-32602` (monorepo#3178). Disabled beats installed:
+/// a disabled provider must fail fast at every create/delegate front door
+/// regardless of whether its binary (or npx) would resolve. An absent map or
+/// absent entry means enabled (the settings default).
+fn ensure_provider_enabled(
+    method: &str,
+    provider_id: &str,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> Result<()> {
+    let disableable =
+        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
+    if disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false)) {
+        let display = intent_providers::provider_config(provider_id).display_name;
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not enabled — enable it in \
+             Settings > Agents."
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a known provider id that is disabled in settings or that the
+/// daemon's own provider discovery reports as unrunnable (not installed, or
+/// gated off by a missing env var/feature code) with a clear,
+/// caller-surfaceable `-32602` — so the FE can toast it — instead of letting
+/// the delegate succeed and the spawn fail later with a raw "No such file or
+/// directory" (spec Decision D2 step 3). The disabled check
+/// ([`ensure_provider_enabled`]) runs first, with its own distinct message
+/// (monorepo#3178). Mirrors `resolve_spawn`'s override-aware resolution
+/// (monorepo#1065) via [`intent_providers::provider_availability_for`], keyed
+/// by the same `providers.paths` settings, and aligns "installed" with what
+/// the spawn path can actually run: a provider whose only runnable path is
+/// its npx fallback (`fallback_npx_package`, e.g. codex) counts as runnable
+/// when npx resolves — exactly like `resolve_spawn`'s fallback tier.
 fn ensure_provider_available(
     method: &str,
     provider_id: &str,
-    provider_paths: &std::collections::BTreeMap<String, String>,
+    providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
-    let available = intent_providers::discover_providers_with_overrides(&|key| {
-        provider_paths.get(key).cloned()
+    ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
+    let availability = intent_providers::provider_availability_for(provider_id, &|key| {
+        providers.paths.get(key).cloned()
+    });
+    ensure_provider_runnable(method, provider_id, availability, &|| {
+        intent_providers::find_npx().is_some()
     })
-    .into_iter()
-    .find(|p| p.id == provider_id)
-    .is_some_and(|p| p.installed);
-    if !available {
-        let display = intent_providers::provider_config(provider_id).display_name;
+}
+
+/// The runnability half of [`ensure_provider_available`], with the npx probe
+/// injected so unit tests can exercise the fallback arm deterministically
+/// (the real probe scans the host's enhanced PATH). `npx_present` is only
+/// consulted when the provider is not installed but declares an npx fallback.
+fn ensure_provider_runnable(
+    method: &str,
+    provider_id: &str,
+    availability: Option<intent_providers::ProviderAvailability>,
+    npx_present: &dyn Fn() -> bool,
+) -> Result<()> {
+    let display = intent_providers::provider_config(provider_id).display_name;
+    let Some(availability) = availability else {
+        // Unknown ids are rejected by `ensure_known_provider` before this;
+        // kept defensive for any future caller that skips it.
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — it is not a \
+             registered provider."
+        )));
+    };
+    if let Some(reason) = &availability.gated_off {
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — {reason}."
+        )));
+    }
+    let runnable = availability.installed || (availability.has_npx_fallback && npx_present());
+    if !runnable {
         return Err(Error::InvalidParams(format!(
             "{method}: provider \"{provider_id}\" ({display}) is not available — it is not \
-             installed, or is disabled. Choose an available provider in Settings > Agents, or \
-             install {display}."
+             installed. Choose an available provider in Settings > Agents, or install {display}."
         )));
     }
     Ok(())
@@ -2869,6 +2924,30 @@ impl Services {
             return Err(crate::agent_session::no_default_provider_error(
                 "agent.create",
             ));
+        }
+        // monorepo#3178: the provider this session would spawn on must not be
+        // one the user explicitly disabled in `providers.enabled` — fail fast
+        // with the distinct "not enabled" -32602 before any session row is
+        // persisted. Resolve it with the spawn path's own precedence
+        // (`resolve_provider_id`: compound `resolved_model` prefix →
+        // `provider` field → settings-derived default) so an explicit
+        // `provider` cannot smuggle in a disabled compound-model provider —
+        // spawn would run the prefix, so the prefix is what gets gated. This
+        // one gate covers every create seam (`agent.create`,
+        // `agent.wakeOrCreate`, and delegate's child creation).
+        // Installed-ness stays delegate-only (`ensure_provider_available`):
+        // direct creates on a known, enabled-but-uninstalled provider keep
+        // their existing spawn-time failure mode.
+        if let Some(p) = crate::agent_session::resolve_provider_id(
+            resolved_model.as_deref(),
+            provider.as_deref(),
+            derived_default.as_deref(),
+        ) {
+            ensure_provider_enabled(
+                "agent.create",
+                &p,
+                self.effective_settings().providers.enabled.as_ref(),
+            )?;
         }
         // Also validate the resolved model's compound prefix unconditionally:
         // the spawn path (`resolve_provider_id`) gives the model prefix
@@ -6312,7 +6391,7 @@ impl Services {
             ensure_provider_available(
                 "agent.delegate",
                 provider_param,
-                &self.effective_settings().providers.paths,
+                &self.effective_settings().providers,
             )?;
             if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
                 let (prefix, _) = intent_providers::parse_compound_model_id(model);
@@ -6325,6 +6404,25 @@ impl Services {
                 }
             }
             Some(provider_param.to_string())
+        } else if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
+            // A compound explicit `model` pins its own provider (spawn
+            // precedence: the prefix outranks everything), so gate that
+            // prefix on the same full availability check as an explicit
+            // `provider` param — otherwise a disabled/uninstalled/env-gated
+            // provider smuggled in via the model prefix would persist a
+            // session and only fail at spawn (monorepo#3178). An unknown
+            // prefix is left to `agent_create_op`'s unconditional prefix
+            // validation; the provider itself stays `None` because
+            // `agent_create_op`'s existing derivation pins it from the model.
+            let (prefix, _) = intent_providers::parse_compound_model_id(model);
+            if intent_providers::find_provider(&prefix).is_some() {
+                ensure_provider_available(
+                    "agent.delegate",
+                    &prefix,
+                    &self.effective_settings().providers,
+                )?;
+            }
+            None
         } else if input.model.is_none() {
             resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
@@ -6820,15 +6918,30 @@ impl Services {
         // that doesn't override it, so validate it up front — before the
         // classification loop can start any task — rather than surfacing the
         // same failure as N per-row `error` dispositions after earlier rows
-        // already spawned. Per-entry `provider` overrides stay per-row
-        // (`error` disposition), consistent with the other per-entry options.
+        // already spawned. A top-level compound `model` default gets the same
+        // up-front gate on its prefix-named provider (spawn precedence: the
+        // prefix outranks `provider`), so a disabled/unrunnable provider
+        // smuggled in via the model default also fails once, up front.
+        // Per-entry `provider`/`model` overrides stay per-row (`error`
+        // disposition via the single-task path), consistent with the other
+        // per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             ensure_known_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
                 "agent.delegate",
                 provider_param,
-                &self.effective_settings().providers.paths,
+                &self.effective_settings().providers,
             )?;
+        }
+        if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
+            let (prefix, _) = intent_providers::parse_compound_model_id(model);
+            if intent_providers::find_provider(&prefix).is_some() {
+                ensure_provider_available(
+                    "agent.delegate",
+                    &prefix,
+                    &self.effective_settings().providers,
+                )?;
+            }
         }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a

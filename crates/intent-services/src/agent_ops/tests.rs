@@ -27609,6 +27609,12 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
     let (_t, svc, ws) = setup().await;
     let plain = seed_task(&svc, &ws, "Plain").await;
     let custom = seed_task(&svc, &ws, "Custom").await;
+    // The top-level compound `model` default is availability-gated up front
+    // (monorepo#3178); satisfy mock's env gate so the batch proceeds.
+    let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+        "MOCK_AGENT_SCRIPT_PATH",
+        "/tmp/does-not-need-to-exist.js",
+    )]);
 
     let resp = svc
         .agent_delegate_op(
