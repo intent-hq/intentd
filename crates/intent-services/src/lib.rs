@@ -21968,6 +21968,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_list_user_messages(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        preview_chars: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_list_user_messages_op(agent_id, workspace_id, preview_chars)
+                .await
+        })
+    }
+
     fn agent_get_session(
         &self,
         agent_id: AgentId,

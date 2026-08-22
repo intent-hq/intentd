@@ -208,13 +208,22 @@
 //! origin) — returning
 //! `{ status: "connected"|"auth_required"|"error", statusCode?,
 //! errorMessage? }`, so the FE no longer contacts MCP server URLs directly —
-//! 295 router methods, 334 total.
+//! 295 router methods, 334 total. Version 7.4 adds the
+//! `agent.listUserMessages` router method (additive; §5.5): all user-role
+//! messages of one agent as lightweight index items, oldest→newest —
+//! `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }` —
+//! with `preview` the extracted plain text bounded to `previewChars`
+//! characters (default 300, server-clamped into [1, 2000]) and `metadata`
+//! passed through verbatim when present; non-user rows are never included,
+//! roles are filtered in SQL and the transcript is never hydrated (unknown
+//! agent or workspace mismatch is not-found) — 296 router methods,
+//! 335 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.3";
+pub const PROTOCOL_VERSION: &str = "7.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

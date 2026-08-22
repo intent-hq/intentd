@@ -1429,6 +1429,31 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listUserMessages`: all user-role messages of an agent as
+    /// lightweight index items, oldest→newest —
+    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`
+    /// (PROTOCOL §5.5). `preview` is the extracted plain text bounded to
+    /// `preview_chars` characters (`None` → server default, server-clamped);
+    /// `metadata` is the persisted row metadata verbatim when present.
+    /// Non-user rows are never included. Bounded cost: one role-filtered
+    /// SQL read whose previews are extracted and truncated inside SQL —
+    /// full content blobs never leave the database and the transcript is
+    /// never hydrated. `NotFound` on an unknown agent or a workspace
+    /// mismatch.
+    fn agent_list_user_messages(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        preview_chars: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, preview_chars);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_user_messages not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getSession`: full [`AgentSession`] projection including
     /// `systemPrompt`, `specialist`, and the persisted metadata block —
     /// the superset that `agent.get`/`AgentLite` strips (PROTOCOL §5.5).
