@@ -36,9 +36,22 @@
 //!    `serve` invocation is babysat this way: one-shot subcommands
 //!    (`status`, `stop`, `doctor`, `call`, …) legitimately exit non-zero, so
 //!    they run exactly once and their exit status passes through
-//! 6. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
+//! 6. every failed start (crash or spawn error) also forces an off-schedule
+//!    channel re-check before the respawn/give-up decision, persisting the
+//!    check schedule as usual: a crash loop is the strongest signal that
+//!    the pinned version is broken, so a fixed build published on the
+//!    channel is installed and respawned instead of the sitter respawning
+//!    the broken version until it gives up (intent-hq/monorepo#3191). The
+//!    give-up only fires after the final failure's re-check found nothing
+//!    newer (or could not be reached); an installed fix clears the backoff
+//!    and the failure counter like any other installed update. The re-check
+//!    honors shutdown/restart signals immediately (never deferring them
+//!    behind the manifest fetch or a download) and adopts a version a
+//!    concurrent updater (e.g. `sitter channel --redownload`) installed
+//!    while the loop was crashing
+//! 7. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
-//! 7. SIGHUP (unix only, sent by `intentd restart`) stops the child
+//! 8. SIGHUP (unix only, sent by `intentd restart`) stops the child
 //!    gracefully and respawns it on the current `state.json` version —
 //!    activating a prior `sitter channel --redownload` install — without
 //!    the sitter exiting. A SIGHUP that lands during a crash-backoff sleep
@@ -444,11 +457,38 @@ impl Supervisor {
                     // truncated, wrong arch) is as permanent as one that
                     // starts and dies, so it feeds the same counter.
                     failures += 1;
+                    eprintln!("intentd-sitter: {what}");
+                    // A failed start forces an off-schedule channel re-check
+                    // (see the module docs and the wait arm below): a fix
+                    // published on the channel heals the loop.
+                    match self
+                        .check_after_failed_start(
+                            &current_version,
+                            &mut signals,
+                            &mut next_check_at,
+                        )
+                        .await
+                    {
+                        FailedStartCheck::Respawn(version) => {
+                            current_version = version;
+                            backoff = self.config.backoff_initial;
+                            failures = 0;
+                            continue;
+                        }
+                        FailedStartCheck::Shutdown(code) => return code,
+                        #[cfg(unix)]
+                        FailedStartCheck::RestartRequested => {
+                            self.refresh_version_from_state(&mut current_version);
+                            backoff = self.config.backoff_initial;
+                            failures = 0;
+                            continue;
+                        }
+                        FailedStartCheck::NothingNewer => {}
+                    }
                     if failures >= self.config.give_up_after_failures {
-                        self.report_give_up(&what, failures);
+                        self.report_give_up(failures);
                         return 0;
                     }
-                    eprintln!("intentd-sitter: {what}");
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
                         BackoffOutcome::Shutdown(code) => return code,
                         #[cfg(unix)]
@@ -503,11 +543,35 @@ impl Supervisor {
                             failures = 0;
                         }
                         failures += 1;
+                        eprintln!("intentd-sitter: {what}");
+                        // A failed start forces an off-schedule channel
+                        // re-check (see the module docs): a fix published on
+                        // the channel is installed and respawned instead of
+                        // respawning the broken version until give-up.
+                        match self
+                            .check_after_failed_start(&current_version, &mut signals, &mut next_check_at)
+                            .await
+                        {
+                            FailedStartCheck::Respawn(version) => {
+                                current_version = version;
+                                backoff = self.config.backoff_initial;
+                                failures = 0;
+                                break; // respawn the fixed version immediately
+                            }
+                            FailedStartCheck::Shutdown(code) => return code,
+                            #[cfg(unix)]
+                            FailedStartCheck::RestartRequested => {
+                                self.refresh_version_from_state(&mut current_version);
+                                backoff = self.config.backoff_initial;
+                                failures = 0;
+                                break; // respawn the state.json version
+                            }
+                            FailedStartCheck::NothingNewer => {}
+                        }
                         if failures >= self.config.give_up_after_failures {
-                            self.report_give_up(&what, failures);
+                            self.report_give_up(failures);
                             return 0;
                         }
-                        eprintln!("intentd-sitter: {what}; respawning");
                         match self.backoff_sleep(&mut backoff, &mut signals).await {
                             BackoffOutcome::Shutdown(code) => return code,
                             #[cfg(unix)]
@@ -632,6 +696,72 @@ impl Supervisor {
         }
     }
 
+    /// One off-schedule channel check after a failed daemon start, on top
+    /// of the periodic schedule (which it re-arms, persisting `state.json`
+    /// so `last_check_at` keeps moving while crash-looping and the stall is
+    /// diagnosable). Reports a version to respawn when the channel published
+    /// a fix — or when the check finds a version a concurrent updater (e.g.
+    /// `sitter channel --redownload`) installed while the loop was crashing;
+    /// [`FailedStartCheck::NothingNewer`] sends the caller to its normal
+    /// backoff/give-up handling.
+    ///
+    /// Signals are observed while the check runs: a shutdown or restart
+    /// request must not be deferred behind the manifest fetch (30s timeout)
+    /// or an update download (10min timeout), or service stop/restart could
+    /// exceed the service manager's own timeout exactly when the daemon is
+    /// crash-looping. The abandoned check finishes on the blocking pool (or
+    /// dies with the process); an install it commits is adopted by the next
+    /// respawn's re-check via the concurrent-updater arm above.
+    async fn check_after_failed_start(
+        &self,
+        current_version: &str,
+        signals: &mut Signals,
+        next_check_at: &mut Instant,
+    ) -> FailedStartCheck {
+        let outcome = tokio::select! {
+            outcome = self.check() => outcome,
+            event = signals.recv() => {
+                return match event {
+                    SignalEvent::Shutdown(signal) => FailedStartCheck::Shutdown(128 + signal),
+                    #[cfg(unix)]
+                    SignalEvent::Restart => {
+                        eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                        FailedStartCheck::RestartRequested
+                    }
+                };
+            }
+        };
+        *next_check_at = self.schedule_next_check();
+        match outcome {
+            Ok(UpdateOutcome::Installed { version, previous }) => {
+                eprintln!(
+                    "intentd-sitter: installed intentd {version} (was {}); \
+                     restarting daemon",
+                    previous.as_deref().unwrap_or("none")
+                );
+                FailedStartCheck::Respawn(version)
+            }
+            // "Already current" relative to the manifest, but not the
+            // version this loop has been respawning: a concurrent updater
+            // installed it after the failed start. Respawn it instead of
+            // sticking with (or giving up on) the crashing version.
+            Ok(UpdateOutcome::AlreadyCurrent { version })
+                if version != current_version && self.paths.daemon_binary(&version).exists() =>
+            {
+                eprintln!(
+                    "intentd-sitter: found concurrently installed intentd {version} \
+                     (was {current_version}); restarting daemon"
+                );
+                FailedStartCheck::Respawn(version)
+            }
+            Ok(UpdateOutcome::AlreadyCurrent { .. }) => FailedStartCheck::NothingNewer,
+            Err(e) => {
+                eprintln!("intentd-sitter: update check failed: {e}");
+                FailedStartCheck::NothingNewer
+            }
+        }
+    }
+
     /// Report a permanently failing daemon on the way out of serve mode.
     ///
     /// The caller must `return 0` right after: launchd (`KeepAlive` with
@@ -641,7 +771,8 @@ impl Supervisor {
     /// the service stay down until a human fixes the cause.
     ///
     /// The daemon inherits the sitter's stdio, so its own error message is
-    /// already in the same log directly above this banner — point at it
+    /// already in the same log directly above this banner (the supervise
+    /// loop also logs each failure before its re-check) — point at it
     /// rather than trying to guess the cause.
     ///
     /// "times in a row without ever staying up" is how `scripts/install.sh`
@@ -649,8 +780,7 @@ impl Supervisor {
     /// log contract; see the wait arm in [`Supervisor::supervise`]): reword
     /// only in lockstep with both scripts and the `install_log_contract_*`
     /// tests in `tests/supervisor_e2e.rs`.
-    fn report_give_up(&self, what: &str, failures: u32) {
-        eprintln!("intentd-sitter: {what}");
+    fn report_give_up(&self, failures: u32) {
         eprintln!(
             "intentd-sitter: intentd failed {failures} times in a row without ever staying up \
              for {:?}; this looks permanent, not transient, so the sitter is giving up instead \
@@ -714,6 +844,24 @@ impl Supervisor {
             let _ = child.kill().await;
         }
     }
+}
+
+/// How a failed-start channel re-check
+/// ([`Supervisor::check_after_failed_start`]) ended.
+enum FailedStartCheck {
+    /// A fixed (or concurrently installed) version is available; respawn it
+    /// with the backoff and failure counter reset.
+    Respawn(String),
+    /// Nothing newer than the crashing version; the caller proceeds to its
+    /// normal backoff/give-up handling.
+    NothingNewer,
+    /// A restart request (SIGHUP) arrived during the check; the caller must
+    /// re-resolve the version from `state.json` and reset the backoff
+    /// before respawning.
+    #[cfg(unix)]
+    RestartRequested,
+    /// A shutdown signal arrived during the check; exit with this code.
+    Shutdown(i32),
 }
 
 /// How a crash-backoff sleep ([`Supervisor::backoff_sleep`]) ended.
