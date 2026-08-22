@@ -204,7 +204,8 @@
 //! connection/auth probe of an HTTP/SSE MCP endpoint run from the daemon
 //! host — a single JSON-RPC `initialize` POST with optional caller headers
 //! plus the stored `mcp.oauth.*` bag injected as the `Authorization` header
-//! when available — returning
+//! when available (only when the probe URL shares the saved config's
+//! origin) — returning
 //! `{ status: "connected"|"auth_required"|"error", statusCode?,
 //! errorMessage? }`, so the FE no longer contacts MCP server URLs directly —
 //! 295 router methods, 334 total.

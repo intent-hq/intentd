@@ -11989,15 +11989,21 @@ impl WorkspaceApi for Services {
             // Inject the stored OAuth bag as the Authorization header when the
             // caller names a server and did not supply one explicitly (the raw
             // bag never crosses the wire — §5.22.1 internal-consumer seam).
+            // Guarded by a same-origin check against the saved config's `url`
+            // so a saved server id cannot be paired with an arbitrary URL to
+            // send its bearer token elsewhere (§5.22.2).
             let has_auth = headers
                 .iter()
                 .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
             if !has_auth {
                 if let Some(name) = server_name.as_deref().filter(|s| !s.is_empty()) {
-                    if let Ok(Some(value)) =
-                        self.mcp_oauth_service().authorization_header(name).await
-                    {
-                        headers.push(("Authorization".to_string(), value));
+                    let saved_url = mcp_servers::config_url(&self.secrets, name).await;
+                    if saved_url.is_some_and(|saved| mcp_servers::same_origin(&saved, &url)) {
+                        if let Ok(Some(value)) =
+                            self.mcp_oauth_service().authorization_header(name).await
+                        {
+                            headers.push(("Authorization".to_string(), value));
+                        }
                     }
                 }
             }

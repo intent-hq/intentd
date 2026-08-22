@@ -678,6 +678,32 @@ fn config_headers(config: &Value) -> Vec<(String, String)> {
     header_pairs(config.get("headers"))
 }
 
+/// Whether two URLs share an origin (scheme + host + port, with known default
+/// ports normalized). Guards the `mcp.testConnection` OAuth-bag injection
+/// (§5.22.2): the stored bearer token is only attached when the probe URL
+/// matches the saved server config's origin, so a caller cannot pair a saved
+/// server id with an arbitrary URL to exfiltrate the token. Unparseable URLs
+/// never match.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(a), Ok(b)) = (reqwest::Url::parse(a), reqwest::Url::parse(b)) else {
+        return false;
+    };
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The configured `url` of the saved external server `server_id`, when one
+/// exists (§5.22.2 OAuth-injection guard).
+pub(crate) async fn config_url(secrets: &AsyncSecretStore, server_id: &str) -> Option<String> {
+    read_configs(secrets)
+        .await
+        .get(server_id)?
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// Flatten an optional `headers` JSON object into `(name, value)` pairs;
 /// non-string values are serialized, mirroring the stdio `env` handling.
 pub(crate) fn header_pairs(headers: Option<&Value>) -> Vec<(String, String)> {
@@ -2318,6 +2344,31 @@ mod tests {
     }
 
     // -- mcp.testConnection (§5.22.2) ----------------------------------------
+
+    #[test]
+    fn same_origin_matches_scheme_host_port() {
+        assert!(same_origin(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com/other/path?q=1"
+        ));
+        assert!(same_origin(
+            "https://mcp.example.com:443/mcp",
+            "https://mcp.example.com/mcp"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "https://evil.example.com/mcp"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "http://mcp.example.com/mcp"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com:8443/mcp"
+        ));
+        assert!(!same_origin("not a url", "https://mcp.example.com/mcp"));
+    }
 
     #[test]
     fn connection_status_2xx_and_reachable_4xx_map_to_connected() {
