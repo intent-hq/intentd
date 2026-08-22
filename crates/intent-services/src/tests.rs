@@ -30541,6 +30541,36 @@ mod default_provider_self_heal {
         );
     }
 
+    /// Heal writing only `providers.active` (model key holds an unresolvable
+    /// raw value) must NOT trip the provider-switch side effect riding the
+    /// same `settings_update` path: with no derivable provider beforehand
+    /// this is first-time setup, not a switch, so `model.default` keeps its
+    /// raw value per heal's per-key no-overwrite guard.
+    #[tokio::test]
+    async fn single_key_heal_does_not_rewrite_unresolvable_model() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.default".into(), serde_json::json!("mystery:m1"))])
+            .expect("seed unresolvable model");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("mystery:m1"))
+        );
+    }
+
     /// The first INSTALLED provider wins in the order discovery reported,
     /// skipping ids the registry doesn't know.
     #[tokio::test]
@@ -30560,6 +30590,279 @@ mod default_provider_self_heal {
         assert_eq!(
             setting(&svc, "providers.active"),
             Some(serde_json::json!("codex"))
+        );
+    }
+}
+
+/// Default-model re-resolution on a default-provider switch (monorepo#3177,
+/// `Services::reresolve_default_model_on_provider_switch`): a
+/// `settings.update` batch that switches `providers.active` to a different
+/// registered provider gets a re-resolved `model.default` appended — the new
+/// provider's cached catalog default-or-first model, else (model currently
+/// set, no catalog) a blank clearing value. An explicit `model.default` in
+/// the batch wins, and a same-provider rewrite changes nothing.
+mod provider_switch_reresolves_default_model {
+    use super::*;
+
+    /// Services with a settings registry wired, seeded with `providers.active`
+    /// = auggie and `model.default` = auggie:fable-5 (the stale-shadow setup
+    /// from monorepo#3177).
+    async fn setup() -> (TempDb, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        let services = Services::new(store).with_settings_registry(registry);
+        services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[
+                ("providers.active".into(), serde_json::json!("auggie")),
+                ("model.default".into(), serde_json::json!("auggie:fable-5")),
+            ])
+            .expect("seed settings");
+        (tmp, services)
+    }
+
+    fn setting(svc: &Services, path: &str) -> Option<serde_json::Value> {
+        svc.settings_registry()
+            .expect("registry wired")
+            .get(path)
+            .filter(|v| !v.is_null())
+    }
+
+    async fn switch_to(svc: &Services, provider: &str) -> serde_json::Value {
+        svc.settings_update(serde_json::json!([
+            { "path": "providers.active", "value": provider }
+        ]))
+        .await
+        .expect("settings.update")
+    }
+
+    /// Warm cache with a marked default ⇒ the switch batch applies the new
+    /// provider AND its catalog-default model atomically; the response
+    /// `applied` list carries both keys.
+    #[tokio::test]
+    async fn switch_reresolves_catalog_default_model() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![
+                serde_json::json!({ "id": "grok-4", "name": "Grok 4" }),
+                serde_json::json!({ "id": "grok-code-fast", "name": "Grok Code Fast", "isDefault": true }),
+            ],
+        );
+
+        let result = switch_to(&svc, "grok").await;
+        let applied = result["applied"].as_array().expect("applied array");
+        assert_eq!(applied.len(), 2, "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("grok"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("grok:grok-code-fast"))
+        );
+    }
+
+    /// No `isDefault` row in the new provider's cached catalog ⇒ the FIRST
+    /// row is used.
+    #[tokio::test]
+    async fn switch_falls_back_to_first_catalog_model() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![
+                serde_json::json!({ "id": "grok-4", "name": "Grok 4" }),
+                serde_json::json!({ "id": "grok-code-fast", "name": "Grok Code Fast" }),
+            ],
+        );
+
+        switch_to(&svc, "grok").await;
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("grok:grok-4"))
+        );
+    }
+
+    /// Cold cache for the new provider ⇒ the stale `model.default` is
+    /// CLEARED (blank), never left shadowing the switched provider
+    /// (monorepo#3044 fail-loudly behavior applies downstream).
+    #[tokio::test]
+    async fn switch_with_cold_cache_clears_stale_model() {
+        let (_tmp, svc) = setup().await;
+
+        switch_to(&svc, "grok").await;
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("grok"))
+        );
+        assert_eq!(setting(&svc, "model.default"), Some(serde_json::json!("")));
+    }
+
+    /// A foreign-prefixed catalog row (`codex:foo` in the grok catalog) is
+    /// not an ownership claim (monorepo#607) — it is not persisted; with a
+    /// model currently stored the stale value is cleared instead.
+    #[tokio::test]
+    async fn foreign_prefixed_catalog_row_clears_instead() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "codex:foo", "name": "Foreign", "isDefault": true })],
+        );
+
+        switch_to(&svc, "grok").await;
+        assert_eq!(setting(&svc, "model.default"), Some(serde_json::json!("")));
+
+        // A self-prefixed row id IS trusted and kept verbatim.
+        let (_tmp2, svc2) = setup().await;
+        svc2.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok:grok-4", "isDefault": true })],
+        );
+        switch_to(&svc2, "grok").await;
+        assert_eq!(
+            setting(&svc2, "model.default"),
+            Some(serde_json::json!("grok:grok-4"))
+        );
+    }
+
+    /// An explicit `model.default` anywhere in the same batch wins — the
+    /// side effect never overrides the caller's pick.
+    #[tokio::test]
+    async fn explicit_model_in_batch_wins() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok-code-fast", "isDefault": true })],
+        );
+
+        svc.settings_update(serde_json::json!([
+            { "path": "providers.active", "value": "grok" },
+            { "path": "model.default", "value": "grok:grok-4" }
+        ]))
+        .await
+        .expect("settings.update");
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("grok:grok-4"))
+        );
+    }
+
+    /// A same-provider rewrite of `providers.active` is NOT a switch — the
+    /// configured model is left alone (also the loop guard: replaying the
+    /// applied batch appends nothing).
+    #[tokio::test]
+    async fn same_provider_rewrite_is_a_noop() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "sonnet5", "isDefault": true })],
+        );
+
+        let result = switch_to(&svc, "auggie").await;
+        let applied = result["applied"].as_array().expect("applied array");
+        assert_eq!(applied.len(), 1, "{result}");
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("auggie:fable-5"))
+        );
+    }
+
+    /// The compound `model.default` prefix outranks `providers.active` in
+    /// derivation, so even after a prior (pre-fix) switch left a stale
+    /// foreign model behind, re-selecting the same target provider is still
+    /// detected as a switch and re-resolves the model.
+    #[tokio::test]
+    async fn stale_compound_prefix_still_detected_as_switch() {
+        let (_tmp, svc) = setup().await;
+        // Simulate the pre-fix corrupted state: provider already switched,
+        // model still the old provider's.
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("providers.active".into(), serde_json::json!("grok"))])
+            .expect("seed switched provider");
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok-code-fast", "isDefault": true })],
+        );
+
+        switch_to(&svc, "grok").await;
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("grok:grok-code-fast"))
+        );
+    }
+
+    /// An unregistered provider value gets no side effect: the string is
+    /// persisted as-is (plain string setting) but `model.default` is
+    /// untouched.
+    #[tokio::test]
+    async fn unregistered_provider_value_is_ignored() {
+        let (_tmp, svc) = setup().await;
+
+        switch_to(&svc, "mystery").await;
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("auggie:fable-5"))
+        );
+    }
+
+    /// Nothing configured yet (no stored model) + cold cache ⇒ nothing to
+    /// clear, nothing appended; the provider applies alone.
+    #[tokio::test]
+    async fn no_stored_model_and_cold_cache_appends_nothing() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        let svc = Services::new(store).with_settings_registry(registry);
+
+        let result = switch_to(&svc, "grok").await;
+        let applied = result["applied"].as_array().expect("applied array");
+        assert_eq!(applied.len(), 1, "{result}");
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// First-time setup is NOT a switch: with no derivable provider (only an
+    /// unresolvable raw `model.default` stored), setting `providers.active`
+    /// appends nothing even on a warm cache — the raw model value is
+    /// preserved (heal's no-overwrite guard relies on this, since heal
+    /// persists through the same `settings_update` path).
+    #[tokio::test]
+    async fn first_time_setup_is_not_a_switch() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        let svc = Services::new(store).with_settings_registry(registry);
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.default".into(), serde_json::json!("mystery:m1"))])
+            .expect("seed unresolvable model");
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok-code-fast", "isDefault": true })],
+        );
+
+        let result = switch_to(&svc, "grok").await;
+        let applied = result["applied"].as_array().expect("applied array");
+        assert_eq!(applied.len(), 1, "{result}");
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("mystery:m1"))
         );
     }
 }
