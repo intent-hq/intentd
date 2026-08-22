@@ -11306,6 +11306,112 @@ impl Services {
             "model": healed_model,
         }))
     }
+
+    /// Default-model re-resolution on a default-provider switch
+    /// (monorepo#3177). When a `settings.update` batch writes
+    /// `providers.active` to a registered provider that differs from the
+    /// currently derived default provider
+    /// ([`agent_session::derived_default_provider`]) — an actual switch, not
+    /// a first-time set-up rewrite of the same provider — the stored
+    /// `model.default` would otherwise go stale: its compound prefix takes
+    /// precedence over `providers.active`, so the old provider's model keeps
+    /// shadowing the switch entirely. Append a re-resolved `model.default`
+    /// to the batch so it applies atomically with the provider change:
+    /// the new provider's cached catalog default-or-first model
+    /// ([`ModelCatalogCache::cached_default_or_first_model`], cache-only —
+    /// never a probe) as a compound id, else — when a model is currently
+    /// stored — a blank value clearing it (the next call that needs a
+    /// default then fails loudly, monorepo#3044, instead of silently
+    /// running on a foreign model). An explicit `model.default` entry
+    /// anywhere in the same batch wins: the caller's pick is never
+    /// overridden. A switch requires a currently derived provider: with
+    /// none derivable (first-time setup — notably
+    /// [`Self::heal_default_provider_settings`], which persists through
+    /// this same path) nothing is appended, preserving heal's per-key
+    /// no-overwrite guard on `model.default`. Loop-guarded by
+    /// construction: once the switch has applied, the derived provider
+    /// equals the stored one, so replaying the same batch appends
+    /// nothing. External `config.toml` edits bypass `settings.update`
+    /// (watcher → registry reload) and deliberately get no re-resolution
+    /// — this side effect covers `settings.update` writers only.
+    fn reresolve_default_model_on_provider_switch(&self, changes: &mut serde_json::Value) {
+        let Some(entries) = changes.as_array_mut() else {
+            return;
+        };
+        let path_of = |e: &serde_json::Value| {
+            e.get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        // The caller's explicit model pick always wins.
+        if entries.iter().any(|e| path_of(e) == "model.default") {
+            return;
+        }
+        // Last write wins within a batch, mirroring apply order: the LAST
+        // `providers.active` entry is taken unconditionally — a non-string
+        // value there means no side effect (the batch will fail schema
+        // validation downstream anyway), never a fall-back to an earlier
+        // entry.
+        let Some(provider) = entries
+            .iter()
+            .rev()
+            .find(|e| path_of(e) == "providers.active")
+            .and_then(|e| e.get("value").and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|id| intent_providers::find_provider(id).is_some())
+            .map(|id| intent_providers::provider_config(id).id.to_string())
+        else {
+            return;
+        };
+        let settings = self.effective_settings();
+        // Only an actual switch qualifies: no derivable provider means
+        // first-time setup (e.g. the heal path), and the provider that
+        // already rules (via a self-prefixed `model.default` or
+        // `providers.active`) makes the batch a same-provider rewrite —
+        // neither may disturb a configured model.
+        match agent_session::derived_default_provider(&settings) {
+            None => return,
+            Some(current) if current == provider => return,
+            Some(_) => {}
+        }
+        let resolved = self
+            .models_catalog
+            .cached_default_or_first_model(&provider)
+            .and_then(|m| match m.split_once(':') {
+                // Catalog row ids may already be compound, but only a prefix
+                // naming the owning provider is trusted — a foreign-prefixed
+                // row is not an ownership claim (monorepo#607).
+                Some((prefix, _)) if prefix == provider => Some(m),
+                Some(_) => None,
+                None => Some(format!("{provider}:{m}")),
+            });
+        let model_currently_set = settings
+            .model
+            .default
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty());
+        match resolved {
+            Some(compound) => {
+                tracing::info!(
+                    provider,
+                    model = compound,
+                    "default-provider switch: re-resolved model.default from the cached catalog"
+                );
+                entries.push(serde_json::json!({ "path": "model.default", "value": compound }));
+            }
+            None if model_currently_set => {
+                tracing::info!(
+                    provider,
+                    "default-provider switch: no cached catalog for the new provider; \
+                     clearing the stale model.default"
+                );
+                entries.push(serde_json::json!({ "path": "model.default", "value": "" }));
+            }
+            // Nothing stored and nothing resolvable: nothing to write.
+            None => {}
+        }
+    }
 }
 
 impl WorkspaceApi for Services {
@@ -11329,6 +11435,12 @@ impl WorkspaceApi for Services {
                 Db,
                 Registry,
             }
+            // A default-provider switch re-resolves `model.default` for the
+            // new provider (monorepo#3177). Appended BEFORE the old-value
+            // snapshot below so a hook-failure rollback also restores the
+            // injected key.
+            let mut changes = changes;
+            self.reresolve_default_model_on_provider_switch(&mut changes);
             // Capture old values for ALL settings in the batch so we can rollback on hook failure.
             // Registry holds the TOML-backed keys; store holds the remaining non-sensitive
             // settings; secrets holds sensitive ones (§9.8).
