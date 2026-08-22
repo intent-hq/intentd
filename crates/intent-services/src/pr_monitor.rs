@@ -225,10 +225,40 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
     crate::harness::latest().pr_monitor_label(&m.repo_owner, &m.repo_name, m.pr_number)
 }
 
+/// Whether a snapshot's merge-requirements checklist reads as truly
+/// mergeable — the `ready` signal gate. GitHub's `mergeable` flag alone
+/// only means "no merge conflicts": a PR blocked by required checks,
+/// missing reviews, or branch protection still reports `mergeable: true`,
+/// so every checklist blocker must be clear — no failing/pending required
+/// checks, no changes-requested/review-required approvals decision, no
+/// unresolved threads when resolution is required, no
+/// `merge_blocked_reason`, and no blocked/behind/dirty
+/// `merge_state_status`.
+fn requirements_ready(req: &MergeRequirements) -> bool {
+    req.state == "open"
+        && !req.is_draft
+        && req.mergeable == Some(true)
+        && !req.has_conflicts
+        && !req.is_behind
+        && req.merge_blocked_reason.is_none()
+        && req.checks.failing_required.is_empty()
+        && req.checks.pending_required.is_empty()
+        && !matches!(
+            req.approvals.decision.as_str(),
+            "changes_requested" | "review_required"
+        )
+        && !(req.threads.unresolved > 0 && req.threads.resolution_required == Some(true))
+        && !matches!(
+            req.merge_state_status.as_deref(),
+            Some("BLOCKED" | "BEHIND" | "DIRTY")
+        )
+}
+
 /// Fold a workspace's monitor rows into the displayStatus PR signals
 /// (§6.5): an ACTIVE row whose persisted `last_snapshot` shows the PR
-/// open/draft raises `open` — and `ready` when the snapshot says mergeable
-/// and not draft (the same mapping as a linked open PR) — while the LATEST
+/// open/draft raises `open` — and `ready` only when the snapshot's full
+/// merge-requirements checklist is clear ([`requirements_ready`]; truly
+/// mergeable, not just conflict-free) — while the LATEST
 /// (most recently updated) COMPLETED row raises `merged` when its final
 /// snapshot shows `merged` — matching linked-PR step-6 "latest" semantics,
 /// so an older merged monitor never shadows a newer closed-unmerged one.
@@ -254,7 +284,7 @@ pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignal
                 let req = &snapshot.requirements;
                 if matches!(req.state.as_str(), "open" | "draft") {
                     signals.open = true;
-                    if req.mergeable == Some(true) && !req.is_draft {
+                    if requirements_ready(req) {
                         signals.ready = true;
                     }
                 }
@@ -2459,6 +2489,19 @@ mod tests {
         s
     }
 
+    /// Clear every merge-requirements blocker on the [`snapshot`] fixture —
+    /// the truly-mergeable checklist shape [`requirements_ready`] accepts.
+    fn ready_requirements(req: &mut MergeRequirements) {
+        req.checks.passed = 1;
+        req.checks.pending = 0;
+        req.checks.items[0].status = "passed".into();
+        req.checks.pending_required.clear();
+        req.approvals.decision = "approved".into();
+        req.approvals.have = 1;
+        req.threads.unresolved = 0;
+        req.merge_state_status = Some("CLEAN".into());
+    }
+
     #[test]
     fn diff_reports_nothing_when_the_snapshot_is_unchanged() {
         let a = snapshot(|_| {});
@@ -4173,17 +4216,19 @@ mod tests {
     /// An ACTIVE PR monitor on an open PR both sets the orthogonal
     /// `waiting` flag on the list/get enrichment path AND feeds the PR
     /// rungs of the derived `displayStatus`: with every task done the
-    /// rollup reads `pr_ready` (the stub PR is open + mergeable, not
-    /// draft) instead of falling through to `complete`. Cancelling the
+    /// rollup reads `pr_ready` (the stub PR is open, not draft, and its
+    /// merge-requirements checklist is clear once the required check
+    /// passes) instead of falling through to `complete`. Cancelling the
     /// monitor lapses both — the flag drops and the rollup returns to the
     /// base `complete`.
     #[tokio::test]
     async fn active_pr_monitor_sets_waiting_and_feeds_the_pr_rungs() {
-        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
         svc.store()
             .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
             .await
             .expect("insert task");
+        forge.edit(|s| s.checks[0].state = CheckState::Success);
         let monitor = register(&svc, &ws, &owner).await;
 
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
@@ -4213,11 +4258,28 @@ mod tests {
         );
     }
 
+    /// Regression: an active monitor on an open PR that is merely
+    /// conflict-free (`mergeable: true`) but still blocked by its
+    /// merge-requirements checklist (the default stub: a pending required
+    /// check) reads `pr_open`, never `pr_ready`.
+    #[tokio::test]
+    async fn active_pr_monitor_blocked_checklist_reads_pr_open() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrOpen),
+            "a blocked checklist keeps the rollup at pr_open"
+        );
+    }
+
     /// The snapshot→signal fold: active open/draft rows raise `open` (and
-    /// `ready` only when mergeable + not draft), completed merged rows
-    /// raise `merged`, and rows with no/unparseable snapshots, non-merged
-    /// completed rows, or active rows already showing a terminal snapshot
-    /// contribute nothing.
+    /// `ready` only when the full merge-requirements checklist is clear +
+    /// not draft), completed merged rows raise `merged`, and rows with
+    /// no/unparseable snapshots, non-merged completed rows, or active rows
+    /// already showing a terminal snapshot contribute nothing.
     #[test]
     fn fold_monitor_pr_signals_maps_rows_to_signals() {
         let ws = WorkspaceId::new();
@@ -4247,8 +4309,11 @@ mod tests {
             Some(serde_json::to_string(&s).unwrap())
         };
 
-        // Active + open + mergeable + not draft → open and ready.
-        let ready = mk(PrMonitorState::Active, snap(|_| {}));
+        // Active + open + clear checklist + not draft → open and ready.
+        let ready = mk(
+            PrMonitorState::Active,
+            snap(|s| ready_requirements(&mut s.requirements)),
+        );
         assert_eq!(
             fold_monitor_pr_signals(std::slice::from_ref(&ready)),
             MonitorPrSignals {
@@ -4257,7 +4322,10 @@ mod tests {
                 merged: false
             }
         );
-        // Draft, or not mergeable → open only.
+        // Draft, not mergeable, or a blocked checklist (the default
+        // fixture: pending required check, review required, unresolved
+        // thread, BLOCKED merge state — despite `mergeable: Some(true)`,
+        // the intent-hq/intentd#1350 regression shape) → open only.
         let draft = mk(
             PrMonitorState::Active,
             snap(|s| {
@@ -4269,7 +4337,8 @@ mod tests {
             PrMonitorState::Active,
             snap(|s| s.requirements.mergeable = Some(false)),
         );
-        for m in [&draft, &unmergeable] {
+        let blocked = mk(PrMonitorState::Active, snap(|_| {}));
+        for m in [&draft, &unmergeable, &blocked] {
             assert_eq!(
                 fold_monitor_pr_signals(std::slice::from_ref(m)),
                 MonitorPrSignals {
@@ -4375,7 +4444,7 @@ mod tests {
             head_sha: None,
             author: None,
             mergeable: Some(true),
-            mergeable_state: None,
+            mergeable_state: Some("clean".into()),
             is_draft: Some(false),
         });
         svc.store().update_workspace(&row).await.expect("update");
@@ -4441,13 +4510,14 @@ mod tests {
     }
 
     /// Monitor lifecycle transitions move the derived `displayStatus`
-    /// through the PR rungs (§6.5): registering on an open mergeable PR
-    /// emits the `pr_ready` promotion, a no-op recompute stays silent, and
-    /// cancelling emits the demotion back to the base rollup (`idle` here:
-    /// no tasks, no linked PR).
+    /// through the PR rungs (§6.5): registering on an open PR with a clear
+    /// merge-requirements checklist emits the `pr_ready` promotion, a
+    /// no-op recompute stays silent, and cancelling emits the demotion
+    /// back to the base rollup (`idle` here: no tasks, no linked PR).
     #[tokio::test]
     async fn monitor_transitions_emit_display_status_through_the_pr_rungs() {
-        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.checks[0].state = CheckState::Success);
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
@@ -4457,7 +4527,7 @@ mod tests {
         assert_eq!(
             display_status_events(&svc, &ws).await,
             vec!["pr_ready".to_string()],
-            "an active monitor on an open mergeable PR promotes to pr_ready"
+            "an active monitor on an open truly-mergeable PR promotes to pr_ready"
         );
 
         // Re-running the recompute without a transition emits nothing.
@@ -4485,6 +4555,7 @@ mod tests {
     #[tokio::test]
     async fn completion_and_rehydration_cancel_drop_the_waiting_flag() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.checks[0].state = CheckState::Success);
         svc.maybe_emit_display_status_changed(&ws).await;
 
         register(&svc, &ws, &owner).await;
@@ -4580,6 +4651,7 @@ mod tests {
     async fn archive_cancels_active_pr_monitors_and_drops_waiting() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.checks[0].state = CheckState::Success);
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         // A terminal (`completed`, not `cancelled`) monitor first — merged
