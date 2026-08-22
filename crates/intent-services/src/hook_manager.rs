@@ -339,7 +339,8 @@ async fn run_hook_script(
              const r = await __hook_exec_inner(opts);\n\
              try {{\n\
                if (r && (r.timedOut === true || (typeof r.exitCode === 'number' && r.exitCode !== 0))) {{\n\
-                 const cmd = [(opts && opts.command) || '?'].concat((opts && opts.args) || []).join(' ');\n\
+                 const argc = ((opts && opts.args) || []).length;\n\
+                 const cmd = ((opts && opts.command) || '?') + (argc ? ' (' + argc + ' args)' : '');\n\
                  const why = r.timedOut === true ? 'timed out' : 'exit code ' + r.exitCode;\n\
                  const stderr = (typeof r.stderr === 'string' ? r.stderr : '').trim();\n\
                  let line = cmd + ' -> ' + why + (stderr ? ': ' + stderr : '');\n\
@@ -440,17 +441,23 @@ fn parse_outcome(v: &Value, logs: Option<String>, exec_error: Option<String>) ->
 /// from the eval envelope) into the diagnostic summary persisted to
 /// `last_error` on non-evicting runs (monorepo#3231): `None` when the run
 /// had no failed execs. The harness owns the wording; the line count and
-/// per-line length are already capped in the envelope.
+/// per-line length are already capped in the envelope. `lastError` is
+/// workspace-visible via `hook.list`, so the capture is secret-conscious:
+/// the envelope records only the command name + arg count (never raw args),
+/// and any URL-embedded `user[:pass]@` credential a tool echoes to stderr is
+/// redacted here (monorepo#836 helper).
 fn parse_exec_failures(v: Option<&Value>) -> Option<String> {
-    let lines: Vec<&str> = v?
+    let lines: Vec<String> = v?
         .as_array()?
         .iter()
         .filter_map(Value::as_str)
         .filter(|s| !s.is_empty())
+        .map(intent_git::redact::redact_credentials)
         .collect();
     if lines.is_empty() {
         return None;
     }
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     Some(crate::harness::latest().hook_exec_failures_warning(&lines))
 }
 
@@ -3809,6 +3816,13 @@ mod tests {
         assert!(err.contains("1 host exec call failed"), "{err}");
         assert!(err.contains("exit code 3"), "{err}");
         assert!(err.contains("broken"), "stderr snippet included: {err}");
+        // lastError is workspace-visible: raw args stay out (command name +
+        // arg count only), so a token passed as an argument never persists.
+        assert!(err.contains("sh (2 args)"), "{err}");
+        assert!(
+            !err.contains("echo broken"),
+            "raw args must not persist: {err}"
+        );
         let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
         assert_eq!(
             listed["hooks"][0]["lastError"].as_str(),
