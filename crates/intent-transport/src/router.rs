@@ -1260,6 +1260,19 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.listUserMessages" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let preview_chars = opt_int(params, "previewChars");
+            match api
+                .agent_list_user_messages(agent_id, ws, preview_chars)
+                .await
+            {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(_)) => Err(not_found("Agent not found")),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "agent.getMessageBlock" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;

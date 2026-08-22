@@ -2608,6 +2608,61 @@ impl Services {
         Ok(json!({ "block": block }))
     }
 
+    /// `agent.listUserMessages` (PROTOCOL §5.5): all user-role messages of
+    /// one agent as lightweight index items, oldest→newest. Previews are
+    /// bounded to `preview_chars` characters (absent → 300, clamped into
+    /// [1, 2000]); `metadata` is passed through verbatim when present so
+    /// clients can distinguish automated rows. Bounded cost (RPC cost
+    /// contract): a metadata-only session read plus ONE role-filtered index
+    /// read — non-user rows are excluded in SQL and the transcript is never
+    /// hydrated.
+    pub(crate) async fn agent_list_user_messages_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        preview_chars: Option<i64>,
+    ) -> Result<Value> {
+        const DEFAULT_PREVIEW_CHARS: i64 = 300;
+        const MAX_PREVIEW_CHARS: i64 = 2000;
+        // Metadata-only scope check — same fail-closed contract as
+        // `agent_get_message_block_op`: a cross-workspace mismatch is
+        // `NotFound`, indistinguishable from an unknown agent.
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let preview_chars = usize::try_from(
+            preview_chars
+                .unwrap_or(DEFAULT_PREVIEW_CHARS)
+                .clamp(1, MAX_PREVIEW_CHARS),
+        )
+        .expect("clamped to [1, MAX_PREVIEW_CHARS]");
+        let items = self
+            .store
+            .get_agent_user_message_index(&agent_id, preview_chars)
+            .await?;
+        let total = items.len();
+        let items: Vec<Value> = items
+            .into_iter()
+            .map(|item| {
+                let mut obj = json!({
+                    "id": item.id,
+                    "preview": item.preview,
+                    "createdAt": item.created_at,
+                });
+                if let Some(metadata) = item.metadata {
+                    obj.as_object_mut()
+                        .expect("item is an object")
+                        .insert("metadata".to_string(), metadata);
+                }
+                obj
+            })
+            .collect();
+        Ok(json!({ "agentId": agent_id.0, "items": items, "total": total }))
+    }
+
     /// Publish an `agent:*` session-mutation event (P3-1.2b): every persisted
     /// session mutation emits an invalidation event so subscribed clients
     /// re-read the projection instead of relying on a local cache.

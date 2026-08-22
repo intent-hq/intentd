@@ -9025,6 +9025,190 @@ async fn wss_agent_get_message_block_serves_full_block() {
     srv.ws.stop().await;
 }
 
+/// `agent.listUserMessages` over the real WSS wire (§5.5): all user-role
+/// messages of one agent as lightweight index items, oldest→newest —
+/// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`.
+/// Non-user rows are never included; previews are bounded to
+/// `previewChars` (default 300, server-clamped); `metadata` passes through
+/// verbatim when present; a workspace mismatch and an unknown agent are
+/// not-found; a missing `agentId` is `-32602`.
+#[tokio::test]
+async fn wss_agent_list_user_messages_serves_bounded_index() {
+    use intent_core::AgentId;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"UserIndex"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"UserIndex"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // Interleave user rows with an assistant row; the second user row
+    // carries metadata (the automated-row marker) and the third is
+    // oversized so the default bound truncates it.
+    let ts = now_iso();
+    let first = srv
+        .store
+        .append_agent_message(
+            &agent,
+            "user",
+            &json!([{ "type": "text", "text": "first question" }]),
+            &ts,
+        )
+        .await
+        .expect("append user 1")
+        .id;
+    srv.store
+        .append_agent_message(
+            &agent,
+            "assistant",
+            &json!([{ "type": "text", "text": "an answer" }]),
+            &ts,
+        )
+        .await
+        .expect("append assistant");
+    let second = srv
+        .store
+        .append_agent_message_with_metadata(
+            &agent,
+            "user",
+            &json!([{ "type": "text", "text": "automated follow-up" }]),
+            Some(&json!({ "automated": true })),
+            &ts,
+        )
+        .await
+        .expect("append user 2")
+        .id;
+    let long_text = "x".repeat(500);
+    let third = srv
+        .store
+        .append_agent_message(
+            &agent,
+            "user",
+            &json!([{ "type": "text", "text": long_text }]),
+            &ts,
+        )
+        .await
+        .expect("append user 3")
+        .id;
+
+    // Default bound: user rows only, oldest→newest, previews capped at 300.
+    let listed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(listed["jsonrpc"], "2.0");
+    assert_eq!(listed["id"], 3);
+    let result = &listed["result"];
+    assert_eq!(result["agentId"], agent_id);
+    assert_eq!(result["total"], 3);
+    let items = result["items"].as_array().expect("items");
+    assert_eq!(items.len(), 3, "non-user rows never included: {result}");
+    assert_eq!(items[0]["id"], first);
+    assert_eq!(items[0]["preview"], "first question");
+    assert!(
+        items[0].get("metadata").is_none(),
+        "metadata omitted when absent: {}",
+        items[0]
+    );
+    assert!(items[0]["createdAt"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert_eq!(items[1]["id"], second);
+    assert_eq!(
+        items[1]["metadata"],
+        json!({ "automated": true }),
+        "metadata passes through verbatim"
+    );
+    assert_eq!(items[2]["id"], third);
+    let preview = items[2]["preview"].as_str().expect("preview");
+    assert_eq!(preview.chars().count(), 300, "default previewChars bound");
+
+    // Explicit previewChars applies; a non-positive value clamps to 1.
+    let tight = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","previewChars":5}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(tight["result"]["items"][0]["preview"], "first");
+    let clamped = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","previewChars":0}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(clamped["result"]["items"][0]["preview"], "f");
+
+    // Cross-workspace mismatch and unknown agent: not-found, fail closed.
+    let other_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":6,"method":"workspace.create","params":{"title":"Other"}}"#,
+    )
+    .await;
+    let other_ws_id = other_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("other workspace id");
+    let mismatch = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","workspaceId":"{other_ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], -32602);
+    assert_eq!(mismatch["error"]["data"]["code"], "not-found");
+    let unknown_agent = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"agent.listUserMessages","params":{"agentId":"agent-00000000-0000-0000-0000-000000000000"}}"#,
+    )
+    .await;
+    assert_eq!(unknown_agent["error"]["code"], -32602);
+    assert_eq!(unknown_agent["error"]["data"]["code"], "not-found");
+
+    // Missing required agentId: -32602.
+    let missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":9,"method":"agent.listUserMessages","params":{}}"#,
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
 /// `search.messages` over the real WSS wire (§5.15): FTS5-backed search over
 /// persisted user/assistant messages. Covers the reworked contract — global
 /// scope when `workspaceId` is absent, `workspaceId` as a hard scope filter,
