@@ -199,7 +199,7 @@ fn resolve_provider_id_empty_configured_default_yields_none() {
 
 #[test]
 fn claude_code_meta_appends_system_prompt() {
-    let meta = build_session_meta("claude-code", Some("Test prompt"));
+    let meta = build_session_meta("claude-code", Some("Test prompt"), Some("Builder"));
     assert!(meta.is_some(), "claude-code gets _meta");
     let meta_map = meta.unwrap();
     assert_eq!(
@@ -253,23 +253,56 @@ fn claude_code_meta_appends_system_prompt() {
     );
 }
 
+/// monorepo#3151: codex `_meta` carries ONLY `sessionTitle` (the task-derived
+/// agent name) — the system prompt stays on the first-turn prepend fallback
+/// (#479) and is never moved into `_meta`, regardless of the prompt.
 #[test]
-fn codex_gets_no_meta() {
-    // The pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`
-    // (#479); codex uses the first-turn prepend fallback, so no _meta is built
-    // regardless of the prompt.
+fn codex_meta_carries_session_title_only() {
     for prompt in [Some("Test prompt"), None, Some(""), Some("   \n\t  ")] {
-        let meta = build_session_meta("codex", prompt);
+        let meta = build_session_meta("codex", prompt, Some("Fix login bug"));
+        let meta_map = meta.expect("codex gets _meta when a session title is present");
+        assert_eq!(
+            meta_map.len(),
+            1,
+            "codex _meta has exactly one key (sessionTitle) — no systemPrompt (prompt {prompt:?})"
+        );
+        assert_eq!(
+            meta_map.get("sessionTitle").and_then(|v| v.as_str()),
+            Some("Fix login bug"),
+            "codex _meta.sessionTitle is the task-derived agent name"
+        );
+    }
+}
+
+/// monorepo#3151: the session title is trimmed before emission.
+#[test]
+fn codex_session_title_is_trimmed() {
+    let meta = build_session_meta("codex", None, Some("  Fix login bug  "));
+    let meta_map = meta.expect("codex gets _meta");
+    assert_eq!(
+        meta_map.get("sessionTitle").and_then(|v| v.as_str()),
+        Some("Fix login bug"),
+        "sessionTitle is trimmed"
+    );
+}
+
+/// monorepo#3151: without a usable title codex builds NO `_meta` — the
+/// resume (`session/load`) path passes `None` and stays unchanged, and blank
+/// names never emit an empty title.
+#[test]
+fn codex_without_title_gets_no_meta() {
+    for title in [None, Some(""), Some("   \n\t  ")] {
+        let meta = build_session_meta("codex", Some("Test prompt"), title);
         assert!(
             meta.is_none(),
-            "codex uses first-turn prepend fallback, not _meta (prompt {prompt:?})"
+            "codex without a non-blank title builds no _meta (title {title:?})"
         );
     }
 }
 
 #[test]
 fn auggie_gets_no_meta() {
-    let meta = build_session_meta("auggie", Some("Test prompt"));
+    let meta = build_session_meta("auggie", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "auggie uses --rules flag, not _meta injection"
@@ -278,7 +311,7 @@ fn auggie_gets_no_meta() {
 
 #[test]
 fn droid_gets_no_meta() {
-    let meta = build_session_meta("droid", Some("Test prompt"));
+    let meta = build_session_meta("droid", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "droid uses --append-system-prompt-file flag, not _meta"
@@ -287,7 +320,7 @@ fn droid_gets_no_meta() {
 
 #[test]
 fn opencode_gets_no_meta() {
-    let meta = build_session_meta("opencode", Some("Test prompt"));
+    let meta = build_session_meta("opencode", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "opencode uses OPENCODE_CONFIG_CONTENT env, not _meta"
@@ -296,7 +329,7 @@ fn opencode_gets_no_meta() {
 
 #[test]
 fn cortex_gets_no_meta() {
-    let meta = build_session_meta("cortex", Some("Test prompt"));
+    let meta = build_session_meta("cortex", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "cortex uses first-turn prepend fallback, not _meta"
@@ -305,7 +338,7 @@ fn cortex_gets_no_meta() {
 
 #[test]
 fn mock_gets_no_meta() {
-    let meta = build_session_meta("mock", Some("Test prompt"));
+    let meta = build_session_meta("mock", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "mock uses first-turn prepend fallback, not _meta"
@@ -317,7 +350,7 @@ fn resolved_provider_with_claude_code_compound_model_gets_meta() {
     // When model is "claude-code:sonnet4.5", resolve_provider_id extracts "claude-code"
     let provider_id =
         resolve_provider_id(Some("claude-code:sonnet4.5"), Some("auggie"), None).unwrap();
-    let meta = build_session_meta(&provider_id, Some("Test prompt"));
+    let meta = build_session_meta(&provider_id, Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_some(),
         "claude-code compound model → claude-code provider → _meta"
@@ -326,7 +359,7 @@ fn resolved_provider_with_claude_code_compound_model_gets_meta() {
 
 #[test]
 fn claude_code_no_prompt_still_injects_disallowed_tools() {
-    let meta = build_session_meta("claude-code", None);
+    let meta = build_session_meta("claude-code", None, Some("Builder"));
     assert!(
         meta.is_some(),
         "claude-code always gets _meta (disallowedTools)"
@@ -371,7 +404,7 @@ fn resolved_default_provider_with_no_model_no_provider_returns_none() {
 
 #[test]
 fn unknown_provider_returns_none() {
-    let meta = build_session_meta("unknown-provider", Some("Test prompt"));
+    let meta = build_session_meta("unknown-provider", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "unknown provider id → no _meta (fallback to first-turn prepend)"
@@ -380,7 +413,7 @@ fn unknown_provider_returns_none() {
 
 #[test]
 fn claude_code_blank_prompt_still_injects_disallowed_tools() {
-    let meta = build_session_meta("claude-code", Some(""));
+    let meta = build_session_meta("claude-code", Some(""), Some("Builder"));
     assert!(
         meta.is_some(),
         "claude-code always gets _meta (disallowedTools)"

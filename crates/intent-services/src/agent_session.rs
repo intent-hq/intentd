@@ -1099,15 +1099,22 @@ fn select_entry<'a>(
 }
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
-/// assembled system prompt (§18.1). Returns `None` for providers that do not use
-/// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
-/// use other mechanisms — codex moved to the first-turn prepend fallback because
-/// the pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`,
-/// #479).
+/// assembled system prompt (§18.1) and the agent's task-derived name. Returns
+/// `None` for providers that do not use `_meta` injection (auggie, droid,
+/// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
 ///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
-fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<Meta> {
+/// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
+///   `session_title` is supplied — monorepo#3151; older adapters ignore the
+///   unknown field). The system prompt stays on the first-turn prepend fallback
+///   because the pinned codex-acp adapter (1.1.14) ignores
+///   `_meta.developerInstructions` (#479) — it is never moved into `_meta`.
+fn build_session_meta(
+    provider_id: &str,
+    system_prompt: Option<&str>,
+    session_title: Option<&str>,
+) -> Option<Meta> {
     match provider_id {
         "claude-code" => {
             let mut meta = Meta::new();
@@ -1135,6 +1142,14 @@ fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<
                 }
             }
 
+            Some(meta)
+        }
+        "codex" => {
+            // Title the durable Codex thread out of band so it stops deriving
+            // its title from the prepended system prompt (monorepo#3151).
+            let title = session_title.map(str::trim).filter(|t| !t.is_empty())?;
+            let mut meta = Meta::new();
+            meta.insert("sessionTitle".to_string(), Value::String(title.to_string()));
             Some(meta)
         }
         _ => None,
@@ -1857,7 +1872,11 @@ impl Services {
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
+        let meta = build_session_meta(
+            &provider_id,
+            stored.system_prompt.as_deref(),
+            Some(&stored.name),
+        );
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -1922,7 +1941,11 @@ impl Services {
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
+        let meta = build_session_meta(
+            &provider_id,
+            stored.system_prompt.as_deref(),
+            Some(&stored.name),
+        );
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2036,7 +2059,9 @@ impl Services {
                 return Ok(None);
             }
         }
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
+        // Resume path: no `sessionTitle` — the durable thread already has its
+        // title and `session/load` behavior must stay unchanged (monorepo#3151).
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref(), None);
         self.publish_status_event(
             &workspace_id,
             agent_id,
