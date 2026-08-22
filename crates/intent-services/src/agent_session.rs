@@ -1099,7 +1099,8 @@ fn select_entry<'a>(
 }
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
-/// assembled system prompt (§18.1) and the agent's task-derived name. Returns
+/// assembled system prompt (§18.1) and the agent's name (task-derived for
+/// delegated agents; may be user-assigned or renamed). Returns
 /// `None` for providers that do not use `_meta` injection (auggie, droid,
 /// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
