@@ -1109,7 +1109,7 @@ fn select_entry<'a>(
 /// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
 ///   `session_title` is supplied — monorepo#3151; older adapters ignore the
 ///   unknown field). The system prompt stays on the first-turn prepend fallback
-///   because the pinned codex-acp adapter (1.1.14) ignores
+///   because the pinned codex-acp adapter (1.6.2) ignores
 ///   `_meta.developerInstructions` (#479) — it is never moved into `_meta`.
 fn build_session_meta(
     provider_id: &str,
