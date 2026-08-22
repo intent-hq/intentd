@@ -4841,6 +4841,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `mcp.testConnection` → `{ status, statusCode?, errorMessage? }` — probe
+    /// an HTTP/SSE MCP endpoint from the daemon host to detect whether it is
+    /// reachable and whether it requires authentication, reusing the stored
+    /// OAuth bag for `serverName` when no explicit `Authorization` header is
+    /// supplied (PROTOCOL §5.22.2).
+    fn mcp_test_connection(
+        &self,
+        url: String,
+        headers: Option<serde_json::Value>,
+        server_name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (url, headers, server_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_test_connection not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------
