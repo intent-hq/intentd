@@ -14,6 +14,12 @@
 # platform URLs point at the mirrored assets. The stable.json published on
 # this repo is unchanged (sitter fallback path + future open-source path).
 #
+# Promotion is beta-first: a guard verifies the beta channel manifest
+# (beta.json on the fixed `channel-beta` release) already carries a version at
+# or beyond the one being promoted, and fails otherwise — a version that never
+# soaked on beta cannot reach stable. The skip_beta_check input bypasses the
+# guard (with a warning) as an emergency escape hatch.
+#
 # Tagged releases are published as GitHub Pre-releases (v-release.yml), so a
 # promotable release only has to exist and not be a draft. Promotion clears the
 # prerelease flag and marks vX.Y.Z as Latest on this repo and — when the mirror
@@ -39,6 +45,11 @@ on:
         description: 'Released version to promote to stable (e.g. 0.1.0)'
         required: true
         type: string
+      skip_beta_check:
+        description: 'Skip the beta-first guard (emergency escape hatch)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -85,6 +96,37 @@ jobs:
             exit 1
           fi
           echo "Release v${VERSION} exists and is not a draft"
+      # Beta-first guard: stable only carries versions that already soaked on
+      # beta, so the beta manifest must be at or beyond the promoted version.
+      # Equal is the normal path; greater means beta already moved ahead.
+      # Fails fast before any channel asset is touched.
+      - name: Verify version was promoted to beta
+        shell: bash
+        env:
+          SKIP_BETA_CHECK: ${{ inputs.skip_beta_check }}
+        run: |
+          if [[ "$SKIP_BETA_CHECK" == "true" ]]; then
+            echo "::warning::skip_beta_check is set; bypassing the beta-first guard for v${VERSION}"
+            exit 0
+          fi
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          if ! gh release download channel-beta --repo "$GITHUB_REPOSITORY" \
+            --pattern beta.json --dir "$tmpdir"; then
+            echo "::error::No beta.json on the channel-beta release; version was never promoted to beta. Promote v${VERSION} to beta first, or re-run with skip_beta_check to bypass."
+            exit 1
+          fi
+          beta_version=$(jq -r '.version // empty' "$tmpdir/beta.json" || true)
+          if [[ ! "$beta_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::beta.json on channel-beta has no parseable version; version was never promoted to beta. Promote v${VERSION} to beta first, or re-run with skip_beta_check to bypass."
+            exit 1
+          fi
+          if [[ "$beta_version" != "$VERSION" ]] && \
+            [[ "$(printf '%s\n%s\n' "$beta_version" "$VERSION" | sort -V | head -n1)" == "$beta_version" ]]; then
+            echo "::error::Beta channel is at v${beta_version}, behind v${VERSION}; promote v${VERSION} to beta first, or re-run with skip_beta_check to bypass."
+            exit 1
+          fi
+          echo "Beta channel is at v${beta_version} (>= v${VERSION}); beta-first guard passed"
       # Read the outgoing stable.json before it is rebuilt so the aggregated
       # notes can span (previous stable, promoted]. Fail-soft: a missing
       # asset/release (first promotion) or any error just leaves the previous
