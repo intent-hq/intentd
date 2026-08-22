@@ -4153,24 +4153,21 @@ impl Services {
             },
         )
         .await;
-        match resolved.models {
-            Some(models) => {
-                let mut out = json!({ "models": models, "source": "auggie" });
-                if resolved.stale {
-                    out["stale"] = Value::Bool(true);
-                    if let Some(w) = resolved.warning {
-                        out["warning"] = Value::String(w);
-                    }
+        if let Some(models) = resolved.models {
+            let mut out = json!({ "models": models, "source": "auggie" });
+            if resolved.stale {
+                out["stale"] = Value::Bool(true);
+                if let Some(w) = resolved.warning {
+                    out["warning"] = Value::String(w);
                 }
-                Ok(out)
             }
-            None => {
-                let mut out = json!({ "models": [], "source": "static" });
-                if let Some(warning) = resolved.warning {
-                    out["warning"] = Value::String(warning);
-                }
-                Ok(out)
+            Ok(out)
+        } else {
+            let mut out = json!({ "models": [], "source": "static" });
+            if let Some(warning) = resolved.warning {
+                out["warning"] = Value::String(warning);
             }
+            Ok(out)
         }
     }
 
