@@ -49,9 +49,14 @@ needs. Fields that matter most:
   ACP `session/new` / `session/load` (claude-code, codex, droid, grok). See §3c.
 - **`model_flag`** — CLI model selection (auggie/droid: `--model`). Providers that select
   models post-session via `session/set_model` (grok) set `supports_set_model: true` and no
-  flag; see `AgentManager::maybe_apply_session_model`
-  (`crates/intent-services/src/agent_manager.rs`). codex takes `-c model=…` config
-  overrides instead — `apply_codex_config_args` (`crates/intent-providers/src/args.rs`).
+  flag; providers whose adapter exposes the model as a `configOptions[id="model"]` select
+  (claude-code, pi, codex) set `supports_config_option_model: true` instead; see
+  `AgentManager::maybe_apply_session_model`
+  (`crates/intent-services/src/agent_manager.rs`). codex also emits `-c model=…` config
+  overrides for the native binary path — `apply_codex_config_args`
+  (`crates/intent-providers/src/args.rs`) — and sets
+  `config_option_model_strips_effort: true` so a `{base}/{effort}` id is stripped to its
+  base before it is sent as the config-option value.
 - **`remove_tool_flag`** — CLI-side tool stripping (auggie: `--remove-tool`), used for
   subagent denial (§6). `None` means spawn-time restrictions are silently dropped for
   this provider and only the MCP-side denylist applies.

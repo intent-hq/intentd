@@ -205,6 +205,28 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) release: tokio::sync::Notify,
 }
 
+/// Test park for one pending-question marker mutation before it acquires the
+/// per-agent ordering lock. The target is `"set"` or `"clear"`; only the
+/// first matching call parks.
+pub(crate) struct PendingMarkerMutationPark {
+    target: String,
+    claimed: std::sync::atomic::AtomicBool,
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+impl PendingMarkerMutationPark {
+    #[cfg(test)]
+    pub(crate) fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -235,6 +257,10 @@ pub struct Services {
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-agent ordering for pending-question marker writes plus their events.
+    pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks,
+    /// Test-only deterministic park before a selected marker mutation.
+    pending_marker_mutation_park: Option<Arc<PendingMarkerMutationPark>>,
     /// Last per-session stats snapshot observed by `agent.getSessionStats`
     /// (PROTOCOL §5.24). The `stats` field on `AgentSession` is derived/not
     /// persisted, so this in-memory cache lets a refresh detect a change and push
@@ -840,6 +866,8 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
+            pending_marker_mutation_park: None,
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
@@ -1469,6 +1497,29 @@ impl Services {
     pub(crate) fn with_wake_archived_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
         self.wake_archived_park = Some(park);
         self
+    }
+
+    /// Test seam: park one selected pending-question marker mutation before it
+    /// enters the per-agent ordering lock.
+    #[cfg(test)]
+    pub(crate) fn with_pending_marker_mutation_park(
+        mut self,
+        park: Arc<PendingMarkerMutationPark>,
+    ) -> Self {
+        self.pending_marker_mutation_park = Some(park);
+        self
+    }
+
+    async fn park_pending_marker_mutation(&self, operation: &str, _message_id: &str) {
+        let Some(park) = &self.pending_marker_mutation_park else {
+            return;
+        };
+        if park.target != operation || park.claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        park.entered.notify_waiters();
+        park.release.notified().await;
     }
 
     /// Park immediately before the scoped attention write when the test seam
