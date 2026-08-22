@@ -10595,8 +10595,16 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         let mut guard = svc.agent_queues.lock().unwrap();
         guard.get_mut(&target).expect("queue")[0].queued_at = "2020-01-01T00:00:00Z".into();
     }
-    svc.record_pending_questions_marker(&ws, &target, "q-msg-1")
-        .await;
+    let question = svc
+        .store()
+        .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append held question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &target, &question.id)
+            .await,
+        "real question row must arm the hold"
+    );
     // The marker write bumps the session's `updated_at` — re-mark the agent
     // idle so the phases below exercise the hold logic, not the
     // actively-responding skip.
@@ -19227,13 +19235,24 @@ async fn agent_edit_truncate_drops_edited_message_and_tail() {
         json!("first question")
     );
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_UPDATED
-        && e.data["truncatedCount"] == json!(2)
-        && e.data["remainingCount"] == json!(2)));
+    // Marker reconciliation can emit the marker-aware empty clear before the
+    // truncate summary. An unbatched subscription delivers those as separate
+    // batches, so wait for the event this assertion owns instead of assuming
+    // it is in the first batch.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let batch = sub.recv().await.expect("open");
+            if batch.iter().any(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["truncatedCount"] == json!(2)
+                    && e.data["remainingCount"] == json!(2)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("truncate summary event");
 }
 
 /// Truncating at the FIRST user message empties the transcript.
@@ -24778,6 +24797,80 @@ async fn dismiss_questions_fails_closed() {
 /// A `question_answers` `messageMetadata` tag naming `answered`.
 fn answer_metadata(answered: &str) -> serde_json::Value {
     json!({ "type": "question_answers", "answeredQuestionsMessageId": answered })
+}
+
+/// The client-visible, transcript-free projections and their update
+/// invalidations preserve all marker states: absent for legacy sessions,
+/// non-empty while pending, and written-empty after a matching answer.
+#[tokio::test]
+async fn pending_marker_projects_on_list_get_and_update_events() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    let legacy_get = svc
+        .agent_get_op(id.clone(), None)
+        .await
+        .expect("legacy get");
+    assert_eq!(legacy_get.metadata.pending_questions_message_id, None);
+    let legacy_list = svc.agent_list_op(ws.clone()).await.expect("legacy list");
+    assert_eq!(legacy_list[0].metadata.pending_questions_message_id, None);
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".into(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+    let set_event = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("set event timed out")
+        .expect("subscription closed");
+    assert_eq!(set_event[0].data["pendingQuestionsMessageId"], asked_id);
+
+    let set_get = svc.agent_get_op(id.clone(), None).await.expect("set get");
+    assert_eq!(
+        set_get.metadata.pending_questions_message_id.as_deref(),
+        Some(asked_id.as_str())
+    );
+    let set_list = svc.agent_list_op(ws.clone()).await.expect("set list");
+    assert_eq!(
+        set_list[0].metadata.pending_questions_message_id.as_deref(),
+        Some(asked_id.as_str())
+    );
+
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".into(),
+        json!([{ "type": "text", "text": "Q: x\nA: y" }]),
+        Some(answer_metadata(&asked_id)),
+    )
+    .await
+    .expect("append answer");
+    let clear_event = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("clear event timed out")
+        .expect("subscription closed");
+    assert_eq!(clear_event[0].data["pendingQuestionsMessageId"], "");
+
+    let cleared_get = svc
+        .agent_get_op(id.clone(), None)
+        .await
+        .expect("cleared get");
+    assert_eq!(
+        cleared_get.metadata.pending_questions_message_id.as_deref(),
+        Some("")
+    );
+    let cleared_list = svc.agent_list_op(ws).await.expect("cleared list");
+    assert_eq!(
+        cleared_list[0]
+            .metadata
+            .pending_questions_message_id
+            .as_deref(),
+        Some("")
+    );
 }
 
 /// The marker is written on a question-bearing append, is OVERWRITTEN (not

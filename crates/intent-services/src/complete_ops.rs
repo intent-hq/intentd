@@ -174,6 +174,12 @@ fn one_shot_launch(
 /// not a spawn arg), filtered like [`intent_providers::build_provider_args`]
 /// filters the flag (empty and the `"default"` sentinel mean "adapter
 /// default"). `None` when the launch args already carry the model.
+///
+/// Providers flagged `config_option_model_strips_effort` (codex) get a
+/// `{base}/{effort}` id stripped to its base, mirroring
+/// `AgentManager::config_option_model_target`: the adapter's
+/// `configOptions[id="model"]` select values are bare base ids, so a
+/// suffixed value would never match.
 fn config_option_model<'m>(
     provider: &intent_providers::ProviderConfig,
     model: Option<&'m str>,
@@ -181,7 +187,12 @@ fn config_option_model<'m>(
     if provider.model_flag.is_some() {
         return None;
     }
-    model.filter(|m| !m.is_empty() && *m != "default")
+    let model = model.filter(|m| !m.is_empty() && *m != "default")?;
+    if provider.config_option_model_strips_effort {
+        let base = model.split_once('/').map_or(model, |(base, _)| base);
+        return (!base.is_empty()).then_some(base);
+    }
+    Some(model)
 }
 
 impl Services {
@@ -710,9 +721,23 @@ rl.on('line', (line) => {
         let pi = intent_providers::find_provider("pi").unwrap();
         assert_eq!(config_option_model(pi, Some("pi-large")), Some("pi-large"));
         // codex-acp also has no CLI model flag on its plain launch, so the
-        // one-shot applies the model the same way.
+        // one-shot applies the model the same way — and codex sets
+        // config_option_model_strips_effort, so a `{base}/{effort}` id is
+        // stripped to its base (the adapter's option values are bare ids).
         let codex = intent_providers::find_provider("codex").unwrap();
         assert_eq!(config_option_model(codex, Some("gpt-5")), Some("gpt-5"));
+        assert_eq!(
+            config_option_model(codex, Some("gpt-5.3-codex/high")),
+            Some("gpt-5.3-codex")
+        );
+        // Degenerate `/effort` with an empty base: no call at all.
+        assert_eq!(config_option_model(codex, Some("/high")), None);
+        // Providers WITHOUT the flag keep any `/` verbatim.
+        assert_eq!(
+            config_option_model(claude, Some("a/b")),
+            Some("a/b"),
+            "claude-code keeps '/' verbatim"
+        );
         // A provider WITH a CLI model flag carries the model in its args; no
         // post-session application.
         let droid = intent_providers::find_provider("droid").unwrap();
