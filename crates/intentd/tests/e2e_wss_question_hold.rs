@@ -536,6 +536,7 @@ where
     .await;
     assert_eq!(sent["success"], true, "ask kickoff ok: {sent}");
     let mut marker_event = None;
+    let mut saw_stream_end = false;
     for _ in 0..120 {
         let frame = wss_event(sub, 30).await;
         let event = &frame["params"]["event"];
@@ -547,9 +548,11 @@ where
         if event["type"] == "agent:stream:end"
             && event["data"]["agentId"].as_str() == Some(asker_id)
         {
+            saw_stream_end = true;
             break;
         }
     }
+    assert!(saw_stream_end, "no agent:stream:end for {asker_id}");
 
     let conv = wss_rpc(
         rpc,
