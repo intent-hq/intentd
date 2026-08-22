@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.38] - 2026-08-22
+
+### 🚀 Features
+
+- *(settings)* Flip agentFeatures.taskGraph default to on ([#1405](https://github.com/intent-hq/intentd/pull/1405))
+
+
 ## [0.7.37] - 2026-08-22
 
 ### 🚀 Features
