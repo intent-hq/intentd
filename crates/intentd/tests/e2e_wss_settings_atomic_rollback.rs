@@ -4,7 +4,10 @@
 //!   to their pre-batch values and returns the failing key in the error
 //!   response;
 //! - retired `model.workspaceOverrides`: `settings.update` over WSS
-//!   tolerates-and-ignores the retired path while `settings.get` rejects it.
+//!   tolerates-and-ignores the retired path while `settings.get` rejects it;
+//! - default-provider switch (monorepo#3177): a `settings.update` batch
+//!   switching `providers.active` re-resolves `model.default` for the new
+//!   provider (cached catalog default, else cleared).
 
 #![cfg(unix)]
 
@@ -418,6 +421,208 @@ async fn retired_workspace_overrides_over_wss() {
         json!(-32602),
         "settings.get on the retired path must reject as unknown: {resp}"
     );
+}
+
+/// Pump a subscriber connection until a `settings:changed` `events.event`
+/// frame arrives; returns the event's `data.changes` array. Bounded wait so
+/// a missing event fails the test instead of hanging it.
+async fn next_settings_changed<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let next = timeout(remaining, ws.next())
+            .await
+            .expect("timed out waiting for settings:changed");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == json!("events.event")
+                    && v["params"]["event"]["type"] == json!("settings:changed")
+                {
+                    return v["params"]["event"]["data"]["changes"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// The `model.default` values carried by a `settings:changed` `data.changes`
+/// array — collected (not just found) so a duplicated injected entry fails
+/// the exactly-once assertions.
+fn model_default_values(changes: &Value) -> Vec<Value> {
+    changes
+        .as_array()
+        .expect("data.changes array")
+        .iter()
+        .filter(|c| c["path"] == json!("model.default"))
+        .map(|c| c["value"].clone())
+        .collect()
+}
+
+/// Default-provider switch over WSS (monorepo#3177): a `settings.update`
+/// batch that switches `providers.active` re-resolves `model.default` for the
+/// new provider — the cached catalog default as a compound id when the cache
+/// is warm (seeded `models-cache.json`), a blank clearing value when it is
+/// cold — and the injected entry rides the same response `applied` list AND
+/// the emitted `settings:changed` event (§6.5), exactly once. An explicit
+/// `model.default` in the batch is never overridden.
+#[tokio::test]
+async fn provider_switch_reresolves_default_model_over_wss() {
+    let data_dir = temp_data_dir();
+    // Warm the grok catalog cache pre-boot (grok's catalog version key is
+    // constant/empty, so the seeded entry is current on any host).
+    std::fs::write(
+        data_dir.join("models-cache.json"),
+        serde_json::to_vec(&json!({
+            "version": 2,
+            "entries": {
+                "grok": {
+                    "versionKey": "",
+                    "fetchedAtMs": 1_700_000_000_000_u64,
+                    "models": [
+                        { "id": "grok-4", "name": "Grok 4" },
+                        { "id": "grok-code-fast", "name": "Grok Code Fast", "isDefault": true }
+                    ]
+                }
+            }
+        }))
+        .expect("serialize seeded cache"),
+    )
+    .expect("seed models-cache.json");
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    // Dedicated subscriber: the injected entry must ride the emitted
+    // `settings:changed` event too (§6.5), not just the RPC response.
+    let mut sub = connect_ws(port, cfg).await;
+    let ack = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["settings:changed"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
+
+    // Baseline: an explicit model pick in the same batch is authoritative —
+    // the side effect must not run even though providers.active is written.
+    let resp = wss_rpc(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({
+            "changes": [
+                {"path": "providers.active", "value": "auggie"},
+                {"path": "model.default", "value": "auggie:fable-5"}
+            ]
+        }),
+    )
+    .await;
+    assert_success_envelope(&resp, 1);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 2, "explicit batch applies verbatim: {resp}");
+    let changes = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        model_default_values(&changes),
+        vec![json!("auggie:fable-5")],
+        "explicit pick rides the event verbatim, exactly once: {changes}"
+    );
+    let resp = wss_rpc(&mut ws, 2, "settings.get", json!({"path": "model.default"})).await;
+    assert_eq!(resp["result"]["value"], json!("auggie:fable-5"));
+
+    // Switch to grok (warm cache): the batch gains a re-resolved
+    // model.default — the catalog row marked isDefault, compound-prefixed.
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({
+            "changes": [
+                {"path": "providers.active", "value": "grok"}
+            ]
+        }),
+    )
+    .await;
+    assert_success_envelope(&resp, 3);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(
+        applied.len(),
+        2,
+        "switch must apply provider + re-resolved model: {resp}"
+    );
+    assert_eq!(applied[0]["path"], json!("providers.active"), "{resp}");
+    assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
+    assert_eq!(applied[1]["value"], json!("grok:grok-code-fast"), "{resp}");
+    let changes = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        model_default_values(&changes),
+        vec![json!("grok:grok-code-fast")],
+        "injected re-resolved model rides the event exactly once: {changes}"
+    );
+    let resp = wss_rpc(&mut ws, 4, "settings.get", json!({"path": "model.default"})).await;
+    assert_eq!(resp["result"]["value"], json!("grok:grok-code-fast"));
+
+    // Switch back to auggie (cold cache — nothing seeded for it): the stale
+    // grok model is CLEARED, never left shadowing the switched provider.
+    let resp = wss_rpc(
+        &mut ws,
+        5,
+        "settings.update",
+        json!({
+            "changes": [
+                {"path": "providers.active", "value": "auggie"}
+            ]
+        }),
+    )
+    .await;
+    assert_success_envelope(&resp, 5);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 2, "{resp}");
+    assert_eq!(applied[1]["path"], json!("model.default"), "{resp}");
+    assert_eq!(applied[1]["value"], json!(""), "{resp}");
+    let changes = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        model_default_values(&changes),
+        vec![json!("")],
+        "injected clearing value rides the event exactly once: {changes}"
+    );
+    let resp = wss_rpc(&mut ws, 6, "settings.get", json!({"path": "model.default"})).await;
+    assert_eq!(resp["result"]["value"], json!(""));
+    let resp = wss_rpc(
+        &mut ws,
+        7,
+        "settings.get",
+        json!({"path": "providers.active"}),
+    )
+    .await;
+    assert_eq!(resp["result"]["value"], json!("auggie"));
 }
 
 /// `workspaceApi.*` over WSS (per AGENTS.md testing gate): the two

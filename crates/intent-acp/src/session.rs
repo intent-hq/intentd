@@ -284,7 +284,8 @@ pub async fn set_session_model(
 /// establishment. Used for providers that expose the model as a
 /// `configOptions[id="model"]` select in the `session/new` result
 /// ([`ProviderConfig::supports_config_option_model`](intent_providers::ProviderConfig),
-/// claude-code today). The request shape is `{ sessionId, configId, value }` —
+/// claude-code, pi, and codex today). The request shape is
+/// `{ sessionId, configId, value }` —
 /// verified live against claude-agent-acp@0.60.0 (2026-07-22), whose response
 /// echoes the updated `configOptions` list; the pinned `agent-client-protocol`
 /// schema has no typed request for it yet.

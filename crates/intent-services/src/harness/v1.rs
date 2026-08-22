@@ -27,8 +27,8 @@ static DOCTRINE: Doctrine = Doctrine {
 /// The v1 registry row. `version` is intent-core's stamped `"1.0"` (asserted
 /// equal to `CURRENT_HARNESS_VERSION` by registry tests); the feature
 /// defaults are the `[agentFeatures]` defaults this doctrine was written
-/// against (all on except the opt-in `taskGraph`), used to gate legacy
-/// NULL-snapshot sessions the way a live read would have when v1 was current.
+/// against (all on), used to gate legacy NULL-snapshot sessions the way a
+/// live read would have when v1 was current.
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
     version: "1.0",
     harness: &V1,

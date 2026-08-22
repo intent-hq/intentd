@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.38] - 2026-08-22
+
+### 🚀 Features
+
+- *(settings)* Flip agentFeatures.taskGraph default to on ([#1405](https://github.com/intent-hq/intentd/pull/1405))
+
+
+## [0.7.37] - 2026-08-22
+
+### 🚀 Features
+
+- *(agents)* Fail fast on disabled or unavailable providers at create/delegate ([#1403](https://github.com/intent-hq/intentd/pull/1403))
+
+### 🐛 Bug Fixes
+
+- *(services)* Re-resolve model.default when providers.active switches ([#1401](https://github.com/intent-hq/intentd/pull/1401))
+
+
+## [0.7.36] - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- *(providers)* Apply codex model via session/set_config_option ([#1395](https://github.com/intent-hq/intentd/pull/1395))
+- Make pending question markers authoritative ([#1350](https://github.com/intent-hq/intentd/pull/1350))
+- *(services)* Derive pr_ready only when the PR is truly mergeable ([#1402](https://github.com/intent-hq/intentd/pull/1402))
+
+
+## [0.7.35] - 2026-08-22
+
+### 🚀 Features
+
+- Send task-derived agent name as session/new _meta.sessionTitle for codex ([#1392](https://github.com/intent-hq/intentd/pull/1392))
+- Preserve Auggie legacy model metadata ([#1333](https://github.com/intent-hq/intentd/pull/1333))
+
+### 🐛 Bug Fixes
+
+- *(providers)* Bump codex-acp npx pin to 1.6.2 ([#1394](https://github.com/intent-hq/intentd/pull/1394))
+- Harden stale-path staging and status refresh ([#1334](https://github.com/intent-hq/intentd/pull/1334))
+- Make delegate tests hermetic — no real auggie dependency ([#1393](https://github.com/intent-hq/intentd/pull/1393))
+
+
 ## [0.7.34] - 2026-08-21
 
 ### 🐛 Bug Fixes

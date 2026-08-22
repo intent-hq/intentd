@@ -2,8 +2,7 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      eleven `agentFeatures.*` paths (defaults on, except the opt-in
-//      `taskGraph`).
+//      eleven `agentFeatures.*` paths (defaults on).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
@@ -46,7 +45,7 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 /// The eleven `agentFeatures.*` settings paths with their defaults — all on
-/// except the opt-in `taskGraph` (intent-hq/monorepo#2445).
+/// (`taskGraph` included since the default flip; intent-hq/monorepo#2445).
 const FEATURE_PATHS: [(&str, bool); 11] = [
     ("agentFeatures.backgroundHooks", true),
     ("agentFeatures.hostExec", true),
@@ -58,7 +57,7 @@ const FEATURE_PATHS: [(&str, bool); 11] = [
     ("agentFeatures.attentionRequests", true),
     ("agentFeatures.stateSnapshot", true),
     ("agentFeatures.prMonitor", true),
-    ("agentFeatures.taskGraph", false),
+    ("agentFeatures.taskGraph", true),
 ];
 
 struct Daemon {
@@ -575,15 +574,15 @@ async fn agent_features_gate_new_sessions_only() {
         prompt_a.contains("## Raising Attention"),
         "full prompt must contain the attentionRequests section"
     );
-    // `taskGraph` is the opt-in exception: with defaults, the task-relations
-    // teaching is absent from the prompt (intent-hq/monorepo#2445).
+    // `taskGraph` defaults on: the task-relations teaching is present in the
+    // prompt (intent-hq/monorepo#2445, default since flipped).
     assert!(
-        !prompt_a.contains("### Task relations during delegation"),
-        "default prompt must not teach task relations (taskGraph opt-in)"
+        prompt_a.contains("### Task relations during delegation"),
+        "default prompt must teach task relations (taskGraph defaults on)"
     );
     assert!(
         prompt_a.contains("## Delegating Tasks"),
-        "single-task delegation guidance must survive taskGraph off"
+        "single-task delegation guidance is present"
     );
 
     // A's bridge (from the generated per-agent MCP config) advertises the

@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_PROCESSING,
@@ -69,6 +70,24 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::Services;
+
+/// Per-agent ordering gate for pending-question marker writes and their
+/// matching `agent:updated` events. Different agents never contend.
+#[derive(Clone, Default)]
+pub(crate) struct PendingQuestionMutationLocks {
+    locks: Arc<Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl PendingQuestionMutationLocks {
+    fn lock_for(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("pending-question lock map poisoned")
+            .entry(agent_id.clone())
+            .or_default()
+            .clone()
+    }
+}
 
 /// The concise per-agent state digest behind `ws.agent.snapshot()` and the
 /// per-turn prompt injection (`current ws.agent.snapshot() => {...}`).
@@ -598,7 +617,7 @@ fn resolve_delegate_provider(
             });
         if let Some(provider_id) = explicit {
             ensure_known_provider("agent.delegate", &provider_id)?;
-            ensure_provider_available("agent.delegate", &provider_id, &settings.providers.paths)?;
+            ensure_provider_available("agent.delegate", &provider_id, &settings.providers)?;
             return Ok(Some(provider_id));
         }
     }
@@ -606,7 +625,7 @@ fn resolve_delegate_provider(
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
             ensure_known_provider("agent.delegate", &derived)?;
-            ensure_provider_available("agent.delegate", &derived, &settings.providers.paths)?;
+            ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
             Ok(Some(derived))
         }
         None => Err(crate::agent_session::no_default_provider_error(
@@ -650,31 +669,86 @@ pub(crate) fn resolve_delegate_provider_preview(
     crate::agent_session::derived_default_provider(&services.effective_settings())
 }
 
-/// Reject a known provider id that the daemon's own provider discovery
-/// reports as unavailable (not installed, or gated off by a missing env
-/// var/feature code) with a clear, caller-surfaceable `-32602` — so the FE
-/// can toast it — instead of letting the delegate succeed and the spawn fail
-/// later with a raw "No such file or directory" (spec Decision D2 step 3).
-/// Mirrors `resolve_spawn`'s override-aware resolution (monorepo#1065) via
-/// [`intent_providers::discover_providers_with_overrides`], keyed by the
-/// same `providers.paths` settings.
+/// Reject a known provider id that the user explicitly disabled in the
+/// `providers.enabled` settings map (`enabled[id] == false`, for providers
+/// with [`intent_providers::ProviderConfig::can_be_disabled`]) with a
+/// distinct "not enabled" `-32602` (monorepo#3178). Disabled beats installed:
+/// a disabled provider must fail fast at every create/delegate front door
+/// regardless of whether its binary (or npx) would resolve. An absent map or
+/// absent entry means enabled (the settings default).
+fn ensure_provider_enabled(
+    method: &str,
+    provider_id: &str,
+    enabled: Option<&std::collections::BTreeMap<String, bool>>,
+) -> Result<()> {
+    let disableable =
+        intent_providers::find_provider(provider_id).is_some_and(|p| p.can_be_disabled);
+    if disableable && enabled.is_some_and(|m| m.get(provider_id) == Some(&false)) {
+        let display = intent_providers::provider_config(provider_id).display_name;
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not enabled — enable it in \
+             Settings > Agents."
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a known provider id that is disabled in settings or that the
+/// daemon's own provider discovery reports as unrunnable (not installed, or
+/// gated off by a missing env var/feature code) with a clear,
+/// caller-surfaceable `-32602` — so the FE can toast it — instead of letting
+/// the delegate succeed and the spawn fail later with a raw "No such file or
+/// directory" (spec Decision D2 step 3). The disabled check
+/// ([`ensure_provider_enabled`]) runs first, with its own distinct message
+/// (monorepo#3178). Mirrors `resolve_spawn`'s override-aware resolution
+/// (monorepo#1065) via [`intent_providers::provider_availability_for`], keyed
+/// by the same `providers.paths` settings, and aligns "installed" with what
+/// the spawn path can actually run: a provider whose only runnable path is
+/// its npx fallback (`fallback_npx_package`, e.g. codex) counts as runnable
+/// when npx resolves — exactly like `resolve_spawn`'s fallback tier.
 fn ensure_provider_available(
     method: &str,
     provider_id: &str,
-    provider_paths: &std::collections::BTreeMap<String, String>,
+    providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
-    let available = intent_providers::discover_providers_with_overrides(&|key| {
-        provider_paths.get(key).cloned()
+    ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
+    let availability = intent_providers::provider_availability_for(provider_id, &|key| {
+        providers.paths.get(key).cloned()
+    });
+    ensure_provider_runnable(method, provider_id, availability, &|| {
+        intent_providers::find_npx().is_some()
     })
-    .into_iter()
-    .find(|p| p.id == provider_id)
-    .is_some_and(|p| p.installed);
-    if !available {
-        let display = intent_providers::provider_config(provider_id).display_name;
+}
+
+/// The runnability half of [`ensure_provider_available`], with the npx probe
+/// injected so unit tests can exercise the fallback arm deterministically
+/// (the real probe scans the host's enhanced PATH). `npx_present` is only
+/// consulted when the provider is not installed but declares an npx fallback.
+fn ensure_provider_runnable(
+    method: &str,
+    provider_id: &str,
+    availability: Option<intent_providers::ProviderAvailability>,
+    npx_present: &dyn Fn() -> bool,
+) -> Result<()> {
+    let display = intent_providers::provider_config(provider_id).display_name;
+    let Some(availability) = availability else {
+        // Unknown ids are rejected by `ensure_known_provider` before this;
+        // kept defensive for any future caller that skips it.
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — it is not a \
+             registered provider."
+        )));
+    };
+    if let Some(reason) = &availability.gated_off {
+        return Err(Error::InvalidParams(format!(
+            "{method}: provider \"{provider_id}\" ({display}) is not available — {reason}."
+        )));
+    }
+    let runnable = availability.installed || (availability.has_npx_fallback && npx_present());
+    if !runnable {
         return Err(Error::InvalidParams(format!(
             "{method}: provider \"{provider_id}\" ({display}) is not available — it is not \
-             installed, or is disabled. Choose an available provider in Settings > Agents, or \
-             install {display}."
+             installed. Choose an available provider in Settings > Agents, or install {display}."
         )));
     }
     Ok(())
@@ -2851,6 +2925,30 @@ impl Services {
                 "agent.create",
             ));
         }
+        // monorepo#3178: the provider this session would spawn on must not be
+        // one the user explicitly disabled in `providers.enabled` — fail fast
+        // with the distinct "not enabled" -32602 before any session row is
+        // persisted. Resolve it with the spawn path's own precedence
+        // (`resolve_provider_id`: compound `resolved_model` prefix →
+        // `provider` field → settings-derived default) so an explicit
+        // `provider` cannot smuggle in a disabled compound-model provider —
+        // spawn would run the prefix, so the prefix is what gets gated. This
+        // one gate covers every create seam (`agent.create`,
+        // `agent.wakeOrCreate`, and delegate's child creation).
+        // Installed-ness stays delegate-only (`ensure_provider_available`):
+        // direct creates on a known, enabled-but-uninstalled provider keep
+        // their existing spawn-time failure mode.
+        if let Some(p) = crate::agent_session::resolve_provider_id(
+            resolved_model.as_deref(),
+            provider.as_deref(),
+            derived_default.as_deref(),
+        ) {
+            ensure_provider_enabled(
+                "agent.create",
+                &p,
+                self.effective_settings().providers.enabled.as_ref(),
+            )?;
+        }
         // Also validate the resolved model's compound prefix unconditionally:
         // the spawn path (`resolve_provider_id`) gives the model prefix
         // precedence over session.provider, so a valid explicit provider must
@@ -3770,8 +3868,7 @@ impl Services {
         // it pending — so they also gate the displayStatus recompute below.
         let hold_moved = if role == "assistant" && has_question_blocks(&content) {
             self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
-                .await;
-            true
+                .await
         } else if role == "user"
             && self
                 .resolve_pending_questions_for_answer(
@@ -4764,54 +4861,194 @@ impl Services {
     /// message whose just-persisted content carries question resource blocks
     /// (called from the turn-end persist paths). Single-slot: a newer
     /// question-bearing turn overwrites an older marker, which is exactly the
-    /// spec's "newest set supersedes" rule. Atomic single-key `json_set` so
+    /// spec's "newest set supersedes" rule. The persisted message `seq` orders
+    /// competing completions, and the per-agent mutation lock keeps the write
+    /// plus its event in that same order. Atomic single-key `json_set` so
     /// sibling metadata keys (`dismissedQuestionsMessageId`,
-    /// `lastSeenMessageId`) are preserved. Best-effort: a failure is logged
-    /// and never fails the turn (the hold simply stays as it was).
+    /// `lastSeenMessageId`) are preserved. A successful write emits
+    /// `agent:updated` with the marker so clients re-read the `AgentLite`
+    /// projection. Returns `true` only when this call committed the latest
+    /// marker. Best-effort: a failure is logged and never fails the turn (the
+    /// hold simply stays as it was).
     pub(crate) async fn record_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         message_id: &str,
-    ) {
-        if let Err(e) = self
+    ) -> bool {
+        self.park_pending_marker_mutation("set", message_id).await;
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+
+        let candidate = match self
             .store
-            .set_agent_session_metadata_key(
+            .get_agent_message_by_id(agent_id, message_id)
+            .await
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to order pending-questions marker");
+                return false;
+            }
+        };
+        let session = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read pending-questions marker");
+                return false;
+            }
+        };
+        if session.pending_questions_message_id() == Some(message_id) {
+            return false;
+        }
+        if let Some(current_id) = session.pending_questions_message_id() {
+            match self
+                .store
+                .get_agent_message_by_id(agent_id, current_id)
+                .await
+            {
+                Ok(Some(current)) if current.seq >= candidate.seq => return false,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to order pending-questions marker");
+                    return false;
+                }
+            }
+        }
+        let current_value = session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY));
+        if current_value.is_some_and(|value| !value.is_string()) {
+            tracing::warn!(
+                agent = %agent_id,
+                "pending-questions marker has a non-string value"
+            );
+            return false;
+        }
+        let current_value = current_value.and_then(Value::as_str).map(str::to_string);
+        let expected = if session.pending_questions_marker_written() {
+            current_value.as_deref().map(Some)
+        } else {
+            Some(None)
+        };
+        match self
+            .store
+            .set_pending_questions_marker_if_unanswered(
                 workspace_id,
                 agent_id,
-                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
-                message_id,
-                None,
+                expected,
+                &candidate,
                 &now_iso(),
             )
             .await
         {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+            Ok(true) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingQuestionsMessageId": message_id,
+                    }),
+                )
+                .await;
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+                false
+            }
         }
     }
 
     /// Clear the pending-questions marker (written as the empty string, which
     /// reads back as "no pending questions" while still marking the session as
-    /// marker-aware so the pre-upgrade tail-walk fallback stays off).
-    /// Best-effort: a failure is logged and never fails the caller.
+    /// marker-aware so the pre-upgrade tail-walk fallback stays off). A
+    /// successful write emits `agent:updated` with the written empty string so
+    /// clients can distinguish the clear from a legacy-absent marker. When
+    /// `expected` is set, the existing per-key CAS clears only that exact
+    /// marker. Returns `true` only when the clear committed. Best-effort: a
+    /// failure is logged and never fails the caller.
     pub(crate) async fn clear_pending_questions_marker(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-    ) {
-        if let Err(e) = self
+        expected: Option<&str>,
+    ) -> bool {
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
+        self.clear_pending_questions_marker_locked(workspace_id, agent_id, expected)
+            .await
+    }
+
+    async fn clear_pending_questions_marker_locked(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        expected: Option<&str>,
+    ) -> bool {
+        let expected_owned = match expected {
+            Some(value) => Some(Some(value.to_string())),
+            None => match self.store.get_agent_session_summary(agent_id).await {
+                Ok(session) => {
+                    let current = session
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| {
+                            metadata.get(intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY)
+                        })
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if current.as_deref() == Some("") {
+                        return false;
+                    }
+                    if session.pending_questions_marker_written() {
+                        current.map(Some)
+                    } else {
+                        Some(None)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to read pending-questions marker");
+                    return false;
+                }
+            },
+        };
+        let expected_guard = expected_owned.as_ref().map(|value| value.as_deref());
+        match self
             .store
             .set_agent_session_metadata_key(
                 workspace_id,
                 agent_id,
                 intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
                 "",
-                None,
+                expected_guard,
                 &now_iso(),
             )
             .await
         {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+            Ok(true) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "pendingQuestionsMessageId": "",
+                    }),
+                )
+                .await;
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+                false
+            }
         }
     }
 
@@ -4870,7 +5107,7 @@ impl Services {
             self.record_pending_questions_marker(workspace_id, agent_id, &id)
                 .await;
         } else {
-            self.clear_pending_questions_marker(workspace_id, agent_id)
+            self.clear_pending_questions_marker(workspace_id, agent_id, None)
                 .await;
             if let Some(manager) = self.agent_manager() {
                 manager
@@ -4902,15 +5139,17 @@ impl Services {
         let Some(answered) = answered_questions_message_id(message_metadata) else {
             return false;
         };
+        self.park_pending_marker_mutation("clear", answered).await;
+        let lock = self.pending_question_mutation_locks.lock_for(agent_id);
+        let _guard = lock.lock().await;
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         if session.pending_questions_message_id() != Some(answered) {
             return false;
         }
-        self.clear_pending_questions_marker(workspace_id, agent_id)
-            .await;
-        true
+        self.clear_pending_questions_marker_locked(workspace_id, agent_id, Some(answered))
+            .await
     }
 
     /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
@@ -6152,7 +6391,7 @@ impl Services {
             ensure_provider_available(
                 "agent.delegate",
                 provider_param,
-                &self.effective_settings().providers.paths,
+                &self.effective_settings().providers,
             )?;
             if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
                 let (prefix, _) = intent_providers::parse_compound_model_id(model);
@@ -6165,6 +6404,25 @@ impl Services {
                 }
             }
             Some(provider_param.to_string())
+        } else if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
+            // A compound explicit `model` pins its own provider (spawn
+            // precedence: the prefix outranks everything), so gate that
+            // prefix on the same full availability check as an explicit
+            // `provider` param — otherwise a disabled/uninstalled/env-gated
+            // provider smuggled in via the model prefix would persist a
+            // session and only fail at spawn (monorepo#3178). An unknown
+            // prefix is left to `agent_create_op`'s unconditional prefix
+            // validation; the provider itself stays `None` because
+            // `agent_create_op`'s existing derivation pins it from the model.
+            let (prefix, _) = intent_providers::parse_compound_model_id(model);
+            if intent_providers::find_provider(&prefix).is_some() {
+                ensure_provider_available(
+                    "agent.delegate",
+                    &prefix,
+                    &self.effective_settings().providers,
+                )?;
+            }
+            None
         } else if input.model.is_none() {
             resolve_delegate_provider(self, input.specialist.as_deref(), workspace_path.as_deref())?
         } else {
@@ -6660,15 +6918,30 @@ impl Services {
         // that doesn't override it, so validate it up front — before the
         // classification loop can start any task — rather than surfacing the
         // same failure as N per-row `error` dispositions after earlier rows
-        // already spawned. Per-entry `provider` overrides stay per-row
-        // (`error` disposition), consistent with the other per-entry options.
+        // already spawned. A top-level compound `model` default gets the same
+        // up-front gate on its prefix-named provider (spawn precedence: the
+        // prefix outranks `provider`), so a disabled/unrunnable provider
+        // smuggled in via the model default also fails once, up front.
+        // Per-entry `provider`/`model` overrides stay per-row (`error`
+        // disposition via the single-task path), consistent with the other
+        // per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             ensure_known_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
                 "agent.delegate",
                 provider_param,
-                &self.effective_settings().providers.paths,
+                &self.effective_settings().providers,
             )?;
+        }
+        if let Some(model) = input.model.as_deref().filter(|m| m.contains(':')) {
+            let (prefix, _) = intent_providers::parse_compound_model_id(model);
+            if intent_providers::find_provider(&prefix).is_some() {
+                ensure_provider_available(
+                    "agent.delegate",
+                    &prefix,
+                    &self.effective_settings().providers,
+                )?;
+            }
         }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a
