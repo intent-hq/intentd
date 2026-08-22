@@ -302,7 +302,7 @@ fn the_default_data_dir_matches_the_daemons_own_resolution() {
 // ---------------------------------------------------------------------------
 
 /// The sitter's own lines, verbatim in shape (the substrings are the install
-/// log contract pinned by `install_log_contract_*` in supervisor_e2e.rs).
+/// log contract pinned by `install_log_contract_*` in `supervisor_e2e.rs`).
 const CRASH_LINE: &str =
     "intentd-sitter: intentd 0.6.8 exited unexpectedly (exit status 1); respawning in 200ms";
 const GIVE_UP_LINE: &str = "intentd-sitter: intentd failed 5 times in a row without ever staying up for 30s; this looks permanent, not transient, so the sitter is giving up instead of respawning it forever";
@@ -370,7 +370,7 @@ impl WaitCase {
 
     /// Create `path` after `delay` — the marker the fake `intentd` waits for
     /// before answering, i.e. the moment the daemon comes up.
-    fn touch_after(&self, delay: Duration, path: PathBuf) -> std::thread::JoinHandle<()> {
+    fn touch_after(delay: Duration, path: PathBuf) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             std::thread::sleep(delay);
             let _ = fs::write(&path, "");
@@ -520,7 +520,7 @@ fn a_crash_the_daemon_recovers_from_is_not_a_failure() {
     let case = WaitCase::new("exit 1", 60, 1, 10);
     let marker = case.up_when_marker_exists();
     case.append_log(CRASH_LINE);
-    let up = case.touch_after(Duration::from_secs(3), marker);
+    let up = WaitCase::touch_after(Duration::from_secs(3), marker);
 
     let (output, _elapsed) = case.run();
     up.join().unwrap();
