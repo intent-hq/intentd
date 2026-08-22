@@ -1,6 +1,6 @@
 [package]
 name = "intent-providers"
-version = "0.7.34"
+version = "0.7.35"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "Provider registry, launch arg/env assembly, model-tier and capability tables"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.7.34" }
+intent-core = { path = "../intent-core", version = "0.7.35" }
 serde_json = { workspace = true }
 tracing.workspace = true
 

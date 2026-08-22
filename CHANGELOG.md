@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.35] - 2026-08-22
+
+### 🚀 Features
+
+- Send task-derived agent name as session/new _meta.sessionTitle for codex ([#1392](https://github.com/intent-hq/intentd/pull/1392))
+- Preserve Auggie legacy model metadata ([#1333](https://github.com/intent-hq/intentd/pull/1333))
+
+### 🐛 Bug Fixes
+
+- *(providers)* Bump codex-acp npx pin to 1.6.2 ([#1394](https://github.com/intent-hq/intentd/pull/1394))
+- Harden stale-path staging and status refresh ([#1334](https://github.com/intent-hq/intentd/pull/1334))
+- Make delegate tests hermetic — no real auggie dependency ([#1393](https://github.com/intent-hq/intentd/pull/1393))
+
+
 ## [0.7.34] - 2026-08-21
 
 ### 🐛 Bug Fixes
