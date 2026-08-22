@@ -11991,12 +11991,12 @@ mod legacy_feature_freeze_tests {
         let _env = mock_env(&script);
         let (mgr, _db, _cfg) = registry_manager().await;
         let agent_id = AgentId::from("agent-freeze-2");
-        // Pin ON while the live setting stays OFF (the default).
-        seed_legacy_session(&mgr, &agent_id, true).await;
+        // Pin OFF while the live setting stays ON (the default).
+        seed_legacy_session(&mgr, &agent_id, false).await;
         let _ends = install_fake_handle(&mgr, &agent_id, None);
         assert!(
-            !mgr.services.effective_settings().agent_features.task_graph,
-            "live taskGraph setting is off (default)"
+            mgr.services.effective_settings().agent_features.task_graph,
+            "live taskGraph setting is on (default)"
         );
 
         activate(&mgr, &agent_id).await;
@@ -12006,11 +12006,11 @@ mod legacy_feature_freeze_tests {
             .expect("activation materialized the snapshot");
         assert_eq!(
             frozen["taskGraph"],
-            serde_json::json!(true),
+            serde_json::json!(false),
             "the legacy pin wins over the live setting"
         );
         // The fold matches the COALESCE read path.
-        assert!(mgr
+        assert!(!mgr
             .services
             .store
             .get_agent_session_task_graph_enabled(&agent_id)

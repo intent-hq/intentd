@@ -32078,8 +32078,8 @@ mod harness_versioning {
             .as_object()
             .expect("wire projection carries the captured snapshot");
         // The snapshot is the camelCase wire form of AgentFeaturesSettings —
-        // spot-check the defaults (taskGraph opt-in off, the rest on).
-        assert_eq!(features["taskGraph"], false);
+        // spot-check the defaults (all on, taskGraph included).
+        assert_eq!(features["taskGraph"], true);
         assert_eq!(features["backgroundHooks"], true);
 
         // Persisted, not projected: the row itself carries the stamp.
@@ -32090,7 +32090,7 @@ mod harness_versioning {
             intent_core::CURRENT_HARNESS_VERSION
         );
         let persisted = session.harness_features.expect("persisted snapshot");
-        assert_eq!(persisted["taskGraph"], serde_json::json!(false));
+        assert_eq!(persisted["taskGraph"], serde_json::json!(true));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent
@@ -32158,7 +32158,7 @@ mod harness_versioning {
         let lite = svc.project_lite_with_flags(session);
         assert_eq!(lite.harness_version, "1.0");
         let features = lite.harness_features.expect("projected from settings");
-        assert_eq!(features["taskGraph"], serde_json::json!(false));
+        assert_eq!(features["taskGraph"], serde_json::json!(true));
 
         // agent.getSession: same overlay.
         let full = svc

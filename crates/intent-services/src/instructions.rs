@@ -227,7 +227,7 @@ fn remove_between(text: &str, start: &str, end: &str) -> String {
 /// delegation" subsection (dispositions, `unlockPlan`, unblocked-wake
 /// guidance). When `hostExec` is off but the Waiting section survives, the
 /// `ws.host.exec` fallback sentence of its "Cross-repo PRs" bullet is
-/// scrubbed. With every gate open (`taskGraph` opted in) this borrows the
+/// scrubbed. With every gate open (the defaults) this borrows the
 /// bundled body untouched (byte-identical prompts). The markers are pinned to
 /// the v1 text by unit tests; on a future set where one is absent the gate is
 /// a no-op (that version's gating adds its own markers).
@@ -391,13 +391,11 @@ mod tests {
         AgentFeaturesSettings::default()
     }
 
-    /// Every gate open: the defaults plus the opt-in `taskGraph`, so gated
-    /// bodies are byte-identical to the bundled sources.
+    /// Every gate open: the defaults (all toggles on, `taskGraph` included
+    /// since the default flip), so gated bodies are byte-identical to the
+    /// bundled sources.
     fn all_on() -> AgentFeaturesSettings {
-        AgentFeaturesSettings {
-            task_graph: true,
-            ..AgentFeaturesSettings::default()
-        }
+        defaults()
     }
 
     #[test]
@@ -504,8 +502,12 @@ mod tests {
         // Guards: the markers still match the bundled body verbatim.
         assert!(COMMON.contains(COMMON_TASK_RELATIONS_START));
         assert!(COMMON.contains(COMMON_TASK_RELATIONS_END));
-        // Default features have `taskGraph` off (opt-in).
-        let common = gated_common(&V1, &defaults());
+        // `taskGraph` defaults on; opt out explicitly.
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..defaults()
+        };
+        let common = gated_common(&V1, &features);
         assert!(!common.contains("### Task relations during delegation"));
         assert!(!common.contains("unlockPlan"));
         assert!(!common.contains("Tasks now unblocked"));
@@ -546,7 +548,11 @@ mod tests {
         assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_HEADER));
         assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_KEY_LINE));
         assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_DEPENDS_LINE));
-        let body = gated_task_breakdown(&V1, &defaults());
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..defaults()
+        };
+        let body = gated_task_breakdown(&V1, &features);
         assert!(!body.contains("### Contract-First Splitting"));
         assert!(!body.contains("### Declaring Task Relations"));
         assert!(!body.contains("dependsOn"));
@@ -563,7 +569,7 @@ mod tests {
         // The ungated convertBlocks materialization rule survives.
         assert!(body.contains("ws.task.convertBlocks(\"spec\")"));
         // Composition routes task-breakdown through the gate.
-        let out = get_instruction_with_common("task-breakdown", &defaults());
+        let out = get_instruction_with_common("task-breakdown", &features);
         assert!(!out.contains("### Declaring Task Relations"));
     }
 
