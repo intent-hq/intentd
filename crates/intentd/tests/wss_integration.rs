@@ -3033,6 +3033,13 @@ async fn wss_agent_reasoning_effort_round_trip() {
 async fn wss_agent_delegate_persists_reasoning_effort() {
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.active", serde_json::json!("auggie"));
+    // Hermeticity (monorepo#3162): point discovery at a deterministic
+    // executable so the delegate availability check passes without a real
+    // auggie on the test host.
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "auggie": "/bin/sh" }),
+    );
     let created_ws = wss_call(
         srv.port,
         srv.cfg.clone(),
