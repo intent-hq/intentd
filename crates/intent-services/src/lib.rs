@@ -11324,9 +11324,16 @@ impl Services {
     /// default then fails loudly, monorepo#3044, instead of silently
     /// running on a foreign model). An explicit `model.default` entry
     /// anywhere in the same batch wins: the caller's pick is never
-    /// overridden. Loop-guarded by construction: once the switch has
-    /// applied, the derived provider equals the stored one, so replaying
-    /// the same batch appends nothing.
+    /// overridden. A switch requires a currently derived provider: with
+    /// none derivable (first-time setup — notably
+    /// [`Self::heal_default_provider_settings`], which persists through
+    /// this same path) nothing is appended, preserving heal's per-key
+    /// no-overwrite guard on `model.default`. Loop-guarded by
+    /// construction: once the switch has applied, the derived provider
+    /// equals the stored one, so replaying the same batch appends
+    /// nothing. External `config.toml` edits bypass `settings.update`
+    /// (watcher → registry reload) and deliberately get no re-resolution
+    /// — this side effect covers `settings.update` writers only.
     fn reresolve_default_model_on_provider_switch(&self, changes: &mut serde_json::Value) {
         let Some(entries) = changes.as_array_mut() else {
             return;
@@ -11341,12 +11348,16 @@ impl Services {
         if entries.iter().any(|e| path_of(e) == "model.default") {
             return;
         }
-        // Last write wins within a batch, mirroring apply order.
+        // Last write wins within a batch, mirroring apply order: the LAST
+        // `providers.active` entry is taken unconditionally — a non-string
+        // value there means no side effect (the batch will fail schema
+        // validation downstream anyway), never a fall-back to an earlier
+        // entry.
         let Some(provider) = entries
             .iter()
             .rev()
-            .filter(|e| path_of(e) == "providers.active")
-            .find_map(|e| e.get("value").and_then(|v| v.as_str()))
+            .find(|e| path_of(e) == "providers.active")
+            .and_then(|e| e.get("value").and_then(|v| v.as_str()))
             .map(str::trim)
             .filter(|id| intent_providers::find_provider(id).is_some())
             .map(|id| intent_providers::provider_config(id).id.to_string())
@@ -11354,11 +11365,15 @@ impl Services {
             return;
         };
         let settings = self.effective_settings();
-        // Not a switch: the batch names the provider that already rules
-        // (via a self-prefixed `model.default` or `providers.active`) — a
-        // same-provider rewrite must not disturb a configured model.
-        if agent_session::derived_default_provider(&settings).as_deref() == Some(&provider) {
-            return;
+        // Only an actual switch qualifies: no derivable provider means
+        // first-time setup (e.g. the heal path), and the provider that
+        // already rules (via a self-prefixed `model.default` or
+        // `providers.active`) makes the batch a same-provider rewrite —
+        // neither may disturb a configured model.
+        match agent_session::derived_default_provider(&settings) {
+            None => return,
+            Some(current) if current == provider => return,
+            Some(_) => {}
         }
         let resolved = self
             .models_catalog

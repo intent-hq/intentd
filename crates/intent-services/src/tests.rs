@@ -30541,6 +30541,36 @@ mod default_provider_self_heal {
         );
     }
 
+    /// Heal writing only `providers.active` (model key holds an unresolvable
+    /// raw value) must NOT trip the provider-switch side effect riding the
+    /// same `settings_update` path: with no derivable provider beforehand
+    /// this is first-time setup, not a switch, so `model.default` keeps its
+    /// raw value per heal's per-key no-overwrite guard.
+    #[tokio::test]
+    async fn single_key_heal_does_not_rewrite_unresolvable_model() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.default".into(), serde_json::json!("mystery:m1"))])
+            .expect("seed unresolvable model");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("mystery:m1"))
+        );
+    }
+
     /// The first INSTALLED provider wins in the order discovery reported,
     /// skipping ids the registry doesn't know.
     #[tokio::test]
@@ -30802,6 +30832,38 @@ mod provider_switch_reresolves_default_model {
         let applied = result["applied"].as_array().expect("applied array");
         assert_eq!(applied.len(), 1, "{result}");
         assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// First-time setup is NOT a switch: with no derivable provider (only an
+    /// unresolvable raw `model.default` stored), setting `providers.active`
+    /// appends nothing even on a warm cache — the raw model value is
+    /// preserved (heal's no-overwrite guard relies on this, since heal
+    /// persists through the same `settings_update` path).
+    #[tokio::test]
+    async fn first_time_setup_is_not_a_switch() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        let svc = Services::new(store).with_settings_registry(registry);
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.default".into(), serde_json::json!("mystery:m1"))])
+            .expect("seed unresolvable model");
+        svc.models_catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok-code-fast", "isDefault": true })],
+        );
+
+        let result = switch_to(&svc, "grok").await;
+        let applied = result["applied"].as_array().expect("applied array");
+        assert_eq!(applied.len(), 1, "{result}");
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("mystery:m1"))
+        );
     }
 }
 
