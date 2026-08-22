@@ -2827,6 +2827,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.status` with request options. `force_refresh` bypasses cached and
+    /// pre-existing in-flight status results. The default preserves the
+    /// existing behavior for implementations that only provide [`Self::git_status`].
+    fn git_status_with_options(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+        force_refresh: bool,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
+        let _ = force_refresh;
+        self.git_status(workspace_id, git_root_id)
+    }
+
     /// `gitRoot.list`: every registered git root for a workspace (agent-
     /// registered and auto-detected), as the wire envelope
     /// `{ gitRoots: [...] }` with each row carrying the persisted
