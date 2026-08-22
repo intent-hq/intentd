@@ -60,15 +60,21 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid } — when MOCK_AGENT_SESSION_LOG points at a file.
-// Lets e2e tests assert exactly which session ids the daemon offered to which
-// child process (e.g. that a cross-provider switch never issues session/load
-// with the old provider's id — monorepo#907).
-function logSessionCall(method, sessionId) {
+// { method, sessionId, pid, meta } — when MOCK_AGENT_SESSION_LOG points at a
+// file. Lets e2e tests assert exactly which session ids the daemon offered to
+// which child process (e.g. that a cross-provider switch never issues
+// session/load with the old provider's id — monorepo#907). `meta` carries the
+// request's `_meta` verbatim (null when absent) so tests can assert the exact
+// provider-specific payload on the wire (e.g. codex `sessionTitle`,
+// monorepo#3151).
+function logSessionCall(method, sessionId, meta) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
-    fs.appendFileSync(path, JSON.stringify({ method, sessionId, pid: process.pid }) + '\n');
+    fs.appendFileSync(
+      path,
+      JSON.stringify({ method, sessionId, pid: process.pid, meta: meta ?? null }) + '\n'
+    );
   } catch (err) {
     log(`session log write failed: ${err.message}`);
   }
@@ -843,7 +849,7 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
-      logSessionCall('session/new', SESSION_ID);
+      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions() });
     }
     case 'session/load':
@@ -852,7 +858,7 @@ async function dispatch(msg) {
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
-      logSessionCall('session/load', msg.params && msg.params.sessionId);
+      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta);
       // With `loadSession: true` behavior, accept ANY session id — including a
       // foreign one — modelling the worst-case provider monorepo#907 guards
       // against. With `advertiseLoadSession`, accept the resume (all
