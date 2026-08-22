@@ -1163,10 +1163,10 @@ pub(crate) async fn fetch_auggie_models(
 /// `{ models: [...] }`, maps `id` ← `shortName` and `name` ← `displayName`,
 /// and skips rows missing either string. Optional picker metadata
 /// (`description`, `modelGroupPriority`, `costTier`, `badges`, `effortLevels`,
-/// `isDefault`, `priority`) is copied only when present/non-empty. The
-/// transient `isLegacyModel` flag is kept so [`finalize_model_rows`] can
-/// filter it, then stripped from the wire. Returns `None` when the payload is
-/// not the expected JSON shape, so the caller falls back to plain text.
+/// `isDefault`, `priority`, `isLegacyModel`) is copied only when
+/// present/non-empty; boolean flags are emitted only when true. Returns `None`
+/// when the payload is not the expected JSON shape, so the caller falls back
+/// to plain text.
 pub(crate) fn parse_model_list_json(stdout: &str) -> Option<Vec<Value>> {
     let parsed: Value = serde_json::from_str(stdout.trim()).ok()?;
     let models = parsed.get("models")?.as_array()?;
@@ -1207,10 +1207,9 @@ pub(crate) fn parse_model_list_json(stdout: &str) -> Option<Vec<Value>> {
     Some(out)
 }
 
-/// Post-process parsed `models.list` rows (PROTOCOL §5.30), porting the
-/// reference `fetchAuggieModels` tail: drop rows flagged `isLegacyModel`
-/// (stripping the flag from survivors) and sort by `modelGroupPriority`, then
-/// `priority`, then `name` — missing priorities sort last (`999`).
+/// Post-process parsed `models.list` rows (PROTOCOL §5.30): preserve every row
+/// and its metadata, then sort by `modelGroupPriority`, `priority`, and `name`
+/// — missing priorities sort last (`999`).
 pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
     fn priority(row: &Value, key: &str) -> f64 {
         row.get(key).and_then(Value::as_f64).unwrap_or(999.0)
@@ -1218,23 +1217,14 @@ pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
     fn name(row: &Value) -> &str {
         row.get("name").and_then(Value::as_str).unwrap_or("")
     }
-    let mut kept: Vec<Value> = rows
-        .into_iter()
-        .filter(|r| r.get("isLegacyModel").and_then(Value::as_bool) != Some(true))
-        .map(|mut r| {
-            if let Some(obj) = r.as_object_mut() {
-                obj.remove("isLegacyModel");
-            }
-            r
-        })
-        .collect();
-    kept.sort_by(|a, b| {
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
         priority(a, "modelGroupPriority")
             .total_cmp(&priority(b, "modelGroupPriority"))
             .then_with(|| priority(a, "priority").total_cmp(&priority(b, "priority")))
             .then_with(|| name(a).cmp(name(b)))
     });
-    kept
+    rows
 }
 
 /// Upper bound on one auggie CLI invocation (model list / session stats).
@@ -1269,7 +1259,7 @@ async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::p
 /// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
 /// reference `fetchAuggieModels`: try `auggie model list --json` for the rich
 /// rows, fall back to the plain-text parser ([`parse_model_list_output`]),
-/// then filter legacy models and sort ([`finalize_model_rows`]). Returns
+/// then preserve all rows and sort ([`finalize_model_rows`]). Returns
 /// `None` when the CLI is unavailable, hangs past
 /// [`AUGGIE_MODELS_TIMEOUT`], or yields nothing parseable, so the caller can
 /// degrade to an empty model list. `auggie_bin` overrides discovery
@@ -4059,8 +4049,13 @@ impl Services {
         force_refresh: bool,
     ) -> Result<Value> {
         let Some(provider_id) = provider_id else {
-            return self.models_list_auggie_op(force_refresh).await;
+            return self.models_list_auggie_op(force_refresh, false).await;
         };
+        if provider_id == "auggie" {
+            let mut response = self.models_list_auggie_op(force_refresh, true).await?;
+            response["providerId"] = Value::String(provider_id);
+            return Ok(response);
+        }
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
@@ -4107,21 +4102,36 @@ impl Services {
     /// fallback when the probe fails with no last-good list. A failed probe
     /// with a last-good cached list serves it labeled `stale: true` +
     /// `warning` — never silently — whether or not the read was forced.
-    async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
+    /// The provider-scoped wire shape also keeps the resolver warning on an
+    /// empty static fallback; the legacy shape omits it for compatibility.
+    async fn models_list_auggie_op(
+        &self,
+        force_refresh: bool,
+        include_fallback_warning: bool,
+    ) -> Result<Value> {
         let auggie_bin = self.auggie_bin.clone();
-        self.models_list_auggie_with(
-            force_refresh,
-            crate::model_catalog::ModelCatalogCache::now_ms(),
-            || Box::pin(fetch_auggie_models_rich(auggie_bin)),
-        )
-        .await
+        let mut response = self
+            .models_list_auggie_with(
+                force_refresh,
+                crate::model_catalog::ModelCatalogCache::now_ms(),
+                || Box::pin(fetch_auggie_models_rich(auggie_bin)),
+            )
+            .await?;
+        if !include_fallback_warning && response["source"] == "static" {
+            response
+                .as_object_mut()
+                .expect("Auggie model response must be an object")
+                .remove("warning");
+        }
+        Ok(response)
     }
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
     /// (the unit-test seam). Delegates all cache policy — indefinite serving,
     /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
-    /// resolved rows onto the legacy wire shape.
+    /// resolved rows onto the shared internal shape. The caller removes the
+    /// empty-fallback warning only when it must preserve the legacy wire shape.
     async fn models_list_auggie_with<F>(
         &self,
         force_refresh: bool,
@@ -4161,18 +4171,21 @@ impl Services {
             },
         )
         .await;
-        match resolved.models {
-            Some(models) => {
-                let mut out = json!({ "models": models, "source": "auggie" });
-                if resolved.stale {
-                    out["stale"] = Value::Bool(true);
-                    if let Some(w) = resolved.warning {
-                        out["warning"] = Value::String(w);
-                    }
+        if let Some(models) = resolved.models {
+            let mut out = json!({ "models": models, "source": "auggie" });
+            if resolved.stale {
+                out["stale"] = Value::Bool(true);
+                if let Some(w) = resolved.warning {
+                    out["warning"] = Value::String(w);
                 }
-                Ok(out)
             }
-            None => Ok(json!({ "models": [], "source": "static" })),
+            Ok(out)
+        } else {
+            let mut out = json!({ "models": [], "source": "static" });
+            if let Some(warning) = resolved.warning {
+                out["warning"] = Value::String(warning);
+            }
+            Ok(out)
         }
     }
 

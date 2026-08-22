@@ -71,9 +71,19 @@ fn no_version() -> String {
     String::new()
 }
 
-/// auggie source: the rich CLI fetch already backing `models.list`
-/// (discovery via `resolve_auggie_bin` — registry sources are plain fns with
-/// no `Services` handle, so the `auggie_bin` test seam is unavailable here).
+/// Auggie catalog wire-shape version. Bump when daemon-side filtering or
+/// metadata projection changes so persisted rows from the old shape cannot be
+/// served indefinitely by the last-good cache.
+pub(crate) const AUGGIE_CATALOG_VERSION: &str = "preserve-legacy-v1";
+
+fn auggie_catalog_version() -> String {
+    AUGGIE_CATALOG_VERSION.to_string()
+}
+
+/// Auggie registry source. The models.list handler uses its Services-aware
+/// fetch so tests and configured binaries keep working; this plain function is
+/// retained for registry uniformity while the entry supplies the shared cache
+/// version key and remains usable by registry-level consumers.
 fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
         match crate::agent_ops::fetch_auggie_models_rich(None).await {
@@ -202,7 +212,7 @@ fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
 static SOURCES: &[ModelSource] = &[
     ModelSource {
         provider_id: "auggie",
-        version_key: no_version,
+        version_key: auggie_catalog_version,
         fetch: auggie_fetch,
     },
     ModelSource {

@@ -105,8 +105,10 @@ impl Drop for TempDb {
 /// by [`TempDb`]'s drop) seeding `providers.active = "auggie"`: since
 /// monorepo#3044 there is no positional provider fallback, so tests that
 /// create/delegate agents without an explicit provider or model need a
-/// configured default to resolve to. The path override makes the provider
-/// available without depending on a host-installed Auggie binary.
+/// configured default to resolve to. The `providers.paths` override points
+/// auggie at a deterministic executable so availability checks
+/// (`agent.delegate`) pass without the real binary on the test host
+/// (monorepo#3162).
 pub(crate) fn test_registry_with_default_provider(
     tmp: &TempDb,
 ) -> std::sync::Arc<crate::SettingsRegistry> {
@@ -30331,7 +30333,7 @@ mod default_provider_self_heal {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![
                 serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
                 serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5", "isDefault": true }),
@@ -30370,7 +30372,7 @@ mod default_provider_self_heal {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![
                 serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
                 serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5" }),
@@ -30394,7 +30396,7 @@ mod default_provider_self_heal {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![serde_json::json!({ "id": "grok:foo", "name": "Foreign", "isDefault": true })],
         );
 
@@ -30415,7 +30417,7 @@ mod default_provider_self_heal {
         let (_tmp2, svc2) = setup().await;
         svc2.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![serde_json::json!({ "id": "auggie:sonnet5", "isDefault": true })],
         );
         let result = svc2

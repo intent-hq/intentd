@@ -61,7 +61,7 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
 fn seed_catalog_with_default(svc: &Services) {
     svc.models_catalog.store_for_test(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -130,7 +130,7 @@ async fn catalog_without_default_row_falls_through() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     svc.models_catalog.store_for_test(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie" }),
@@ -226,7 +226,7 @@ async fn catalog_default_model_suppresses_the_settings_default_effort() {
     let (_t, svc, ws, _spec, _cfg) = setup().await;
     svc.models_catalog.store_for_test(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                      "effortLevels": ["low", "high"], "isDefault": true }),
