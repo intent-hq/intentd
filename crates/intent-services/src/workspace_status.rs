@@ -498,8 +498,11 @@ pub(crate) struct AttentionSignals {
 /// `state`/`last_snapshot` columns: no forge calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MonitorPrSignals {
-    /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR that
-    /// the forge reports mergeable — the `pr_ready` mapping.
+    /// An ACTIVE monitor's last snapshot shows an open (non-draft) PR whose
+    /// full merge-requirements checklist is clear — truly mergeable, not
+    /// merely conflict-free (see
+    /// [`crate::pr_monitor::fold_monitor_pr_signals`]) — the `pr_ready`
+    /// mapping.
     pub(crate) ready: bool,
     /// An ACTIVE monitor's last snapshot shows an open or draft PR.
     pub(crate) open: bool,
@@ -526,15 +529,20 @@ pub(crate) struct MonitorPrSignals {
 ///    ([`Services::workspace_is_waiting`]).
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
-///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+///    `pr_ready` only when truly mergeable (`mergeable == Some(true)` AND
+///    `mergeable_state == "clean"`, not draft), else `pr_open`. GitHub's
+///    `mergeable` flag alone only means "no merge conflicts" — a PR blocked
+///    by required checks or reviews still reports `mergeable: true` — so a
+///    missing/unknown `mergeable_state` conservatively reads `pr_open`.
 ///    An ACTIVE PR monitor whose last snapshot shows an open/draft PR
-///    (`monitor_prs`) is the same rung: `pr_ready` when the snapshot says
-///    mergeable and not draft, else `pr_open` — so a workspace watching an
-///    open PR (including cross-repo) never falls through to
-///    `complete`/`idle`. When none of those carries an open/draft entry but
-///    the workspace `prStatus` column is `Open`/`Draft`, that column is the
-///    fallback PR-stage signal and yields `pr_open` (never `pr_ready`: the
-///    column carries no mergeable info).
+///    (`monitor_prs`) is the same rung: `pr_ready` when the snapshot's full
+///    merge-requirements checklist is clear and the PR is not draft, else
+///    `pr_open` — so a workspace watching an open PR (including cross-repo)
+///    never falls through to `complete`/`idle`. When none of those carries
+///    an open/draft entry but the workspace `prStatus` column is
+///    `Open`/`Draft`, that column is the fallback PR-stage signal and
+///    yields `pr_open` (never `pr_ready`: the column carries no mergeable
+///    info).
 /// 5. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
 /// 6. Latest PR (linked, else most recently updated entry) merged — or
@@ -603,7 +611,11 @@ fn compute_base_display_status(
     });
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
-        return if pr.mergeable == Some(true) && !draft {
+        // `mergeable` alone only rules out conflicts; only a "clean"
+        // `mergeable_state` means the forge would actually accept the merge
+        // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
+        let clean = pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("clean");
+        return if clean && !draft {
             WorkspaceDisplayStatus::PrReady
         } else {
             WorkspaceDisplayStatus::PrOpen
@@ -828,6 +840,7 @@ mod display_status {
         );
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
         assert_eq!(
             compute_display_status(sig(false), true, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::InProgress
@@ -853,6 +866,7 @@ mod display_status {
         );
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
         assert_eq!(
             compute_display_status(sig(true), false, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
@@ -926,6 +940,7 @@ mod display_status {
         // task rollup.
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
         for (signals, expected) in [
             (failed(), WorkspaceDisplayStatus::Failed),
             (blocked(), WorkspaceDisplayStatus::Blocked),
@@ -964,6 +979,7 @@ mod display_status {
         // stages and complete are untouched.
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
         assert_eq!(
             compute_display_status(sig(false), false, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::PrReady
@@ -983,6 +999,7 @@ mod display_status {
     fn open_active_pr_mergeable_is_pr_ready() {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
+        open.mergeable_state = Some("clean".into());
         assert_eq!(
             compute_display_status(
                 sig(false),
@@ -996,6 +1013,31 @@ mod display_status {
         );
     }
 
+    /// Regression (observed with intent-hq/intentd#1350): GitHub reports
+    /// `mergeable: true` for a PR still blocked by required checks or
+    /// reviews — only `mergeable_state == "clean"` reads as truly
+    /// mergeable. Any other or missing state derives `pr_open`.
+    #[test]
+    fn open_active_pr_mergeable_but_not_clean_is_pr_open() {
+        for state in ["blocked", "behind", "dirty", "unstable", "unknown"] {
+            let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+            open.mergeable = Some(true);
+            open.mergeable_state = Some(state.into());
+            assert_eq!(
+                compute_display_status(sig(false), false, Some(&open), &[], None, None),
+                WorkspaceDisplayStatus::PrOpen,
+                "mergeable_state {state}"
+            );
+        }
+        // Absent `mergeable_state` is conservative too: never `pr_ready`.
+        let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        open.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&open), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
     #[test]
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
@@ -1005,12 +1047,14 @@ mod display_status {
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
+        draft.mergeable_state = Some("clean".into());
         assert_eq!(
             compute_display_status(sig(false), false, Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
+        flagged.mergeable_state = Some("clean".into());
         flagged.is_draft = Some(true);
         assert_eq!(
             compute_display_status(sig(false), false, Some(&flagged), &[], None, None),
@@ -1065,6 +1109,7 @@ mod display_status {
         );
         let mut ready = open;
         ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
         let list = vec![merged.clone(), ready];
         assert_eq!(
             compute_display_status(
@@ -1084,6 +1129,7 @@ mod display_status {
         let stale = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
         let mut fresh = pr(PullRequestStatus::Open, "2026-01-05T00:00:00Z");
         fresh.mergeable = Some(true);
+        fresh.mergeable_state = Some("clean".into());
         let list = vec![stale, fresh];
         assert_eq!(
             compute_display_status(sig(false), false, None, &list, None, None),
@@ -1254,6 +1300,7 @@ mod display_status {
     fn pr_info_objects_take_precedence_over_pr_status() {
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
         assert_eq!(
             compute_display_status(
                 sig(false),
