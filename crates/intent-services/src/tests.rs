@@ -30333,7 +30333,7 @@ mod default_provider_self_heal {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![
                 serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
                 serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5", "isDefault": true }),
@@ -30372,7 +30372,7 @@ mod default_provider_self_heal {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![
                 serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
                 serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5" }),
@@ -30396,7 +30396,7 @@ mod default_provider_self_heal {
         let (_tmp, svc) = setup().await;
         svc.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![serde_json::json!({ "id": "grok:foo", "name": "Foreign", "isDefault": true })],
         );
 
@@ -30417,7 +30417,7 @@ mod default_provider_self_heal {
         let (_tmp2, svc2) = setup().await;
         svc2.models_catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![serde_json::json!({ "id": "auggie:sonnet5", "isDefault": true })],
         );
         let result = svc2
