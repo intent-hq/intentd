@@ -92,7 +92,6 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
         }
     }
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    log.lock().unwrap().push(path.to_string());
     let (status, body) = match routes.lock().unwrap().get(path) {
         Some(body) => ("200 OK", body.clone()),
         None => ("404 Not Found", b"not found".to_vec()),
@@ -103,6 +102,11 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
         body.len()
     );
     let _ = stream.write_all(&body);
+    // Log only after the response is fully written: a logged request proves
+    // its handler already read the route table, so a test that waits on the
+    // log and then swaps a route knows the swap cannot have been seen by
+    // that request.
+    log.lock().unwrap().push(path.to_string());
 }
 
 /// A base URL whose port refuses requests (network down).
@@ -878,6 +882,296 @@ fn install_log_contract_spawn_failure_line_is_emitted_verbatim() {
          no longer emits — update both scripts and INSTALL_LOG_CONTRACT in \
          lockstep; stderr: {stderr}"
     );
+}
+
+/// The crash-loop self-heal (intent-hq/monorepo#3191): a daemon stuck in a
+/// crash loop must force off-schedule channel re-checks so a fixed build
+/// published on the channel is installed and respawned — without waiting
+/// out the periodic schedule (12–24h in production, disabled here) and
+/// without any give-up in play. Before the fix the sitter only re-ran the
+/// startup check's version forever, so this test wedges until timeout.
+#[test]
+fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(7));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    // Periodic checks disabled (hour-long interval) and give-up out of
+    // reach: only the failed-start re-check can find the fix.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "200")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "10000")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+
+    // Wait for the startup check plus at least one failed-start re-check
+    // against the still-broken manifest, so the fix below is definitely
+    // found by a re-check and not by the startup check.
+    wait_until(
+        "a failed-start re-check against the 0.1.0 manifest",
+        Duration::from_secs(15),
+        || read_or_empty(&log_path).contains("run") && requests.lock().unwrap().len() >= 2,
+    );
+
+    // Publish fixed 0.2.0; the crash loop's next re-check must install it.
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(20), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must still be supervising after self-healing"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        !stderr.contains("giving up"),
+        "self-heal must not go through give-up: {stderr}"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+}
+
+/// The give-up half of #3191: when the failure count reaches the give-up
+/// threshold, the final failure's re-check runs first — a fix published on
+/// the channel is installed and respawned instead of the sitter wedging
+/// itself with a give-up exit. Before the fix the sitter gave up here.
+#[test]
+fn fix_published_at_the_give_up_threshold_heals_instead_of_giving_up() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(9));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    // The 1s backoff after the first crash is the window in which the test
+    // publishes the fix, so the second (= threshold) failure's re-check
+    // deterministically sees 0.2.0.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(BACKOFF_INITIAL_ENV, "1000")
+        .env(BACKOFF_CAP_ENV, "2000")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "2")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+
+    // Startup check + the first failure's re-check both saw 0.1.0: the fix
+    // is published strictly between failure 1 and failure 2.
+    wait_until(
+        "the first failure's re-check against the 0.1.0 manifest",
+        Duration::from_secs(15),
+        || read_or_empty(&log_path).contains("run") && requests.lock().unwrap().len() >= 2,
+    );
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+
+    // Failure 2 hits the threshold, but its re-check finds and installs
+    // 0.2.0: the sitter must respawn it, not give up.
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(20), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive: a published fix beats the give-up"
+    );
+    let runs = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 2, "0.1.0 must have failed exactly twice");
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        !stderr.contains("giving up"),
+        "a healed crash loop must never give up: {stderr}"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+}
+
+/// Give-up still works when there is genuinely no fix: with a reachable
+/// channel that keeps answering "0.1.0 is current", every failed start
+/// re-checks (startup + one per failure) and the sitter still gives up at
+/// the threshold with exit 0 — the re-checks must not reset the counter.
+#[test]
+fn give_up_still_fires_when_the_recheck_confirms_no_newer_version() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(9));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "4")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an unfixable crash loop must still give up with exit 0"
+    );
+
+    let runs = read_or_empty(&daemon_log_path(dir.path()))
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 4, "must stop at the give-up threshold");
+    // Startup check + one re-check per failed start: last_check_at keeps
+    // moving while crash-looping, so the stall is diagnosable.
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        5,
+        "expected the startup check plus one re-check per failure"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("failed 4 times in a row")
+            && stderr.contains("giving up instead of respawning it forever"),
+        "stderr: {stderr}"
+    );
+    let state = state::load(&paths.state_path);
+    assert!(
+        state.last_check_at.is_some(),
+        "re-checks must persist the check schedule"
+    );
+}
+
+/// Same self-heal for the spawn-failure arm: a binary that exists but can
+/// never be spawned must also trigger failed-start re-checks and pick up a
+/// published fix.
+#[test]
+fn spawn_failure_loop_self_heals_when_the_channel_publishes_a_fix() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Preinstall, then strip the exec bit: the binary exists (so the
+    // startup check stays AlreadyCurrent) but cannot be spawned.
+    preinstall(&paths, "0.1.0", &crash_script(3));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = paths.daemon_binary("0.1.0");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "200")
+        .env(BACKOFF_RESET_ENV, "60000")
+        .env(GIVE_UP_AFTER_ENV, "10000")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let stderr = stderr_path(dir.path());
+    wait_until(
+        "a failed-spawn re-check against the 0.1.0 manifest",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&stderr).contains("failed to spawn")
+                && requests.lock().unwrap().len() >= 2
+        },
+    );
+
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(20), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must still be supervising after self-healing"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
 }
 
 #[test]
