@@ -47,6 +47,7 @@ pub struct PiCliStatus {
 /// scan mirroring the pi-acp child's PATH, or direct validation for explicit
 /// paths), then run `--version` with a short timeout. Blocking (subprocess
 /// wait) — call from a blocking context.
+#[must_use]
 pub fn probe_pi_cli() -> PiCliStatus {
     let command = resolve_real_pi_command();
     let resolved_path = intent_providers::find_pi_cli(&command);
@@ -83,7 +84,7 @@ fn is_relative_with_separator(command: &str) -> bool {
 /// verdict (Missing / known-too-old) is a clear, user-facing error naming
 /// the found version, the requirement, and the pi-acp pin
 /// ([`intent_providers::pi_gate_reason`]); Unknown proceeds with a WARN
-/// (version_gate.rs policy). Pure over the status — unit-testable without a
+/// (`version_gate.rs` policy). Pure over the status — unit-testable without a
 /// real probe.
 pub(crate) fn check_pi_cli_for_spawn(status: &PiCliStatus) -> crate::Result<()> {
     if let Some(reason) = intent_providers::pi_gate_reason(&status.gate) {

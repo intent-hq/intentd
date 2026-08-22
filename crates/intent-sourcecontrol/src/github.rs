@@ -8,13 +8,20 @@
 //! `errors` mapped onto [`Error::Api`]), so [`graphql_data`] only guards
 //! against a `null` payload.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::model::*;
+use crate::model::{
+    AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
+    NewPullRequest, Page, PageParams, PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, Repo,
+    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
+    ReviewVerdict, RollupCheck, ScCapabilities, UserIdentity,
+};
 use crate::SourceControl;
 
 /// Bounded TCP connect wait for every octocrab request. Without these
@@ -35,6 +42,10 @@ pub struct GitHubSourceControl {
 impl GitHubSourceControl {
     /// Build a client from a personal token, optionally targeting a GitHub
     /// Enterprise instance via `api_base_url` (`octocrab` `.base_uri(...)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the octocrab client cannot be built (e.g. an invalid `api_base_url`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
         let mut builder = octocrab::Octocrab::builder()
             .personal_token(token.to_string())
@@ -83,7 +94,7 @@ fn rest_page(cursor: Option<&str>) -> u64 {
 
 /// Per-page size sent to GitHub for a requested `limit` (`1..=100`).
 fn rest_per_page(limit: u8) -> u64 {
-    limit.clamp(1, REST_MAX_PER_PAGE) as u64
+    u64::from(limit.clamp(1, REST_MAX_PER_PAGE))
 }
 
 /// The next REST cursor when the fetched page filled the per-page window — the
@@ -122,8 +133,8 @@ fn page_full_set<T>(all: Vec<T>, page: u64, per_page: u64) -> Page<T> {
     let has_more = (all.len() as u64) > page.saturating_mul(per_page);
     let items = all
         .into_iter()
-        .skip(offset as usize)
-        .take(per_page as usize)
+        .skip(usize::try_from(offset).expect("value fits in usize"))
+        .take(usize::try_from(per_page).expect("value fits in usize"))
         .collect();
     Page {
         items,
@@ -133,9 +144,8 @@ fn page_full_set<T>(all: Vec<T>, page: u64, per_page: u64) -> Page<T> {
 
 // --- JSON → model mapping (pure; unit-tested with fixtures) ---
 
-fn login_of(user: &Option<dto::User>) -> String {
-    user.as_ref()
-        .and_then(|u| u.login.clone())
+fn login_of(user: Option<&dto::User>) -> String {
+    user.and_then(|u| u.login.clone())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -157,7 +167,7 @@ pub(crate) fn derive_check_state(status: &str, conclusion: Option<&str>) -> Chec
     }
     match conclusion {
         Some("success") => CheckState::Success,
-        Some("neutral") | Some("skipped") => CheckState::Neutral,
+        Some("neutral" | "skipped") => CheckState::Neutral,
         Some("cancelled") => CheckState::Cancelled,
         _ => CheckState::Failure,
     }
@@ -198,7 +208,7 @@ pub(crate) fn map_pull(value: Value) -> Result<PullRequest> {
         draft: p.draft,
         source_branch,
         target_branch: p.base.and_then(|r| r.r#ref).unwrap_or_default(),
-        author: login_of(&p.user),
+        author: login_of(p.user.as_ref()),
         mergeable: p.mergeable,
         mergeable_state: p.mergeable_state,
         head_sha,
@@ -344,7 +354,7 @@ pub(crate) fn build_issue_search_query(
 ) -> String {
     let mut q = format!("is:issue repo:{}/{}", repo.owner, repo.name);
     if matches!(state, "open" | "closed") {
-        q.push_str(&format!(" state:{state}"));
+        let _ = write!(q, " state:{state}");
     }
     for label in labels
         .unwrap_or_default()
@@ -352,7 +362,7 @@ pub(crate) fn build_issue_search_query(
         .map(str::trim)
         .filter(|l| !l.is_empty())
     {
-        q.push_str(&format!(" label:\"{}\"", label.replace('"', "")));
+        let _ = write!(q, " label:\"{}\"", label.replace('"', ""));
     }
     let text = sanitize_search_text(search);
     if !text.is_empty() {
@@ -388,7 +398,7 @@ pub(crate) fn build_repo_search_query(input: &str) -> String {
 pub(crate) fn map_review(value: Value) -> Result<Review> {
     let r: dto::Review = serde_json::from_value(value)?;
     Ok(Review {
-        author: login_of(&r.user),
+        author: login_of(r.user.as_ref()),
         verdict: verdict_from_state(r.state.as_deref().unwrap_or_default()),
         body: r.body,
         submitted_at: r.submitted_at.unwrap_or_default(),
@@ -399,7 +409,7 @@ pub(crate) fn map_issue_comment(value: Value) -> Result<Comment> {
     let c: dto::IssueComment = serde_json::from_value(value)?;
     Ok(Comment {
         id: c.id.to_string(),
-        author: login_of(&c.user),
+        author: login_of(c.user.as_ref()),
         body: c.body.unwrap_or_default(),
         path: None,
         line: None,
@@ -415,7 +425,7 @@ pub(crate) fn map_review_comment(value: Value) -> Result<ReviewComment> {
         body: c.body.unwrap_or_default(),
         path: c.path.unwrap_or_default(),
         line: c.line,
-        author: login_of(&c.user),
+        author: login_of(c.user.as_ref()),
         created_at: c.created_at.unwrap_or_default(),
         updated_at: c.updated_at.unwrap_or_default(),
         in_reply_to_id: c.in_reply_to_id,
@@ -457,7 +467,7 @@ pub(crate) fn map_review_thread(value: Value) -> Result<ReviewThread> {
         .map(|c| ReviewThreadComment {
             id: c.id.unwrap_or_default(),
             body: c.body.unwrap_or_default(),
-            author: login_of(&c.author),
+            author: login_of(c.author.as_ref()),
             path: c.path.unwrap_or_default(),
             line: c.line,
             created_at: c.created_at.unwrap_or_default(),
@@ -517,9 +527,11 @@ fn encode_path_segments(path: &str) -> String {
     for byte in path.bytes() {
         match byte {
             b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
+                out.push(byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out
@@ -698,7 +710,7 @@ mod dto {
     }
 }
 
-const REVIEW_DECISION_QUERY: &str = r#"
+const REVIEW_DECISION_QUERY: &str = r"
 query GetReviewDecision($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
@@ -706,7 +718,7 @@ query GetReviewDecision($owner: String!, $repo: String!, $prNumber: Int!) {
     }
   }
 }
-"#;
+";
 
 /// Map the GraphQL `reviewDecision` payload to [`ReviewDecision`]. GitHub
 /// reports `null` when the base branch has no review requirement; that (or
@@ -729,7 +741,7 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
 /// probe, and a monitor diffing two truncated pages can report phantom
 /// "check removed" lines for whatever fell off. Paginating `contexts` is the
 /// complete fix if that ceiling is ever hit in practice.
-const MERGE_REQUIREMENTS_QUERY: &str = r#"
+const MERGE_REQUIREMENTS_QUERY: &str = r"
 query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
@@ -765,7 +777,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
     }
   }
 }
-"#;
+";
 
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
 /// commit on the PR is its head).
@@ -783,7 +795,7 @@ fn derive_status_context_state(state: &str) -> CheckState {
 }
 
 /// Map one `statusCheckRollup.contexts` node onto a [`RollupCheck`]. GraphQL
-/// `CheckRun` carries `status`/`conclusion` in SCREAMING_SNAKE_CASE (unlike
+/// `CheckRun` carries `status`/`conclusion` in `SCREAMING_SNAKE_CASE` (unlike
 /// the lowercase REST payload [`derive_check_state`] expects), so the values
 /// are lowercased before mapping; `StatusContext` uses the legacy `state`.
 fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
@@ -850,7 +862,7 @@ fn map_branch_rules(value: &Value) -> BranchRules {
                     .and_then(|p| p.get("required_approving_review_count"))
                     .and_then(Value::as_u64)
                 {
-                    let count = count as u32;
+                    let count = u32::try_from(count).unwrap_or(u32::MAX);
                     rules.required_approving_review_count = Some(
                         rules
                             .required_approving_review_count
@@ -885,7 +897,7 @@ fn map_branch_rules(value: &Value) -> BranchRules {
     rules
 }
 
-const REVIEW_THREADS_QUERY: &str = r#"
+const REVIEW_THREADS_QUERY: &str = r"
 query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
@@ -902,7 +914,7 @@ query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first:
     }
   }
 }
-"#;
+";
 
 #[async_trait]
 impl SourceControl for GitHubSourceControl {
@@ -1173,7 +1185,7 @@ impl SourceControl for GitHubSourceControl {
             Some(PrState::Open) => {
                 body.insert("state".into(), json!("open"));
             }
-            Some(PrState::Closed) | Some(PrState::Merged) => {
+            Some(PrState::Closed | PrState::Merged) => {
                 body.insert("state".into(), json!("closed"));
             }
             None => {}
@@ -1428,7 +1440,7 @@ impl SourceControl for GitHubSourceControl {
         page: PageParams,
     ) -> Result<Page<ReviewThread>> {
         // GraphQL caps `first` at 100; the cursor is the native `endCursor`.
-        let first = page.limit.clamp(1, 100) as i64;
+        let first = i64::from(page.limit.clamp(1, 100));
         let after = page.cursor.clone();
         let payload = json!({
             "query": REVIEW_THREADS_QUERY,
@@ -1577,7 +1589,7 @@ impl GitHubSourceControl {
         extract: impl Fn(Value) -> Value,
         map: impl Fn(Value) -> Result<T>,
     ) -> Result<Vec<T>> {
-        let per_page = REST_MAX_PER_PAGE as u64;
+        let per_page = u64::from(REST_MAX_PER_PAGE);
         let mut page = 1u64;
         let mut out = Vec::new();
         loop {
@@ -2119,14 +2131,14 @@ mod tests {
     fn maps_user_identity_and_omits_credentials() {
         let u = map_user_identity(json!({
             "login": "octocat",
-            "id": 583231,
+            "id": 583_231,
             "name": "The Octocat",
             "avatar_url": "https://avatars.githubusercontent.com/u/583231",
             "html_url": "https://github.com/octocat"
         }))
         .unwrap();
         assert_eq!(u.login, "octocat");
-        assert_eq!(u.id, Some(583231));
+        assert_eq!(u.id, Some(583_231));
         let wire = serde_json::to_value(&u).unwrap();
         assert_eq!(wire["login"], "octocat");
         assert_eq!(

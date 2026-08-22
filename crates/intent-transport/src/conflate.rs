@@ -432,7 +432,7 @@ impl Conflate for ChatItem {
 fn text_delta_of(entity: &Value) -> Option<&str> {
     let block = entity.get("block")?;
     match block.get("type").and_then(Value::as_str) {
-        Some("text") | Some("thinking") => block.get("textDelta").and_then(Value::as_str),
+        Some("text" | "thinking") => block.get("textDelta").and_then(Value::as_str),
         _ => None,
     }
 }

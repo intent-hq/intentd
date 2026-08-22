@@ -6,7 +6,7 @@
 //! aggregated wake over WSS with both children's summaries.
 //!
 //! Coverage:
-//! - Delegation groups persist to SQLite (write-through)
+//! - Delegation groups persist to `SQLite` (write-through)
 //! - Groups rehydrate on `agent.resolveInterrupted` with sealed=true
 //! - Pre-restart completions survive restart
 //! - Aggregated wake fires exactly once with both summaries
@@ -62,7 +62,7 @@ impl Drop for Daemon {
             // `<data_dir>/intentd.<date>.log` after the TempDir sweep,
             // leaving `itd-delgrp-*` residue under /tmp.
             let descendants = descendant_pids(self.child.id());
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
             let _ = self.child.wait();
             for &d in &descendants {
@@ -159,7 +159,7 @@ fn descendant_pids(root: u32) -> Vec<i32> {
         );
     }
     let mut pids = Vec::new();
-    let mut queue = vec![root as i32];
+    let mut queue = vec![root.cast_signed()];
     let mut seen: std::collections::HashSet<i32> = queue.iter().copied().collect();
     while let Some(parent) = queue.pop() {
         for &(pid, ppid) in &table {
@@ -323,7 +323,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -347,13 +347,13 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
 }
 
-/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// Short base under /tmp (UDS `SUN_LEN` cap); the returned guard removes the
 /// dir on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
 fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-delgrp-")
@@ -434,37 +434,21 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Increment 6: full restart scenario - wait for the aggregated wake with both reports.
 #[tokio::test]
 async fn baseline_plus_aggregated_wake() {
-    let Some(script) = gate("WSS after_all baseline (no restart)") else {
-        return;
-    };
-
-    let data_dir_guard = temp_data_dir();
-    let data_dir = data_dir_guard.path().to_path_buf();
-    let ws_id = seed_workspace_only(&data_dir).await;
     const CHILD_A: &str = "WAKE1_CHILD_ALPHA";
     const CHILD_B: &str = "WAKE1_CHILD_BETA";
     const REPORT_A: &str = "REPORT_ALPHA finished the alpha task";
     const REPORT_B: &str = "REPORT_BETA finished the beta task";
     const PARENT_GO: &str = "WAKE1_PARENT_GO";
-    let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
-    let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
-    let delegate_a_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
-        json!(CHILD_A),
-    );
-    let delegate_b_js = format!(
-        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
-        json!(CHILD_B),
-    );
-
-    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
-    // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
-    // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
-    // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
-    // the correct delayMs for child2.
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+                                    // DETERMINISTIC CHILD2 DELAY: daemon1 gets child2 delay=60000ms (1 minute)
+                                    // so child2 cannot complete before the kill (~15s into test). Daemon2 gets
+                                    // delay=0ms so child2 completes quickly and fires the aggregated wake post-restart.
+                                    // Build TWO behavior JSONs, one per daemon, so each daemon's mock agent sees
+                                    // the correct delayMs for child2.
     fn build_behavior(
         child2_delay_ms: u64,
         report_a_js: &str,
@@ -514,6 +498,23 @@ async fn baseline_plus_aggregated_wake() {
         })
         .to_string()
     }
+    let Some(script) = gate("WSS after_all baseline (no restart)") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let report_a_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_A));
+    let report_b_js = format!("return await ws.agent.reportToParent({});", json!(REPORT_B));
+    let delegate_a_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!(CHILD_A),
+    );
+    let delegate_b_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'after_all', model: 'mock:default' }});",
+        json!(CHILD_B),
+    );
 
     let behavior_daemon1 = build_behavior(
         60000,
@@ -530,14 +531,15 @@ async fn baseline_plus_aggregated_wake() {
         ("RUST_LOG", "intent_services=info"),
     ];
     let child = spawn_serve(&data_dir, "both", &env_daemon1);
-    let _daemon = Daemon {
+    let daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -700,7 +702,7 @@ async fn baseline_plus_aggregated_wake() {
     eprintln!("Killing daemon1 and all mock processes...");
     drop(sub);
     drop(rpc);
-    drop(_daemon);
+    drop(daemon);
     tokio::time::sleep(Duration::from_millis(500)).await;
     eprintln!("Daemon1 killed.");
 
@@ -709,7 +711,7 @@ async fn baseline_plus_aggregated_wake() {
         .await
         .expect("open store for inspection");
     let groups = store
-        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.to_string()))
+        .list_undelivered_groups(&intent_core::WorkspaceId(ws_id.clone()))
         .await
         .expect("list undelivered groups");
     assert_eq!(groups.len(), 1, "exactly one delegation group persisted");
@@ -757,7 +759,8 @@ async fn baseline_plus_aggregated_wake() {
 
     // Get daemon2 port + fingerprint
     let status2 = common::await_wss_status(&socket).await;
-    let port2 = status2["result"]["port"].as_u64().expect("port2") as u16;
+    let port2 = u16::try_from(status2["result"]["port"].as_u64().expect("port2"))
+        .expect("value fits in u16");
     let fp2 = status2["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint2")
@@ -792,7 +795,7 @@ async fn baseline_plus_aggregated_wake() {
         store
             .insert_interrupted_agent(
                 &AgentId(child2_id.clone()),
-                &WorkspaceId(ws_id.to_string()),
+                &WorkspaceId(ws_id.clone()),
                 "active",
                 &now_iso(),
             )
@@ -848,11 +851,11 @@ async fn baseline_plus_aggregated_wake() {
         match ev["type"].as_str() {
             Some("agent:stream:activity") => {
                 wake_chunks += 1;
-                eprintln!("  parent stream:activity (wake_chunks={})", wake_chunks);
+                eprintln!("  parent stream:activity (wake_chunks={wake_chunks})");
             }
             Some("agent:stream:end") => {
                 wake_ends += 1;
-                eprintln!("  parent stream:end (wake_ends={})", wake_ends);
+                eprintln!("  parent stream:end (wake_ends={wake_ends})");
             }
             Some("agent:idle") => {
                 parent_idle_again = true;
@@ -891,20 +894,16 @@ async fn baseline_plus_aggregated_wake() {
     let wake = wakes[0];
     assert!(
         wake.contains(REPORT_A),
-        "wake must contain child1 report ({}): wake={}",
-        REPORT_A,
-        wake
+        "wake must contain child1 report ({REPORT_A}): wake={wake}"
     );
     assert!(
         wake.contains(REPORT_B),
-        "wake must contain child2 report ({}): wake={}",
-        REPORT_B,
-        wake
+        "wake must contain child2 report ({REPORT_B}): wake={wake}"
     );
     eprintln!("✓ Aggregated wake delivered successfully post-restart!");
     eprintln!("✓ Exactly ONE wake fired after both children settled (pre+post restart)");
-    eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_A);
-    eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_B);
+    eprintln!("✓ Wake payload contains BOTH child reports: {REPORT_A}");
+    eprintln!("✓ Wake payload contains BOTH child reports: {REPORT_B}");
     eprintln!("✓ STAB-108: conservative reconciliation predicate prevented premature group firing");
     eprintln!("✓ STAB-108: startup rehydration sweep loaded the undelivered group");
     eprintln!(

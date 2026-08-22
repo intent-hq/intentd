@@ -81,7 +81,7 @@ impl<T: Copy + PartialEq> LastObservedCache<T> {
     /// intervened. A poisoned lock returns `u64::MAX` (never matches a live
     /// generation, and the write path bails on the poisoned lock anyway).
     fn generation(&self) -> u64 {
-        self.0.lock().map(|g| g.evictions).unwrap_or(u64::MAX)
+        self.0.lock().map_or(u64::MAX, |g| g.evictions)
     }
 
     /// Seed the baseline when absent (read paths): records the first
@@ -163,7 +163,17 @@ impl Services {
     /// cache when absent so the first post-read mutation compares against
     /// this baseline (a seed never emits; see
     /// [`Services::maybe_emit_display_status_changed`]).
-    pub(crate) async fn enrich_display_status(&self, ws: &mut Workspace) {
+    ///
+    /// `sessions` — the workspace's session summaries when the caller already
+    /// fetched them (the aggregate enrichment path does, for `agentSummary` /
+    /// `lastActivity`); passed through to the attention probe so the hot
+    /// list/get emit never re-issues the same per-workspace session query
+    /// (monorepo#3058). `None` lets the probe fetch its own.
+    pub(crate) async fn enrich_display_status(
+        &self,
+        ws: &mut Workspace,
+        sessions: Option<&[intent_core::AgentSession]>,
+    ) {
         // The orthogonal `waiting` flag rides the same emit path but is
         // independent of the `taskStats` gate below: it is populated even
         // when a transient notes-read failure leaves `displayStatus` absent.
@@ -173,18 +183,17 @@ impl Services {
         // list/get reads cost one in-memory lookup, no per-row store
         // fan-out); only a cache miss — first touch after startup — probes
         // the store and seeds the `workspace:waiting-changed` baseline.
-        ws.waiting = match self.last_waiting_statuses.get(&ws.id) {
-            Some(waiting) => waiting,
-            None => {
-                // Pre-read generation snapshot: a `workspace.delete`
-                // eviction racing the probe must not have this seed
-                // resurrect the baseline.
-                let waiting_generation = self.last_waiting_statuses.generation();
-                let waiting = self.workspace_is_waiting(&ws.id).await;
-                self.last_waiting_statuses
-                    .seed(&ws.id, waiting, waiting_generation);
-                waiting
-            }
+        ws.waiting = if let Some(waiting) = self.last_waiting_statuses.get(&ws.id) {
+            waiting
+        } else {
+            // Pre-read generation snapshot: a `workspace.delete`
+            // eviction racing the probe must not have this seed
+            // resurrect the baseline.
+            let waiting_generation = self.last_waiting_statuses.generation();
+            let waiting = self.workspace_is_waiting(&ws.id).await;
+            self.last_waiting_statuses
+                .seed(&ws.id, waiting, waiting_generation);
+            waiting
         };
         if ws.task_stats.is_none() {
             return;
@@ -200,7 +209,8 @@ impl Services {
         // agent-monitored PRs DO feed the PR rungs: an active monitor on an
         // open PR (including cross-repo) reads as an open-PR signal.
         let display_status = compute_display_status(
-            self.workspace_attention_signals(&ws.id, ws.attention).await,
+            self.workspace_attention_signals(&ws.id, ws.attention, sessions)
+                .await,
             ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
@@ -261,7 +271,7 @@ impl Services {
         };
         let task_stats = compute_task_stats(&notes);
         let signals = self
-            .workspace_attention_signals(workspace_id, ws.attention)
+            .workspace_attention_signals(workspace_id, ws.attention, None)
             .await;
         // Wait signals (hooks/subscriptions) do not fold into the promotion
         // — they surface as the orthogonal `waiting` flag on the read paths
@@ -286,7 +296,7 @@ impl Services {
         };
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 display_status_changed_event(workspace_id, status),
             )
             .await;
@@ -335,7 +345,7 @@ impl Services {
         };
         if transitioned {
             publish_event(
-                &self.event_bus,
+                self.event_bus.as_ref(),
                 waiting_changed_event(workspace_id, waiting),
             )
             .await;
@@ -394,17 +404,31 @@ impl Services {
     /// store read failure fails open — session-derived signals read `false`
     /// (and `question_hold_active` fails open itself) so list/get emission
     /// is never wedged; the flag-derived signal needs no store read.
+    ///
+    /// `sessions` — the workspace's session summaries when the caller already
+    /// fetched them (the list/get enrichment path does); avoids re-issuing
+    /// the same per-workspace query on the hot emit path (monorepo#3058).
+    /// `None` fetches fresh summaries.
     pub(crate) async fn workspace_attention_signals(
         &self,
         workspace_id: &WorkspaceId,
         attention: WorkspaceAttention,
+        sessions: Option<&[intent_core::AgentSession]>,
     ) -> AttentionSignals {
         let mut signals = AttentionSignals {
             needs_attention: attention == WorkspaceAttention::ReviewRequired,
             ..AttentionSignals::default()
         };
-        let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
-            return signals;
+        let fetched;
+        let sessions: &[intent_core::AgentSession] = match sessions {
+            Some(sessions) => sessions,
+            None => match self.store.list_agent_session_summaries(workspace_id).await {
+                Ok(list) => {
+                    fetched = list;
+                    &fetched
+                }
+                Err(_) => return signals,
+            },
         };
         let top_level: Vec<_> = sessions
             .iter()
@@ -426,7 +450,21 @@ impl Services {
         }
         if !signals.needs_attention {
             for session in top_level {
-                if self.question_hold_active(&session.id).await {
+                // The summaries already carry the session `metadata`, so a
+                // written pending-questions marker is decided right here with
+                // no extra store read (monorepo#3058) — same derivation as
+                // [`Services::question_hold_active`]. Only pre-upgrade
+                // sessions (marker key never written) fall back to the full
+                // per-session probe, which also materializes the marker.
+                let hold = if session.pending_questions_marker_written() {
+                    match session.pending_questions_message_id() {
+                        Some(pending) => session.dismissed_questions_message_id() != Some(pending),
+                        None => false,
+                    }
+                } else {
+                    self.question_hold_active(&session.id).await
+                };
+                if hold {
                     signals.needs_attention = true;
                     break;
                 }
@@ -661,9 +699,9 @@ fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent 
 }
 
 /// Unit tests for the pure `compute_display_status` derivation (canonical
-/// precedence): failed → blocked → needs_attention → running agent →
+/// precedence): failed → blocked → `needs_attention` → running agent →
 /// active/latest open PR (linked or monitor-signalled) → open tasks →
-/// merged PR → complete/not_started.
+/// merged PR → `complete/not_started`.
 #[cfg(test)]
 mod display_status {
     use intent_core::{
@@ -1244,8 +1282,8 @@ mod display_status {
     /// Monitor-signal shorthand for the tests below.
     fn monitors(open: bool, ready: bool, merged: bool) -> MonitorPrSignals {
         MonitorPrSignals {
-            open,
             ready,
+            open,
             merged,
         }
     }
@@ -1398,7 +1436,7 @@ mod workspace_needs_attention {
 
     /// Probe the session-derived axes with a `None` workspace flag.
     async fn signals(svc: &Services, ws: &WorkspaceId) -> AttentionSignals {
-        svc.workspace_attention_signals(ws, WorkspaceAttention::None)
+        svc.workspace_attention_signals(ws, WorkspaceAttention::None, None)
             .await
     }
 
@@ -1527,11 +1565,11 @@ mod workspace_needs_attention {
         // axis.
         let (svc, ws, _tmp) = setup().await;
         let s = svc
-            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
+            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired, None)
             .await;
         assert!(s.needs_attention);
         let s = svc
-            .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
+            .workspace_attention_signals(&ws, WorkspaceAttention::Unread, None)
             .await;
         assert_eq!(s, AttentionSignals::default());
     }
@@ -1637,12 +1675,81 @@ mod workspace_needs_attention {
             .expect("drop agent_session table");
         assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
         let s = svc
-            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
+            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired, None)
             .await;
         assert!(
             s.needs_attention,
             "flag-derived axes survive a store read failure"
         );
+    }
+
+    /// Caller-supplied session summaries are authoritative (monorepo#3058):
+    /// the probe derives from the given slice with no store re-read, so the
+    /// hot list/get emit path reuses its `agentSummary`/`lastActivity` fetch.
+    /// Proven by dropping the table first — a `None` caller would fail open
+    /// to defaults, while the supplied slice still yields the signals.
+    #[tokio::test]
+    async fn supplied_sessions_skip_the_store_read() {
+        let (svc, ws, _tmp) = setup().await;
+        let mut s = mk_session(&ws, "agent-attn");
+        s.attention_request_kind = Some("blocker".to_string());
+        sqlx::query("DROP TABLE agent_session")
+            .execute(svc.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        let sessions = vec![s];
+        let got = svc
+            .workspace_attention_signals(&ws, WorkspaceAttention::None, Some(&sessions))
+            .await;
+        assert!(
+            got.blocked,
+            "derived from the supplied slice, no store read"
+        );
+    }
+
+    /// A written pending-questions marker on the summary decides the
+    /// question hold inline (monorepo#3058): no per-session store probe, so
+    /// the hold reads correctly even with the message log unavailable. Set
+    /// marker → holds; marker matching the dismissal → no hold; cleared
+    /// (empty-written) marker → no hold and NO tail-walk fallback.
+    #[tokio::test]
+    async fn written_markers_decide_question_hold_without_store_reads() {
+        let (svc, ws, _tmp) = setup().await;
+        let pending = mk_session(&ws, "agent-pending");
+        let mut pending = pending;
+        pending.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): "msg-1"
+        }));
+        let mut resolved = mk_session(&ws, "agent-resolved");
+        resolved.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): "msg-2",
+            (intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY): "msg-2"
+        }));
+        let mut cleared = mk_session(&ws, "agent-cleared");
+        cleared.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): ""
+        }));
+
+        // No sessions/messages persisted at all: every derivation below runs
+        // off the supplied summaries alone.
+        let holds = svc
+            .workspace_attention_signals(
+                &ws,
+                WorkspaceAttention::None,
+                Some(std::slice::from_ref(&pending)),
+            )
+            .await;
+        assert!(holds.needs_attention, "set marker holds");
+        for (name, session) in [("resolved", resolved), ("cleared", cleared)] {
+            let s = svc
+                .workspace_attention_signals(
+                    &ws,
+                    WorkspaceAttention::None,
+                    Some(std::slice::from_ref(&session)),
+                )
+                .await;
+            assert!(!s.needs_attention, "{name} marker must not hold");
+        }
     }
 }
 
@@ -1740,7 +1847,7 @@ mod display_status_events {
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }
 
-    /// A task-completion transition (in_progress → complete over
+    /// A task-completion transition (`in_progress` → complete over
     /// `task.updateNoteStatus`) emits the event with the self-sufficient
     /// `{ workspaceId, displayStatus }` payload.
     #[tokio::test]
@@ -1774,7 +1881,7 @@ mod display_status_events {
     }
 
     /// A task-status change that does not move the derived rollup (a second
-    /// task flipping not_started → in_progress while the rollup is already
+    /// task flipping `not_started` → `in_progress` while the rollup is already
     /// `in_progress`) publishes no displayStatus event.
     #[tokio::test]
     async fn no_op_recompute_stays_silent() {
@@ -1921,7 +2028,7 @@ mod display_status_events {
         // End the run: during the grace window the status stays in_progress
         // (workspace_activity still reports AgentRunning) — no event yet
         // (assert_silent's 300ms watch sits inside the 500ms window).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_silent(&mut sub).await;
 
         // After the debounce window the demotion to idle emits.
@@ -2053,7 +2160,7 @@ mod display_status_events {
 
     /// G2: `agent.update` recomputes when a status-relevant field changes —
     /// flipping the attention-holding agent to `isBackground: true` removes
-    /// it from the needs_attention derivation and emits the demotion.
+    /// it from the `needs_attention` derivation and emits the demotion.
     #[tokio::test]
     async fn agent_update_is_background_transition_emits() {
         let h = harness().await;
@@ -2083,7 +2190,7 @@ mod display_status_events {
 
     /// Question-resolution trigger via `agent.dismissQuestions` (§6.5 step 0):
     /// persisting the dismissal marker retires the question hold and emits the
-    /// needs_attention → idle demotion.
+    /// `needs_attention` → idle demotion.
     #[tokio::test]
     async fn question_dismiss_transition_emits() {
         let h = harness().await;
@@ -2471,7 +2578,7 @@ mod display_status_events {
         );
         assert!(
             h.services
-                .workspace_attention_signals(&h.ws, intent_core::WorkspaceAttention::None)
+                .workspace_attention_signals(&h.ws, intent_core::WorkspaceAttention::None, None)
                 .await
                 .needs_attention
         );
@@ -2509,14 +2616,14 @@ mod display_status_events {
 
         let mut sub = subscribe(&h);
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // Wait out the debounced idle recompute: blocked outranks both
         // transitions, so nothing emits (assert_silent's 300ms watch
         // covers the 100ms debounce window).
         assert_silent(&mut sub).await;
         assert!(
             h.services
-                .workspace_attention_signals(&h.ws, intent_core::WorkspaceAttention::None)
+                .workspace_attention_signals(&h.ws, intent_core::WorkspaceAttention::None, None)
                 .await
                 .blocked
         );
@@ -2547,7 +2654,7 @@ mod display_status_events {
         // End then immediately begin again: the second begin cancels the
         // pending idle debounce, so no demotion ever emits (assert_silent's
         // 300ms watch covers the 100ms window).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         h.services.agent_activity_begin(&h.ws).await;
         assert_silent(&mut sub).await;
     }
@@ -2831,7 +2938,7 @@ mod display_status_events {
         assert_silent(&mut sub).await;
         let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
         ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
-        h.services.enrich_display_status(&mut ws).await;
+        h.services.enrich_display_status(&mut ws, None).await;
         assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
@@ -2882,7 +2989,7 @@ mod display_status_events {
         );
     }
 
-    /// ReviewRequired flag triggers (§6.5 step 2): a `workspace.update`
+    /// `ReviewRequired` flag triggers (§6.5 step 2): a `workspace.update`
     /// carrying `attention: review_required` promotes the derived rollup to
     /// `needs_attention` and emits; `workspace.dismissAttention` retires it
     /// and emits the demotion.

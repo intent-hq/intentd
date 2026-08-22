@@ -28,7 +28,10 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         use nix::sys::signal::{self, Signal};
         use nix::unistd::Pid;
-        let _ = signal::killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        let _ = signal::killpg(
+            Pid::from_raw(self.child.id().cast_signed()),
+            Signal::SIGKILL,
+        );
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -120,6 +123,7 @@ fn temp_data_dir() -> PathBuf {
 }
 
 fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
+    use std::os::unix::process::CommandExt;
     common::enable_ws_api(data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
@@ -137,7 +141,6 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
         .env("MOCK_AGENT_BEHAVIOR", behavior)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    use std::os::unix::process::CommandExt;
     command.process_group(0);
     let child = command.spawn().expect("spawn intentd serve");
     Daemon {
@@ -259,7 +262,8 @@ async fn list_active_tracks_only_mid_turn_agents_over_real_wss() {
         &data_dir.join("daemon.log"),
     )
     .await;
-    let port = status["result"]["port"].as_u64().expect("WSS port") as u16;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("WSS port"))
+        .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");

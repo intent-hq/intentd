@@ -13,6 +13,7 @@
 //! test helpers. The delegation preamble is already byte-pinned by
 //! `agent_ops::tests::delegate_appends_task_note_preamble_to_first_message`.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,7 +31,10 @@ use crate::Services;
 fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize().iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Minimal workspace row for store-backed goldens.
@@ -95,7 +99,7 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".config.toml"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
         }
     }
@@ -106,7 +110,18 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    // monorepo#3044: delegation requires a resolvable provider (no positional
+    // fallback) — seed a configured default with a deterministic
+    // `providers.paths` override so availability checks pass hermetically.
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[
+            ("providers.active".into(), json!("auggie")),
+            ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+        ])
+        .expect("seed default provider");
+    let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 
@@ -462,7 +477,7 @@ fn golden_hook_wake_logs_section() {
     // LAST 2048 chars survive, nothing more. Positionally distinct bytes
     // pin which end is retained and the exact cap.
     let logs: String = (0..3000)
-        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .map(|i| char::from(b'a' + u8::try_from(i % 26).expect("< 26")))
         .collect();
     assert_eq!(
         crate::hook_manager::with_wake_logs("msg", Some(&logs)),
@@ -1279,7 +1294,7 @@ fn golden_image_and_attachment_notice_bytes() {
 
 /// Supervisor-history truncation markers: the omitted-exchanges comment
 /// (exact bytes inside the wrapper) and the middle-truncation marker line
-/// inside an oversized tool_result.
+/// inside an oversized `tool_result`.
 #[test]
 fn golden_supervisor_history_truncation_markers() {
     use intent_core::AgentMessage;

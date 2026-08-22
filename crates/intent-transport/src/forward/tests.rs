@@ -46,9 +46,10 @@ async fn create_lists_forwards_and_round_trips_bytes() {
     let result = parsed(handle(create, &mut reg, false).await);
     assert_eq!(result["id"], 1);
     let forward_id = result["result"]["forwardId"].as_str().unwrap().to_string();
-    let local_port = result["result"]["localPort"].as_u64().unwrap() as u16;
+    let local_port =
+        u16::try_from(result["result"]["localPort"].as_u64().unwrap()).expect("value fits in u16");
     assert_eq!(
-        result["result"]["remotePort"].as_u64().unwrap() as u16,
+        u16::try_from(result["result"]["remotePort"].as_u64().unwrap()).expect("value fits in u16"),
         echo_port
     );
     assert_ne!(local_port, 0, "an ephemeral local port is bound");
@@ -67,7 +68,7 @@ async fn create_lists_forwards_and_round_trips_bytes() {
     assert_eq!(forwards.len(), 1);
     assert_eq!(forwards[0]["forwardId"], forward_id);
     assert_eq!(
-        forwards[0]["localPort"].as_u64().unwrap() as u16,
+        u16::try_from(forwards[0]["localPort"].as_u64().unwrap()).expect("value fits in u16"),
         local_port
     );
 

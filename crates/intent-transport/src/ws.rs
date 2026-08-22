@@ -15,6 +15,7 @@
 //! it is the only path in this module that ever bypasses those checks.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -171,11 +172,15 @@ impl WsApiServer {
     /// Build a listener from the shared API + event bus, the M5.1 self-signed
     /// certificate, and the M5.2 token store. Fails only if the cert/key PEM
     /// cannot be parsed into a rustls server config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key PEM cannot be parsed into a rustls server config.
     pub fn new(
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<AsyncTokenStore>,
+        token_store: &Arc<AsyncTokenStore>,
         options: WsOptions,
         control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Result<Self> {
@@ -184,7 +189,7 @@ impl WsApiServer {
             api,
             bus,
             acceptor: Some(acceptor),
-            token_store: Some((*token_store).clone()),
+            token_store: Some((**token_store).clone()),
             enabled: options.enabled,
             auth_enabled: options.auth_enabled,
             // The WSS transport is remote by default; an override forces it
@@ -253,11 +258,15 @@ impl WsApiServer {
     /// daemon. Every accepted connection registers with `reverse_registry` so
     /// agent-initiated reverse RPCs (`browser.exec`, PROTOCOL §5.14/§12.4)
     /// see the union of both listeners' clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cert/key PEM cannot be parsed into a rustls server config.
     pub fn new_with_reverse(
         api: Arc<dyn WorkspaceApi>,
         bus: EventBus,
         tls: &TlsCertificate,
-        token_store: Arc<AsyncTokenStore>,
+        token_store: &Arc<AsyncTokenStore>,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
         control: Option<Arc<dyn crate::control::SystemControl>>,
@@ -295,6 +304,10 @@ impl WsApiServer {
 
     /// Install server pairing info provider on the inner state. Uses the same
     /// `Arc::get_mut` pattern as `install_registry`. Called from composition root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (called after `start` published clones).
     pub fn install_pairing_info(
         &mut self,
         server_pairing_info: Arc<dyn crate::server::ServerPairingInfo>,
@@ -305,13 +318,17 @@ impl WsApiServer {
     }
 
     /// Start the listener, returning the bound port (single-flight).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if binding the listener fails.
     pub async fn start(&self) -> std::io::Result<u16> {
         self.inner.start().await
     }
 
     /// Gracefully stop the listener (idempotent).
     pub async fn stop(&self) {
-        self.inner.stop().await
+        self.inner.stop().await;
     }
 
     /// The bound port, or `None` when not currently running.
@@ -320,6 +337,11 @@ impl WsApiServer {
     }
 
     /// The number of currently-connected WebSocket clients (the `/health` count).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the client-set mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn client_count(&self) -> usize {
         self.inner
             .clients
@@ -330,6 +352,7 @@ impl WsApiServer {
 
     /// The pinned SHA-256 certificate fingerprint (colon-separated hex), or
     /// `None` when running in insecure dev mode without a TLS certificate.
+    #[must_use]
     pub fn fingerprint(&self) -> Option<&str> {
         self.inner.fingerprint.as_deref()
     }
@@ -337,6 +360,7 @@ impl WsApiServer {
     /// Whether the listener is running in insecure (plain-`ws://`, no bearer
     /// auth) dev mode. Used by `system.status` so remote clients see the
     /// real TLS posture rather than a phantom fingerprint.
+    #[must_use]
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
     }
@@ -386,7 +410,7 @@ impl WsInner {
     pub(crate) async fn heartbeat_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(self.heartbeat_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let timeout_ms = self.heartbeat_timeout.as_millis() as i64;
+        let timeout_ms = i64::try_from(self.heartbeat_timeout.as_millis()).unwrap_or(i64::MAX);
         loop {
             tick.tick().await;
             let now = now_ms();
@@ -494,7 +518,7 @@ impl WsInner {
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n"
         );
         if let Some(value) = &extensions_header {
-            response.push_str(&format!("Sec-WebSocket-Extensions: {value}\r\n"));
+            let _ = write!(response, "Sec-WebSocket-Extensions: {value}\r\n");
         }
         response.push_str("\r\n");
         stream.write_all(response.as_bytes()).await?;
@@ -644,7 +668,6 @@ impl WsInner {
         loop {
             tokio::select! {
                 incoming = stream.next() => match incoming {
-                    None => break,
                     Some(Err(e)) => {
                         // Over-limit inbound message or frame (monorepo#495):
                         // tell the client why with a 1009 (Message Too Big)
@@ -682,7 +705,7 @@ impl WsInner {
                         }
                     }
                     Some(Ok(Message::Pong(_))) => last_pong.store(now_ms(), Ordering::Relaxed),
-                    Some(Ok(Message::Close(_))) => break,
+                    None | Some(Ok(Message::Close(_))) => break,
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
                 Some(frame) = app_rx.recv() => {
@@ -846,8 +869,7 @@ fn header_str(value: &[u8]) -> Option<String> {
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

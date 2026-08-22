@@ -1,6 +1,6 @@
-//! E2E coverage for note.* operations (intent-services note_ops.rs coverage boost).
+//! E2E coverage for note.* operations (intent-services `note_ops.rs` coverage boost).
 //!
-//! Tests call intent_services::Services directly (not via WSS transport) for hermetic
+//! Tests call `intent_services::Services` directly (not via WSS transport) for hermetic
 //! in-process coverage. Tests note.add, note.edit, note.editLines, note.updateMetadata,
 //! note.listTasks paths.
 
@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::{
@@ -18,14 +18,14 @@ use intent_core::{
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 
-/// Clean up SQLite database including -wal and -shm sidecars.
+/// Clean up `SQLite` database including -wal and -shm sidecars.
 fn cleanup_db(db: &PathBuf) {
     std::fs::remove_file(db).ok();
     std::fs::remove_file(db.with_extension("db-wal")).ok();
     std::fs::remove_file(db.with_extension("db-shm")).ok();
 }
 
-fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
+fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
@@ -86,7 +86,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root.clone()))
         .await
         .expect("insert ws");
 

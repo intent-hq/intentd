@@ -2,6 +2,92 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.34] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- *(services)* Re-fetch stale non-Merged PR pool entries during the git-root sweep ([#1390](https://github.com/intent-hq/intentd/pull/1390))
+
+
+## [0.7.33] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- *(services)* Terminal PR verdicts override stale entries in the list PR pool ([#1387](https://github.com/intent-hq/intentd/pull/1387))
+
+
+## [0.7.32] - 2026-08-21
+
+### 📚 Documentation
+
+- ShowTab reveals by activating in a visible panel without stealing focus ([#1384](https://github.com/intent-hq/intentd/pull/1384))
+
+
+## [0.7.31] - 2026-08-21
+
+### 🔧 Refactor
+
+- Complete the pedantic clippy burndown, empty the temporary allowlist ([#1382](https://github.com/intent-hq/intentd/pull/1382))
+
+
+## [0.7.30] - 2026-08-21
+
+### 🔧 Refactor
+
+- Burn down pedantic must_use, cast, and signature-adjacent lints ([#1379](https://github.com/intent-hq/intentd/pull/1379))
+
+### ⚡ Performance
+
+- Keep workspace.list/get enrichment off note bodies and duplicate session reads ([#1378](https://github.com/intent-hq/intentd/pull/1378))
+
+
+## [0.7.29] - 2026-08-21
+
+### 🚀 Features
+
+- First-class provider param on agent.delegate ([#1375](https://github.com/intent-hq/intentd/pull/1375))
+
+### 🐛 Bug Fixes
+
+- *(git)* Order intentd's credential helper ahead of OS-default ones ([#1364](https://github.com/intent-hq/intentd/pull/1364))
+- Add workspace.delete to the compound-op statement tier ([#3074](https://github.com/intent-hq/intentd/pull/3074))
+- Self-heal default provider settings and remove positional auggie fallback ([#1373](https://github.com/intent-hq/intentd/pull/1373))
+- Surface a client-visible terminal state for wedged turns ([#1374](https://github.com/intent-hq/intentd/pull/1374))
+
+### 📚 Documentation
+
+- Burn down pedantic missing_errors_doc and missing_panics_doc ([#1371](https://github.com/intent-hq/intentd/pull/1371))
+- Burn down pedantic doc_markdown ([#1367](https://github.com/intent-hq/intentd/pull/1367))
+
+
+## [0.7.28] - 2026-08-21
+
+### 🔧 Refactor
+
+- Burn down pedantic style and Option/format lints ([#1360](https://github.com/intent-hq/intentd/pull/1360))
+
+### 🧪 Testing
+
+- De-flake hook rehydration countdown tests racing the run loop
+
+
+## [0.7.27] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- Make dev-env intent-services tests hermetic and macOS-safe ([#1355](https://github.com/intent-hq/intentd/pull/1355))
+- *(acp)* Truncate oversized workspace_api output inline when file redirect fails ([#1354](https://github.com/intent-hq/intentd/pull/1354))
+- Preserve structured browser.exec action-result errors on the agent surface ([#1363](https://github.com/intent-hq/intentd/pull/1363))
+- Batch agent.getSubscriptions status reads into one IN-list query ([#1357](https://github.com/intent-hq/intentd/pull/1357))
+- Emit agent:process:evicted with reason idle-ttl from the TTL idle sweep ([#1356](https://github.com/intent-hq/intentd/pull/1356))
+- Stop serving tokenUsage on workspace.list rows and agentSummary on archived rows ([#1359](https://github.com/intent-hq/intentd/pull/1359))
+
+### 📚 Documentation
+
+- Document hidden-by-default tabs, showTab action, and listTabs visibility ([#1358](https://github.com/intent-hq/intentd/pull/1358))
+- Workspace-inactive semantics for showTab/focusTab/openTab ([#1362](https://github.com/intent-hq/intentd/pull/1362))
+
+
 ## [0.7.26] - 2026-08-20
 
 ### ⚙️ Miscellaneous Tasks

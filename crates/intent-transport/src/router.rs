@@ -238,7 +238,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         Ok(v) => v,
         // Parse errors are always answered with id null (§9), even for
         // would-be notifications — notification status is not yet known.
-        Err(_) => return Some(error_string(Value::Null, PARSE_ERROR, "Parse error", None)),
+        Err(_) => return Some(error_string(&Value::Null, PARSE_ERROR, "Parse error", None)),
     };
 
     // Envelope validation (-32600). Answered even for notification-shaped
@@ -246,7 +246,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     let (echo_id, method, is_notification) = match check_envelope(&value) {
         EnvelopeCheck::NotObject => {
             return Some(error_string(
-                Value::Null,
+                &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: expected an object",
                 None,
@@ -254,7 +254,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
         EnvelopeCheck::BadJsonRpc { echo_id } => {
             return Some(error_string(
-                echo_id,
+                &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: jsonrpc must be \"2.0\"",
                 None,
@@ -262,7 +262,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
         EnvelopeCheck::BadMethod { echo_id } => {
             return Some(error_string(
-                echo_id,
+                &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: method must be a non-empty string",
                 None,
@@ -270,7 +270,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
         EnvelopeCheck::BadId => {
             return Some(error_string(
-                Value::Null,
+                &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: id must be a string, number, or null",
                 None,
@@ -286,15 +286,14 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     // params: object kept as-is; positional array coerced to {}; absent/null
     // treated as empty; any other scalar is invalid (§3.1).
     let params: Map<String, Value> = match value.get("params") {
-        None | Some(Value::Null) => Map::new(),
         Some(Value::Object(m)) => m.clone(),
-        Some(Value::Array(_)) => Map::new(),
+        None | Some(Value::Null | Value::Array(_)) => Map::new(),
         Some(_) => {
             if is_notification {
                 return None;
             }
             return Some(error_string(
-                echo_id,
+                &echo_id,
                 INVALID_PARAMS,
                 "Invalid params",
                 Some(json!({ "code": "invalid-params" })),
@@ -320,14 +319,14 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     // oversized response is never double-warned on top of its `error!`.
     Some(match result {
         Ok(v) => {
-            let frame = success_string(echo_id.clone(), v);
+            let frame = success_string(&echo_id.clone(), &v);
             if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                oversized_response_string(echo_id, method, frame.len())
+                oversized_response_string(&echo_id, method, frame.len())
             } else {
                 frame
             }
         }
-        Err(e) => error_string(echo_id, e.code, &e.message, e.data),
+        Err(e) => error_string(&echo_id, e.code, &e.message, e.data),
     })
 }
 
@@ -1585,7 +1584,7 @@ async fn dispatch(
             // present non-string value is a malformed request — reject it
             // rather than silently falling back to the legacy path.
             match params.get("providerId") {
-                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                None | Some(Value::Null | Value::String(_)) => {}
                 Some(_) => {
                     return Err(invalid_params(
                         "agent.setModel: providerId must be a string",
@@ -1917,10 +1916,7 @@ async fn dispatch(
                         match v.as_str() {
                             Some(s) => ids.push(s.to_string()),
                             None => {
-                                return Err(invalid_params(format!(
-                                    "resume[{}] must be a string",
-                                    i
-                                )))
+                                return Err(invalid_params(format!("resume[{i}] must be a string")))
                             }
                         }
                     }
@@ -1937,8 +1933,7 @@ async fn dispatch(
                             Some(s) => ids.push(s.to_string()),
                             None => {
                                 return Err(invalid_params(format!(
-                                    "abandon[{}] must be a string",
-                                    i
+                                    "abandon[{i}] must be a string"
                                 )))
                             }
                         }
@@ -3987,6 +3982,8 @@ fn opt_string_map(
 /// Optional integer param from a JSON number (absent/non-number → `None`).
 /// Used by the `event.*` `limit` / `minutesAgo` knobs, whose defaults are
 /// applied in the service layer (`value || default`).
+// Whole-valued floats from JSON clients; float→int casts saturate.
+#[allow(clippy::cast_possible_truncation)]
 fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4053,6 +4050,8 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
 /// The canonical form nests them under `page` ({ continuationToken, limit });
 /// for parity with the other paginated reads we fall back to top-level `limit`
 /// and `nextToken` when no `page` object is present.
+// Whole-valued floats from JSON clients; float→int casts saturate.
+#[allow(clippy::cast_possible_truncation)]
 fn parse_page_params(params: &Map<String, Value>) -> (Option<i64>, Option<String>) {
     if let Some(Value::Object(page)) = params.get("page") {
         let limit = page
@@ -4096,6 +4095,8 @@ fn normalize_acceptance_criteria(params: &Map<String, Value>) -> Vec<String> {
 
 /// Loosely parse an integer from a JSON number or leading-int string
 /// (`parseInt`-like), returning `None` when no integer is present.
+// Whole-valued floats from JSON clients; float→int casts saturate.
+#[allow(clippy::cast_possible_truncation)]
 fn parse_int_loose(value: Option<&Value>) -> Option<i64> {
     match value {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4146,13 +4147,13 @@ fn workspace_err(e: Error) -> RpcErr {
 }
 
 /// Serialize a success envelope. `result` is always a JSON object (§3.2).
-fn success_string(id: Value, result: Value) -> String {
+fn success_string(id: &Value, result: &Value) -> String {
     let resp = json!({ "jsonrpc": "2.0", "result": result, "id": id });
     serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
 }
 
 /// Serialize an error envelope, optionally carrying `data`.
-fn error_string(id: Value, code: i32, message: &str, data: Option<Value>) -> String {
+fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
     let mut err = Map::new();
     err.insert("code".to_string(), json!(code));
     err.insert("message".to_string(), json!(message));
@@ -4168,7 +4169,7 @@ fn error_string(id: Value, code: i32, message: &str, data: Option<Value>) -> Str
 /// echoing the request id, so the client fails fast instead of hitting its
 /// RPC timeout on a silently dropped frame. The writer-task cap remains as a
 /// last-resort backstop for non-response frames (subscription pushes/events).
-fn oversized_response_string(id: Value, method: &str, response_bytes: usize) -> String {
+fn oversized_response_string(id: &Value, method: &str, response_bytes: usize) -> String {
     tracing::error!(
         method,
         response_bytes,

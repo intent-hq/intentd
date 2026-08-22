@@ -21,7 +21,7 @@ use intent_sentry::{IssueStatusFilter, SentryEngine, SentryRegistry, SentrySetti
 /// (→ `-32603`): a missing/invalid credential pair (`NotConfigured`) and any
 /// other Sentry failure both surface as `Internal` with a descriptive
 /// message (§5.29, §9).
-pub(crate) fn map_sentry_err(e: intent_sentry::Error) -> Error {
+pub(crate) fn map_sentry_err(e: &intent_sentry::Error) -> Error {
     Error::Internal(e.to_string())
 }
 
@@ -38,7 +38,7 @@ pub(crate) async fn resolve_engine(
         Some(engine) => Ok(engine),
         None => SentryRegistry::from_settings(&SentrySettings::default())
             .await
-            .map_err(map_sentry_err),
+            .map_err(|e: intent_sentry::Error| map_sentry_err(&e)),
     }
 }
 
@@ -46,8 +46,8 @@ pub(crate) async fn resolve_engine(
 /// an invalid value is rejected with `InvalidParams` (→ `-32602`, §5.29).
 /// `None` returns `None` so the engine applies its own default policy
 /// (matches the FE which omits the field).
-pub(crate) fn parse_status(status: Option<String>) -> Result<Option<IssueStatusFilter>> {
-    match status.as_deref() {
+pub(crate) fn parse_status(status: Option<&str>) -> Result<Option<IssueStatusFilter>> {
+    match status {
         None => Ok(None),
         Some("unresolved") => Ok(Some(IssueStatusFilter::Unresolved)),
         Some("resolved") => Ok(Some(IssueStatusFilter::Resolved)),
@@ -73,19 +73,19 @@ mod tests {
     fn parses_status_with_default() {
         assert_eq!(parse_status(None).unwrap(), None);
         assert_eq!(
-            parse_status(Some("unresolved".into())).unwrap(),
+            parse_status(Some("unresolved")).unwrap(),
             Some(IssueStatusFilter::Unresolved)
         );
         assert_eq!(
-            parse_status(Some("resolved".into())).unwrap(),
+            parse_status(Some("resolved")).unwrap(),
             Some(IssueStatusFilter::Resolved)
         );
         assert_eq!(
-            parse_status(Some("ignored".into())).unwrap(),
+            parse_status(Some("ignored")).unwrap(),
             Some(IssueStatusFilter::Ignored)
         );
         assert_eq!(
-            parse_status(Some("all".into())).unwrap(),
+            parse_status(Some("all")).unwrap(),
             Some(IssueStatusFilter::All)
         );
     }
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn rejects_invalid_status() {
         assert!(matches!(
-            parse_status(Some("bogus".into())),
+            parse_status(Some("bogus")),
             Err(Error::InvalidParams(_))
         ));
     }
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn maps_not_configured_to_internal() {
-        let mapped = map_sentry_err(intent_sentry::Error::NotConfigured("no creds".into()));
+        let mapped = map_sentry_err(&intent_sentry::Error::NotConfigured("no creds".into()));
         assert!(matches!(mapped, Error::Internal(_)));
     }
 }

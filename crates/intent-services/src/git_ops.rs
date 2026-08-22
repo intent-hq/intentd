@@ -541,7 +541,7 @@ pub(crate) fn build_diffs(
     Ok(Value::Array(out))
 }
 /// Build the `git.commitDetails` wire result for a single commit. Returns the
-/// flattened shape consumed by the FE ChangesTabType: metadata plus the
+/// flattened shape consumed by the FE `ChangesTabType`: metadata plus the
 /// per-file `fileDetails: [{ path, additions, deletions }]` array (`files` is
 /// the flat path-string list, kept for callers that only want names).
 pub(crate) fn build_commit_details(worktree: &Path, commit_hash: &str) -> Result<Value> {
@@ -624,7 +624,7 @@ pub(crate) fn build_numstat(
 /// two-dot `<boundary>..<target_ref>` range, carrying the full file contents
 /// at the boundary and the target so the FE branch-base viewer can render the
 /// diff from `oldContent`/`newContent` alone (parity with
-/// `batchedGitBranchBaseDiff` / TrackedChangeDiffViewer). `chunks` is always
+/// `batchedGitBranchBaseDiff` / `TrackedChangeDiffViewer`). `chunks` is always
 /// an empty array — the FE consumer ignores it for the branch-base shape.
 /// Boundary resolution matches [`build_numstat`]; an unresolved boundary
 /// yields an empty array.
@@ -934,7 +934,7 @@ mod tests {
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: 0o160000,
+                mode: 0o160_000,
                 uid: 0,
                 gid: 0,
                 file_size: 0,
@@ -956,7 +956,7 @@ mod tests {
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: 0o160000,
+                mode: 0o160_000,
                 uid: 0,
                 gid: 0,
                 file_size: 0,

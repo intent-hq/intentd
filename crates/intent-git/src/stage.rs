@@ -27,6 +27,10 @@ use crate::submodule::{
 /// absolute path (`/repo/sub/a.txt`) is refused exactly like its relative
 /// spelling — it would otherwise slip past the guard and be normalized into
 /// `sub/a.txt` on the way to `index.add_path`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository has no working directory, a pathspec matches no files, or another libgit2 operation fails.
 pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     reject_submodule_internal_paths(&repo, paths)?;
@@ -58,6 +62,10 @@ pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
 /// index when the path is absent from `HEAD` (a newly added file). With no
 /// commit yet (unborn `HEAD`) every path is reset against the empty tree, so a
 /// staged add is dropped from the index.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository has no working directory or another libgit2 operation fails.
 pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let workdir = repo
@@ -116,6 +124,10 @@ pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
 /// it, not the other way round. It stays safe because the index entries under
 /// the `packages/` prefix classify it as tracked, routing it through
 /// `checkout_index`, which leaves the `160000` entry alone.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if a path escapes the worktree; `Error::Internal` if the repository has no working directory, a pathspec matches no files, or another libgit2 operation fails.
 pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     reject_submodule_internal_paths(&repo, paths)?;
@@ -280,8 +292,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
     let p = Path::new(raw);
     if p.is_absolute() {
         p.strip_prefix(workdir)
-            .map(drop_curdir)
-            .unwrap_or_else(|_| drop_curdir(p))
+            .map_or_else(|_| drop_curdir(p), drop_curdir)
     } else {
         drop_curdir(p)
     }
@@ -297,7 +308,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
 fn drop_curdir(p: &Path) -> String {
     p.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .map(|c| c.as_os_str())
+        .map(std::path::Component::as_os_str)
         .collect::<std::path::PathBuf>()
         .to_string_lossy()
         .to_string()
@@ -312,6 +323,10 @@ fn drop_curdir(p: &Path) -> String {
 /// client cannot slip a multi-file or path-mismatched patch through the
 /// single-file wire contract (`-32602` on mismatch). The patch is streamed on
 /// stdin so no temp file is written.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if the patch targets more than one file or a path other than `file_path`; `Error::Internal` if `git apply` fails even with the three-way fallback.
 pub fn stage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<()> {
     validate_single_file_patch(file_path, patch)?;
     apply_patch_cached(worktree_path, patch, false)
@@ -322,6 +337,10 @@ pub fn stage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<
 /// unstaging the rest of `file_path`. Mirrors `gitService.unstageHunk`; the
 /// direct-then-`--3way` fallback and the single-file header check match
 /// [`stage_hunk`].
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if the patch targets more than one file or a path other than `file_path`; `Error::Internal` if `git apply` fails even with the three-way fallback.
 pub fn unstage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<()> {
     validate_single_file_patch(file_path, patch)?;
     apply_patch_cached(worktree_path, patch, true)
@@ -803,7 +822,7 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = discard(dir.path(), &[".".to_string()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
-        let err = discard(dir.path(), &["".to_string()]).unwrap_err();
+        let err = discard(dir.path(), &[String::new()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
     }
 

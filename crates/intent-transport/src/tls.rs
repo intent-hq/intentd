@@ -47,6 +47,14 @@ static CACHE: Mutex<Option<TlsCertificate>> = Mutex::new(None);
 /// Ensure a TLS certificate is available under `data_dir`. Returns the cached
 /// cert if present, otherwise loads a valid persisted cert, otherwise generates
 /// and persists a new one. The result is cached in memory.
+///
+/// # Errors
+///
+/// Returns an error if generating or persisting a new certificate fails.
+///
+/// # Panics
+///
+/// Panics if the in-memory certificate cache mutex is poisoned (a prior panic while holding the lock).
 pub fn ensure_tls_certificate(data_dir: &Path) -> Result<TlsCertificate> {
     if let Some(cert) = CACHE.lock().expect("tls cache poisoned").clone() {
         return Ok(cert);
@@ -96,6 +104,7 @@ pub enum CertStatus {
 
 /// Inspect the persisted certificate under `data_dir` without mutating it
 /// (read-only; never generates). Drives the `doctor` cert-validity check.
+#[must_use]
 pub fn inspect_cert(data_dir: &Path) -> CertStatus {
     let (cert_path, key_path) = cert_paths(data_dir);
     if !cert_path.exists() || !key_path.exists() {
@@ -197,7 +206,7 @@ fn generate_new_cert(data_dir: &Path) -> Result<TlsCertificate> {
     let now = OffsetDateTime::now_utc();
     let not_after = now
         .replace_year(now.year() + VALIDITY_YEARS)
-        .unwrap_or_else(|_| now + Duration::days(365 * VALIDITY_YEARS as i64));
+        .unwrap_or_else(|_| now + Duration::days(365 * i64::from(VALIDITY_YEARS)));
 
     let mut params = CertificateParams::new(collect_san()).map_err(internal)?;
     params.not_before = now;

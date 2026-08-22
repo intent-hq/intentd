@@ -141,6 +141,7 @@ fn full_denylist() -> Vec<&'static str> {
 /// `getToolDenylistForAgentType`). Returns an empty vec for any type that is
 /// not a restricted background agent (interactive/foreground agents are
 /// unrestricted).
+#[must_use]
 pub fn get_tool_denylist_for_agent_type(agent_type: &str) -> Vec<&'static str> {
     match agent_type {
         // Pure text-generation / analysis agents: no side effects.
@@ -199,8 +200,9 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
 /// 3. Global fallback: [`SUBAGENT_TOOLS`] + [`CONFLICTING_BUILTIN_TOOLS`] —
 ///    sub-agents have no UI representation, so every agent must go through the
 ///    workspace `ws.agent.*` surface instead of the auggie-native sub-agent.
+#[must_use]
 pub fn get_tools_to_remove(specialist: Option<&str>, agent_type: &str) -> Vec<&'static str> {
-    if matches!(specialist, Some("spec-writer") | Some("coordinator")) {
+    if matches!(specialist, Some("spec-writer" | "coordinator")) {
         let mut out = Vec::with_capacity(
             FILE_WRITE_TOOLS.len() + SUBAGENT_TOOLS.len() + CONFLICTING_BUILTIN_TOOLS.len(),
         );

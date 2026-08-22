@@ -38,6 +38,10 @@ impl LinearRegistry {
     /// Construct the engine, or a typed [`Error::NotConfigured`] when no key is
     /// available. Async because the secrets-store lookup runs on the blocking pool
     /// with a bounded timeout (see [`token::resolve`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConfigured`] when no API key is available; propagates client-construction failures.
     pub async fn from_settings(settings: &LinearSettings) -> Result<Arc<dyn LinearEngine>> {
         let key = resolve_token(settings).await?;
         let client = LinearClient::new(&key, settings.api_base_url.as_deref())?;

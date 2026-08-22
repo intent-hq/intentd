@@ -57,7 +57,7 @@ const BURST_THRESHOLD: usize = 100;
 /// cooldown-only collapses consume the window rather than extend it, so
 /// unrelated small activity after a churn returns to per-file events within
 /// one cooldown instead of staying in summary mode indefinitely.
-const BURST_COOLDOWN: Duration = Duration::from_millis(1000);
+const BURST_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Upper bound on raw events ingested per [`drain_ready`] call. `ingest` is
 /// cheap and never awaits, but the raw channel is unbounded; the cap keeps a
@@ -174,13 +174,12 @@ impl Action {
 /// Map a `notify` event kind to an [`Action`]; `None` for access/other kinds
 /// that carry no mutation (they are dropped, matching the TS adapter which only
 /// forwards add/change/unlink).
-fn action_for(kind: &EventKind) -> Option<Action> {
+fn action_for(kind: EventKind) -> Option<Action> {
     match kind {
         EventKind::Create(_) => Some(Action::Create),
         EventKind::Remove(_) => Some(Action::Delete),
         EventKind::Modify(ModifyKind::Name(_)) => Some(Action::Rename),
-        EventKind::Modify(_) => Some(Action::Modify),
-        EventKind::Any => Some(Action::Modify),
+        EventKind::Modify(_) | EventKind::Any => Some(Action::Modify),
         EventKind::Access(_) | EventKind::Other => None,
     }
 }
@@ -205,7 +204,7 @@ enum IgnoreVerdict {
     None,
 }
 
-fn to_verdict<T>(m: Match<T>) -> IgnoreVerdict {
+fn to_verdict<T>(m: &Match<T>) -> IgnoreVerdict {
     if m.is_ignore() {
         IgnoreVerdict::Ignore
     } else if m.is_whitelist() {
@@ -217,7 +216,7 @@ fn to_verdict<T>(m: Match<T>) -> IgnoreVerdict {
 
 /// Locate the repository git dir for `root`, handling both a `.git` directory
 /// and a `.git` **file** (`gitdir: <path>`) as written by linked worktrees and
-/// CoW checkouts. Returns `None` for non-git roots.
+/// `CoW` checkouts. Returns `None` for non-git roots.
 fn resolve_git_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
     let meta = std::fs::metadata(&dot_git).ok()?;
@@ -361,13 +360,13 @@ impl GitignoreMatcher {
             if !abs.starts_with(dir) {
                 continue;
             }
-            let v = to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(abs, is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
         }
         if let Some(matcher) = &self.exclude {
-            let v = to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(abs, is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
@@ -375,13 +374,13 @@ impl GitignoreMatcher {
         if let Some(matcher) = &self.global {
             // The global matcher is rooted at "" (per `Gitignore::global`), so
             // it must see the relative path, not the absolute one.
-            let v = to_verdict(matcher.matched_path_or_any_parents(Path::new(rel), is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(Path::new(rel), is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
         }
         if let Some(matcher) = &self.defaults {
-            return to_verdict(matcher.matched_path_or_any_parents(abs, is_dir));
+            return to_verdict(&matcher.matched_path_or_any_parents(abs, is_dir));
         }
         IgnoreVerdict::None
     }
@@ -551,12 +550,12 @@ impl FileWatcher {
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         workspace_id: WorkspaceId,
-        root: PathBuf,
+        root: &Path,
     ) -> Self {
         // `subscribe` returns the canonical root it demuxes against, so the
         // relative-path strip works against the paths the OS reports (macOS
         // FSEvents resolves `/var/...` → `/private/var/...`).
-        let (sub, raw_rx, root) = hub.subscribe(&root);
+        let (sub, raw_rx, root) = hub.subscribe(root);
         let task = tokio::spawn(debounce_loop(bus, workspace_id, root, raw_rx));
         Self { _sub: sub, task }
     }
@@ -565,6 +564,7 @@ impl FileWatcher {
     /// established. Registration is deferred off the caller's thread
     /// (monorepo#1572), so tests must wait for it before mutating the tree.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     pub(super) async fn wait_established(&self, timeout: Duration) {
         self._sub.wait_established(timeout).await;
     }
@@ -585,18 +585,17 @@ async fn debounce_loop(
     loop {
         let next_deadline = pending.values().map(|(_, at)| *at).min();
         tokio::select! {
-            maybe = raw_rx.recv() => match maybe {
-                Some(event) => {
+            maybe = raw_rx.recv() => {
+                if let Some(event) = maybe {
                     ingest(&root, &mut matcher, &event, &mut pending);
                     drain_ready(&root, &mut matcher, &mut raw_rx, &mut pending);
-                }
-                // Watcher dropped: flush whatever is pending, then stop.
-                None => {
+                } else {
+                    // Watcher dropped: flush whatever is pending, then stop.
                     flush_all(&bus, &workspace_id, &mut pending).await;
                     return;
                 }
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 // Ingest everything already delivered before deciding what is
                 // due, so the burst decision sees the full backlog even when
                 // publishes are slow (STAB-121).
@@ -636,7 +635,7 @@ fn ingest(
     event: &notify::Event,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
-    let Some(action) = action_for(&event.kind) else {
+    let Some(action) = action_for(event.kind) else {
         return;
     };
     let deadline = tokio::time::Instant::now() + DEBOUNCE;
@@ -725,7 +724,7 @@ pub(super) async fn flush_due(
     }
 }
 
-/// Handle burst scenario: collapse >BURST_THRESHOLD events into bounded
+/// Handle burst scenario: collapse >`BURST_THRESHOLD` events into bounded
 /// per-directory summary events with metadata indicating the burst.
 async fn flush_burst(
     bus: &EventBus,
@@ -857,24 +856,24 @@ mod tests {
     #[test]
     fn action_for_maps_notify_kinds() {
         assert_eq!(
-            action_for(&EventKind::Create(CreateKind::File)),
+            action_for(EventKind::Create(CreateKind::File)),
             Some(Action::Create)
         );
         assert_eq!(
-            action_for(&EventKind::Remove(RemoveKind::File)),
+            action_for(EventKind::Remove(RemoveKind::File)),
             Some(Action::Delete)
         );
         assert_eq!(
-            action_for(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
+            action_for(EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
             Some(Action::Rename)
         );
         assert_eq!(
-            action_for(&EventKind::Modify(ModifyKind::Data(
+            action_for(EventKind::Modify(ModifyKind::Data(
                 notify::event::DataChange::Content
             ))),
             Some(Action::Modify)
         );
-        assert_eq!(action_for(&EventKind::Other), None);
+        assert_eq!(action_for(EventKind::Other), None);
     }
 
     #[test]

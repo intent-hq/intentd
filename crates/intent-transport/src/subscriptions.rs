@@ -211,6 +211,7 @@ pub(crate) fn parse_subscribe_params(
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
 /// optional `replaceGroup` is read (§6.2).
+#[allow(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
@@ -424,7 +425,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_MESSAGE,
         ],
     };
-    types.iter().map(|s| s.to_string()).collect()
+    types.iter().map(std::string::ToString::to_string).collect()
 }
 
 /// Materialize a channel's seq-0 snapshot as a JSON array (TB-0 §1.4). On a read
@@ -766,9 +767,10 @@ fn rebudget_merged_page(obj: &mut Map<String, Value>) {
     arr.drain(..lo);
     if let Some(b) = boundary {
         obj.insert("truncated".to_string(), Value::Bool(true));
-        let token = intent_services::pagination::remint_backward_token(b as usize)
-            .map(Value::String)
-            .unwrap_or(Value::Null);
+        let token = intent_services::pagination::remint_backward_token(
+            usize::try_from(b).expect("value fits in usize"),
+        )
+        .map_or(Value::Null, Value::String);
         obj.insert("nextToken".to_string(), token);
     }
 }
@@ -992,19 +994,18 @@ impl ChatDeltaState {
             // reaching here id-less so re-delivery still upserts by id
             // instead of duplicating.
             let mut block = block.clone();
-            let bid = match block
+            let bid = if let Some(id) = block
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
             {
-                Some(id) => id.to_string(),
-                None => {
-                    let id = format!("{message_id}:{index}");
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.insert("id".to_string(), Value::String(id.clone()));
-                    }
-                    id
+                id.to_string()
+            } else {
+                let id = format!("{message_id}:{index}");
+                if let Some(obj) = block.as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.clone()));
                 }
+                id
             };
             let is_added = !self.seen_ids.contains(&bid);
             self.seen_ids.insert(bid.clone());
@@ -1069,7 +1070,7 @@ impl ChatDeltaState {
         };
         let added = self.note_block(&block_id);
         let entity = self.entity(&message_id, block, None, None, false);
-        Some(single_delta(added, entity))
+        Some(single_delta(added, &entity))
     }
 
     /// Map an `agent:tool:call`: synthesize a `tool_use` block matching the
@@ -1343,7 +1344,7 @@ impl ChatDeltaState {
             .map(|(id, block)| {
                 let block = match block.get("type").and_then(Value::as_str) {
                     Some(t) if block.get("text").is_none() && (t == "text" || t == "thinking") => {
-                        let text = self.text_acc.get(id).map(String::as_str).unwrap_or("");
+                        let text = self.text_acc.get(id).map_or("", String::as_str);
                         json!({ "type": t, "id": id, "text": text })
                     }
                     _ => block.clone(),
@@ -1448,7 +1449,7 @@ impl ChatDeltaState {
 
 /// Build a single-entity delta envelope, routing the entity to `added` (first
 /// sighting) or `updated` (a known block grown/changed).
-fn single_delta(added: bool, entity: Value) -> Value {
+fn single_delta(added: bool, entity: &Value) -> Value {
     if added {
         json!({ "added": [entity], "updated": [], "removedIds": [] })
     } else {
@@ -1485,12 +1486,11 @@ pub(crate) async fn channel_delta(
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task => None,
+        Channel::Task | Channel::Chat => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is
         // unreachable for `Chat`.
-        Channel::Chat => None,
     }
 }
 
@@ -1695,8 +1695,7 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         .data
         .get("workspaceId")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| event.workspace_id.as_str().to_string());
+        .map_or_else(|| event.workspace_id.as_str().to_string(), str::to_string);
     match event.event_type.as_str() {
         WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id] })),
         WORKSPACE_CREATED => {

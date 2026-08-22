@@ -15,6 +15,10 @@ impl Store {
     /// Record (or overwrite) the delivered-completion identity for the pair.
     /// Identities are monotonic per pair (a new report gets a new timestamp),
     /// so a plain upsert is sufficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn record_completion_wake_delivery(
         &self,
         parent_agent_id: &AgentId,
@@ -41,6 +45,10 @@ impl Store {
     }
 
     /// The delivered-completion identity recorded for the pair, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_completion_wake_delivery(
         &self,
         parent_agent_id: &AgentId,

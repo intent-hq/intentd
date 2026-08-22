@@ -29,6 +29,7 @@ pub struct WorktreeLocks {
 
 impl WorktreeLocks {
     /// Create an empty lock registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -70,6 +71,10 @@ pub(crate) fn create_worktree(repo_path: &Path, name: &str, worktree_path: &Path
 /// (`refs/remotes/{remote}/{base_ref}`) over the local branch so a fresh
 /// workspace starts from the latest known remote state (no network fetch).
 /// Returns the SHA of the commit the worktree is checked out at.
+///
+/// # Errors
+///
+/// Returns [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::InvalidParams` if `branch` is already checked out in another worktree; `Error::Internal` if the branch or worktree cannot otherwise be created.
 pub fn provision_worktree(
     repo_path: &Path,
     name: &str,
@@ -140,7 +145,7 @@ pub fn provision_worktree(
 }
 
 /// Map a libgit2 worktree-add error into a domain error, classifying the
-/// "branch already checked out" failure as InvalidParams with an actionable
+/// "branch already checked out" failure as `InvalidParams` with an actionable
 /// message (PROTOCOL §9 `-32602`) instead of a generic Internal error.
 fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     let msg = e.message();
@@ -148,8 +153,7 @@ fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     // is in use by another worktree (including the main working tree).
     if msg.contains("already checked out") {
         Error::InvalidParams(format!(
-            "branch '{}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree",
-            branch
+            "branch '{branch}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree"
         ))
     } else {
         map_git_err(e)
@@ -164,6 +168,10 @@ fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
 /// and falls back to HEAD, never an unresolvable ref. Read-only probe backing
 /// the best-effort base-ref validation of chief workspace-create proposals
 /// (monorepo#761).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened.
 pub fn base_ref_resolves(repo_path: &Path, base_ref: &str, remote: &str) -> Result<bool> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     if base_ref.is_empty() {
@@ -221,6 +229,10 @@ pub(crate) fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<
 /// `None` when the directory was already gone or had to be removed in place
 /// (rename fallback, e.g. permissions or directory busy). Idempotent: a
 /// missing directory or registration is `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if pruning the registration or renaming the directory fails.
 pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<PathBuf>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     if let Ok(names) = repo.worktrees() {
@@ -256,19 +268,27 @@ pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<
 /// directory detached by [`detach_worktree`], parallelized via
 /// [`crate::fs_remove::remove_dir_all_parallel`]. Run this outside any
 /// per-repo lock. Idempotent: an already-missing path is `Ok`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the recursive removal fails.
 pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
     crate::fs_remove::remove_dir_all_parallel(trash_path)
         .map_err(|e| Error::Internal(format!("cannot remove detached worktree dir: {e}")))
 }
 
-/// CoW counterpart of [`detach_worktree`] for standalone checkouts
+/// `CoW` counterpart of [`detach_worktree`] for standalone checkouts
 /// (`checkoutMode == "cow"`): rename the checkout directory to a unique
-/// sibling trash path awaiting [`remove_detached_worktree`]. A CoW checkout
+/// sibling trash path awaiting [`remove_detached_worktree`]. A `CoW` checkout
 /// is a full clone with no registration in the source repository, so there
 /// is nothing to prune — this is filesystem work only and never opens a
 /// repository. Same semantics as the detach phase: `Ok(None)` when the
 /// directory was already gone or had to be removed in place (rename
 /// fallback). Idempotent.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the rename (and its in-place removal fallback) fails.
 pub fn detach_checkout_dir(checkout_path: &Path) -> Result<Option<PathBuf>> {
     rename_worktree_to_trash(checkout_path)
 }
@@ -293,9 +313,7 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
             // Trash-candidate collision (`EEXIST` / `ENOTEMPTY`; the latter has
             // no stable `ErrorKind` on our MSRV, so probe the candidate): retry
             // with a fresh nonce.
-            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {
-                continue;
-            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {}
             Err(e) => {
                 tracing::debug!(
                     error = %e,
@@ -317,18 +335,17 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
 /// `<wt>.deleting-<nonce>` in the same parent directory, so the rename never
 /// crosses filesystems.
 fn detached_trash_path(worktree_path: &Path) -> PathBuf {
-    let name = worktree_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "worktree".to_string());
+    let name = worktree_path.file_name().map_or_else(
+        || "worktree".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let parent = worktree_path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     for attempt in 0u32.. {
         let candidate = parent.join(format!("{name}.deleting-{nonce:x}-{attempt}"));
         if !candidate.exists() {
@@ -344,6 +361,10 @@ fn detached_trash_path(worktree_path: &Path) -> PathBuf {
 /// are handled the same as main repositories. Returns whether a lock file was
 /// removed. A missing lock file is `Ok(false)`; other filesystem errors surface
 /// as [`Error::Internal`].
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or removing the lock file fails for a reason other than it being missing.
 pub fn remove_index_lock(worktree_path: &Path) -> Result<bool> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     // `Repository::path()` returns the worktree-specific git dir (e.g.

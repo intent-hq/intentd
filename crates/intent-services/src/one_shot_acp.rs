@@ -133,7 +133,7 @@ pub(crate) async fn run_one_shot_acp_in(
         .await
         .map_err(|e| match e {
             SpawnError::QueueTimeout { waited, limit } => OneShotError::QueueTimeout {
-                waited_ms: waited.as_millis() as u64,
+                waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
                 limit,
             },
             SpawnError::Spawn(detail) => OneShotError::Spawn(detail),
@@ -338,16 +338,14 @@ fn append_chunk_text(note: &intent_acp::IncomingNotification, text: &mut String)
     if note.method != "session/update" {
         return;
     }
-    let update = match note.params.get("update") {
-        Some(update) => update,
-        None => return,
+    let Some(update) = note.params.get("update") else {
+        return;
     };
     if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
         return;
     }
-    let content = match update.get("content") {
-        Some(content) => content,
-        None => return,
+    let Some(content) = update.get("content") else {
+        return;
     };
     if content.get("type").and_then(Value::as_str) != Some("text") {
         return;

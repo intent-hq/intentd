@@ -1,13 +1,13 @@
 //! E2E coverage for chief-gated ws.app.* surface via mock ACP agent.
 //!
-//! Drives real MCP tool invocations through the workspace_api tool with the
+//! Drives real MCP tool invocations through the `workspace_api` tool with the
 //! mock-acp-agent.mjs fixture, asserting:
 //! - ws.app.workspaces.list returns user workspaces (never __chief__)
 //! - ws.app.agents.list returns agent metadata
 //! - ws.app.proposal.show persists application/vnd.intent.proposal+json resource
 //! - Non-chief workspace agents are gated from ws.app.*
 //!
-//! Pattern: reuses the harness from e2e_mock_agent_workspace_api_bindings.rs.
+//! Pattern: reuses the harness from `e2e_mock_agent_workspace_api_bindings.rs`.
 
 mod common;
 
@@ -101,6 +101,7 @@ async fn chief_agent_ws_app_workspaces_list() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).
@@ -132,7 +133,7 @@ async fn chief_agent_ws_app_workspaces_list() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -150,10 +151,10 @@ async fn chief_agent_ws_app_workspaces_list() {
     };
 
     // Call ws.app.workspaces.list via MCP
-    let js = r#"
+    let js = r"
         const result = await ws.app.workspaces.list({});
         return { workspaces: result };
-    "#;
+    ";
 
     let behavior = json!({
         "toolCall": {
@@ -283,6 +284,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -295,7 +297,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -457,6 +459,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -469,7 +472,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -631,6 +634,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
@@ -642,7 +646,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -792,7 +796,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
 /// envelope (`await ws.app.proposal.show(...)` then returns a plain object),
 /// so the tool output carries no `__mcpContentItems` at all — previously
 /// nothing registered and no card rendered while the JS saw `ok: true`.
-/// Drives the full mock-ACP path (tool_call_update → transcript writer) and
+/// Drives the full mock-ACP path (`tool_call_update` → transcript writer) and
 /// asserts the standalone proposal-resource block is still persisted from
 /// the binding-time registration + FIFO claim.
 #[tokio::test]
@@ -808,6 +812,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
@@ -819,7 +824,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create chief agent");
@@ -979,6 +984,7 @@ async fn non_chief_agent_ws_app_gating_error() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
     // Pin `workspaceApi.toonOutput` off so the workspace_api tool body stays
     // plain JSON for the serde_json assertions below (TOON is on by default).
@@ -1003,7 +1009,7 @@ async fn non_chief_agent_ws_app_gating_error() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -1021,14 +1027,14 @@ async fn non_chief_agent_ws_app_gating_error() {
     };
 
     // Try to call ws.app.workspaces.list from non-chief workspace
-    let js = r#"
+    let js = r"
         try {
             const result = await ws.app.workspaces.list({});
             return { success: true, result };
         } catch (error) {
             return { success: false, error: error.message };
         }
-    "#;
+    ";
 
     let behavior = json!({
         "toolCall": {
@@ -1124,8 +1130,7 @@ async fn non_chief_agent_ws_app_gating_error() {
         .expect("error should be a string");
     assert!(
         error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
-        "Expected gating error message in tool output, got: {}",
-        error_msg
+        "Expected gating error message in tool output, got: {error_msg}"
     );
 
     manager.shutdown().await;

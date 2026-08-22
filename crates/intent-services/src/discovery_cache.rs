@@ -35,8 +35,8 @@ fn cache() -> &'static DiscoveryCache<ProviderAvailability> {
 /// Resolve every registered provider's availability through the cache,
 /// preserving [`ACP_PROVIDERS`] registry order — the order
 /// `discover_providers_with_npx_overrides` has always returned.
-pub(crate) fn discover_providers_cached(
-    provider_paths: &HashMap<String, String>,
+pub(crate) fn discover_providers_cached<S: std::hash::BuildHasher>(
+    provider_paths: &HashMap<String, String, S>,
 ) -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()

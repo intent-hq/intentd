@@ -76,11 +76,7 @@ fn subscribe_params_validation() {
     assert_eq!(p.replace_group.as_deref(), Some("g"));
 
     // Empty / missing / non-array → error.
-    for bad in [
-        r#"{"eventTypes":[]}"#,
-        r#"{}"#,
-        r#"{"eventTypes":"note:*"}"#,
-    ] {
+    for bad in [r#"{"eventTypes":[]}"#, r"{}", r#"{"eventTypes":"note:*"}"#] {
         let v = parse(bad);
         let err = parse_subscribe_params(v.as_object().unwrap()).unwrap_err();
         assert!(err.contains("non-empty array"));
@@ -94,7 +90,7 @@ fn unsubscribe_id_validation() {
         parse_unsubscribe_id(ok.as_object().unwrap()).unwrap(),
         "ws-sub-3"
     );
-    for bad in [r#"{}"#, r#"{"subscriptionId":""}"#] {
+    for bad in [r"{}", r#"{"subscriptionId":""}"#] {
         let v = parse(bad);
         let err = parse_unsubscribe_id(v.as_object().unwrap()).unwrap_err();
         assert!(err.contains("subscriptionId is required"));
@@ -116,7 +112,7 @@ fn next_subscription_id_is_monotonic_and_prefixed() {
 fn error_frame_tags_invalid_params_with_data_code() {
     // -32602 carries the machine-readable discriminator (PROTOCOL §3.3).
     let v = parse(&error_frame(
-        json!(7),
+        &json!(7),
         -32602,
         "eventTypes must be a non-empty array",
     ));
@@ -129,7 +125,7 @@ fn error_frame_tags_invalid_params_with_data_code() {
 
     // Other codes stay data-less.
     for code in [-32600, -32601, -32603, -32001] {
-        let v = parse(&error_frame(json!(1), code, "boom"));
+        let v = parse(&error_frame(&json!(1), code, "boom"));
         assert_eq!(v["error"]["code"], json!(code));
         assert!(v["error"].get("data").is_none(), "no data for {code}: {v}");
     }

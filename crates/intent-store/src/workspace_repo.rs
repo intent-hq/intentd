@@ -18,6 +18,10 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if encoding workspace fields or the insert fails.
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         self.insert_workspace_with_auto_commit(ws, None).await
     }
@@ -28,6 +32,10 @@ impl Store {
     /// workspace never silently degrades to global-tracking semantics.
     /// `None` leaves the column NULL (resolves against the global at read
     /// time).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_workspace_with_auto_commit(
         &self,
         ws: &Workspace,
@@ -53,15 +61,15 @@ impl Store {
             .bind(&ws.repository_name)
             .bind(&ws.worktree_path)
             .bind(&ws.scope)
-            .bind(ws.skip_worktree as i64)
-            .bind(ws.is_remote as i64)
+            .bind(i64::from(ws.skip_worktree))
+            .bind(i64::from(ws.is_remote))
             .bind(&ws.default_model)
-            .bind(ws.pr_number.map(|n| n as i64))
+            .bind(ws.pr_number.map(u64::cast_signed))
             .bind(&ws.pr_url)
             .bind(pr_status_to_db(ws)?)
             .bind(active_pr_to_db(ws)?)
             .bind(pull_requests_to_db(ws)?)
-            .bind(ws.archived as i64)
+            .bind(i64::from(ws.archived))
             .bind(&ws.archived_at)
             .bind(tags_to_db(&ws.tags)?)
             .bind(&ws.created_at)
@@ -70,7 +78,7 @@ impl Store {
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
-            .bind(auto_commit.map(|v| v as i64))
+            .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
@@ -78,6 +86,10 @@ impl Store {
     }
 
     /// Fetch a single workspace by id, or `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id = ?");
         let row = sqlx::query(&sql)
@@ -102,6 +114,10 @@ impl Store {
     /// Otherwise the stored column holds, so a get → mutate → write flow whose
     /// read predated a concurrent bump can never silently revert it (the
     /// `attention` clobber shape fixed by #1481).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
@@ -129,15 +145,15 @@ impl Store {
         .bind(&ws.repository_name)
         .bind(&ws.worktree_path)
         .bind(&ws.scope)
-        .bind(ws.skip_worktree as i64)
-        .bind(ws.is_remote as i64)
+        .bind(i64::from(ws.skip_worktree))
+        .bind(i64::from(ws.is_remote))
         .bind(&ws.default_model)
-        .bind(ws.pr_number.map(|n| n as i64))
+        .bind(ws.pr_number.map(u64::cast_signed))
         .bind(&ws.pr_url)
         .bind(pr_status_to_db(ws)?)
         .bind(active_pr_to_db(ws)?)
         .bind(pull_requests_to_db(ws)?)
-        .bind(ws.archived as i64)
+        .bind(i64::from(ws.archived))
         .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
@@ -168,12 +184,16 @@ impl Store {
     /// last-writer-wins by design — refreshes are idempotent against the
     /// forge and the next sweep converges. `NotFound` when the workspace
     /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
              active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
         )
-        .bind(ws.pr_number.map(|n| n as i64))
+        .bind(ws.pr_number.map(u64::cast_signed))
         .bind(&ws.pr_url)
         .bind(pr_status_to_db(ws)?)
         .bind(active_pr_to_db(ws)?)
@@ -204,19 +224,23 @@ impl Store {
     /// Uses raw `BEGIN IMMEDIATE` (same pattern as `insert_events`):
     /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
     /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
-    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// that intermittently fails with `SQLITE_BUSY` (code 5). With
     /// `max_connections=1` on the write pool, concurrent recomputes serialize
     /// at `pool.acquire()` instead.
     ///
     /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
     /// `agent_message` for sessions still on the per-message fallback (no
     /// snapshot/baseline token report), and that work happens while holding
-    /// the daemon's sole write connection and the SQLite write lock. The
+    /// the daemon's sole write connection and the `SQLite` write lock. The
     /// report-backed skip keeps the common case cheap, and the fallback read
     /// projects each message's usage object in SQL and filters to
     /// usage-bearing rows off a partial index instead of materializing message
     /// bodies (monorepo#1571) — so what a workspace of long-history fallback
     /// sessions pays for is its usage-bearing rows, not its transcript bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,
@@ -287,6 +311,10 @@ impl Store {
     /// current attention differs from `attention`. Returns whether a row was
     /// written (`true` ⇒ the value actually changed); `NotFound` when the
     /// workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` when the workspace does not exist; `Error::Internal` if the update or presence check fails.
     pub async fn set_workspace_attention(
         &self,
         id: &WorkspaceId,
@@ -351,12 +379,16 @@ impl Store {
     /// (`list_workspaces_lite`, the `workspace.subscribe` seq-0 snapshot) serve
     /// a fresh timestamp after a restart.
     ///
-    /// Comparison runs through SQLite's `julianday()` rather than raw TEXT so
+    /// Comparison runs through `SQLite`'s `julianday()` rather than raw TEXT so
     /// timestamps of differing fractional-second precision order correctly
     /// (lexicographic `…:00Z` vs `…:00.5Z` compares backwards). A malformed
     /// `last_activity` parses to NULL and is treated as "older" (overwritten);
     /// a malformed input never writes. Returns whether a row was written;
     /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn bump_workspace_last_activity(
         &self,
         id: &WorkspaceId,
@@ -399,8 +431,12 @@ impl Store {
     /// Also removes the workspace's `draft` rows explicitly — `draft` has no
     /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
     ///
-    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
         let pool = self.write_pool();
         let id = id.clone();
@@ -444,6 +480,10 @@ impl Store {
     /// Whether a workspace id was ever used — a live row exists **or** a
     /// delete tombstone is recorded. `workspace.create` uses this to uniquify
     /// derived slug ids so a deleted workspace's id is never recycled.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn workspace_id_ever_used(&self, id: &WorkspaceId) -> Result<bool> {
         let row = sqlx::query(
             "SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) \
@@ -462,13 +502,17 @@ impl Store {
     /// `workspace.delete` cleanup guard: only an auto-generated branch is ever
     /// deleted with the worktree (TS `removeGitWorktree` parity). Store-only —
     /// the flag never appears on the wire, so it lives outside [`Workspace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_branch_auto_generated(
         &self,
         id: &WorkspaceId,
         auto_generated: bool,
     ) -> Result<()> {
         let res = sqlx::query("UPDATE workspace SET branch_auto_generated = ? WHERE id = ?")
-            .bind(auto_generated as i64)
+            .bind(i64::from(auto_generated))
             .bind(&id.0)
             .execute(self.write_pool())
             .await
@@ -481,6 +525,10 @@ impl Store {
 
     /// Whether the workspace's branch was auto-generated at create time.
     /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_branch_auto_generated(&self, id: &WorkspaceId) -> Result<bool> {
         let row = sqlx::query("SELECT branch_auto_generated FROM workspace WHERE id = ?")
             .bind(&id.0)
@@ -497,9 +545,13 @@ impl Store {
     /// §3b). Mirrored from the global `git.autoCommit` at create time and
     /// toggled via `workspace.setAutoCommit`. Store-only column — the value
     /// is surfaced through the dedicated getter RPC, not on [`Workspace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
         let res = sqlx::query("UPDATE workspace SET auto_commit_enabled = ? WHERE id = ?")
-            .bind(enabled as i64)
+            .bind(i64::from(enabled))
             .bind(&id.0)
             .execute(self.write_pool())
             .await
@@ -514,6 +566,10 @@ impl Store {
     /// pre-migration rows (NULL column) — the caller resolves NULL against
     /// the global `git.autoCommit` setting. `NotFound` when the workspace
     /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
         let row = sqlx::query("SELECT auto_commit_enabled FROM workspace WHERE id = ?")
             .bind(&id.0)
@@ -530,6 +586,10 @@ impl Store {
     /// The seeded virtual [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief
     /// is synthesized on read by the service layer and never surfaces via
     /// `workspace.list` (TS `findAll` parity, `workspace.repository.ts`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspaces(&self, include_archived: bool) -> Result<Vec<Workspace>> {
         let sql = if include_archived {
             format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? ORDER BY created_at")
@@ -555,7 +615,7 @@ where
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
 }
 
-/// Encode the optional `pr_status` enum to its PascalCase DB word, or `None`.
+/// Encode the optional `pr_status` enum to its `PascalCase` DB word, or `None`.
 fn pr_status_to_db(ws: &Workspace) -> Result<Option<String>> {
     ws.pr_status.map(|s| enum_to_db(&s)).transpose()
 }
@@ -684,7 +744,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         setup_script,
         is_remote: col::<i64>(row, "is_remote")? != 0,
         default_model: col(row, "default_model")?,
-        pr_number: pr_number.map(|n| n as u64),
+        pr_number: pr_number.map(i64::cast_unsigned),
         pr_url: col(row, "pr_url")?,
         pr_status,
         active_pull_request,

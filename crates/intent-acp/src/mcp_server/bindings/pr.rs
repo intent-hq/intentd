@@ -19,28 +19,28 @@ use serde_json::Value;
 
 use super::{map_err, req_i64};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.pr = {
         snapshot: (prNumber, options) =>
             host({ method: 'pr.snapshot', args: { prNumber, ...(options || {}) } }),
     };
-"#;
+";
 
 /// The `agentFeatures.prMonitor` segment of the `ws.pr` prelude: the three
 /// monitor installers, appended to [`PRELUDE`] only when the toggle is on. A
 /// unit test guards that the segment stays syntactically attachable.
-pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r#"
+pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r"
     ws.pr.monitor = (prNumber, options) =>
         host({ method: 'pr.monitor', args: { prNumber, ...(options || {}) } });
     ws.pr.unmonitor = (prNumber, options) =>
         host({ method: 'pr.unmonitor', args: { prNumber, ...(options || {}) } });
     ws.pr.monitors = () => host({ method: 'pr.monitors' });
-"#;
+";
 
 /// Feature-aware `ws.pr` prelude: the monitor installers are omitted when
 /// `agentFeatures.prMonitor` is off, so agent code touching them fails with a
-/// clear `ws.pr.monitor is not a function` TypeError.
+/// clear `ws.pr.monitor is not a function` `TypeError`.
 pub(crate) fn prelude_for(features: &intent_core::settings_file::AgentFeaturesSettings) -> String {
     let mut out = PRELUDE.to_string();
     if features.pr_monitor {
@@ -72,7 +72,7 @@ fn req_pr_number(args: &Value) -> Result<u64, String> {
     if pr_number <= 0 {
         return Err("prNumber is required and must be a number".to_string());
     }
-    Ok(pr_number as u64)
+    Ok(pr_number.cast_unsigned())
 }
 
 /// The optional cross-repo override; slug validation lives in the engine, but
@@ -168,6 +168,7 @@ mod tests {
     /// were reached — the caller-context guards must reject before the
     /// service layer sees the call.
     #[derive(Default)]
+    #[allow(clippy::struct_field_names)] // fields mirror the spied method names
     struct SpyApi {
         start_called: AtomicBool,
         stop_called: AtomicBool,

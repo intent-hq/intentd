@@ -15,12 +15,20 @@ use crate::map_git_err;
 
 /// `git reset --hard <target>`: move `HEAD` to `target` and overwrite the index
 /// and working tree to match it (discarding local changes).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `target` cannot be resolved or the reset fails.
 pub fn reset_hard(worktree_path: &Path, target: &str) -> Result<()> {
     reset(worktree_path, target, ResetType::Hard)
 }
 
 /// `git reset --soft <target>`: move `HEAD` to `target`, leaving the index and
 /// working tree untouched (staged changes are preserved).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `target` cannot be resolved or the reset fails.
 pub fn reset_soft(worktree_path: &Path, target: &str) -> Result<()> {
     reset(worktree_path, target, ResetType::Soft)
 }

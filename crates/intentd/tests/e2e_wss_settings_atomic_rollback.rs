@@ -42,7 +42,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -210,7 +210,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -247,9 +247,12 @@ async fn mixed_batch_rollback_over_wss() {
 
     // Get server fingerprint and port from system.status (WSS listener started at boot via config)
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -343,9 +346,12 @@ async fn retired_workspace_overrides_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -415,7 +421,7 @@ async fn retired_workspace_overrides_over_wss() {
 }
 
 /// `workspaceApi.*` over WSS (per AGENTS.md testing gate): the two
-/// TOML-backed workspace_api output knobs appear in `settings.list` with
+/// TOML-backed `workspace_api` output knobs appear in `settings.list` with
 /// their definitions, round-trip through `settings.update`/`settings.reset`,
 /// and out-of-range values reject with `-32602`.
 #[tokio::test]
@@ -431,9 +437,12 @@ async fn workspace_api_settings_round_trip_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -451,9 +460,9 @@ async fn workspace_api_settings_round_trip_over_wss() {
         .find(|e| e["path"] == "workspaceApi.maxOutputChars")
         .expect("workspaceApi.maxOutputChars missing from settings.list");
     assert_eq!(chars["type"], json!("number"));
-    assert_eq!(chars["value"], json!(100000.0));
+    assert_eq!(chars["value"], json!(100_000.0));
     assert_eq!(chars["min"], json!(0.0));
-    assert_eq!(chars["max"], json!(10000000.0));
+    assert_eq!(chars["max"], json!(10_000_000.0));
     assert_eq!(chars["origin"], json!("default"));
     let toon = settings
         .iter()
@@ -469,7 +478,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
         2,
         "settings.update",
         json!({ "changes": [
-            {"path": "workspaceApi.maxOutputChars", "value": 250000},
+            {"path": "workspaceApi.maxOutputChars", "value": 250_000},
             {"path": "workspaceApi.toonOutput", "value": false}
         ] }),
     )
@@ -486,7 +495,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
     .await;
     // Registry-read numbers are reported as floats on the wire (see
     // `wire_value`), matching the numeric shape of the catalog defaults.
-    assert_eq!(resp["result"]["value"], json!(250000.0));
+    assert_eq!(resp["result"]["value"], json!(250_000.0));
     assert_eq!(resp["result"]["origin"], json!("file"));
     let resp = wss_rpc(
         &mut ws,
@@ -499,7 +508,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
     assert_eq!(resp["result"]["origin"], json!("file"));
 
     // Sub-1000 non-zero / over-max values reject with -32602.
-    for bad in [json!(500), json!(20000000)] {
+    for bad in [json!(500), json!(20_000_000)] {
         let resp = wss_rpc(
             &mut ws,
             5,
@@ -528,7 +537,7 @@ async fn workspace_api_settings_round_trip_over_wss() {
         json!({"path": "workspaceApi.maxOutputChars"}),
     )
     .await;
-    assert_eq!(resp["result"]["value"], json!(100000.0));
+    assert_eq!(resp["result"]["value"], json!(100_000.0));
     let resp = wss_rpc(
         &mut ws,
         8,
@@ -559,9 +568,12 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -659,9 +671,12 @@ async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -736,6 +751,7 @@ fn assert_success_envelope(resp: &Value, id: i64) {
     assert!(resp["result"].is_object(), "{resp}");
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// The `agents` memory knobs as clients actually receive them (monorepo#2109):
 /// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
 /// `agents.idleReapMinutes` advertises the shipped 10-minute default.
@@ -749,7 +765,12 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 /// rejected by `SettingsFile::validate` inside `SettingsRegistry::apply`,
 /// i.e. the catalog advertising a value the write path refuses.
 #[tokio::test]
+// The advertised max is a small whole-valued float: casts are exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn agent_memory_knobs_over_wss() {
+    // The static bound `SettingsFile` enforces when parsing config.toml. The
+    // catalog bound may sit below it (this machine's RAM) but never above.
+    const PARSE_BOUND_MB: f64 = 1_024_000.0;
     let data_dir = temp_data_dir();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -761,9 +782,12 @@ async fn agent_memory_knobs_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -771,9 +795,6 @@ async fn agent_memory_knobs_over_wss() {
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(port, cfg).await;
 
-    // The static bound `SettingsFile` enforces when parsing config.toml. The
-    // catalog bound may sit below it (this machine's RAM) but never above.
-    const PARSE_BOUND_MB: f64 = 1_024_000.0;
     let budget = "agents.memoryBudgetMb";
     let reap = "agents.idleReapMinutes";
 

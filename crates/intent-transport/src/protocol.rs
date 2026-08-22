@@ -16,7 +16,7 @@
 //! `workspace.list` / `workspace.get` rows (§5.1, monorepo#1396) — the field
 //! was optional, so row shapes remain valid for existing clients. Version 4.3
 //! adds `voice.transcribe` (additive): daemon-side speech-to-text over a
-//! pluggable provider (ElevenLabs Scribe | OpenAI) — 278 router methods,
+//! pluggable provider (`ElevenLabs` Scribe | `OpenAI`) — 278 router methods,
 //! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
 //! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
 //! same `-32603` / "Internal error" envelope, no method-catalog change.
@@ -299,29 +299,26 @@ impl LargeFrameWarnThrottle {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match entries.iter_mut().find(|(m, _)| m == method) {
-            Some((_, last)) => {
-                if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
-                    false
-                } else {
-                    *last = now;
-                    true
-                }
-            }
-            None => {
-                if entries.len() >= MAX_TRACKED_METHODS {
-                    if let Some(stalest) = entries
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (_, last))| *last)
-                        .map(|(i, _)| i)
-                    {
-                        entries.swap_remove(stalest);
-                    }
-                }
-                entries.push((method.to_string(), now));
+        if let Some((_, last)) = entries.iter_mut().find(|(m, _)| m == method) {
+            if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
+                false
+            } else {
+                *last = now;
                 true
             }
+        } else {
+            if entries.len() >= MAX_TRACKED_METHODS {
+                if let Some(stalest) = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(i, _)| i)
+                {
+                    entries.swap_remove(stalest);
+                }
+            }
+            entries.push((method.to_string(), now));
+            true
         }
     }
 

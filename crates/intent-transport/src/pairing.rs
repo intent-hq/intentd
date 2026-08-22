@@ -8,6 +8,7 @@
 //! the long-lived bearer token (Decision 4), so remote (TCP) callers get a
 //! -32001 auth error regardless of the `--mode` locality flag.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -53,9 +54,11 @@ fn encode_query_value(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -104,7 +107,7 @@ pub(crate) async fn handle(
             return None;
         }
         return Some(error_frame(
-            req.id_echo,
+            &req.id_echo,
             -32001,
             "pairing.getInfo is local-only",
         ));
@@ -114,17 +117,17 @@ pub(crate) async fn handle(
         return None;
     }
     match result {
-        Ok(v) => Some(success_frame(req.id_echo, v)),
+        Ok(v) => Some(success_frame(&req.id_echo, &v)),
         // Listener-down carries the machine-readable discriminator
         // `error.data.code = "listener-down"` so `intentd pair` auto-enable
         // stops depending on message prose (monorepo#1822).
         Err(e @ Error::ListenerDown) => Some(error_frame_with_data(
-            req.id_echo,
+            &req.id_echo,
             e.code(),
             &e.to_string(),
-            json!({ "code": "listener-down" }),
+            &json!({ "code": "listener-down" }),
         )),
-        Err(e) => Some(error_frame(req.id_echo, e.code(), &e.to_string())),
+        Err(e) => Some(error_frame(&req.id_echo, e.code(), &e.to_string())),
     }
 }
 

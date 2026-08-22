@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 
 /// Cap on the serialized `attachments` payload of a `drafts.set` (rejected
-/// with `-32602` above this) to keep SQLite rows bounded (PROTOCOL §5.16).
+/// with `-32602` above this) to keep `SQLite` rows bounded (PROTOCOL §5.16).
 pub(crate) const MAX_ATTACHMENTS_BYTES: usize = 25 * 1024 * 1024;
 
 /// The three `drafts.*` methods, once classified.
@@ -101,6 +101,16 @@ async fn resolve_for_write(
 /// JSON array, an empty array is normalized to `None` (nothing stored), and a
 /// serialized payload above [`MAX_ATTACHMENTS_BYTES`] is rejected (`-32602`).
 fn validate_attachments(attachments: Option<Value>) -> Result<Option<Value>, (i32, String)> {
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let Some(value) = attachments else {
         return Ok(None);
     };
@@ -112,16 +122,6 @@ fn validate_attachments(attachments: Option<Value>) -> Result<Option<Value>, (i3
     };
     if items.is_empty() {
         return Ok(None);
-    }
-    struct CountingWriter(usize);
-    impl std::io::Write for CountingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
     let mut counter = CountingWriter(0);
     serde_json::to_writer(&mut counter, &value).map_err(|e| (-32603, e.to_string()))?;
@@ -150,7 +150,7 @@ pub(crate) async fn handle(
     ) else {
         return frame(
             req.id_present,
-            req.id_echo,
+            &req.id_echo,
             Err((
                 -32602,
                 "Missing required parameter: workspaceId/agentId".to_string(),
@@ -198,17 +198,21 @@ pub(crate) async fn handle(
             },
         },
     };
-    frame(req.id_present, req.id_echo, result)
+    frame(req.id_present, &req.id_echo, result)
 }
 
 /// Build the response frame for a `drafts.*` result, or `None` for a
 /// notification (no `id`).
-fn frame(id_present: bool, id_echo: Value, result: Result<Value, (i32, String)>) -> Option<String> {
+fn frame(
+    id_present: bool,
+    id_echo: &Value,
+    result: Result<Value, (i32, String)>,
+) -> Option<String> {
     if !id_present {
         return None;
     }
     Some(match result {
-        Ok(value) => success_frame(id_echo, value),
+        Ok(value) => success_frame(id_echo, &value),
         Err((code, message)) => error_frame(id_echo, code, &message),
     })
 }

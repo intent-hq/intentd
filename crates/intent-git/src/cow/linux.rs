@@ -1,4 +1,4 @@
-//! Linux CoW implementation using per-file FICLONE ioctl.
+//! Linux `CoW` implementation using per-file FICLONE ioctl.
 
 use intent_core::{Error, Result};
 use std::fs;
@@ -12,9 +12,9 @@ use super::CowSupport;
 // FICLONE ioctl number from linux/fs.h. libc::Ioctl is the target's ioctl
 // request type (c_ulong on glibc, c_int on musl).
 #[cfg(target_os = "linux")]
-const FICLONE: libc::Ioctl = 0x40049409;
+const FICLONE: libc::Ioctl = 0x4004_9409;
 
-/// Get volume IDs (st_dev) for both paths as a cache key.
+/// Get volume IDs (`st_dev`) for both paths as a cache key.
 pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
     let src_meta = fs::metadata(src).ok()?;
     let dst_meta = fs::metadata(dst).ok()?;
@@ -60,7 +60,7 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
     } else {
         let errno = io::Error::last_os_error();
         match errno.raw_os_error() {
-            Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::EINVAL) => {
+            Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) => {
                 Err(Error::Unsupported("CoW cloning not supported".to_string()))
             }
             _ => Err(Error::Internal(format!("FICLONE ioctl failed: {errno}"))),

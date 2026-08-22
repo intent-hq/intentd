@@ -110,14 +110,14 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 // listTabs shows the tab with visibility: "hidden":
 // { tabId: "tab-bg1", url: "http://localhost:5173/", ownerAgentId: "<your-agent-id>", visibility: "hidden", ... }
 
-// Reveal it when the user should see it — mounted without stealing focus
+// Reveal it when the user should see it — activated in a visible panel without stealing focus
 {
   "actions": [
     { "action": "showTab", "tabId": "tab-bg1" }
   ]
 }
 
-// Reveal AND activate (explicit opt-in to moving focus)
+// Reveal AND focus (explicit opt-in to moving focus)
 {
   "actions": [
     { "action": "showTab", "tabId": "tab-bg1", "focus": true }
@@ -138,6 +138,12 @@ action-result error. `focusTab` keeps its visible-tab semantics and fails on a h
 tab with an error pointing at `showTab`. Note that re-issuing
 `openTab { url, visible: true }` on a URL you already have hidden does NOT reveal it:
 a dedupe hit never changes the reused tab's visibility — use `showTab`.
+
+All of this works even when the workspace is not currently visible in the app: the
+operations succeed and apply their effects to the persisted layout state, and
+`showTab { focus: true }` / `focusTab` / `openTab { visible: true }` skip the actual
+UI focus attempt, carrying a workspace-not-visible `warning` string in the action
+result.
 
 ## Opening Local HTML Files
 

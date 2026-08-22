@@ -30,6 +30,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -213,7 +214,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -238,7 +239,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -338,13 +339,15 @@ fn seed_grok_path_override(data_dir: &Path, wrapper: &Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
+    let _ = write!(
+        text,
         "\n[providers.paths]\ngrok = \"{}\"\n",
         wrapper.display()
-    ));
+    );
     std::fs::write(&path, text).expect("write config.toml");
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Cross-provider `agent.setModel` regression: switching a live `mock` agent
 /// to `grok:grok-4-fast` must respawn onto the (hermetically wrapped) grok
 /// binary, open a fresh `session/new` there, and prepend the prior
@@ -380,7 +383,8 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -618,7 +622,8 @@ async fn load_session_harness(script: &str, tag: &str, model: &str) -> LoadSessi
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -686,6 +691,7 @@ async fn load_session_harness(script: &str, tag: &str, model: &str) -> LoadSessi
     harness
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// monorepo#907 regression: a committed cross-provider switch must NEVER
 /// issue `session/load` with the old provider's session id against the new
 /// provider's binary — even when that provider advertises `loadSession: true`
@@ -753,6 +759,7 @@ async fn cross_provider_switch_skips_foreign_session_load() {
     );
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Same-provider model switches keep the `session/load` resume: the respawned
 /// child is offered the ORIGINAL session id (its owner provider is unchanged)
 /// and no history replay happens. Runs on the grok wrapper (not `mock:` — the
@@ -817,6 +824,7 @@ async fn same_provider_model_switch_resumes_via_session_load() {
     );
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Deferred-commit semantics: a cross-provider switch REVERTED before the
 /// next message is a no-op — the live child and its original session are
 /// reused untouched (no respawn, no session/load, no replay, no notice).

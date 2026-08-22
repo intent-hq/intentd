@@ -40,6 +40,7 @@ tokio::task_local! {
 /// Whether the current request is over a TCP transport (WSS). Returns `true`
 /// (remote/untrusted) for TCP connections or when called outside a request
 /// context (fail-closed). Thread-safe.
+#[must_use]
 pub fn is_tcp_connection() -> bool {
     IS_TCP.try_with(|cell| *cell.borrow()).unwrap_or(true)
 }

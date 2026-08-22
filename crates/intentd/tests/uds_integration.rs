@@ -1,5 +1,5 @@
 //! End-to-end UDS slice test: seed via the store, then drive the daemon as a
-//! JSON-RPC client over a temp Unix-domain socket (§5.7 DoD).
+//! JSON-RPC client over a temp Unix-domain socket (§5.7 `DoD`).
 
 mod common;
 

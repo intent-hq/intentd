@@ -2,7 +2,7 @@
 //! `mcp.oauth.*` RPC family manages the opaque OAuth bag associated with each
 //! external MCP server id; bags are secret material. Every wire response is
 //! **presence-only** — the bag itself never leaves the daemon over the wire.
-//! Storage lives in the `mcp_oauth_tokens` SQLite table (§9.4); internal
+//! Storage lives in the `mcp_oauth_tokens` `SQLite` table (§9.4); internal
 //! consumers (e.g. an outbound HTTP request built inside the daemon) read the
 //! raw bag through [`Store::get_mcp_oauth_token`], never through the wire.
 

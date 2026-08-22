@@ -1,7 +1,7 @@
 //! Universal MCP config conversion (§6.8) — port of `universal-mcp-config.ts`.
 //!
 //! We store MCP servers in an Auggie-compatible shape. Other ACP providers
-//! (OpenCode, Claude Code, Codex) each expect different formats. This module
+//! (`OpenCode`, Claude Code, Codex) each expect different formats. This module
 //! normalizes the internal representation into a canonical shape and converts to
 //! provider-specific formats, and injects the safe baseline env into stdio
 //! servers (the `applyBaselineEnvToStdioServers` analog).
@@ -138,8 +138,8 @@ pub fn normalize_mcp_servers(servers: &Value) -> NormalizedMcpServers {
     out
 }
 
-fn headers_to_value(headers: &Option<BTreeMap<String, String>>) -> Option<Value> {
-    headers.as_ref().map(|h| {
+fn headers_to_value(headers: Option<&BTreeMap<String, String>>) -> Option<Value> {
+    headers.map(|h| {
         let mut m = Map::new();
         for (k, v) in h {
             m.insert(k.clone(), Value::String(v.clone()));
@@ -165,7 +165,8 @@ fn pairs_array(map: &BTreeMap<String, String>) -> Value {
     )
 }
 
-/// Convert to the OpenCode config `mcp` block (port of `toOpenCodeMcpConfig`).
+/// Convert to the `OpenCode` config `mcp` block (port of `toOpenCodeMcpConfig`).
+#[must_use]
 pub fn to_opencode_mcp_config(normalized: &NormalizedMcpServers) -> Value {
     let mut mcp = Map::new();
     for (name, server) in normalized {
@@ -183,7 +184,7 @@ pub fn to_opencode_mcp_config(normalized: &NormalizedMcpServers) -> Value {
             NormalizedMcpServer::Http { url, headers }
             | NormalizedMcpServer::Sse { url, headers } => {
                 let mut obj = json!({ "type": "remote", "url": url, "enabled": true });
-                if let Some(h) = headers_to_value(headers) {
+                if let Some(h) = headers_to_value(headers.as_ref()) {
                     obj["headers"] = h;
                 }
                 obj
@@ -206,15 +207,17 @@ pub(crate) fn to_claude_mcp_json(normalized: &NormalizedMcpServers) -> Value {
                 "args": args,
                 "env": env_to_value(env),
             }),
-            NormalizedMcpServer::Http { url, headers } => remote_entry("http", url, headers),
-            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers),
+            NormalizedMcpServer::Http { url, headers } => {
+                remote_entry("http", url, headers.as_ref())
+            }
+            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers.as_ref()),
         };
         servers.insert(name.clone(), entry);
     }
     json!({ "mcpServers": Value::Object(servers) })
 }
 
-fn remote_entry(kind: &str, url: &str, headers: &Option<BTreeMap<String, String>>) -> Value {
+fn remote_entry(kind: &str, url: &str, headers: Option<&BTreeMap<String, String>>) -> Value {
     let mut obj = json!({ "type": kind, "url": url });
     if let Some(h) = headers_to_value(headers) {
         obj["headers"] = h;
@@ -224,6 +227,7 @@ fn remote_entry(kind: &str, url: &str, headers: &Option<BTreeMap<String, String>
 
 /// Convert to the Auggie `--mcp-config` `{ mcpServers }` shape (the storage
 /// format): stdio entries are `{ command, args, env }`, remotes carry `type`.
+#[must_use]
 pub fn to_auggie_mcp_config(normalized: &NormalizedMcpServers) -> Value {
     let mut servers = Map::new();
     for (name, server) in normalized {
@@ -233,8 +237,10 @@ pub fn to_auggie_mcp_config(normalized: &NormalizedMcpServers) -> Value {
                 "args": args,
                 "env": env_to_value(env),
             }),
-            NormalizedMcpServer::Http { url, headers } => remote_entry("http", url, headers),
-            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers),
+            NormalizedMcpServer::Http { url, headers } => {
+                remote_entry("http", url, headers.as_ref())
+            }
+            NormalizedMcpServer::Sse { url, headers } => remote_entry("sse", url, headers.as_ref()),
         };
         servers.insert(name.clone(), entry);
     }
@@ -256,10 +262,10 @@ pub(crate) fn to_acp_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<Value
                 "env": pairs_array(env),
             })),
             NormalizedMcpServer::Http { url, headers } => {
-                servers.push(acp_remote(name, "http", url, headers))
+                servers.push(acp_remote(name, "http", url, headers.as_ref()));
             }
             NormalizedMcpServer::Sse { url, headers } => {
-                servers.push(acp_remote(name, "sse", url, headers))
+                servers.push(acp_remote(name, "sse", url, headers.as_ref()));
             }
         }
     }
@@ -271,9 +277,9 @@ fn acp_remote(
     name: &str,
     kind: &str,
     url: &str,
-    headers: &Option<BTreeMap<String, String>>,
+    headers: Option<&BTreeMap<String, String>>,
 ) -> Value {
-    let headers = headers.clone().unwrap_or_default();
+    let headers = headers.cloned().unwrap_or_default();
     json!({ "name": name, "type": kind, "url": url, "headers": pairs_array(&headers) })
 }
 
@@ -284,6 +290,7 @@ fn acp_remote(
 /// shape as [`to_acp_mcp_servers`] — stdio entries serialize untagged (no
 /// `type` field), remotes carry `type: http|sse` — but typed so the session
 /// lifecycle helpers take `Vec<McpServer>` directly.
+#[must_use]
 pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpServer> {
     let mut servers = Vec::new();
     for (name, server) in normalized {
@@ -301,12 +308,14 @@ pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpS
             }
             NormalizedMcpServer::Http { url, headers } => {
                 servers.push(McpServer::Http(
-                    McpServerHttp::new(name.clone(), url.clone()).headers(header_pairs(headers)),
+                    McpServerHttp::new(name.clone(), url.clone())
+                        .headers(header_pairs(headers.as_ref())),
                 ));
             }
             NormalizedMcpServer::Sse { url, headers } => {
                 servers.push(McpServer::Sse(
-                    McpServerSse::new(name.clone(), url.clone()).headers(header_pairs(headers)),
+                    McpServerSse::new(name.clone(), url.clone())
+                        .headers(header_pairs(headers.as_ref())),
                 ));
             }
         }
@@ -314,9 +323,8 @@ pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpS
     servers
 }
 
-fn header_pairs(headers: &Option<BTreeMap<String, String>>) -> Vec<HttpHeader> {
+fn header_pairs(headers: Option<&BTreeMap<String, String>>) -> Vec<HttpHeader> {
     headers
-        .as_ref()
         .map(|h| {
             h.iter()
                 .map(|(k, v)| HttpHeader::new(k.clone(), v.clone()))
@@ -409,6 +417,7 @@ pub(crate) fn to_codex_mcp_overrides(
 /// Return a copy of `servers` where each stdio server's `env` is the parent
 /// baseline merged with that server's existing env (existing env wins). Remote
 /// servers are returned unchanged (port of `applyBaselineEnvToStdioServers`).
+#[must_use]
 pub fn apply_baseline_env_to_stdio_servers(
     servers: &NormalizedMcpServers,
     baseline: &EnvMap,

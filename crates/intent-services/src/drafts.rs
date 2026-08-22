@@ -1,4 +1,4 @@
-//! services::drafts — BE-persisted per-client chat drafts (§9.10, §15) and the
+//! `services::drafts` — BE-persisted per-client chat drafts (§9.10, §15) and the
 //! `client.hello` client-row upsert (§16).
 //!
 //! The connection→logical-`clientId` binding and the `server` capability block
@@ -73,7 +73,7 @@ impl Services {
             )
         };
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             draft_changed_event(&workspace_id, &agent_id, &client_id, updated.is_some()),
         )
         .await;
@@ -92,7 +92,7 @@ impl Services {
             .delete_draft(&workspace_id, &agent_id, &client_id)
             .await?;
         publish_event(
-            &self.event_bus,
+            self.event_bus.as_ref(),
             draft_changed_event(&workspace_id, &agent_id, &client_id, false),
         )
         .await;

@@ -36,7 +36,7 @@ pub(crate) fn request_identity(value: &Value) -> (Option<Value>, String) {
 /// If serialization itself ever fails, fall back to a deterministic valid
 /// envelope (id null) rather than an empty frame, matching the router's
 /// `internal_fallback`.
-pub(crate) fn internal_error_frame(id: Value) -> String {
+pub(crate) fn internal_error_frame(id: &Value) -> String {
     serde_json::to_string(&json!({
         "jsonrpc": "2.0",
         "error": { "code": -32603, "message": "Internal error" },
@@ -68,9 +68,10 @@ pub(crate) fn maybe_inject_panic(method: &str) {
         return;
     }
     if let Ok(list) = std::env::var("INTENTD_TEST_PANIC_METHOD") {
-        if list.split(',').map(str::trim).any(|m| m == method) {
-            panic!("injected test panic for method {method}");
-        }
+        assert!(
+            !list.split(',').map(str::trim).any(|m| m == method),
+            "injected test panic for method {method}"
+        );
     }
 }
 
@@ -117,7 +118,7 @@ where
                 panic = %panic_message(payload.as_ref()),
                 "JSON-RPC handler panicked; connection kept alive"
             );
-            rpc_id.map(internal_error_frame)
+            rpc_id.as_ref().map(internal_error_frame)
         }
     }
 }
@@ -149,7 +150,10 @@ where
                 "JSON-RPC handler panicked; connection kept alive"
             );
             match rpc_id {
-                Some(id) => out_tx.send_priority(internal_error_frame(id)).await.is_ok(),
+                Some(id) => out_tx
+                    .send_priority(internal_error_frame(&id))
+                    .await
+                    .is_ok(),
                 None => !out_tx.is_closed(),
             }
         }
@@ -172,7 +176,9 @@ pub(crate) mod test_support {
 
     /// Hold the global-state lock for a hand-rolled swap (hook + env).
     pub(crate) fn lock_global_state() -> MutexGuard<'static, ()> {
-        GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+        GLOBAL_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Silence the default panic hook's stderr backtrace inside a scope; the

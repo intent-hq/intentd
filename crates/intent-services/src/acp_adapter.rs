@@ -117,7 +117,7 @@ impl AdapterSlots {
         }
         tracing::debug!(
             limit = self.limit,
-            wait_ms = wait.as_millis() as u64,
+            wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
             "ephemeral adapter bound reached; queueing for a slot"
         );
         // `acquire_owned` only errors on a closed semaphore, which never
@@ -154,6 +154,7 @@ pub(crate) fn adapter_slots() -> &'static AdapterSlots {
 /// (notably an e2e test) sizes work to the bound actually in force, rather
 /// than to the value it asked [`init_adapter_slots`] for — which is ignored
 /// when a bound was already installed.
+#[must_use]
 pub fn adapter_slot_limit() -> u32 {
     adapter_slots().limit()
 }
@@ -340,7 +341,7 @@ pub(crate) async fn spawn_adapter_in(
         let waited = started.elapsed();
         tracing::warn!(
             limit = slots.limit(),
-            waited_ms = waited.as_millis() as u64,
+            waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
             program = %cmd.program.display(),
             "gave up waiting for an ephemeral adapter slot"
         );
@@ -529,7 +530,7 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
-        let pgid = Pid::from_raw(pid as i32);
+        let pgid = Pid::from_raw(pid.cast_signed());
         let _ = killpg(pgid, Signal::SIGTERM);
         tokio::time::sleep(TERM_GRACE).await;
         if !matches!(child.try_wait(), Ok(Some(_))) {
@@ -653,6 +654,7 @@ mod reap_tests {
     // `intent_acp::descendant_sweep`; this module keeps the adapter-level
     // integration regression.
 
+    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
     /// Regression for the live escape: an MCP-server-style grandchild that
     /// moves into its OWN process group survives `killpg` on the adapter
     /// group (observed: codex-acp's auggie ran with pgid == its own pid); the
@@ -692,8 +694,10 @@ mod reap_tests {
 
         // Prove the grandchild actually escaped the adapter's process group —
         // otherwise killpg would reach it and the test would be vacuous.
-        let child_pgid = getpgid(Some(Pid::from_raw(child.id().expect("child pid") as i32)))
-            .expect("child pgid");
+        let child_pgid = getpgid(Some(Pid::from_raw(
+            child.id().expect("child pid").cast_signed(),
+        )))
+        .expect("child pgid");
         let grandchild_pgid =
             getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
         assert_ne!(

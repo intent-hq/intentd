@@ -74,8 +74,8 @@ async fn file_store_token() -> Option<String> {
     let handle =
         tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Ok(Some(v)))) => non_empty(v),
-        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Ok(Some(v)))) => non_empty(&v),
+        Ok(Ok(Ok(None)) | Err(_)) => None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,
@@ -84,7 +84,6 @@ async fn file_store_token() -> Option<String> {
             );
             None
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,
@@ -98,14 +97,14 @@ async fn file_store_token() -> Option<String> {
 /// Read `GITHUB_TOKEN`, falling back to `GH_TOKEN`.
 fn env_token() -> Option<String> {
     pick_env_token(
-        std::env::var("GITHUB_TOKEN").ok(),
-        std::env::var("GH_TOKEN").ok(),
+        std::env::var("GITHUB_TOKEN").ok().as_deref(),
+        std::env::var("GH_TOKEN").ok().as_deref(),
     )
 }
 
 /// Pure selection of the env token (testable): prefer `GITHUB_TOKEN`, then
 /// `GH_TOKEN`, ignoring empty values.
-pub(crate) fn pick_env_token(github: Option<String>, gh: Option<String>) -> Option<String> {
+pub(crate) fn pick_env_token(github: Option<&str>, gh: Option<&str>) -> Option<String> {
     github
         .and_then(non_empty)
         .or_else(|| gh.and_then(non_empty))
@@ -126,8 +125,8 @@ async fn gh_cli_token() -> Option<String> {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     });
     match timeout(GH_CLI_TIMEOUT, handle).await {
-        Ok(Ok(Some(v))) => non_empty(v),
-        Ok(Ok(None)) | Ok(Err(_)) => None,
+        Ok(Ok(Some(v))) => non_empty(&v),
+        Ok(Ok(None) | Err(_)) => None,
         Err(_) => {
             tracing::warn!("`gh auth token` timed out");
             None
@@ -136,7 +135,7 @@ async fn gh_cli_token() -> Option<String> {
 }
 
 /// `Some(s)` only when `s` is non-empty after trimming.
-fn non_empty(s: String) -> Option<String> {
+fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -151,19 +150,19 @@ mod tests {
 
     #[test]
     fn prefers_github_token_over_gh_token() {
-        let picked = pick_env_token(Some("gho_primary".into()), Some("gho_fallback".into()));
+        let picked = pick_env_token(Some("gho_primary"), Some("gho_fallback"));
         assert_eq!(picked.as_deref(), Some("gho_primary"));
     }
 
     #[test]
     fn falls_back_to_gh_token() {
-        let picked = pick_env_token(None, Some("gho_fallback".into()));
+        let picked = pick_env_token(None, Some("gho_fallback"));
         assert_eq!(picked.as_deref(), Some("gho_fallback"));
     }
 
     #[test]
     fn ignores_empty_values() {
-        assert_eq!(pick_env_token(Some("   ".into()), Some("".into())), None);
+        assert_eq!(pick_env_token(Some("   "), Some("")), None);
         assert_eq!(pick_env_token(None, None), None);
     }
 

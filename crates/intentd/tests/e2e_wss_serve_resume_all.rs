@@ -39,7 +39,7 @@ use tokio_tungstenite::WebSocketStream;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// Short base under /tmp (UDS SUN_LEN cap); the returned guard removes the
+/// Short base under /tmp (UDS `SUN_LEN` cap); the returned guard removes the
 /// dir on drop — hold it for the full test (`INTENTD_TEST_KEEP_TMP` keeps it).
 fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wra-")
@@ -188,7 +188,7 @@ async fn wss_rpc(
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -283,7 +283,7 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         #[cfg(not(unix))]
@@ -346,7 +346,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
     eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
     let child1 = spawn_serve(&data_dir, "both", &env, false);
-    let _daemon1 = Daemon {
+    let daemon1 = Daemon {
         child: child1,
         data_dir: data_dir.clone(),
     };
@@ -418,7 +418,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     }
 
     eprintln!("Killing daemon1 to simulate interruption");
-    drop(_daemon1); // Kill daemon1
+    drop(daemon1); // Kill daemon1
 
     // Phase 2: Boot daemon2 with --resume-all and subscribe to agent events
     eprintln!("Phase 2: Boot daemon2 with --resume-all");
@@ -434,7 +434,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
 
     // Get system status to retrieve port and fingerprint for WSS
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -526,7 +527,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
     // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
     eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
     let child1 = spawn_serve(&data_dir, "both", &env, false);
-    let _daemon1 = Daemon {
+    let daemon1 = Daemon {
         child: child1,
         data_dir: data_dir.clone(),
     };
@@ -581,7 +582,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
     eprintln!("Setting agents.resumeInterruptedOnStart=on over WSS");
     {
         let status = common::await_wss_status(&socket).await;
-        let port = status["result"]["port"].as_u64().expect("port") as u16;
+        let port = u16::try_from(status["result"]["port"].as_u64().expect("port"))
+            .expect("value fits in u16");
         let fingerprint = status["result"]["fingerprint"]
             .as_str()
             .expect("fingerprint")
@@ -621,7 +623,7 @@ async fn setting_on_resumes_without_resume_all_flag() {
     }
 
     eprintln!("Killing daemon1 to simulate interruption");
-    drop(_daemon1);
+    drop(daemon1);
 
     // Phase 2: Boot daemon2 WITHOUT --resume-all. DISPLAY is set so
     // `detect_has_display()` is true: `auto` would skip the sweep, proving a
@@ -645,7 +647,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
     assert!(await_uds(&socket).await, "daemon2 did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

@@ -1,4 +1,4 @@
-//! WSS e2e for the FirstTurnPrepend system-prompt fallback (§18.1).
+//! WSS e2e for the `FirstTurnPrepend` system-prompt fallback (§18.1).
 //!
 //! The `mock` provider is registered with
 //! `InjectionMechanism::FirstTurnPrepend` (like cortex): it has no native
@@ -12,7 +12,7 @@
 //!   `<specialist_role>` section) BEFORE the role reminder and user content.
 //! * Turn 2 (same session) does NOT repeat the block.
 //!
-//! SessionMeta note: the `_meta` mechanism (claude-code) is keyed off the
+//! `SessionMeta` note: the `_meta` mechanism (claude-code) is keyed off the
 //! provider ID in `build_session_meta`, and the mock provider cannot be
 //! spawned under that ID (spawn resolution and binary lookup are
 //! provider-ID-keyed). The `_meta` payload shapes are covered by the unit
@@ -210,7 +210,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -235,7 +235,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -290,7 +290,7 @@ fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
         .collect()
 }
 
-/// Pre-seed the daemon's SQLite store with a workspace (the daemon opens the
+/// Pre-seed the daemon's `SQLite` store with a workspace (the daemon opens the
 /// same data dir on launch).
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
@@ -350,7 +350,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
     ws.0
 }
 
-/// FirstTurnPrepend over the real WSS transport: a specialist agent on the
+/// `FirstTurnPrepend` over the real WSS transport: a specialist agent on the
 /// `mock` provider (registered `InjectionMechanism::FirstTurnPrepend`) must
 /// receive the assembled system prompt — `<system>`-wrapped, including the
 /// `<specialist_role>` section — prepended to the FIRST prompt of its fresh
@@ -398,7 +398,8 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -560,7 +561,8 @@ async fn specialist_prompt_frozen_across_file_edit_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

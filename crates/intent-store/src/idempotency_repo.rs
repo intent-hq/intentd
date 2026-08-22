@@ -12,6 +12,10 @@ use crate::Store;
 impl Store {
     /// Look up the stored `result_json` for `(workspace_id, key)`, or `None` when
     /// the key has not been recorded yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_idempotent(&self, workspace_id: &str, key: &str) -> Result<Option<String>> {
         let row = sqlx::query(
             "SELECT result_json FROM idempotency_key WHERE workspace_id = ? AND idempotency_key = ?",
@@ -28,6 +32,10 @@ impl Store {
     /// `INSERT OR IGNORE` so a concurrent duplicate that won the race is kept and
     /// the loser is a no-op (best-effort dedupe, design §5.3). Returns `true` when
     /// this call inserted the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn put_idempotent(
         &self,
         workspace_id: &str,
@@ -54,6 +62,10 @@ impl Store {
     /// Reaper sweep (design §5.4): delete rows whose `created_at` is strictly
     /// older than `cutoff` (an RFC-3339 string), returning the number removed.
     /// Uses `idx_idempotency_created`; idempotent — a re-run removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
         let res = sqlx::query("DELETE FROM idempotency_key WHERE created_at < ?")
             .bind(cutoff)

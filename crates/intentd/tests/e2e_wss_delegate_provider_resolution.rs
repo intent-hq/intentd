@@ -196,7 +196,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -256,7 +256,8 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -330,7 +331,8 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -379,5 +381,213 @@ async fn delegate_errors_not_auggie_when_configured_default_unavailable_over_wss
     assert!(
         !message.to_ascii_lowercase().contains("auggie"),
         "error must never silently point at the hardcoded default provider: {message}"
+    );
+}
+
+/// monorepo#3044: nothing configured at all (`providers.active` unset, no
+/// compound `model.default`) — `agent.delegate` without an explicit
+/// provider/model fails the RPC with `-32602` and a clear "no default
+/// provider/model is configured" message, never silently spawning the former
+/// positional fallback (Auggie).
+#[tokio::test]
+async fn delegate_errors_when_no_default_provider_configured_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let ws_result = wss_rpc(
+        &mut ws,
+        10,
+        "workspace.create",
+        json!({ "title": "3044 WSS E2E no default", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
+
+    // Deliberately NO settings.update: nothing configured, nothing healed
+    // (self-heal only runs on the host provider-discovery path, which no
+    // client drives here).
+    let delegate_resp = wss_rpc_raw(
+        &mut ws,
+        20,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+        }),
+    )
+    .await;
+    let error = delegate_resp.get("error").unwrap_or_else(|| {
+        panic!("no configured default must fail loudly, not spawn a positional fallback: {delegate_resp}")
+    });
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "no-default resolution failure maps to invalid params (§9): {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no default provider/model is configured"),
+        "error states that no default provider/model is configured: {message}"
+    );
+    assert!(
+        !message.to_ascii_lowercase().contains("auggie"),
+        "error must never point at the former hardcoded fallback provider: {message}"
+    );
+}
+
+/// Explicit `provider` param (PROTOCOL §5.5, monorepo#3044): the param pins
+/// the delegated session's provider over the wire, outranking a configured
+/// default naming a different provider; a compound `model` contradicting the
+/// param is rejected with `-32602` naming both sides.
+#[tokio::test]
+async fn delegate_explicit_provider_param_over_wss() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let behavior = json!({ "response": "mock response" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let ws_result = wss_rpc(
+        &mut ws,
+        10,
+        "workspace.create",
+        json!({ "title": "provider param WSS E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"].as_str().expect("workspace id");
+
+    // Configured default names a DIFFERENT provider than the explicit param.
+    wss_rpc(
+        &mut ws,
+        20,
+        "settings.update",
+        json!({ "changes": [{ "path": "providers.active", "value": "codex" }] }),
+    )
+    .await;
+
+    let delegate_result = wss_rpc(
+        &mut ws,
+        30,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+            "provider": "mock",
+        }),
+    )
+    .await;
+    let agent_id = delegate_result["agentId"].as_str().expect("agentId");
+    assert_eq!(
+        delegate_result["provider"].as_str(),
+        Some("mock"),
+        "delegate result surfaces the explicit provider param over the wire: {delegate_result}"
+    );
+
+    let get_result = wss_rpc(
+        &mut ws,
+        40,
+        "agent.get",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        get_result["agent"]["provider"].as_str(),
+        Some("mock"),
+        "explicit provider param persisted on the delegated session: {get_result}"
+    );
+
+    // Contradiction: compound model naming a different provider than the
+    // param rejects with -32602 naming both sides, before any side effect.
+    let contradiction = wss_rpc_raw(
+        &mut ws,
+        50,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+            "provider": "mock",
+            "model": "codex:gpt-5.6",
+        }),
+    )
+    .await;
+    let error = contradiction
+        .get("error")
+        .unwrap_or_else(|| panic!("contradicting provider/model must fail: {contradiction}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "contradiction rejects with InvalidParams: {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("codex") && message.contains("mock"),
+        "error names both the model's provider and the param: {message}"
+    );
+
+    // Unknown provider id rejects with -32602 naming the known providers.
+    let unknown = wss_rpc_raw(
+        &mut ws,
+        60,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do the thing",
+            "provider": "typo-provider",
+        }),
+    )
+    .await;
+    let error = unknown
+        .get("error")
+        .unwrap_or_else(|| panic!("unknown provider must fail: {unknown}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "unknown provider rejects with InvalidParams: {error}"
+    );
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("unknown provider: typo-provider"),
+        "error names the bad id: {message}"
     );
 }

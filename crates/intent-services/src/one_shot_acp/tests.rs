@@ -24,7 +24,7 @@ fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
 
 /// Shared preamble: an NDJSON JSON-RPC loop that answers `initialize` and
 /// `session/new`, then hands `session/prompt` to `onPrompt(id, msg)`.
-const ADAPTER_PRELUDE: &str = r#"
+const ADAPTER_PRELUDE: &str = r"
 import readline from 'node:readline';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const result = (id, r) => send({ jsonrpc: '2.0', id, result: r });
@@ -44,7 +44,7 @@ rl.on('line', async (line) => {
   if (msg.id !== undefined && msg.method === undefined) return onClientResponse(msg);
 });
 let onClientResponse = () => {};
-"#;
+";
 
 #[tokio::test]
 async fn one_shot_collects_streamed_reply_text() {
@@ -280,9 +280,7 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
 /// Count the lines the mock adapters have appended to `log` so far (each line
 /// is one adapter that actually started).
 fn started_count(log: &std::path::Path) -> usize {
-    std::fs::read_to_string(log)
-        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0)
+    std::fs::read_to_string(log).map_or(0, |s| s.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
 /// Poll `cond` until it holds, failing with `what` if it never does.

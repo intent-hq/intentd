@@ -113,7 +113,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
-/// Pinned-fingerprint cert verifier (mirrors wss_integration.rs).
+/// Pinned-fingerprint cert verifier (mirrors `wss_integration.rs`).
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,
@@ -207,7 +207,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -217,7 +217,8 @@ async fn boot(data_dir: &Path) -> (u16, String) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let actual_port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -241,7 +242,7 @@ async fn server_pairing_info_over_uds() {
 
     assert_eq!(result["token"].as_str().unwrap(), TOKEN);
     assert_eq!(result["certFingerprint"].as_str().unwrap(), fp);
-    assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["path"].as_str().unwrap(), "/ws");
     assert!(result["localIps"].is_array());
     assert!(result["hostname"].is_string());
@@ -310,7 +311,7 @@ async fn pairing_get_info_over_uds() {
 
     assert_eq!(result["token"].as_str().unwrap(), TOKEN);
     assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
-    assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+    assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
     assert_eq!(result["version"].as_u64().unwrap(), 1);
     assert!(result["hosts"].is_array());
 
@@ -364,7 +365,7 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
             !hosts.contains(&"127.0.0.1".to_string()),
             "wide bind must not advertise loopback: {hosts:?}"
         );
-        assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+        assert_eq!(result["port"].as_u64().unwrap(), u64::from(port));
         assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
     } else {
         let error = &response["error"];
@@ -539,7 +540,7 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => return Some(text),
-                Some(Ok(_)) => continue,
+                Some(Ok(_)) => {}
                 _ => return None,
             }
         }
@@ -561,7 +562,7 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     let status: Value = loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => break serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     };

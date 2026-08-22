@@ -149,6 +149,7 @@ pub enum CloneErrorCategory {
 
 impl CloneErrorCategory {
     /// Stable wire identifier for this category (`error.data.code`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             CloneErrorCategory::PathInvalid => "path-invalid",
@@ -165,6 +166,7 @@ impl CloneErrorCategory {
 
 impl Error {
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
+    #[must_use]
     pub fn code(&self) -> i32 {
         match self {
             Error::InvalidParams(_)
@@ -187,9 +189,10 @@ impl Error {
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
             | Error::WarmInFlight { .. }
-            | Error::AdapterBusy { .. } => -32603,
+            | Error::AdapterBusy { .. }
+            // Unsupported: map to internal error for now
+            | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
-            Error::Unsupported(_) => -32603, // Map to internal error for now
         }
     }
 }

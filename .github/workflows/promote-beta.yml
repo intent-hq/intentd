@@ -20,6 +20,11 @@
 # prerelease/Latest flags — clearing the Pre-release flag and moving the
 # Latest badge remain stable-promotion semantics.
 #
+# As a best-effort extra, promotion also rewrites the `channel-beta` release
+# body with aggregated release notes covering every version since the previous
+# beta (aggregate-channel-notes.sh). Notes steps are fail-soft: they never
+# block the promotion or change manifest publishing.
+#
 # Promotions do not comment on monorepo issues: the release notifier
 # (scripts/notify-fixed-issues.sh) runs only from the release tag build
 # (publish-channel-manifest.yml) and its comments are channel-free.
@@ -78,9 +83,10 @@ jobs:
             exit 1
           fi
           echo "Release v${VERSION} exists and is not a draft"
-      # Read the outgoing beta.json before it is rebuilt so the summary can
-      # name it. Fail-soft: a missing asset/release (first promotion) or any
-      # error just leaves the previous version empty.
+      # Read the outgoing beta.json before it is rebuilt so the aggregated
+      # notes can span (previous beta, promoted] and the summary can name it.
+      # Fail-soft: a missing asset/release (first promotion) or any error
+      # just leaves the previous version empty.
       - name: Read previous beta version
         id: prev-beta
         continue-on-error: true
@@ -108,10 +114,21 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh beta beta.json
+      # Fail-soft: aggregated notes are a nice-to-have; a failure here must
+      # never fail the promotion (the manifest is already published).
+      - name: Aggregate beta release notes
+        id: notes
+        continue-on-error: true
+        shell: bash
+        env:
+          PREV_BETA: ${{ steps.prev-beta.outputs.version }}
+        run: |
+          ./scripts/aggregate-channel-notes.sh beta "$VERSION" "$PREV_BETA"
       - name: Post summary
         shell: bash
         env:
           PREV_BETA: ${{ steps.prev-beta.outputs.version }}
+          NOTES_OUTCOME: ${{ steps.notes.outcome }}
         run: |
           {
             echo "## Beta promotion"
@@ -120,7 +137,13 @@ jobs:
             echo ""
             echo "**Previous beta:** ${PREV_BETA:-unknown (first promotion?)}"
             echo ""
-            echo "- [channel-beta release](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-beta)"
+            if [[ "$NOTES_OUTCOME" == "success" ]]; then
+              echo "**Aggregated notes:** updated on channel-beta"
+            else
+              echo "**Aggregated notes:** skipped (non-blocking failure; manifest unaffected)"
+            fi
+            echo ""
+            echo "- [channel-beta release (aggregated notes)](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-beta)"
             echo "- [beta.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-beta/beta.json)"
           } >> "$GITHUB_STEP_SUMMARY"
       # --- Public mirror: intent-hq/intentd-releases ---

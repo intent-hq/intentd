@@ -34,6 +34,10 @@ pub struct PushOutcome {
 /// caller-resolved GitHub token used as the final credential-chain step for
 /// HTTPS github.com remotes (see [`crate::auth`]). Errors when the branch has no
 /// local commit or the remote rejects the push.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the branch name is empty, the branch has no local commit, or the remote rejects the push.
 pub fn push(
     worktree_path: &Path,
     remote: &str,
@@ -98,6 +102,10 @@ pub fn push(
 /// deleted once the push returns, and pushed with a plain force when requested.
 /// `token` is an optional caller-resolved GitHub token used as the final
 /// credential-chain step for HTTPS github.com remotes (see [`crate::auth`]).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `src` cannot be resolved to a commit, the temporary ref cannot be written, or the remote rejects the push.
 pub fn push_refspec(
     worktree_path: &Path,
     remote: &str,
@@ -123,8 +131,7 @@ pub fn push_refspec(
         "refs/intent/tmp-push-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     );
     repo.reference(&tmp_ref, oid, true, "intent push-refspec temp")
         .map_err(map_git_err)?;

@@ -6,7 +6,7 @@
 //! also has to be exercised over the real `/ws` upgrade, byte-for-byte,
 //! against the JSON-RPC contract in the monorepo's `docs/protocol/`.
 //!
-//! Drives a real pinned-TLS WebSocket against a live `intentd serve
+//! Drives a real pinned-TLS WebSocket against a live `intentd serve`
 //! with the WSS listener enabled and asserts the exact envelope + payload shapes for:
 //! - `workspace.get({ workspaceId: "__chief__" })` → synthesized shape
 //!   (pinned title / timestamps, empty branch, no repo / worktree).
@@ -22,7 +22,7 @@
 //!   `workspace.delete` → `{ success: true }`; `workspace.dismissAttention`
 //!   → `{ workspace: … }`. Chief remains reachable via `workspace.get`.
 //! - `ws.app.agents.waitFor` (chief-gated cross-workspace waiting): the
-//!   immediate and after_all modes end-to-end through the real MCP bridge
+//!   immediate and `after_all` modes end-to-end through the real MCP bridge
 //!   (mock ACP provider → `workspace_api` tool → service registry → wake
 //!   delivery), plus the non-chief gating error — see the three
 //!   `*_waitfor_*` tests at the bottom of this file.
@@ -266,7 +266,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -302,7 +302,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -325,7 +325,8 @@ async fn chief_workspace_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -356,15 +357,9 @@ async fn chief_workspace_over_wss() {
     assert_eq!(chief["createdAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(chief["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(chief["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
-    assert!(chief.get("path").map(Value::is_null).unwrap_or(true));
-    assert!(chief
-        .get("worktreePath")
-        .map(Value::is_null)
-        .unwrap_or(true));
-    assert!(chief
-        .get("repositoryName")
-        .map(Value::is_null)
-        .unwrap_or(true));
+    assert!(chief.get("path").is_none_or(Value::is_null));
+    assert!(chief.get("worktreePath").is_none_or(Value::is_null));
+    assert!(chief.get("repositoryName").is_none_or(Value::is_null));
 
     // (b) `workspace.list` MUST NOT include `__chief__`.
     let resp = wss_rpc_envelope(&mut ws, 3, "workspace.list", json!({})).await;
@@ -446,8 +441,7 @@ async fn chief_workspace_over_wss() {
     .await;
     assert!(resp["result"]["workspace"]
         .get("statusMessage")
-        .map(Value::is_null)
-        .unwrap_or(true));
+        .is_none_or(Value::is_null));
 
     // (e) On Chief: `workspace.archive` returns the synthesized `Workspace`
     //     (Chief cannot be archived, so `archived = false` is preserved);
@@ -544,7 +538,8 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -639,8 +634,8 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
 /// - agent.list returns agent metadata (queryable by ws.app.agents.list)
 /// - events.subscribe accepts app:* event types (subscription succeeds)
 /// The full ws.app.* MCP tool dispatch path (including actual event emission) is covered
-/// by e2e_mock_agent_workspace_api_bindings.rs and MCP binding unit tests. Proposal
-/// persistence is covered by e2e_mock_agent_ws_app::chief_agent_ws_app_proposal_resource_persisted.
+/// by `e2e_mock_agent_workspace_api_bindings.rs` and MCP binding unit tests. Proposal
+/// persistence is covered by `e2e_mock_agent_ws_app::chief_agent_ws_app_proposal_resource_persisted`.
 #[tokio::test]
 async fn ws_app_surface_events_and_gating_over_wss() {
     let data_dir = temp_data_dir();
@@ -653,7 +648,8 @@ async fn ws_app_surface_events_and_gating_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -840,7 +836,8 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1258,7 +1255,8 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1403,7 +1401,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
         let resp = wss_rpc_envelope(
             &mut rpc,
-            20 + i as i64,
+            20 + i64::try_from(i).expect("value fits in i64"),
             "agent.sendMessage",
             json!({ "workspaceId": wsid, "agentId": tid, "content": "please finish" }),
         )
@@ -1593,7 +1591,7 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     let _ = wss_rpc_envelope(&mut rpc, 35, "agent.stop", json!({ "agentId": chief_id })).await;
 }
 
-/// `ws.app.agents.waitFor` (after_all mode) end-to-end over the real WSS
+/// `ws.app.agents.waitFor` (`after_all` mode) end-to-end over the real WSS
 /// wire: the chief enrolls targets in TWO different user workspaces in ONE
 /// delegation group; the group seals when the chief's registering turn ends
 /// (parent idle) and fires a SINGLE aggregated wake once both settle.
@@ -1645,7 +1643,8 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1758,7 +1757,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
     for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
         let resp = wss_rpc_envelope(
             &mut rpc,
-            20 + i as i64,
+            20 + i64::try_from(i).expect("value fits in i64"),
             "agent.sendMessage",
             json!({ "workspaceId": wsid, "agentId": tid, "content": "please finish" }),
         )
@@ -1809,7 +1808,7 @@ async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
 }
 
 /// Scoped `agent.cancelSubscriptions` by `groupId` end-to-end over the real
-/// WSS wire: the chief registers an after_all delegation group on two
+/// WSS wire: the chief registers an `after_all` delegation group on two
 /// targets, an unknown `groupId` is rejected with `-32602` (registry
 /// untouched), and cancelling the real `groupId` removes the group AND both
 /// grouped watches in one call.
@@ -1850,7 +1849,8 @@ async fn chief_scoped_group_cancel_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2020,7 +2020,8 @@ async fn non_chief_waitfor_gated_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2142,7 +2143,8 @@ async fn workspace_archive_unarchive_bridge_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -2291,7 +2293,8 @@ async fn chief_workspace_archive_gated_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
     disable_toon_output(&socket).await;
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

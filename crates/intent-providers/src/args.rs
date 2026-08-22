@@ -6,6 +6,7 @@
 //! (`provider-config.ts`), and `getAuggieExecPATH` (`execute-auggie-command.ts`).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::{ProviderConfig, ProviderRuntime};
@@ -94,7 +95,11 @@ pub struct ArgInputs<'a> {
 /// Order mirrors the TS flow: `base_args`, then `--model <id>`, then quiet,
 /// rules, and MCP-config flags — each gated on the provider's capability flags.
 pub fn build_provider_args(config: &ProviderConfig, inputs: &ArgInputs) -> Vec<String> {
-    let mut args: Vec<String> = config.base_args.iter().map(|s| s.to_string()).collect();
+    let mut args: Vec<String> = config
+        .base_args
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     if let (Some(model), Some(flag)) = (inputs.model, config.model_flag) {
         if !model.is_empty() && model != MODEL_SENTINEL_DEFAULT {
@@ -180,6 +185,7 @@ pub(crate) fn upsert_codex_config_args(args: &[String], key: &str, value: &str) 
 /// into base + reasoning effort; the base is written as `model`, and the effort
 /// (from the model id, else the `env_effort` fallback) as `model_reasoning_effort`.
 /// `env_effort` is supplied by the spawn layer (e.g. `CODEX_REASONING_EFFORT`).
+#[must_use]
 pub fn apply_codex_config_args(
     args: Vec<String>,
     raw_model: Option<&str>,
@@ -231,9 +237,10 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   The unsloth endpoint (which adds the `provider.unsloth-studio` block)
 ///   rides [`build_provider_env_with_unsloth`]; this 4-arg form passes `None`.
 ///
-/// `mcp_config_json` must be a serialized JSON object in the OpenCode `mcp`
+/// `mcp_config_json` must be a serialized JSON object in the `OpenCode` `mcp`
 /// config shape (see `to_opencode_mcp_config` in `intent-acp`); it is spliced
 /// in verbatim. Providers that don't take env config ignore it.
+#[must_use]
 pub fn build_provider_env(
     config: &ProviderConfig,
     model: Option<&str>,
@@ -254,6 +261,7 @@ pub fn build_provider_env(
 /// (managed-server lifecycle not yet run) the unsloth child spawns with
 /// permission-only config and no provider block. Every other provider
 /// ignores `unsloth_endpoint`.
+#[must_use]
 pub fn build_provider_env_with_unsloth(
     config: &ProviderConfig,
     model: Option<&str>,
@@ -400,11 +408,12 @@ fn unsloth_provider_part(ep: &UnslothEndpoint, effective_model: &str) -> String 
         json_escape(display)
     );
     if effective_model != ep.model_id {
-        models.push_str(&format!(
+        let _ = write!(
+            models,
             ",\"{}\":{{\"name\":\"{}\"}}",
             json_escape(effective_model),
             json_escape(effective_model)
-        ));
+        );
     }
     format!(
         "\"provider\":{{\"{UNSLOTH_OPENCODE_PROVIDER_ID}\":{{\"npm\":\"{UNSLOTH_NPM_PACKAGE}\",\"name\":\"{UNSLOTH_PROVIDER_NAME}\",\"options\":{{\"baseURL\":\"{}\",\"apiKey\":\"{}\"}},\"models\":{{{models}}}}}}}",
@@ -474,7 +483,7 @@ pub(crate) fn json_escape(s: &str) -> String {
             '\x0C' => out.push_str("\\f"), // form feed
             c if c.is_control() => {
                 // Escape other control characters as \uXXXX.
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             _ => out.push(c),
         }
@@ -492,6 +501,7 @@ const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
 /// `#!/usr/bin/env node` shebang resolves the right `node`. Entries are
 /// de-duplicated while preserving order. Port of the `getAuggieExecPATH` behavior
 /// (generalized across providers).
+#[must_use]
 pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
     enhanced_path_with(
         provider_binary,

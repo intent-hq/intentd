@@ -42,11 +42,11 @@ pub enum RiskLevel {
 /// Derive a [`RiskLevel`] from a tool-call title (parity: TS `assessRiskLevel`):
 /// high-risk patterns win over low-risk; everything else is medium.
 pub(crate) fn assess_risk_level(title: &str) -> RiskLevel {
-    let lower = title.to_lowercase();
     const HIGH: [&str; 7] = [
         "delete", "remove", "execute", "write", "modify", "create", "launch",
     ];
     const LOW: [&str; 4] = ["read", "view", "list", "get"];
+    let lower = title.to_lowercase();
     if HIGH.iter().any(|p| lower.contains(p)) {
         RiskLevel::High
     } else if LOW.iter().any(|p| lower.contains(p)) {
@@ -110,6 +110,7 @@ pub enum PermissionOutcome {
 impl PermissionOutcome {
     /// The `RequestPermissionResponse` body returned to the agent over ACP
     /// (`{ outcome: { outcome: "selected", optionId } }` or `{ outcome: "cancelled" }`).
+    #[must_use]
     pub fn to_response_value(&self) -> Value {
         json!({ "outcome": self.to_event_value() })
     }
@@ -195,6 +196,7 @@ impl Default for PermissionRegistry {
 
 impl PermissionRegistry {
     /// A registry with the default 5-minute prompt timeout.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_timeout(DEFAULT_PERMISSION_TIMEOUT)
     }
@@ -222,6 +224,10 @@ impl PermissionRegistry {
 
     /// Register `data` as outstanding and return the receiver its outcome will
     /// arrive on (from [`resolve`](Self::resolve) or a timeout-driven removal).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn register(&self, data: PermissionRequestData) -> oneshot::Receiver<PermissionOutcome> {
         let (sender, receiver) = oneshot::channel();
         self.inner
@@ -233,6 +239,10 @@ impl PermissionRegistry {
 
     /// Deliver `outcome` to the waiter for `request_id`. Returns `false` when no
     /// such prompt is outstanding (already resolved or timed out).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn resolve(&self, request_id: &str, outcome: PermissionOutcome) -> bool {
         match self.inner.lock().unwrap().remove(request_id) {
             Some(pending) => pending.sender.send(outcome).is_ok(),
@@ -241,11 +251,19 @@ impl PermissionRegistry {
     }
 
     /// Drop a prompt without delivering an outcome (timeout cleanup).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn remove(&self, request_id: &str) {
         self.inner.lock().unwrap().remove(request_id);
     }
 
     /// Snapshot of every outstanding prompt, for client reconnect recovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pending(&self) -> Vec<PermissionRequestData> {
         self.inner
             .lock()
@@ -345,8 +363,7 @@ fn now_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

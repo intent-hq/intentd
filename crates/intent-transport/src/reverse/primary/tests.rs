@@ -62,9 +62,9 @@ fn empty_registry_reports_no_primary() {
 async fn dispatch_routes_to_the_first_registered_channel() {
     let reg = PrimaryReverseRegistry::new();
     let (a, mut rx_a) = idle_channel();
-    let (_b, mut rx_b) = idle_channel();
+    let (b, mut rx_b) = idle_channel();
     let _g_a = reg.register(a.clone());
-    let _g_b = reg.register(_b);
+    let _g_b = reg.register(b);
     assert_eq!(reg.len(), 2);
 
     let out = dispatch_and_reply(&reg, &a, &mut rx_a, json!({ "primary": "a" }))
@@ -78,9 +78,9 @@ async fn dispatch_routes_to_the_first_registered_channel() {
 #[tokio::test]
 async fn dropping_the_primary_promotes_the_next_registration() {
     let reg = PrimaryReverseRegistry::new();
-    let (_a, mut _rx_a) = idle_channel();
+    let (a, mut _rx_a) = idle_channel();
     let (b, mut rx_b) = idle_channel();
-    let g_a = reg.register(_a);
+    let g_a = reg.register(a);
     let _g_b = reg.register(b.clone());
     drop(g_a);
     assert_eq!(reg.len(), 1);
@@ -131,6 +131,6 @@ async fn dispatch_reports_transport_error_when_channel_is_closed() {
         .expect_err("transport error");
     match err {
         ReverseDispatchError::Transport { .. } => {}
-        other => panic!("unexpected error: {other:?}"),
+        other @ ReverseDispatchError::NoClient => panic!("unexpected error: {other:?}"),
     }
 }

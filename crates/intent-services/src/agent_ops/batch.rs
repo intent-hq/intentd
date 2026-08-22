@@ -61,7 +61,11 @@ fn dependent_edges(snaps: &HashMap<String, BatchTaskSnap>) -> HashMap<&str, Vec<
         if !is_workable(snap.status) {
             continue;
         }
-        let deps: HashSet<&str> = snap.depends_on.iter().map(|d| d.as_str()).collect();
+        let deps: HashSet<&str> = snap
+            .depends_on
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         for dep in deps {
             dependents.entry(dep).or_default().push(id);
         }
@@ -92,7 +96,11 @@ fn critical_path_details(snaps: &HashMap<String, BatchTaskSnap>) -> HashMap<Stri
         if !workable.contains(id.as_str()) {
             continue;
         }
-        let deps: HashSet<&str> = snap.depends_on.iter().map(|d| d.as_str()).collect();
+        let deps: HashSet<&str> = snap
+            .depends_on
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         for dep in deps {
             if workable.contains(dep) {
                 dependents.entry(dep).or_default().push(id);
@@ -298,7 +306,10 @@ pub(crate) fn classify_batch_tasks(
                         })
                         .cloned()
                         .collect();
-                    if !unmet.is_empty() {
+                    if unmet.is_empty() {
+                        startable.push(id.as_str());
+                        None
+                    } else {
                         let decision_needed = unmet
                             .iter()
                             .filter(|dep| {
@@ -315,9 +326,6 @@ pub(crate) fn classify_batch_tasks(
                             unmet,
                             decision_needed,
                         })
-                    } else {
-                        startable.push(id.as_str());
-                        None
                     }
                 }
             }
@@ -333,7 +341,7 @@ pub(crate) fn classify_batch_tasks(
         let dependents = dependent_edges(snaps);
         startable.sort_by(|a, b| {
             let priority = |id: &str| priorities.get(id).copied().unwrap_or(0);
-            let unlocked = |id: &str| dependents.get(id).map_or(0, |d| d.len());
+            let unlocked = |id: &str| dependents.get(id).map_or(0, std::vec::Vec::len);
             priority(b)
                 .cmp(&priority(a))
                 .then(unlocked(b).cmp(&unlocked(a)))
@@ -365,7 +373,7 @@ pub(crate) fn classify_batch_tasks(
                             neighbors
                                 .iter()
                                 .filter(|n| active.contains(**n))
-                                .map(|n| n.to_string())
+                                .map(std::string::ToString::to_string)
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -399,9 +407,9 @@ pub(crate) fn project_unlock_plan(
     snaps: &HashMap<String, BatchTaskSnap>,
     started: &[String],
 ) -> Vec<String> {
-    let started_set: HashSet<&str> = started.iter().map(|s| s.as_str()).collect();
+    let started_set: HashSet<&str> = started.iter().map(std::string::String::as_str).collect();
     let mut simulated = snaps.clone();
-    for (id, snap) in simulated.iter_mut() {
+    for (id, snap) in &mut simulated {
         let running = snap.live_agent.is_some()
             && !matches!(snap.status, TaskStatus::Complete | TaskStatus::Cancelled);
         if started_set.contains(id.as_str()) || running {
@@ -433,8 +441,11 @@ mod tests {
     fn snap(status: TaskStatus, deps: &[&str], conflicts: &[&str]) -> BatchTaskSnap {
         BatchTaskSnap {
             status,
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            conflicts_with: conflicts.iter().map(|s| s.to_string()).collect(),
+            depends_on: deps.iter().map(std::string::ToString::to_string).collect(),
+            conflicts_with: conflicts
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             live_agent: None,
             effort_minutes: None,
         }
@@ -451,7 +462,7 @@ mod tests {
     }
 
     fn ids(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(std::string::ToString::to_string).collect()
     }
 
     fn started_ids(out: &[(String, BatchDisposition)]) -> Vec<&str> {
@@ -677,7 +688,7 @@ mod tests {
         snaps.insert("d".into(), snap(TaskStatus::NotStarted, &[], &["c"]));
         let out = classify_batch_tasks(&ids(&["a", "b", "c", "d"]), &snaps);
         let started = started_ids(&out);
-        for (id, s) in snaps.iter() {
+        for (id, s) in &snaps {
             for other in &s.conflicts_with {
                 assert!(
                     !(started.contains(&id.as_str()) && started.contains(&other.as_str())),

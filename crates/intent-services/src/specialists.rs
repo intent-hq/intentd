@@ -3,7 +3,7 @@
 //! (`<workspacePath>/.intent/specialists/`), then user
 //! (`~/.intent/specialists/`), then bundled (`resources/specialists/`,
 //! read-only). Ports `specialist-file-loader.ts` + `specialists.ipc.ts`'s
-//! combined load. Nothing is persisted in SQLite; `create`/`edit`/`delete`
+//! combined load. Nothing is persisted in `SQLite`; `create`/`edit`/`delete`
 //! write user/project files only and `bundled` definitions are read-only.
 
 use std::path::{Path, PathBuf};
@@ -176,14 +176,12 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
     let mut found_end = false;
     let mut body_lines: Vec<&str> = Vec::new();
     for line in lines {
-        if !found_end {
-            if line.trim() == "---" {
-                found_end = true;
-            } else {
-                fm_lines.push(line);
-            }
-        } else {
+        if found_end {
             body_lines.push(line);
+        } else if line.trim() == "---" {
+            found_end = true;
+        } else {
+            fm_lines.push(line);
         }
     }
     if !found_end {
@@ -433,7 +431,6 @@ fn build_def_inheriting(
             }
             // Explicit empty value: clears any inherited value (nothing
             // emitted). For `roleReminder` this matches the absent case.
-            Some(_) => {}
             // Absent key: the config scalars inherit the lower tiers'
             // effective value; `roleReminder` does not.
             None if INHERITED_CONFIG_KEYS.contains(&key) => {
@@ -445,7 +442,7 @@ fn build_def_inheriting(
                     def.insert(key.into(), json!(v));
                 }
             }
-            None => {}
+            Some(_) | None => {}
         }
     }
     // `modelOptions` (PROTOCOL §5.11): same inherit-on-omit fold as the config
@@ -682,7 +679,7 @@ impl SpecialistsService {
     /// explicit `hidden: false` unhides and an explicit empty scalar clears
     /// (PROTOCOL §5.11).
     /// SECURITY: validates the id before file access to prevent path traversal
-    /// (review thread PRRT_kwDOS9Wxuc6SIlcV).
+    /// (review thread `PRRT_kwDOS9Wxuc6SIlcV`).
     fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
         // Validate id before passing to load_from_dir to prevent path traversal
         // attacks on ALL frontmatter lookups (resolve_agent_type, resolve_model,
@@ -774,7 +771,7 @@ impl SpecialistsService {
     /// order (project > user > bundled), used at spawn time when no explicit
     /// model parameter is supplied. Returns `None` when the specialist is
     /// unknown or declares no `model`, allowing the caller to fall through to
-    /// the settings chain. Validation is now performed inside resolve().
+    /// the settings chain. Validation is now performed inside `resolve()`.
     pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get("model")
@@ -875,6 +872,7 @@ impl SpecialistsService {
     /// lower ones for the same id while `hidden` and the config scalars
     /// inherit across tiers (PROTOCOL §5.11). `workspace_path` adds the
     /// project tier.
+    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
@@ -927,14 +925,16 @@ impl SpecialistsService {
             .get("roleReminder")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                let body = def
-                    .get("behaviorPrompt")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                auto_generate_role_reminder(body)
-            });
+            .map_or_else(
+                || {
+                    let body = def
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    auto_generate_role_reminder(body)
+                },
+                str::to_string,
+            );
         if reminder.is_empty() {
             return None;
         }
@@ -1428,7 +1428,7 @@ mod tests {
     /// Rot-check regression test: the bundled `verifier.md` prompt must instruct
     /// the verifier to mark verified tasks complete with `update_note_task_status`
     /// and explain the completion policy (only APPROVED tasks, DEVIATION/MISSING
-    /// stay in review_required). This prevents future prompt rewrites from
+    /// stay in `review_required`). This prevents future prompt rewrites from
     /// silently dropping the workflow instruction and leaving tasks stuck in
     /// `review_required`.
     #[test]

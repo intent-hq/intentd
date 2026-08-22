@@ -116,7 +116,7 @@ pub(crate) trait Harness: Send + Sync {
 
     // --- Turn envelope (`agent_manager::build_turn_prompt`) ---
 
-    /// `<system>`-wrapped assembled system prompt for the FirstTurnPrepend
+    /// `<system>`-wrapped assembled system prompt for the `FirstTurnPrepend`
     /// fallback.
     fn first_turn_prepend_block(&self, prompt: &str) -> String;
     /// The per-turn state snapshot line around the serialized snapshot JSON.
@@ -129,7 +129,7 @@ pub(crate) trait Harness: Send + Sync {
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
-    /// (FirstTurnPrepend → snapshot → Context → naming nudge → role reminder
+    /// (`FirstTurnPrepend` → snapshot → Context → naming nudge → role reminder
     /// → body) is itself versioned.
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String;
 
@@ -169,7 +169,7 @@ pub(crate) trait Harness: Send + Sync {
     /// `[WORKSPACE EVENTS] Child agent {label} {kind}.` completion wake with
     /// report/summary/error tail and the #2051 watch-retired notes.
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String;
-    /// One `- {label} {kind}.…` per-child line of an after_all group wake,
+    /// One `- {label} {kind}.…` per-child line of an `after_all` group wake,
     /// including the attention fold.
     fn group_child_line(&self, params: &ChildSettlementParams<'_>) -> String;
     /// The aggregated group-settlement wake: header plus accumulated
@@ -355,16 +355,15 @@ pub(crate) fn latest() -> &'static dyn Harness {
 /// versions fall back to the latest with a WARN (never fail a turn over a
 /// stale or corrupt stamp).
 pub(crate) fn resolve_entry(version: &str) -> &'static HarnessEntry {
-    match REGISTRY.iter().find(|e| e.version == version) {
-        Some(e) => e,
-        None => {
-            tracing::warn!(
-                version = %version,
-                latest = LATEST_VERSION,
-                "unknown harness version; falling back to latest"
-            );
-            latest_entry()
-        }
+    if let Some(e) = REGISTRY.iter().find(|e| e.version == version) {
+        e
+    } else {
+        tracing::warn!(
+            version = %version,
+            latest = LATEST_VERSION,
+            "unknown harness version; falling back to latest"
+        );
+        latest_entry()
     }
 }
 
@@ -373,7 +372,7 @@ mod tests {
     use super::*;
 
     fn data_ptr(h: &'static dyn Harness) -> *const () {
-        h as *const dyn Harness as *const ()
+        std::ptr::from_ref::<dyn Harness>(h).cast::<()>()
     }
 
     /// The registry keys on the exact version string sessions are stamped

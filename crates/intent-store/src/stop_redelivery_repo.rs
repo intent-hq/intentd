@@ -23,6 +23,10 @@ pub struct StopRedeliveryRow {
 impl Store {
     /// Upsert the persisted stop-redelivery payload for one agent (the newest
     /// arm replaces any prior payload).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn set_stop_redelivery(
         &self,
         agent_id: &AgentId,
@@ -47,6 +51,10 @@ impl Store {
 
     /// Delete the persisted stop-redelivery payload for one agent (no-op when
     /// none is armed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_stop_redelivery(&self, agent_id: &AgentId) -> Result<()> {
         sqlx::query("DELETE FROM agent_stop_redelivery WHERE agent_id = ?")
             .bind(&agent_id.0)
@@ -62,6 +70,10 @@ impl Store {
     /// them). A row whose stored payload is not valid JSON comes back as
     /// `Value::Null` rather than failing the whole load — rehydration is
     /// best-effort and the caller skips entries it cannot decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn load_all_stop_redeliveries(&self) -> Result<Vec<StopRedeliveryRow>> {
         let rows = sqlx::query(
             "SELECT r.agent_id, r.payload, r.created_at \

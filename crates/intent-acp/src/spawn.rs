@@ -36,7 +36,7 @@ pub struct SpawnOptions<'a> {
     pub rules_file: Option<&'a str>,
     /// Path to an MCP config file (appended when the provider supports MCP).
     pub mcp_config_file: Option<&'a str>,
-    /// Pre-serialized MCP block (OpenCode `mcp` config shape) merged into
+    /// Pre-serialized MCP block (`OpenCode` `mcp` config shape) merged into
     /// `OPENCODE_CONFIG_CONTENT` for providers that take env config
     /// (opencode, unsloth). Ignored by every other provider.
     pub env_mcp_config: Option<&'a str>,
@@ -56,11 +56,11 @@ pub struct SpawnOptions<'a> {
     /// [`ProviderConfig::remove_tool_flag`] — providers that don't advertise a
     /// flag silently ignore the input rather than receive an unknown arg.
     pub tools_to_remove: Vec<&'static str>,
-    /// When provider_binary is None and the provider spawns via npx (either a
+    /// When `provider_binary` is None and the provider spawns via npx (either a
     /// `fallback_npx_package` or an npx-only provider's pinned
     /// `npx_only_package`), this is the resolved npx path.
     pub npx_fallback_binary: Option<&'a Path>,
-    /// The package spec to pass to npx when npx_fallback_binary is set (may
+    /// The package spec to pass to npx when `npx_fallback_binary` is set (may
     /// carry a pinned `@<version>` suffix).
     pub npx_fallback_package: Option<&'static str>,
 }
@@ -70,6 +70,7 @@ impl<'a> SpawnOptions<'a> {
     /// both npx fields set. Single source of truth for the program selection,
     /// the `-y <pkg>` arg prepend, and the Node-child env decisions (heap cap,
     /// #555 codex env scrub).
+    #[must_use]
     pub fn via_npx(&self) -> bool {
         self.provider_binary.is_none()
             && self.npx_fallback_binary.is_some()
@@ -77,6 +78,7 @@ impl<'a> SpawnOptions<'a> {
     }
 
     /// Construct options for a provider with all optional inputs unset.
+    #[must_use]
     pub fn new(provider: &'a ProviderConfig) -> Self {
         Self {
             provider,
@@ -100,6 +102,7 @@ impl<'a> SpawnOptions<'a> {
 /// Assemble the launch arguments, including the Codex `-c` config overrides
 /// (which read `CODEX_REASONING_EFFORT` / `CODEX_MODEL_REASONING_EFFORT`).
 /// When spawning via npx fallback, prepends `-y <package>` before the provider's args.
+#[must_use]
 pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -144,6 +147,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 /// that path directly; otherwise, when `opts.npx_fallback_binary` is set,
 /// spawns npx; otherwise falls back to the bare `opts.provider.command`
 /// and relies on the enriched `PATH`.
+#[must_use]
 pub fn build_command(opts: &SpawnOptions) -> Command {
     build_command_with_captured_env(opts, captured_credential_env())
 }
@@ -284,6 +288,10 @@ impl SpawnedAgent {
     /// init). Descendants that escaped into their OWN process groups survive
     /// the `killpg`, so they are snapshotted before the kill and swept
     /// afterwards ([`crate::descendant_sweep`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first I/O error from the kill or the wait; a child that already exited is tolerated.
     pub async fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         let descendants = match self.child.id() {
@@ -294,7 +302,7 @@ impl SpawnedAgent {
         if let Some(pid) = self.child.id() {
             use nix::sys::signal::{killpg, Signal};
             use nix::unistd::Pid;
-            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
         }
         // The group SIGKILL above may already have terminated the direct child,
         // making `start_kill` report a spurious "already exited" error
@@ -320,12 +328,16 @@ impl SpawnedAgent {
 }
 
 /// Spawn the provider and wire up its [`Connection`] (§6.2 + §6.3).
+///
+/// # Errors
+///
+/// Returns [`AcpError::Spawn`] if the provider process cannot be started or its stdio pipes cannot be taken.
 pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
     let mut cmd = build_command(opts);
-    let command_name = opts
-        .provider_binary
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| opts.provider.command.to_string());
+    let command_name = opts.provider_binary.map_or_else(
+        || opts.provider.command.to_string(),
+        |p| p.display().to_string(),
+    );
     let mut child = cmd
         .spawn()
         .map_err(|e| AcpError::Spawn(format!("{command_name}: {e}")))?;
@@ -487,6 +499,7 @@ mod kill_tests {
         panic!("grandchild pid {grandchild_pid} still alive after group kill");
     }
 
+    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms; preset/present name distinct env sets
     /// Regression for the killpg-escape vector: an MCP-server-style grandchild
     /// that moves into its OWN process group survives the group SIGKILL in
     /// `kill()` (observed live: codex-acp's auggie ran with pgid == its own
@@ -537,7 +550,7 @@ mod kill_tests {
         // Prove the grandchild actually escaped the child's process group —
         // otherwise killpg would reach it and the test would be vacuous.
         let child_pid = agent.child_mut().id().expect("child pid");
-        let child_pgid = getpgid(Some(Pid::from_raw(child_pid as i32))).expect("child pgid");
+        let child_pgid = getpgid(Some(Pid::from_raw(child_pid.cast_signed()))).expect("child pgid");
         let grandchild_pgid =
             getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
         assert_ne!(
@@ -608,12 +621,10 @@ mod build_command_tests {
         // The parent dir should be first in the PATH
         let parent_dir = resolved_path.parent().unwrap().display().to_string();
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let expected_prefix = format!("{}{}", parent_dir, sep);
+        let expected_prefix = format!("{parent_dir}{sep}");
         assert!(
             path_value.starts_with(&expected_prefix),
-            "PATH should start with {}, got: {}",
-            expected_prefix,
-            path_value
+            "PATH should start with {expected_prefix}, got: {path_value}"
         );
     }
 
@@ -712,12 +723,10 @@ mod build_command_tests {
         let path_value = env_path.unwrap().1.unwrap().to_string_lossy();
         let parent_dir = npx_path.parent().unwrap().display().to_string();
         let sep = if cfg!(windows) { ";" } else { ":" };
-        let expected_prefix = format!("{}{}", parent_dir, sep);
+        let expected_prefix = format!("{parent_dir}{sep}");
         assert!(
             path_value.starts_with(&expected_prefix),
-            "PATH should start with {} so npx can find node, got: {}",
-            expected_prefix,
-            path_value
+            "PATH should start with {expected_prefix} so npx can find node, got: {path_value}"
         );
     }
 
@@ -925,6 +934,7 @@ mod captured_env_tests {
         assert_eq!(env_value(&cmd, &name).as_deref(), Some("captured-value"));
     }
 
+    #[allow(clippy::similar_names)] // pid/pgid are the POSIX terms; preset/present name distinct env sets
     #[test]
     fn captured_var_never_overrides_daemon_process_env() {
         let provider = intent_providers::find_provider("auggie").unwrap();

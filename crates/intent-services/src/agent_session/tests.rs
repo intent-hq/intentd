@@ -1,4 +1,4 @@
-//! Driver tests over a temp SQLite store + a mock ACP agent: a prompt turn
+//! Driver tests over a temp `SQLite` store + a mock ACP agent: a prompt turn
 //! accumulates chunks, publishes events in order with a single terminal
 //! `stream:end`, persists `acpSessionId`, and gates resume on the capability.
 
@@ -84,7 +84,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => prompt_result.clone(),
                 _ => json!({}),
             };
@@ -127,8 +126,8 @@ fn prompt_updates() -> Vec<String> {
 }
 
 /// A prompt turn that streams one text chunk, a `tool_call` (started), then a
-/// `tool_call_update` that completes it with output — exercises tool_use +
-/// tool_result block accumulation (CS-0 D6).
+/// `tool_call_update` that completes it with output — exercises `tool_use` +
+/// `tool_result` block accumulation (CS-0 D6).
 fn prompt_updates_with_tool_result() -> Vec<String> {
     let chunk = json!({
         "jsonrpc": "2.0",
@@ -533,7 +532,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => json!({ "stopReason": "end_turn" }),
                 _ => json!({}),
             };
@@ -689,7 +687,10 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         model: None,
         reasoning_effort: None,
         effort_levels: None,
-        provider: None,
+        // Pinned explicitly: seeded sessions predate monorepo#3044, when a
+        // `None` provider still resolved positionally to auggie; resolution
+        // now fails loudly with no provider and no configured default.
+        provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
         status: AgentStatus::Pending,
@@ -3141,7 +3142,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3226,7 +3226,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3447,7 +3446,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => json!({ "stopReason": "end_turn" }),
                 _ => json!({}),
             };
@@ -3740,7 +3738,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -5036,7 +5033,7 @@ fn surfaced_levels_filters_default_sentinel() {
 }
 
 /// Regression (PROTOCOL §5.5, Option C): a claude-code-shaped `configOptions`
-/// (thought_level select with default/low/medium/high/max) yields
+/// (`thought_level` select with default/low/medium/high/max) yields
 /// `effortLevels: ["low","medium","high","max"]` on the wire — persisted by
 /// `open_acp_session` itself, carried by the `AgentLite` projection, and
 /// announced by ONE `agent:updated`; the identical re-discovery on the next
@@ -6168,13 +6165,12 @@ async fn thought_text_is_absent_from_text_block_extraction() {
 /// more tool calls, asserting the invariant after EVERY step.
 #[tokio::test]
 async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persist() {
+    const GROUP_TEXT: &str =
+        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let mut transcript = super::Transcript::new("m1".to_string());
     services.set_live_turn(&agent_id, "m1", Vec::new());
-
-    const GROUP_TEXT: &str =
-        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
 
     let tool_note = |id: &str, title: &str| IncomingNotification {
         method: "session/update".to_string(),
@@ -6215,10 +6211,7 @@ async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persi
                 json!(format!("m1:{index}")),
                 "{step}: block ids stay {{messageId}}:{{index}}"
             );
-            if matches!(
-                block["type"].as_str(),
-                Some("tool_use") | Some("tool_result")
-            ) {
+            if matches!(block["type"].as_str(), Some("tool_use" | "tool_result")) {
                 assert!(index > 0, "{step}: no tool block precedes the group open");
             }
         }

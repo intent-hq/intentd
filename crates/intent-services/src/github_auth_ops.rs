@@ -216,7 +216,7 @@ pub(crate) async fn run_poll_loop(
     }
     let status = outcome.map_or("authorized", FlowPhase::as_wire);
     tracing::info!(status, "github device flow finished");
-    publish_event(&bus, auth_changed_event(status)).await;
+    publish_event(bus.as_ref(), auth_changed_event(status)).await;
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.
@@ -266,7 +266,7 @@ pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
 /// gate for gh CLI side effects (login sync on authorize, logout on revoke):
 /// a mock-host flow (test seam) stores a token gh cannot use, and touching
 /// `gh` from it would reach the host's real login state from tests. Trailing
-/// slashes are insignificant ("https://github.com/" is the same host), so
+/// slashes are insignificant ("<https://github.com>/" is the same host), so
 /// normalize before comparing.
 pub(crate) fn is_production_login_host(base_uri: &str) -> bool {
     base_uri.trim_end_matches('/')
@@ -283,10 +283,10 @@ fn is_safe_login_base_uri(uri: &str) -> bool {
         return false;
     };
     let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority
-        .strip_prefix("[::1]")
-        .map(|_| "::1")
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
+    let host = authority.strip_prefix("[::1]").map_or_else(
+        || authority.split(':').next().unwrap_or_default(),
+        |_| "::1",
+    );
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
@@ -333,7 +333,7 @@ pub(crate) fn auth_status_to_wire(is_configured: bool, slot: Option<&FlowSlot>) 
         "oauthUrl": oauth_url,
         "configuredButNeedsUpdate": false,
         "updatedScopes": "",
-        "deviceFlow": slot.map(flow_to_wire).unwrap_or(Value::Null),
+        "deviceFlow": slot.map_or(Value::Null, flow_to_wire),
     })
 }
 

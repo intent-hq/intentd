@@ -16,6 +16,10 @@ impl Store {
     /// Insert or replace a link (upsert on `(workspace_id, note_id,
     /// task_key)`). FE parity: `addTaskAgentAssociation` overwrites any
     /// existing entry at the same key. Returns the persisted row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_task_agent_link(&self, link: &TaskAgentLink) -> Result<TaskAgentLink> {
         sqlx::query(&format!(
             "INSERT OR REPLACE INTO task_agent_link ({TASK_AGENT_LINK_COLUMNS}) \
@@ -35,6 +39,10 @@ impl Store {
 
     /// Delete a single link by its full key. Returns whether a row was
     /// actually removed; deleting an unknown key is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_task_agent_link(
         &self,
         workspace_id: &WorkspaceId,
@@ -56,6 +64,10 @@ impl Store {
 
     /// List every link for a workspace, oldest first — hydration read for
     /// `task.listAgentLinks`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_task_agent_links(
         &self,
         workspace_id: &WorkspaceId,
@@ -72,6 +84,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_link_row(r: &SqliteRow) -> Result<TaskAgentLink> {
     Ok(TaskAgentLink {
         workspace_id: WorkspaceId::from(r.get::<String, _>("workspace_id")),

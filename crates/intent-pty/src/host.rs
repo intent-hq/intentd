@@ -289,6 +289,7 @@ pub struct PtyHost {
 
 impl PtyHost {
     /// Create an empty host.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -300,6 +301,14 @@ impl PtyHost {
     /// retries (monorepo#653), up to ~0.8s worst-case before giving up. Async
     /// callers that cannot tolerate that on a runtime thread should wrap the
     /// call in `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if `openpty` keeps failing after the bounded retries or spawning the child fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn spawn(&self, spec: SpawnSpec) -> Result<PtyId> {
         let pair = openpty_with_retry(spec.size.to_portable())?;
 
@@ -336,7 +345,7 @@ impl PtyHost {
         }));
 
         let reader_fanout = Arc::clone(&fanout);
-        let handle = std::thread::spawn(move || read_loop(reader, reader_fanout));
+        let handle = std::thread::spawn(move || read_loop(reader, &reader_fanout));
 
         let cwd = spec
             .cwd
@@ -389,6 +398,14 @@ impl PtyHost {
     /// Attach a new subscriber: capture recent scrollback to back-fill, then a
     /// live receiver for subsequent output. The snapshot and subscription are
     /// taken under one lock so no chunk is lost or duplicated across the seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn attach(&self, id: PtyId) -> Result<Attachment> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
@@ -400,6 +417,14 @@ impl PtyHost {
 
     /// Snapshot the PTY's current scrollback for replay (`terminal.getBuffer` /
     /// ACP `terminal/output`), without subscribing to live output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn scrollback(&self, id: PtyId) -> Result<Vec<u8>> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
@@ -407,12 +432,24 @@ impl PtyHost {
     }
 
     /// The PTY child's process id, if the platform reported one at spawn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn pid(&self, id: PtyId) -> Option<u32> {
         self.sessions.lock().unwrap().get(&id).and_then(|s| s.pid)
     }
 
     /// The child's exit status if it has already exited, else `None`. Latches
     /// the status so it stays observable after the stream closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn try_exit(&self, id: PtyId) -> Result<Option<PtyExit>> {
         let session = self.get(id)?;
         Ok(observe_exit(&session))
@@ -426,6 +463,14 @@ impl PtyHost {
     /// scrollback (monorepo#587 makes that output eventually-complete rather
     /// than lost). Callers reading scrollback right after `wait()` should poll
     /// briefly rather than assume it is final.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
         let session = self.get(id)?;
         loop {
@@ -438,6 +483,14 @@ impl PtyHost {
 
     /// Write input to the PTY master. The per-PTY writer mutex serializes
     /// concurrent writers so each write lands as one contiguous chunk (§12.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the write or flush fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn write(&self, id: PtyId, data: &[u8]) -> Result<()> {
         let session = self.get(id)?;
         let mut writer = session.writer.lock().unwrap();
@@ -447,6 +500,14 @@ impl PtyHost {
     }
 
     /// Resize the PTY's visible area.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the master is already torn down or the resize fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn resize(&self, id: PtyId, size: PtySize) -> Result<()> {
         let session = self.get(id)?;
         let guard = session.master.lock().unwrap();
@@ -457,6 +518,14 @@ impl PtyHost {
     }
 
     /// Deliver a signal to the PTY's process group (SIGINT/Ctrl-C, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if no session exists for `id`; `Error::Internal` if the session has no process id or delivering the signal fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn signal(&self, id: PtyId, sig: PtySignal) -> Result<()> {
         let session = self.get(id)?;
         #[cfg(unix)]
@@ -476,6 +545,10 @@ impl PtyHost {
     }
 
     /// Whether the PTY exists and its child has not yet exited.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn is_alive(&self, id: PtyId) -> bool {
         match self.sessions.lock().unwrap().get(&id).cloned() {
             Some(session) => matches!(session.child.lock().unwrap().try_wait(), Ok(None)),
@@ -486,6 +559,10 @@ impl PtyHost {
     /// Metadata for one tracked PTY (`terminal.list` / `terminal.readOutput`):
     /// its `scope`, display name, working directory, and whether its child is
     /// still running. `None` when the id is unknown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn info(&self, id: PtyId) -> Option<PtyInfo> {
         let session = self.sessions.lock().unwrap().get(&id).cloned()?;
         let alive = matches!(session.child.lock().unwrap().try_wait(), Ok(None));
@@ -498,12 +575,20 @@ impl PtyHost {
     }
 
     /// Number of PTYs currently tracked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn count(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
 
     /// The live, list-visible PTYs currently tracked under `scope`. Hidden and
     /// exited sessions remain addressable for output and explicit release.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub fn list_scope(&self, scope: &str) -> Vec<PtyId> {
         self.sessions
             .lock()
@@ -515,6 +600,10 @@ impl PtyHost {
     }
 
     /// Kill one PTY and reap its whole process group. Returns whether it existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn kill(&self, id: PtyId) -> bool {
         let session = self.sessions.lock().unwrap().remove(&id);
         match session {
@@ -533,6 +622,10 @@ impl PtyHost {
     /// and latched exit status remain readable. No-op when the session is
     /// unknown, the child is still running (the group is legitimately
     /// alive), or the group is already empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn reap_group_stragglers(&self, id: PtyId) {
         let Ok(session) = self.get(id) else { return };
         #[cfg(unix)]
@@ -580,6 +673,10 @@ impl PtyHost {
     /// `terminal.create` already in flight on an accepted connection when the
     /// listener stops) either registers before the drain and is reaped by it,
     /// or observes the latch and is refused with its child reaped in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a per-session mutex is poisoned (a prior panic while holding the lock).
     pub async fn kill_all(&self) -> usize {
         self.closed.store(true, Ordering::SeqCst);
         let victims: Vec<Arc<PtySession>> = {
@@ -616,7 +713,7 @@ impl PtyHost {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .is_none_or(|h| h.is_finished())
+                .is_none_or(std::thread::JoinHandle::is_finished)
         })
     }
 
@@ -692,7 +789,7 @@ fn exit_watch_loop(session: &PtySession) {
 
 /// Blocking reader loop (own thread): append each chunk to scrollback and
 /// broadcast it under one lock so attach sees a consistent history/live seam.
-fn read_loop(mut reader: Box<dyn Read + Send>, fanout: Arc<Mutex<Fanout>>) {
+fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buf) {
@@ -703,7 +800,7 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: Arc<Mutex<Fanout>>) {
                 guard.scrollback.push(&chunk);
                 let _ = guard.tx.send(chunk);
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
@@ -772,7 +869,7 @@ fn reap_refused_spawn(session: &PtySession) {
 /// SIGTERM the process group, then escalate to SIGKILL when the group is
 /// non-empty after [`TERM_GRACE`]. Escalation is keyed on the *process
 /// group* emptying, not on the direct child's exit: a descendant that
-/// survives SIGTERM must still be SIGKILLed even when the shell itself
+/// survives SIGTERM must still be `SIGKILLed` even when the shell itself
 /// exited promptly (monorepo#1300). Keep reaping the direct child — a zombie
 /// leader keeps the pgid occupied, so the ESRCH probe only reports empty
 /// once the leader is reaped. Reap via `observe_exit` so the one-shot exit
@@ -806,7 +903,7 @@ fn kill_group(pid: u32, sig: PtySignal) -> std::result::Result<(), nix::errno::E
         PtySignal::Terminate => Signal::SIGTERM,
         PtySignal::Kill => Signal::SIGKILL,
     };
-    killpg(Pid::from_raw(pid as i32), signal)
+    killpg(Pid::from_raw(pid.cast_signed()), signal)
 }
 
 /// Whether the process group led by `pid` (pgid == pid via `setsid`) has no
@@ -818,7 +915,7 @@ fn process_group_empty(pid: u32) -> bool {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
     matches!(
-        killpg(Pid::from_raw(pid as i32), None),
+        killpg(Pid::from_raw(pid.cast_signed()), None),
         Err(nix::errno::Errno::ESRCH)
     )
 }
@@ -833,7 +930,7 @@ mod tests {
     }
 
     /// Deadline scale factor for slow environments (coverage runs export
-    /// INTENTD_TEST_TIMEOUT_MULTIPLIER); never below 1.0, and non-finite
+    /// `INTENTD_TEST_TIMEOUT_MULTIPLIER`); never below 1.0, and non-finite
     /// values (`inf`/`NaN`) are ignored so `Duration::mul_f64` cannot panic.
     fn timeout_multiplier() -> f64 {
         std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
@@ -853,15 +950,13 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !contains(&acc, needle) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => break,
-                Err(_) => break,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
             }
         }
         acc
@@ -878,15 +973,13 @@ mod tests {
         let mut acc = Vec::new();
         let deadline = Instant::now() + timeout;
         while !needles.iter().all(|n| contains(&acc, n)) {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(d) => d,
-                None => break,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
             };
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(chunk)) => acc.extend_from_slice(&chunk),
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => break,
-                Err(_) => break,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
             }
         }
         acc
@@ -896,7 +989,7 @@ mod tests {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
         matches!(
-            kill(Pid::from_raw(pid as i32), None),
+            kill(Pid::from_raw(pid.cast_signed()), None),
             Ok(()) | Err(nix::errno::Errno::EPERM)
         )
     }
@@ -1140,20 +1233,18 @@ mod tests {
                         if contains(&out, marker.as_bytes()) {
                             break;
                         }
-                        if drained {
-                            panic!(
-                                "{marker}: fast-exiting child's output was lost; \
-                                 exit 0 and reader drained to EOF but scrollback stayed {:?}",
-                                String::from_utf8_lossy(&out)
-                            );
-                        }
-                        if Instant::now() >= deadline {
-                            panic!(
-                                "{marker}: output drain never completed within deadline; \
-                                 scrollback so far {:?}",
-                                String::from_utf8_lossy(&out)
-                            );
-                        }
+                        assert!(
+                            !drained,
+                            "{marker}: fast-exiting child's output was lost; \
+                             exit 0 and reader drained to EOF but scrollback stayed {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
+                        assert!(
+                            Instant::now() < deadline,
+                            "{marker}: output drain never completed within deadline; \
+                             scrollback so far {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
 
@@ -1246,9 +1337,10 @@ mod tests {
             if let Some(pid) = text.split_whitespace().find_map(|t| t.parse().ok()) {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("grandchild pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -1304,9 +1396,10 @@ mod tests {
             {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
@@ -1357,9 +1450,10 @@ mod tests {
             {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("descendant pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert!(pid_alive(descendant), "descendant alive before kill_all");
@@ -1462,9 +1556,10 @@ mod tests {
             {
                 break pid;
             }
-            if Instant::now() >= deadline {
-                panic!("straggler pid never printed within deadline; scrollback: {text:?}");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "straggler pid never printed within deadline; scrollback: {text:?}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert!(pid_alive(straggler), "straggler outlives the shell");

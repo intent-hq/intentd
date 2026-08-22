@@ -46,8 +46,7 @@ pub(crate) fn default_secrets_path() -> PathBuf {
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 /// File-backed secret store (see the module docs for path resolution, atomic
@@ -65,6 +64,7 @@ impl Default for FileSecretStore {
 
 impl FileSecretStore {
     /// Store backed by the default path ([`default_secrets_path`]).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_path(default_secrets_path())
     }
@@ -76,6 +76,7 @@ impl FileSecretStore {
     }
 
     /// The backing file path.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -83,11 +84,19 @@ impl FileSecretStore {
     /// Return the stored secret for `account`: `Ok(Some(value))` if present,
     /// `Ok(None)` if confirmed absent (missing file or key not in map), or
     /// `Err` if the backing file is unreadable or corrupt (IO/parse failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the backing file is unreadable or corrupt.
     pub fn load(&self, account: &str) -> Result<Option<String>> {
         self.read_map_strict().map(|mut map| map.remove(account))
     }
 
     /// Persist `value` for `account`, replacing any existing secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if creating the secrets directory, serializing, or writing the file fails.
     pub fn store(&self, account: &str, value: &str) -> Result<()> {
         let mut map = self.read_map();
         map.insert(account.to_string(), value.to_string());
@@ -96,6 +105,10 @@ impl FileSecretStore {
 
     /// Delete the secret for `account`; absence is an idempotent success (and
     /// does not rewrite the file).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if rewriting the secrets file fails.
     pub fn delete(&self, account: &str) -> Result<()> {
         let mut map = self.read_map();
         if map.remove(account).is_none() {

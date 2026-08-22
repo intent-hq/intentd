@@ -182,8 +182,15 @@ async fn boot(max_outstanding: u32) -> Fixture {
         rpc_limiter: limiter.clone(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(Arc::clone(&api), bus.clone(), &tls, token_store, opts, None)
-        .expect("server");
+    let ws = WsApiServer::new(
+        Arc::clone(&api),
+        bus.clone(),
+        &tls,
+        &token_store,
+        opts,
+        None,
+    )
+    .expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
 

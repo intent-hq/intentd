@@ -36,6 +36,13 @@ not own) and `already-claimed` (a claim lost to an earlier claim). Each names th
 owning agent when the tab has one; a `not-owner` on an unowned tab carries no owner
 info — the remedy is `claimTab`.
 
+For a single-action call the returned value is that action's envelope. A multi-action
+batch that fails returns `{ success: false, results, error }`; the batch aborts on the
+first failing action, so `results` holds only the actions executed so far (the failing
+one last). The multi-action *success* shape is `{ results }` with no `success` key, so
+test failure with `r.success === false` — a truthiness check like `!r.success`
+misclassifies every successful batch.
+
 - `{ action: "claimTab", tabId, width, height? }` - Claim an unowned (user) tab for
   yourself. `width` is required (a claim without it is a validation error); omitted
   `height` defaults to 800. Claims are atomic, first-claim-wins: a successful claim
@@ -80,11 +87,13 @@ dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden 
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
 Revealing an existing tab is `showTab`-only.
 
-- `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by mounting it into a
-  panel. Owner-only: on a tab you do not own it returns the structured `not-owner`
-  error. `focus` defaults to false: the tab is mounted without being activated and
-  without moving panel focus; `focus: true` reveals AND activates — the tab becomes
-  the panel's active tab and the panel takes focus. Idempotent on an already-visible
+- `{ action: "showTab", tabId, focus? }` - Reveal a hidden tab by activating it in a
+  visible panel. Owner-only: on a tab you do not own it returns the structured
+  `not-owner` error. `focus` defaults to false: the tab is activated in a visible
+  panel without moving panel/keyboard focus and without displacing the
+  currently-viewed conversation; `focus: true` reveals AND focuses — the tab becomes
+  its panel's active tab and the panel takes focus. The reveal is persisted: a
+  revealed tab stays visible across app restarts. Idempotent on an already-visible
   tab: with `focus: false` it is a no-op success; with `focus: true` it still
   activates the tab and focuses its panel. An unknown `tabId` fails as an
   action-result error naming the unknown id.
@@ -97,6 +106,19 @@ Hidden tabs are fully usable for background work — screenshots, evaluation, an
 navigation are deterministic offscreen thanks to viewport emulation. Reveal a tab
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
+
+Tab operations do not require the workspace to be currently open/visible in the app:
+every action (`openTab` hidden or visible, `closeTab`, `showTab`, `evaluate`,
+`screenshot`, …) works regardless of workspace visibility — webviews spin up in the
+background as needed. Visibility/activation effects apply to the persisted layout
+state: `showTab` activates the tab in a visible panel of the workspace's layout (and
+with `focus: true`, also focuses it) so it is correct when the user next opens the
+workspace. When the
+workspace is not currently visible in the UI, no actual UI focus/activation is
+attempted: `showTab { focus: true }`, `focusTab`, and `openTab { visible: true }`
+succeed, apply their state effects, skip the UI focus attempt, and the action result
+carries an additive `warning` string stating that the workspace is not visible so no
+UI focus was attempted (the field is absent when the workspace is visible).
 
 ## Basic Actions
 - `{ action: "listTabs", scope? }` - List browser tabs (`scope: "mine" | "unclaimed" | "all"`, default `all`) with ownership, sizing, and visibility info

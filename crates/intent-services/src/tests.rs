@@ -1,4 +1,4 @@
-//! End-to-end `note.*` service tests over a temp SQLite store. Pure content
+//! End-to-end `note.*` service tests over a temp `SQLite` store. Pure content
 //! math is covered in `note_ops`; these assert persistence, the setContent
 //! reduction guard, spec-title skip, workspace scoping, and error mapping.
 
@@ -26,8 +26,8 @@ fn disable_node_compile_cache() {
 }
 
 /// Guard for tests that mutate debounce env vars to prevent parallel test
-/// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
-/// WORKSPACE_IDLE debounce vars.
+/// races (`env::set_var` is process-global). Supports both `LAST_ACTIVITY` and
+/// `WORKSPACE_IDLE` debounce vars.
 static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard for debounce env vars: holds the lock, sets the vars, and restores
@@ -40,13 +40,13 @@ pub(crate) struct DebounceEnvGuard {
 
 impl DebounceEnvGuard {
     pub(crate) fn new(millis: &str) -> Self {
-        let _lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
+        let lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
         let prior_last_activity = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
         let prior_workspace_idle = std::env::var_os("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", millis);
         std::env::set_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", millis);
         Self {
-            _lock,
+            _lock: lock,
             prior_last_activity,
             prior_workspace_idle,
         }
@@ -95,10 +95,26 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".config.toml"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
         }
     }
+}
+
+/// A settings registry (backed by a config file next to the temp db, removed
+/// by [`TempDb`]'s drop) seeding `providers.active = "auggie"`: since
+/// monorepo#3044 there is no positional provider fallback, so tests that
+/// create/delegate agents without an explicit provider or model need a
+/// configured default to resolve to.
+pub(crate) fn test_registry_with_default_provider(
+    tmp: &TempDb,
+) -> std::sync::Arc<crate::SettingsRegistry> {
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[("providers.active".to_string(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
+    registry
 }
 
 /// Drop-cleanup wrapper around a per-test workspaces root, paired with the
@@ -537,6 +553,14 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
 /// slim `tokenUsage` (all rows) and `agentSummary` (archived rows).
 #[tokio::test]
 async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
+    // Dogfooding shape (issue math: ~10 KB/row at 130 workspaces): the vast
+    // majority archived, each with the agent sessions a coordinator +
+    // sub-agent workflow accumulates over a workspace's life. Unslimmed this
+    // dataset serializes well over 1 MiB — the assertion below only holds
+    // with the list-path slimming in place.
+    const WORKSPACES: usize = 130;
+    const ACTIVE: usize = 8;
+    const SESSIONS_PER_WS: u64 = 20;
     use std::collections::BTreeMap;
 
     use intent_core::{
@@ -599,15 +623,6 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         session_corrupted: false,
         pending_delete_at: None,
     };
-
-    // Dogfooding shape (issue math: ~10 KB/row at 130 workspaces): the vast
-    // majority archived, each with the agent sessions a coordinator +
-    // sub-agent workflow accumulates over a workspace's life. Unslimmed this
-    // dataset serializes well over 1 MiB — the assertion below only holds
-    // with the list-path slimming in place.
-    const WORKSPACES: usize = 130;
-    const ACTIVE: usize = 8;
-    const SESSIONS_PER_WS: u64 = 20;
 
     for i in 0..WORKSPACES {
         let ws = WorkspaceId::new();
@@ -1239,8 +1254,283 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert!(stored.pull_requests.is_none(), "merge must not persist");
 }
 
+/// The emit-path PR merge moves a stale entry's status up the lifecycle
+/// ladder (open/draft < closed < merged) when a lower-priority duplicate
+/// ranks higher: a git-root entry still reading `open`/`draft`/`closed`
+/// flips to `merged` when the monitor's snapshot saw the PR merge (status +
+/// updatedAt + isDraft; identity fields keep the git-root entry — a
+/// `draft` entry upgraded to a terminal status must not keep claiming
+/// `isDraft: true`), while a git-root entry already `merged` is never
+/// downgraded by the snapshotless completed-monitor `closed` fallback
+/// (intent-hq/monorepo#3127).
+#[tokio::test]
+async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
+    use intent_core::{
+        PrMonitor, PrMonitorId, PrMonitorState, PullRequestInfo, PullRequestStatus,
+        WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let pr_info =
+        |number: u64, url: &str, title: &str, status: PullRequestStatus| PullRequestInfo {
+            id: number.to_string(),
+            number,
+            url: url.to_string(),
+            title: title.to_string(),
+            status,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        };
+    let monitor =
+        |ws: &WorkspaceId, number: i64, state: PrMonitorState, snapshot: Option<String>| {
+            PrMonitor {
+                monitor_id: PrMonitorId::new(),
+                workspace_id: ws.clone(),
+                agent_id: AgentId::from("agent-mon"),
+                repo_owner: "o".into(),
+                repo_name: "r".into(),
+                pr_number: number,
+                state,
+                last_snapshot: snapshot,
+                baseline_snapshot: None,
+                pending_changes: vec![],
+                pending_since: None,
+                last_change_at: None,
+                last_polled_at: None,
+                last_error: None,
+                created_at: "2026-01-02T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:01Z".into(),
+            }
+        };
+
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from("agent-mon"),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Monitor Owner".into(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+    };
+    store.insert_agent_session(&session).await.expect("session");
+
+    // Git root: PR 1 stale-open (the sweep hasn't seen the merge yet),
+    // PR 3 already merged, PR 4 stale-draft, PR 5 stale-closed.
+    let mut stale_draft = pr_info(
+        4,
+        "https://github.com/o/r/pull/4",
+        "Stale draft",
+        PullRequestStatus::Draft,
+    );
+    stale_draft.is_draft = Some(true);
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: "/tmp/root-a".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("o".into()),
+            repo_name: Some("r".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(vec![
+                pr_info(
+                    1,
+                    "https://github.com/o/r/pull/1",
+                    "Stale open",
+                    PullRequestStatus::Open,
+                ),
+                pr_info(
+                    3,
+                    "https://github.com/o/r/pull/3",
+                    "Already merged",
+                    PullRequestStatus::Merged,
+                ),
+                stale_draft,
+                pr_info(
+                    5,
+                    "https://github.com/o/r/pull/5",
+                    "Stale closed",
+                    PullRequestStatus::Closed,
+                ),
+            ]),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("git root");
+
+    // Monitors whose snapshots saw PRs 1, 4 and 5 merge, plus a snapshotless
+    // completed monitor on PR 3 (synthesized URL duplicates the git-root
+    // entry; its `closed` fallback carries no merged/closed verdict).
+    let merged_snapshot = |number: u64, title: &str| {
+        serde_json::json!({
+            "title": title,
+            "url": format!("https://github.com/o/r/pull/{number}"),
+            "conversationCount": 0,
+            "reviewCommentCount": 0,
+            "requirements": {
+                "state": "merged",
+                "isDraft": false,
+                "hasConflicts": false,
+                "isBehind": false,
+                "checks": {
+                    "total": 0, "passed": 0, "failed": 0, "pending": 0,
+                    "items": [], "failingRequired": [], "pendingRequired": [],
+                    "requiredKnown": true
+                },
+                "approvals": { "decision": "none", "have": 0, "changesRequested": 0 },
+                "threads": { "unresolved": 0 },
+                "rulesKnown": false
+            }
+        })
+        .to_string()
+    };
+    for m in [
+        monitor(
+            &ws,
+            1,
+            PrMonitorState::Completed,
+            Some(merged_snapshot(1, "Stale open")),
+        ),
+        monitor(&ws, 3, PrMonitorState::Completed, None),
+        monitor(
+            &ws,
+            4,
+            PrMonitorState::Completed,
+            Some(merged_snapshot(4, "Stale draft")),
+        ),
+        monitor(
+            &ws,
+            5,
+            PrMonitorState::Completed,
+            Some(merged_snapshot(5, "Stale closed")),
+        ),
+    ] {
+        store.insert_pr_monitor(&m).await.expect("monitor");
+    }
+
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+    for (list, path) in [
+        (
+            svc.list_workspaces(false).await.expect("full list"),
+            "workspace.list",
+        ),
+        (
+            svc.list_workspaces_lite(false).await.expect("lite list"),
+            "lite list",
+        ),
+    ] {
+        let row = list.iter().find(|w| w.id == ws).expect("ws row");
+        let prs = row.pull_requests.as_ref().expect("pullRequests");
+        assert_eq!(prs.len(), 4, "{path}: URL dedup keeps one entry per PR");
+        // Stale-open git-root entry: the monitor's merged verdict wins the
+        // lifecycle fields (status, updatedAt, isDraft), git-root keeps the
+        // identity fields.
+        assert_eq!(prs[0].url, "https://github.com/o/r/pull/1", "{path}");
+        assert_eq!(prs[0].title, "Stale open", "{path}: git-root fields kept");
+        assert_eq!(
+            prs[0].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: monitor's merged verdict overrides the stale open status"
+        );
+        assert_eq!(
+            prs[0].updated_at, "2026-01-02T00:00:01Z",
+            "{path}: updatedAt follows the status upgrade"
+        );
+        // Already-merged git-root entry: the completed monitor's `closed`
+        // fallback must not downgrade the merged verdict.
+        assert_eq!(prs[1].url, "https://github.com/o/r/pull/3", "{path}");
+        assert_eq!(
+            prs[1].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: closed fallback never downgrades a merged entry"
+        );
+        assert_eq!(
+            prs[1].updated_at, "2026-01-01T00:00:00Z",
+            "{path}: terminal entry untouched"
+        );
+        // Stale-draft git-root entry: isDraft moves with the status so the
+        // upgraded entry can't read merged while still claiming draft.
+        assert_eq!(prs[2].url, "https://github.com/o/r/pull/4", "{path}");
+        assert_eq!(
+            prs[2].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: monitor's merged verdict overrides the stale draft status"
+        );
+        assert_eq!(
+            prs[2].is_draft,
+            Some(false),
+            "{path}: isDraft follows the status upgrade"
+        );
+        // Stale-closed git-root entry: merged is irreversible, so it
+        // overrides even a terminal `closed`.
+        assert_eq!(prs[3].url, "https://github.com/o/r/pull/5", "{path}");
+        assert_eq!(
+            prs[3].status,
+            intent_core::PullRequestStatus::Merged,
+            "{path}: merged verdict overrides a stale closed status"
+        );
+        assert_eq!(
+            prs[3].updated_at, "2026-01-02T00:00:01Z",
+            "{path}: updatedAt follows the closed→merged upgrade"
+        );
+    }
+}
+
 /// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
-/// (self filtered out, other-repo filtered out) with the PascalCase status.
+/// (self filtered out, other-repo filtered out) with the `PascalCase` status.
 #[tokio::test]
 async fn cross_workspace_list_siblings_scopes_to_repository() {
     let tmp = TempDb::new();
@@ -2286,7 +2576,7 @@ async fn task_list_and_get_project_workspace_tasks() {
     let parents: Vec<Option<&str>> = result
         .tasks
         .iter()
-        .map(|t| t.parent_id.as_ref().map(|p| p.as_str()))
+        .map(|t| t.parent_id.as_ref().map(intent_core::NoteId::as_str))
         .collect();
     assert_eq!(
         parents,
@@ -2451,7 +2741,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .await
         .expect("setRelations");
     assert!(r.ok);
-    let dep_ids: Vec<&str> = r.depends_on.iter().map(|d| d.as_str()).collect();
+    let dep_ids: Vec<&str> = r
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(dep_ids, vec!["task-a", "task-b"]);
     assert_eq!(r.conflicts_with[0].as_str(), "task-b");
 
@@ -2463,7 +2757,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .expect("getMyTask");
     assert_eq!(mine.task_metadata.depends_on.len(), 2);
     assert_eq!(mine.task_metadata.conflicts_with.len(), 1);
-    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = mine
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
 
     // task.list projects the same fields.
@@ -2474,7 +2772,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .find(|t| t.id.as_str() == "task-c")
         .expect("task-c row");
     assert_eq!(c.depends_on.len(), 2);
-    let unmet: Vec<&str> = c.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = c
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
 
     // task.get projects them too; task-c has dependsOn edges, so this
@@ -2483,7 +2785,11 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
         .task_get(ws.clone(), NoteId::from("task-c"))
         .await
         .expect("task.get");
-    let unmet: Vec<&str> = got.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = got
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
     assert!(got.spec_linked);
 
@@ -2835,7 +3141,11 @@ async fn note_reads_project_unmet_depends_on() {
         .await
         .expect("get c");
     let task = c.metadata.task.as_ref().expect("task metadata");
-    let unmet: Vec<&str> = task.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = task
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec!["task-b"]);
 
     // note.list: same projection; dep-less task rows omit the field on the
@@ -3146,9 +3456,17 @@ async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
     let fe_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Frontend").await;
 
     let ui_meta = child_task_meta(&svc, &ws, &r.created_note_ids, "Wiring").await;
-    let deps: Vec<&str> = ui_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = ui_meta
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![api_id.as_str()], "dependsOn resolved via key=");
-    let conflicts: Vec<&str> = ui_meta.conflicts_with.iter().map(|d| d.as_str()).collect();
+    let conflicts: Vec<&str> = ui_meta
+        .conflicts_with
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(
         conflicts,
         vec![fe_id.as_str()],
@@ -3161,7 +3479,11 @@ async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
         .get_my_task(ws.clone(), NoteId::from(ui_id.as_str()))
         .await
         .expect("getMyTask");
-    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    let unmet: Vec<&str> = mine
+        .unmet_depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(unmet, vec![api_id.as_str()]);
 }
 
@@ -3181,7 +3503,11 @@ async fn convert_blocks_key_takes_precedence_over_title() {
     assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
     let key_owner = child_id_by_title(&svc, &ws, &r.created_note_ids, "Key Owner").await;
     let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
-    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = consumer
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![key_owner.as_str()]);
 }
 
@@ -3211,7 +3537,11 @@ async fn convert_blocks_resolves_existing_task_note_ids() {
         .expect("convertBlocks");
     assert_eq!(r.converted_count, 1);
     let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
-    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = consumer
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec!["pre-task"], "existing task-note id resolves");
     assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
     assert!(
@@ -3244,7 +3574,11 @@ async fn convert_blocks_warns_on_unknown_reference_and_still_converts() {
     assert!(alpha.depends_on.is_empty());
     let alpha_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Alpha").await;
     let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
-    let deps: Vec<&str> = beta.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = beta
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(
         deps,
         vec![alpha_id.as_str()],
@@ -3387,7 +3721,11 @@ async fn convert_blocks_warns_on_validator_rejected_edges() {
     // cycle and Beta→Beta is a self-edge — both rejected.
     let beta_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Beta").await;
     let alpha = child_task_meta(&svc, &ws, &r.created_note_ids, "Alpha").await;
-    let deps: Vec<&str> = alpha.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = alpha
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![beta_id.as_str()], "acyclic edge applies");
     let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
     assert!(beta.depends_on.is_empty(), "rejected edges skipped");
@@ -3451,7 +3789,11 @@ async fn convert_blocks_auto_convert_surfaces_relations_via_note_write() {
     let x_meta = x.metadata.task.as_ref().expect("X task");
     assert_eq!(x_meta.estimated_effort.as_deref(), Some("1d"));
     let y_meta = y.metadata.task.as_ref().expect("Y task");
-    let deps: Vec<&str> = y_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    let deps: Vec<&str> = y_meta
+        .depends_on
+        .iter()
+        .map(intent_core::NoteId::as_str)
+        .collect();
     assert_eq!(deps, vec![x.id.as_str()]);
 }
 
@@ -4349,7 +4691,7 @@ async fn comment_add_empty_target_is_invalid_params() {
             ws,
             id,
             "some note content".into(),
-            "".into(),
+            String::new(),
             "c".into(),
             None,
             None,
@@ -5342,7 +5684,7 @@ async fn insert_file_event(
             event_type: "file:changed".to_string(),
             actor: EventActor {
                 actor_type,
-                id: actor_id.map(|s| s.to_string()),
+                id: actor_id.map(std::string::ToString::to_string),
                 name: actor_id.map(|s| format!("name-{s}")),
                 ..Default::default()
             },
@@ -7638,7 +7980,7 @@ mod change_event_parity {
 
         // A nested begin/end pair stays non-zero → NO event is emitted.
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_eq!(
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::AgentRunning
@@ -7646,7 +7988,7 @@ mod change_event_parity {
 
         // Last session leaves flight: AgentRunning → Idle (emits idle after debounce).
         // If the nested pair had emitted, this would observe agent_running instead.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // Wait for debounce window to expire.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let ev = recv_one(&mut sub).await;
@@ -7663,7 +8005,7 @@ mod change_event_parity {
         assert_eq!(got.activity, WorkspaceActivity::Idle);
 
         // Decrementing past zero is a saturating no-op (no panic, stays Idle).
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         assert_eq!(
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::Idle
@@ -7686,7 +8028,7 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_eq!(ev["data"]["activity"], "agent_running");
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // Quickly re-begin activity within the debounce window (race scenario).
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7766,7 +8108,7 @@ mod change_event_parity {
         );
 
         // End agent activity: the workspace returns to idle after debounce window.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         // During grace window, workspace_activity() still reports AgentRunning.
         assert_eq!(
             h.services.workspace_activity(&h.ws),
@@ -7827,7 +8169,7 @@ mod change_event_parity {
             "dismiss_attention MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// Regression for STAB-N: `archive_workspace` must derive activity.
@@ -7851,7 +8193,7 @@ mod change_event_parity {
             "archive_workspace MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// Regression for STAB-N: `unarchive_workspace` must derive activity.
@@ -7881,7 +8223,7 @@ mod change_event_parity {
             "unarchive_workspace MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// Regression for STAB-N: `mark_seen` must derive activity.
@@ -7907,7 +8249,7 @@ mod change_event_parity {
             "mark_seen MUST derive activity=agent_running"
         );
 
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
     }
 
     /// The BE raises `attention`, it persists across a store reload, the raise is
@@ -8182,7 +8524,7 @@ mod change_event_parity {
 
     /// Regression (intent-hq/monorepo#1481): same race window as above, for
     /// `raise_attention`. Raising IS activity — `updated_at` moves — but the
-    /// write must still be scoped to attention + updated_at, so a concurrent
+    /// write must still be scoped to attention + `updated_at`, so a concurrent
     /// title change survives.
     #[tokio::test]
     async fn raise_attention_race_preserves_concurrent_title_change() {
@@ -8795,6 +9137,7 @@ mod change_event_parity {
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
     /// bug: on `note.list` with no `id='spec'` note but exactly one top-level,
     /// non-task note titled "Spec", the stray is *adopted* — its `note.id` is
@@ -9796,7 +10139,7 @@ mod drafts_events {
         assert!(ev.data.get("text").is_none());
     }
 
-    /// Attachments round-trip through the real SQLite store (additive
+    /// Attachments round-trip through the real `SQLite` store (additive
     /// `attachments` column, §5.16): stored verbatim, empty-text-with-
     /// attachments persists, empty-text-no-attachments clears, and the
     /// `draft:changed` payload never carries attachment content.
@@ -9929,6 +10272,8 @@ mod pr {
     use super::{workspace, TempDb};
     use crate::Services;
 
+    // Test stub: one independent bool per scripted scenario.
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(Default)]
     struct StubForge {
         fail_threads: bool,
@@ -9993,6 +10338,9 @@ mod pr {
         /// PR number whose `get_pr` pends forever (hung-connection
         /// regression, intent-hq/monorepo#1988 lineage).
         hang_get_pr: Option<u64>,
+        /// PR numbers `get_pr` was called with, in call order (sweep
+        /// stale-pool heal tests assert cap + ordering).
+        seen_get_pr: std::sync::Mutex<Vec<u64>>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -10039,7 +10387,7 @@ mod pr {
         async fn get_user(&self) -> ScResult<UserIdentity> {
             Ok(UserIdentity {
                 login: "octocat".into(),
-                id: Some(583231),
+                id: Some(583_231),
                 name: Some("The Octocat".into()),
                 avatar_url: Some("https://avatars.example/u/1".into()),
                 html_url: Some("https://github.com/octocat".into()),
@@ -10153,6 +10501,7 @@ mod pr {
             })
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            self.seen_get_pr.lock().unwrap().push(number);
             if self.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
                 std::future::pending::<()>().await;
@@ -10161,6 +10510,8 @@ mod pr {
                 return Err(ScError::NotFound("no such PR".into()));
             }
             let mut pr = sample_pr();
+            pr.number = number;
+            pr.url = format!("https://github.com/o/r/pull/{number}");
             if self.merged_linked {
                 pr.state = PrState::Merged;
             }
@@ -11693,6 +12044,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     #[tokio::test]
     async fn refresh_all_pauses_between_workspaces() {
         // Inter-workspace pause (intent-hq/monorepo#703): the sweep sleeps
@@ -11866,7 +12218,7 @@ mod pr {
 
     #[tokio::test]
     async fn execute_runs_commit_push_create_pr_pipeline() {
-        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        let (_t, _w, bare, svc, ws, work) = ac_setup(StubForge::default()).await;
         // An unstaged change for the commit step to capture.
         std::fs::write(work.join("feature.txt"), "hello\n").unwrap();
 
@@ -11915,7 +12267,7 @@ mod pr {
         assert_eq!(st["existingPR"]["number"], 7);
 
         // The bare remote now carries the feature branch.
-        let bare_repo = git2::Repository::open_bare(_b.0.clone()).unwrap();
+        let bare_repo = git2::Repository::open_bare(bare.0.clone()).unwrap();
         assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
 
         // mergePR via the stubbed forge.
@@ -12356,7 +12708,7 @@ mod pr {
     }
 
     /// Commit an empty tree in `dir` so its HEAD resolves to a SHA, returning
-    /// the commit SHA (SweepRepo repos have an unborn HEAD by default).
+    /// the commit SHA (`SweepRepo` repos have an unborn HEAD by default).
     fn sweep_commit(dir: &std::path::Path) -> String {
         let repo = git2::Repository::open(dir).unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
@@ -12449,7 +12801,7 @@ mod pr {
         assert_eq!(updated.len(), 1, "no re-stamp churn");
     }
 
-    /// The sweep's local steps run without a SourceControl provider: the
+    /// The sweep's local steps run without a `SourceControl` provider: the
     /// commit-sha backfill still stamps a NULL row when `sc` is `None`
     /// (unconfigured credentials must not strand pre-migration rows).
     #[tokio::test]
@@ -12640,6 +12992,10 @@ mod pr {
         assert_eq!(after.pr_number, None);
         assert_eq!(after.pr_url, None);
         assert_eq!(after.pr_status, None);
+        assert!(
+            after.pull_requests.is_none(),
+            "unlink never appends the off-branch PR to the pool"
+        );
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)
@@ -12681,6 +13037,377 @@ mod pr {
         let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
         assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
         assert!(list.iter().any(|p| p.number == 77));
+    }
+
+    /// Build a persisted `pull_requests` entry shaped exactly like
+    /// `build_pr_info(StubForge::get_pr(number))` (so an identical re-fetch
+    /// is a no-op), with the status/updatedAt under test.
+    fn pool_entry(
+        number: u64,
+        status: intent_core::PullRequestStatus,
+        updated_at: &str,
+    ) -> intent_core::PullRequestInfo {
+        let mut pr = sample_pr();
+        pr.number = number;
+        pr.url = format!("https://github.com/o/r/pull/{number}");
+        let mut info = crate::pr_ops::build_pr_info(&pr);
+        info.status = status;
+        info.updated_at = updated_at.into();
+        info
+    }
+
+    /// The sweep-time pool heal (monorepo#3127): a persisted entry still
+    /// recorded Open whose PR the forge reports merged is corrected to
+    /// Merged by the next sweep, emitting `gitRoot:updated`.
+    #[tokio::test]
+    async fn sweep_pool_heal_corrects_stale_open_entry_to_merged() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Open,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // No monitor, no link: only the sweep's pool heal can see the merge.
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 43);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// Reopen handling: Merged is the only irreversible state, so a
+    /// persisted Closed entry is re-fetched too — the forge now reporting
+    /// the PR open moves the entry back to Open (`gitRoot:updated`).
+    #[tokio::test]
+    async fn pool_heal_reopens_persisted_closed_entry() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// The heal re-fetches at most `MAX_STALE_POOL_REFETCHES` entries per
+    /// sweep, oldest `updatedAt` first, and never re-fetches Merged entries.
+    #[tokio::test]
+    async fn pool_heal_caps_refetches_oldest_updated_first() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        // Entry number n carries updatedAt day 8-n, so recency order is the
+        // reverse of number order: the oldest five are 7, 6, 5, 4, 3.
+        let mut entries: Vec<intent_core::PullRequestInfo> = (1..=7)
+            .map(|n| {
+                pool_entry(
+                    n,
+                    intent_core::PullRequestStatus::Closed,
+                    &format!("2026-01-{:02}T00:00:00Z", 8 - n),
+                )
+            })
+            .collect();
+        entries.push(pool_entry(
+            99,
+            intent_core::PullRequestStatus::Merged,
+            "2020-01-01T00:00:00Z",
+        ));
+        root.pull_requests = Some(entries);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc = Arc::new(StubForge::default());
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = svc.refresh_git_root_pr(root, &sc_dyn).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        assert_eq!(
+            *sc.seen_get_pr.lock().unwrap(),
+            vec![7, 6, 5, 4, 3],
+            "cap of 5, oldest first, Merged #99 never re-fetched"
+        );
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        for n in [3u64, 4, 5, 6, 7] {
+            let entry = list.iter().find(|p| p.number == n).unwrap();
+            assert_eq!(entry.status, intent_core::PullRequestStatus::Open);
+        }
+        for n in [1u64, 2] {
+            let entry = list.iter().find(|p| p.number == n).unwrap();
+            assert_eq!(entry.status, intent_core::PullRequestStatus::Closed);
+        }
+        let merged = list.iter().find(|p| p.number == 99).unwrap();
+        assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
+    }
+
+    /// A forge error on one entry is fail-soft: the entry keeps its
+    /// persisted snapshot, the rest of the heal proceeds, and the root
+    /// refresh still succeeds.
+    #[tokio::test]
+    async fn pool_heal_tolerates_per_entry_fetch_error() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![
+            pool_entry(
+                43,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-01T00:00:00Z",
+            ),
+            pool_entry(
+                44,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-02T00:00:00Z",
+            ),
+        ]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            missing_pr: Some(43),
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        let failed = list.iter().find(|p| p.number == 43).unwrap();
+        assert_eq!(failed.status, intent_core::PullRequestStatus::Closed);
+        let healed = list.iter().find(|p| p.number == 44).unwrap();
+        assert_eq!(healed.status, intent_core::PullRequestStatus::Open);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// Re-fetched entries whose snapshots are unchanged persist nothing and
+    /// emit no `gitRoot:updated`.
+    #[tokio::test]
+    async fn pool_heal_unchanged_entries_emit_no_event() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        // Identical to what the stub's `get_pr(43)` snapshot builds.
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Open,
+            "",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unchanged);
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 0);
+    }
+
+    /// A hung pool-entry re-fetch (monorepo#1988 lineage) is bounded by the
+    /// per-entry timeout: the heal moves past it, keeps the entry's persisted
+    /// snapshot, and the linked-PR delta computed before the heal still
+    /// persists — a persistently hanging oldest-first entry can no longer
+    /// starve the linked refresh out of the per-root budget.
+    #[tokio::test]
+    async fn pool_heal_hung_entry_times_out_and_linked_delta_persists() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        // 500 ms per-root budget → 50 ms per heal entry; generous enough for
+        // the healthy work (SQLite writes) on a saturated CI machine.
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(500));
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        root.pull_requests = Some(vec![pool_entry(
+            7,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // Linked #42 is fetched merged; pool entry #7's fetch went dark.
+        let sc = Arc::new(StubForge {
+            merged_linked: true,
+            hang_get_pr: Some(7),
+            ..Default::default()
+        });
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            svc.refresh_git_root_pr(root, &sc_dyn),
+        )
+        .await
+        .expect("per-entry timeout must bound the hung fetch")
+        .unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+        assert_eq!(*sc.seen_get_pr.lock().unwrap(), vec![42, 7]);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged),
+            "linked delta persists despite the hung pool entry"
+        );
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        let hung = list.iter().find(|p| p.number == 7).unwrap();
+        assert_eq!(hung.status, intent_core::PullRequestStatus::Closed);
+    }
+
+    /// The heal is repo-scoped, not branch-scoped: an unlinked root whose
+    /// HEAD is unreadable (linkage path `Skipped`) still heals its pool,
+    /// upgrading the outcome to `Updated`.
+    #[tokio::test]
+    async fn pool_heal_runs_on_branchless_root_upgrading_skipped() {
+        let primary = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        // A plain directory, not a git repo: current-branch read fails.
+        let plain = std::env::temp_dir().join(format!("intentd-plain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut root = sweep_root(&ws.id, &plain, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            43,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        let _ = std::fs::remove_dir_all(&plain);
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
+    }
+
+    /// The heal never re-fetches the PR the linkage path already fetched
+    /// this pass: a linked PR that also sits in the pool is fetched exactly
+    /// once, while other stale entries still heal.
+    #[tokio::test]
+    async fn pool_heal_excludes_the_freshly_fetched_linked_pr() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        root.pull_requests = Some(vec![
+            pool_entry(
+                42,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-01T00:00:00Z",
+            ),
+            pool_entry(
+                43,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-02T00:00:00Z",
+            ),
+        ]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc = Arc::new(StubForge::default());
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = svc.refresh_git_root_pr(root, &sc_dyn).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+        assert_eq!(
+            *sc.seen_get_pr.lock().unwrap(),
+            vec![42, 43],
+            "linked #42 fetched once by the linkage path, never by the heal"
+        );
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let list = roots[0].pull_requests.as_ref().expect("pull_requests");
+        for n in [42u64, 43] {
+            let entry = list.iter().find(|p| p.number == n).unwrap();
+            assert_eq!(entry.status, intent_core::PullRequestStatus::Open);
+        }
+    }
+
+    /// Unlinking on a branch mismatch still refreshes an existing pool entry
+    /// for that PR in place — the fetched snapshot is authoritative and
+    /// already paid for — without the heal re-fetching it this pass.
+    #[tokio::test]
+    async fn unlink_refreshes_existing_pool_entry_in_place() {
+        let primary = SweepRepo::init("main", None);
+        // Root repo is on "main"; the linked PR #42's head is "feature".
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        root.pull_requests = Some(vec![pool_entry(
+            42,
+            intent_core::PullRequestStatus::Closed,
+            "2026-01-01T00:00:00Z",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc = Arc::new(StubForge::default());
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        let outcome = svc.refresh_git_root_pr(root, &sc_dyn).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+        assert_eq!(
+            *sc.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "in-place refresh reuses the unlink fetch; the heal skips #42"
+        );
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, None);
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1, "in-place only — no append");
+        assert_eq!(list[0].number, 42);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
     }
 }
 
@@ -16136,8 +16863,14 @@ mod file_tracking {
             .into_iter()
             .find(|f| f.path == "b.txt")
             .unwrap();
-        assert_eq!(summary.additions, fd.additions as i64);
-        assert_eq!(summary.deletions, fd.deletions as i64);
+        assert_eq!(
+            summary.additions,
+            i64::try_from(fd.additions).expect("fits in i64")
+        );
+        assert_eq!(
+            summary.deletions,
+            i64::try_from(fd.deletions).expect("fits in i64")
+        );
         assert_eq!(summary.old_blob_sha, fd.old_blob);
         assert_eq!(summary.new_blob_sha, fd.new_blob);
         assert!(!summary.is_binary);
@@ -16204,8 +16937,14 @@ mod file_tracking {
             .find(|f| f.path == "img.bin")
             .unwrap();
         assert_eq!(bin.is_binary, legacy_bin.is_binary);
-        assert_eq!(bin.additions, legacy_bin.additions as i64);
-        assert_eq!(bin.deletions, legacy_bin.deletions as i64);
+        assert_eq!(
+            bin.additions,
+            i64::try_from(legacy_bin.additions).expect("fits in i64")
+        );
+        assert_eq!(
+            bin.deletions,
+            i64::try_from(legacy_bin.deletions).expect("fits in i64")
+        );
         let rows = svc.store().list_diffs(&ws).await.unwrap();
         let bin_row = rows.iter().find(|r| r.file_path == "img.bin").unwrap();
         assert_eq!(bin_row.hunks_json, "[]");
@@ -16468,7 +17207,7 @@ mod usage_stats_recording {
                 None,
                 None,
                 false,
-                Default::default(),
+                intent_core::AgentCreateExtra::default(),
             )
             .await
             .expect("create agent");
@@ -17918,9 +18657,7 @@ mod script {
             }
             if v["type"] == "script:output" {
                 let chunk = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
-                if contains(&chunk, b"Restarting (attempt") {
-                    panic!("too-fast-exit service must NOT auto-restart; saw restart separator");
-                }
+                assert!(!contains(&chunk, b"Restarting (attempt"), "too-fast-exit service must NOT auto-restart; saw restart separator");
                 return contains(&chunk, b"Exited too quickly").then_some(());
             }
             None
@@ -19054,7 +19791,7 @@ mod rules {
         assert!(!prompt.contains("CoW sandbox"), "no CoW mention");
     }
 
-    /// Task 6: shared-mode direct workspace (CoW unsupported) gets no hints.
+    /// Task 6: shared-mode direct workspace (`CoW` unsupported) gets no hints.
     #[tokio::test]
     async fn assembly_omits_hints_for_shared_mode_direct() {
         let tree = worktree();
@@ -19180,9 +19917,9 @@ mod rules {
     }
 
     /// Task 6 (verifier requirement): explicit isolation:"shared" override must prevent
-    /// sandbox hint even when workspace has cow_supported=true and setting ON. This
-    /// mutation test ensures build_isolation_hint keys off session.sandbox_path (actual
-    /// effective isolation), not workspace.cow_supported (capability).
+    /// sandbox hint even when workspace has `cow_supported=true` and setting ON. This
+    /// mutation test ensures `build_isolation_hint` keys off `session.sandbox_path` (actual
+    /// effective isolation), not `workspace.cow_supported` (capability).
     #[tokio::test]
     async fn assembly_omits_sandbox_hint_when_explicit_shared_override() {
         let tree = worktree();
@@ -19312,9 +20049,9 @@ mod rules {
     }
 
     /// Task 6 (verifier requirement): explicit isolation:"cow" override in a setting-OFF
-    /// workspace must still inject sandbox hint when session has sandbox_path. This
-    /// mutation test proves build_isolation_hint respects actual session.sandbox_path
-    /// (effective isolation), not just workspace.cow_supported + setting.
+    /// workspace must still inject sandbox hint when session has `sandbox_path`. This
+    /// mutation test proves `build_isolation_hint` respects actual `session.sandbox_path`
+    /// (effective isolation), not just `workspace.cow_supported` + setting.
     #[tokio::test]
     async fn assembly_injects_sandbox_hint_when_explicit_cow_override() {
         let tree = worktree();
@@ -20267,26 +21004,25 @@ mod known_repo {
         for _ in 0..100 {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             // Try to receive batched events (could be empty or timeout)
-            match tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await {
-                Ok(Some(batch)) => {
-                    for evt in batch {
-                        if evt.event_type == "workspace:updated"
-                            && evt.workspace_id == id
-                            && evt
-                                .data
-                                .get("changes")
-                                .and_then(|c| c.get("repositoryOwner"))
-                                .is_some()
-                        {
-                            updated_event = Some(evt);
-                            break;
-                        }
-                    }
-                    if updated_event.is_some() {
+            if let Ok(Some(batch)) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await
+            {
+                for evt in batch {
+                    if evt.event_type == "workspace:updated"
+                        && evt.workspace_id == id
+                        && evt
+                            .data
+                            .get("changes")
+                            .and_then(|c| c.get("repositoryOwner"))
+                            .is_some()
+                    {
+                        updated_event = Some(evt);
                         break;
                     }
                 }
-                _ => continue,
+                if updated_event.is_some() {
+                    break;
+                }
             }
         }
 
@@ -20951,11 +21687,12 @@ mod worktree_provisioning {
         let caps = svc.system_capabilities().await.expect("capabilities");
         let obj = caps.as_object().expect("result is an object");
         assert!(
-            obj.get("cowSupported").is_some_and(|v| v.is_boolean()),
+            obj.get("cowSupported")
+                .is_some_and(serde_json::Value::is_boolean),
             "cowSupported present as a boolean when the probe ran: {caps}"
         );
         assert_eq!(
-            obj.get("cowSupported").and_then(|v| v.as_bool()),
+            obj.get("cowSupported").and_then(serde_json::Value::as_bool),
             svc.compute_cow_supported().await,
             "capability mirrors the shared workspaces-root probe"
         );
@@ -20990,7 +21727,7 @@ mod worktree_provisioning {
     }
 
     /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
-    /// standalone CoW clone (not a linked worktree) checked out on the
+    /// standalone `CoW` clone (not a linked worktree) checked out on the
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
@@ -21142,13 +21879,13 @@ mod worktree_provisioning {
         );
     }
 
-    /// `workspace.delete` of a CoW workspace removes the checkout directory
+    /// `workspace.delete` of a `CoW` workspace removes the checkout directory
     /// and its `<root>/<workspaceId>` parent but never touches the source
     /// repository: no registration prune and — critically — no branch delete,
     /// even when the source carries a same-named branch and the workspace's
     /// branch is flagged auto-generated (the guard that deletes worktree
-    /// branches). The CoW workspace's branch lives only inside the clone.
-    /// CI-safe: the standalone checkout is a plain `git clone`, so no CoW
+    /// branches). The `CoW` workspace's branch lives only inside the clone.
+    /// CI-safe: the standalone checkout is a plain `git clone`, so no `CoW`
     /// filesystem support is needed to exercise the delete path.
     #[tokio::test]
     async fn delete_cow_checkout_removes_dir_without_touching_source_repo() {
@@ -21234,7 +21971,7 @@ mod worktree_provisioning {
 
     /// cowIsolation on + CoW-capable filesystem: `workspace.duplicate`
     /// mirrors the create decision matrix — the duplicate gets a standalone
-    /// CoW clone with `checkoutMode: "cow"` persisted, and the source repo
+    /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
     #[tokio::test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
@@ -21343,7 +22080,7 @@ mod worktree_provisioning {
         );
     }
 
-    /// Regression for monorepo#774 (`workspace.create` path): when the CoW
+    /// Regression for monorepo#774 (`workspace.create` path): when the `CoW`
     /// probe succeeds but `provision_cow_checkout` fails afterwards (here: an
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
@@ -21388,7 +22125,7 @@ mod worktree_provisioning {
         );
     }
 
-    /// monorepo#774, `workspace.duplicate` path: a CoW provisioning failure
+    /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
     /// after a successful probe is swallowed (the duplicate continues without
     /// a worktree), and the empty `<root>/<wsId>` dir the probe created is
     /// removed on the error path — the dir only reappears via the metadata
@@ -21541,7 +22278,7 @@ mod worktree_provisioning {
         assert!(
             matches!(
                 dup.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             ),
             "standalone source must never yield a worktree; got {:?}",
             dup.checkout_mode
@@ -21793,10 +22530,13 @@ mod worktree_provisioning {
                 .expect("load registry"),
         );
         registry
-            .apply(&[(
-                "workspace.branchPrefix".to_string(),
-                serde_json::json!("aw/"),
-            )])
+            .apply(&[
+                (
+                    "workspace.branchPrefix".to_string(),
+                    serde_json::json!("aw/"),
+                ),
+                ("providers.active".to_string(), serde_json::json!("auggie")),
+            ])
             .expect("set prefix");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
         let root = unique_dir("intentd-wtslug-root");
@@ -22148,7 +22888,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idslug-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let make = |prompt: &str| WorkspaceCreate {
             skip_isolation: Some(true),
@@ -22184,7 +22926,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-idrecycle-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let make = |prompt: &str| WorkspaceCreate {
             skip_isolation: Some(true),
@@ -22234,7 +22978,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-iddir-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         std::fs::create_dir_all(root.0.join("auth-fix")).expect("seed leftover dir");
 
@@ -22354,7 +23100,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleempty-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -22400,7 +23148,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titlenone-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -22429,7 +23179,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titlewsp-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -22458,7 +23210,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-titleexpl-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let ws = svc
             .create_workspace(
@@ -23236,8 +23990,9 @@ mod file_ops_service {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Containment integration test: delegate an agent with isolation=cow, perform a
-    /// file write through the agent-scoped ops path (caller_agent_id → resolve_root),
+    /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
     #[tokio::test]
     async fn file_write_via_sandboxed_agent_is_contained() {
@@ -23279,10 +24034,7 @@ mod file_ops_service {
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
         if probe == CowSupport::Unsupported {
-            eprintln!(
-                "SKIP test (CoW not supported): {:?} → {:?}",
-                user_dir, workspaces_root
-            );
+            eprintln!("SKIP test (CoW not supported): {user_dir:?} → {workspaces_root:?}");
             let _ = fs::remove_dir_all(&test_root);
             return;
         }
@@ -23388,8 +24140,7 @@ mod file_ops_service {
         let sandbox_file = sandbox_path.join("contained.txt");
         assert!(
             sandbox_file.exists(),
-            "Write must land in sandbox: {:?}",
-            sandbox_file
+            "Write must land in sandbox: {sandbox_file:?}"
         );
         let sandbox_content = fs::read_to_string(&sandbox_file).unwrap();
         assert_eq!(sandbox_content, "sandboxed write");
@@ -23398,8 +24149,7 @@ mod file_ops_service {
         let user_file = user_dir.join("contained.txt");
         assert!(
             !user_file.exists(),
-            "User directory must remain untouched: {:?}",
-            user_file
+            "User directory must remain untouched: {user_file:?}"
         );
 
         // ws.file.getAttachment for a SANDBOXED caller: the source is the
@@ -23443,8 +24193,9 @@ mod file_ops_service {
         let _ = fs::remove_dir_all(&test_root);
     }
 
+    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
-    /// when an eligible CoW provisioning kicks off (monorepo#871 — the clone
+    /// when an eligible `CoW` provisioning kicks off (monorepo#871 — the clone
     /// runs in a background task, off the delegate critical path). The settled
     /// outcome is observable on the child's session: sandbox fields present on
     /// success, absent on the shared-mode fallback.
@@ -23496,7 +24247,8 @@ mod file_ops_service {
         let expect_sandbox = matches!(probe, CowSupport::Supported);
 
         // Create services with workspaces_root configured
-        let mut svc = Services::new(store.clone());
+        let mut svc = Services::new(store.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
         svc.workspaces_root = Some(workspaces_root);
 
         // Delegate with isolation=cow
@@ -24480,7 +25232,7 @@ mod initial_agent_orchestration {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{TempDb, WorkspacesRoot};
+    use super::{test_registry_with_default_provider, TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, SubscriptionFilter};
 
     fn create_input(agent: Option<WorkspaceCreateInitialAgent>) -> WorkspaceCreate {
@@ -24514,6 +25266,7 @@ mod initial_agent_orchestration {
         let ws_root = WorkspacesRoot::new();
         let services = Services::new(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp))
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
@@ -24597,8 +25350,9 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
         let key = Some("ws-agent-idem-1".to_string());
 
         let input = || {
@@ -24651,8 +25405,9 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
         let key = Some("ws-agent-no-prompt-idem-1".to_string());
 
         let input = || {
@@ -24710,8 +25465,9 @@ mod initial_agent_orchestration {
             let tmp = TempDb::new();
             let store = Store::open(&tmp.path).await.expect("open store");
             let ws_root = WorkspacesRoot::new();
-            let services =
-                Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+            let services = Services::new(store.clone())
+                .with_workspaces_root(ws_root.path().to_path_buf())
+                .with_settings_registry(test_registry_with_default_provider(&tmp));
 
             let res = services
                 .create_workspace(
@@ -24794,8 +25550,9 @@ mod initial_agent_orchestration {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        let services =
-            Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
 
         let res = services
             .create_workspace(
@@ -25062,7 +25819,7 @@ mod clone_orchestration {
         assert!(
             matches!(
                 ws.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             ),
             "hydration persists cow or direct: {:?}",
             ws.checkout_mode
@@ -25782,7 +26539,7 @@ mod clone_orchestration {
         );
     }
 
-    /// Pinned CoW coverage (probe-gated like the checkout-mode tests): with
+    /// Pinned `CoW` coverage (probe-gated like the checkout-mode tests): with
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
@@ -26130,7 +26887,7 @@ mod repo_warm_cache {
             .await
         {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("owner"), "names the bad segment: {msg}")
+                assert!(msg.contains("owner"), "names the bad segment: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -26152,7 +26909,7 @@ mod repo_warm_cache {
 
         match svc.repo_warm_cache("not-a-repo-url".to_string()).await {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("owner/repo"), "actionable message: {msg}")
+                assert!(msg.contains("owner/repo"), "actionable message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -26393,6 +27150,131 @@ mod browser_exec_reverse {
             .await
             .expect_err("transport");
         assert!(matches!(err, Error::Internal(m) if m.contains("timeout")));
+    }
+
+    // Regression (monorepo#3042): a `success: false` FE envelope that carries
+    // structured per-action errors (not-owner / already-claimed) must come
+    // back as data on the agent seam — not flattened into `Error::Internal`.
+    #[tokio::test]
+    async fn browser_exec_preserves_structured_single_action_ownership_failure() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": null,
+                "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 })],
+                None,
+                None,
+            )
+            .await
+            .expect("structured failure is data, not Err");
+        assert_eq!(out["action"], "resizeTab");
+        assert_eq!(out["success"], json!(false));
+        assert_eq!(out["errorCode"], "not-owner");
+        assert_eq!(out["ownerAgentId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn browser_exec_preserves_structured_multi_action_partial_failure() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "1 of 2 actions failed",
+            "results": [
+                { "action": "listTabs", "success": true, "result": [] },
+                {
+                    "action": "claimTab",
+                    "success": false,
+                    "errorCode": "already-claimed",
+                    "ownerAgentId": "agent-42",
+                    "error": "Tab tab-3 is owned by agent agent-42"
+                }
+            ],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "listTabs" }),
+                    json!({ "action": "claimTab", "tabId": "tab-3", "width": 1280 }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("partial failure is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results preserved");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1]["errorCode"], "already-claimed");
+        assert_eq!(results[1]["ownerAgentId"], "agent-42");
+    }
+
+    // The FE aborts a batch on the first failing action and returns the
+    // partial results collected so far: a 3-action batch failing at action 1
+    // replies with a single result. The shape must key off the request
+    // arity, so multi-action callers still get the envelope form.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_shape() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let out = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 }),
+                    json!({ "action": "screenshot" }),
+                    json!({ "action": "listTabs" }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect("aborted batch is data, not Err");
+        assert_eq!(out["success"], json!(false));
+        let results = out["results"].as_array().expect("results key present");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["errorCode"], "not-owner");
+        assert_eq!(results[0]["ownerAgentId"], "agent-7");
+    }
+
+    #[tokio::test]
+    async fn browser_exec_failure_without_results_still_errors() {
+        let dispatch = RecordingDispatch::with_reply(json!({
+            "success": false,
+            "error": "CDP not attached",
+        }));
+        let (_tmp, _root, svc) = services_with(dispatch).await;
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .expect_err("no per-action detail to preserve");
+        assert!(matches!(err, Error::Internal(m) if m.contains("CDP not attached")));
     }
 }
 
@@ -26654,7 +27536,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
 
 /// Inter-workspace pause (intent-hq/monorepo#703): `scan_all_token_usage`
 /// sleeps `SWEEP_INTER_WORKSPACE_PAUSE` after each workspace so the sweep
-/// never monopolizes SQLite pool slots — and still completes correctly over
+/// never monopolizes `SQLite` pool slots — and still completes correctly over
 /// several workspaces. `tokio::time::sleep` guarantees at least the requested
 /// duration, so the wall-clock lower bound proves the pause is wired. (Paused
 /// time is unusable here: auto-advance trips sqlx's pool-acquire timeout.)
@@ -26867,7 +27749,7 @@ mod last_activity_events {
         }
     }
 
-    /// After `raise_attention` (which bumps workspace.updated_at), a
+    /// After `raise_attention` (which bumps `workspace.updated_at`), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
     async fn raise_attention_emits_last_activity() {
@@ -26958,7 +27840,7 @@ mod last_activity_events {
         );
     }
 
-    /// Rapid bumps to the same workspace (e.g., multiple raise_attention calls)
+    /// Rapid bumps to the same workspace (e.g., multiple `raise_attention` calls)
     /// coalesce into one `workspace:updated { lastActivity }` event carrying
     /// the latest derived value.
     #[tokio::test]
@@ -27399,7 +28281,7 @@ mod last_activity_events {
         assert!(!changed2, "second scan should skip (unchanged watermark)");
     }
 
-    /// Finding F2: rescan when the agent_message watermark changes.
+    /// Finding F2: rescan when the `agent_message` watermark changes.
     #[tokio::test]
     async fn incremental_token_scan_rescan_on_append() {
         let h = harness().await;
@@ -27572,7 +28454,7 @@ mod last_activity_events {
         assert_eq!(ev["data"]["activity"], "agent_running");
 
         // End agent activity → schedules idle flip after 100ms.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // Re-begin within the window → cancels the pending idle flip and emits AgentRunning.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -27605,7 +28487,7 @@ mod last_activity_events {
         );
 
         // Clean up.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
@@ -27627,7 +28509,7 @@ mod last_activity_events {
         assert_eq!(ev["data"]["activity"], "agent_running");
 
         // End agent activity → schedules idle flip after 100ms.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // Before the window expires, no idle event yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -27692,7 +28574,7 @@ mod last_activity_events {
     }
 
     /// Regression for STAB-N: busy→idle transition debounce (test c).
-    /// workspace_activity() MUST return AgentRunning during the grace window
+    /// `workspace_activity()` MUST return `AgentRunning` during the grace window
     /// (before the debounce fires) so list/get/update responses and the event
     /// stream agree on the derived state.
     #[tokio::test]
@@ -27709,7 +28591,7 @@ mod last_activity_events {
         );
 
         // End agent activity → schedules idle flip after 100ms.
-        h.services.agent_activity_end(&h.ws).await;
+        h.services.agent_activity_end(&h.ws);
 
         // During the grace window, workspace_activity() MUST still report AgentRunning.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -28923,7 +29805,7 @@ mod turn_token_usage {
                 }
             };
             let recompute = h.services.recompute_workspace_token_usage(&h.ws, false);
-            let (_, recomputed) = tokio::join!(rename, recompute);
+            let ((), recomputed) = tokio::join!(rename, recompute);
             recomputed.expect("recompute ok");
             let ws = h.store.get_workspace(&h.ws).await.expect("reload");
             assert_eq!(ws.title, title, "recompute must never revert the title");
@@ -29207,7 +30089,7 @@ mod provider_discovery_payload {
     }
 
     /// The pure gate-to-fields mapping (`apply_pi_cli_fields`): Missing and
-    /// TooOld gate the row off with an actionable reason; Ok and Unknown are
+    /// `TooOld` gate the row off with an actionable reason; Ok and Unknown are
     /// permissive (Unknown logs a WARN instead of gating).
     #[test]
     fn pi_cli_fields_mapping_covers_all_gates() {
@@ -29278,6 +30160,272 @@ mod provider_discovery_payload {
         assert!(installed, "Unknown must stay permissive: {obj}");
         assert_eq!(obj["cliVersionOk"], false, "{obj}");
         assert!(obj.get("unavailableReason").is_none(), "{obj}");
+    }
+}
+
+/// Default-provider settings self-heal (monorepo#3044,
+/// `Services::heal_default_provider_settings`): with no derivable default and
+/// an installed registered provider, the first installed provider is
+/// persisted as `providers.active` plus its cached catalog default (or first)
+/// model as a compound `model.default`; existing values are never
+/// overwritten, and with nothing installed nothing is written.
+mod default_provider_self_heal {
+    use super::*;
+
+    /// Services with an EMPTY settings registry (no default provider) — the
+    /// precondition the heal exists for.
+    async fn setup() -> (TempDb, Services) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+        let registry =
+            std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+        let services = Services::new(store).with_settings_registry(registry);
+        (tmp, services)
+    }
+
+    fn setting(svc: &Services, path: &str) -> Option<serde_json::Value> {
+        svc.settings_registry()
+            .expect("registry wired")
+            .get(path)
+            .filter(|v| !v.is_null())
+    }
+
+    /// Unset settings + installed provider with a cached `isDefault` row ⇒
+    /// both keys healed; a second sweep is a no-op (idempotent).
+    #[tokio::test]
+    async fn unset_settings_heal_provider_and_catalog_default_model() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![
+                serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
+                serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5", "isDefault": true }),
+            ],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("auggie:sonnet5"))
+        );
+
+        // Idempotent: the healed values now derive a default, so a repeat
+        // sweep (restart / later discovery call) writes nothing.
+        let again = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal again");
+        assert_eq!(again["healed"], false, "{again}");
+        assert_eq!(again["reason"], "already-configured", "{again}");
+    }
+
+    /// No `isDefault` row in the cached catalog ⇒ the FIRST row is used.
+    #[tokio::test]
+    async fn catalog_without_default_row_heals_first_model() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![
+                serde_json::json!({ "id": "fable-5", "name": "Fable 5" }),
+                serde_json::json!({ "id": "sonnet5", "name": "Sonnet 5" }),
+            ],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["model"], "auggie:fable-5", "{result}");
+    }
+
+    /// A cached row id with a FOREIGN compound prefix (`grok:foo` in the
+    /// auggie catalog) is not an ownership claim (monorepo#607) — persisting
+    /// it would let the prefix override the healed `providers.active`. The
+    /// provider is healed alone; a self-prefixed row is kept as-is.
+    #[tokio::test]
+    async fn foreign_prefixed_catalog_row_heals_provider_only() {
+        let (_tmp, svc) = setup().await;
+        svc.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "grok:foo", "name": "Foreign", "isDefault": true })],
+        );
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+
+        // A self-prefixed row id IS trusted and kept verbatim.
+        let (_tmp2, svc2) = setup().await;
+        svc2.models_catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "auggie:sonnet5", "isDefault": true })],
+        );
+        let result = svc2
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["model"], "auggie:sonnet5", "{result}");
+    }
+
+    /// Cold catalog cache (no models known) ⇒ the provider is persisted
+    /// alone; `model.default` stays unset.
+    #[tokio::test]
+    async fn no_cached_models_heals_provider_only() {
+        let (_tmp, svc) = setup().await;
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "auggie", "{result}");
+        assert!(result["model"].is_null(), "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("auggie"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// A configured `providers.active` is never overwritten — the heal is a
+    /// no-op even when discovery reports a different installed provider.
+    #[tokio::test]
+    async fn configured_active_provider_is_never_overwritten() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("providers.active".into(), serde_json::json!("codex"))])
+            .expect("seed active provider");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "already-configured", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("codex"))
+        );
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// A compound `model.default` alone already derives a default provider —
+    /// the heal never touches either key.
+    #[tokio::test]
+    async fn compound_default_model_alone_blocks_heal() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[("model.default".into(), serde_json::json!("codex:gpt-5"))])
+            .expect("seed default model");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "already-configured", "{result}");
+        assert_eq!(setting(&svc, "providers.active"), None);
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("codex:gpt-5"))
+        );
+    }
+
+    /// Nothing installed (empty list, or only ids the registry doesn't know)
+    /// ⇒ nothing is written; the keys stay unset for the next discovery pass.
+    #[tokio::test]
+    async fn nothing_installed_writes_nothing() {
+        let (_tmp, svc) = setup().await;
+
+        for installed in [vec![], vec!["not-a-provider".to_string()]] {
+            let result = svc
+                .heal_default_provider_settings(&installed)
+                .await
+                .expect("heal");
+            assert_eq!(result["healed"], false, "{result}");
+            assert_eq!(result["reason"], "no-installed-provider", "{result}");
+        }
+        assert_eq!(setting(&svc, "providers.active"), None);
+        assert_eq!(setting(&svc, "model.default"), None);
+    }
+
+    /// Both keys hold raw values that don't resolve to a registered provider
+    /// (e.g. ids from a foreign build): no derivable default, but the
+    /// no-overwrite rule still wins — nothing is rewritten.
+    #[tokio::test]
+    async fn unresolvable_existing_values_are_not_overwritten() {
+        let (_tmp, svc) = setup().await;
+        svc.settings_registry()
+            .expect("registry wired")
+            .apply(&[
+                ("providers.active".into(), serde_json::json!("mystery")),
+                ("model.default".into(), serde_json::json!("mystery:m1")),
+            ])
+            .expect("seed unresolvable values");
+
+        let result = svc
+            .heal_default_provider_settings(&["auggie".into()])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], false, "{result}");
+        assert_eq!(result["reason"], "values-already-set", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("mystery"))
+        );
+        assert_eq!(
+            setting(&svc, "model.default"),
+            Some(serde_json::json!("mystery:m1"))
+        );
+    }
+
+    /// The first INSTALLED provider wins in the order discovery reported,
+    /// skipping ids the registry doesn't know.
+    #[tokio::test]
+    async fn first_registered_installed_provider_wins() {
+        let (_tmp, svc) = setup().await;
+
+        let result = svc
+            .heal_default_provider_settings(&[
+                "not-a-provider".into(),
+                "codex".into(),
+                "auggie".into(),
+            ])
+            .await
+            .expect("heal");
+        assert_eq!(result["healed"], true, "{result}");
+        assert_eq!(result["provider"], "codex", "{result}");
+        assert_eq!(
+            setting(&svc, "providers.active"),
+            Some(serde_json::json!("codex"))
+        );
     }
 }
 
@@ -30451,7 +31599,9 @@ mod harness_versioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (tmp, Services::new(store), ws)
+        let registry = test_registry_with_default_provider(&tmp);
+        let services = Services::new(store).with_settings_registry(registry);
+        (tmp, services, ws)
     }
 
     async fn create_agent(
@@ -30467,7 +31617,7 @@ mod harness_versioning {
             parent,
             None,
             false,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent")

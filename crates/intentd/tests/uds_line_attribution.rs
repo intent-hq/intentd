@@ -104,7 +104,7 @@ async fn next_line_attribution_event(reader: &mut BufReader<OwnedReadHalf>) -> V
     }
 }
 
-async fn boot(
+fn boot(
     bus: &EventBus,
 ) -> (
     PathBuf,
@@ -142,7 +142,7 @@ async fn line_attribution_compute_now_persists_and_emits_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     // RPC connection (mutations + their responses).
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();

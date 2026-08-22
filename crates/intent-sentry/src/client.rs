@@ -32,7 +32,7 @@ impl std::fmt::Debug for SentryClient {
             .field("base_url", &self.base_url)
             .field("organization", &self.organization)
             .field("token", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

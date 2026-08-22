@@ -57,6 +57,8 @@ fn counting_fetch(
     }
 }
 
+// `try_from` is not const-callable; the TTL is far below `u64::MAX` millis.
+#[allow(clippy::cast_possible_truncation)]
 const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
 /// An arbitrarily large age (~10 years in ms): cached entries have no TTL,

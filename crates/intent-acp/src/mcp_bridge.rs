@@ -88,11 +88,13 @@ pub struct McpBridge {
 
 impl McpBridge {
     /// The bound loopback address (`127.0.0.1:<ephemeral-port>`).
+    #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
     /// The address as a `host:port` string for the bridge subcommand args.
+    #[must_use]
     pub fn connect_addr(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
     }
@@ -116,6 +118,10 @@ impl Drop for McpBridge {
 /// yields one response line, a notification (no `id`) yields nothing. The
 /// dispatch watchdog deadline is derived from the server's (possibly
 /// env-overridden) eval budget via [`effective_dispatch_timeout`].
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding the loopback listener fails.
 pub async fn serve_workspace_mcp_tcp(
     server: Arc<WorkspaceMcpServer>,
 ) -> std::io::Result<McpBridge> {
@@ -261,11 +267,11 @@ async fn serve_connection<S: BridgeDispatch>(
                                     tracing::warn!(%method, error = %e, "mcp bridge dispatch task failed");
                                 }
                             },
-                            _ = tokio::time::sleep(dispatch_timeout) => {
+                            () = tokio::time::sleep(dispatch_timeout) => {
                                 dispatch.0.abort();
                                 tracing::warn!(
                                     %method,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                                     "mcp bridge dispatch exceeded watchdog deadline; aborted and synthesized timeout error"
                                 );
                                 if let Some(id) = id {
@@ -423,6 +429,10 @@ struct PendingRequest {
 /// [`BRIDGE_OUTCOME_UNKNOWN_CODE`] — the listener may have executed them
 /// before the drop, so a blind retry could double-apply. Either way the
 /// provider's MCP client never has to time out.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if reading stdin or writing stdout fails; connection drops to `addr` are retried, not surfaced.
 pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
     run_bridge(
         addr,
@@ -473,7 +483,7 @@ where
     let mut initial = true;
     let mut buffered: Vec<String> = Vec::new();
     loop {
-        let stream = match connect_with_retry(
+        let Some(stream) = connect_with_retry(
             addr,
             cfg,
             initial,
@@ -483,9 +493,8 @@ where
             &mut connect,
         )
         .await?
-        {
-            Some(stream) => stream,
-            None => return Ok(()),
+        else {
+            return Ok(());
         };
         initial = false;
         let (tcp_read, tcp_write) = stream.into_split();
@@ -582,7 +591,7 @@ where
                                 &mut overflowed,
                                 output,
                             )
-                            .await?
+                            .await?;
                         } else if !overflowed
                             && held.len() < INITIAL_BUFFER_MAX_LINES
                             && held_bytes + line.len() <= INITIAL_BUFFER_MAX_BYTES
@@ -626,7 +635,7 @@ where
         tokio::pin!(sleep);
         loop {
             tokio::select! {
-                _ = &mut sleep => break,
+                () = &mut sleep => break,
                 line = input.next_line() => match line? {
                     Some(line) => {
                         buffer_or_reject(
@@ -637,7 +646,7 @@ where
                             &mut overflowed,
                             output,
                         )
-                        .await?
+                        .await?;
                     }
                     None => return Ok(None),
                 },

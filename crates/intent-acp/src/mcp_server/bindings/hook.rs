@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::{map_err, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.hook = {
         schedule: (opts) => host({ method: 'hook.schedule', args: opts || {} }),
@@ -24,7 +24,7 @@ pub(crate) const PRELUDE: &str = r#"
         cancel: (hookId) => host({ method: 'hook.cancel', args: { hookId } }),
         runNow: (hookId) => host({ method: 'hook.runNow', args: { hookId } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

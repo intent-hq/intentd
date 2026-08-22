@@ -20,15 +20,16 @@ use crate::token;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceProvider {
-    /// ElevenLabs Scribe (`scribe_v2`) — the default.
+    /// `ElevenLabs` Scribe (`scribe_v2`) — the default.
     #[default]
     ElevenLabs,
-    /// OpenAI (configurable model, `whisper-1` fallback).
+    /// `OpenAI` (configurable model, `whisper-1` fallback).
     OpenAi,
 }
 
 impl VoiceProvider {
     /// Wire spelling (`elevenlabs` | `openai`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             VoiceProvider::ElevenLabs => "elevenlabs",
@@ -37,6 +38,7 @@ impl VoiceProvider {
     }
 
     /// Parse a wire spelling; `None` for anything unknown.
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "elevenlabs" => Some(VoiceProvider::ElevenLabs),
@@ -50,7 +52,7 @@ impl VoiceProvider {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceSettings {
-    /// Selected provider (default ElevenLabs).
+    /// Selected provider (default `ElevenLabs`).
     #[serde(default)]
     pub provider: VoiceProvider,
     /// Inline API key (already resolved, e.g. read from the secrets store by
@@ -61,7 +63,7 @@ pub struct VoiceSettings {
     /// Override for the provider API endpoint (defaults to the public API).
     #[serde(default)]
     pub api_base_url: Option<String>,
-    /// OpenAI transcription model (`voice.openai.model`); `None` uses the
+    /// `OpenAI` transcription model (`voice.openai.model`); `None` uses the
     /// engine default. Ignored by other providers.
     #[serde(default)]
     pub openai_model: Option<String>,
@@ -75,6 +77,10 @@ impl VoiceRegistry {
     /// [`Error::NotConfigured`] when no key is available. Async because the
     /// secrets-store lookup runs on the blocking pool with a bounded timeout
     /// (see [`token::resolve`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConfigured`] when no API key is available; propagates engine-construction failures.
     pub async fn from_settings(settings: &VoiceSettings) -> Result<Arc<dyn VoiceEngine>> {
         let key = resolve_key(settings).await?;
         let base_url = settings.api_base_url.as_deref();

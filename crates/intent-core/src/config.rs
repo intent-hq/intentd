@@ -2,7 +2,7 @@
 //!
 //! Paths are resolved via the `directories` crate, honoring the
 //! `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment overrides. The data dir
-//! holds the SQLite database (`intentd.db`), the UDS (`intentd.sock`), and the
+//! holds the `SQLite` database (`intentd.db`), the UDS (`intentd.sock`), and the
 //! non-secret settings file (`config.toml`), which is loaded strictly through
 //! [`crate::settings_file::SettingsFile`] — a malformed file fails `resolve()`
 //! instead of being silently ignored.
@@ -95,7 +95,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Path to `config.toml` (non-secret settings).
     pub config_path: PathBuf,
-    /// Path to the SQLite database file.
+    /// Path to the `SQLite` database file.
     pub db_path: PathBuf,
     /// Path to the Unix-domain-socket the daemon listens on.
     pub socket_path: PathBuf,
@@ -133,6 +133,10 @@ impl Config {
     /// wrong type, out-of-range value) is an error — never silently ignored.
     /// `INTENTD_IDLE_REAP_MINUTES` / `INTENTD_STREAM_RETENTION_HOURS` env vars
     /// still take precedence over the file for their respective knobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the data directory cannot be resolved or `config.toml` cannot be read/initialized; `Error::InvalidInput` if the file is malformed.
     pub fn resolve() -> Result<Self> {
         let data_dir = match std::env::var_os("INTENTD_DATA_DIR") {
             Some(p) => PathBuf::from(p),

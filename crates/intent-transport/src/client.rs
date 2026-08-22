@@ -105,7 +105,7 @@ pub(crate) async fn handle(
     if req.client_id_invalid {
         return frame(
             req.id_present,
-            req.id_echo,
+            &req.id_echo,
             Err((-32602, "clientId must be a string".to_string())),
         );
     }
@@ -114,7 +114,7 @@ pub(crate) async fn handle(
         .upsert_client(resolved.clone(), req.name, req.capabilities)
         .await
     {
-        return frame(req.id_present, req.id_echo, Err((-32603, e.to_string())));
+        return frame(req.id_present, &req.id_echo, Err((-32603, e.to_string())));
     }
     *client_id = Some(resolved.clone());
     let server = server_json(
@@ -126,7 +126,7 @@ pub(crate) async fn handle(
     );
     frame(
         req.id_present,
-        req.id_echo,
+        &req.id_echo,
         Ok(json!({
             "clientId": resolved.as_str(),
             "protocolVersion": PROTOCOL_VERSION,
@@ -137,12 +137,16 @@ pub(crate) async fn handle(
 
 /// Build the response frame for a `client.hello` result, or `None` for a
 /// notification (no `id`).
-fn frame(id_present: bool, id_echo: Value, result: Result<Value, (i32, String)>) -> Option<String> {
+fn frame(
+    id_present: bool,
+    id_echo: &Value,
+    result: Result<Value, (i32, String)>,
+) -> Option<String> {
     if !id_present {
         return None;
     }
     Some(match result {
-        Ok(value) => success_frame(id_echo, value),
+        Ok(value) => success_frame(id_echo, &value),
         Err((code, message)) => error_frame(id_echo, code, &message),
     })
 }

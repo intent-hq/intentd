@@ -89,6 +89,10 @@ pub fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> 
 /// one-liner. Composition roots that share a registry across the UDS + WSS
 /// listeners (REV-1) — and the daemon-wide outstanding-RPC cap — call
 /// [`serve_uds_with_reverse`] instead.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding or serving the local socket fails.
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -122,6 +126,10 @@ where
 /// exposes `server.pairingInfo`/`server.rotateToken` (§5.2) to local clients.
 /// `limiter` is the daemon-wide outstanding-slow-path-RPC cap
 /// (`server.maxOutstandingRpcs`) shared with the WSS listener.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding or serving the local socket fails.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
@@ -171,7 +179,7 @@ where
                     Err(e) => tracing::warn!(error = %e, "uds accept failed"),
                 }
             }
-            _ = &mut shutdown => break,
+            () = &mut shutdown => break,
         }
     }
 
@@ -241,7 +249,7 @@ where
     // whichever client connected first. The guard drops when this function
     // returns (normal exit, error, or panic-unwind) so failover is exactly the
     // connection arrival order.
-    let _reverse_guard = reverse_registry.register(reverse.clone());
+    let reverse_guard = reverse_registry.register(reverse.clone());
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = Vec::new();
@@ -256,7 +264,7 @@ where
                 // the connection WITHOUT draining the rest of the oversized
                 // line into memory.
                 let frame = crate::events::error_frame(
-                    serde_json::Value::Null,
+                    &serde_json::Value::Null,
                     -32600,
                     &format!(
                         "message exceeds maximum size of {} bytes",
@@ -313,7 +321,7 @@ where
     // EOF after a server-initiated close (e.g. an oversized frame).
     drop(subs);
     drop(forwards);
-    drop(_reverse_guard);
+    drop(reverse_guard);
     drop(reverse);
     drop(out_tx);
     let _ = writer.await;
@@ -354,24 +362,20 @@ where
                 BoundedLine::Line
             });
         }
-        match available.iter().position(|&b| b == b'\n') {
-            Some(pos) => {
-                if buf.len() + pos > limit {
-                    return Ok(BoundedLine::TooLong);
-                }
-                buf.extend_from_slice(&available[..pos]);
-                reader.consume(pos + 1);
-                return Ok(BoundedLine::Line);
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > limit {
+                return Ok(BoundedLine::TooLong);
             }
-            None => {
-                let len = available.len();
-                if buf.len() + len > limit {
-                    return Ok(BoundedLine::TooLong);
-                }
-                buf.extend_from_slice(available);
-                reader.consume(len);
-            }
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(BoundedLine::Line);
         }
+        let len = available.len();
+        if buf.len() + len > limit {
+            return Ok(BoundedLine::TooLong);
+        }
+        buf.extend_from_slice(available);
+        reader.consume(len);
     }
 }
 

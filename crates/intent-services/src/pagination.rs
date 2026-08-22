@@ -29,10 +29,12 @@ pub(crate) const MAX_PAGE_LIMIT: usize = 200;
 /// Clamp a client-supplied `limit` into the contract range. `None` yields the
 /// default (50); zero/negative clamp up to 1; values over the cap clamp down to
 /// 200.
+#[must_use]
 pub fn clamp_limit(limit: Option<i64>) -> usize {
     match limit {
         None => DEFAULT_PAGE_LIMIT,
-        Some(l) => l.clamp(1, MAX_PAGE_LIMIT as i64) as usize,
+        Some(l) => usize::try_from(l.clamp(1, i64::try_from(MAX_PAGE_LIMIT).unwrap_or(i64::MAX)))
+            .unwrap_or(MAX_PAGE_LIMIT),
     }
 }
 
@@ -72,8 +74,7 @@ pub fn page_window(len: usize, limit: Option<i64>, token: Option<&str>) -> PageW
     let end = token
         .and_then(decode_token)
         .and_then(|v| v.get("b").and_then(Value::as_u64))
-        .map(|b| (b as usize).min(len))
-        .unwrap_or(len);
+        .map_or(len, |b| usize::try_from(b).unwrap_or(usize::MAX).min(len));
     let start = end.saturating_sub(limit);
     let next_token = if start > 0 {
         Some(encode_token(&json!({ "b": start })))
@@ -137,7 +138,8 @@ pub(crate) fn forward_page_window(
     limit: Option<i64>,
     token: &str,
 ) -> Option<SeekPageWindow> {
-    let f = decode_token(token)?.get("f").and_then(Value::as_u64)? as usize;
+    let f = usize::try_from(decode_token(token)?.get("f").and_then(Value::as_u64)?)
+        .expect("value fits in usize");
     let limit = clamp_limit(limit);
     let start = f.min(len);
     let end = (start + limit).min(len);
@@ -170,6 +172,7 @@ pub enum BudgetAnchor {
 /// contiguous; rows are never skipped over). `Target` grows outward
 /// alternating older-first (mirroring the unbudgeted half-older split);
 /// each direction stops independently at its first non-fitting row.
+#[must_use]
 pub fn budget_page(sizes: &[usize], anchor: BudgetAnchor, budget: usize) -> (usize, usize) {
     let n = sizes.len();
     if n == 0 {
@@ -240,6 +243,7 @@ pub fn budget_page(sizes: &[usize], anchor: BudgetAnchor, budget: usize) -> (usi
 /// page's effective start: `{"b": start}` while older rows remain. Same
 /// cursor shape as [`page_window`], so the resumed page picks up exactly at
 /// the first excluded (older) row.
+#[must_use]
 pub fn remint_backward_token(start: usize) -> Option<String> {
     (start > 0).then(|| encode_token(&json!({ "b": start })))
 }
@@ -271,9 +275,7 @@ pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
         }
     }
     let mut sink = CountingSink(0);
-    serde_json::to_writer(&mut sink, row)
-        .map(|()| sink.0)
-        .unwrap_or(0)
+    serde_json::to_writer(&mut sink, row).map_or(0, |()| sink.0)
 }
 
 /// A page of items plus the opaque token for the next (older) page.
@@ -306,7 +308,7 @@ pub(crate) fn paginate_slice<T: Clone>(
 /// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
 pub(crate) fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
     let mut lines: Vec<&str> = text.split('\n').collect();
-    while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
     let page = paginate_slice(&lines, limit, token);
@@ -336,8 +338,7 @@ pub(crate) fn parse_offset(token: Option<&str>) -> usize {
     token
         .and_then(decode_token)
         .and_then(|v| v.get("o").and_then(Value::as_u64))
-        .map(|n| n as usize)
-        .unwrap_or(0)
+        .map_or(0, |n| usize::try_from(n).expect("value fits in usize"))
 }
 
 #[cfg(test)]

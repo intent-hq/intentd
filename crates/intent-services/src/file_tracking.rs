@@ -66,8 +66,8 @@ pub(crate) async fn track_change(
         own_deletions.max(sibling_deletions),
     );
     Ok((
-        (change.additions - prev_additions).max(0) as u64,
-        (change.deletions - prev_deletions).max(0) as u64,
+        (change.additions - prev_additions).max(0).cast_unsigned(),
+        (change.deletions - prev_deletions).max(0).cast_unsigned(),
     ))
 }
 

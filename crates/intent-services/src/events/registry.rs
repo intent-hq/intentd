@@ -26,14 +26,14 @@
 //! so `archive_workspace`/`unarchive_workspace` publish `workspace:updated`
 //! with an `archived` boolean in the delta; the registry subscribes to that
 //! event and treats `archived: true` as a suspend (all watch roots torn down —
-//! otherwise every archived workspace leaks its FSEvents streams until daemon
+//! otherwise every archived workspace leaks its `FSEvents` streams until daemon
 //! restart) and `archived: false` as a resume. Resume additionally runs a
 //! catch-up so derived state changed while unwatched is not silently lost: a
 //! `GitStatusRefresher::trigger` plus the skills/specialists rescan (both
 //! fingerprint-checked, so an untouched tree emits nothing).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,7 +157,7 @@ impl WatcherRegistry {
             tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files");
             file_watchers.insert(
                 ws_id.clone(),
-                FileWatcher::start(&hub, bus.clone(), ws_id.clone(), path.clone()),
+                FileWatcher::start(&hub, bus.clone(), ws_id.clone(), &path.clone()),
             );
         }
         tracing::info!(count = file_watchers.len(), "file watchers started");
@@ -168,8 +168,8 @@ impl WatcherRegistry {
                 &hub,
                 &git_common,
                 &refresher,
-                ws_id.clone(),
-                path.clone(),
+                &ws_id.clone(),
+                &path.clone(),
                 "",
             ) {
                 git_watchers.insert(ws_id.clone(), w);
@@ -222,7 +222,7 @@ impl WatcherRegistry {
         self.hub.root_established(root)
     }
 
-    /// Live shared FSEvents stream count — the consolidation metric.
+    /// Live shared `FSEvents` stream count — the consolidation metric.
     #[cfg(test)]
     fn stream_count(&self) -> usize {
         self.hub.stream_count()
@@ -242,25 +242,22 @@ fn start_git_metadata_watch(
     hub: &Arc<SharedWatchHub>,
     common_watches: &Arc<GitCommonDirWatches>,
     refresher: &Arc<GitStatusRefresher>,
-    ws_id: WorkspaceId,
-    path: PathBuf,
+    ws_id: &WorkspaceId,
+    path: &Path,
     suffix: &str,
 ) -> Option<GitMetadataWatcher> {
-    match GitMetadataWatcher::start(
+    if let Some(w) = GitMetadataWatcher::start(
         hub,
         common_watches,
         Arc::clone(refresher),
         ws_id.clone(),
-        path.clone(),
+        &path.to_path_buf(),
     ) {
-        Some(w) => {
-            tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
-            Some(w)
-        }
-        None => {
-            tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");
-            None
-        }
+        tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
+        Some(w)
+    } else {
+        tracing::debug!(workspace = %ws_id, path = %path.display(), "no .git directory; not watching git metadata");
+        None
     }
 }
 
@@ -281,16 +278,11 @@ fn start_watches(
     tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace files{suffix}");
     file_watchers.insert(
         ws_id.clone(),
-        FileWatcher::start(hub, bus.clone(), ws_id.clone(), path.to_path_buf()),
+        FileWatcher::start(hub, bus.clone(), ws_id.clone(), path),
     );
-    if let Some(w) = start_git_metadata_watch(
-        hub,
-        common_watches,
-        refresher,
-        ws_id.clone(),
-        path.to_path_buf(),
-        suffix,
-    ) {
+    if let Some(w) =
+        start_git_metadata_watch(hub, common_watches, refresher, &ws_id.clone(), path, suffix)
+    {
         git_watchers.insert(ws_id.clone(), w);
     }
 }
@@ -318,7 +310,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
     ev.data
         .get("changes")
         .and_then(|c| c.get("archived"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
 }
 
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
@@ -351,7 +343,7 @@ async fn lifecycle_loop(
                     Some(batch) => batch,
                     None => return,
                 },
-                _ = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     let now = Instant::now();
                     let expired: Vec<WorkspaceId> = pending
                         .iter()
@@ -376,8 +368,8 @@ async fn lifecycle_loop(
                             &p.path,
                             " (setup completion backstop)",
                         );
-                        skills.add_workspace(ws_id.clone(), p.path.clone());
-                        specialists.add_workspace(ws_id, p.path);
+                        skills.add_workspace(ws_id.clone(), &p.path.clone());
+                        specialists.add_workspace(ws_id, &p.path);
                     }
                     continue;
                 }
@@ -421,8 +413,8 @@ async fn lifecycle_loop(
                         &p.path,
                         " (setup completed)",
                     );
-                    skills.add_workspace(ws_id.clone(), p.path.clone());
-                    specialists.add_workspace(ws_id, p.path);
+                    skills.add_workspace(ws_id.clone(), &p.path.clone());
+                    specialists.add_workspace(ws_id, &p.path);
                 }
                 WORKSPACE_OPENED => {
                     let Some(path) = resolve_path(&ev, services.as_ref()).await else {
@@ -445,8 +437,8 @@ async fn lifecycle_loop(
                         &path,
                         " (runtime registration)",
                     );
-                    skills.add_workspace(ws_id.clone(), path.clone());
-                    specialists.add_workspace(ws_id, path);
+                    skills.add_workspace(ws_id.clone(), &path.clone());
+                    specialists.add_workspace(ws_id, &path);
                 }
                 WORKSPACE_DELETED | WORKSPACE_CLOSED => {
                     if pending.remove(&ws_id).is_some() {
@@ -518,8 +510,8 @@ async fn lifecycle_loop(
                         // baseline, exactly as it does for any single `file:*`
                         // event today.
                         refresher.trigger(ws_id.clone());
-                        skills.resume_workspace(ws_id.clone(), path.clone());
-                        specialists.resume_workspace(ws_id, path);
+                        skills.resume_workspace(ws_id.clone(), &path.clone());
+                        specialists.resume_workspace(ws_id, &path);
                     }
                     None => {}
                 },
@@ -544,12 +536,11 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         })
         .map(PathBuf::from);
 
-    let path = match from_payload {
-        Some(p) => Some(p),
-        None => {
-            let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
-            ws.path.or(ws.worktree_path).map(PathBuf::from)
-        }
+    let path = if let Some(p) = from_payload {
+        Some(p)
+    } else {
+        let ws = services.get_workspace(ev.workspace_id.clone()).await.ok()?;
+        ws.path.or(ws.worktree_path).map(PathBuf::from)
     }?;
 
     path.is_dir().then_some(path)
@@ -822,14 +813,14 @@ mod tests {
     async fn boot_time_workspace_is_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("boot");
         let ws = test_workspace("ws-boot", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
 
@@ -842,11 +833,11 @@ mod tests {
     async fn workspace_created_after_start_gains_watching_and_deletion_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         // Nothing is watched yet: the boot seed is empty.
 
         // Register a workspace at runtime via `workspace:created` (payload
@@ -860,7 +851,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, true))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-create.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -873,7 +864,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
             .await
             .expect("publish deleted");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         std::fs::write(root.path.join("after-delete.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
@@ -892,11 +883,11 @@ mod tests {
     async fn created_workspace_defers_watching_until_setup_completes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
 
         let root = TempDir::new("setup-deferred");
         let ws = test_workspace("ws-setup-deferred", &root.path);
@@ -908,7 +899,7 @@ mod tests {
         // and churn under it must publish nothing.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            _registry.root_established(&root.path).is_none(),
+            registry.root_established(&root.path).is_none(),
             "created workspace must not be watched while setup is pending"
         );
         std::fs::write(root.path.join("during-setup.txt"), "hi").expect("write file");
@@ -922,7 +913,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, true))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-setup.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -940,11 +931,11 @@ mod tests {
     async fn no_script_completion_starts_watching_promptly() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
 
         let root = TempDir::new("no-script");
         let ws = test_workspace("ws-no-script", &root.path);
@@ -954,7 +945,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, false))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("no-script.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -972,11 +963,11 @@ mod tests {
     async fn backstop_starts_watchers_when_setup_completion_never_arrives() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
+        let registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
 
         let root = TempDir::new("backstop");
         let ws = test_workspace("ws-backstop", &root.path);
@@ -984,7 +975,7 @@ mod tests {
             .await
             .expect("publish created");
         // No completion published: the backstop alone must start the watch.
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-backstop.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1001,11 +992,11 @@ mod tests {
     async fn delete_while_pending_discards_the_deferred_start() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
 
-        let _registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
+        let registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
 
         let root = TempDir::new("delete-pending");
         let ws = test_workspace("ws-delete-pending", &root.path);
@@ -1023,7 +1014,7 @@ mod tests {
         // Ride out the backstop window: nothing may have started.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(
-            _registry.root_established(&root.path).is_none(),
+            registry.root_established(&root.path).is_none(),
             "deleted-while-pending workspace must never be watched"
         );
         std::fs::write(root.path.join("never.txt"), "hi").expect("write file");
@@ -1039,7 +1030,7 @@ mod tests {
     async fn workspace_opened_resolves_path_via_services() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("opened");
         let ws = test_workspace("ws-opened", &root.path);
@@ -1048,20 +1039,20 @@ mod tests {
         // only the id, so the registry must resolve the path via the api.
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         // Simulate close → open: after close the watchers are gone, and the
         // reopen path exercises the get_workspace lookup.
         bus.publish(&lifecycle_event(WORKSPACE_CLOSED, &ws, false))
             .await
             .expect("publish closed");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         bus.publish(&lifecycle_event(WORKSPACE_OPENED, &ws, false))
             .await
             .expect("publish opened");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-open.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1072,7 +1063,7 @@ mod tests {
     }
 
     /// Consolidation regression: two workspaces whose roots sit under the same
-    /// parent share one FSEvents stream, so the in-process demux is the only
+    /// parent share one `FSEvents` stream, so the in-process demux is the only
     /// thing keeping them apart. Each must publish `file:*` events for its own
     /// paths only — a leak here would attribute one workspace's edits to the
     /// other.
@@ -1081,7 +1072,7 @@ mod tests {
     async fn workspaces_sharing_a_consolidated_root_receive_only_their_own_file_events() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         // Sibling roots under one parent: the hub groups them onto a single
         // shared stream.
@@ -1134,7 +1125,7 @@ mod tests {
     async fn many_workspaces_share_a_single_stream_per_parent_directory() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _sub) = bus_and_sub().await;
         let parent = TempDir::new("count");
         let workspaces: Vec<_> = (0..8)
@@ -1168,7 +1159,7 @@ mod tests {
     async fn archiving_one_workspace_leaves_its_shared_stream_co_tenant_watched() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let parent = TempDir::new("shared-archive");
         let root_a = parent.path.join("ws-a");
@@ -1179,7 +1170,7 @@ mod tests {
         let ws_b = test_workspace("ws-shared-arch-b", &root_b);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws_a.clone(), ws_b.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         confirm_watch_live(&mut sub, &ws_a.id, &root_a).await;
         confirm_watch_live(&mut sub, &ws_b.id, &root_b).await;
 
@@ -1187,7 +1178,7 @@ mod tests {
         bus.publish(&archive_event(&ws_a, true))
             .await
             .expect("publish archived");
-        wait_for_root(&_registry, &root_a, false).await;
+        wait_for_root(&registry, &root_a, false).await;
 
         std::fs::write(root_a.join("while-archived.txt"), "hi").expect("write in a");
         let leaked = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(2)).await;
@@ -1206,7 +1197,7 @@ mod tests {
         bus.publish(&archive_event(&ws_a, false))
             .await
             .expect("publish unarchived");
-        wait_for_root(&_registry, &root_a, true).await;
+        wait_for_root(&registry, &root_a, true).await;
 
         std::fs::write(root_a.join("after-unarchive.txt"), "hi").expect("write in a");
         let ev = next_file_event(&mut sub, &ws_a.id, LIVENESS).await;
@@ -1218,19 +1209,19 @@ mod tests {
 
     /// Regression: archiving a workspace must tear its watch roots down.
     /// Before the fix only `workspace:deleted`/`workspace:closed` deregistered,
-    /// so every archived workspace leaked its FSEvents streams until restart.
+    /// so every archived workspace leaked its `FSEvents` streams until restart.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn archived_workspace_stops_watching_and_unarchive_resumes_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("archived");
         let ws = test_workspace("ws-archived", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         // Probed rather than written once: the negative assertion after the
         // archive would be vacuous if delivery had never started, and delivery
         // can lag establishment by more than a single write's budget.
@@ -1240,7 +1231,7 @@ mod tests {
         bus.publish(&archive_event(&ws, true))
             .await
             .expect("publish archived");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         std::fs::write(root.path.join("while-archived.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
@@ -1254,7 +1245,7 @@ mod tests {
         bus.publish(&archive_event(&ws, false))
             .await
             .expect("publish unarchived");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-unarchive.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1283,7 +1274,7 @@ mod tests {
     /// under test before a negative probe, by flushing the shared
     /// [`GitStatusRefresher`] pipeline with a marker workspace
     /// (monorepo#2012). A fixed quiet-gap drain is a race: a refresh from
-    /// earlier churn traverses FSEvents delivery, the 1s debounce, and a
+    /// earlier churn traverses `FSEvents` delivery, the 1s debounce, and a
     /// blocking-pool recompute, and under load its `changes:git-status` can
     /// publish arbitrarily later than any fixed gap.
     ///
@@ -1293,7 +1284,7 @@ mod tests {
     /// single publisher's events in order, so a marker event bounds every
     /// publish enqueued before its own — EXCEPT a workspace refresh due in
     /// the same debounce batch, which can be processed (and published) after
-    /// the marker's (per-batch HashMap order), and a straggler trigger that
+    /// the marker's (per-batch `HashMap` order), and a straggler trigger that
     /// raced in just after the marker's. Both stragglers surface during the
     /// NEXT round, so the pipeline is settled once two consecutive rounds
     /// observe nothing but their marker. Panics if settlement never happens
@@ -1343,7 +1334,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1499,7 +1490,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1583,14 +1574,14 @@ mod tests {
     async fn unrelated_workspace_update_leaves_watching_intact() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let root = TempDir::new("updated");
         let ws = test_workspace("ws-updated", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         let mut ev = lifecycle_event(WORKSPACE_UPDATED, &ws, false);
         ev.data = serde_json::json!({
@@ -1598,7 +1589,7 @@ mod tests {
             "changes": { "title": "renamed" },
         });
         bus.publish(&ev).await.expect("publish updated");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-update.txt"), "hi").expect("write file");
         let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
@@ -1619,7 +1610,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1648,13 +1639,13 @@ mod tests {
         ws.worktree_path = ws.path.clone();
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let _registry = start_registry(&bus, api).await;
-        wait_for_root(&_registry, &root.path, true).await;
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         bus.publish(&archive_event(&ws, true))
             .await
             .expect("publish archived");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         // Change git state while unwatched, then drain anything the archive
         // transition itself may still have had in flight.
@@ -1680,7 +1671,7 @@ mod tests {
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, _file_sub) = bus_and_sub().await;
         let mut status_sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![CHANGES_GIT_STATUS.to_string()],
@@ -1689,7 +1680,7 @@ mod tests {
         let fake = Arc::new(FakeApi::new(Vec::new()));
         let api: Arc<dyn WorkspaceApi> = fake.clone();
 
-        let _registry = start_registry(&bus, api).await;
+        let registry = start_registry(&bus, api).await;
         // Nothing is watched yet: the boot seed is empty.
 
         // Real repo with a seed commit, registered at runtime. The refresher
@@ -1722,7 +1713,7 @@ mod tests {
         bus.publish(&setup_completed_event(&ws, true))
             .await
             .expect("publish setup completed");
-        wait_for_root(&_registry, &root.path, true).await;
+        wait_for_root(&registry, &root.path, true).await;
 
         // External `git checkout`-style HEAD rewrite → debounced refresh.
         repo.set_head("refs/heads/other").unwrap();
@@ -1736,7 +1727,7 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
             .await
             .expect("publish deleted");
-        wait_for_root(&_registry, &root.path, false).await;
+        wait_for_root(&registry, &root.path, false).await;
 
         repo.set_head("refs/heads/main").unwrap();
         let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(3)).await;

@@ -162,6 +162,7 @@ async fn boot() -> Fixture {
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let services = Services::new(store)
         .with_workspaces_root(workspaces_root)
+        .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let tls = ensure_tls_certificate(&dir).expect("cert");
@@ -173,7 +174,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(api, bus.clone(), &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
@@ -230,7 +231,6 @@ async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
                         return v;
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
                 Message::Close(_) => panic!("connection closed mid-stream"),
                 _ => {}
             }
@@ -336,7 +336,7 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
         )
         .await
         .expect("append assistant message");
-    fx.bus.publish_transient(&stream_event(
+    let _ = fx.bus.publish_transient(&stream_event(
         &ws_id,
         &agent_id,
         CHAT_STREAM_DELTA,
@@ -345,14 +345,14 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
             "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
         }),
     ));
-    fx.bus.publish_transient(&stream_event(
+    let _ = fx.bus.publish_transient(&stream_event(
         &ws_id,
         &agent_id,
         AGENT_STREAM_END,
         json!({ "agentId": agent_id }),
     ));
     for _ in 0..2048 {
-        fx.bus.publish_transient(&NewEvent {
+        let _ = fx.bus.publish_transient(&NewEvent {
             workspace_id: WorkspaceId::from(ws_id.as_str()),
             timestamp: now_iso(),
             event_type: "note:created".to_string(),

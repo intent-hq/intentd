@@ -60,6 +60,10 @@ impl SourceControlRegistry {
     /// unknown ([`Error::Config`]) or no token is available
     /// ([`Error::NotConfigured`]). Async because the secrets-store / `gh` lookups
     /// run on the blocking pool with bounded timeouts (see [`token::resolve`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] for an unknown provider; [`Error::NotConfigured`] when no token is available; propagates client-construction failures.
     pub async fn from_settings(settings: &SourceControlSettings) -> Result<Arc<dyn SourceControl>> {
         match settings.active_provider.as_str() {
             "github" => {

@@ -26,7 +26,7 @@ use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
 /// and the identical constant in `dispatch.rs`).
 const SENDER_WATCH_NOTIFICATION: &str = "You will be notified when the agent responds.";
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.agent = {
         create: (name, message, opts) =>
@@ -67,7 +67,7 @@ pub(crate) const PRELUDE: &str = r#"
         reportBlocker: (reason) =>
             host({ method: 'agent.reportBlocker', args: { reason } }),
     };
-"#;
+";
 
 /// The `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` installer
 /// lines inside [`PRELUDE`], removed when `agentFeatures.attentionRequests`
@@ -77,7 +77,7 @@ pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (
 
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
 /// off the two attention-request installers are omitted, so agent code
-/// touching them fails with a clear `not a function` TypeError. Every other
+/// touching them fails with a clear `not a function` `TypeError`. Every other
 /// `ws.agent.*` method (including `reportToParent`) stays un-gated. With the
 /// toggle on — the default — this borrows [`PRELUDE`] byte-identically.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {
@@ -275,7 +275,7 @@ async fn delegate(
                     Ok(entry) => entries.push(entry),
                     Err(_) => {
                         return Err(format!(
-                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, reasoningEffort? }} objects, got: {v}"
+                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }} objects, got: {v}"
                         ));
                     }
                 }
@@ -291,6 +291,7 @@ async fn delegate(
         agent_instructions: opt_str(args, "agentInstructions"),
         specialist: opt_str(args, "specialist"),
         model: opt_str(args, "model"),
+        provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
         behavior_prompt: opt_str(args, "behaviorPrompt"),
         wait_mode: opt_str(args, "waitMode"),
@@ -1015,7 +1016,7 @@ fn merge_ok(mut v: Value) -> Value {
 mod tests {
     use super::*;
 
-    fn entry(id: &str, extra: Value) -> Value {
+    fn entry(id: &str, extra: &Value) -> Value {
         let mut v = json!({
             "id": id,
             "content": format!("content-{id}"),
@@ -1034,10 +1035,10 @@ mod tests {
     fn present_queue_sorts_next_delivery_first() {
         // Deliberately scrambled input: normal, editing, interrupt, normal.
         let raw = vec![
-            entry("normal-1", json!({})),
-            entry("editing-1", json!({ "editing": true })),
-            entry("interrupt-1", json!({ "interruptPriority": true })),
-            entry("normal-2", json!({})),
+            entry("normal-1", &json!({})),
+            entry("editing-1", &json!({ "editing": true })),
+            entry("interrupt-1", &json!({ "interruptPriority": true })),
+            entry("normal-2", &json!({})),
         ];
         let out = present_queue(raw);
         let ids: Vec<&str> = out.iter().map(|e| e["id"].as_str().unwrap()).collect();
@@ -1052,9 +1053,9 @@ mod tests {
     #[test]
     fn present_queue_keeps_interrupt_arrival_order() {
         let raw = vec![
-            entry("interrupt-1", json!({ "interruptPriority": true })),
-            entry("interrupt-2", json!({ "interruptPriority": true })),
-            entry("normal-1", json!({})),
+            entry("interrupt-1", &json!({ "interruptPriority": true })),
+            entry("interrupt-2", &json!({ "interruptPriority": true })),
+            entry("normal-1", &json!({})),
         ];
         let out = present_queue(raw);
         let ids: Vec<&str> = out.iter().map(|e| e["id"].as_str().unwrap()).collect();
@@ -1065,7 +1066,7 @@ mod tests {
     fn present_queue_lifts_attribution_and_drops_bulk() {
         let raw = vec![entry(
             "attributed",
-            json!({
+            &json!({
                 "messageMetadata": {
                     "type": "agent_message",
                     "fromAgentId": "agent-abc",
@@ -1083,7 +1084,7 @@ mod tests {
 
     #[test]
     fn present_queue_user_entries_have_no_attribution() {
-        let out = present_queue(vec![entry("user-entry", json!({}))]);
+        let out = present_queue(vec![entry("user-entry", &json!({}))]);
         assert!(out[0].get("fromAgentId").is_none());
         assert!(out[0].get("fromAgentName").is_none());
     }
@@ -1094,12 +1095,12 @@ mod tests {
         let queue = present_queue(vec![
             entry(
                 "foreign",
-                json!({ "messageMetadata": { "fromAgentId": "agent-other" } }),
+                &json!({ "messageMetadata": { "fromAgentId": "agent-other" } }),
             ),
-            entry("user-entry", json!({})),
+            entry("user-entry", &json!({})),
             entry(
                 "own",
-                json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
+                &json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
             ),
         ]);
         assert_eq!(caller_pending_entry(&queue, &caller), Some("own"));
@@ -1116,7 +1117,7 @@ mod tests {
         let caller = AgentId::from("agent-caller");
         let queue = present_queue(vec![entry(
             "own-editing",
-            json!({
+            &json!({
                 "editing": true,
                 "messageMetadata": { "fromAgentId": "agent-caller" },
             }),
@@ -1130,14 +1131,14 @@ mod tests {
         let queue = present_queue(vec![
             entry(
                 "own-editing",
-                json!({
+                &json!({
                     "editing": true,
                     "messageMetadata": { "fromAgentId": "agent-caller" },
                 }),
             ),
             entry(
                 "own-pending",
-                json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
+                &json!({ "messageMetadata": { "fromAgentId": "agent-caller" } }),
             ),
         ]);
         assert_eq!(

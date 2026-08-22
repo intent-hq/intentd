@@ -33,6 +33,10 @@ pub struct AgentMetricsRow {
 
 impl Store {
     /// Upsert the per-workspace metrics row, stamping `updated_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_workspace_metrics(
         &self,
         workspace_id: &WorkspaceId,
@@ -60,6 +64,10 @@ impl Store {
     }
 
     /// Read one workspace's metrics row (absent → `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_metrics(
         &self,
         workspace_id: &WorkspaceId,
@@ -76,6 +84,10 @@ impl Store {
     }
 
     /// List every workspace's metrics row (for `metrics.getAllWorkspaceStats`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_metrics(&self) -> Result<Vec<WorkspaceMetricsRow>> {
         let rows = sqlx::query(
             "SELECT workspace_id, additions, deletions, files_changed, updated_at \
@@ -88,6 +100,10 @@ impl Store {
     }
 
     /// Delete one workspace's metrics row (used when it has no tracked changes).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_metrics(&self, workspace_id: &WorkspaceId) -> Result<()> {
         sqlx::query("DELETE FROM workspace_metrics WHERE workspace_id = ?")
             .bind(&workspace_id.0)
@@ -98,6 +114,10 @@ impl Store {
     }
 
     /// Upsert one per-agent, per-workspace metrics row, stamping `updated_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_agent_metrics(
         &self,
         workspace_id: &WorkspaceId,
@@ -127,6 +147,10 @@ impl Store {
     }
 
     /// List the per-agent metrics rows for one workspace (powers `byAgent`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_metrics_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -144,6 +168,10 @@ impl Store {
 
     /// List one agent's metrics rows across every workspace (for
     /// `metrics.getAgentStats`, whose totals are summed across workspaces).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_metrics(&self, agent_id: &str) -> Result<Vec<AgentMetricsRow>> {
         let rows = sqlx::query(
             "SELECT agent_id, workspace_id, additions, deletions, files_changed, updated_at \
@@ -158,6 +186,10 @@ impl Store {
 
     /// Delete one workspace's per-agent metrics rows (cleared before a recompute
     /// rewrites the live per-agent breakdown).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_agent_metrics_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -172,6 +204,10 @@ impl Store {
 
     /// Delete one agent's metrics rows across every workspace, returning the
     /// number of rows removed (backs `metrics.clearAgentStats`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_agent_metrics(&self, agent_id: &str) -> Result<u64> {
         let result = sqlx::query("DELETE FROM agent_metrics WHERE agent_id = ?")
             .bind(agent_id)
@@ -182,6 +218,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_workspace_metrics_row(r: &SqliteRow) -> Result<WorkspaceMetricsRow> {
     Ok(WorkspaceMetricsRow {
         workspace_id: WorkspaceId(r.get("workspace_id")),
@@ -192,6 +229,7 @@ fn map_workspace_metrics_row(r: &SqliteRow) -> Result<WorkspaceMetricsRow> {
     })
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_agent_metrics_row(r: &SqliteRow) -> Result<AgentMetricsRow> {
     Ok(AgentMetricsRow {
         agent_id: r.get("agent_id"),

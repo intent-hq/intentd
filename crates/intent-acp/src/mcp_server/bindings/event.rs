@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.event = {
         agentActivity: (agentId, minutesAgo) =>
@@ -26,7 +26,7 @@ pub(crate) const PRELUDE: &str = r#"
         unsubscribe: (subscriptionId) =>
             host({ method: 'event.unsubscribe', args: { subscriptionId } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

@@ -63,7 +63,7 @@ use uuid::Uuid;
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// MIME type the FE renders as QuestionCards (PROTOCOL §7.x question resource).
+/// MIME type the FE renders as `QuestionCards` (PROTOCOL §7.x question resource).
 const QUESTION_MIME: &str = "application/vnd.intent.question+json";
 
 /// Turn-1 trigger for the asker: the mock's rule matches on this so the
@@ -89,7 +89,7 @@ const HELD_DISMISS: &str = "held until dismissal";
 /// two distinct pending question messages).
 const ASK_AGAIN_MARKER: &str = "ASK_SECOND_QUESTION_NOW_E2E";
 
-/// The flattened `Q:`/`A:` answer a user sends after filling the QuestionCard.
+/// The flattened `Q:`/`A:` answer a user sends after filling the `QuestionCard`.
 const ANSWER_TEXT: &str = "Q: Which environment should I deploy to?\nA: Staging";
 /// An UNTAGGED user message sent while questions are pending: never held
 /// (user origin), but carries no `question_answers` tag, so it must NOT
@@ -127,7 +127,7 @@ impl Drop for Daemon {
         if std::thread::panicking() {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -281,7 +281,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -306,7 +306,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -363,7 +363,7 @@ where
     panic!("no pendingQuestionsMessageId={expected:?} event for {agent_id}");
 }
 
-/// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace.
+/// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -484,7 +484,8 @@ async fn boot(script: &str, behavior: &str) -> (Daemon, String, u16, Arc<ClientC
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1330,7 +1331,7 @@ async fn dismiss_questions_idle_empty_queue_starts_notice_turn_over_wss() {
 ///    A's hold is active).
 /// 2. Dismissing A while B still holds automatic deliveries PARKS A's
 ///    notice: `agent.getQueue` surfaces the entry at the queue HEAD with its
-///    `questions_dismissed` metadata — the DoD's undelivered-entry shape.
+///    `questions_dismissed` metadata — the `DoD`'s undelivered-entry shape.
 /// 3. Dismissing B releases the hold: B's notice delivers first (immediate),
 ///    A's parked notice drains behind it — transcript order B-notice →
 ///    A-notice, queue empty.

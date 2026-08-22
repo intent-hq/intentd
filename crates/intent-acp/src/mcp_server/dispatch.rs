@@ -91,8 +91,8 @@ impl StageSentinel {
             tracing::warn!(
                 summary,
                 stage = stage.get(),
-                elapsed_ms = (budget + budget / 2).as_millis() as u64,
-                budget_ms = budget.as_millis() as u64,
+                elapsed_ms = u64::try_from((budget + budget / 2).as_millis()).unwrap_or(u64::MAX),
+                budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
                 "workspace_api dispatch still in flight past the JS eval budget"
             );
         }))
@@ -128,8 +128,7 @@ pub(super) fn default_workspace_api_timeout() -> Duration {
 fn workspace_api_timeout_from(raw: Option<&str>) -> Duration {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(WORKSPACE_API_TIMEOUT)
+        .map_or(WORKSPACE_API_TIMEOUT, Duration::from_millis)
 }
 
 /// Default for `workspaceApi.maxOutputChars` — mirrors the settings-catalog
@@ -214,7 +213,7 @@ impl WorkspaceMcpServer {
         tracing::trace!("workspace_api dispatch: eval starting");
         let eval_started = Instant::now();
         let eval_result = js_eval(&full_code, &opts, Some(host)).await;
-        let eval_ms = eval_started.elapsed().as_millis() as u64;
+        let eval_ms = u64::try_from(eval_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let eval_ok = eval_result.is_ok();
         tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");
         // Drain the binding-time collection unconditionally: the attachments
@@ -267,7 +266,9 @@ impl WorkspaceMcpServer {
                         tracing::trace!("workspace_api dispatch: settings read starting");
                         let stage_started = Instant::now();
                         let (toon_output, max_chars) = self.workspace_api_output_settings().await;
-                        settings_ms = Some(stage_started.elapsed().as_millis() as u64);
+                        settings_ms = Some(
+                            u64::try_from(stage_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
                         let (body, ext) = render_workspace_api_value(&value, toon_output);
                         stage.set("output finalize");
                         tracing::trace!("workspace_api dispatch: output finalize starting");
@@ -275,7 +276,9 @@ impl WorkspaceMcpServer {
                         let out = self
                             .finalize_workspace_api_output(body, ext, max_chars)
                             .await;
-                        finalize_ms = Some(stage_started.elapsed().as_millis() as u64);
+                        finalize_ms = Some(
+                            u64::try_from(stage_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
                         out
                     }
                 }
@@ -290,7 +293,7 @@ impl WorkspaceMcpServer {
             }
         };
         let total = started.elapsed();
-        let total_ms = total.as_millis() as u64;
+        let total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX);
         if total > self.workspace_api_timeout {
             // Slow-dispatch marker (monorepo#2709): the whole dispatch took
             // longer than the JS eval budget, so the post-eval awaits (or a
@@ -304,7 +307,7 @@ impl WorkspaceMcpServer {
                 settings_ms = ?settings_ms,
                 finalize_ms = ?finalize_ms,
                 total_ms,
-                budget_ms = self.workspace_api_timeout.as_millis() as u64,
+                budget_ms = u64::try_from(self.workspace_api_timeout.as_millis()).unwrap_or(u64::MAX),
                 "workspace_api dispatch exceeded the JS eval budget"
             );
         } else {
@@ -344,8 +347,12 @@ impl WorkspaceMcpServer {
                 .get("value")
                 .and_then(Value::as_f64)
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .map(|n| n as usize)
-                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+                .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| {
+                    // Guarded finite + non-negative; float→int casts saturate.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let n = n as usize;
+                    n
+                }),
             Err(_) => DEFAULT_MAX_OUTPUT_CHARS,
         };
         (toon_output, max_chars)
@@ -754,7 +761,7 @@ async fn workspace_host_dispatch(
     if let Some(v) = super::bindings::try_dispatch(
         &api,
         &workspace_id,
-        &caller_agent_id,
+        caller_agent_id.as_ref(),
         turn_attachments.as_ref(),
         agent_features,
         is_sub_agent,
@@ -788,7 +795,7 @@ fn workspace_api_error(text: &str) -> Value {
 }
 
 /// Render a [`JsError`] into the reference tool's error-text style. Syntax
-/// errors and `Cannot read properties of undefined` TypeErrors get a
+/// errors and `Cannot read properties of undefined` `TypeErrors` get a
 /// clearer human-facing rewrite; everything else falls through as `Error: …`.
 fn format_js_error(err: &JsError) -> String {
     match err {
@@ -818,7 +825,7 @@ fn format_js_error(err: &JsError) -> String {
     }
 }
 
-/// QuickJS reports syntax errors as bare `Error: ...` with an indicative
+/// `QuickJS` reports syntax errors as bare `Error: ...` with an indicative
 /// phrase in the body (e.g. `unexpected token`, `expected identifier`),
 /// unlike V8 which stamps `SyntaxError:` on the message. Match both so the
 /// friendlier prefix still triggers on either engine.
@@ -832,7 +839,7 @@ fn looks_like_syntax_error(msg: &str) -> bool {
 }
 
 /// Pull the property name out of a `Cannot read properties of undefined
-/// (reading 'foo')` TypeError message, matching the reference regex.
+/// (reading 'foo')` `TypeError` message, matching the reference regex.
 fn extract_missing_prop(msg: &str) -> Option<String> {
     let key = "(reading '";
     let start = msg.find(key)? + key.len();
@@ -889,7 +896,7 @@ mod timeout_override_tests {
     fn positive_millis_override() {
         assert_eq!(
             workspace_api_timeout_from(Some("120000")),
-            Duration::from_millis(120_000)
+            Duration::from_secs(120)
         );
         assert_eq!(
             workspace_api_timeout_from(Some(" 500 ")),

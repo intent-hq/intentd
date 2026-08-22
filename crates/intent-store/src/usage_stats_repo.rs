@@ -24,8 +24,8 @@ use crate::Store;
 
 /// One additive contribution to a `(bucket_utc, model, provider)` bucket. All counters
 /// default to 0, so writers set only the fields their path owns (turn end:
-/// tokens + runs + longest_run_ms; session start: sessions_started;
-/// lines-changed: lines_added/lines_deleted). `longest_run_ms` is folded in
+/// tokens + runs + `longest_run_ms`; session start: `sessions_started`;
+/// lines-changed: `lines_added/lines_deleted`). `longest_run_ms` is folded in
 /// with MAX semantics, not summed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageStatsDelta {
@@ -91,6 +91,10 @@ impl Store {
     /// `local_date` / `local_hour` untouched, so an existing bucket keeps its
     /// first-writer's stamp. `None` (local offset indeterminate at record
     /// time) persists NULLs, which readers treat like pre-D12 rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn add_usage_stats(
         &self,
         bucket_utc: &str,
@@ -122,16 +126,16 @@ impl Store {
         .bind(provider)
         .bind(local.map(|l| l.date.as_str()))
         .bind(local.map(|l| i64::from(l.hour)))
-        .bind(delta.input_tokens as i64)
-        .bind(delta.output_tokens as i64)
-        .bind(delta.cache_read_tokens as i64)
-        .bind(delta.cache_creation_tokens as i64)
-        .bind(delta.thought_tokens as i64)
-        .bind(delta.runs as i64)
-        .bind(delta.sessions_started as i64)
-        .bind(delta.longest_run_ms as i64)
-        .bind(delta.lines_added as i64)
-        .bind(delta.lines_deleted as i64)
+        .bind(delta.input_tokens.cast_signed())
+        .bind(delta.output_tokens.cast_signed())
+        .bind(delta.cache_read_tokens.cast_signed())
+        .bind(delta.cache_creation_tokens.cast_signed())
+        .bind(delta.thought_tokens.cast_signed())
+        .bind(delta.runs.cast_signed())
+        .bind(delta.sessions_started.cast_signed())
+        .bind(delta.longest_run_ms.cast_signed())
+        .bind(delta.lines_added.cast_signed())
+        .bind(delta.lines_deleted.cast_signed())
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("add usage stats failed: {e}")))?;
@@ -141,6 +145,10 @@ impl Store {
     /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model,
     /// provider)` — the read surface the `stats.getUsage` aggregation (and
     /// tests) build on; period filtering/grouping happens in the service layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
         let rows = sqlx::query(&format!(
             "SELECT bucket_utc, model, provider, local_date, local_hour, {COUNTER_COLUMNS}
@@ -161,16 +169,16 @@ impl Store {
                     .get::<Option<i64>, _>("local_hour")
                     .and_then(|h| u8::try_from(h).ok())
                     .filter(|h| *h < 24),
-                input_tokens: row.get::<i64, _>("input_tokens") as u64,
-                output_tokens: row.get::<i64, _>("output_tokens") as u64,
-                cache_read_tokens: row.get::<i64, _>("cache_read_tokens") as u64,
-                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens") as u64,
-                thought_tokens: row.get::<i64, _>("thought_tokens") as u64,
-                runs: row.get::<i64, _>("runs") as u64,
-                sessions_started: row.get::<i64, _>("sessions_started") as u64,
-                longest_run_ms: row.get::<i64, _>("longest_run_ms") as u64,
-                lines_added: row.get::<i64, _>("lines_added") as u64,
-                lines_deleted: row.get::<i64, _>("lines_deleted") as u64,
+                input_tokens: row.get::<i64, _>("input_tokens").cast_unsigned(),
+                output_tokens: row.get::<i64, _>("output_tokens").cast_unsigned(),
+                cache_read_tokens: row.get::<i64, _>("cache_read_tokens").cast_unsigned(),
+                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens").cast_unsigned(),
+                thought_tokens: row.get::<i64, _>("thought_tokens").cast_unsigned(),
+                runs: row.get::<i64, _>("runs").cast_unsigned(),
+                sessions_started: row.get::<i64, _>("sessions_started").cast_unsigned(),
+                longest_run_ms: row.get::<i64, _>("longest_run_ms").cast_unsigned(),
+                lines_added: row.get::<i64, _>("lines_added").cast_unsigned(),
+                lines_deleted: row.get::<i64, _>("lines_deleted").cast_unsigned(),
             })
             .collect())
     }
@@ -445,13 +453,15 @@ mod tests {
     }
 
     /// The 0057 migration backfill stamps pre-D12 rows (NULL local columns)
-    /// from `bucket_utc` via SQLite's system-timezone conversion and leaves
+    /// from `bucket_utc` via `SQLite`'s system-timezone conversion and leaves
     /// already-stamped rows alone. Fresh DBs run the migration against an
     /// empty table, so re-execute the migration's UPDATE (the real embedded
     /// SQL, ALTERs skipped) against seeded pre-D12 rows and check it against
-    /// SQLite's own `'localtime'` conversion.
+    /// `SQLite`'s own `'localtime'` conversion.
     #[tokio::test]
     async fn migration_backfill_stamps_pre_d12_rows_from_system_timezone() {
+        // (bucket_utc, local_date, local_hour, expected_date, expected_hour)
+        type BackfillCheckRow = (String, Option<String>, Option<i64>, Option<String>, i64);
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         for bucket in ["2026-07-25T00:00:00Z", "2026-07-25T23:00:00Z"] {
@@ -501,8 +511,6 @@ mod tests {
                 .expect("run backfill statement");
         }
 
-        // (bucket_utc, local_date, local_hour, expected_date, expected_hour)
-        type BackfillCheckRow = (String, Option<String>, Option<i64>, Option<String>, i64);
         let checked: Vec<BackfillCheckRow> = sqlx::query_as(
             "SELECT bucket_utc, local_date, local_hour,
                         date(bucket_utc, 'localtime'),
@@ -531,7 +539,7 @@ mod tests {
         }
     }
 
-    /// The 0059 provider migration rebuilds the table (SQLite cannot alter a
+    /// The 0059 provider migration rebuilds the table (`SQLite` cannot alter a
     /// PK) and must preserve pre-existing rows with `provider = 'unknown'`.
     /// Fresh DBs run the migration against an empty table, so recreate the
     /// pre-0059 shape, seed rows, and re-execute the migration's embedded SQL.

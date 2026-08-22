@@ -37,7 +37,7 @@ use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::map_git_err;
 
 /// Default wall-clock bound for the cache clone, matching the service-layer
-/// clone budget (`intent-services` CLONE_TIMEOUT).
+/// clone budget (`intent-services` `CLONE_TIMEOUT`).
 const CACHE_CLONE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 
 /// Env var overriding the clone bound, in whole seconds. Unset, unparseable,
@@ -45,7 +45,7 @@ const CACHE_CLONE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 const CACHE_CLONE_TIMEOUT_ENV: &str = "INTENTD_CACHE_CLONE_TIMEOUT_SECS";
 
 /// Default wall-clock bound for the refresh fetch, matching
-/// [`crate::fetch`]'s SHELL_FETCH_TIMEOUT.
+/// [`crate::fetch`]'s `SHELL_FETCH_TIMEOUT`.
 const CACHE_FETCH_TIMEOUT_DEFAULT: Duration = Duration::from_secs(100);
 
 /// Env var overriding the fetch bound, in whole seconds. Unset, unparseable,
@@ -210,6 +210,10 @@ fn forget_fresh(cache_path: &Path) {
 /// git via the environment (see [`crate::auth`]); it never appears in argv.
 /// Callers for the same repo serialize on a per-repo async lock; the git work
 /// itself runs on the blocking pool.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `owner`/`repo` is not a safe path segment; `Error::Internal` if the clone or refresh fails.
 pub async fn ensure_cached_repo(
     cache_root: &Path,
     github_url: &str,
@@ -225,6 +229,10 @@ pub async fn ensure_cached_repo(
 /// [`CacheEnsureEvent`]s while the ensure runs. The callback is invoked from
 /// the blocking pool and drain threads — it must be cheap and non-blocking
 /// (e.g. a channel send). `None` behaves exactly like [`ensure_cached_repo`].
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `owner`/`repo` is not a safe path segment; `Error::Internal` if the clone or refresh fails.
 pub async fn ensure_cached_repo_with_progress(
     cache_root: &Path,
     github_url: &str,
@@ -592,6 +600,10 @@ fn chunk_fn(
 /// [`ensure_cached_repo`] refresh/re-clone of the same cache (which
 /// hard-resets or deletes the directory mid-read). The closure runs on the
 /// blocking pool.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the blocking task fails; otherwise propagates the closure result.
 pub async fn with_cache_lock_blocking<T, F>(cache_path: &Path, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -635,6 +647,10 @@ pub struct CachedBranches {
 /// reader therefore verifies the slot's `origin` actually points at
 /// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
 /// a local seed) is a miss, never another repo's branch list.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if `owner`/`repo` is not a safe path segment; `Error::Internal` if reading the cached branch list fails.
 pub async fn list_cached_branches(
     cache_root: &Path,
     owner: &str,
@@ -711,7 +727,7 @@ fn list_cached_branches_blocking(
 ///    GitHub branches) into the clone so `base_ref` resolution sees every
 ///    upstream branch, not just the cache's default.
 /// 3. Create + check out `branch` from `base_ref` (same resolution and
-///    branch-reuse semantics as the CoW checkout path) and hard-reset to it.
+///    branch-reuse semantics as the `CoW` checkout path) and hard-reset to it.
 /// 4. Retarget `origin` from the cache path to `origin_url` (the real GitHub
 ///    URL), so pushes/fetches in the checkout never touch the cache.
 /// 5. Populate submodules from the cache's local module git dirs
@@ -744,6 +760,10 @@ pub(crate) fn provision_direct_checkout(
 /// callback: the submodule-population `git submodule update … --progress`
 /// output streams through `on_submodule_chunk` as it arrives. `None` behaves
 /// exactly like [`provision_direct_checkout`].
+///
+/// # Errors
+///
+/// Returns [`Error::BaseRefUnresolvable`] if `base_ref` does not resolve; `Error::Internal` for clone, checkout, or submodule-population failures.
 pub fn provision_direct_checkout_with_progress(
     cache_path: &Path,
     checkout_path: &Path,
@@ -755,7 +775,7 @@ pub fn provision_direct_checkout_with_progress(
     let sha = provision_plain_clone_checkout(
         cache_path,
         checkout_path,
-        OriginTarget::Url(origin_url),
+        &OriginTarget::Url(origin_url),
         branch,
         base_ref,
     )?;
@@ -904,7 +924,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &to)?;
         } else {
-            copy_dir_entry(&entry, &ty, &to)?;
+            copy_dir_entry(&entry, ty, &to)?;
         }
     }
     Ok(())
@@ -913,7 +933,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Copy one non-directory dir entry (file or symlink) to `to`.
 fn copy_dir_entry(
     entry: &std::fs::DirEntry,
-    ty: &std::fs::FileType,
+    ty: std::fs::FileType,
     to: &Path,
 ) -> std::io::Result<()> {
     if ty.is_symlink() {
@@ -1079,7 +1099,7 @@ fn copy_modules_subdir(
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
         if !ty.is_dir() {
-            copy_dir_entry(&entry, &ty, &to)?;
+            copy_dir_entry(&entry, ty, &to)?;
             continue;
         }
         let child_rel = rel.join(entry.file_name());
@@ -1110,7 +1130,7 @@ fn copy_module_dir(src: &Path, dst: &Path, nested: &ModuleLiveness) -> std::io::
         } else if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &to)?;
         } else {
-            copy_dir_entry(&entry, &ty, &to)?;
+            copy_dir_entry(&entry, ty, &to)?;
         }
     }
     Ok(())
@@ -1139,7 +1159,7 @@ pub(crate) enum OriginTarget<'a> {
 pub(crate) fn provision_plain_clone_checkout(
     source_path: &Path,
     checkout_path: &Path,
-    origin: OriginTarget<'_>,
+    origin: &OriginTarget<'_>,
     branch: &str,
     base_ref: Option<&str>,
 ) -> Result<String> {
@@ -1235,7 +1255,7 @@ fn run_git_streamed(
     timeout: Duration,
     on_chunk: Option<ProgressChunkFn>,
 ) -> Result<()> {
-    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
+    let os_args: Vec<&std::ffi::OsStr> = args.iter().map(std::convert::AsRef::as_ref).collect();
     run_git_os_streamed(dir, &os_args, token, timeout, on_chunk)
 }
 
@@ -1299,9 +1319,10 @@ fn run_git_os_streamed(
     // forever — the poll loop below would then kill a healthy child at the
     // deadline.
     let drain = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || match on_chunk {
-            Some(cb) => drain_chunks(stderr, &cb),
-            None => {
+        std::thread::spawn(move || {
+            if let Some(cb) = on_chunk {
+                drain_chunks(stderr, &cb)
+            } else {
                 use std::io::Read;
                 let mut stderr = stderr;
                 let mut buf = String::new();
@@ -1419,16 +1440,13 @@ fn take_valid_utf8(bytes: &mut Vec<u8>) -> String {
             Err(e) => {
                 let (valid, rest) = input.split_at(e.valid_up_to());
                 out.push_str(std::str::from_utf8(valid).expect("validated prefix"));
-                match e.error_len() {
-                    Some(len) => {
-                        out.push(char::REPLACEMENT_CHARACTER);
-                        input = &rest[len..];
-                    }
-                    None => {
-                        // Incomplete trailing sequence: keep for the next read.
-                        input = rest;
-                        break;
-                    }
+                if let Some(len) = e.error_len() {
+                    out.push(char::REPLACEMENT_CHARACTER);
+                    input = &rest[len..];
+                } else {
+                    // Incomplete trailing sequence: keep for the next read.
+                    input = rest;
+                    break;
                 }
             }
         }
@@ -1523,7 +1541,7 @@ mod tests {
         dir
     }
 
-    /// Self-cleaning scratch dir for a cache root (testutil's TempDir is tied
+    /// Self-cleaning scratch dir for a cache root (testutil's `TempDir` is tied
     /// to `init_repo`; a cache root must start empty and non-git).
     struct CacheRoot(PathBuf);
 

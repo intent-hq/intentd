@@ -1,4 +1,4 @@
-//! OpenAI transcription provider (`POST /v1/audio/transcriptions`, multipart).
+//! `OpenAI` transcription provider (`POST /v1/audio/transcriptions`, multipart).
 //!
 //! Uses the configured model (`voice.openai.model`, default
 //! `gpt-4o-transcribe`) and falls back to `whisper-1` when the selected model
@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::engine::{TranscribeRequest, Transcript, VoiceEngine};
 use crate::error::{Error, Result};
 
-/// Default OpenAI REST base URL.
+/// Default `OpenAI` REST base URL.
 pub(crate) const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
 
 /// Default transcription model (the `voice.openai.model` catalog default).
@@ -24,7 +24,7 @@ const DEFAULT_MODEL: &str = "gpt-4o-transcribe";
 /// Fallback model when the selected model is unavailable on the account.
 const FALLBACK_MODEL: &str = "whisper-1";
 
-/// OpenAI implementation of [`VoiceEngine`].
+/// `OpenAI` implementation of [`VoiceEngine`].
 pub(crate) struct OpenAiEngine {
     http: reqwest::Client,
     /// Secret API key. Never logged, printed, or surfaced via `Debug`.
@@ -40,7 +40,7 @@ impl std::fmt::Debug for OpenAiEngine {
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("api_key", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -67,11 +67,7 @@ impl OpenAiEngine {
     }
 
     /// Build the multipart form for one attempt (forms are not cloneable).
-    fn build_form(
-        &self,
-        request: &TranscribeRequest,
-        model: &str,
-    ) -> Result<reqwest::multipart::Form> {
+    fn build_form(request: &TranscribeRequest, model: &str) -> Result<reqwest::multipart::Form> {
         let file_name = super::elevenlabs::file_name_for(&request.mime_type);
         let part = reqwest::multipart::Part::bytes(request.audio.clone())
             .file_name(file_name)
@@ -93,7 +89,7 @@ impl OpenAiEngine {
     /// One transcription attempt against `model`.
     async fn attempt(&self, request: &TranscribeRequest, model: &str) -> Result<Transcript> {
         let url = format!("{}/v1/audio/transcriptions", self.base_url);
-        let form = self.build_form(request, model)?;
+        let form = Self::build_form(request, model)?;
         let resp = self
             .http
             .post(&url)
@@ -124,7 +120,12 @@ impl OpenAiEngine {
         let duration_ms = body
             .get("duration")
             .and_then(Value::as_f64)
-            .map(|secs| (secs * 1000.0) as u64);
+            // Float→int casts saturate; durations are non-negative seconds.
+            .map(|secs| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = (secs * 1000.0) as u64;
+                ms
+            });
         Ok(Transcript { text, duration_ms })
     }
 }

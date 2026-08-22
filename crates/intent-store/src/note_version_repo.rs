@@ -19,6 +19,10 @@ impl Store {
     /// Append a full-snapshot version of `note` (its *current* content) and
     /// prune to the newest [`MAX_NOTE_VERSIONS`]. Returns the new version
     /// number (1-based, strictly increasing per note).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn append_note_version(
         &self,
         note: &Note,
@@ -96,6 +100,10 @@ impl Store {
     /// (`content_length` is computed in SQL). Scoped by
     /// `(workspace_id, note_id)` (migration 0030 composite FK) so a same-id
     /// note in another workspace cannot leak its version history.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_note_versions(
         &self,
         workspace_id: &WorkspaceId,
@@ -116,6 +124,10 @@ impl Store {
 
     /// Fetch one stored version (with content), or `NotFound`. Scoped by
     /// `(workspace_id, note_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the note version does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn get_note_version(
         &self,
         workspace_id: &WorkspaceId,

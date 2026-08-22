@@ -322,8 +322,7 @@ impl ModelCatalogCache {
     pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     }
 
     /// The last successfully fetched rows for `provider_id` regardless of
@@ -386,6 +385,32 @@ impl ModelCatalogCache {
             (entry.version_key.clone(), default_id)
         };
         (entry_version_key == (source.version_key)()).then_some(default_id)
+    }
+
+    /// The cached catalog's default-model id for `provider_id`, falling back
+    /// to the FIRST row of the provider's last-good entry when no row is
+    /// marked `isDefault` (default-provider self-heal, monorepo#3044). Same
+    /// synchronous, read-only, probe-free contract as
+    /// [`Self::cached_default_model`]: an unregistered provider, cold cache,
+    /// stale-pin entry, or an empty catalog all return `None` (the caller
+    /// then persists the provider without a model).
+    pub(crate) fn cached_default_or_first_model(&self, provider_id: &str) -> Option<String> {
+        if let Some(m) = self.cached_default_model(provider_id) {
+            return Some(m);
+        }
+        let source = source_for(provider_id)?;
+        let (entry_version_key, first_id) = {
+            let entries = self.entries.lock().expect("model catalog cache poisoned");
+            let entry = entries.get(provider_id)?;
+            let first_id = entry
+                .models
+                .first()
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            (entry.version_key.clone(), first_id)
+        };
+        (entry_version_key == (source.version_key)()).then_some(first_id)
     }
 
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
@@ -497,7 +522,8 @@ impl ModelCatalogCache {
             return None;
         }
         let age = now_ms - entry.failed_at_ms;
-        (age < MODELS_NEGATIVE_TTL.as_millis() as u64).then(|| entry.reason.clone())
+        (age < u64::try_from(MODELS_NEGATIVE_TTL.as_millis()).unwrap_or(u64::MAX))
+            .then(|| entry.reason.clone())
     }
 
     /// Record a probe failure so non-forced reads within
@@ -640,38 +666,34 @@ where
     let fetched = cell
         .get_or_init(|| async {
             let fetched = fetch().await;
-            match &fetched.models {
-                Some(models) => {
-                    cache.clear_negative(provider_id);
-                    if !models.is_empty() {
-                        cache.store(provider_id, version_key, models.clone(), now_ms);
-                    }
+            if let Some(models) = &fetched.models {
+                cache.clear_negative(provider_id);
+                if !models.is_empty() {
+                    cache.store(provider_id, version_key, models.clone(), now_ms);
                 }
-                None => {
-                    let reason = fetched
-                        .warning
-                        .clone()
-                        .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-                    cache.store_negative(provider_id, version_key, reason, now_ms);
-                }
+            } else {
+                let reason = fetched
+                    .warning
+                    .clone()
+                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+                cache.store_negative(provider_id, version_key, reason, now_ms);
             }
             fetched
         })
         .await
         .clone();
     cache.finish_inflight(provider_id, version_key, &cell);
-    match fetched.models {
-        Some(models) => ResolvedModels {
+    if let Some(models) = fetched.models {
+        ResolvedModels {
             models: Some(models),
             stale: false,
             warning: fetched.warning,
-        },
-        None => {
-            let reason = fetched
-                .warning
-                .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-            failure_fallback(cache, provider_id, version_key, reason)
         }
+    } else {
+        let reason = fetched
+            .warning
+            .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+        failure_fallback(cache, provider_id, version_key, reason)
     }
 }
 

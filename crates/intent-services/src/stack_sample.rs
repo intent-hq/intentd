@@ -59,6 +59,14 @@ pub(crate) async fn sample_stacks(
 
     #[cfg(unix)]
     {
+        /// Panic-safe release of the in-progress flag (dropped inside the
+        /// blocking task, so an unwinding capture still releases it).
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                SAMPLING_IN_PROGRESS.store(false, Ordering::Release);
+            }
+        }
         use std::sync::atomic::{AtomicBool, Ordering};
 
         static SAMPLING_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -70,14 +78,6 @@ pub(crate) async fn sample_stacks(
             return Err(Error::Internal(
                 "a stack sampling session is already in progress".to_string(),
             ));
-        }
-        /// Panic-safe release of the in-progress flag (dropped inside the
-        /// blocking task, so an unwinding capture still releases it).
-        struct Release;
-        impl Drop for Release {
-            fn drop(&mut self) {
-                SAMPLING_IN_PROGRESS.store(false, Ordering::Release);
-            }
         }
 
         tokio::task::spawn_blocking(move || {
@@ -107,10 +107,10 @@ fn snapshot_sigprof() -> Option<SigprofSnapshot> {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         let mut timer: libc::itimerval = std::mem::zeroed();
-        if libc::sigaction(libc::SIGPROF, std::ptr::null(), &mut action) != 0 {
+        if libc::sigaction(libc::SIGPROF, std::ptr::null(), &raw mut action) != 0 {
             return None;
         }
-        if libc::getitimer(libc::ITIMER_PROF, &mut timer) != 0 {
+        if libc::getitimer(libc::ITIMER_PROF, &raw mut timer) != 0 {
             return None;
         }
         Some(SigprofSnapshot { action, timer })
@@ -141,9 +141,13 @@ impl Drop for RestoreSigprof {
         // process moments ago; handler before timer so no SIGPROF is
         // delivered to a not-yet-restored handler.
         unsafe {
-            let _ = libc::sigaction(libc::SIGPROF, &snap.action, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGPROF, &raw const snap.action, std::ptr::null_mut());
             if timer_armed {
-                let _ = libc::setitimer(libc::ITIMER_PROF, &snap.timer, std::ptr::null_mut());
+                let _ = libc::setitimer(
+                    libc::ITIMER_PROF,
+                    &raw const snap.timer,
+                    std::ptr::null_mut(),
+                );
             }
         }
     }
@@ -160,12 +164,14 @@ fn capture(duration_ms: i64, frequency_hz: i64) -> Result<serde_json::Value> {
     // Blocklist per pprof guidance: unwinding through these from the signal
     // handler risks deadlocks on their internal locks.
     let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(frequency_hz as i32)
+        .frequency(i32::try_from(frequency_hz).expect("frequency clamped to [1, 250]"))
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
         .map_err(|e| Error::Internal(format!("failed to start stack sampler: {e}")))?;
 
-    std::thread::sleep(std::time::Duration::from_millis(duration_ms as u64));
+    std::thread::sleep(std::time::Duration::from_millis(
+        duration_ms.cast_unsigned(),
+    ));
 
     let report = guard
         .report()
@@ -300,9 +306,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn preexisting_sigprof_handler_is_restored() {
-        let _serial = CAPTURE_SERIAL.lock().await;
-
         extern "C" fn external_handler(_: libc::c_int) {}
+        let _serial = CAPTURE_SERIAL.lock().await;
 
         // SAFETY: installs/reads SIGPROF dispositions on this test process
         // only; serialized with the other capture tests via CAPTURE_SERIAL.
@@ -311,7 +316,7 @@ mod tests {
             external.sa_sigaction = external_handler as *const () as usize;
             let mut previous: libc::sigaction = std::mem::zeroed();
             assert_eq!(
-                libc::sigaction(libc::SIGPROF, &external, &mut previous),
+                libc::sigaction(libc::SIGPROF, &raw const external, &raw mut previous),
                 0,
                 "install external handler"
             );
@@ -322,12 +327,12 @@ mod tests {
 
             let mut after: libc::sigaction = std::mem::zeroed();
             assert_eq!(
-                libc::sigaction(libc::SIGPROF, std::ptr::null(), &mut after),
+                libc::sigaction(libc::SIGPROF, std::ptr::null(), &raw mut after),
                 0,
                 "read disposition after sampling"
             );
             // Put the original disposition back before asserting.
-            libc::sigaction(libc::SIGPROF, &previous, std::ptr::null_mut());
+            libc::sigaction(libc::SIGPROF, &raw const previous, std::ptr::null_mut());
 
             assert_eq!(
                 after.sa_sigaction, external_handler as *const () as usize,
@@ -349,7 +354,7 @@ mod tests {
         let second = sample_stacks(Some(100), Some(99)).await;
         match second {
             Err(Error::Internal(msg)) => {
-                assert!(msg.contains("already in progress"), "msg: {msg}")
+                assert!(msg.contains("already in progress"), "msg: {msg}");
             }
             other => panic!("expected in-progress rejection, got {other:?}"),
         }
