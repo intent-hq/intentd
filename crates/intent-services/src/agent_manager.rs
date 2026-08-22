@@ -2947,9 +2947,10 @@ impl AgentManager {
             .collect();
 
         // The persisted model (bare part of a compound id) feeds the
-        // post-session model application for providers with no CLI model
-        // flag — `session/set_model` (grok) or `session/set_config_option`
-        // (claude-code) — see `maybe_apply_session_model`.
+        // post-session model application for providers whose adapter takes
+        // the model over ACP — `session/set_model` (grok) or
+        // `session/set_config_option` (claude-code, codex) — see
+        // `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
         // The persisted `reasoningEffort` (PROTOCOL §5.5) feeds the generic
@@ -3227,11 +3228,15 @@ impl AgentManager {
     /// (`supports_set_model`; grok today), and
     /// `session/set_config_option { configId: "model" }` for providers that
     /// expose the model as a session config option
-    /// (`supports_config_option_model`; claude-code today). Compound ids are
-    /// honored only when their provider prefix matches the running provider (a
-    /// stale id from a pre-spawn provider switch must not be sent); bare ids
-    /// are treated as provider-local. The `default` sentinel and empty ids are
-    /// no-ops. Failures are logged at WARN and never fail session startup.
+    /// (`supports_config_option_model`; claude-code, pi, and codex today —
+    /// codex's npx-fallback adapter ignores `-c model=…` argv overrides and
+    /// its `session/set_model` handler rejects our id formats, but it
+    /// advertises a bare-id `configOptions[id="model"]` select). Compound ids
+    /// are honored only when their provider prefix matches the running
+    /// provider (a stale id from a pre-spawn provider switch must not be
+    /// sent); bare ids are treated as provider-local. The `default` sentinel
+    /// and empty ids are no-ops. Failures are logged at WARN and never fail
+    /// session startup.
     async fn maybe_apply_session_model(
         conn: &Connection,
         provider: &ProviderConfig,
@@ -3307,7 +3312,11 @@ impl AgentManager {
     /// `session/set_config_option { configId: "model" }`, or `None` when the
     /// call should not be issued: providers without
     /// `supports_config_option_model`, or ids rejected by
-    /// [`Self::provider_local_model_target`].
+    /// [`Self::provider_local_model_target`]. For providers whose stored ids
+    /// may embed a reasoning effort (`config_option_model_strips_effort`;
+    /// codex `{base}/{effort}` ids), the suffix is stripped: the adapter's
+    /// model select values are bare base ids, and the effort rides the
+    /// separate `thought_level` config option.
     fn config_option_model_target<'m>(
         provider: &ProviderConfig,
         stored_model: Option<&'m str>,
@@ -3315,7 +3324,12 @@ impl AgentManager {
         if !provider.supports_config_option_model {
             return None;
         }
-        Self::provider_local_model_target(provider, stored_model)
+        let target = Self::provider_local_model_target(provider, stored_model)?;
+        if provider.config_option_model_strips_effort {
+            let base = target.split_once('/').map_or(target, |(base, _)| base);
+            return (!base.is_empty()).then_some(base);
+        }
+        Some(target)
     }
 
     /// Shared gating for the post-session model-application paths: `None` for
@@ -7934,6 +7948,16 @@ fn resolve_spawn(
         // application against the real daemon.
         let config_option_model =
             std::env::var("MOCK_AGENT_CONFIG_OPTION_MODEL").is_ok_and(|v| v == "1");
+        // `MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT=1` additionally marks
+        // the mock's stored model ids as effort-bearing (codex-like
+        // `{base}/{effort}`), so the E2E suite can assert the daemon strips
+        // the suffix before sending the config-option value.
+        let strips_effort =
+            std::env::var("MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT").is_ok_and(|v| v == "1");
+        // `MOCK_AGENT_SET_MODEL=1` marks the mock as a set_model provider
+        // (grok-like), so the E2E suite can exercise the post-session
+        // `session/set_model` application against the real daemon.
+        let set_model = std::env::var("MOCK_AGENT_SET_MODEL").is_ok_and(|v| v == "1");
         let provider = ProviderConfig {
             command: "node",
             base_args,
@@ -7946,6 +7970,8 @@ fn resolve_spawn(
             },
             supports_session_mcp_servers: session_mcp,
             supports_config_option_model: config_option_model,
+            config_option_model_strips_effort: config_option_model && strips_effort,
+            supports_set_model: set_model,
             ..*base
         };
         return Ok(ResolvedSpawn {
@@ -11521,6 +11547,50 @@ mod role_reminder_tests {
         assert_eq!(
             AgentManager::config_option_model_target(claude, Some("Opus 4.8")),
             None
+        );
+
+        // Codex opted into the config-option path (its npx-fallback adapter
+        // ignores `-c model=…` argv overrides, and its `session/set_model`
+        // handler rejects both bare and `{base}/{effort}` ids). The
+        // adapter's model select values are bare base ids, so a
+        // `{base}/{effort}` suffix is stripped daemon-side; the effort rides
+        // the separate `thought_level` config option.
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert_eq!(
+            AgentManager::set_model_target(codex, Some("gpt-5.6-sol")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(codex, Some("gpt-5.6-sol")),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(codex, Some("codex:gpt-5.3-codex/high")),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(codex, Some("gpt-5.6-sol/xhigh")),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(codex, Some("default")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(codex, Some("grok:grok-4.5")),
+            None
+        );
+        // A degenerate id that is ALL effort suffix must not send an empty
+        // model value.
+        assert_eq!(
+            AgentManager::config_option_model_target(codex, Some("/high")),
+            None
+        );
+        // claude-code ids keep any `/` verbatim — only providers flagged
+        // `config_option_model_strips_effort` split on it.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("some/model")),
+            Some("some/model")
         );
     }
 
