@@ -5809,7 +5809,7 @@ async fn create_rejects_bare_model_owned_by_other_provider() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -5985,7 +5985,7 @@ async fn create_rejects_bare_dynamic_model_via_cached_catalog() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         now,
     );
@@ -6038,8 +6038,12 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
     let auggie_rows = vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })];
     // Auggie claims fable-5, but grok has no cached catalog: ownership by
     // grok is not disproven, so the id passes.
-    svc.models_catalog
-        .test_store("auggie", "", auggie_rows.clone(), now);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        auggie_rows.clone(),
+        now,
+    );
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
         ..Default::default()
@@ -6080,7 +6084,7 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
     .await
     .expect("shared id claimed by the requested provider's own catalog");
     // Fresh services: auggie's claiming entry sits under a stale version key
-    // (auggie's current key is "" — no version pin), so it is not evidence
+    // under a stale version key, so it is not evidence
     // even though grok's own catalog disproves ownership.
     let (_t2, svc2, ws2) = setup().await;
     svc2.models_catalog
@@ -6119,7 +6123,7 @@ async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         now,
     );
@@ -6182,7 +6186,7 @@ async fn set_model_rejects_bare_model_owned_by_other_provider() {
     );
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -6239,7 +6243,7 @@ async fn set_model_normalizes_legacy_provider_aliases() {
     );
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -6288,7 +6292,7 @@ async fn set_model_bare_model_with_explicit_provider_id() {
     );
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -8910,7 +8914,7 @@ fn effort_guard_rejects_only_against_cached_evidence() {
     let cache = crate::model_catalog::ModelCatalogCache::new(None);
     cache.store_for_test(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -8951,7 +8955,7 @@ async fn create_validates_reasoning_effort_against_cached_effort_levels() {
     let (_t, svc, ws) = setup().await;
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -9039,7 +9043,7 @@ fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
         { "shortName": "old-model", "displayName": "Old", "isLegacyModel": true },
         { "displayName": "No shortName" },
         { "shortName": "haiku4.5", "displayName": "Haiku", "description": "",
-          "badges": [], "effortLevels": [] }
+          "badges": [], "effortLevels": [], "isLegacyModel": false }
     ] }"#;
     let rows = parse_model_list_json(out).expect("parsed");
     assert_eq!(rows.len(), 3, "row without shortName is skipped");
@@ -9060,6 +9064,7 @@ fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
     assert!(!haiku.contains_key("description"));
     assert!(!haiku.contains_key("badges"));
     assert!(!haiku.contains_key("effortLevels"));
+    assert!(!haiku.contains_key("isLegacyModel"));
 }
 
 #[test]
@@ -9070,7 +9075,7 @@ fn parse_model_list_json_rejects_non_catalog_payloads() {
 }
 
 #[test]
-fn finalize_model_rows_filters_legacy_and_sorts() {
+fn finalize_model_rows_preserves_legacy_metadata_and_sorts() {
     let rows = vec![
         json!({ "id": "z", "name": "Zeta", "provider": "auggie" }),
         json!({ "id": "old", "name": "Old", "provider": "auggie", "isLegacyModel": true }),
@@ -9084,10 +9089,39 @@ fn finalize_model_rows_filters_legacy_and_sorts() {
     let out = finalize_model_rows(rows);
     let ids: Vec<&str> = out.iter().map(|r| r["id"].as_str().unwrap()).collect();
     // Group asc, then priority asc, then name; missing priorities sort last.
-    assert_eq!(ids, vec!["a2", "a", "b", "z"]);
-    assert!(out
+    assert_eq!(ids, vec!["a2", "a", "b", "old", "z"]);
+    assert_eq!(out[3]["isLegacyModel"], true);
+    assert!(out[..3]
         .iter()
-        .all(|r| r.as_object().unwrap().get("isLegacyModel").is_none()));
+        .chain(&out[4..])
+        .all(|r| r.get("isLegacyModel").is_none()));
+}
+
+#[test]
+fn finalize_model_rows_preserves_full_mixed_catalog() {
+    let current = (0..12).map(|i| {
+        json!({ "id": format!("current-{i:02}"), "name": format!("Current {i:02}"),
+                "provider": "auggie" })
+    });
+    let legacy = (0..21).map(|i| {
+        json!({ "id": format!("legacy-{i:02}"), "name": format!("Legacy {i:02}"),
+                "provider": "auggie", "isLegacyModel": true })
+    });
+    let out = finalize_model_rows(current.chain(legacy).collect());
+
+    assert_eq!(out.len(), 33);
+    assert_eq!(
+        out.iter()
+            .filter(|row| row["isLegacyModel"] == true)
+            .count(),
+        21
+    );
+    assert_eq!(
+        out.iter()
+            .filter(|row| row.get("isLegacyModel").is_none())
+            .count(),
+        12
+    );
 }
 
 #[test]
@@ -9281,11 +9315,16 @@ async fn models_list_cortex_gate_is_open_and_serves_empty_list() {
     );
 }
 
-/// Seed the unified model cache under the legacy auggie key `("auggie", "")`
-/// (the timestamp is irrelevant to serving — entries never expire).
+/// Seed the unified model cache under the current Auggie catalog key.
+/// The timestamp is irrelevant to serving because entries never expire.
 fn seed_auggie_cache(svc: &Services, rows: Vec<serde_json::Value>) {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
-    svc.models_catalog.test_store("auggie", "", rows, now);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        rows,
+        now,
+    );
 }
 
 /// The test clock for the legacy-path tests (unix-ms shaped, arbitrary).
@@ -9411,7 +9450,11 @@ async fn models_list_legacy_negative_window_expires_then_refetches() {
     assert_eq!(res["source"], "auggie");
     assert!(svc
         .models_catalog
-        .test_negative_reason("auggie", "", later)
+        .test_negative_reason(
+            "auggie",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
+            later
+        )
         .is_none());
 }
 
@@ -9458,7 +9501,11 @@ async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
     assert!(res["warning"].is_string());
     assert!(svc
         .models_catalog
-        .test_negative_reason("auggie", "", legacy_now())
+        .test_negative_reason(
+            "auggie",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
+            legacy_now()
+        )
         .is_some());
 }
 
@@ -9469,8 +9516,12 @@ async fn models_list_legacy_cache_hit_ignores_negative_window() {
     // non-forced read to the stale fallback: the entry is served plainly.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "nw", "name": "NW", "provider": "auggie" })];
-    svc.models_catalog
-        .test_store("auggie", "", sentinel.clone(), 0);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        sentinel.clone(),
+        0,
+    );
     // A forced failed probe arms the negative window (stale fallback).
     let res = svc
         .models_list_auggie_with(true, legacy_now(), || Box::pin(async { None }))
@@ -9496,8 +9547,12 @@ async fn models_list_legacy_old_entry_served_without_probe() {
     // a non-forced read must never spawn a CLI probe when an entry exists.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "lg2", "name": "LG2", "provider": "auggie" })];
-    svc.models_catalog
-        .test_store("auggie", "", sentinel.clone(), 0);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        sentinel.clone(),
+        0,
+    );
     let res = svc
         .models_list_auggie_with(false, legacy_now(), || {
             panic!("must not probe when an entry exists")
@@ -9508,6 +9563,36 @@ async fn models_list_legacy_old_entry_served_without_probe() {
     assert_eq!(res["source"], "auggie");
     assert!(res["stale"].is_null() || res["stale"] == false, "{res}");
     assert!(res["warning"].is_null(), "{res}");
+}
+
+#[tokio::test]
+async fn models_list_auggie_empty_fallback_warning_matches_wire_shape() {
+    let (_t, svc, _ws) = setup().await;
+    let svc = svc.with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let internal = svc
+        .models_list_auggie_with(false, now, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch fallback");
+    assert_eq!(
+        internal["warning"],
+        "auggie CLI unavailable or returned no models"
+    );
+
+    let legacy = svc.models_list_op(None, false).await.expect("legacy read");
+    assert_eq!(legacy["source"], "static");
+    assert!(legacy.get("warning").is_none(), "{legacy}");
+
+    let provider = svc
+        .models_list_op(Some("auggie".to_string()), false)
+        .await
+        .expect("provider read");
+    assert_eq!(provider["providerId"], "auggie");
+    assert_eq!(provider["source"], "static");
+    assert_eq!(
+        provider["warning"],
+        "auggie CLI unavailable or returned no models"
+    );
 }
 
 #[tokio::test]

@@ -607,6 +607,71 @@ fn connect_with_session_result(
     (conn, note_rx, agent)
 }
 
+/// Mock agent that RECORDS every incoming request frame into `seen` before
+/// answering like the standard mock — lets tests assert the exact wire params
+/// (e.g. `session/new` `_meta`, monorepo#3151).
+fn spawn_recording_mock_agent<R, W>(
+    read: R,
+    write: W,
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            seen.lock().unwrap().push(value.clone());
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against the recording mock; also returns the recorded frames.
+#[allow(clippy::type_complexity)]
+fn connect_recording() -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<Value>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_recording_mock_agent(c2a_agent, a2c_agent, seen.clone());
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, seen)
+}
+
 async fn setup() -> (TempDb, Services, EventBus, AgentId, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -2689,6 +2754,106 @@ async fn recreate_acp_session_replaces_stored_id() {
     );
     let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+}
+
+/// Seed a second agent session with the codex provider and a task-derived
+/// name (monorepo#3151 wire tests).
+async fn insert_codex_agent(bus: &EventBus, workspace_id: &WorkspaceId) -> AgentId {
+    let agent_id = AgentId::from("agent-codex");
+    let mut session = new_session(&agent_id, workspace_id);
+    session.provider = Some("codex".to_string());
+    session.name = "Fix login bug".to_string();
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert codex agent session");
+    agent_id
+}
+
+/// The recorded `session/new` frame for monorepo#3151 assertions.
+fn recorded_session_new(seen: &Arc<std::sync::Mutex<Vec<Value>>>) -> Value {
+    let frames = seen.lock().unwrap();
+    frames
+        .iter()
+        .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
+        .cloned()
+        .expect("session/new frame recorded")
+}
+
+/// monorepo#3151: `open_acp_session` for a codex agent sends the task-derived
+/// agent name as `session/new` `_meta.sessionTitle` — and nothing else in
+/// `_meta` (the system prompt stays on the first-turn prepend).
+#[tokio::test]
+async fn open_acp_session_codex_sends_session_title_meta() {
+    let (_tmp, services, bus, _agent_id, ws) = setup().await;
+    let codex_id = insert_codex_agent(&bus, &ws).await;
+    let (conn, _rx, _agent, seen) = connect_recording();
+
+    services
+        .open_acp_session(&conn, &codex_id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+
+    let frame = recorded_session_new(&seen);
+    assert_eq!(
+        frame["params"]["_meta"],
+        json!({ "sessionTitle": "Fix login bug" }),
+        "codex session/new carries only _meta.sessionTitle"
+    );
+}
+
+/// monorepo#3151: the recreate path (`session/new` replacing a lost id) sends
+/// the same `_meta.sessionTitle` as the create path.
+#[tokio::test]
+async fn recreate_acp_session_codex_sends_session_title_meta() {
+    let (_tmp, services, bus, _agent_id, ws) = setup().await;
+    let codex_id = insert_codex_agent(&bus, &ws).await;
+    let (conn, _rx, _agent, seen) = connect_recording();
+
+    bus.store()
+        .set_acp_session_id(&ws, &codex_id, "stale-id")
+        .await
+        .unwrap();
+    services
+        .recreate_acp_session(&conn, &codex_id, "stale-id", "/tmp/ws", Vec::new())
+        .await
+        .expect("recreate session");
+
+    let frame = recorded_session_new(&seen);
+    assert_eq!(
+        frame["params"]["_meta"],
+        json!({ "sessionTitle": "Fix login bug" }),
+        "codex recreate session/new carries only _meta.sessionTitle"
+    );
+}
+
+/// monorepo#3151: the resume path stays unchanged — a codex `session/load`
+/// carries NO `_meta` (the durable thread already has its title).
+#[tokio::test]
+async fn resume_acp_session_codex_sends_no_meta() {
+    let (_tmp, services, bus, _agent_id, ws) = setup().await;
+    let codex_id = insert_codex_agent(&bus, &ws).await;
+    let (conn, _rx, _agent, seen) = connect_recording();
+
+    bus.store()
+        .set_acp_session_id(&ws, &codex_id, ACP_SID)
+        .await
+        .unwrap();
+    services
+        .resume_acp_session(&conn, &init_caps(true), &codex_id, "/tmp/ws", Vec::new())
+        .await
+        .expect("resume session")
+        .expect("session loaded");
+
+    let frames = seen.lock().unwrap();
+    let load = frames
+        .iter()
+        .find(|f| f.get("method").and_then(Value::as_str) == Some("session/load"))
+        .expect("session/load frame recorded");
+    assert!(
+        load["params"].get("_meta").is_none(),
+        "codex session/load carries no _meta (resume unchanged)"
+    );
 }
 
 /// `resume_acp_session` on the happy path emits the `session-load` status
