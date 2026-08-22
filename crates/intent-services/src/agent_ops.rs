@@ -2614,7 +2614,8 @@ impl Services {
     /// [1, 2000]); `metadata` is passed through verbatim when present so
     /// clients can distinguish automated rows. Bounded cost (RPC cost
     /// contract): a metadata-only session read plus ONE role-filtered index
-    /// read — non-user rows are excluded in SQL and the transcript is never
+    /// read whose previews are extracted and truncated inside SQL — full
+    /// content blobs never leave the database and the transcript is never
     /// hydrated.
     pub(crate) async fn agent_list_user_messages_op(
         &self,

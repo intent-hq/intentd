@@ -2968,11 +2968,13 @@ impl Store {
 
     /// Read an agent's user-role messages as lightweight index items in
     /// chronological (`seq` ascending) order — the `agent.listUserMessages`
-    /// projection (PROTOCOL §5.5). Selects only user rows in SQL (non-user
-    /// roles never hydrate), decodes each row's content once, and reduces it
-    /// to a plain-text preview bounded to `preview_chars` characters via
-    /// [`user_message_preview`]; `metadata` is passed through verbatim when
-    /// present.
+    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
+    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
+    /// the same expression the FTS index uses), and the preview truncated to
+    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
+    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
+    /// never transferred out of the database or decoded. `metadata` is
+    /// passed through verbatim when present.
     ///
     /// # Errors
     ///
@@ -2983,20 +2985,20 @@ impl Store {
         agent_id: &AgentId,
         preview_chars: usize,
     ) -> Result<Vec<UserMessageIndexItem>> {
-        let rows = sqlx::query(
-            "SELECT id, content, metadata, created_at FROM agent_message \
-             WHERE agent_id = ? AND role = 'user' ORDER BY seq ASC",
-        )
-        .bind(&agent_id.0)
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
+        let sql = format!(
+            "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
+                    m.metadata, m.created_at \
+             FROM agent_message m \
+             WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
+            .bind(&agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
         rows.iter()
             .map(|row| {
-                let content: serde_json::Value =
-                    serde_json::from_str(&col::<String>(row, "content")?).map_err(|e| {
-                        Error::Internal(format!("decode message content failed: {e}"))
-                    })?;
                 let metadata: Option<serde_json::Value> =
                     match col::<Option<String>>(row, "metadata")? {
                         Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
@@ -3006,7 +3008,7 @@ impl Store {
                     };
                 Ok(UserMessageIndexItem {
                     id: col(row, "id")?,
-                    preview: user_message_preview(&content, preview_chars),
+                    preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
                     metadata,
                     created_at: col(row, "created_at")?,
                 })
@@ -3384,30 +3386,6 @@ pub struct UserMessageIndexItem {
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
-}
-
-/// Extract plain text from a user message's JSON `content` and truncate it
-/// to `preview_chars` characters (char-boundary safe). Mirrors the
-/// services-layer `search_ops::message_text` extraction: a bare string is
-/// used as-is, an array of content blocks contributes each block's `text`
-/// field joined by spaces, and any other shape falls back to its compact
-/// JSON encoding.
-#[must_use]
-pub fn user_message_preview(content: &serde_json::Value, preview_chars: usize) -> String {
-    let text = match content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join(" "),
-        other => other.to_string(),
-    };
-    if text.chars().count() <= preview_chars {
-        text
-    } else {
-        text.chars().take(preview_chars).collect()
-    }
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
@@ -6177,43 +6155,75 @@ mod tests {
             .is_empty());
     }
 
-    /// [`user_message_preview`] extraction shapes: bare strings pass
-    /// through, block arrays join their `text` fields, non-JSON-array
-    /// shapes fall back to compact JSON, and truncation is char-boundary
-    /// safe on multi-byte text.
-    #[test]
-    fn user_message_preview_shapes_and_truncation() {
-        use super::user_message_preview;
+    /// The SQL preview extraction (`MESSAGE_FTS_TEXT_SQL` + `substr`) shapes:
+    /// bare strings pass through, block arrays join their `text` fields,
+    /// non-string/array shapes fall back to compact JSON, and truncation is
+    /// char-boundary safe on multi-byte text (`SQLite` `substr` counts
+    /// characters, not bytes).
+    #[tokio::test]
+    async fn user_message_preview_shapes_and_truncation() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-shapes".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        // Each case gets its own agent so one call reads one shape.
+        let preview_of = |content: serde_json::Value, chars: usize| {
+            let store = &store;
+            let ws_id = ws_id.clone();
+            let ts = ts.clone();
+            async move {
+                let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+                store
+                    .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+                    .await
+                    .expect("insert session");
+                store
+                    .append_agent_message(&agent_id, "user", &content, &ts)
+                    .await
+                    .expect("append");
+                let items = store
+                    .get_agent_user_message_index(&agent_id, chars)
+                    .await
+                    .expect("index");
+                items[0].preview.clone()
+            }
+        };
 
         assert_eq!(
-            user_message_preview(&serde_json::json!("plain string"), 300),
+            preview_of(serde_json::json!("plain string"), 300).await,
             "plain string"
         );
         assert_eq!(
-            user_message_preview(&serde_json::json!("plain string"), 5),
+            preview_of(serde_json::json!("plain string"), 5).await,
             "plain"
         );
         assert_eq!(
-            user_message_preview(
-                &serde_json::json!([
+            preview_of(
+                serde_json::json!([
                     {"type": "text", "text": "one"},
                     {"type": "tool_use", "name": "t"},
                     {"type": "text", "text": "two"},
                 ]),
                 300
-            ),
+            )
+            .await,
             "one two"
         );
         assert_eq!(
-            user_message_preview(&serde_json::json!({"weird": "shape"}), 300),
+            preview_of(serde_json::json!({"weird": "shape"}), 300).await,
             r#"{"weird":"shape"}"#
         );
         // Char-boundary-safe truncation on multi-byte text.
         let multibyte = "é".repeat(10);
-        assert_eq!(
-            user_message_preview(&serde_json::json!(multibyte), 4),
-            "éééé"
-        );
+        assert_eq!(preview_of(serde_json::json!(multibyte), 4).await, "éééé");
     }
 
     /// `get_agent_session_summary` returns the session row with `messages`

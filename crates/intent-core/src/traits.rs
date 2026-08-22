@@ -1436,9 +1436,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// `preview_chars` characters (`None` → server default, server-clamped);
     /// `metadata` is the persisted row metadata verbatim when present.
     /// Non-user rows are never included. Bounded cost: one role-filtered
-    /// SQL read decoding only `id/content/metadata/created_at` — the
-    /// transcript is never hydrated. `NotFound` on an unknown agent or a
-    /// workspace mismatch.
+    /// SQL read whose previews are extracted and truncated inside SQL —
+    /// full content blobs never leave the database and the transcript is
+    /// never hydrated. `NotFound` on an unknown agent or a workspace
+    /// mismatch.
     fn agent_list_user_messages(
         &self,
         agent_id: AgentId,
