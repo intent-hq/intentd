@@ -255,7 +255,7 @@ fn claude_code_meta_appends_system_prompt() {
 
 #[test]
 fn codex_gets_no_meta() {
-    // The pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`
+    // The pinned codex-acp adapter (1.6.2) ignores `_meta.developerInstructions`
     // (#479); codex uses the first-turn prepend fallback, so no _meta is built
     // regardless of the prompt.
     for prompt in [Some("Test prompt"), None, Some(""), Some("   \n\t  ")] {

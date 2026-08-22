@@ -1102,7 +1102,7 @@ fn select_entry<'a>(
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
 /// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
 /// use other mechanisms — codex moved to the first-turn prepend fallback because
-/// the pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`,
+/// the pinned codex-acp adapter (1.6.2) ignores `_meta.developerInstructions`,
 /// #479).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
