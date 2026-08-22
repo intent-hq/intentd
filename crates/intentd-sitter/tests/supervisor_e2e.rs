@@ -92,7 +92,6 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
         }
     }
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    log.lock().unwrap().push(path.to_string());
     let (status, body) = match routes.lock().unwrap().get(path) {
         Some(body) => ("200 OK", body.clone()),
         None => ("404 Not Found", b"not found".to_vec()),
@@ -103,6 +102,11 @@ fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
         body.len()
     );
     let _ = stream.write_all(&body);
+    // Log only after the response is fully written: a logged request proves
+    // its handler already read the route table, so a test that waits on the
+    // log and then swaps a route knows the swap cannot have been seen by
+    // that request.
+    log.lock().unwrap().push(path.to_string());
 }
 
 /// A base URL whose port refuses requests (network down).
