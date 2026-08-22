@@ -226,8 +226,8 @@ pub(crate) fn normalize_diff_paths(worktree: &Path, paths: Vec<String>) -> Vec<S
         .collect()
 }
 
-/// Parse the `git.stage` `paths` param and enforce the stage-all rejection,
-/// mirroring the TS builder exactly. Rejections and an empty result surface as
+/// Parse the `git.stage` `paths` param and enforce the stage-all rejection in
+/// every accepted shape. Rejections and an empty result surface as
 /// [`Error::Internal`] (→ `-32603`).
 pub(crate) fn parse_stage_paths(paths: &Value) -> Result<Vec<String>> {
     // Reject staging everything — operates on the original value (TS parity):
@@ -252,6 +252,12 @@ pub(crate) fn parse_stage_paths(paths: &Value) -> Result<Vec<String>> {
             .collect(),
         _ => Vec::new(),
     };
+
+    for path in &list {
+        if path == "." || path == "*" || path.contains("--all") {
+            return Err(Error::Internal(STAGE_ALL_MSG.to_string()));
+        }
+    }
 
     if list.is_empty() {
         return Err(Error::Internal(NO_PATHS_MSG.to_string()));
@@ -833,7 +839,14 @@ mod tests {
 
     #[test]
     fn rejects_stage_all_forms() {
-        for v in [json!("."), json!("*"), json!("git add --all")] {
+        for v in [
+            json!("."),
+            json!("*"),
+            json!("git add --all"),
+            json!(["tracked.txt", "*"]),
+            json!(["tracked.txt", "--all"]),
+            json!("tracked.txt,*"),
+        ] {
             let err = parse_stage_paths(&v).unwrap_err();
             assert!(matches!(err, Error::Internal(_)));
             assert!(format!("{err}").contains("Staging all files is not allowed"));
