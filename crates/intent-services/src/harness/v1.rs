@@ -654,6 +654,15 @@ impl Harness for V1 {
         )
     }
 
+    fn hook_exec_failures_warning(&self, lines: &[&str]) -> String {
+        format!(
+            "last run: {} host exec call{} failed (the run itself completed): {}",
+            lines.len(),
+            plural(i64::try_from(lines.len()).unwrap_or(i64::MAX)),
+            lines.join("; ")
+        )
+    }
+
     fn hook_wake_framing(
         &self,
         hook_name: &str,

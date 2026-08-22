@@ -216,6 +216,10 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String;
     /// Log-line warning for a returned hook `state` exceeding the byte cap.
     fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String;
+    /// Diagnostic summary for a run whose `ws.host.exec` calls failed
+    /// (nonzero exit / timeout) without the script throwing — persisted to
+    /// `lastError` so silent check failures stay observable (monorepo#3231).
+    fn hook_exec_failures_warning(&self, lines: &[&str]) -> String;
     /// `[Background hook "{name}"] {message}` framing plus the optional
     /// trailing state note.
     fn hook_wake_framing(&self, hook_name: &str, message: &str, state_note: Option<&str>)

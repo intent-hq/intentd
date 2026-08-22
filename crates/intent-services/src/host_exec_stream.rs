@@ -289,6 +289,9 @@ pub async fn start_stream(
         (Some(cwd), Some(ws_id)) => {
             Some(host_exec::resolve_cwd_within_workspace(api, ws_id, cwd, None).await?)
         }
+        // No explicit `cwd` but a workspace caller: default to the workspace
+        // root (monorepo#3231), same as the one-shot surface.
+        (None, Some(ws_id)) => host_exec::default_cwd_for_workspace(api, ws_id).await,
         _ => None,
     };
 

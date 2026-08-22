@@ -152,6 +152,33 @@ mod tests {
         assert!(r.get("timedOut").is_none());
     }
 
+    /// Regression for intent-hq/monorepo#3231: an omitted `cwd` must default
+    /// to the workspace root, not the daemon's own process cwd — in-hook
+    /// `git fetch` calls silently ran from the daemon's cwd and failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_defaults_cwd_to_workspace_root() {
+        let (api, ws) = api("default-cwd");
+        let root = api
+            .get_workspace(ws.clone())
+            .await
+            .unwrap()
+            .worktree_path
+            .unwrap();
+        let r = dispatch(&api, &ws, "exec", &json!({ "command": "pwd" }))
+            .await
+            .unwrap();
+        assert_eq!(r["exitCode"], 0);
+        let printed = r["stdout"].as_str().unwrap().trim();
+        // macOS `/tmp` resolves through a `/private` symlink; accept either.
+        let canonical = std::fs::canonicalize(&root)
+            .map_or_else(|_| root.clone(), |p| p.to_string_lossy().into_owned());
+        assert!(
+            printed == root || printed == canonical,
+            "pwd must print the workspace root ({root} or {canonical}), got {printed}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn exec_reports_non_zero_exit_code() {

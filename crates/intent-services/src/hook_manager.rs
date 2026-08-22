@@ -28,6 +28,13 @@
 //! pointer). A run may also return a `state`
 //! field: its JSON serialization persists to `last_state` (size-capped) and
 //! is injected into the next run as the `hookState` global.
+//!
+//! `ws.host.exec` calls inside a run are additionally observed by an
+//! in-envelope wrapper (monorepo#3231): a call that returns a nonzero
+//! `exitCode` or `timedOut: true` — without the script throwing — is
+//! recorded, and the run's failure summary persists to `last_error` on the
+//! (still-active) hook so a silently broken check is observable via
+//! `ws.hook.list`; a later all-healthy run clears it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -87,6 +94,13 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
 
+/// Caps on the per-run `ws.host.exec` failure capture (monorepo#3231): at
+/// most this many failed-exec lines are recorded per run, each truncated to
+/// this many chars, so a looping script cannot bloat the summary that lands
+/// in `last_error`.
+const HOOK_EXEC_FAILURE_MAX: usize = 5;
+const HOOK_EXEC_FAILURE_LINE_CAP: usize = 300;
+
 /// Control frames the service ops send to a hook's scheduler task.
 enum HookControl {
     /// Run the script immediately and reset the inter-run timer.
@@ -110,6 +124,7 @@ enum RunOutcome {
     Continue {
         logs: Option<String>,
         state: StateUpdate,
+        exec_error: Option<String>,
     },
     /// `{ dispatch: true, message }` — wake the owner; terminates the hook
     /// unless it is perpetual, which stays scheduled.
@@ -117,6 +132,7 @@ enum RunOutcome {
         message: String,
         logs: Option<String>,
         state: StateUpdate,
+        exec_error: Option<String>,
     },
     /// Throw or timeout — evict, persist the error, wake the owner.
     Failed { error: String, logs: RunLogs },
@@ -272,6 +288,8 @@ async fn run_hook_script(
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
     let max_bytes = HOOK_LOG_MAX_BYTES;
+    let exec_failure_max = HOOK_EXEC_FAILURE_MAX;
+    let exec_failure_line_cap = HOOK_EXEC_FAILURE_LINE_CAP;
     // The previous run's carry-over state, injected as the `hookState`
     // global. Embedded as a JSON.parse of a string literal so arbitrary
     // persisted JSON can never break the envelope; a corrupt row (should
@@ -314,6 +332,24 @@ async fn run_hook_script(
            }}\n\
          }};\n\
          const console = {{ log: __hook_log, info: __hook_log, warn: __hook_log, error: __hook_log }};\n\
+         const __hook_exec_failures = [];\n\
+         if (globalThis.ws && ws.host && typeof ws.host.exec === 'function') {{\n\
+           const __hook_exec_inner = ws.host.exec;\n\
+           ws.host.exec = async (opts) => {{\n\
+             const r = await __hook_exec_inner(opts);\n\
+             try {{\n\
+               if (r && (r.timedOut === true || (typeof r.exitCode === 'number' && r.exitCode !== 0))) {{\n\
+                 const cmd = [(opts && opts.command) || '?'].concat((opts && opts.args) || []).join(' ');\n\
+                 const why = r.timedOut === true ? 'timed out' : 'exit code ' + r.exitCode;\n\
+                 const stderr = (typeof r.stderr === 'string' ? r.stderr : '').trim();\n\
+                 let line = cmd + ' -> ' + why + (stderr ? ': ' + stderr : '');\n\
+                 if (line.length > {exec_failure_line_cap}) line = line.slice(0, {exec_failure_line_cap}) + '…';\n\
+                 if (__hook_exec_failures.length < {exec_failure_max}) __hook_exec_failures.push(line);\n\
+               }}\n\
+             }} catch (_e) {{}}\n\
+             return r;\n\
+           }};\n\
+         }}\n\
          const hookState = {hook_state_literal};\n\
          let __hook_user;\n\
          let __hook_threw = false;\n\
@@ -326,8 +362,8 @@ async fn run_hook_script(
          }}\n\
          const __logs = __hook_logs.length === 0 ? '' :\n\
            (__hook_logs_dropped ? '[earlier log lines truncated]\\n' : '') + __hook_logs.join('\\n');\n\
-         if (__hook_threw) return {{ __k: 'e', __v: __hook_err, __logs }};\n\
-         return {{ __k: __hook_user === undefined ? 'u' : 'v', __v: __hook_user, __logs }};"
+         if (__hook_threw) return {{ __k: 'e', __v: __hook_err, __logs, __execFailures: __hook_exec_failures }};\n\
+         return {{ __k: __hook_user === undefined ? 'u' : 'v', __v: __hook_user, __logs, __execFailures: __hook_exec_failures }};"
     );
     let opts = intent_js::EvalOptions {
         timeout,
@@ -340,12 +376,18 @@ async fn run_hook_script(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            let exec_error = parse_exec_failures(v.get("__execFailures"));
             match v.get("__k").and_then(Value::as_str) {
                 Some("u") => RunOutcome::Continue {
                     logs,
                     state: StateUpdate::Keep,
+                    exec_error,
                 },
-                Some("v") => parse_outcome(&v.get("__v").cloned().unwrap_or(Value::Null), logs),
+                Some("v") => parse_outcome(
+                    &v.get("__v").cloned().unwrap_or(Value::Null),
+                    logs,
+                    exec_error,
+                ),
                 Some("e") => RunOutcome::Failed {
                     error: v
                         .get("__v")
@@ -371,7 +413,7 @@ async fn run_hook_script(
 
 /// Interpret the script's returned value: only `{ dispatch: true }` fires a
 /// dispatch; everything else (including `null` and non-objects) re-runs.
-fn parse_outcome(v: &Value, logs: Option<String>) -> RunOutcome {
+fn parse_outcome(v: &Value, logs: Option<String>, exec_error: Option<String>) -> RunOutcome {
     let mut logs = logs;
     let state = parse_state(v, &mut logs);
     if v.get("dispatch").and_then(Value::as_bool) == Some(true) {
@@ -384,9 +426,32 @@ fn parse_outcome(v: &Value, logs: Option<String>) -> RunOutcome {
             message,
             logs,
             state,
+            exec_error,
         };
     }
-    RunOutcome::Continue { logs, state }
+    RunOutcome::Continue {
+        logs,
+        state,
+        exec_error,
+    }
+}
+
+/// Fold the run's captured `ws.host.exec` failure lines (`__execFailures`
+/// from the eval envelope) into the diagnostic summary persisted to
+/// `last_error` on non-evicting runs (monorepo#3231): `None` when the run
+/// had no failed execs. The harness owns the wording; the line count and
+/// per-line length are already capped in the envelope.
+fn parse_exec_failures(v: Option<&Value>) -> Option<String> {
+    let lines: Vec<&str> = v?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(crate::harness::latest().hook_exec_failures_warning(&lines))
 }
 
 /// Interpret a returned `state` field: absent keeps the previous carry-over
@@ -586,11 +651,13 @@ impl Services {
                 message,
                 logs,
                 state,
+                exec_error,
             } => {
                 let mut hook = hook;
                 hook.last_run_at = Some(now_iso());
                 hook.run_count = 1;
                 hook.last_logs = logs;
+                hook.last_error = exec_error;
                 state.apply(&mut hook);
                 // Perpetual (spec decision 4b): a dispatching validation run
                 // wakes the owner AND persists the ACTIVE schedule — unlike
@@ -648,11 +715,16 @@ impl Services {
                 self.maybe_emit_waiting_changed(workspace_id).await;
                 Ok(json!({ "hook": hook, "dispatched": true }))
             }
-            RunOutcome::Continue { logs, state } => {
+            RunOutcome::Continue {
+                logs,
+                state,
+                exec_error,
+            } => {
                 let mut hook = hook;
                 hook.last_run_at = Some(now_iso());
                 hook.run_count = 1;
                 hook.last_logs = logs;
+                hook.last_error = exec_error;
                 state.apply(&mut hook);
                 // A validation run that outlasts a short TTL completes
                 // normally, but a continue at/after expiresAt expires
@@ -1185,7 +1257,11 @@ impl Services {
         .await;
         let last_run_at = now_iso();
         match outcome {
-            RunOutcome::Continue { logs, state } => {
+            RunOutcome::Continue {
+                logs,
+                state,
+                exec_error,
+            } => {
                 // In-flight-run-at-expiry: a run already executing when the
                 // TTL passes completes normally, but a continue at/after
                 // `expiresAt` expires the hook instead of rescheduling it
@@ -1198,6 +1274,7 @@ impl Services {
                         .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                         .await?;
                     self.persist_hook_state(hook, state).await?;
+                    self.persist_hook_exec_error(hook, exec_error).await?;
                     self.store.expire_hook(&hook.hook_id).await?;
                     hook.state = HookState::Expired;
                     hook.last_run_at = Some(last_run_at);
@@ -1216,6 +1293,7 @@ impl Services {
                     .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                     .await?;
                 self.persist_hook_state(hook, state).await?;
+                self.persist_hook_exec_error(hook, exec_error).await?;
                 self.store
                     .update_hook_state(&hook.hook_id, HookState::Scheduled)
                     .await?;
@@ -1232,6 +1310,7 @@ impl Services {
                 message,
                 logs,
                 state,
+                exec_error,
             } => {
                 self.store
                     .update_hook_run(&hook.hook_id, &last_run_at, None)
@@ -1240,6 +1319,7 @@ impl Services {
                     .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                     .await?;
                 self.persist_hook_state(hook, state).await?;
+                self.persist_hook_exec_error(hook, exec_error).await?;
                 // A perpetual hook survives its own dispatch: count the fire,
                 // wake the owner, then return to `scheduled` and keep the
                 // loop alive. `hook:dispatched` is non-terminal here and may
@@ -1354,6 +1434,26 @@ impl Services {
                 Ok(false)
             }
         }
+    }
+
+    /// Persist a non-evicting run's `ws.host.exec` failure summary to
+    /// `last_error` (monorepo#3231) — or clear a previously recorded one when
+    /// this run's execs all succeeded, so a recovered check stops reading as
+    /// broken. Skips the write when nothing changes (the common all-healthy
+    /// cadence).
+    async fn persist_hook_exec_error(
+        &self,
+        hook: &mut Hook,
+        exec_error: Option<String>,
+    ) -> Result<()> {
+        if hook.last_error == exec_error {
+            return Ok(());
+        }
+        self.store
+            .update_hook_last_error(&hook.hook_id, exec_error.as_deref())
+            .await?;
+        hook.last_error = exec_error;
+        Ok(())
     }
 
     /// Apply a run's [`StateUpdate`] to the persisted row and the in-memory
@@ -3633,6 +3733,99 @@ mod tests {
             .expect("runNow again");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         wait_for_wake(&svc, &owner, "count 2").await;
+    }
+
+    /// Regression for intent-hq/monorepo#3231 (functional half): a hook's
+    /// `ws.host.exec` with no explicit `cwd` runs from the workspace root,
+    /// not the daemon's own process cwd.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_host_exec_defaults_cwd_to_workspace_root() {
+        let (_tmp, _root, svc, _ws, owner) = setup().await;
+        // A second workspace WITH a filesystem root (the setup default has
+        // none): the hook's exec must land there.
+        let root = tempfile::tempdir().expect("workspace root");
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.worktree_path = Some(root.path().to_string_lossy().into_owned());
+        svc.store().insert_workspace(&row).await.expect("ws");
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "cwd-probe",
+                    "code": "const r = await ws.host.exec({ command: 'pwd' }); \
+                             return { dispatch: true, message: 'pwd=' + r.stdout.trim() };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        assert_eq!(out["dispatched"], json!(true));
+        let expected = root.path().to_string_lossy().into_owned();
+        // macOS `/tmp` resolves through a `/private` symlink; accept either.
+        let canonical = std::fs::canonicalize(root.path())
+            .map_or_else(|_| expected.clone(), |p| p.to_string_lossy().into_owned());
+        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let text = serde_json::to_string(&session.messages).unwrap();
+        assert!(
+            text.contains(&format!("pwd={expected}")) || text.contains(&format!("pwd={canonical}")),
+            "hook exec must run from the workspace root ({expected} or {canonical}): {text}"
+        );
+    }
+
+    /// Regression for intent-hq/monorepo#3231 (observability half): a run
+    /// whose `ws.host.exec` fails (nonzero exit) without the script throwing
+    /// persists a failure summary to `lastError` on the still-active hook,
+    /// and a later all-healthy run clears it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_exec_failure_persists_last_error_and_recovery_clears_it() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Note-driven command switch: `fail` → exit 3, anything else → ok.
+        let mut probe = note(&ws, "exec-note", "fail");
+        svc.store().insert_note(&probe).await.unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "exec-failures",
+                    "code": "const n = await ws.note.read('exec-note'); \
+                             const arg = n.content.includes('fail') ? 'echo broken >&2; exit 3' : 'true'; \
+                             await ws.host.exec({ command: 'sh', args: ['-c', arg] }); \
+                             return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        // The validation run's failed exec landed in lastError, the hook is
+        // still active, and hook.list serializes it.
+        assert_eq!(hook.state, HookState::Scheduled);
+        let err = hook.last_error.as_deref().expect("lastError persisted");
+        assert!(err.contains("1 host exec call failed"), "{err}");
+        assert!(err.contains("exit code 3"), "{err}");
+        assert!(err.contains("broken"), "stderr snippet included: {err}");
+        let listed = svc.hook_list_op(&ws, Some(&owner)).await.unwrap();
+        assert_eq!(
+            listed["hooks"][0]["lastError"].as_str(),
+            hook.last_error.as_deref()
+        );
+        // A recovered run clears the warning.
+        probe.content = "ok".to_string();
+        svc.store().update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        let hook = wait_for_hook(&svc, &hook.hook_id, |h| {
+            h.run_count == 2 && h.last_error.is_none()
+        })
+        .await;
+        assert_eq!(hook.last_error, None);
+        assert_eq!(hook.state, HookState::Scheduled);
     }
 
     #[tokio::test]
