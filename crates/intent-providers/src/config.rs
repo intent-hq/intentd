@@ -393,12 +393,14 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         short_name: "Cortex",
         // Cortex defers ALL MCP tools by default (`settings.toolSearch !==
-        // false` — default ON): the model gets a names-only reminder
-        // ("Schemas are NOT loaded in your context") and sees no description
-        // text unless it calls `tool_search`. Serve the compact
-        // `workspace_api` description and carry the full ws.* reference in
-        // the system prompt (first-turn prepend).
-        truncates_tool_descriptions: true,
+        // false` — default ON): a names-only reminder ("Schemas are NOT
+        // loaded in your context") replaces description text unless the
+        // model calls `tool_search`. However, this entry has NO MCP delivery
+        // channel yet (no `supports_mcp_config` / `supports_session_mcp_servers`
+        // / env config / pi extension), so the workspace bridge never reaches
+        // cortex sessions — flipping `truncates_tool_descriptions` here would
+        // inject the full ws.* reference for tools cortex cannot call. Flip it
+        // together with bridge delivery: intent-hq/monorepo#3303.
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {

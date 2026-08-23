@@ -92,12 +92,13 @@ fn registry_field_parity() {
     // descriptions get the compact `workspace_api` description +
     // system-prompt API reference: claude-code cuts at ~2k chars
     // (anthropics/claude-code#53933), grok's `search_tool` truncates at
-    // 2,048 chars (MCP tools never appear in the tool list), cortex defers
-    // ALL MCP tools to a names-only reminder by default, and droid's remote
-    // Statsig `mcp_tool_search` flag gates 200-char deferred summaries
-    // (defensive). Evidence per entry lives in config.rs. Every other
-    // provider keeps the full tool description byte-identical to before.
-    let flagged = ["claude-code", "cortex", "droid", "grok"];
+    // 2,048 chars (MCP tools never appear in the tool list), and droid's
+    // remote Statsig `mcp_tool_search` flag gates 200-char deferred summaries
+    // (defensive). Cortex also defers ALL MCP tools to a names-only reminder,
+    // but it has no MCP delivery channel yet, so flagging it is deferred to
+    // intent-hq/monorepo#3303. Evidence per entry lives in config.rs. Every
+    // other provider keeps the full tool description byte-identical to before.
+    let flagged = ["claude-code", "droid", "grok"];
     for p in ACP_PROVIDERS {
         assert_eq!(
             p.truncates_tool_descriptions,
