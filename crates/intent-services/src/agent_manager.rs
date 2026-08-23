@@ -2467,7 +2467,11 @@ impl AgentManager {
             // Truncating providers get the full `workspace_api` reference in
             // the prompt (this bridge's exact per-agent assembly — gating,
             // chief-ness, and model options identical to what a non-flagged
-            // provider's tools/list would serve).
+            // provider's tools/list would serve). Invariant: truncating
+            // providers must go through this `rules_file.is_none()` branch —
+            // the bridge serves the compact description unconditionally, so a
+            // caller-supplied rules file would leave its "Workspace API
+            // Reference" pointer dangling (ws.help() as the only fallback).
             let workspace_api_docs = opts
                 .provider
                 .truncates_tool_descriptions

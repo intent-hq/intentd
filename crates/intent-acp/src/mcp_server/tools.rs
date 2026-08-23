@@ -1481,6 +1481,29 @@ mod tests {
                     !compact.contains("\nAPI:"),
                     "chief={is_chief}: compact description must cut before the API sections"
                 );
+                // Implementation-independent cut-placement guards (the
+                // `expected` splice above mirrors the production algorithm, so
+                // by itself it cannot catch a mis-placed cut): every index
+                // entry line of the full description survives verbatim, and
+                // the compact text ends exactly at the index's last entry.
+                let index_lines: Vec<&str> = full[..index_end]
+                    .lines()
+                    .filter(|l| l.starts_with("  ws."))
+                    .collect();
+                assert!(
+                    !index_lines.is_empty(),
+                    "chief={is_chief}: full description has no index entry lines"
+                );
+                for line in &index_lines {
+                    assert!(
+                        compact.contains(&format!("\n{line}\n")),
+                        "chief={is_chief}: compact description dropped index line {line:?}"
+                    );
+                }
+                assert!(
+                    compact.ends_with(&format!("{}\n", index_lines.last().unwrap())),
+                    "chief={is_chief}: compact description must end at the last index entry"
+                );
             }
         }
     }
@@ -1489,6 +1512,10 @@ mod tests {
     // the ~2k truncation cutoff (anthropics/claude-code#53933) — that is its
     // reason to exist — for both chief variants and every gating combination
     // (all-defaults is the longest; gating only removes index lines).
+    // Passing here strictly implies `namespace_index_fits_within_truncation_budget`
+    // passes (the compact text is the full description's prefix through the
+    // index, plus a longer header line); that test is kept because it guards
+    // the FULL description's prefix independently of the compact feature.
     #[test]
     fn compact_description_fits_within_truncation_budget() {
         const BUDGET: usize = 2000;
