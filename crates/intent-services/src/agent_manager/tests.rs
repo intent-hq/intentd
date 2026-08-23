@@ -2482,6 +2482,78 @@ async fn acquire_revalidates_candidate_after_claim() {
     );
 }
 
+/// monorepo#2247 (PR review) — the admission paths run inside ABORTABLE
+/// worker futures: when the future is dropped at the `kill().await`, the
+/// `ClaimGuard` releases the claim, and that release itself must kick the
+/// drain — otherwise a message that parked behind the claim (`try_begin`
+/// lost `ReapClaimed` mid-kill) strands until an unrelated queue event.
+#[tokio::test]
+async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-abort-kick");
+    let victim = AgentId::from("a-abort-kick");
+    seed_agent(&mgr, &ws, &victim).await;
+    let mut session = mgr.services.store.get_agent_session(&victim).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    // Keep `release_tx` alive: dropping it would complete the blocked kill
+    // and defeat the mid-kill abort below.
+    let (kill, mut entered_rx, _release_tx) = blocking_kill();
+    mgr.registry.register(victim.clone(), kill);
+    mgr.registry.set_last_active(&victim, 1);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    fill_active(&mgr, 7, &log);
+
+    let acquire = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            let (try_claim, release) = mgr.admission_claim_fns();
+            mgr.registry
+                .acquire(&AgentId::from("spawning"), try_claim, release)
+                .await;
+        })
+    };
+    entered_rx.recv().await.expect("kill entered");
+
+    // Mid-kill, a send parks behind the claim (its inline drain kick loses
+    // `try_begin` against the held claim).
+    mgr.services
+        .agent_queue_message_op(victim.clone(), "parked behind claim".into(), None, None)
+        .await
+        .expect("queue message");
+    assert_eq!(services.queue_snapshot(&victim).len(), 1, "message parked");
+
+    // Abort the admission future at the `kill().await`: the `ClaimGuard`
+    // releases the claim, and the release's own drain kick delivers the
+    // parked message — no tail call after the await ever runs here.
+    acquire.abort();
+    let _ = acquire.await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if services.queue_snapshot(&victim).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the aborted admission's claim release kicks the parked drain");
+}
+
 /// monorepo#2247 — the turn-start budget gate's eviction claims its victim
 /// against `try_begin` on the same terms as `acquire`'s evict arm.
 #[tokio::test]

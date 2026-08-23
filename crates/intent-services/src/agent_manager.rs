@@ -1258,8 +1258,9 @@ impl ProcessRegistry {
     /// Unlike the reap sweeps this future IS dropped in production (the
     /// worker task that spawns through it is abortable), so the held claim is
     /// released by a drop guard rather than a tail call — a drop at the
-    /// `kill().await` frees the claim; only the post-release drain kick is
-    /// skipped on that path.
+    /// `kill().await` frees the claim, and the admission `release` spawns the
+    /// drain kick itself ([`AgentManager::admission_claim_fns`]), so a message
+    /// that parked behind the claim drains even on that path.
     ///
     /// # Panics
     ///
@@ -2490,11 +2491,12 @@ impl AgentManager {
     ) -> Result<()> {
         // Claim-before-kill (monorepo#2247): the slot-cap/budget eviction
         // inside `acquire` claims its victim against `try_begin` exactly like
-        // the reap sweeps, so a turn cannot start on the victim mid-kill.
+        // the reap sweeps, so a turn cannot start on the victim mid-kill. The
+        // admission variant's `release` spawns its own drain kick, so the
+        // kick survives this (abortable) future being dropped mid-kill.
         {
-            let (try_claim, release, released) = self.reap_claim_fns();
+            let (try_claim, release) = self.admission_claim_fns();
             self.registry.acquire(&agent_id, try_claim, release).await;
-            self.kick_released_via_attached(released).await;
         }
 
         // Session row for the sub-agent derivation below and the prompt
@@ -7274,23 +7276,7 @@ impl AgentManager {
         Arc<Mutex<Vec<AgentId>>>,
     ) {
         let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
-        let try_claim = {
-            let busy = self.busy.clone();
-            let claims = self.reap_claims.clone();
-            move |id: &AgentId| {
-                // Lock order busy → reap_claims, matching `try_begin`, so
-                // "not busy → claimed" is atomic against a concurrent claim.
-                // The insert result IS the claim: `false` (already present)
-                // means an overlapping sweep holds this id — treating that as
-                // a win would let its release drop the shared claim while
-                // this sweep's kill is still in flight, reopening the window.
-                let busy = busy.lock().unwrap();
-                if busy.contains(id) {
-                    return false;
-                }
-                claims.lock().unwrap().insert(id.clone())
-            }
-        };
+        let try_claim = self.try_claim_fn();
         let release = {
             let claims = self.reap_claims.clone();
             let released = released.clone();
@@ -7300,6 +7286,67 @@ impl AgentManager {
             }
         };
         (try_claim, release, released)
+    }
+
+    /// The `try_claim` half of the claim-before-kill wiring, shared by
+    /// [`Self::reap_claim_fns`] and [`Self::admission_claim_fns`].
+    fn try_claim_fn(&self) -> impl Fn(&AgentId) -> bool {
+        let busy = self.busy.clone();
+        let claims = self.reap_claims.clone();
+        move |id: &AgentId| {
+            // Lock order busy → reap_claims, matching `try_begin`, so
+            // "not busy → claimed" is atomic against a concurrent claim.
+            // The insert result IS the claim: `false` (already present)
+            // means an overlapping sweep holds this id — treating that as
+            // a win would let its release drop the shared claim while
+            // this sweep's kill is still in flight, reopening the window.
+            let busy = busy.lock().unwrap();
+            if busy.contains(id) {
+                return false;
+            }
+            claims.lock().unwrap().insert(id.clone())
+        }
+    }
+
+    /// [`Self::reap_claim_fns`] for the ABORTABLE admission paths —
+    /// `create_agent`'s `acquire` and the worker's `acquire_turn_start`
+    /// (monorepo#2247). Same `try_claim`; `release` spawns the drain kick
+    /// for the released agent itself instead of recording it for a
+    /// post-sweep tail call, because these futures can be dropped at the
+    /// `kill().await` (the [`ClaimGuard`] then runs `release` from its
+    /// `Drop`) and a tail call after the await never runs on that path —
+    /// a message that parked behind the claim would strand until the next
+    /// unrelated queue event. The kick's `Arc<Self>` comes from the
+    /// manager attached to the services surface — production always
+    /// attaches it; when unattached (bare test wiring) or outside a tokio
+    /// runtime the kick is skipped and a parked message drains on the
+    /// next external queue event instead.
+    fn admission_claim_fns(&self) -> (impl Fn(&AgentId) -> bool, impl Fn(&AgentId)) {
+        let try_claim = self.try_claim_fn();
+        let release = {
+            let claims = self.reap_claims.clone();
+            let services = self.services.clone();
+            move |id: &AgentId| {
+                claims.lock().unwrap().remove(id);
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
+                let services = services.clone();
+                let id = id.clone();
+                handle.spawn(async move {
+                    let Some(mgr) = services.agent_manager() else {
+                        return;
+                    };
+                    if !services.has_ready_to_send(&id) {
+                        return;
+                    }
+                    if let Ok(session) = services.store.get_agent_session(&id).await {
+                        mgr.try_drain_queue(id, session.workspace_id).await;
+                    }
+                });
+            }
+        };
+        (try_claim, release)
     }
 
     /// Drain kick for messages that parked behind a claim: with the claim
@@ -7316,22 +7363,6 @@ impl AgentManager {
                     .try_drain_queue(id, session.workspace_id)
                     .await;
             }
-        }
-    }
-
-    /// [`Self::kick_released`] for `&self` callers (monorepo#2247): the
-    /// admission paths (`create_agent`'s `acquire`, the worker's
-    /// `acquire_turn_start`) run on `&self`, so the kick's `Arc<Self>` comes
-    /// from the manager attached to the services surface — production always
-    /// attaches it. When unattached (bare test wiring) or nothing was
-    /// released, this is a no-op; a parked message then drains on the next
-    /// external queue event instead of immediately.
-    async fn kick_released_via_attached(&self, released: Arc<Mutex<Vec<AgentId>>>) {
-        if released.lock().unwrap().is_empty() {
-            return;
-        }
-        if let Some(mgr) = self.services.agent_manager() {
-            mgr.kick_released(released).await;
         }
     }
 
@@ -8443,12 +8474,13 @@ async fn run_message_worker(
         {
             // Claim-before-kill (monorepo#2247): the turn-start gate's budget
             // eviction claims its victim against `try_begin` exactly like the
-            // reap sweeps, so a turn cannot start on the victim mid-kill.
-            let (try_claim, release, released) = mgr.reap_claim_fns();
+            // reap sweeps, so a turn cannot start on the victim mid-kill. The
+            // admission variant's `release` spawns its own drain kick, so the
+            // kick survives this (abortable) worker being dropped mid-kill.
+            let (try_claim, release) = mgr.admission_claim_fns();
             mgr.registry
                 .acquire_turn_start(&agent_id, try_claim, release)
                 .await;
-            mgr.kick_released(released).await;
         }
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
