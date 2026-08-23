@@ -198,7 +198,7 @@ async fn wss_rpc(
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -299,7 +299,7 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         #[cfg(not(unix))]
@@ -514,8 +514,7 @@ async fn await_drained_and_idle(
         let queue = wss_rpc(ws, 30, "agent.getQueue", json!({ "agentId": agent_id })).await;
         let empty = queue["queue"]
             .as_array()
-            .map(|q| q.is_empty())
-            .unwrap_or(false);
+            .is_some_and(std::vec::Vec::is_empty);
         let got = wss_rpc(
             ws,
             31,
@@ -628,7 +627,8 @@ async fn boot_restart_daemon(
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let ws = connect_ws(port, client_config(&fp)).await;
     (daemon, ws)
 }

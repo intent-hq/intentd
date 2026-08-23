@@ -52,6 +52,7 @@ async fn boot() -> Fixture {
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let services = Services::new(store)
         .with_workspaces_root(workspaces_root)
+        .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
@@ -163,7 +164,7 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     {
         let err = wss_rpc_raw(
             &mut rpc,
-            200 + i as i64,
+            200 + i64::try_from(i).expect("value fits in i64"),
             "agent.subscribe",
             json!({
                 "workspaceId": ws_id,

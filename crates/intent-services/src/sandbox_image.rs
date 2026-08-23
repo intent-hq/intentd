@@ -45,6 +45,7 @@ pub const SUPPORTED_EXEC_PROTOCOL: &str = "intent-exec/1";
 pub const BUILTIN_IMAGE_VERSION: &str = "0.1.0";
 
 /// Manifest URL of the built-in pinned base image (public mirror).
+#[must_use]
 pub fn builtin_manifest_url() -> String {
     format!(
         "https://github.com/intent-hq/intentd-releases/releases/download/guest-image-v{BUILTIN_IMAGE_VERSION}/manifest.json"
@@ -55,6 +56,7 @@ pub fn builtin_manifest_url() -> String {
 pub const GUEST_IMAGE_CACHE_DIR: &str = "guest-images";
 
 /// Cache root for guest images under the daemon `data_dir`.
+#[must_use]
 pub fn guest_image_cache_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(GUEST_IMAGE_CACHE_DIR)
 }
@@ -73,6 +75,7 @@ pub enum ImageSource {
 
 impl ImageSource {
     /// Stable machine-readable identifier carried in events/errors.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             ImageSource::RepoConfig => "repo-config",
@@ -82,6 +85,7 @@ impl ImageSource {
     }
 
     /// Human-readable name of the config surface for error prose.
+    #[must_use]
     pub fn describe(&self) -> &'static str {
         match self {
             ImageSource::RepoConfig => ".intent/config.json (executionEnvironment.image)",
@@ -99,6 +103,7 @@ impl std::fmt::Display for ImageSource {
 
 /// The built-in pinned image reference (manifest fetched unpinned; the rootfs
 /// inside is always sha256-verified).
+#[must_use]
 pub fn builtin_image_ref() -> GuestImageRef {
     GuestImageRef {
         manifest_url: builtin_manifest_url(),
@@ -109,6 +114,7 @@ pub fn builtin_image_ref() -> GuestImageRef {
 /// Resolve which image reference a spawn should use: repo config →
 /// profile default → built-in pin. The EE-5 orchestrator passes the repo's
 /// parsed [`RepoConfig`] and the active profile's optional override.
+#[must_use]
 pub fn resolve_image_ref(
     repo_config: &RepoConfig,
     profile_default: Option<&GuestImageRef>,
@@ -245,6 +251,7 @@ pub enum ImageError {
 impl ImageError {
     /// The config surface the failing image reference came from. Cache I/O
     /// failures are environmental, not config-attributable.
+    #[must_use]
     pub fn config_source(&self) -> Option<&ImageSource> {
         match self {
             ImageError::ManifestFetch { config_source, .. }
@@ -272,6 +279,11 @@ impl From<ImageError> for intent_core::Error {
 impl ImageManifest {
     /// Parse and contract-check a manifest document. `url` and `source` label
     /// the structured error on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImageError::ManifestInvalid` on parse failure, or a
+    /// [`Self::validate`] error on contract violations.
     pub fn parse_and_validate(
         content: &str,
         url: &str,
@@ -290,6 +302,10 @@ impl ImageManifest {
     /// Contract conformance: schema version, architecture, rootfs format,
     /// digest shape, and the vsock exec agent. Violations produce
     /// [`ImageError::NonConforming`] naming the config source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ImageError::NonConforming` on any contract violation.
     pub fn validate(&self, url: &str, source: &ImageSource) -> std::result::Result<(), ImageError> {
         let fail = |detail: String| ImageError::NonConforming {
             url: url.to_string(),
@@ -384,6 +400,11 @@ const ROOTFS_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// The manifest is always re-fetched (it is small and may move between
 /// versions); the rootfs is content-addressed by its sha256, so a cache hit
 /// skips the download entirely.
+///
+/// # Errors
+///
+/// Returns an [`ImageError`] when the fetch, validation, download, or cache
+/// write fails.
 pub async fn ensure_image(
     data_dir: &Path,
     image_ref: &GuestImageRef,
@@ -414,6 +435,10 @@ pub async fn ensure_image(
 /// pin, and contract-check it — the network/validation half of
 /// [`ensure_image`], without touching the cache or downloading the rootfs.
 /// Also the engine behind the `sandbox.image.check` dry-run RPC (§5.5b).
+///
+/// # Errors
+///
+/// Returns an [`ImageError`] when the fetch, pin check, or validation fails.
 pub async fn fetch_and_validate_manifest(
     image_ref: &GuestImageRef,
     source: &ImageSource,
@@ -603,15 +628,12 @@ async fn download_hashed(
     file.flush()
         .await
         .map_err(|e| format!("flush {}: {e}", dest.display()))?;
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(hex_digest(&hasher.finalize()))
 }
 
 /// Hex sha256 of a fetched manifest document — the pin value clients save
 /// alongside a `sandbox.microvm.image` override (`sandbox.image.check`, §5.5b).
+#[must_use]
 pub fn manifest_sha256(bytes: &[u8]) -> String {
     hex_sha256(bytes)
 }
@@ -620,11 +642,16 @@ pub fn manifest_sha256(bytes: &[u8]) -> String {
 fn hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex_digest(&hasher.finalize())
+}
+
+/// Lowercase hex rendering of a digest.
+fn hex_digest(digest: &[u8]) -> String {
+    use std::fmt::Write as _;
+    digest.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 /// Publish a `sandbox:image:*` event when a bus is wired; failures are logged
@@ -925,7 +952,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("x86_64"));
         assert!(msg.contains(".intent/config.json (executionEnvironment.image)"));
-        assert_eq!(err.config_source().map(|s| s.as_str()), Some("repo-config"));
+        assert_eq!(
+            err.config_source().map(super::ImageSource::as_str),
+            Some("repo-config")
+        );
     }
 
     #[tokio::test]
@@ -948,6 +978,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_each_contract_violation() {
+        type Mutator = Box<dyn Fn(&mut ImageManifest)>;
         let sha = "a".repeat(64);
         let good: ImageManifest =
             serde_json::from_value(manifest_json("http://example.invalid/rootfs.tar.xz", &sha))
@@ -955,7 +986,6 @@ mod tests {
         let src = ImageSource::BuiltinPin;
         good.validate("u", &src).expect("baseline manifest valid");
 
-        type Mutator = Box<dyn Fn(&mut ImageManifest)>;
         let cases: Vec<(&str, Mutator)> = vec![
             ("schema", Box::new(|m| m.schema = 2)),
             ("arch", Box::new(|m| m.arch = "riscv64".into())),

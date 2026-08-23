@@ -73,12 +73,14 @@ pub struct FileDiff {
 
 impl FileDiff {
     /// Whether either side of the delta is a `160000` gitlink entry.
+    #[must_use]
     pub fn is_gitlink(&self) -> bool {
         self.old_is_gitlink || self.new_is_gitlink
     }
 
     /// The old-side submodule pin SHA — `old_blob` only when that side is a
     /// gitlink (never a regular file's blob OID).
+    #[must_use]
     pub fn gitlink_old_sha(&self) -> Option<&str> {
         if self.old_is_gitlink {
             self.old_blob.as_deref()
@@ -89,6 +91,7 @@ impl FileDiff {
 
     /// The new-side submodule pin SHA — `new_blob` only when that side is a
     /// gitlink (never a regular file's blob OID).
+    #[must_use]
     pub fn gitlink_new_sha(&self) -> Option<&str> {
         if self.new_is_gitlink {
             self.new_blob.as_deref()
@@ -107,8 +110,17 @@ pub struct FileDiffWithHunks {
     pub hunks: Vec<DiffHunk>,
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Summaries for the index→workdir diff (staged + unstaged + untracked), without
 /// hunks. Use [`hunks_between`] with each file's blob SHAs to expand on demand.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
+///
+/// # Panics
+///
+/// Panics if a diff delta reported by libgit2 cannot be re-fetched by index (an internal libgit2 invariant violation).
 pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let mut opts = DiffOptions::new();
@@ -149,6 +161,7 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
     Ok(out)
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Per-file summaries **and** hunks for the index→workdir diff (staged +
 /// unstaged + untracked), from a **single** diff traversal — unlike the
 /// two-pass combination of [`diff_index_to_workdir`] +
@@ -160,6 +173,14 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
 /// to matching paths (a path with no pending change yields no entry). `None`
 /// diffs the full tree. An empty slice behaves like `None` (libgit2 treats no
 /// pathspecs as match-all).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
+///
+/// # Panics
+///
+/// Panics if a diff delta reported by libgit2 cannot be re-fetched by index (an internal libgit2 invariant violation).
 pub fn diff_index_to_workdir_with_hunks(
     repo_path: &Path,
     pathspecs: Option<&[&str]>,
@@ -215,6 +236,10 @@ pub fn diff_index_to_workdir_with_hunks(
 /// Per-file summaries for the staged changes (HEAD→index diff), mirroring
 /// `git diff --cached --numstat`. An unborn `HEAD` diffs the index against the
 /// empty tree (every staged file is an addition).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn diff_head_to_index(repo_path: &Path) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let head_tree = repo
@@ -234,6 +259,10 @@ pub fn diff_head_to_index(repo_path: &Path) -> Result<Vec<FileDiff>> {
 /// merge-base of `base_ref` and `HEAD` → `HEAD`), mirroring
 /// `git diff --numstat <base>...<branch>`. Returns an empty vec when `base_ref`
 /// or `HEAD` cannot be resolved.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or another libgit2 operation fails. An unresolvable `base_ref` or `HEAD` is not an error — it yields an empty vec.
 pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
@@ -246,9 +275,8 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
         Ok(mb) => repo.find_commit(mb).ok().and_then(|c| c.tree().ok()),
         Err(_) => None,
     };
-    let head_tree = match repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) {
-        Some(t) => t,
-        None => return Ok(Vec::new()),
+    let Some(head_tree) = repo.find_commit(head_oid).ok().and_then(|c| c.tree().ok()) else {
+        return Ok(Vec::new());
     };
     let diff = repo
         .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), None)
@@ -260,6 +288,10 @@ pub fn diff_range(repo_path: &Path, base_ref: &str) -> Result<Vec<FileDiff>> {
 /// (staged + unstaged tracked changes; untracked files are **excluded**),
 /// mirroring `git diff HEAD --numstat`. Returns an empty vec when `HEAD` is
 /// unborn (nothing to diff against).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn diff_head_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Some(head_tree) = repo
@@ -281,6 +313,10 @@ pub fn diff_head_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> {
 /// (unstaged tracked changes; untracked files are **excluded**), mirroring
 /// `git diff --numstat`. Unlike [`diff_index_to_workdir`], this omits untracked
 /// entries to match the CLI numstat's tracked-only surface.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn diff_index_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let diff = repo
@@ -295,6 +331,10 @@ pub fn diff_index_to_workdir_tracked(repo_path: &Path) -> Result<Vec<FileDiff>> 
 /// resolved by the caller); `to_ref` is likewise revparse-able (typically
 /// `HEAD` or a branch name). Returns an empty vec when either side cannot
 /// be resolved.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or another libgit2 operation fails. An unresolvable `from_sha` or `to_ref` is not an error — it yields an empty vec.
 pub fn diff_two_dot(repo_path: &Path, from_sha: &str, to_ref: &str) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Ok(from_obj) = repo.revparse_single(from_sha) else {
@@ -322,6 +362,10 @@ pub fn diff_two_dot(repo_path: &Path, from_sha: &str, to_ref: &str) -> Result<Ve
 /// boundary can be resolved (the FE folds that to an empty result).
 ///
 /// Ports `resolveBranchBoundary` in `git.service.ts` / the FE bridge seeder.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
 pub fn resolve_branch_boundary(
     repo_path: &Path,
     base_ref: Option<&str>,
@@ -380,6 +424,10 @@ pub fn resolve_branch_boundary(
 /// commit's own changes against its first parent). A root commit (no parent)
 /// diffs against the empty tree, so every file appears as additions. An
 /// unresolvable `commit_hash` returns [`Error::NotFound`].
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] if `commit_hash` does not resolve to a commit; `Error::Internal` if another libgit2 operation fails.
 pub fn diff_commit(repo_path: &Path, commit_hash: &str) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let obj = repo
@@ -413,6 +461,14 @@ pub fn diff_commit(repo_path: &Path, commit_hash: &str) -> Result<Vec<FileDiff>>
 /// Cost: a single tree→workdir traversal; untracked file content is never
 /// loaded (no `show_untracked_content`), so untracked entries are counted
 /// without reading their bytes.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
+///
+/// # Panics
+///
+/// Panics if a diff delta reported by libgit2 cannot be re-fetched by index (an internal libgit2 invariant violation).
 pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
     let started = Instant::now();
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
@@ -458,13 +514,14 @@ pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
         tracing::warn!(
             repo_path = %repo_path.display(),
             total_files,
-            total_ms = total.as_millis() as u64,
+            total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
             "head_diff_rollup: slow HEAD→workdir diff rollup"
         );
     }
     Ok((total_files, total_additions, total_deletions))
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Build per-file [`FileDiff`] summaries (path + line stats + blob SHAs) from a
 /// computed [`git2::Diff`].
 fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
@@ -506,6 +563,7 @@ fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
 /// are commit SHAs in the **submodule's** odb, not blobs in this repository —
 /// so this builds the same one-line pseudo-diff without any object lookups.
 /// Either side may be `None` (added / deleted submodule).
+#[must_use]
 pub fn gitlink_hunks(old_sha: Option<&str>, new_sha: Option<&str>) -> Vec<DiffHunk> {
     let mut lines = Vec::new();
     if let Some(old) = old_sha {
@@ -528,9 +586,9 @@ pub fn gitlink_hunks(old_sha: Option<&str>, new_sha: Option<&str>) -> Vec<DiffHu
         return Vec::new();
     }
     vec![DiffHunk {
-        old_start: if old_sha.is_some() { 1 } else { 0 },
+        old_start: u32::from(old_sha.is_some()),
         old_lines: u32::from(old_sha.is_some()),
-        new_start: if new_sha.is_some() { 1 } else { 0 },
+        new_start: u32::from(new_sha.is_some()),
         new_lines: u32::from(new_sha.is_some()),
         lines,
     }]
@@ -540,6 +598,10 @@ pub fn gitlink_hunks(old_sha: Option<&str>, new_sha: Option<&str>) -> Vec<DiffHu
 /// blob is treated as empty (added/deleted file). Both blobs must exist in the
 /// object DB (committed/staged content); for an unstaged workdir change whose
 /// post-image is not yet a blob, use [`hunks_index_to_workdir`] instead.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if a blob SHA is invalid or a blob cannot be read.
 pub fn hunks_between(
     repo_path: &Path,
     old_blob: Option<&str>,
@@ -554,6 +616,7 @@ pub fn hunks_between(
     patch_to_hunks(&patch)
 }
 
+#[allow(clippy::similar_names)] // path vs the libgit2 patch - both domain terms
 /// Compute hunks for a single file directly from the index→workdir diff, reading
 /// the workdir content rather than looking up a post-image blob in the object DB
 /// (an unstaged change's new content is not yet a blob, so [`hunks_between`]
@@ -563,6 +626,14 @@ pub fn hunks_between(
 /// has no pending change (or is binary). The path is set as a **literal**
 /// pathspec (fnmatch matching disabled, matching the single-pass variant) so
 /// libgit2 prunes the walk instead of scanning the tree.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the underlying libgit2 operation fails.
+///
+/// # Panics
+///
+/// Panics if a diff delta reported by libgit2 cannot be re-fetched by index (an internal libgit2 invariant violation).
 pub fn hunks_index_to_workdir(repo_path: &Path, rel_path: &str) -> Result<Vec<DiffHunk>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let mut opts = DiffOptions::new();

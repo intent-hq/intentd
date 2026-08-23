@@ -57,8 +57,7 @@ const REAP_POLL: Duration = Duration::from_millis(25);
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Build a wire `McpServerStatus` (§5.22), omitting absent optional fields.
@@ -134,8 +133,10 @@ fn normalize_config(mut config: Value, forced_id: Option<&str>) -> Result<Value>
             .get("id")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| format!("srv-{}", &Uuid::new_v4().simple().to_string()[..8])),
+            .map_or_else(
+                || format!("srv-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                String::from,
+            ),
     };
     obj.insert("id".into(), json!(id));
     let transport = obj
@@ -150,15 +151,14 @@ fn normalize_config(mut config: Value, forced_id: Option<&str>) -> Result<Value>
     }
     obj.insert("transport".into(), json!(transport.clone()));
     validate_transport_fields(obj, &transport)?;
-    if !obj
+    if obj
         .get("name")
         .and_then(Value::as_str)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+        .is_none_or(str::is_empty)
     {
         obj.insert("name".into(), json!(id));
     }
-    if !obj.get("enabled").map(Value::is_boolean).unwrap_or(false) {
+    if !obj.get("enabled").is_some_and(Value::is_boolean) {
         obj.insert("enabled".into(), json!(false));
     }
     Ok(config)
@@ -170,8 +170,7 @@ fn validate_transport_fields(obj: &Map<String, Value>, transport: &str) -> Resul
         let has_cmd = obj
             .get("command")
             .and_then(Value::as_str)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|s| !s.is_empty());
         if !has_cmd {
             return Err(Error::InvalidParams(
                 "stdio server requires a non-empty command".to_string(),
@@ -181,8 +180,7 @@ fn validate_transport_fields(obj: &Map<String, Value>, transport: &str) -> Resul
         let has_url = obj
             .get("url")
             .and_then(Value::as_str)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
+            .is_some_and(|s| !s.is_empty());
         if !has_url {
             return Err(Error::InvalidParams(format!(
                 "{transport} server requires a url"
@@ -324,8 +322,7 @@ impl McpHub {
             .lock()
             .unwrap()
             .get(id)
-            .map(|rs| rs.status.clone())
-            .unwrap_or_else(|| status_stopped(id))
+            .map_or_else(|| status_stopped(id), |rs| rs.status.clone())
     }
 
     /// Remove + reap `id` without emitting a `stopped` event (used before a
@@ -678,8 +675,39 @@ async fn probe_remote(config: &Value) -> Result<Option<u64>> {
 /// The configured request headers of a remote config (`headers` object;
 /// non-string values are serialized, mirroring the stdio `env` handling).
 fn config_headers(config: &Value) -> Vec<(String, String)> {
-    config
-        .get("headers")
+    header_pairs(config.get("headers"))
+}
+
+/// Whether two URLs share an origin (scheme + host + port, with known default
+/// ports normalized). Guards the `mcp.testConnection` OAuth-bag injection
+/// (§5.22.2): the stored bearer token is only attached when the probe URL
+/// matches the saved server config's origin, so a caller cannot pair a saved
+/// server id with an arbitrary URL to exfiltrate the token. Unparseable URLs
+/// never match.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(a), Ok(b)) = (reqwest::Url::parse(a), reqwest::Url::parse(b)) else {
+        return false;
+    };
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The configured `url` of the saved external server `server_id`, when one
+/// exists (§5.22.2 OAuth-injection guard).
+pub(crate) async fn config_url(secrets: &AsyncSecretStore, server_id: &str) -> Option<String> {
+    read_configs(secrets)
+        .await
+        .get(server_id)?
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Flatten an optional `headers` JSON object into `(name, value)` pairs;
+/// non-string values are serialized, mirroring the stdio `env` handling.
+pub(crate) fn header_pairs(headers: Option<&Value>) -> Vec<(String, String)> {
+    headers
         .and_then(Value::as_object)
         .map(|obj| {
             obj.iter()
@@ -695,6 +723,74 @@ fn config_headers(config: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// `mcp.testConnection` (PROTOCOL §5.22.2): probe an HTTP/SSE MCP endpoint
+/// with a single JSON-RPC `initialize` POST from the daemon host and map the
+/// outcome onto a connection status — 401/403 → `auth_required`, any other
+/// status below 500 → `connected` (the server is reachable; 404/405 just mean
+/// the endpoint shape differs), 5xx → `error`, network failure / timeout →
+/// `error` with no `statusCode`. The response body is never read — only the
+/// HTTP status matters — and redirects are never followed (headers may carry
+/// credentials that would otherwise be forwarded cross-host).
+pub(crate) async fn test_connection(url: &str, headers: &[(String, String)]) -> Value {
+    let client = match reqwest::Client::builder()
+        .timeout(HANDSHAKE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return connection_error_value(&format!("http client init failed: {e}")),
+    };
+    test_connection_with(&client, url, headers).await
+}
+
+/// [`test_connection`] against a caller-supplied client (test seam: lets the
+/// timeout path be exercised with a short-timeout client).
+async fn test_connection_with(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Value {
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_HTTP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "intentd", "version": env!("CARGO_PKG_VERSION") },
+        },
+    });
+    match post_rpc(client, url, headers, None, None, &init).await {
+        Ok(resp) => connection_status_value(resp.status().as_u16()),
+        Err(Error::Internal(msg)) => connection_error_value(&msg),
+        Err(e) => connection_error_value(&e.to_string()),
+    }
+}
+
+/// Map the HTTP status of the connection-test `initialize` POST onto the
+/// `mcp.testConnection` result shape (§5.22.2).
+fn connection_status_value(status: u16) -> Value {
+    match status {
+        401 | 403 => json!({
+            "status": "auth_required",
+            "statusCode": status,
+            "errorMessage": format!("authentication required (HTTP {status}) — check configured headers"),
+        }),
+        s if s < 500 => json!({ "status": "connected", "statusCode": s }),
+        s => json!({
+            "status": "error",
+            "statusCode": s,
+            "errorMessage": format!("server error (HTTP {s})"),
+        }),
+    }
+}
+
+/// The transport-failure `mcp.testConnection` result (no HTTP status:
+/// unreachable, timeout, or request build failure).
+fn connection_error_value(message: &str) -> Value {
+    json!({ "status": "error", "errorMessage": message })
+}
+
 /// Reachability probe for an `sse` endpoint: a GET with
 /// `Accept: text/event-stream` must answer 2xx. The stream body is never read.
 async fn probe_sse(
@@ -708,7 +804,7 @@ async fn probe_sse(
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.send().await.map_err(|e| classify_send_error(e, url))?;
+    let resp = req.send().await.map_err(|e| classify_send_error(&e, url))?;
     check_http_status(resp.status())
 }
 
@@ -821,7 +917,7 @@ async fn post_rpc(
     if let Some(ver) = protocol_version {
         req = req.header("MCP-Protocol-Version", ver);
     }
-    req.send().await.map_err(|e| classify_send_error(e, url))
+    req.send().await.map_err(|e| classify_send_error(&e, url))
 }
 
 /// Read a JSON-RPC response envelope from a streamable-HTTP reply: a JSON body
@@ -878,7 +974,7 @@ fn sse_response_for_id(buf: &str, id: u64) -> Option<Value> {
 }
 
 /// Map a transport-level reqwest failure onto a user-facing `lastError`.
-fn classify_send_error(e: reqwest::Error, url: &str) -> Error {
+fn classify_send_error(e: &reqwest::Error, url: &str) -> Error {
     if e.is_timeout() {
         Error::Internal(format!("timed out connecting to {url}"))
     } else if e.is_connect() {
@@ -949,7 +1045,7 @@ fn kill_group(
 ) -> std::result::Result<(), nix::errno::Errno> {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    killpg(Pid::from_raw(pid as i32), sig)
+    killpg(Pid::from_raw(pid.cast_signed()), sig)
 }
 
 /// Stateless executor for the `mcp.servers.*` namespace (PROTOCOL §5.22) over
@@ -2245,5 +2341,128 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(h.status("r-upd")["state"], json!("running"));
+    }
+
+    // -- mcp.testConnection (§5.22.2) ----------------------------------------
+
+    #[test]
+    fn same_origin_matches_scheme_host_port() {
+        assert!(same_origin(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com/other/path?q=1"
+        ));
+        assert!(same_origin(
+            "https://mcp.example.com:443/mcp",
+            "https://mcp.example.com/mcp"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "https://evil.example.com/mcp"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "http://mcp.example.com/mcp"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com:8443/mcp"
+        ));
+        assert!(!same_origin("not a url", "https://mcp.example.com/mcp"));
+    }
+
+    #[test]
+    fn connection_status_2xx_and_reachable_4xx_map_to_connected() {
+        for code in [200u16, 202, 404, 405, 422] {
+            let v = connection_status_value(code);
+            assert_eq!(v["status"], json!("connected"), "HTTP {code}");
+            assert_eq!(v["statusCode"], json!(code));
+            assert!(v.get("errorMessage").is_none(), "HTTP {code}");
+        }
+    }
+
+    #[test]
+    fn connection_status_401_403_map_to_auth_required() {
+        for code in [401u16, 403] {
+            let v = connection_status_value(code);
+            assert_eq!(v["status"], json!("auth_required"), "HTTP {code}");
+            assert_eq!(v["statusCode"], json!(code));
+            let msg = v["errorMessage"].as_str().unwrap();
+            assert!(msg.contains(&code.to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn connection_status_5xx_maps_to_error() {
+        let v = connection_status_value(503);
+        assert_eq!(v["status"], json!("error"));
+        assert_eq!(v["statusCode"], json!(503));
+        assert!(v["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("server error (HTTP 503)"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_success_reports_connected() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let resp = ok_json_response(body);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _guard) = http_stub(leaked).await;
+
+        let v = test_connection(&url, &[]).await;
+        assert_eq!(v["status"], json!("connected"));
+        assert_eq!(v["statusCode"], json!(200));
+    }
+
+    #[tokio::test]
+    async fn test_connection_401_reports_auth_required() {
+        let (url, _guard) =
+            http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
+        let v = test_connection(&url, &[]).await;
+        assert_eq!(v["status"], json!("auth_required"));
+        assert_eq!(v["statusCode"], json!(401));
+    }
+
+    #[tokio::test]
+    async fn test_connection_unreachable_reports_error_without_status_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let v = test_connection(&url, &[]).await;
+        assert_eq!(v["status"], json!("error"));
+        assert!(v.get("statusCode").is_none());
+        assert!(v["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("unreachable from daemon host"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_timeout_reports_error() {
+        // A listener that accepts but never answers; a short-timeout client
+        // exercises the timeout arm without waiting HANDSHAKE_TIMEOUT.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let v = test_connection_with(&client, &url, &[]).await;
+        hold.abort();
+        assert_eq!(v["status"], json!("error"));
+        assert!(v.get("statusCode").is_none());
+        assert!(v["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("timed out connecting to"));
     }
 }

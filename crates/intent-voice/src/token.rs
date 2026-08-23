@@ -57,8 +57,8 @@ async fn file_store_key(provider: VoiceProvider) -> Option<String> {
     let handle =
         tokio::task::spawn_blocking(move || intent_core::FileSecretStore::new().load(account));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Ok(Some(v)))) => non_empty(v),
-        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Ok(Some(v)))) => non_empty(&v),
+        Ok(Ok(Ok(None)) | Err(_)) => None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 account = %account,
@@ -67,7 +67,6 @@ async fn file_store_key(provider: VoiceProvider) -> Option<String> {
             );
             None
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
                 account = %account,
@@ -80,16 +79,16 @@ async fn file_store_key(provider: VoiceProvider) -> Option<String> {
 
 /// Read the provider's env fallback.
 fn env_key(provider: VoiceProvider) -> Option<String> {
-    pick_env_key(std::env::var(env_var(provider)).ok())
+    pick_env_key(std::env::var(env_var(provider)).ok().as_deref())
 }
 
 /// Pure selection of the env key (testable), ignoring empty values.
-pub(crate) fn pick_env_key(value: Option<String>) -> Option<String> {
+pub(crate) fn pick_env_key(value: Option<&str>) -> Option<String> {
     value.and_then(non_empty)
 }
 
 /// `Some(s)` only when `s` is non-empty after trimming.
-fn non_empty(s: String) -> Option<String> {
+fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -115,11 +114,8 @@ mod tests {
 
     #[test]
     fn picks_non_empty_env_key() {
-        assert_eq!(
-            pick_env_key(Some("sk-abc".into())).as_deref(),
-            Some("sk-abc")
-        );
-        assert_eq!(pick_env_key(Some("   ".into())), None);
+        assert_eq!(pick_env_key(Some("sk-abc")).as_deref(), Some("sk-abc"));
+        assert_eq!(pick_env_key(Some("   ")), None);
         assert_eq!(pick_env_key(None), None);
     }
 }

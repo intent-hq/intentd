@@ -1429,6 +1429,31 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.listUserMessages`: all user-role messages of an agent as
+    /// lightweight index items, oldest→newest —
+    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`
+    /// (PROTOCOL §5.5). `preview` is the extracted plain text bounded to
+    /// `preview_chars` characters (`None` → server default, server-clamped);
+    /// `metadata` is the persisted row metadata verbatim when present.
+    /// Non-user rows are never included. Bounded cost: one role-filtered
+    /// SQL read whose previews are extracted and truncated inside SQL —
+    /// full content blobs never leave the database and the transcript is
+    /// never hydrated. `NotFound` on an unknown agent or a workspace
+    /// mismatch.
+    fn agent_list_user_messages(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        preview_chars: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, workspace_id, preview_chars);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_user_messages not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getSession`: full [`AgentSession`] projection including
     /// `systemPrompt`, `specialist`, and the persisted metadata block —
     /// the superset that `agent.get`/`AgentLite` strips (PROTOCOL §5.5).
@@ -2278,7 +2303,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// completion watch if delegated, deliver continuation message. Abandon: mark
     /// row `abandoned`, append system interruption message. Returns
     /// `{ resumed: string[], abandoned: string[], failed: [{ agentId, error }] }`.
-    /// Ids must be pending interrupted_agent rows; unknown/already-resolved ids
+    /// Ids must be pending `interrupted_agent` rows; unknown/already-resolved ids
     /// land in `failed`. An id in both lists is `-32602`. (PROTOCOL §5.5).
     fn agent_resolve_interrupted(
         &self,
@@ -2532,7 +2557,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `sandbox.cow.merge`: manually trigger merge-back for a sandboxed agent (PROTOCOL §5.34).
-    /// Returns `{ ok, status, ... }` with merge outcome (merged | conflict | blocked | merge_pending).
+    /// Returns `{ ok, status, ... }` with merge outcome (merged | conflict | blocked | `merge_pending`).
     fn sandbox_merge(
         &self,
         workspace_id: WorkspaceId,
@@ -2615,7 +2640,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `sandbox.options`: the capability-resolved execution-environment
     /// availability matrix (global, no `workspaceId`) — `{ defaultType,
     /// options: [{ type, enabled, available, default, reason? }] }`. A type
-    /// is `available` when the host can actually run it (`cow` requires CoW
+    /// is `available` when the host can actually run it (`cow` requires `CoW`
     /// filesystem support on the workspaces root; `microvm` additionally
     /// requires microVM host capability — see
     /// `system.capabilities.microvmSupported`); `reason` is a structured
@@ -2914,6 +2939,19 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::git_status not implemented".to_string(),
             ))
         })
+    }
+
+    /// `git.status` with request options. `force_refresh` bypasses cached and
+    /// pre-existing in-flight status results. The default preserves the
+    /// existing behavior for implementations that only provide [`Self::git_status`].
+    fn git_status_with_options(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+        force_refresh: bool,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
+        let _ = force_refresh;
+        self.git_status(workspace_id, git_root_id)
     }
 
     /// `gitRoot.list`: every registered git root for a workspace (agent-
@@ -4278,7 +4316,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `voice.transcribe`: speech-to-text over a pluggable provider
-    /// (ElevenLabs Scribe | OpenAI). `params` carries `audio` (required,
+    /// (`ElevenLabs` Scribe | `OpenAI`). `params` carries `audio` (required,
     /// base64), optional `mimeType`, `language`, `provider` override, and
     /// `context { prompt?, keyterms? }`; returns `{ text, provider,
     /// durationMs? }`. Missing/oversized/invalid audio → `InvalidParams`
@@ -4499,17 +4537,34 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Default-provider self-heal (monorepo#3044), invoked by the transport
+    /// after a `host.providerDiscovery` pass with the registry-ordered ids of
+    /// the providers discovery reported as installed. When no default
+    /// provider is derivable from settings and at least one installed
+    /// provider exists, the implementation persists the first installed
+    /// provider as `providers.active` (and, when a cached model catalog
+    /// exists for it, its default model as a compound `model.default`).
+    /// Idempotent, and never overwrites an existing settings value. Returns
+    /// `{ healed: boolean, ... }`. Default: no-op (read-only wirings).
+    fn settings_heal_default_provider(
+        &self,
+        installed_provider_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = installed_provider_ids;
+        Box::pin(async { Ok(serde_json::json!({ "healed": false })) })
+    }
+
     /// `system.capabilities`: machine-level capabilities independent of any
     /// workspace — `{ cowSupported?: boolean, microvmSupported?: boolean }`
-    /// (PROTOCOL §5.7). `cowSupported` reports the CoW probe of the
+    /// (PROTOCOL §5.7). `cowSupported` reports the `CoW` probe of the
     /// workspaces root (`true`/`false` for a supported/unsupported
     /// filesystem, omitted when the probe cannot run) — the same cached probe
     /// that fills `Workspace.cowSupported` (§5.1). `microvmSupported` reports
     /// whether the host can run microVM agent sandboxes: a platform check
     /// (macOS: ARM64 only; Linux: `/dev/kvm` present; other OSes: false)
-    /// ANDed with `cowSupported` (microVM requires CoW — each agent VM
+    /// `ANDed` with `cowSupported` (microVM requires `CoW` — each agent VM
     /// mounts its own reflink clone). It is `false` on an incapable platform
-    /// regardless of the CoW probe; on a capable platform it mirrors
+    /// regardless of the `CoW` probe; on a capable platform it mirrors
     /// `cowSupported` and is omitted when that probe cannot run. Unlike the
     /// `system.status`/`system.shutdown` control fast-path, this is a router
     /// method: it needs the service layer's workspaces-root resolution and
@@ -4903,6 +4958,25 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_oauth_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `mcp.testConnection` → `{ status, statusCode?, errorMessage? }` — probe
+    /// an HTTP/SSE MCP endpoint from the daemon host to detect whether it is
+    /// reachable and whether it requires authentication, reusing the stored
+    /// OAuth bag for `serverName` when no explicit `Authorization` header is
+    /// supplied (PROTOCOL §5.22.2).
+    fn mcp_test_connection(
+        &self,
+        url: String,
+        headers: Option<serde_json::Value>,
+        server_name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (url, headers, server_name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_test_connection not implemented".to_string(),
             ))
         })
     }
@@ -5495,7 +5569,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
     /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
@@ -5515,7 +5589,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// counterpart of the UTF-8-only `file.read` (PROTOCOL §5.9;
     /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
     /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_read_chunk(
         &self,
         workspace_id: WorkspaceId,
@@ -5535,7 +5609,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.write`: create/overwrite a file (parent dirs created); returns
     /// `{ ok: true, path, size }` where `size` is the content byte/char length
     /// (PROTOCOL §5.10).
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_write(
         &self,
         workspace_id: WorkspaceId,
@@ -5554,7 +5628,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.list`: directory entries as a **bare array** of
     /// `{ name, type }` (`type` = `"file"`/`"directory"`); `path` defaults to
     /// `"."` (PROTOCOL §5.10).
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_list(
         &self,
         workspace_id: WorkspaceId,
@@ -5571,7 +5645,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `file.delete`: remove a single file (rejects directories); returns
     /// `{ ok: true, path, deleted: true }` (PROTOCOL §5.10).
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_delete(
         &self,
         workspace_id: WorkspaceId,
@@ -5589,7 +5663,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.mkdir`: create a directory (recursive); returns
     /// `{ ok: true, path, created: true }`, or `{ ok: true, path, existed: true }`
     /// when the directory already exists (PROTOCOL §5.10).
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_mkdir(
         &self,
         workspace_id: WorkspaceId,
@@ -5607,7 +5681,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.rename`: move a file/directory (destination must not exist);
     /// returns `{ ok: true, oldPath, newPath, renamed: true, isDirectory }`
     /// (PROTOCOL §5.10).
-    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
     fn file_rename(
         &self,
         workspace_id: WorkspaceId,
@@ -5925,7 +5999,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `crossWorkspace.listSiblings`: workspaces sharing the caller's
     /// `repositoryPath`, excluding self. Bare array of
     /// `{ id, title, branch, status, createdAt, updatedAt }` (`title` defaults
-    /// to `"Untitled"`; `status` is the PascalCase `WorkspaceStatus`).
+    /// to `"Untitled"`; `status` is the `PascalCase` `WorkspaceStatus`).
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,

@@ -76,6 +76,10 @@ fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
 /// URL — a token rotated mid-flight only affects that one shared read,
 /// which retires immediately — so this cannot swap credentials across
 /// users.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if `git` cannot be spawned, the ls-remote fails or times out, or the shared flight is abandoned.
 pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
     let owned_url = url.to_string();
     let token = token.map(str::to_owned);
@@ -138,19 +142,20 @@ where
             rx
         }
     };
-    let published = flight.wait_for(|o| o.is_some()).await.map(|o| o.clone());
-    let outcome = match published {
-        Ok(published) => published.expect("guarded by wait_for"),
+    let published = flight
+        .wait_for(std::option::Option::is_some)
+        .await
+        .map(|o| o.clone());
+    let Ok(published) = published else {
         // The driver vanished without publishing (panic). Evict the dead
         // flight so later callers do not join it, then surface the failure.
-        Err(_) => {
-            let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
-            if map.get(key).is_some_and(|f| f.same_channel(&flight)) {
-                map.remove(key);
-            }
-            return Err(Error::Internal("ls-remote flight abandoned".to_string()));
+        let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
+        if map.get(key).is_some_and(|f| f.same_channel(&flight)) {
+            map.remove(key);
         }
+        return Err(Error::Internal("ls-remote flight abandoned".to_string()));
     };
+    let outcome = published.expect("guarded by wait_for");
     outcome.map_err(Error::Internal)
 }
 
@@ -321,8 +326,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| !s.success())
-            .unwrap_or(true)
+            .map_or(true, |s| !s.success())
         {
             eprintln!("skipping ls_remote_lists_local_file_remote: git not on PATH");
             return;
@@ -352,8 +356,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| !s.success())
-            .unwrap_or(true)
+            .map_or(true, |s| !s.success())
         {
             eprintln!("skipping ls_remote_failure_is_redacted_error: git not on PATH");
             return;

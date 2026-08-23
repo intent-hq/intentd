@@ -21,7 +21,10 @@ mod dispatch;
 mod tools;
 
 pub(crate) use tools::ToolDef;
-pub use tools::{MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions};
+pub use tools::{
+    MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions,
+    WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+};
 
 // Static description const, exposed for the segment-assembly parity tests
 // in `crate::tests` (the assembled all-defaults description must be
@@ -52,6 +55,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The agent→BE MCP server: a fixed workspace context, the shared service
 /// surface, and the set of tool names denied for this agent's type.
+#[allow(clippy::struct_excessive_bools)]
 pub struct WorkspaceMcpServer {
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -82,7 +86,7 @@ pub struct WorkspaceMcpServer {
     /// Disabled features are pruned from the tool description and JS prelude
     /// and denied at dispatch. Defaults to all-on (FE front door, tests).
     agent_features: AgentFeaturesSettings,
-    /// Whether the workspace can run CoW sandboxes (CoW probe supported OR a
+    /// Whether the workspace can run `CoW` sandboxes (`CoW` probe supported OR a
     /// microVM execution environment). Gates the sandbox-related doc clauses
     /// (`mergeOnTurnEnd`, sandbox fields) in the `workspace_api` description
     /// — description-only: dispatch accepts and ignores `mergeOnTurnEnd`
@@ -108,6 +112,13 @@ pub struct WorkspaceMcpServer {
     /// and prelude and denied at dispatch with a redirect to the
     /// attention-request methods. Defaults to `false` (top-level).
     is_sub_agent: bool,
+    /// Whether `tools/list` serves the compact `workspace_api` description
+    /// (`ProviderConfig::truncates_tool_descriptions` — providers whose MCP
+    /// client cuts long descriptions at ~2k chars). The full reference then
+    /// rides the session's system prompt via
+    /// [`Self::full_workspace_api_description`]. Defaults to `false`: every
+    /// non-flagged provider keeps today's full description byte-identical.
+    compact_tool_descriptions: bool,
 }
 
 impl WorkspaceMcpServer {
@@ -129,6 +140,7 @@ impl WorkspaceMcpServer {
             specialist_model_options: Vec::new(),
             microvm_hints: None,
             is_sub_agent: false,
+            compact_tool_descriptions: false,
         }
     }
 
@@ -141,7 +153,7 @@ impl WorkspaceMcpServer {
     ) -> Self {
         let denylist = get_tool_denylist_for_agent_type(agent_type)
             .into_iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         Self {
             denylist,
@@ -162,6 +174,7 @@ impl WorkspaceMcpServer {
 
     /// Set the calling agent this server front-doors for (the spawn-time wiring
     /// point). Caller-aware tools attribute their actions to this id.
+    #[must_use]
     pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
         self.caller_agent_id = caller;
         self
@@ -170,6 +183,7 @@ impl WorkspaceMcpServer {
     /// Wire the daemon-wide turn-attachment registry (§7.1 deterministic
     /// attach). Registration only activates when a `caller_agent_id` is also
     /// set — the registry keys pending attachments by agent.
+    #[must_use]
     pub fn with_turn_attachments(mut self, registry: Option<Arc<TurnAttachmentRegistry>>) -> Self {
         self.turn_attachments = registry;
         self
@@ -179,16 +193,18 @@ impl WorkspaceMcpServer {
     /// wiring point — settings are read once at bridge creation so live
     /// sessions keep their original surface). Disabled features are pruned
     /// from the tool description and JS prelude and denied at dispatch.
+    #[must_use]
     pub fn with_agent_features(mut self, features: AgentFeaturesSettings) -> Self {
         self.agent_features = features;
         self
     }
 
-    /// Capture whether this bridge's workspace can run CoW sandboxes (the
+    /// Capture whether this bridge's workspace can run `CoW` sandboxes (the
     /// spawn-time wiring point, like `with_agent_features`). When `false`
     /// the sandbox doc clauses (`mergeOnTurnEnd`, sandbox status fields) are
     /// scrubbed from the `workspace_api` description — description-only,
     /// dispatch is unaffected.
+    #[must_use]
     pub fn with_cow_capable(mut self, cow_capable: bool) -> Self {
         self.cow_capable = cow_capable;
         self
@@ -198,6 +214,7 @@ impl WorkspaceMcpServer {
     /// `workspace_api` description (the spawn-time wiring point — resolved
     /// once at bridge creation, like `agent_features`). Pass only specialists
     /// that carry options; an empty list keeps the default description.
+    #[must_use]
     pub fn with_specialist_model_options(
         mut self,
         options: Vec<tools::SpecialistModelOptions>,
@@ -211,6 +228,7 @@ impl WorkspaceMcpServer {
     /// point, like `with_cow_capable`. Pass `Some` only for
     /// microVM-workspace bridges; `None` (the default) keeps the description
     /// unchanged.
+    #[must_use]
     pub fn with_microvm_hints(mut self, hints: Option<tools::MicrovmSpawnHints>) -> Self {
         self.microvm_hints = hints;
         self
@@ -221,9 +239,39 @@ impl WorkspaceMcpServer {
     /// `parent_agent_id.is_some() || is_background`). Sub-agent bridges prune
     /// `ws.app.question.*` from the tool description and JS prelude and deny
     /// it at dispatch with a redirect to the attention-request methods.
+    #[must_use]
     pub fn with_sub_agent(mut self, is_sub_agent: bool) -> Self {
         self.is_sub_agent = is_sub_agent;
         self
+    }
+
+    /// Serve the compact `workspace_api` description from `tools/list` (the
+    /// spawn-time wiring point for providers with
+    /// `ProviderConfig::truncates_tool_descriptions`). The caller pairs this
+    /// with [`Self::full_workspace_api_description`] appended to the system
+    /// prompt so the full reference survives client-side truncation.
+    #[must_use]
+    pub fn with_compact_tool_descriptions(mut self, compact: bool) -> Self {
+        self.compact_tool_descriptions = compact;
+        self
+    }
+
+    /// The fully assembled `workspace_api` description for THIS bridge —
+    /// chief-ness, effective `[agentFeatures]` gating (sub-agent question
+    /// gate folded in), and specialist model options all applied — exactly
+    /// what a non-truncating provider's `tools/list` serves. Used by the
+    /// spawn path to append the full reference to the system prompt when
+    /// `tools/list` serves the compact variant.
+    #[must_use]
+    pub fn full_workspace_api_description(&self) -> String {
+        tools::workspace_api_description_with_model_options(
+            self.is_chief,
+            &self.effective_agent_features(),
+            self.cow_capable,
+            &self.specialist_model_options,
+            self.microvm_hints.as_ref(),
+        )
+        .into_owned()
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation
@@ -310,16 +358,20 @@ impl WorkspaceMcpServer {
                 // sub-agent question gate folded in) prune the disabled
                 // surface and specialist `modelOptions` extend the delegate
                 // docs; with all defaults on (and no options, top-level) the
-                // assembled text is the static const unchanged.
+                // assembled text is the static const unchanged. Bridges for
+                // truncating providers serve the compact variant instead —
+                // the full reference rides the system prompt
+                // (`full_workspace_api_description`).
                 let description = if t.name == "workspace_api" {
-                    tools::workspace_api_description_with_model_options(
-                        self.is_chief,
-                        &self.effective_agent_features(),
-                        self.cow_capable,
-                        &self.specialist_model_options,
-                        self.microvm_hints.as_ref(),
-                    )
-                    .into_owned()
+                    if self.compact_tool_descriptions {
+                        tools::compact_workspace_api_description(
+                            self.is_chief,
+                            &self.effective_agent_features(),
+                            self.cow_capable,
+                        )
+                    } else {
+                        self.full_workspace_api_description()
+                    }
                 } else {
                     t.description.to_string()
                 };
@@ -370,6 +422,8 @@ impl WorkspaceMcpServer {
     }
 }
 
+// By-value: callers hand over freshly built payloads.
+#[allow(clippy::needless_pass_by_value)]
 fn ok(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }

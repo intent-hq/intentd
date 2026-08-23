@@ -1,4 +1,4 @@
-//! Unit tests: open a temp SQLite DB, run migrations, and round-trip
+//! Unit tests: open a temp `SQLite` DB, run migrations, and round-trip
 //! workspaces and notes including the `include_archived` filter.
 
 use std::path::PathBuf;
@@ -101,7 +101,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
         ]
     );
     assert_eq!(
@@ -111,7 +111,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105
         ]
     );
 }
@@ -137,9 +137,8 @@ async fn open_rejects_database_from_newer_build() {
     }
 
     let result = Store::open(&tmp.path).await;
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!("reopen must refuse a schema from a newer build"),
+    let Err(err) = result else {
+        panic!("reopen must refuse a schema from a newer build")
     };
     let msg = err.to_string();
     assert!(msg.contains("downgrades are unsupported"), "got {msg:?}");
@@ -759,6 +758,93 @@ async fn note_round_trip() {
     assert_eq!(fetched.id, note.id);
 }
 
+/// `max_note_updated_at` (monorepo#3058): the newest note `updated_at` per
+/// workspace as a single aggregate — `None` for a workspace with no notes,
+/// the max across notes otherwise, matching what folding hydrated
+/// `list_notes` rows would produce. Backs the `lastActivity` derivation on
+/// the hot list/get emit paths without note-body hydration.
+#[tokio::test]
+async fn max_note_updated_at_matches_list_notes_fold() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // No notes: the aggregate reads None (SQL MAX over zero rows is NULL).
+    assert_eq!(
+        store.max_note_updated_at(&ws_id).await.expect("empty max"),
+        None
+    );
+
+    let mk_note = |id: &str, updated_at: &str| Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: id.to_string(),
+        content: "body".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: updated_at.to_string(),
+        rev: 0,
+        updated_at: updated_at.to_string(),
+    };
+    for (id, ts) in [
+        ("n-old", "2026-01-01T00:00:00Z"),
+        ("n-new", "2026-03-01T00:00:00Z"),
+        ("n-mid", "2026-02-01T00:00:00Z"),
+    ] {
+        store.insert_note(&mk_note(id, ts)).await.expect("insert");
+    }
+
+    let max = store.max_note_updated_at(&ws_id).await.expect("max");
+    assert_eq!(max.as_deref(), Some("2026-03-01T00:00:00Z"));
+
+    // Parity with the old fold over hydrated rows.
+    let notes = store.list_notes(&ws_id).await.expect("list");
+    let folded = notes.iter().map(|n| n.updated_at.as_str()).max();
+    assert_eq!(max.as_deref(), folded);
+
+    // Scoped per workspace: another workspace's notes never leak in.
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .expect("insert other ws");
+    assert_eq!(
+        store.max_note_updated_at(&other).await.expect("other max"),
+        None
+    );
+
+    // The aggregate must be answered from the covering
+    // idx_note_workspace_updated_at index — never by visiting note rows
+    // (whose bodies can be large), or the O(notes) read this replaces
+    // silently returns (monorepo#3058).
+    let details: Vec<String> =
+        sqlx::query("EXPLAIN QUERY PLAN SELECT MAX(updated_at) FROM note WHERE workspace_id = ?")
+            .bind(&ws_id.0)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("COVERING INDEX idx_note_workspace_updated_at")),
+        "aggregate must use the covering index, plan: {details:?}"
+    );
+}
+
 #[tokio::test]
 async fn note_version_append_list_get_and_prune() {
     let tmp = TempDb::new();
@@ -810,13 +896,16 @@ async fn note_version_append_list_get_and_prune() {
         .list_note_versions(&ws_id, &note.id)
         .await
         .expect("list versions");
-    assert_eq!(versions.len(), MAX_NOTE_VERSIONS as usize);
+    assert_eq!(
+        versions.len(),
+        usize::try_from(MAX_NOTE_VERSIONS).expect("value fits in usize")
+    );
     assert_eq!(versions.first().map(|e| e.v), Some(6), "oldest 5 pruned");
     assert_eq!(versions.last().map(|e| e.v), Some(total));
     assert!(versions.iter().all(|e| e.entry_type == "snapshot"));
     assert_eq!(
         versions.last().map(|e| e.content_length),
-        Some(note.content.len() as i64)
+        Some(i64::try_from(note.content.len()).expect("value fits in i64"))
     );
 
     let got = store
@@ -890,7 +979,7 @@ async fn append_note_version_rolls_back_on_body_error() {
 
 /// Regression for monorepo#657: a failed COMMIT in `append_note_version`
 /// must roll the transaction back so the sole write-pool connection
-/// (max_connections=1) is not returned to the pool still holding an open
+/// (`max_connections=1`) is not returned to the pool still holding an open
 /// transaction + write lock. `defer_foreign_keys = ON` postpones a
 /// ghost-note FK violation to COMMIT time, forcing the COMMIT itself to
 /// fail; pre-fix code propagated the error without ROLLBACK, poisoning the
@@ -1092,7 +1181,7 @@ async fn rollback_or_poison_emits_warn_on_detach() {
     .expect("create trap trigger");
 
     let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let _guard = tracing::subscriber::set_default(WarnCapture {
+    let guard = tracing::subscriber::set_default(WarnCapture {
         events: captured.clone(),
         next_span_id: std::sync::atomic::AtomicU64::new(1),
     });
@@ -1100,7 +1189,7 @@ async fn rollback_or_poison_emits_warn_on_detach() {
         .append_note_version(&note, &author, &ts)
         .await
         .expect_err("INSERT must fail on the rollback trigger");
-    drop(_guard);
+    drop(guard);
 
     // The detach path fired (pool size dropped to 0) and emitted a WARN
     // event carrying the ROLLBACK error.
@@ -1970,8 +2059,8 @@ async fn comment_update_preserves_legacy_extra_keys() {
 /// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
 /// `set_thread_status` all scope by `(id, workspace_id)`, so a caller
 /// declaring workspace B cannot mutate a comment row that belongs to
-/// workspace A. Bare-id probes surface as NotFound / zero-row updates
-/// depending on the mutation shape (mirrors the note_repo 0022 pattern).
+/// workspace A. Bare-id probes surface as `NotFound` / zero-row updates
+/// depending on the mutation shape (mirrors the `note_repo` 0022 pattern).
 #[tokio::test]
 async fn comment_mutations_reject_cross_workspace_bare_id_writes() {
     let tmp = TempDb::new();
@@ -2261,10 +2350,10 @@ async fn event_metadata_round_trips_through_store() {
 }
 
 /// Regression for monorepo#670: a failed COMMIT in `insert_events` must roll
-/// the transaction back so the sole write-pool connection (max_connections=1)
+/// the transaction back so the sole write-pool connection (`max_connections=1`)
 /// is not returned to the pool still holding an open transaction + write
 /// lock. The `event` table has no FK on `workspace_id`, so unlike the
-/// note_version variant this test plants a trap: a trigger on `event`
+/// `note_version` variant this test plants a trap: a trigger on `event`
 /// inserts into a table whose FK is `DEFERRABLE INITIALLY DEFERRED`, so the
 /// violation only surfaces at COMMIT time, forcing the COMMIT itself to
 /// fail. Pre-fix code propagated the error without ROLLBACK, poisoning the
@@ -2812,7 +2901,7 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
 
 /// Finding F4 (fsync half): `connect()` sets `PRAGMA synchronous = NORMAL`
 /// (safe under WAL) to cut fsync load on high-write workloads. This test
-/// asserts that a fresh pool has `synchronous = NORMAL` (2 in SQLite's integer
+/// asserts that a fresh pool has `synchronous = NORMAL` (2 in `SQLite`'s integer
 /// encoding: 0=OFF, 1=NORMAL, 2=FULL).
 #[tokio::test]
 async fn connect_sets_synchronous_normal_under_wal() {
@@ -2964,7 +3053,10 @@ async fn retention_sweep_chunked_deletion_completes() {
 
     let old = "2026-01-01T00:00:00Z";
     let new = "2026-06-01T00:00:00Z";
-    let total_old = crate::event_repo::RETENTION_DELETE_CHUNK as usize * 2 + 50;
+    let total_old = usize::try_from(crate::event_repo::RETENTION_DELETE_CHUNK)
+        .expect("value fits in usize")
+        * 2
+        + 50;
     let mut seed: Vec<NewEvent> = (0..total_old)
         .map(|_| typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()))
         .collect();
@@ -3045,7 +3137,7 @@ async fn retention_delete_query_plan_uses_index() {
 /// Disk-space reclamation: a freshly created database is in
 /// `auto_vacuum = INCREMENTAL` mode, pages emptied by retention deletes land
 /// on the freelist, and bounded `Store::incremental_vacuum` calls actually
-/// release them (freelist shrinks, logical page_count drops).
+/// release them (freelist shrinks, logical `page_count` drops).
 #[tokio::test]
 async fn incremental_vacuum_releases_freelist_pages() {
     let tmp = TempDb::new();
@@ -3118,7 +3210,7 @@ async fn incremental_vacuum_releases_freelist_pages() {
         .expect("drain vacuum");
     assert_eq!(
         freed_bounded + freed_rest,
-        freelist_after_delete as u64,
+        freelist_after_delete.cast_unsigned(),
         "all freelist pages should be released"
     );
     assert_eq!(store.freelist_count().await.expect("freelist"), 0);
@@ -3135,7 +3227,7 @@ async fn incremental_vacuum_releases_freelist_pages() {
 }
 
 /// One-time activation (monorepo#720 finding 1): a legacy database created
-/// without auto_vacuum stays in NONE mode when reopened through `Store::open`
+/// without `auto_vacuum` stays in NONE mode when reopened through `Store::open`
 /// (the connect pragma is recorded but inert), so
 /// `Store::activate_incremental_vacuum` must run a VACUUM that converts it to
 /// incremental mode, shrinks the file, and makes subsequent bounded
@@ -3517,7 +3609,7 @@ async fn agent_session_attention_request_round_trip_and_clear() {
 /// G9 regression (attention-clobber race): the full-row
 /// `update_agent_session` must NOT write the `attention_request_*` columns.
 /// A long-lived in-memory `AgentSession` persisted mid-race can therefore
-/// neither resurrect a request that `clear_attention_request` already NULLed
+/// neither resurrect a request that `clear_attention_request` already `NULLed`
 /// nor clobber a fresh one written by `set_attention_request` in the interim.
 #[tokio::test]
 async fn full_row_update_never_touches_attention_request_columns() {
@@ -3799,7 +3891,7 @@ async fn agent_session_resolved_model_guard_and_clear() {
     assert_eq!(resolved.as_deref(), Some("Opus 4.8"));
 }
 
-/// `set_agent_session_status` stop_reason parameter: `None` leaves the column
+/// `set_agent_session_status` `stop_reason` parameter: `None` leaves the column
 /// untouched; `Some(None)` clears it to NULL; `Some(Some(reason))` sets the
 /// new value. Exercises the three-way encoding for set/clear/leave-unchanged
 /// across a status update. `stop_reason_timestamp` is coupled: set → stamped
@@ -5099,9 +5191,9 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
 }
 
 /// Concurrent write + read stress test: verify that the single-writer pool
-/// eliminates SQLITE_BUSY (code 5) errors under heavy concurrent load.
+/// eliminates `SQLITE_BUSY` (code 5) errors under heavy concurrent load.
 /// Spawns ~50 concurrent writes + concurrent reads; all must succeed without
-/// busy_timeout errors, and no read may be latency-coupled to the write storm
+/// `busy_timeout` errors, and no read may be latency-coupled to the write storm
 /// (which is what a shared read/write pool regression looks like).
 #[tokio::test]
 async fn concurrent_writes_no_sqlite_busy() {
@@ -5119,8 +5211,8 @@ async fn concurrent_writes_no_sqlite_busy() {
                 let ts = now_iso();
                 let workspace = Workspace {
                     id: ws_id.clone(),
-                    title: format!("Workspace {}", i),
-                    branch: format!("main-{}", i),
+                    title: format!("Workspace {i}"),
+                    branch: format!("main-{i}"),
                     base_ref: None,
                     base_commit_sha: None,
                     status: WorkspaceStatus::Active,
@@ -5132,7 +5224,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     updated_at: ts.clone(),
                     last_activity: None,
                     tags: vec![],
-                    path: Some(format!("/tmp/ws-{}", i)),
+                    path: Some(format!("/tmp/ws-{i}")),
                     repository_path: None,
                     repository_owner: None,
                     repository_name: None,
@@ -5186,8 +5278,7 @@ async fn concurrent_writes_no_sqlite_busy() {
         let result = handle.await.unwrap();
         assert!(
             result.is_ok(),
-            "Write failed (SQLITE_BUSY would be Error::Internal with 'database is locked'): {:?}",
-            result
+            "Write failed (SQLITE_BUSY would be Error::Internal with 'database is locked'): {result:?}"
         );
     }
     let write_storm = storm_start.elapsed();
@@ -5201,16 +5292,13 @@ async fn concurrent_writes_no_sqlite_busy() {
     let mut slowest_read = std::time::Duration::ZERO;
     for handle in read_handles {
         let (result, elapsed) = handle.await.unwrap();
-        assert!(result.is_ok(), "Read failed: {:?}", result);
+        assert!(result.is_ok(), "Read failed: {result:?}");
         slowest_read = slowest_read.max(elapsed);
     }
     let read_budget = std::cmp::max(std::time::Duration::from_secs(5), write_storm / 2);
     assert!(
         slowest_read < read_budget,
-        "Slowest read took {:?} (budget {:?}, write storm {:?}) — reads queueing behind writers?",
-        slowest_read,
-        read_budget,
-        write_storm
+        "Slowest read took {slowest_read:?} (budget {read_budget:?}, write storm {write_storm:?}) — reads queueing behind writers?"
     );
 
     // Verify all 50 workspaces were written
@@ -5225,7 +5313,7 @@ async fn concurrent_writes_no_sqlite_busy() {
 
 /// Test the periodic WAL checkpoint task: verify it runs on schedule and stops
 /// cleanly when the handle is aborted. The task runs every 60s and executes
-/// PRAGMA wal_checkpoint(PASSIVE) via the write pool.
+/// PRAGMA `wal_checkpoint(PASSIVE)` via the write pool.
 #[tokio::test]
 async fn periodic_wal_checkpoint_runs_and_stops() {
     let tmp = TempDb::new();
@@ -5256,10 +5344,10 @@ async fn periodic_wal_checkpoint_runs_and_stops() {
     assert_eq!(loaded.len(), 1);
 }
 
-/// Smoke test: verify the two-pool split sizing (write pool max_connections=1,
-/// read pool max_connections=32) and that both pools support basic queries.
+/// Smoke test: verify the two-pool split sizing (write pool `max_connections=1`,
+/// read pool `max_connections=32`) and that both pools support basic queries.
 /// The write pool is single-connection to serialize all mutations and eliminate
-/// in-process writer-vs-writer busy_timeout contention. The read pool size (32)
+/// in-process writer-vs-writer `busy_timeout` contention. The read pool size (32)
 /// is sized to absorb the client-driven startup read burst without slow-acquire
 /// warnings (STAB-6, STAB-46), scaled up from 16 for the RAM-based agent
 /// process cap raise to 56 (intent-hq/intentd#296).
@@ -5665,7 +5753,7 @@ async fn agent_queue_load_defaults_null_turn_id_to_row_id() {
     );
 }
 
-/// A transient SQLITE_BUSY error as surfaced by the repositories
+/// A transient `SQLITE_BUSY` error as surfaced by the repositories
 /// (monorepo#1139: "get note failed: ... (code: 5) database is locked").
 fn busy_error() -> Error {
     Error::Internal(
@@ -5711,9 +5799,9 @@ async fn read_retry_does_not_retry_non_busy_errors() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// Extended busy-family codes (261 SQLITE_BUSY_RECOVERY, 517
-/// SQLITE_BUSY_SNAPSHOT, 773 SQLITE_BUSY_TIMEOUT) are retried like the base
-/// `(code: 5)`, while unrelated 5xx codes (e.g. 516 SQLITE_ABORT_ROLLBACK)
+/// Extended busy-family codes (261 `SQLITE_BUSY_RECOVERY`, 517
+/// `SQLITE_BUSY_SNAPSHOT`, 773 `SQLITE_BUSY_TIMEOUT`) are retried like the base
+/// `(code: 5)`, while unrelated 5xx codes (e.g. 516 `SQLITE_ABORT_ROLLBACK`)
 /// are not.
 #[tokio::test]
 async fn read_retry_classifies_busy_family_codes() {
@@ -5814,6 +5902,7 @@ async fn write_txn_retry_retries_busy_then_succeeds() {
 /// fail at runtime with a UNIQUE constraint violation on
 /// `_sqlx_migrations.version`.
 #[test]
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // extensions generated by our own code with fixed case
 fn migrations_have_unique_versions() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let mut versions: std::collections::HashMap<i64, Vec<String>> =
@@ -5824,7 +5913,7 @@ fn migrations_have_unique_versions() {
         if !name.ends_with(".sql") {
             continue;
         }
-        let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
         let version: i64 = digits
             .parse()
             .unwrap_or_else(|_| panic!("migration '{name}' has no numeric version prefix"));
@@ -5961,7 +6050,7 @@ async fn hook_list_filters_by_workspace_and_agent() {
 
     let ws_hooks = store.list_hooks_by_workspace(&ws_a).await.expect("list ws");
     let mut ws_ids: Vec<&str> = ws_hooks.iter().map(|h| h.hook_id.0.as_str()).collect();
-    ws_ids.sort();
+    ws_ids.sort_unstable();
     assert_eq!(ws_ids, vec!["hook-a1", "hook-a2"]);
 
     let agent_hooks = store
@@ -6161,7 +6250,7 @@ async fn hook_load_active_and_delete() {
 
     let active = store.load_active_hooks().await.expect("load active");
     let mut ids: Vec<&str> = active.iter().map(|h| h.hook_id.0.as_str()).collect();
-    ids.sort();
+    ids.sort_unstable();
     assert_eq!(ids, vec!["hook-run", "hook-sched"]);
 
     store
@@ -6229,7 +6318,10 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         .list_agent_flipped_completions(&agent_a)
         .await
         .expect("list capped");
-    assert_eq!(listed.len(), crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize);
+    assert_eq!(
+        listed.len(),
+        usize::try_from(crate::AGENT_FLIPPED_COMPLETIONS_CAP).expect("value fits in usize")
+    );
     assert!(
         !listed.iter().any(|(_, n)| n == &first),
         "oldest row evicted at the cap"
@@ -6267,7 +6359,7 @@ async fn agent_flipped_completion_record_dedup_cap_remove_and_reopen() {
         .expect("list after reopen");
     assert_eq!(
         listed.len(),
-        crate::AGENT_FLIPPED_COMPLETIONS_CAP as usize - 1
+        usize::try_from(crate::AGENT_FLIPPED_COMPLETIONS_CAP).expect("value fits in usize") - 1
     );
 
     // Take (consume-on-stamp read): returns the rows oldest-first and

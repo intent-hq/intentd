@@ -2,7 +2,7 @@
 //!
 //! Stateless one-shot completion so background FE requests (slug generation,
 //! note-status checks — the two remaining `background-request.service.ts`
-//! callers) no longer need an ACPProvider or an ephemeral agent session. The
+//! callers) no longer need an `ACPProvider` or an ephemeral agent session. The
 //! daemon owns the full lifecycle: spawn the provider, collect its cleaned
 //! reply, reap the process on any failure path (timeout, cancel, drop). No
 //! session/agent state is created, so there is nothing to garbage-collect on
@@ -174,6 +174,12 @@ fn one_shot_launch(
 /// not a spawn arg), filtered like [`intent_providers::build_provider_args`]
 /// filters the flag (empty and the `"default"` sentinel mean "adapter
 /// default"). `None` when the launch args already carry the model.
+///
+/// Providers flagged `config_option_model_strips_effort` (codex) get a
+/// `{base}/{effort}` id stripped to its base, mirroring
+/// `AgentManager::config_option_model_target`: the adapter's
+/// `configOptions[id="model"]` select values are bare base ids, so a
+/// suffixed value would never match.
 fn config_option_model<'m>(
     provider: &intent_providers::ProviderConfig,
     model: Option<&'m str>,
@@ -181,7 +187,12 @@ fn config_option_model<'m>(
     if provider.model_flag.is_some() {
         return None;
     }
-    model.filter(|m| !m.is_empty() && *m != "default")
+    let model = model.filter(|m| !m.is_empty() && *m != "default")?;
+    if provider.config_option_model_strips_effort {
+        let base = model.split_once('/').map_or(model, |(base, _)| base);
+        return (!base.is_empty()).then_some(base);
+    }
+    Some(model)
 }
 
 impl Services {
@@ -289,8 +300,7 @@ impl Services {
                             p
                         } else {
                             return Err(Error::InvalidParams(format!(
-                                "configured auggie path is not a valid file: {}",
-                                trimmed
+                                "configured auggie path is not a valid file: {trimmed}"
                             )));
                         }
                     }
@@ -416,11 +426,11 @@ mod tests {
     use super::*;
     use intent_store::Store;
 
-    /// RAII temp SQLite store: the db (and its `-wal`/`-shm` sidecars) live in
+    /// RAII temp `SQLite` store: the db (and its `-wal`/`-shm` sidecars) live in
     /// a guarded temp dir removed on drop — including on panic — unless
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) is set.
     struct TempDb {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         path: PathBuf,
     }
 
@@ -428,7 +438,7 @@ mod tests {
         fn new() -> Self {
             let dir = crate::tests::test_tempdir("intentd-completeops-");
             let path = dir.path().join("store.db");
-            Self { _dir: dir, path }
+            Self { dir, path }
         }
     }
 
@@ -440,7 +450,7 @@ mod tests {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         registry
@@ -508,7 +518,7 @@ mod tests {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         let applied: Vec<(String, serde_json::Value)> = keys
@@ -532,7 +542,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                r#"import readline from 'node:readline';
+                r"import readline from 'node:readline';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const rl = readline.createInterface({{ input: process.stdin, terminal: false }});
 rl.on('line', (line) => {{
@@ -549,7 +559,7 @@ rl.on('line', (line) => {{
     send({{ jsonrpc: '2.0', id: msg.id, result: {{ stopReason: 'end_turn' }} }});
   }}
 }});
-"#
+"
             ),
         )
         .expect("write mock adapter");
@@ -648,7 +658,7 @@ rl.on('line', (line) => {{
         let script = dir.path().join("adapter.mjs");
         std::fs::write(
             &script,
-            r#"import readline from 'node:readline';
+            r"import readline from 'node:readline';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', (line) => {
@@ -665,7 +675,7 @@ rl.on('line', (line) => {
     send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
   }
 });
-"#,
+",
         )
         .expect("write mock adapter");
         let bin = dir.path().join("codex-acp");
@@ -711,9 +721,23 @@ rl.on('line', (line) => {
         let pi = intent_providers::find_provider("pi").unwrap();
         assert_eq!(config_option_model(pi, Some("pi-large")), Some("pi-large"));
         // codex-acp also has no CLI model flag on its plain launch, so the
-        // one-shot applies the model the same way.
+        // one-shot applies the model the same way — and codex sets
+        // config_option_model_strips_effort, so a `{base}/{effort}` id is
+        // stripped to its base (the adapter's option values are bare ids).
         let codex = intent_providers::find_provider("codex").unwrap();
         assert_eq!(config_option_model(codex, Some("gpt-5")), Some("gpt-5"));
+        assert_eq!(
+            config_option_model(codex, Some("gpt-5.3-codex/high")),
+            Some("gpt-5.3-codex")
+        );
+        // Degenerate `/effort` with an empty base: no call at all.
+        assert_eq!(config_option_model(codex, Some("/high")), None);
+        // Providers WITHOUT the flag keep any `/` verbatim.
+        assert_eq!(
+            config_option_model(claude, Some("a/b")),
+            Some("a/b"),
+            "claude-code keeps '/' verbatim"
+        );
         // A provider WITH a CLI model flag carries the model in its args; no
         // post-session application.
         let droid = intent_providers::find_provider("droid").unwrap();
@@ -981,12 +1005,11 @@ rl.on('line', (line) => {
             "no cached evidence must not drop a bare id"
         );
 
-        // auggie and grok are both version-pin-free, so a "" version key
-        // makes each entry current evidence.
+        // Use each provider's current catalog version key for ownership evidence.
         let catalog = empty_catalog();
         catalog.store_for_test(
             "auggie",
-            "",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
             vec![serde_json::json!({ "id": "sonnet4.5", "provider": "auggie" })],
         );
         catalog.store_for_test(
@@ -1021,7 +1044,7 @@ rl.on('line', (line) => {
         // then the default — so any client gets the setting for free.
         let (_bin_dir, bin) = fake_auggie_echoing_args("quick-actions");
         let (tmp, services) = services_with_bin(bin).await;
-        let registry = crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+        let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
             .expect("load registry");
         registry
             .apply(&[
@@ -1082,7 +1105,7 @@ rl.on('line', (line) => {
         // quick-action key set, the CLI still runs with no `--model`.
         let (_bin_dir, bin) = fake_auggie_echoing_args("provider-settings");
         let (tmp, services) = services_with_bin(bin).await;
-        let registry = crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+        let registry = crate::SettingsRegistry::load(tmp.dir.path().join("config.toml"))
             .expect("load registry");
         registry
             .apply(&[

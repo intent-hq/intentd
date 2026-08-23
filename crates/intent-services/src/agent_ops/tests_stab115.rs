@@ -4,7 +4,7 @@
 //! - provider defaults > global default
 //!
 //! (The per-workspace override tier was removed in monorepo#1000; a stale
-//! `model.workspaceOverrides` SQLite row must be ignored. The background-agent
+//! `model.workspaceOverrides` `SQLite` row must be ignored. The background-agent
 //! tier was removed in monorepo#1729 — the renamed `quickActions.*` keys scope
 //! to single-shot quick actions and never to agent sessions.)
 //!
@@ -30,6 +30,11 @@ async fn setup() -> (TempDb, Services, WorkspaceId, tempfile::TempDir) {
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
+    // monorepo#3044: creation requires a resolvable provider (no positional
+    // fallback) — seed the pre-existing effective default explicitly.
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws, config_dir)
 }
@@ -66,7 +71,7 @@ async fn create_agent(
             None,
             None,
             false,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -90,7 +95,7 @@ async fn agent_create_resolves_model_from_settings_default() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
-/// monorepo#1000 regression: a stale `model.workspaceOverrides` SQLite row
+/// monorepo#1000 regression: a stale `model.workspaceOverrides` `SQLite` row
 /// (left behind by a pre-removal daemon) must NOT influence resolution — the
 /// retired tier is gone, so the chain proceeds to the live tiers.
 #[tokio::test]
@@ -303,7 +308,7 @@ async fn agent_create_mismatched_settings_default_falls_back_to_cli_default() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![serde_json::json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );

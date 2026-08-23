@@ -115,7 +115,7 @@ async fn subscribe(
     (reader, sub_write, sub_id, arr)
 }
 
-async fn boot(
+fn boot(
     bus: &EventBus,
 ) -> (
     PathBuf,
@@ -132,6 +132,7 @@ async fn boot(
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
         Services::new(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -157,7 +158,7 @@ async fn agent_channel_snapshot_then_removed_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
@@ -214,7 +215,7 @@ async fn task_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
@@ -297,7 +298,7 @@ async fn comment_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
@@ -365,7 +366,7 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
 
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
     let mut rpc_reader = tokio::io::BufReader::new(rpc_read);

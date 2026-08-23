@@ -33,6 +33,7 @@ static NOISE_DIRECTORIES: &[&str] = &[
 ];
 
 /// Resolve the user's home directory from the environment (cross-platform).
+#[cfg(not(test))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -91,8 +92,8 @@ struct CacheEntry {
 }
 
 /// Global discovery cache keyed by normalized workspace path
-static DISCOVERY_CACHE: once_cell::sync::Lazy<Mutex<HashMap<String, CacheEntry>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static DISCOVERY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Public API: discover skills for a workspace
 pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
@@ -129,13 +130,13 @@ pub(crate) async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMeta
     let changed = match old_skills {
         None => !new_skills.is_empty(), // Changed if we now have skills
         Some(old) => {
-            if old.len() != new_skills.len() {
-                true
-            } else {
+            if old.len() == new_skills.len() {
                 // Compare sorted skill names
                 let old_names: Vec<_> = old.iter().map(|s| &s.name).collect();
                 let new_names: Vec<_> = new_skills.iter().map(|s| &s.name).collect();
                 old_names != new_names
+            } else {
+                true
             }
         }
     };
@@ -162,6 +163,13 @@ fn get_scan_targets(
 ) -> Vec<ScanTarget> {
     let mut targets = Vec::new();
 
+    // Hermetic-test seam (intent-hq/monorepo#3029): unit tests never fall
+    // back to the developer's real home directory — user-installed skills
+    // would otherwise leak into prompts assembled by tests. Tests that need
+    // user-scope targets pass an explicit `home_override`.
+    #[cfg(test)]
+    let home = home_override;
+    #[cfg(not(test))]
     let home = home_override.or_else(home_dir);
     if let Some(home) = home {
         targets.push(ScanTarget {
@@ -366,7 +374,7 @@ struct ScanState {
     scanned_directories: usize,
 }
 
-/// Find all SKILL.md files under root_path
+/// Find all SKILL.md files under `root_path`
 async fn find_skill_files(
     root_path: &Path,
     observed_paths: &mut std::collections::HashSet<PathBuf>,
@@ -413,7 +421,7 @@ async fn walk_directory(
     while let Ok(Some(entry)) = entries.next_entry().await {
         dir_entries.push(entry);
     }
-    dir_entries.sort_by_key(|e| e.file_name());
+    dir_entries.sort_by_key(tokio::fs::DirEntry::file_name);
 
     // Check for SKILL.md in this directory
     let has_skill_file = dir_entries
@@ -584,7 +592,7 @@ fn extract_frontmatter(content: &str) -> Option<FrontmatterExtraction> {
 fn parse_frontmatter_yaml(frontmatter_text: &str) -> Option<serde_yaml::Value> {
     serde_yaml::from_str::<serde_yaml::Value>(frontmatter_text)
         .ok()
-        .filter(|v| v.is_mapping())
+        .filter(serde_yaml::Value::is_mapping)
 }
 
 /// Quote malformed scalar values in YAML (unquoted colons)
@@ -688,8 +696,7 @@ async fn get_path_fingerprint(path: &Path) -> PathFingerprint {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_millis());
             PathFingerprint {
                 path: path.to_path_buf(),
                 exists: true,
@@ -720,7 +727,7 @@ mod tests {
     use super::*;
 
     fn build_skill_content(frontmatter: &str, body: &str) -> String {
-        format!("---\n{}\n---\n\n{}\n", frontmatter, body)
+        format!("---\n{frontmatter}\n---\n\n{body}\n")
     }
 
     async fn write_skill(skill_root: &Path, skill_name: &str, content: &str) -> PathBuf {
@@ -747,6 +754,22 @@ mod tests {
     fn clear_cache() {
         let mut cache = DISCOVERY_CACHE.lock().unwrap();
         cache.clear();
+    }
+
+    /// Hermeticity regression (intent-hq/monorepo#3029): in test builds,
+    /// scanning without an explicit home override must never produce
+    /// user-scope targets — the developer's real home directory (and any
+    /// skills installed there) stays out of test-assembled prompts.
+    #[test]
+    fn test_scan_targets_without_home_override_skip_user_scope() {
+        let targets = get_scan_targets(Some("/tmp/ws"), None);
+        assert!(
+            targets.iter().all(|t| t.scope == "project"),
+            "no user-scope scan targets without an explicit home override"
+        );
+
+        let with_home = get_scan_targets(Some("/tmp/ws"), Some(PathBuf::from("/tmp/home")));
+        assert!(with_home.iter().any(|t| t.scope == "user"));
     }
 
     #[tokio::test]
@@ -967,7 +990,7 @@ mod tests {
         // Create a deep directory structure beyond MAX_SCAN_DEPTH
         let mut deep_path = skills_root.clone();
         for i in 0..=MAX_SCAN_DEPTH + 1 {
-            deep_path = deep_path.join(format!("level{}", i));
+            deep_path = deep_path.join(format!("level{i}"));
         }
         tokio::fs::create_dir_all(&deep_path).await.unwrap();
 

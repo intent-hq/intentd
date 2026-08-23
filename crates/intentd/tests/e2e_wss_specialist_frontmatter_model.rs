@@ -1,5 +1,5 @@
 //! WSS e2e for specialist frontmatter model resolution (fix for review thread
-//! PRRT_kwDOS9Wxuc6SIhDY): validates that agent.create with a specialistId but
+//! `PRRT_kwDOS9Wxuc6SIhDY`): validates that agent.create with a specialistId but
 //! no explicit model parameter resolves the specialist's frontmatter `model`
 //! field through the 3-tier precedence (project > user > bundled).
 
@@ -195,7 +195,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -246,7 +246,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
 
     // Discover bound port + fingerprint via UDS
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -319,7 +320,8 @@ async fn specialist_hidden_round_trips_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -358,7 +360,7 @@ async fn specialist_hidden_round_trips_over_wss() {
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
 /// bundled-dir override, `specialist.list` over WSS returns exactly the eight
 /// embedded reference specialists — `pr-shepherd` is gone from the bundled set
-/// (review thread PRRT_kwDOS9Wxuc6YSV2u).
+/// (review thread `PRRT_kwDOS9Wxuc6YSV2u`).
 #[tokio::test]
 async fn embedded_bundled_catalog_over_wss() {
     let data_dir = temp_data_dir();
@@ -377,7 +379,8 @@ async fn embedded_bundled_catalog_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -473,7 +476,8 @@ async fn specialist_config_scalars_inherit_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -558,7 +562,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -617,7 +621,8 @@ async fn specialist_model_options_round_trip_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

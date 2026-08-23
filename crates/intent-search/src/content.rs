@@ -71,9 +71,14 @@ fn build_matcher(query: &str, opts: &SearchOpts) -> Result<RegexMatcher> {
         .map_err(|_| Error::InvalidParams("Invalid regex".to_string()))
 }
 
+#[allow(clippy::similar_names)] // matcher/matches are the natural grep-domain names
 /// Run a gitignore-aware content search rooted at `root`. Honors `opts.globs`
 /// (path globs), `opts.maxResults` (sets `truncated` when exceeded), and the
 /// `cancel` token (stops early, best-effort).
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if the query regex or a path glob is invalid; `Error::Internal` if the walk fails.
 pub fn search_in_files(
     root: &Path,
     query: &str,
@@ -93,11 +98,8 @@ pub fn search_in_files(
         if cancel.is_cancelled() || truncated {
             break;
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();
@@ -145,18 +147,12 @@ impl Sink for ContentSink<'_> {
             }
         }
         let line_bytes = first_line(mat.bytes());
-        let col = self
-            .matcher
-            .find(line_bytes)
-            .ok()
-            .flatten()
-            .map(|m| {
-                String::from_utf8_lossy(&line_bytes[..m.start()])
-                    .chars()
-                    .count()
-                    + 1
-            })
-            .unwrap_or(1);
+        let col = self.matcher.find(line_bytes).ok().flatten().map_or(1, |m| {
+            String::from_utf8_lossy(&line_bytes[..m.start()])
+                .chars()
+                .count()
+                + 1
+        });
         self.matches.push(SearchMatch {
             file: self.file.to_string(),
             line: mat.line_number().unwrap_or(0),

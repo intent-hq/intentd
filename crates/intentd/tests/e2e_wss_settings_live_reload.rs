@@ -59,7 +59,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -214,7 +214,7 @@ async fn wss_rpc(ws: &mut Wss, id: i64, method: &str, params: Value) -> Value {
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -242,7 +242,7 @@ async fn next_settings_event(ws: &mut Wss) -> Value {
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -268,7 +268,7 @@ async fn assert_no_settings_event(ws: &mut Wss, secs: u64) {
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             Ok(other) => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -286,7 +286,7 @@ fn atomic_write(path: &Path, content: &str) {
 /// by polling daemon.log for the readiness line the composition root emits
 /// (`spawn_config_watcher_init` in `crates/intentd/src/main.rs`). The
 /// watcher registers in a background task (monorepo#1581), so a fast test
-/// can otherwise hand-edit config.toml before the FSEvents watch exists and
+/// can otherwise hand-edit config.toml before the `FSEvents` watch exists and
 /// the edit is missed entirely — no wait on `settings:changed`, however
 /// long, can recover it (monorepo#1849). Bounded by [`LIVENESS`]; fails
 /// fast if the daemon reports the watcher failed to start.
@@ -325,9 +325,12 @@ async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")

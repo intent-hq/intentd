@@ -1,7 +1,7 @@
 //! End-to-end tests for client-served ACP handlers (fs, permission, terminal).
 //!
-//! Drives the mock ACP agent to issue agent→client requests (fs/read_text_file,
-//! fs/write_text_file, session/request_permission, terminal/*) and asserts on
+//! Drives the mock ACP agent to issue agent→client requests (`fs/read_text_file`,
+//! `fs/write_text_file`, `session/request_permission`, terminal/*) and asserts on
 //! the daemon's responses. Covers the client-served slice of the ACP protocol
 //! (spec §6.2–§6.4) at the e2e layer, which was near-0% before this test suite.
 //!
@@ -24,7 +24,7 @@ use intent_store::Store;
 
 const SESSION_ID: &str = "mock-session-1";
 
-fn workspace(id: &WorkspaceId, path: std::path::PathBuf) -> Workspace {
+fn workspace(id: &WorkspaceId, path: &std::path::Path) -> Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
@@ -82,12 +82,14 @@ async fn setup_manager(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    if intent_providers::resolve_on_path("node").is_none() {
-        panic!("node not on PATH");
-    }
-    if !std::path::Path::new(script).exists() {
-        panic!("script not found at {script}");
-    }
+    assert!(
+        intent_providers::resolve_on_path("node").is_some(),
+        "node not on PATH"
+    );
+    assert!(
+        std::path::Path::new(script).exists(),
+        "script not found at {script}"
+    );
 
     let db = std::env::temp_dir().join(format!("intentd-e2e-client-{}.db", uuid::Uuid::new_v4()));
     let ws_root = std::env::temp_dir().join(format!("itd-e2e-client-ws-{}", uuid::Uuid::new_v4()));
@@ -97,11 +99,12 @@ async fn setup_manager(
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root.clone()))
         .await
         .expect("insert ws");
 
@@ -130,7 +133,7 @@ async fn create_agent_session(
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -584,7 +587,7 @@ async fn terminal_output_truncation() {
     let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-/// Test wait_for_exit on a process that exits with non-zero code.
+/// Test `wait_for_exit` on a process that exits with non-zero code.
 #[tokio::test]
 #[cfg(unix)]
 async fn terminal_non_zero_exit() {

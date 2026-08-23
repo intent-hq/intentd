@@ -1,6 +1,6 @@
 //! Wire-facing domain structs (§9.1). Every struct uses
 //! `#[serde(rename_all = "camelCase")]` so JSON matches the existing TS types
-//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / snake_case
+//! and docs/protocol/methods/ §5.1/§5.2. Enums serialize to their lowercase / `snake_case`
 //! string forms, which are also their stored DB representations.
 
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRoo
 use crate::settings_file::SandboxType;
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
-/// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
+/// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
 /// `Deleted`), matching the TS string enum exactly; these are also the stored DB
 /// words (the column DEFAULT is unused — inserts always bind explicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -43,7 +43,7 @@ pub enum WorkspaceAttention {
 }
 
 /// Pull-request lifecycle status (§9.1; TS `PullRequestStatus` in
-/// `src/shared/types.ts`). Wire values are the PascalCase variant names
+/// `src/shared/types.ts`). Wire values are the `PascalCase` variant names
 /// (`Open`/`Closed`/`Merged`/`Draft`), matching the TS string enum exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PullRequestStatus {
@@ -112,7 +112,7 @@ pub enum NoteVisibility {
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned canonical status rollup over the active/latest PR,
 /// `taskStats`, live agent activity, and the per-workspace attention axes.
-/// Wire values are the snake_case variant names, matching the FE union
+/// Wire values are the `snake_case` variant names, matching the FE union
 /// exactly. Canonical precedence (§6.5): `Failed` (a top-level agent parked
 /// in `error`) > `Blocked` (a top-level pending `blocker` attention
 /// request) > `NeedsAttention` (discussion requests, pending structured
@@ -139,6 +139,9 @@ pub enum WorkspaceDisplayStatus {
 }
 
 /// Workspace entity (§9.1).
+// The bool fields mirror the protocol's wire shape; grouping them would
+// change the serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -243,8 +246,8 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
-    /// Whether CoW isolation is supported on this machine. Computed as:
-    /// cow_probe(workspacesRoot, workspacesRoot) Supported — a machine
+    /// Whether `CoW` isolation is supported on this machine. Computed as:
+    /// `cow_probe(workspacesRoot, workspacesRoot)` Supported — a machine
     /// capability of the workspaces root's filesystem, independent of the
     /// workspace or checkout mode. Used by the FE to gate the Copy-on-Write
     /// opt-in toggle.
@@ -341,6 +344,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 /// virtual scope for Chief-of-Staff agents that never appears in
 /// `workspace.list` and is never persisted, but `workspace.get` returns
 /// this shape and `agent.create` accepts its id as the workspace scope.
+#[must_use]
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
@@ -415,6 +419,7 @@ impl UsageCost {
     /// an accepted consequence of storing a single figure — a cross-currency
     /// numeric comparison is semantically meaningless and the daemon never
     /// invents a conversion rate.
+    #[must_use]
     pub fn merge(lhs: Option<&UsageCost>, rhs: Option<&UsageCost>) -> Option<UsageCost> {
         match (lhs, rhs) {
             (None, None) => None,
@@ -455,6 +460,8 @@ pub struct TokenUsageTotals {
     pub cost: Option<UsageCost>,
 }
 
+// serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -482,6 +489,7 @@ impl TokenUsageTotals {
 /// the end-of-turn token report. Shared by the store's usage-row fetch (which
 /// hydrates message contents only for fallback sessions, monorepo#738) and the
 /// tally itself, so the two decisions can never drift apart.
+#[must_use]
 pub fn token_usage_reported(
     baseline: Option<&TokenUsageTotals>,
     snapshot: Option<&TokenUsageTotals>,
@@ -618,7 +626,7 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scripts: Option<Vec<RepoScript>>,
 
-    /// Repo-root-relative directory prefixes excluded from CoW checkout
+    /// Repo-root-relative directory prefixes excluded from `CoW` checkout
     /// provisioning (`workspace.create`/`workspace.duplicate`): matching
     /// directories are not cloned into the checkout (e.g. huge caches that
     /// slow the clone down). `.git` and the repo root itself cannot be
@@ -721,6 +729,7 @@ pub struct WorkspaceTaskStats {
 /// (`TASK_LINK_REGEX_FLEXIBLE`). Shared by the enriched `taskStats` path
 /// (intent-services `compute_task_stats`) and the cheap store-level counting
 /// query (`Store::count_task_stats`) so the two stay in lock-step.
+#[must_use]
 pub fn extract_spec_task_ids(content: &str) -> std::collections::HashSet<String> {
     const MARKER: &str = "(intent://local/task/";
     let mut ids = std::collections::HashSet::new();
@@ -831,7 +840,7 @@ pub struct WorkspaceCreate {
     pub repository_name: Option<String>,
     pub worktree_path: Option<String>,
     pub scope: Option<String>,
-    /// Opt out of the isolated checkout (worktree or CoW clone) and work
+    /// Opt out of the isolated checkout (worktree or `CoW` clone) and work
     /// directly in the repository folder. Canonical wire name is
     /// `skipIsolation`; `skipWorktree` is the deprecated pre-CoW alias
     /// (either set ⇒ direct mode). The persisted column keeps its historical
@@ -870,7 +879,7 @@ pub struct WorkspaceCreate {
     /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
     /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
     /// it as `data.progressId`, and provisioning paths that stream nothing
-    /// today (worktree / CoW / direct) emit milestone frames. Absent keeps
+    /// today (worktree / `CoW` / direct) emit milestone frames. Absent keeps
     /// the legacy event behavior exactly. Never persisted.
     pub progress_id: Option<String>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
@@ -1020,6 +1029,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
+#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -1044,6 +1054,7 @@ pub struct NoteMetadata {
 impl NoteMetadata {
     /// True when no metadata field is populated; used by [`Note`]'s
     /// `skip_serializing_if` so plain notes omit the `metadata` key entirely.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.task.is_none()
     }
@@ -1900,6 +1911,7 @@ pub struct CommentWire {
 
 impl CommentWire {
     /// Map a stored [`Comment`] to its nested wire shape.
+    #[must_use]
     pub fn from_comment(c: &Comment) -> Self {
         let anchor_context = match (&c.anchor_before, &c.anchor_after) {
             (None, None) => None,
@@ -2318,6 +2330,7 @@ pub const SLIM_PAGE_BUDGET_BYTES: usize = 512 * 1024;
 /// and passes through). Shared by the serve-time slim projection
 /// (intent-services `tool_block`) and the write-time `lastToolUse` preview
 /// (intent-store, [`last_tool_use_preview`]).
+#[must_use]
 pub fn slim_body_size(body: &serde_json::Value) -> usize {
     struct CountingSink(usize);
     impl std::io::Write for CountingSink {
@@ -2333,9 +2346,7 @@ pub fn slim_body_size(body: &serde_json::Value) -> usize {
         serde_json::Value::String(s) => s.len(),
         other => {
             let mut sink = CountingSink(0);
-            serde_json::to_writer(&mut sink, other)
-                .map(|()| sink.0)
-                .unwrap_or(0)
+            serde_json::to_writer(&mut sink, other).map_or(0, |()| sink.0)
         }
     }
 }
@@ -2449,6 +2460,22 @@ pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::
     Some(Value::Object(preview))
 }
 
+/// Per-field byte budget for `agent.list` row previews (list-payload cost
+/// contract, extending monorepo#2932): the preview fields exist to render a
+/// one-line summary in list contexts (sidebar rows, HUD cells), so each is
+/// bounded to this render-sized budget on the LIST path only — `agent.get` /
+/// `agent.getSession` keep serving full values. See
+/// [`AgentLite::cap_list_previews`]. String fields count JSON-SERIALIZED
+/// content bytes against the budget (escaping-heavy content is truncated
+/// harder, so the wire bound holds); the `lastToolUse` input preview goes
+/// through [`cap_json_value`], whose serialized size stays within a small
+/// constant factor of the budget. Sized against the dogfooding workspace
+/// that motivated the cap (253 sessions, ~1.1 MB `agent.list` frames): at
+/// 400 bytes/field the same response serializes to ~630 KB — well under the
+/// transport's 1 MiB large-frame warn — while keeping each preview long
+/// enough for its one-line render.
+pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
+
 /// Metadata key under which the client-supplied `userAppMessageId` is
 /// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
 /// the router (which folds the top-level param into `messageMetadata`) and
@@ -2550,6 +2577,7 @@ pub enum MessageOrigin {
 
 impl MessageOrigin {
     /// `true` for [`MessageOrigin::User`].
+    #[must_use]
     pub fn is_user(self) -> bool {
         matches!(self, MessageOrigin::User)
     }
@@ -2574,6 +2602,9 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// the provider's `session:created`), `nameExplicitlySet`, `systemPrompt`, etc.
 /// `messages` is the append-only conversation log; `stats` is a derived snapshot
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
+// The bool fields mirror the TS wire shape; grouping them would change the
+// serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -2677,11 +2708,11 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
-    /// workspaces with CoW support). `None` for shared-mode agents.
+    /// workspaces with `CoW` support). `None` for shared-mode agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
     /// Sandbox path when this agent runs in a CoW-isolated sandbox. The full path
-    /// to the CoW clone of the workspace directory that serves as this agent's
+    /// to the `CoW` clone of the workspace directory that serves as this agent's
     /// working root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_path: Option<String>,
@@ -2881,6 +2912,12 @@ pub struct AgentMetadata {
     /// reload). Omitted when nothing was dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_questions_message_id: Option<String>,
+    /// Authoritative pending-question marker (PROTOCOL §5.5): a non-empty
+    /// message id means that message's questions are pending; an empty string
+    /// means no questions are pending. Omitted only for legacy sessions whose
+    /// raw metadata never carried the marker key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questions_message_id: Option<String>,
     /// Per-conversation seen marker (PROTOCOL §5.5): the id of the newest
     /// transcript message the user has seen, advanced monotonically by
     /// `agent.markSeen`. Clients position the "New messages" divider right
@@ -2904,6 +2941,9 @@ pub struct AgentMetadata {
 /// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
 /// transcript, a nested `metadata` object, and the runtime activity flags the
 /// iOS coverflow reads.
+// The bool fields mirror the TS wire shape; grouping them would change the
+// serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -3095,6 +3135,12 @@ impl AgentLite {
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
+        let pending_questions_message_id = session.pending_questions_marker_written().then(|| {
+            session
+                .pending_questions_message_id()
+                .unwrap_or_default()
+                .to_string()
+        });
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let metadata = AgentMetadata {
@@ -3113,6 +3159,7 @@ impl AgentLite {
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
+            pending_questions_message_id,
             last_seen_message_id,
             is_initial_agent,
         };
@@ -3162,6 +3209,96 @@ impl AgentLite {
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
+        }
+    }
+
+    /// List-path preview capping (list-payload cost contract, extending
+    /// monorepo#2932): bound every render-preview field to
+    /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — `lastAgentResponse`,
+    /// `lastUserMessage`, `digest`, and `metadata.completionReport` are
+    /// truncated char-boundary safe against their JSON-SERIALIZED size
+    /// (escaping-heavy content cannot defeat the wire-frame goal by
+    /// expanding 6x on serialization). `lastToolUse` keeps the documented §5.5
+    /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
+    /// only an over-budget `input` is replaced by [`cap_json_value`]'s
+    /// structure-preserving preview, with `inputTruncated: true` stamped
+    /// structurally and `inputBytes` recording the input's serialized size —
+    /// a write-time `inputBytes` (already-flagged persisted preview) is kept,
+    /// so it always names the ORIGINAL block's size, mirroring
+    /// [`last_tool_use_preview`]. `name` is never touched, so the FE's tool
+    /// classification keeps working. These fields exist to render a one-line
+    /// summary in list contexts, so `agent.list` applies this to every row;
+    /// the detail reads (`agent.get` / `agent.getSession`) never call it and
+    /// keep serving full values.
+    pub fn cap_list_previews(&mut self) {
+        use serde_json::Value;
+        // JSON-escaped content bytes of `s` as it will hit the wire (quotes
+        // excluded), counted through a discarding writer like
+        // [`slim_body_size`]: escaping-heavy content (`"`/`\`/control chars,
+        // up to 6 bytes per char) must count against the budget, or a
+        // control-character-dense preview would defeat the frame-size goal.
+        fn escaped_len(s: &str) -> usize {
+            struct CountingSink(usize);
+            impl std::io::Write for CountingSink {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0 += buf.len();
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut sink = CountingSink(0);
+            serde_json::to_writer(&mut sink, s).map_or(0, |()| sink.0.saturating_sub(2))
+        }
+        fn cap_string(field: &mut Option<String>) {
+            if let Some(s) = field {
+                let mut end = s.len().min(AGENT_LIST_PREVIEW_BUDGET_BYTES);
+                loop {
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let escaped = escaped_len(&s[..end]);
+                    if escaped <= AGENT_LIST_PREVIEW_BUDGET_BYTES || end == 0 {
+                        break;
+                    }
+                    // Proportional shrink: `escaped > budget` makes the new
+                    // end strictly smaller, so the loop converges without
+                    // overshooting escaping-heavy content to zero.
+                    end = end * AGENT_LIST_PREVIEW_BUDGET_BYTES / escaped;
+                }
+                if end < s.len() {
+                    s.truncate(end);
+                }
+            }
+        }
+        cap_string(&mut self.last_agent_response);
+        cap_string(&mut self.last_user_message);
+        cap_string(&mut self.digest);
+        cap_string(&mut self.metadata.completion_report);
+        match self.last_tool_use.as_mut() {
+            Some(Value::Object(preview)) => {
+                if let Some(input) = preview.get("input") {
+                    let size = slim_body_size(input);
+                    if size > AGENT_LIST_PREVIEW_BUDGET_BYTES {
+                        let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                        let capped = cap_json_value(input, &mut budget);
+                        preview.insert("input".to_string(), capped);
+                        preview.insert("inputTruncated".to_string(), Value::Bool(true));
+                        preview
+                            .entry("inputBytes")
+                            .or_insert_with(|| serde_json::json!(size));
+                    }
+                }
+            }
+            // Defensive: the persisted 0098 preview is always the object
+            // shape above; a non-object value still gets the whole-value
+            // bound so no row can smuggle an unbounded payload.
+            Some(other) if slim_body_size(other) > AGENT_LIST_PREVIEW_BUDGET_BYTES => {
+                let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                *other = cap_json_value(other, &mut budget);
+            }
+            _ => {}
         }
     }
 }
@@ -3220,6 +3357,13 @@ pub struct AgentDelegateInput {
     pub agent_instructions: Option<String>,
     pub specialist: Option<String>,
     pub model: Option<String>,
+    /// Explicit ACP provider for the delegated child (PROTOCOL §5.5).
+    /// Disambiguates models that exist under multiple providers. Wins over
+    /// every derived resolution rung (compound-`model` prefix, specialist
+    /// frontmatter, settings default); must name a known, available
+    /// provider, and a compound `model` naming a DIFFERENT provider is a
+    /// contradiction — both reject with `-32602` before any side effect.
+    pub provider: Option<String>,
     /// Reasoning-effort level for the delegated child (PROTOCOL §5.5/§5.11).
     /// Wins over the chosen model option's `reasoningEffort` and the
     /// specialist's frontmatter scalar; validated against the cached model
@@ -3229,8 +3373,8 @@ pub struct AgentDelegateInput {
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
     /// Sandbox isolation mode: "cow" (copy-on-write sandbox) or "shared" (default).
-    /// When "cow" and CoW is supported, the agent runs in an isolated CoW clone of
-    /// the workspace directory. Falls back to shared mode if CoW is unsupported.
+    /// When "cow" and `CoW` is supported, the agent runs in an isolated `CoW` clone of
+    /// the workspace directory. Falls back to shared mode if `CoW` is unsupported.
     pub isolation: Option<String>,
     /// Whether the child's sandbox auto-merges back into canonical when its
     /// turn ends (default `true` = today's behavior). `false` keeps the
@@ -3249,7 +3393,7 @@ pub struct AgentDelegateInput {
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task
-    /// `specialist`/`model`/`reasoningEffort` overrides. Mutually exclusive
+    /// `specialist`/`model`/`provider`/`reasoningEffort` overrides. Mutually exclusive
     /// with `taskNoteId`/`noteId`/`taskText`, and the single-task-only
     /// `agentInstructions`/`force` are rejected alongside it; when present
     /// the result enumerates every listed task with its disposition
@@ -3274,7 +3418,7 @@ pub struct AgentDelegateInput {
 #[serde(untagged)]
 pub enum BatchTaskEntry {
     /// Bare task-note id — inherits the call's top-level
-    /// `specialist`/`model`/`reasoningEffort` defaults.
+    /// `specialist`/`model`/`provider`/`reasoningEffort` defaults.
     Id(NoteId),
     /// Object entry with per-task overrides.
     Options(BatchTaskOptions),
@@ -3282,6 +3426,7 @@ pub enum BatchTaskEntry {
 
 impl BatchTaskEntry {
     /// The task-note id this entry addresses, regardless of shape.
+    #[must_use]
     pub fn task_note_id(&self) -> &NoteId {
         match self {
             BatchTaskEntry::Id(id) => id,
@@ -3291,7 +3436,7 @@ impl BatchTaskEntry {
 }
 
 /// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
-/// `specialist`/`model`/`reasoningEffort` override the call's top-level
+/// `specialist`/`model`/`provider`/`reasoningEffort` override the call's top-level
 /// defaults for that task only. `agentInstructions` is carried solely so the
 /// delegate op can reject it with a clear error — it is never honored (each
 /// started task's first message resolves from its own task note).
@@ -3308,6 +3453,8 @@ pub struct BatchTaskOptions {
     pub specialist: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
@@ -3333,6 +3480,10 @@ impl VmResources {
     /// Validate the override against the microVM helper's bounds
     /// (`vcpus` 1–16, `memMib` >= 128). Called at delegate/create time so
     /// invalid sizing errors immediately instead of at VM boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when a field is out of bounds.
     pub fn validate(&self) -> Result<(), crate::Error> {
         if let Some(v) = self.vcpus {
             if v == 0 || v > crate::settings_file::MAX_MICROVM_VCPUS {
@@ -3895,7 +4046,7 @@ mod tests {
 
     use serde_json::json;
 
-    /// [`last_tool_use_preview`] derivation: the LAST tool_use block wins,
+    /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
     /// an under-budget input passes through whole (no flags), an over-budget
     /// input is capped with the additive `inputTruncated`/`inputBytes`
     /// flags, a tool-less / non-array content yields `None`, and a missing
@@ -3926,7 +4077,10 @@ mod tests {
         let preview = last_tool_use_preview(&big).unwrap();
         assert_eq!(preview["name"], "write_file");
         assert_eq!(preview["inputTruncated"], true);
-        assert!(preview["inputBytes"].as_u64().unwrap() as usize > SLIM_PROJECTION_BUDGET_BYTES);
+        assert!(
+            usize::try_from(preview["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
+                > SLIM_PROJECTION_BUDGET_BYTES
+        );
         assert_eq!(preview["input"]["path"], "/tmp/a.txt");
         let served = serde_json::to_string(&preview["input"]).unwrap();
         assert!(
@@ -4060,7 +4214,7 @@ mod tests {
                 assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
                 assert!(o.agent_instructions.is_none());
             }
-            other => panic!("expected Options, got {other:?}"),
+            other @ BatchTaskEntry::Id(_) => panic!("expected Options, got {other:?}"),
         }
         assert_eq!(tasks[2].task_note_id().0, "min-id");
 
@@ -4389,7 +4543,7 @@ mod tests {
         }
     }
 
-    /// `WorkspaceStatus` serializes to the PascalCase TS `WorkspaceStatus` string
+    /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string
     /// enum (`src/shared/types.ts`): `Active`/`Inactive`/`Archived`/`Deleted`.
     #[test]
     fn workspace_status_wire_forms_match_ts() {
@@ -4407,7 +4561,7 @@ mod tests {
         }
     }
 
-    /// `Workspace` emits PascalCase `status` and omits absent optionals
+    /// `Workspace` emits `PascalCase` `status` and omits absent optionals
     /// (`skip_serializing_if`) so the iOS decoder sees the documented field set
     /// without nulls.
     #[test]
@@ -5067,13 +5221,293 @@ mod tests {
         assert_eq!(v["lastActivity"], "t1");
     }
 
-    /// `metadata.isInitialAgent` is presence-detected: omitted from the
-    /// `AgentLite` metadata projection when the raw session metadata lacks the
-    /// key, and equally omitted when the key is present but not the JSON
-    /// boolean `true` (`false` or a non-boolean value) — never `false`, never
-    /// `null` (PROTOCOL §5.5).
+    /// [`AgentLite::cap_list_previews`] (list-payload cost contract): each
+    /// preview string is truncated to [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
+    /// char-boundary safe, an over-budget `lastToolUse` collapses to the
+    /// bounded [`cap_json_value`] preview with the small `name` key
+    /// surviving, and under-budget values pass through untouched.
     #[test]
-    fn agent_lite_is_initial_agent_omitted_unless_true() {
+    fn agent_lite_cap_list_previews_bounds_preview_fields() {
+        let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            // Multi-byte tail: truncation must land on a char boundary.
+            completion_report: Some(format!(
+                "{}{}",
+                "r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES - 1),
+                "é".repeat(8)
+            )),
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let mut lite = AgentLite::from_session(
+            session,
+            2,
+            Some("a".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 4)),
+            Some("short user ask".to_string()),
+            Some("d".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES + 1)),
+            Some("assistant".to_string()),
+            Some("msg-1".to_string()),
+        );
+        lite.last_tool_use = Some(json!({
+            "name": "write_file",
+            "input": {
+                "path": "/tmp/a.txt",
+                "content": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 8),
+            },
+        }));
+
+        lite.cap_list_previews();
+
+        assert_eq!(
+            lite.last_agent_response.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        );
+        assert_eq!(
+            lite.digest.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        );
+        // Under-budget values pass through untouched.
+        assert_eq!(lite.last_user_message.as_deref(), Some("short user ask"));
+        // The multi-byte report truncates on a char boundary at or under the
+        // budget (never mid-`é`).
+        let report = lite.metadata.completion_report.as_deref().unwrap();
+        assert!(report.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        assert!(report.is_char_boundary(report.len()));
+        // The over-budget tool input collapses to the bounded shape with the
+        // structural `name` untouched and the §5.5 truncation flags stamped:
+        // `inputTruncated: true` plus `inputBytes` naming the original
+        // input's serialized size.
+        let tool_use = lite.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "write_file");
+        assert_eq!(tool_use["inputTruncated"], json!(true));
+        let original_input_bytes = slim_body_size(&json!({
+            "path": "/tmp/a.txt",
+            "content": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 8),
+        }));
+        assert_eq!(tool_use["inputBytes"], json!(original_input_bytes));
+        let served = serde_json::to_string(&tool_use["input"]).unwrap();
+        assert!(
+            served.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES * 2,
+            "capped lastToolUse input stays near the budget, got {} bytes",
+            served.len()
+        );
+    }
+
+    /// [`AgentLite::cap_list_previews`] on an ALREADY-FLAGGED persisted
+    /// preview (input was over the write-time 2 KiB budget, so 0098 stored
+    /// `inputTruncated`/`inputBytes` alongside a capped input): the list
+    /// re-cap tightens `input` to the list budget but keeps the write-time
+    /// `inputBytes` — it always names the ORIGINAL block's size — and the
+    /// flags stay structural (never subject to budget admission).
+    /// An under-budget preview passes through untouched, flags absent.
+    #[test]
+    fn agent_lite_cap_list_previews_keeps_write_time_truncation_flags() {
+        let mk = |tool_use: serde_json::Value| {
+            let session = AgentSession {
+                harness_version: CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id: AgentId::from("agent-1"),
+                workspace_id: WorkspaceId::from("ws-1"),
+                parent_agent_id: None,
+                backend_session_id: None,
+                acp_session_id: None,
+                name: "Builder".to_string(),
+                name_explicitly_set: true,
+                model: None,
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: None,
+                system_prompt: None,
+                specialist: None,
+                status: AgentStatus::Active,
+                is_active: true,
+                messages: vec![],
+                stats: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: false,
+                metadata: None,
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                created_at: "t0".to_string(),
+                updated_at: "t1".to_string(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+            };
+            let mut lite = AgentLite::from_session(session, 1, None, None, None, None, None);
+            lite.last_tool_use = Some(tool_use);
+            lite
+        };
+
+        // Write-time-flagged preview: the persisted input (already capped at
+        // 2 KiB by 0098) is still over the list budget; the original block
+        // was 5000 serialized bytes.
+        let mut flagged = mk(json!({
+            "name": "write_file",
+            "input": { "content": "x".repeat(SLIM_PROJECTION_BUDGET_BYTES - 64) },
+            "inputTruncated": true,
+            "inputBytes": 5000,
+        }));
+        flagged.cap_list_previews();
+        let tool_use = flagged.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "write_file");
+        assert_eq!(tool_use["inputTruncated"], json!(true));
+        assert_eq!(
+            tool_use["inputBytes"],
+            json!(5000),
+            "write-time inputBytes (original block size) survives the re-cap"
+        );
+        let served = serde_json::to_string(&tool_use["input"]).unwrap();
+        assert!(
+            served.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES * 2,
+            "re-capped input stays near the list budget, got {} bytes",
+            served.len()
+        );
+
+        // Under-budget preview: untouched, no flags appear.
+        let small = json!({ "name": "read_file", "input": { "path": "/tmp/a.txt" } });
+        let mut unflagged = mk(small.clone());
+        unflagged.cap_list_previews();
+        assert_eq!(unflagged.last_tool_use.as_ref(), Some(&small));
+    }
+
+    /// The string-field cap counts JSON-SERIALIZED bytes: escaping-heavy
+    /// content (control chars expand to `\u00XX`, 6 bytes per char) is
+    /// truncated harder so the serialized preview stays at the budget — a
+    /// 400-char control-character message must not serialize to 2400 wire
+    /// bytes. Plain content is unaffected (escaped size == in-memory size).
+    #[test]
+    fn agent_lite_cap_list_previews_bounds_serialized_bytes() {
+        let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let mut lite = AgentLite::from_session(
+            session,
+            1,
+            // 400 control chars: 400 in-memory bytes, 2400 serialized.
+            Some("\u{1}".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES)),
+            // Escaping-free content at exactly the budget passes untouched.
+            Some("p".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES)),
+            None,
+            Some("assistant".to_string()),
+            Some("msg-1".to_string()),
+        );
+
+        lite.cap_list_previews();
+
+        let response = lite.last_agent_response.as_deref().unwrap();
+        let serialized = serde_json::to_string(response).unwrap();
+        assert!(
+            serialized.len() - 2 <= AGENT_LIST_PREVIEW_BUDGET_BYTES,
+            "escaping-heavy preview bounded at the SERIALIZED budget, got {} bytes",
+            serialized.len() - 2
+        );
+        assert!(!response.is_empty(), "content retained, not zeroed");
+        assert_eq!(
+            lite.last_user_message.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
+            "escaping-free content at exactly the budget passes untouched"
+        );
+    }
+
+    /// Presence-sensitive `AgentLite` metadata fields preserve their distinct
+    /// wire states: `pendingQuestionsMessageId` is omitted for legacy rows,
+    /// emitted with a message id when set, and emitted as `""` when cleared;
+    /// `isInitialAgent` is emitted only for the JSON boolean `true`.
+    #[test]
+    fn agent_lite_presence_sensitive_metadata_wire_shape() {
         let session = |metadata: Option<serde_json::Value>| AgentSession {
             harness_version: CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
@@ -5122,6 +5556,15 @@ mod tests {
             let lite = AgentLite::from_session(session(metadata), 0, None, None, None, None, None);
             serde_json::to_value(&lite).unwrap()
         };
+
+        let legacy = project(Some(json!({})));
+        assert!(legacy["metadata"]
+            .get("pendingQuestionsMessageId")
+            .is_none());
+        let set = project(Some(json!({ PENDING_QUESTIONS_MESSAGE_ID_KEY: "msg-q1" })));
+        assert_eq!(set["metadata"]["pendingQuestionsMessageId"], "msg-q1");
+        let cleared = project(Some(json!({ PENDING_QUESTIONS_MESSAGE_ID_KEY: "" })));
+        assert_eq!(cleared["metadata"]["pendingQuestionsMessageId"], "");
 
         // No metadata at all, key absent, `false`, and non-boolean values all
         // omit the key entirely.

@@ -154,6 +154,8 @@ struct ForgeState {
     get_pr_calls: usize,
     /// `(name, state, required)` triples served as the check rollup.
     checks: Vec<(String, CheckState, bool)>,
+    /// The authoritative review decision served by `merge_requirements`.
+    review_decision: ReviewDecision,
 }
 
 impl Default for ForgeState {
@@ -163,6 +165,7 @@ impl Default for ForgeState {
             conversation_comments: 0,
             get_pr_calls: 0,
             checks: vec![("build".into(), CheckState::Pending, true)],
+            review_decision: ReviewDecision::ReviewRequired,
         }
     }
 }
@@ -308,10 +311,13 @@ impl SourceControl for StubForge {
         Ok(Vec::new())
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
-        let checks = self.state.lock().unwrap().checks.clone();
+        let (checks, review_decision) = {
+            let s = self.state.lock().unwrap();
+            (s.checks.clone(), s.review_decision)
+        };
         Ok(MergeRequirementSignals {
             merge_state_status: Some("CLEAN".into()),
-            review_decision: Some(ReviewDecision::ReviewRequired),
+            review_decision: Some(review_decision),
             checks: checks
                 .iter()
                 .map(|(name, state, required)| RollupCheck {
@@ -552,7 +558,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws_srv = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
     Fixture {
@@ -1087,15 +1093,23 @@ async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
 }
 
 /// Active-monitor `waiting` flag + PR-rung derivation over the wire
-/// (PROTOCOL §5.1/§6.5): registering a monitor on an open mergeable PR
-/// moves the derived `displayStatus` to `pr_ready` — both `workspace.get`
-/// and `workspace.list` serve it with additive `waiting: true` while the
+/// (PROTOCOL §5.1/§6.5): registering a monitor on an open PR whose full
+/// merge-requirements checklist is clear (checks passed, approved, no
+/// unresolved threads — not merely conflict-free) moves the derived
+/// `displayStatus` to `pr_ready` — both `workspace.get` and
+/// `workspace.list` serve it with additive `waiting: true` while the
 /// monitor is ACTIVE — and cancelling it over the wire (`prMonitor.cancel`)
 /// lapses the signal back to `idle` and drops the field (omitted, never
 /// `false`). Both transitions emit `workspace:displayStatus-changed`.
 #[tokio::test]
 async fn active_monitor_serves_waiting_and_pr_ready_over_wss() {
     let fx = boot().await;
+    // Clear every checklist blocker: the required check passes and the
+    // review decision reads approved (the stub serves no threads).
+    fx.forge.edit(|s| {
+        s.checks[0].1 = CheckState::Success;
+        s.review_decision = ReviewDecision::Approved;
+    });
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
 
     // Baseline read: the seeded workspace (no tasks, no hooks, no running
@@ -1330,6 +1344,11 @@ async fn archive_over_wss_cancels_active_monitors_and_drops_waiting() {
 #[tokio::test]
 async fn cross_repo_monitor_drives_pr_ready_then_pr_merged_over_wss() {
     let fx = boot().await;
+    // Clear every checklist blocker so the open PR reads truly mergeable.
+    fx.forge.edit(|s| {
+        s.checks[0].1 = CheckState::Success;
+        s.review_decision = ReviewDecision::Approved;
+    });
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
 
     // Baseline read seeds the transition emitter's last-observed status
@@ -1357,7 +1376,8 @@ async fn cross_repo_monitor_drives_pr_ready_then_pr_merged_over_wss() {
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
     // Watch a PR on a repo that is NOT the workspace's own `o/r` (the stub
-    // forge serves any repo ref): the open mergeable PR reads pr_ready.
+    // forge serves any repo ref): the open truly-mergeable PR reads
+    // pr_ready.
     fx.services
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "other", "repo", 7)
         .await
@@ -1607,7 +1627,7 @@ async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_
         s.checks = vec![
             ("build".into(), CheckState::Pending, true),
             ("lint".into(), CheckState::Pending, false),
-        ]
+        ];
     });
     let monitor = fx
         .services

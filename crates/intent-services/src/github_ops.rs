@@ -27,7 +27,7 @@ const MAX_LIMIT: i64 = 200;
 /// Clamp an optional `limit` / `perPage` into the §5.5 `[1, 200]` window
 /// (default 50) and cast to the engine's `u8` query width.
 pub(crate) fn clamp_limit(limit: Option<i64>) -> u8 {
-    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as u8
+    u8::try_from(limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)).expect("clamped to [1, 200]")
 }
 
 /// Wrap an engine-native cursor (a REST page number or a GraphQL end-cursor)

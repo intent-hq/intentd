@@ -19,9 +19,11 @@ use serde_json::{json, Value};
 
 use crate::WorkspaceMcpServer;
 
+// `status_message_state` is `Option<Option<_>>`: no-override vs landed value.
+#[allow(clippy::option_option)]
 #[derive(Default)]
 struct FakeApi {
-    /// Recorded `git_agent_commit` calls: (message, agent_id, user_requested).
+    /// Recorded `git_agent_commit` calls: (message, `agent_id`, `user_requested`).
     agent_commit_calls: Mutex<Vec<(String, Option<String>, bool)>>,
     script_list_calls: Mutex<u32>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
@@ -49,9 +51,9 @@ struct FakeApi {
     // `Some(Some(x))` or `Some(None)` = the value the last `update_workspace`
     // call landed on after empty/whitespace-clear normalization.
     status_message_state: Mutex<Option<Option<String>>>,
-    /// Recorded `save_asset` calls: (data, mime_type, original_name).
+    /// Recorded `save_asset` calls: (data, `mime_type`, `original_name`).
     save_asset_calls: Mutex<Vec<(String, String, Option<String>)>>,
-    /// Recorded `git_root_register` calls: (path, agent_id).
+    /// Recorded `git_root_register` calls: (path, `agent_id`).
     git_root_register_calls: Mutex<Vec<(String, String)>>,
     /// Recorded `git_root_unregister` calls: path.
     git_root_unregister_calls: Mutex<Vec<String>>,
@@ -826,6 +828,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             sandbox_path: None,
             sandbox_branch: None,
             dismissed_questions_message_id: None,
+            pending_questions_message_id: None,
             last_seen_message_id: None,
             is_initial_agent: None,
         },
@@ -1070,7 +1073,7 @@ async fn script_list_returns_array() {
 #[tokio::test]
 async fn script_create_forwards_positional_signature() {
     let (srv, api) = server();
-    let code = r#"
+    let code = r"
         return await ws.script.create('dev', 'pnpm dev', 'service', {
             cwd: 'app',
             env: { PORT: '3000' },
@@ -1078,7 +1081,7 @@ async fn script_create_forwards_positional_signature() {
             autoStart: true,
             scriptId: 's-1',
         });
-    "#;
+    ";
     let resp = call(&srv, code).await;
     assert_eq!(resp["result"]["isError"], json!(false));
     let calls = api.script_create_calls.lock().unwrap();

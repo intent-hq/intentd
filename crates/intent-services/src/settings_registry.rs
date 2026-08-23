@@ -138,6 +138,7 @@ pub enum SettingOrigin {
 
 impl SettingOrigin {
     /// Wire spelling of the origin (`default` | `file` | `flag`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             SettingOrigin::Default => "default",
@@ -278,6 +279,10 @@ impl SettingsRegistry {
     /// keys are tolerated — their values are captured for the boot-time
     /// import-and-strip
     /// ([`SettingsRegistry::legacy_values`] / [`SettingsRegistry::strip_legacy`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the config file is malformed (fails to parse or validate in [`SettingsFile::load_or_init_with_legacy`]); `Error::Internal` if the file cannot be read or initialized.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let (file, legacy) = SettingsFile::load_or_init_with_legacy(&path)?;
@@ -356,6 +361,10 @@ impl SettingsRegistry {
 
     /// Current effective snapshot (cheap `Arc` clone; never blocks writers
     /// for longer than the pointer swap).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn snapshot(&self) -> Arc<SettingsSnapshot> {
         self.snapshot
             .read()
@@ -391,6 +400,10 @@ impl SettingsRegistry {
     }
 
     /// Current self-write generation (0 until the first `apply` write).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn generation(&self) -> u64 {
         self.inner
             .lock()
@@ -418,6 +431,14 @@ impl SettingsRegistry {
     /// the key rejects [`SettingsRegistry::apply`]. The pin value is
     /// validated against the typed schema. Does not notify subscribers —
     /// pinning happens at boot, before anyone subscribes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` for an unknown setting path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pin(&self, path: &str, value: Value, flag: &str) -> Result<()> {
         if !KNOWN_PATHS.contains(&path) {
             return Err(Error::InvalidParams(format!("unknown setting: {path}")));
@@ -448,6 +469,14 @@ impl SettingsRegistry {
     /// pinned keys are rejected with [`Error::InvalidParams`] before anything
     /// mutates. Returns the changed-key notice (also broadcast to
     /// subscribers when non-empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` for an unknown setting path or an invalid value; `Error::Internal` if the atomic config rewrite fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         for (path, _) in changes {
@@ -497,6 +526,14 @@ impl SettingsRegistry {
     /// registry state is untouched — the caller (live-reload watcher) keeps
     /// last-good. Returns the changed-key notice (also broadcast to
     /// subscribers when non-empty).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the config text is not valid TOML.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn reload(&self, text: &str) -> Result<SettingsChanged> {
         let file = SettingsFile::parse_str(text)?;
         let doc: DocumentMut = text
@@ -521,7 +558,7 @@ impl SettingsRegistry {
         let changed: BTreeSet<String> = KNOWN_PATHS
             .iter()
             .filter(|p| json_get(&old.effective_json, p) != json_get(&new.effective_json, p))
-            .map(|p| p.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         let notice = SettingsChanged {
             generation: inner.generation,
@@ -860,6 +897,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn precedence_is_default_then_file_then_flag() {
         let (_dir, path) = temp_config(Some("[server.wsApi]\nenabled = true\nport = 6000\n"));
         let reg = SettingsRegistry::load(&path).expect("load");
@@ -1168,7 +1206,7 @@ mod tests {
         reg.apply(&set("agents.maxConcurrent", json!(1)))
             .expect("apply first");
         let first = std::fs::read_to_string(&path).expect("read first");
-        for i in 2..=(SELF_WRITE_HISTORY as i64 + 1) {
+        for i in 2..=(i64::try_from(SELF_WRITE_HISTORY).expect("small const") + 1) {
             reg.apply(&set("agents.maxConcurrent", json!(i)))
                 .expect("apply");
         }
@@ -1201,7 +1239,7 @@ mod tests {
             .expect("apply");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read dir")
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| name != "config.toml")
             .collect();
@@ -1288,9 +1326,8 @@ mod tests {
     fn load_still_rejects_other_unknown_keys() {
         let seed = "[model]\nworkspaceOverrides = {}\n\n[agents]\nbogusKey = 1\n";
         let (_dir, path) = temp_config(Some(seed));
-        let err = match SettingsRegistry::load(&path) {
-            Ok(_) => panic!("unknown key must refuse load"),
-            Err(e) => e,
+        let Err(err) = SettingsRegistry::load(&path) else {
+            panic!("unknown key must refuse load")
         };
         assert!(err.to_string().contains("bogusKey"), "{err}");
     }

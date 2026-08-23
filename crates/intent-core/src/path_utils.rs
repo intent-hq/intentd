@@ -148,6 +148,7 @@ fn capture_login_shell_with(shell: Option<&str>) -> LoginShellCapture {
 /// This is the single source of truth for login-shell resolution: both the
 /// login-shell PATH capture in this module and the `host.env` probe consume
 /// it, so the reported shell and the enrichment shell always agree.
+#[must_use]
 pub fn login_shell() -> Option<String> {
     let env_shell = std::env::var_os("SHELL");
     let env_shell = env_shell.as_deref().filter(|shell| !shell.is_empty());
@@ -189,10 +190,10 @@ fn user_db_shell() -> Option<String> {
         let rc = unsafe {
             libc::getpwuid_r(
                 libc::getuid(),
-                &mut pwd,
+                &raw mut pwd,
                 buf.as_mut_ptr(),
                 buf.len(),
-                &mut result,
+                &raw mut result,
             )
         };
         if rc == libc::ERANGE && buf.len() < (1 << 20) {
@@ -239,8 +240,7 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     // dump failure from failing the whole capture — the env payload is
     // optional and degrades to an empty map.
     let cmd = format!(
-        r#"printf '{}%s{}'  "$PATH"; printf '{}'; /usr/bin/env -0 2>/dev/null || /usr/bin/awk 'BEGIN{{for(k in ENVIRON)printf "%s=%s%c",k,ENVIRON[k],0}}' 2>/dev/null || true; printf '{}'"#,
-        PATH_START_SENTINEL, PATH_END_SENTINEL, ENV_START_SENTINEL, ENV_END_SENTINEL
+        r#"printf '{PATH_START_SENTINEL}%s{PATH_END_SENTINEL}'  "$PATH"; printf '{ENV_START_SENTINEL}'; /usr/bin/env -0 2>/dev/null || /usr/bin/awk 'BEGIN{{for(k in ENVIRON)printf "%s=%s%c",k,ENVIRON[k],0}}' 2>/dev/null || true; printf '{ENV_END_SENTINEL}'"#
     );
     let mut args = flags.to_vec();
     args.push(&cmd);
@@ -365,6 +365,7 @@ pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
 ///
 /// SECURITY: values are secrets — callers must never log, trace, or serialize
 /// them; keys-only if any logging is needed at all.
+#[must_use]
 pub fn login_shell_credential_env() -> &'static BTreeMap<String, String> {
     &login_shell_capture().credential_env
 }
@@ -381,7 +382,11 @@ pub fn prewarm_login_shell_path() {
 }
 
 /// Helper to push a directory to the list if it's not empty and not already seen.
-pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
+pub fn push_dir<S: std::hash::BuildHasher>(
+    dirs: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf, S>,
+    dir: PathBuf,
+) {
     if dir.as_os_str().is_empty() {
         return;
     }
@@ -401,13 +406,15 @@ pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathB
 ///
 /// Note: Callers that need custom precedence (e.g., provider-binary dir first,
 /// then ~/.augment/bin for auggie, then enriched dirs, then inherited PATH) should
-/// use `enriched_tool_dirs()` + split_paths to build the order themselves.
+/// use `enriched_tool_dirs()` + `split_paths` to build the order themselves.
+#[must_use]
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
     enhanced_path_dirs_with_home(home_dir().as_deref())
 }
 
 /// Variant of [`enhanced_path_dirs`] with the home directory injected instead
 /// of resolved from the environment. Inherited PATH precedence is unchanged.
+#[must_use]
 pub fn enhanced_path_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -433,6 +440,7 @@ pub fn enhanced_path_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
 /// Use this when you need to control precedence explicitly (e.g., prepend
 /// provider-binary dir and ~/.augment/bin for auggie, then these enriched dirs,
 /// then inherited PATH last).
+#[must_use]
 pub fn enriched_tool_dirs() -> Vec<PathBuf> {
     enriched_tool_dirs_with_home(home_dir().as_deref())
 }
@@ -445,6 +453,7 @@ pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
+#[allow(clippy::similar_names)] // path vs the semver patch component - both domain terms
 fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64, bool)> {
     let version = path.file_name()?.to_str()?.strip_prefix('v')?;
     let core = version.split(['-', '+']).next()?;
@@ -538,6 +547,7 @@ pub const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
 
 /// True when `path` carries a Windows-runnable executable extension
 /// (`.exe`/`.cmd`/`.bat`, case-insensitive).
+#[must_use]
 pub fn has_windows_exec_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -551,12 +561,14 @@ pub fn has_windows_exec_extension(path: &Path) -> bool {
 /// True when `p` is a file that is executable (unix checks the exec bit;
 /// Windows requires a runnable executable extension — `CreateProcess` cannot
 /// run a bare extensionless file, so its mere existence is not enough).
+#[must_use]
 pub fn is_executable_file(p: &Path) -> bool {
     is_executable_file_for(p, cfg!(windows))
 }
 
 /// [`is_executable_file`] parametrized on the platform (test seam — Windows
 /// CI is disabled, so the Windows arm is unit-tested on POSIX).
+#[must_use]
 pub fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
     if !p.is_file() {
         return false;
@@ -567,9 +579,7 @@ pub fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
@@ -642,11 +652,7 @@ mod tests {
         let dirs = enhanced_path_dirs();
         let mut seen = HashSet::new();
         for dir in &dirs {
-            assert!(
-                seen.insert(dir),
-                "Directory {:?} appears multiple times",
-                dir
-            );
+            assert!(seen.insert(dir), "Directory {dir:?} appears multiple times");
         }
     }
 
@@ -996,8 +1002,7 @@ mod tests {
         // 70,000 'X' characters = 70KB, well over typical pipe buffer size
         let noise = "X".repeat(70_000);
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n",
-            noise
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{noise}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n"
         );
         let start = std::time::Instant::now();
         let dirs = write_and_capture(&fake_shell, &script).dirs;
@@ -1012,8 +1017,7 @@ mod tests {
         assert_eq!(dirs[0], PathBuf::from("/large/bin"));
         assert!(
             elapsed < Duration::from_secs(5),
-            "Should complete well within timeout (no deadlock), took {:?}",
-            elapsed
+            "Should complete well within timeout (no deadlock), took {elapsed:?}"
         );
     }
 

@@ -223,7 +223,7 @@ pub(crate) fn is_placeholder_model(model: Option<&str>) -> bool {
     let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) else {
         return true;
     };
-    let bare = m.split_once(':').map(|(_, b)| b).unwrap_or(m).trim();
+    let bare = m.split_once(':').map_or(m, |(_, b)| b).trim();
     bare.is_empty() || bare.eq_ignore_ascii_case("default")
 }
 
@@ -254,8 +254,7 @@ pub(crate) fn stats_model_key(
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| p.to_ascii_lowercase())
-        .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+        .map_or_else(|| UNKNOWN_MODEL.to_string(), str::to_ascii_lowercase)
 }
 
 /// The `usage_stats_hourly` provider key for a session: the resolved provider
@@ -267,8 +266,7 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
     provider_id
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| p.to_ascii_lowercase())
-        .unwrap_or_else(|| UNKNOWN_PROVIDER.to_string())
+        .map_or_else(|| UNKNOWN_PROVIDER.to_string(), str::to_ascii_lowercase)
 }
 
 /// Record one agent-session start (D2: *sessions* = agent sessions) into the
@@ -276,25 +274,27 @@ pub(crate) fn stats_provider_key(provider_id: Option<&str>) -> String {
 /// [`stats_model_key`] (normalized model, falling back to the resolved
 /// provider id when no model is resolved at creation time — D13). `provider`
 /// is the session's raw `provider` field; the resolved id follows the spawn
-/// precedence (compound model prefix → provider field → configured default
-/// (`providers.active`) → hardcoded default provider), though this call site
-/// has no settings to offer and always passes `None` for the configured
-/// default.
+/// precedence (compound model prefix → provider field → `configured_default`,
+/// the settings-derived default the create seam passes through). An
+/// unresolvable provider falls to the `"unknown"` stats tail (monorepo#3044:
+/// no positional last resort).
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
 pub(crate) async fn record_session_started(
     store: &Store,
     raw_model: Option<&str>,
     provider: Option<&str>,
+    configured_default: Option<&str>,
 ) {
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let provider_id = crate::agent_session::resolve_provider_id(raw_model, provider, None);
+    let provider_id =
+        crate::agent_session::resolve_provider_id(raw_model, provider, configured_default);
     // No resolved display model exists at creation time — the configOptions
     // resolution (D13/D14) only happens at session open.
-    let model = stats_model_key(raw_model, None, Some(&provider_id));
-    let provider_key = stats_provider_key(Some(&provider_id));
+    let model = stats_model_key(raw_model, None, provider_id.as_deref());
+    let provider_key = stats_provider_key(provider_id.as_deref());
     let delta = UsageStatsDelta {
         sessions_started: 1,
         ..Default::default()
@@ -341,7 +341,7 @@ pub(crate) async fn record_lines_changed(
                 provider.as_deref(),
                 None,
             );
-            (model, resolved, Some(provider_id))
+            (model, resolved, provider_id)
         }
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "read agent model for lines-changed stats failed");

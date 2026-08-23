@@ -3,7 +3,7 @@
 //! that auto-unarchives the workspace (the archive/auto-unarchive loop).
 //!
 //! Drives: create workspace → Watcher registers `ws.agent.watch` on
-//! WatchTarget through the MCP bridge → target parks mid-turn (mock ACP
+//! `WatchTarget` through the MCP bridge → target parks mid-turn (mock ACP
 //! provider, `parkIfPromptContains`) → `workspace.archive` (the sweep
 //! interrupts the target keep-alive, whose `agent:idle` fires the completion
 //! watch) → asserts:
@@ -52,7 +52,7 @@ impl Drop for Daemon {
         {
             use nix::sys::signal::{self, Signal};
             use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id() as i32);
+            let pid = Pid::from_raw(self.child.id().cast_signed());
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         let _ = self.child.wait();
@@ -241,7 +241,7 @@ async fn wss_rpc(ws: &mut TlsWs, budget: Budget, id: i64, method: &str, params: 
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -439,12 +439,12 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     // Watcher: registers the watch through the MCP bridge, and acknowledges
     // wake turns. Target: parks mid-turn on its marker so the archive sweep
     // interrupts it (whose idle fires the completion watch while archived).
-    let watch_js = r#"
+    let watch_js = r"
         const agents = await ws.agent.list();
         const t = agents.find(a => a.name === 'WatchTarget');
         const r = await ws.agent.watch(t.id);
         return 'watched=' + r.ok + ' watchTarget=' + r.agentId;
-    "#;
+    ";
     let behavior = json!({
         "parkIfPromptContains": TARGET_PARK,
         "rules": [
@@ -480,7 +480,8 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     let status = tokio::time::timeout_at(budget.step(60), common::await_wss_status(&socket))
         .await
         .expect("daemon wss status not ready within budget");
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -623,7 +624,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
         &watcher,
         "empty queue after unarchive",
         budget.step(30),
-        |queue| queue.is_empty(),
+        <[serde_json::Value]>::is_empty,
     )
     .await;
 }

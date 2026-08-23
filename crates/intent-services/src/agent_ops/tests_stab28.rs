@@ -2,7 +2,7 @@
 //!
 //! Covers the re-wake subscription-loss failure mode: a parent that re-messages
 //! a settled child via agent.send must be woken when that child settles again.
-//! The interrupt-path wedge is tested in agent_manager/tests.rs.
+//! The interrupt-path wedge is tested in `agent_manager/tests.rs`.
 
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
@@ -32,7 +32,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create");

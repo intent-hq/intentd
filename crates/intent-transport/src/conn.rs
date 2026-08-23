@@ -386,7 +386,7 @@ pub(crate) async fn process_frame(
                         let _ = out.send_priority(frame).await;
                     }
                 })
-                .await
+                .await;
             });
             return true;
         }
@@ -415,7 +415,7 @@ pub(crate) async fn process_frame(
                         let _ = out.send_priority(frame).await;
                     }
                 })
-                .await
+                .await;
             });
             return true;
         }
@@ -489,10 +489,10 @@ pub(crate) async fn process_frame(
     // unknown/invalid frames use a null id), so a panic in `handle_message`
     // (which owns the -32700 reply) still yields a response instead of
     // silently hanging the client.
-    let (rpc_id, method) = parsed
-        .as_ref()
-        .map(panic_guard::request_identity)
-        .unwrap_or_else(|| (Some(Value::Null), String::new()));
+    let (rpc_id, method) = parsed.as_ref().map_or_else(
+        || (Some(Value::Null), String::new()),
+        panic_guard::request_identity,
+    );
     // A frame that fails parse/envelope validation never reaches a service:
     // `handle_message` answers it with `-32700`/`-32600` immediately. Gating it
     // on the limiter would mask those codes behind `-32011` (and would silently
@@ -523,7 +523,7 @@ pub(crate) async fn process_frame(
                 let _ = out_tx.send_priority(response).await;
             }
         })
-        .await
+        .await;
     });
     true
 }
@@ -570,7 +570,7 @@ async fn reject_overloaded(
     match rpc_id {
         Some(id) => out_tx
             .send_priority(events::error_frame(
-                id,
+                &id,
                 OVERLOAD_ERROR_CODE,
                 OVERLOAD_ERROR_MESSAGE,
             ))
@@ -614,8 +614,8 @@ async fn handle_fast_path(
                 // it can never be preceded by an `events.event` notification.
                 if id.present {
                     let frame = events::success_frame(
-                        id.echo,
-                        json!({ "subscriptionId": subscription_id }),
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
@@ -635,7 +635,7 @@ async fn handle_fast_path(
             Ok(subscription_id) => {
                 let success = subs.remove(&subscription_id);
                 if id.present {
-                    let frame = events::success_frame(id.echo, json!({ "success": success }));
+                    let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
                 }
                 true
@@ -649,7 +649,7 @@ async fn handle_fast_path(
 /// (notifications get no response). Returns `false` if the channel is closed.
 async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &OutboundSender) -> bool {
     if id.present {
-        let frame = events::error_frame(id.echo, -32602, message);
+        let frame = events::error_frame(&id.echo, -32602, message);
         return out_tx.send_priority(frame).await.is_ok();
     }
     true
@@ -696,44 +696,41 @@ async fn forward_subscription(
                     return;
                 };
                 for event in batch {
-                    match conflate::event_key(&event) {
-                        Some(key) => {
-                            let item = EventItem::new(&key, event);
-                            let sid = &subscription_id;
-                            match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
-                                item.into_frame(sid)
-                            }) {
-                                Enqueue::Closed => return,
-                                Enqueue::Sent | Enqueue::Buffered => {}
-                                // Buffer at capacity (too many distinct keys /
-                                // bytes pending): fall back to the original
-                                // blocking backpressure — flush, then send.
-                                Enqueue::Overflow(item) => {
-                                    if !buffer
-                                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                                        .await
-                                    {
-                                        return;
-                                    }
-                                    if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
-                                        return;
-                                    }
+                    if let Some(key) = conflate::event_key(&event) {
+                        let item = EventItem::new(&key, event);
+                        let sid = &subscription_id;
+                        match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
+                            item.into_frame(sid)
+                        }) {
+                            Enqueue::Closed => return,
+                            Enqueue::Sent | Enqueue::Buffered => {}
+                            // Buffer at capacity (too many distinct keys /
+                            // bytes pending): fall back to the original
+                            // blocking backpressure — flush, then send.
+                            Enqueue::Overflow(item) => {
+                                if !buffer
+                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                                    .await
+                                {
+                                    return;
+                                }
+                                if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
+                                    return;
                                 }
                             }
                         }
-                        None => {
-                            // Barrier: flush conflated frames first, then block.
-                            if !buffer
-                                .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                                .await
-                            {
-                                return;
-                            }
-                            let frame =
-                                events::build_event_notification(&subscription_id, &event);
-                            if out_tx.send(frame).await.is_err() {
-                                return;
-                            }
+                    } else {
+                        // Barrier: flush conflated frames first, then block.
+                        if !buffer
+                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                            .await
+                        {
+                            return;
+                        }
+                        let frame =
+                            events::build_event_notification(&subscription_id, &event);
+                        if out_tx.send(frame).await.is_err() {
+                            return;
                         }
                     }
                 }
@@ -788,8 +785,8 @@ async fn handle_sub_fast_path(
                 // can never be preceded by a `subscription.push` notification (§3.4).
                 if id.present {
                     let frame = events::success_frame(
-                        id.echo,
-                        json!({ "subscriptionId": subscription_id }),
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
@@ -842,8 +839,8 @@ async fn handle_sub_fast_path(
                 let subscription_id = events::next_subscription_id();
                 if id.present {
                     let frame = events::success_frame(
-                        id.echo,
-                        json!({ "subscriptionId": subscription_id }),
+                        &id.echo,
+                        &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
@@ -896,8 +893,8 @@ async fn handle_sub_fast_path(
                     let subscription_id = events::next_subscription_id();
                     if id.present {
                         let frame = events::success_frame(
-                            id.echo,
-                            json!({ "subscriptionId": subscription_id }),
+                            &id.echo,
+                            &json!({ "subscriptionId": subscription_id }),
                         );
                         if out_tx.send_priority(frame).await.is_err() {
                             return false;
@@ -907,8 +904,7 @@ async fn handle_sub_fast_path(
                         api.clone(),
                         channel,
                         workspace_id
-                            .map(WorkspaceId::from)
-                            .unwrap_or_else(|| WorkspaceId::from(String::new())),
+                            .map_or_else(|| WorkspaceId::from(String::new()), WorkspaceId::from),
                         note_id.map(NoteId::from),
                         subscription,
                         subscription_id.clone(),
@@ -924,7 +920,7 @@ async fn handle_sub_fast_path(
             Ok(subscription_id) => {
                 let success = subs.remove(&subscription_id);
                 if id.present {
-                    let frame = events::success_frame(id.echo, json!({ "success": success }));
+                    let frame = events::success_frame(&id.echo, &json!({ "success": success }));
                     return out_tx.send_priority(frame).await.is_ok();
                 }
                 true
@@ -1081,7 +1077,7 @@ async fn forward_chat_subscription(
             },
             // A pending recovery with a quiet bus: retry on a timer so the
             // client is not left stale until the next event happens to arrive.
-            _ = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
+            () = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
                 if !attempt_chat_recovery(
                     api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
                     &mut seq, &out_tx, &mut state, &mut pending_recovery,
@@ -1487,7 +1483,7 @@ mod tests {
                 None => false,
                 Some(frame) => {
                     let v: Value = serde_json::from_str(&frame).expect("valid json response");
-                    matches!(v["error"]["code"].as_i64(), Some(-32700) | Some(-32600))
+                    matches!(v["error"]["code"].as_i64(), Some(-32700 | -32600))
                 }
             };
             assert_eq!(

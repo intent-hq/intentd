@@ -10,7 +10,7 @@
 //!
 //! Flow: daemon1 parks the first turn after streaming one chunk
 //! (`blockUntilCancel`), graceful shutdown (system.shutdown) flushes the
-//! partial assistant row + captures the interrupted_agent row; daemon2 (mock
+//! partial assistant row + captures the `interrupted_agent` row; daemon2 (mock
 //! advertises `loadSession` and accepts the resume) resolves the agent via
 //! `agent.resolveInterrupted { resume }`. Asserts on the resumed child's
 //! prompt log: the continuation prompt carries the interrupting user message
@@ -199,7 +199,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -267,9 +267,10 @@ where
         if lines.iter().any(&pred) {
             return lines;
         }
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for {what}; log so far: {lines:?}");
-        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "timed out waiting for {what}; log so far: {lines:?}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -292,16 +293,15 @@ where
         if pred(&session.messages) {
             return;
         }
-        if tokio::time::Instant::now() > deadline {
-            panic!(
-                "timed out waiting for {what}; transcript: {:?}",
-                session
-                    .messages
-                    .iter()
-                    .map(|m| (m.role.clone(), m.content.to_string()))
-                    .collect::<Vec<_>>()
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "timed out waiting for {what}; transcript: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.to_string()))
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -482,7 +482,8 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(&fp);
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
     let mut ws = common::wss_connect_with_retry(port, cfg, &url).await;

@@ -5,6 +5,7 @@
 //! the goldens and force a deliberate new-version decision instead.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
 use intent_core::TaskStatus;
@@ -26,8 +27,8 @@ static DOCTRINE: Doctrine = Doctrine {
 /// The v1 registry row. `version` is intent-core's stamped `"1.0"` (asserted
 /// equal to `CURRENT_HARNESS_VERSION` by registry tests); the feature
 /// defaults are the `[agentFeatures]` defaults this doctrine was written
-/// against (all on except the opt-in `taskGraph`), used to gate legacy
-/// NULL-snapshot sessions the way a live read would have when v1 was current.
+/// against (all on), used to gate legacy NULL-snapshot sessions the way a
+/// live read would have when v1 was current.
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
     version: "1.0",
     harness: &V1,
@@ -84,10 +85,10 @@ pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
 /// `{name} ({id})` display label for a settling child, falling back to the
 /// bare id when no name resolved.
 fn child_label(params: &ChildSettlementParams<'_>) -> String {
-    params
-        .agent_name
-        .map(|name| format!("{name} ({})", params.child_id))
-        .unwrap_or_else(|| params.child_id.to_string())
+    params.agent_name.map_or_else(
+        || params.child_id.to_string(),
+        |name| format!("{name} ({})", params.child_id),
+    )
 }
 
 /// The settlement verb for a child completion event type.
@@ -121,8 +122,7 @@ fn attention_verb(kind: &str) -> &str {
 }
 
 fn describe_opt<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    v.map_or_else(|| "unknown".to_string(), |v| v.to_string())
 }
 
 fn signed(delta: i64) -> String {
@@ -468,6 +468,21 @@ impl Harness for V1 {
             .to_string()
     }
 
+    fn empty_wake_redrive_nudge(&self) -> String {
+        "[SYSTEM NOTE] Automatic recovery (monorepo#3262): your previous turn ended \
+         unexpectedly mid-response, and the follow-up wake produced no output. Assess where \
+         you left off and continue the work; if the work is already complete, say so \
+         explicitly."
+            .to_string()
+    }
+
+    fn empty_wake_attention_reason(&self) -> String {
+        "Turn ended unexpectedly: the last turn stopped mid-response and the automatic \
+         recovery wake produced no output. The agent is idle and needs a fresh message to \
+         continue."
+            .to_string()
+    }
+
     fn note_images_notice(&self, n: usize) -> String {
         format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
     }
@@ -495,13 +510,13 @@ impl Harness for V1 {
         let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
         let mut report_rendered = false;
         if let Some(report) = params.completion_report {
-            msg.push_str(&format!(" Report: {report}"));
+            let _ = write!(msg, " Report: {report}");
             report_rendered = true;
         } else if let Some(summary) = params.last_response_summary {
-            msg.push_str(&format!(" Summary: {summary}"));
+            let _ = write!(msg, " Summary: {summary}");
         }
         if let Some(err) = params.error {
-            msg.push_str(&format!(" Error: {err}"));
+            let _ = write!(msg, " Error: {err}");
         }
         // monorepo#1898: the stall suspicion and the report can come from
         // different session reads, so the tail is derived from what was
@@ -523,11 +538,9 @@ impl Harness for V1 {
                      now retired. The agent was deleted, so it cannot be re-watched.",
                 );
             } else {
-                msg.push_str(&format!(
-                    " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+                let _ = write!(msg, " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
                      retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
-                    params.child_id
-                ));
+                    params.child_id);
             }
         }
         msg
@@ -539,13 +552,13 @@ impl Harness for V1 {
         let mut line = format!("- {label} {kind}.");
         let mut report_rendered = false;
         if let Some(report) = params.completion_report {
-            line.push_str(&format!(" Report: {report}"));
+            let _ = write!(line, " Report: {report}");
             report_rendered = true;
         } else if let Some(summary) = params.last_response_summary {
-            line.push_str(&format!(" Summary: {summary}"));
+            let _ = write!(line, " Summary: {summary}");
         }
         if let Some(err) = params.error {
-            line.push_str(&format!(" Error: {err}"));
+            let _ = write!(line, " Error: {err}");
         }
         // Pending attention request (agent:attention-requested): the child's
         // immediate parent wake already fired at raise time (the alert); the
@@ -557,7 +570,7 @@ impl Harness for V1 {
             } else {
                 "Requested a discussion"
             };
-            line.push_str(&format!(" {verb}: {reason}"));
+            let _ = write!(line, " {verb}: {reason}");
         }
         // monorepo#1898: same consistency guard as `completion_wake` — never
         // append the "No completion report" tail to a line that already
@@ -593,11 +606,12 @@ impl Harness for V1 {
             "[WORKSPACE EVENTS] Child agent {agent_name} ({agent_id}) reported. Report: {report}"
         );
         if watch_consumed {
-            wake_text.push_str(&format!(
+            let _ = write!(
+                wake_text,
                 " NOTE: this report consumed your one-shot watch on this agent — it will NOT \
                  fire again on completion (failure/deletion still deliver). Call \
                  ws.agent.watch(\"{agent_id}\") again to be woken at its next completion."
-            ));
+            );
         }
         wake_text
     }
@@ -688,8 +702,7 @@ impl Harness for V1 {
             .char_indices()
             .rev()
             .nth(HOOK_WAKE_LOGS_CAP - 1)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            .map_or(0, |(i, _)| i);
         format!(
             "{message}\n\n[hook logs]\n[earlier log lines truncated]\n{}",
             &logs[start..]
@@ -700,6 +713,22 @@ impl Harness for V1 {
         format!(
             "[hook state dropped: {state_bytes} bytes exceeds the {cap_bytes}-byte cap; \
              previous state kept]"
+        )
+    }
+
+    fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
+        let omitted = total.saturating_sub(lines.len());
+        let more = if omitted > 0 {
+            format!("; …and {omitted} more not shown")
+        } else {
+            String::new()
+        };
+        format!(
+            "last run: {} host exec call{} failed (the run itself completed): {}{}",
+            total,
+            plural(i64::try_from(total).unwrap_or(i64::MAX)),
+            lines.join("; "),
+            more
         )
     }
 
@@ -811,16 +840,18 @@ impl Harness for V1 {
             r.checks.passed, r.checks.failed, r.checks.pending, r.checks.total
         );
         if !r.checks.failing_required.is_empty() {
-            checks.push_str(&format!(
+            let _ = write!(
+                checks,
                 "; failing required: {}",
                 r.checks.failing_required.join(", ")
-            ));
+            );
         }
         if !r.checks.pending_required.is_empty() {
-            checks.push_str(&format!(
+            let _ = write!(
+                checks,
                 "; pending required: {}",
                 r.checks.pending_required.join(", ")
-            ));
+            );
         }
         if !r.checks.required_known {
             checks.push_str(" (required-check flags unavailable)");
@@ -1006,7 +1037,7 @@ impl Harness for V1 {
             "[PR monitor {label}] {} change{} detected on \"{}\" ({}):\n{bullets}\n\nWhere the PR \
              stands now:\n{}",
             changes.len(),
-            plural(changes.len() as i64),
+            plural(i64::try_from(changes.len()).expect("value fits in i64")),
             snapshot.title,
             snapshot.url,
             self.pr_checklist(snapshot)
@@ -1035,7 +1066,7 @@ impl Harness for V1 {
                 .map(|c| format!("- {c}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            body.push_str(&format!("\n\nChanges since the last report:\n{bullets}"));
+            let _ = write!(body, "\n\nChanges since the last report:\n{bullets}");
         }
         body
     }

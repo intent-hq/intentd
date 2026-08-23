@@ -1,4 +1,4 @@
-//! Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
+//! Sandbox provisioning and lifecycle for `CoW` agent isolation (direct-mode and
 //! CoW-checkout workspaces).
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use crate::nested_repos::{is_dirty_excluding_submodules as is_dirty, stage_all_s
 use crate::now_iso;
 
 /// Test hook: artificial delay (milliseconds) at the top of
-/// [`provision_sandbox`], standing in for a slow CoW clone of a large
+/// [`provision_sandbox`], standing in for a slow `CoW` clone of a large
 /// checkout. Lets e2e tests prove provisioning runs off the delegate
 /// critical path (monorepo#871). NOTE: this seam is compiled into release
 /// binaries too (release-mode e2e runs need it); it is inert unless the
@@ -39,7 +39,7 @@ async fn apply_test_provision_hooks() -> Result<()> {
         test_provision_delay_from(std::env::var(TEST_PROVISION_DELAY_MS_ENV).ok().as_deref())
     {
         tracing::warn!(
-            delay_ms = delay.as_millis() as u64,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             "provision_sandbox: artificial delay (test seam)"
         );
         tokio::time::sleep(delay).await;
@@ -55,14 +55,14 @@ async fn apply_test_provision_hooks() -> Result<()> {
 /// Outcome of sandbox provisioning.
 #[derive(Debug, Clone)]
 pub enum ProvisionOutcome {
-    /// CoW is supported; sandbox was created.
+    /// `CoW` is supported; sandbox was created.
     Supported {
         path: PathBuf,
         branch: String,
         base_commit_sha: String,
         snapshot_commit_sha: Option<String>,
     },
-    /// CoW is not supported; fallback to shared mode (no bytes copied).
+    /// `CoW` is not supported; fallback to shared mode (no bytes copied).
     Unsupported,
 }
 
@@ -114,7 +114,7 @@ pub enum DirtyHandling {
 
 /// Configuration for sandbox provisioning.
 pub(crate) struct ProvisionConfig {
-    /// Workspaces root directory (from config.workspaces_root).
+    /// Workspaces root directory (from `config.workspaces_root`).
     pub workspaces_root: PathBuf,
 }
 
@@ -204,9 +204,9 @@ impl Drop for MergeClaimGuard {
 /// Provision a sandbox for an agent in a sandbox-eligible (direct-mode or
 /// CoW-checkout) workspace.
 ///
-/// 1. Probe CoW support between the canonical repository directory and the sandbox parent.
+/// 1. Probe `CoW` support between the canonical repository directory and the sandbox parent.
 /// 2. If Unsupported, return `ProvisionOutcome::Unsupported` (fallback to shared mode; ZERO bytes copied).
-/// 3. If Supported: cow_clone the canonical directory to `<workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>`.
+/// 3. If Supported: `cow_clone` the canonical directory to `<workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>`.
 /// 4. Create branch `sb/<agentId>` in the sandbox.
 /// 5. If the source had uncommitted changes, create a snapshot commit of the dirty state.
 /// 6. Persist the sandbox record.
@@ -349,7 +349,7 @@ pub async fn provision_sandbox(
     })
 }
 
-/// Synchronous half of [`provision_sandbox`]: filesystem probe, CoW clone,
+/// Synchronous half of [`provision_sandbox`]: filesystem probe, `CoW` clone,
 /// and git2 branch/snapshot setup. Runs on the blocking pool — no store or
 /// event-bus interaction happens here.
 fn provision_sandbox_blocking(
@@ -449,7 +449,7 @@ fn provision_sandbox_blocking(
         .map_err(|e| Error::Internal(format!("create branch failed: {e}")))?;
 
     // Check out the new branch
-    let refname = format!("refs/heads/{}", branch_name);
+    let refname = format!("refs/heads/{branch_name}");
     sandbox_repo
         .set_head(&refname)
         .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
@@ -563,7 +563,7 @@ pub async fn push_conflict_recovery_branch(
     // Ref-safe timestamp: now_iso's digits only (colons are illegal in refs).
     let timestamp: String = now_iso()
         .chars()
-        .filter(|c| c.is_ascii_digit())
+        .filter(char::is_ascii_digit)
         .take(14)
         .collect();
     let recovery_branch = format!("{branch}-recovery-{timestamp}");
@@ -698,7 +698,7 @@ pub(crate) async fn merge_sandbox_with(
                 &sandbox_path,
                 &sandbox,
                 &agent_id,
-                dirty_handling,
+                &dirty_handling,
             )
         })
         .await
@@ -783,7 +783,7 @@ fn merge_sandbox_git(
     sandbox_path: &Path,
     sandbox: &Sandbox,
     agent_id: &AgentId,
-    dirty_handling: DirtyHandling,
+    dirty_handling: &DirtyHandling,
 ) -> Result<MergeOutcome> {
     let mut dirty_commit_ms: u64 = 0;
     let fetch_ms: u64;
@@ -850,7 +850,8 @@ fn merge_sandbox_git(
             sandbox_repo
                 .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
                 .map_err(|e| Error::Internal(format!("auto-commit sandbox failed: {e}")))?;
-            dirty_commit_ms = dirty_started.elapsed().as_millis() as u64;
+            dirty_commit_ms =
+                u64::try_from(dirty_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         }
 
         // Get canonical HEAD
@@ -937,7 +938,7 @@ fn merge_sandbox_git(
             .to_str()
             .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
         let temp_ref = format!("refs/intent/sandbox-merge/{}", agent_id.0);
-        let refspec = format!("+{}:{}", branch_ref_name, temp_ref);
+        let refspec = format!("+{branch_ref_name}:{temp_ref}");
 
         // Sandbox paths are intentd-controlled absolute paths under
         // workspaces_root, so the positional <repository> argument cannot be
@@ -962,7 +963,7 @@ fn merge_sandbox_git(
                 String::from_utf8_lossy(&fetch_out.stderr).trim()
             )));
         }
-        fetch_ms = fetch_started.elapsed().as_millis() as u64;
+        fetch_ms = u64::try_from(fetch_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let cherrypick_started = std::time::Instant::now();
         let outcome = apply_sandbox_commits(
@@ -971,7 +972,7 @@ fn merge_sandbox_git(
             sandbox,
             &canonical_head_commit,
         );
-        cherrypick_ms = cherrypick_started.elapsed().as_millis() as u64;
+        cherrypick_ms = u64::try_from(cherrypick_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // The temp ref only anchors the fetch; drop it regardless of outcome.
         if let Ok(mut r) = canonical_repo.find_reference(&temp_ref) {
@@ -1086,7 +1087,7 @@ fn apply_sandbox_commits(
         // No commits to apply (only the snapshot, base == HEAD, or nothing
         // new since the last merge)
         return Ok(MergeOutcome::Merged {
-            commit_range: format!("{}..{} (empty)", start_sha, sandbox_head_sha),
+            commit_range: format!("{start_sha}..{sandbox_head_sha} (empty)"),
             canonical_head: canonical_head_sha,
             sandbox_head_sha,
         });
@@ -1192,7 +1193,7 @@ fn apply_sandbox_commits(
     }
 
     Ok(MergeOutcome::Merged {
-        commit_range: format!("{}..{}", start_sha, sandbox_head_sha),
+        commit_range: format!("{start_sha}..{sandbox_head_sha}"),
         canonical_head: current_oid.to_string(),
         sandbox_head_sha,
     })
@@ -1256,7 +1257,7 @@ fn audit_diverged_sandbox_branches(
 ///   initialization).
 /// - Worktree workspaces share the checkout with the user (no sandboxes):
 ///   returns an error.
-/// - Otherwise (skip_worktree = true OR no worktree provisioned): the user's
+/// - Otherwise (`skip_worktree` = true OR no worktree provisioned): the user's
 ///   repository folder (`repository_path`).
 pub(crate) fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let repo_path = match workspace.checkout_mode {
@@ -1286,16 +1287,14 @@ pub(crate) fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
     let path = PathBuf::from(repo_path);
     if !path.exists() {
         return Err(Error::InvalidParams(format!(
-            "repository path does not exist: {}",
-            repo_path
+            "repository path does not exist: {repo_path}"
         )));
     }
 
     // Verify it's a git repository
     if !path.join(".git").exists() {
         return Err(Error::InvalidParams(format!(
-            "repository path is not a git repository: {}",
-            repo_path
+            "repository path is not a git repository: {repo_path}"
         )));
     }
 
@@ -1304,11 +1303,8 @@ pub(crate) fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
 
 /// Derive a repository slug from the workspace (repository name, sanitized).
 fn repo_slug_from_workspace(workspace: &Workspace) -> String {
-    workspace
-        .repository_name
-        .as_ref()
-        .map(|n| slugify(n))
-        .unwrap_or_else(|| {
+    workspace.repository_name.as_ref().map_or_else(
+        || {
             workspace
                 .repository_path
                 .as_ref()
@@ -1318,7 +1314,9 @@ fn repo_slug_from_workspace(workspace: &Workspace) -> String {
                         .map(|n| n.to_string_lossy().to_string())
                 })
                 .unwrap_or_else(|| "repo".to_string())
-        })
+        },
+        |n| slugify(n),
+    )
 }
 
 /// Simple slugification: lowercase, replace non-alphanumeric with hyphens.
@@ -1332,7 +1330,7 @@ fn slugify(s: &str) -> String {
 }
 
 /// Restore index-tracked files that are missing from the worktree (the
-/// best-effort CoW clone may have skipped them as non-clonable). Checks out
+/// best-effort `CoW` clone may have skipped them as non-clonable). Checks out
 /// ONLY those paths from the index, so genuinely dirty state — modified
 /// tracked files, staged changes, untracked files — is left untouched.
 fn restore_missing_tracked_files(
@@ -1537,7 +1535,7 @@ fn get_files_in_range(
     Ok(files)
 }
 
-/// Get the list of commits after start_sha up to end_sha (exclusive of start, inclusive of end).
+/// Get the list of commits after `start_sha` up to `end_sha` (exclusive of start, inclusive of end).
 fn get_commits_after(
     repo: &git2::Repository,
     start_sha: &str,
@@ -1604,7 +1602,7 @@ mod test_hook_tests {
     fn positive_millis_enable_delay() {
         assert_eq!(
             test_provision_delay_from(Some("10000")),
-            Some(Duration::from_millis(10_000))
+            Some(Duration::from_secs(10))
         );
         assert_eq!(
             test_provision_delay_from(Some(" 500 ")),
@@ -1662,7 +1660,7 @@ mod tests {
         (dir, repo_path)
     }
 
-    /// Create a test repo under a specific parent directory (for same-volume CoW tests)
+    /// Create a test repo under a specific parent directory (for same-volume `CoW` tests)
     /// Uses workspace root's target dir, not crate's target dir, to ensure same volume.
     fn temp_repo_in_target(name: &str) -> (PathBuf, PathBuf) {
         // Navigate to workspace root (up from crates/intent-services)
@@ -1807,8 +1805,7 @@ mod tests {
         // CoW is temporarily locked to macOS; skip everywhere else.
         if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
-                "Skipping test: CoW not supported between {:?} and {:?}",
-                repo_path, workspaces_root
+                "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -1959,8 +1956,7 @@ mod tests {
         // CoW is temporarily locked to macOS; skip everywhere else.
         if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
-                "Skipping test: CoW not supported between {:?} and {:?}",
-                repo_path, workspaces_root
+                "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2127,8 +2123,7 @@ mod tests {
         // CoW is temporarily locked to macOS; skip everywhere else.
         if cfg!(not(target_os = "macos")) || probe == CowSupport::Unsupported {
             eprintln!(
-                "Skipping test: CoW not supported between {:?} and {:?}",
-                repo_path, workspaces_root
+                "Skipping test: CoW not supported between {repo_path:?} and {workspaces_root:?}"
             );
             let _ = fs::remove_dir_all(&test_root);
             return;
@@ -2775,7 +2770,7 @@ mod tests {
                 // Verify file2.txt is in canonical
                 assert!(canonical_path.join("file2.txt").exists());
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // Persistent lifecycle: the merged tip is recorded on the record so
@@ -2838,7 +2833,7 @@ mod tests {
             sandbox_head_sha, ..
         } = outcome
         else {
-            panic!("Expected Merged outcome for turn 1, got {:?}", outcome);
+            panic!("Expected Merged outcome for turn 1, got {outcome:?}");
         };
         assert_eq!(sandbox_head_sha, turn1_sha);
         assert!(canonical_path.join("turn1.txt").exists());
@@ -2867,7 +2862,7 @@ mod tests {
             ..
         } = outcome
         else {
-            panic!("Expected Merged outcome for turn 2, got {:?}", outcome);
+            panic!("Expected Merged outcome for turn 2, got {outcome:?}");
         };
         assert_eq!(sandbox_head_sha, turn2_sha);
         assert!(
@@ -3060,7 +3055,7 @@ mod tests {
                 assert_eq!(overlapping_paths.len(), 1);
                 assert_eq!(overlapping_paths[0], "file1.txt");
             }
-            _ => panic!("Expected Blocked outcome, got {:?}", outcome),
+            _ => panic!("Expected Blocked outcome, got {outcome:?}"),
         }
 
         // Cleanup
@@ -3173,7 +3168,7 @@ mod tests {
                 // Verify canonical is pristine (not mid-merge)
                 assert!(repo.state() == git2::RepositoryState::Clean);
             }
-            _ => panic!("Expected Conflict outcome, got {:?}", outcome),
+            _ => panic!("Expected Conflict outcome, got {outcome:?}"),
         }
 
         // Clean up
@@ -3268,7 +3263,7 @@ mod tests {
                     "WIP snapshot must not be merged"
                 );
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // Clean up
@@ -3306,9 +3301,11 @@ mod tests {
         let provision_outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
             .await
             .unwrap();
-        let sandbox_path = match provision_outcome {
-            ProvisionOutcome::Supported { path, .. } => path,
-            _ => panic!("Expected Supported"),
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = provision_outcome
+        else {
+            panic!("Expected Supported")
         };
 
         // In the sandbox, make a commit with a specific author (simulating the agent)
@@ -3339,7 +3336,7 @@ mod tests {
         let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
         match outcome {
             MergeOutcome::Merged { .. } => {}
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // Verify attribution was preserved in canonical
@@ -3608,7 +3605,7 @@ mod tests {
 
         let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
         let MergeOutcome::Merged { canonical_head, .. } = outcome else {
-            panic!("Expected Merged outcome, got {:?}", outcome);
+            panic!("Expected Merged outcome, got {outcome:?}");
         };
 
         // Merge landed in the workspace checkout with attribution preserved.
@@ -3685,7 +3682,7 @@ mod tests {
             let blob_oid = canonical_repo.blob(b"intent blob payload").unwrap();
             canonical_repo
                 .reference(
-                    &format!("refs/intent/blobs/{}", blob_oid),
+                    &format!("refs/intent/blobs/{blob_oid}"),
                     blob_oid,
                     false,
                     "test blob ref",
@@ -3706,14 +3703,14 @@ mod tests {
                     .branch(&branch_name, &head_commit, false)
                     .unwrap();
                 sandbox_repo
-                    .set_head(&format!("refs/heads/{}", branch_name))
+                    .set_head(&format!("refs/heads/{branch_name}"))
                     .unwrap();
 
                 // Blob ref, as inherited from the source repo by CoW clones.
                 let blob_oid = sandbox_repo.blob(b"intent blob payload").unwrap();
                 sandbox_repo
                     .reference(
-                        &format!("refs/intent/blobs/{}", blob_oid),
+                        &format!("refs/intent/blobs/{blob_oid}"),
                         blob_oid,
                         false,
                         "test blob ref",
@@ -3757,7 +3754,7 @@ mod tests {
             MergeOutcome::Merged { .. } => {
                 assert!(canonical_path.join("agent.txt").exists());
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         // The temp fetch ref is cleaned up after the merge.
@@ -3800,7 +3797,7 @@ mod tests {
                 .branch(&branch_name, &head_commit, false)
                 .unwrap();
             sandbox_repo
-                .set_head(&format!("refs/heads/{}", branch_name))
+                .set_head(&format!("refs/heads/{branch_name}"))
                 .unwrap();
         }
 
@@ -3843,7 +3840,7 @@ mod tests {
             MergeOutcome::Merged { .. } => {
                 assert!(canonical_path.join("agent.txt").exists());
             }
-            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+            _ => panic!("Expected Merged outcome, got {outcome:?}"),
         }
 
         let _ = fs::remove_dir_all(&test_root);
@@ -3879,7 +3876,7 @@ mod tests {
                 .branch(&branch_name, &head_commit, false)
                 .unwrap();
             sandbox_repo
-                .set_head(&format!("refs/heads/{}", branch_name))
+                .set_head(&format!("refs/heads/{branch_name}"))
                 .unwrap();
         }
 
@@ -3917,7 +3914,7 @@ mod tests {
             .expect("already-applied commit must not be an internal error");
         match outcome {
             MergeOutcome::Merged { .. } => {}
-            other => panic!("already-applied change must report Merged, got {:?}", other),
+            other => panic!("already-applied change must report Merged, got {other:?}"),
         }
 
         // No duplicate/empty commit: canonical HEAD is unchanged.
@@ -4029,7 +4026,7 @@ mod tests {
                 .branch(&branch_name, &head_commit, false)
                 .unwrap();
             sandbox_repo
-                .set_head(&format!("refs/heads/{}", branch_name))
+                .set_head(&format!("refs/heads/{branch_name}"))
                 .unwrap();
         }
         commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
@@ -4073,7 +4070,7 @@ mod tests {
             MergeOutcome::Merged { .. } => {
                 assert!(canonical_path.join("agent.txt").exists());
             }
-            other => panic!("Expected Merged outcome, got {:?}", other),
+            other => panic!("Expected Merged outcome, got {other:?}"),
         }
         assert!(!lock_path.exists(), "stale lock must be gone after merge");
 
@@ -4113,7 +4110,7 @@ mod tests {
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: 0o160000,
+                mode: 0o160_000,
                 uid: 0,
                 gid: 0,
                 file_size: 0,
@@ -4146,7 +4143,7 @@ mod tests {
                 .branch(&branch_name, &head_commit, false)
                 .unwrap();
             sandbox_repo
-                .set_head(&format!("refs/heads/{}", branch_name))
+                .set_head(&format!("refs/heads/{branch_name}"))
                 .unwrap();
         }
 
@@ -4178,10 +4175,7 @@ mod tests {
             .expect("identical submodule bump must not be an internal error");
         match outcome {
             MergeOutcome::Merged { .. } => {}
-            other => panic!(
-                "identical submodule pointer must merge cleanly, got {:?}",
-                other
-            ),
+            other => panic!("identical submodule pointer must merge cleanly, got {other:?}"),
         }
 
         let _ = fs::remove_dir_all(&test_root);
@@ -4239,7 +4233,7 @@ mod tests {
                 );
                 assert!(overlapping_paths.is_empty());
             }
-            _ => panic!("Expected Blocked outcome, got {:?}", outcome),
+            _ => panic!("Expected Blocked outcome, got {outcome:?}"),
         }
 
         // The sandbox record is untouched, so the merge stays retryable.
@@ -4416,8 +4410,24 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let (_dir, repo_path) = temp_repo("snapshot-nested-non-utf8");
-        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
         let name = std::ffi::OsStr::from_bytes(b"bad-\xff-wt");
+        // Some filesystems reject non-UTF-8 file names outright (APFS on
+        // macOS fails with EILSEQ), so the fixture cannot exist there. Probe
+        // at runtime and skip instead of failing (intent-hq/monorepo#3028);
+        // the test still runs fully on Linux/CI. Only the name-rejection
+        // errno may skip — anything else (permissions, ENOSPC) must surface.
+        if let Err(err) = fs::create_dir(repo_path.join(name)) {
+            assert!(
+                matches!(err.raw_os_error(), Some(libc::EILSEQ | libc::EINVAL)),
+                "unexpected error creating non-UTF-8 fixture: {err}"
+            );
+            eprintln!(
+                "skipping create_snapshot_commit_skips_non_utf8_nested_repo_names: \
+                 filesystem rejects non-UTF-8 file names"
+            );
+            return;
+        }
+        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
         make_nested_repo(&repo_path, Path::new(name));
         fs::write(repo_path.join("dirty.txt"), "dirty").unwrap();
 

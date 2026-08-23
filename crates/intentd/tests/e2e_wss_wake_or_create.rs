@@ -72,6 +72,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
+    common::seed_default_provider(data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
@@ -211,7 +212,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -344,7 +345,8 @@ async fn boot_daemon_with_task_env(
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -371,7 +373,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -642,13 +644,18 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
 /// delegated child's FIRST message with a `---` separator, so the child sees
 /// the body first followed by the note ID/title and the single-task scope
 /// contract byte-for-byte. Exercised over the real WSS wire (not just the
-/// `intent-services` unit tests) per the repo's e2e requirement. Hermetic —
-/// no ACP provider is spawned; the child's persisted `metadata.initialMessage`
-/// carries the preamble bytes at delegate time.
+/// `intent-services` unit tests) per the repo's e2e requirement. No ACP turn
+/// is driven — the child's persisted `metadata.initialMessage` carries the
+/// preamble bytes at delegate time — but the daemon needs the mock env gate
+/// satisfied so `agent.delegate`'s availability gate accepts `mock:default`.
 #[tokio::test]
 async fn delegate_with_task_note_id_appends_preamble_over_wss() {
     const TITLE: &str = "TASK-C preamble task";
-    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task(TITLE).await;
+    let Some(script) = gate("WSS delegate preamble E2E") else {
+        return;
+    };
+    let (_daemon, ws_id, task_note_id, port, fp) =
+        boot_daemon_with_task_env(TITLE, &[("MOCK_AGENT_SCRIPT_PATH", &script)]).await;
     let cfg = client_config(&fp);
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
@@ -704,11 +711,18 @@ This note is your workspace for this task. Update it with your progress, finding
 /// agents actually associated with the task (here the delegated assignee)
 /// instead of returning an all-zero snapshot, over the real WSS wire. An
 /// unrelated agent stays out of scope, and a nonexistent note id yields an
-/// empty (not erroring) snapshot. Hermetic — no ACP provider is spawned.
+/// empty (not erroring) snapshot. No ACP turn is driven, but the mock env
+/// gate must be satisfied for `agent.delegate`'s availability gate.
 #[tokio::test]
 async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
-    let (_daemon, ws_id, task_note_id, port, fp) =
-        boot_daemon_with_task("Diagnostics filter task").await;
+    let Some(script) = gate("WSS diagnostics task filter E2E") else {
+        return;
+    };
+    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task_env(
+        "Diagnostics filter task",
+        &[("MOCK_AGENT_SCRIPT_PATH", &script)],
+    )
+    .await;
     let cfg = client_config(&fp);
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
@@ -785,10 +799,16 @@ async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
 /// `skipAutoCommit=true` delivers a first message that ends at the scope
 /// directive with NO state-specific auto-commit instruction, byte-for-byte,
 /// over the real WSS wire — the opt-out only gates the idle subscriber.
+/// No ACP turn is driven, but the mock env gate must be satisfied for
+/// `agent.delegate`'s availability gate.
 #[tokio::test]
 async fn delegate_with_skip_auto_commit_stays_status_neutral_over_wss() {
     const TITLE: &str = "TASK-C skipAutoCommit task";
-    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task(TITLE).await;
+    let Some(script) = gate("WSS delegate skipAutoCommit E2E") else {
+        return;
+    };
+    let (_daemon, ws_id, task_note_id, port, fp) =
+        boot_daemon_with_task_env(TITLE, &[("MOCK_AGENT_SCRIPT_PATH", &script)]).await;
     let cfg = client_config(&fp);
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
@@ -844,11 +864,16 @@ This note is your workspace for this task. Update it with your progress, finding
 /// rejects a second `agent.delegate` / a new-id `task.assignAgent` with a
 /// JSON-RPC `-32602` envelope (PROTOCOL §9) naming the existing agent, and
 /// `force: true` deliberately overrides on both methods. Same-id re-assign
-/// stays idempotent-ok. Hermetic — no ACP provider is spawned; the guard
-/// fires before any turn starts.
+/// stays idempotent-ok. No ACP turn is driven — the guard fires before any
+/// turn starts — but the mock env gate must be satisfied for
+/// `agent.delegate`'s availability gate.
 #[tokio::test]
 async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
-    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("Occupied Task").await;
+    let Some(script) = gate("WSS occupancy guard E2E") else {
+        return;
+    };
+    let (_daemon, ws_id, task_note_id, port, fp) =
+        boot_daemon_with_task_env("Occupied Task", &[("MOCK_AGENT_SCRIPT_PATH", &script)]).await;
     let cfg = client_config(&fp);
     let mut rpc = connect_ws(port, cfg.clone()).await;
 

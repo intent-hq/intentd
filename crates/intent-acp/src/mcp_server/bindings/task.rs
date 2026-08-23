@@ -27,7 +27,7 @@ const VALID_TASK_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.task = {
         updateStatus: (noteId, taskText, status) =>
@@ -52,7 +52,7 @@ pub(crate) const PRELUDE: &str = r#"
         assignAgent: (noteId, agentId, force) =>
             host({ method: 'task.assignAgent', args: { noteId, agentId, force } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

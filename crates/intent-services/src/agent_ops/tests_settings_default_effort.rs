@@ -39,6 +39,11 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
+    // monorepo#3044: creation requires a resolvable provider (no positional
+    // fallback) — seed the effective default provider explicitly.
+    registry
+        .apply(&[("providers.active".into(), serde_json::json!("auggie"))])
+        .expect("seed default provider");
     let services = Services::new(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(
@@ -65,9 +70,12 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
 /// ACP provider binary being installed on the test host (CI has none).
 fn seed_catalog(svc: &Services) {
     for provider in ["auggie", "mock"] {
+        let version_key = crate::model_catalog::source_for(provider)
+            .map(|source| (source.version_key)())
+            .unwrap_or_default();
         svc.models_catalog.store_for_test(
             provider,
-            "",
+            &version_key,
             vec![
                 json!({ "id": "fable-5", "name": "Fable 5", "provider": provider,
                         "effortLevels": ["low", "high"] }),
@@ -212,7 +220,7 @@ async fn explicit_effort_param_and_explicit_clear_outrank_the_setting() {
         None,
         None,
         AgentCreateExtra {
-            reasoning_effort: Some("".into()),
+            reasoning_effort: Some(String::new()),
             ..Default::default()
         },
     )

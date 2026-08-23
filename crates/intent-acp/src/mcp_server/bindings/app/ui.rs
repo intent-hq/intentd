@@ -13,7 +13,7 @@ use crate::mcp_server::bindings::map_err;
 
 use crate::mcp_server::bindings::{opt_i64, opt_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.app = ws.app || {};
     ws.app.ui = {
@@ -21,7 +21,7 @@ pub(crate) const PRELUDE: &str = r#"
         highlight: (id, options) => host({ method: 'app.ui.highlight', args: { id, ...(options || {}) } }),
         targets: () => host({ method: 'app.ui.targets', args: {} }),
     };
-"#;
+";
 
 const MAX_HIGHLIGHT_DURATION_MS: i64 = 30_000;
 
@@ -195,10 +195,10 @@ fn normalize_required_string(args: &Value, field: &str) -> Result<String, String
     let value = args
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("{} is required and must be a string", field))?;
+        .ok_or_else(|| format!("{field} is required and must be a string"))?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(format!("{} cannot be empty", field));
+        return Err(format!("{field} cannot be empty"));
     }
     Ok(trimmed.to_string())
 }
@@ -210,8 +210,7 @@ fn normalize_duration_ms(args: &Value, field: &str) -> Result<Option<i64>, Strin
     };
     if duration <= 0 || duration > MAX_HIGHLIGHT_DURATION_MS {
         return Err(format!(
-            "{} must be between 1 and {}",
-            field, MAX_HIGHLIGHT_DURATION_MS
+            "{field} must be between 1 and {MAX_HIGHLIGHT_DURATION_MS}"
         ));
     }
     Ok(Some(duration))

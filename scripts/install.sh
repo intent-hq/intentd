@@ -34,9 +34,29 @@
 #
 #   INTENTD_AUTO_RESUME=auto|on|off  (or --auto-resume=<value>, on direct runs)
 #
+# The prompt and both of those accept the obvious yes/no spellings for on/off
+# (y/yes/true, n/no/false), in any case.
+#
+# The release channel the daemon is installed from — and updated on — defaults
+# to stable. Choose another with:
+#
+#   INTENTD_CHANNEL=stable|beta|alpha  (or --channel=<value>, on direct runs)
+#
+# A non-default choice is pinned via `intentd sitter channel`, which writes the
+# sitter's own config.toml, so the service keeps following it across restarts
+# and updates. A default run writes no pin, leaving any channel you pinned
+# earlier by hand untouched.
+#
+# Service setup is refused up front when a daemon is already running and owns
+# the data dir the service would serve: a daemon locks its data dir for its
+# whole lifetime, so a second one on the same dir can only crash-loop. Nothing
+# is registered in that case — see check_data_dir_not_owned.
+#
 # INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
-# serves the same data dir the install-time CLI used.
+# serves the same data dir the install-time CLI used. A relative value is
+# anchored to the directory this installer runs in, since the service has no
+# working directory of its own — see resolve_data_dir.
 #
 # Idempotent: re-running replaces the installed binary atomically, and
 # service setup restarts an already-registered service instead of
@@ -63,30 +83,216 @@ cleanup() {
   if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi
 }
 
-# Poll `intentd status` until the daemon answers. First service start can be
-# slow: the sitter downloads the real daemon before serving.
+# Lines of service log quoted when the daemon never came up: enough to carry
+# the daemon's own error (it inherits the sitter's stdio, so its message sits
+# directly above the sitter's respawn lines) without dumping an unbounded log.
+log_tail_lines=40
+
+# How the wait for the first daemon start is bounded (all seconds). The wait
+# ends the moment the outcome is decided — the daemon answers, or the sitter's
+# own failure lines appear — so these only cap the undecided case:
+#
+#   verify_deadline  hard bound on the whole wait. Generous on purpose: the
+#                    first start downloads the daemon, and the crash that
+#                    proves an install broken can land well after a 60s
+#                    window (a slow channel resolve/download delays the very
+#                    first spawn, so the first crash line does too).
+#   verify_poll      gap between `intentd status` probes and log reads.
+#   verify_settle    grace after crash evidence first appears: the sitter
+#                    respawns, so a daemon that died once and then came up is
+#                    a working install, not a failure.
+#   verify_progress  when to say the wait is still open, so a long download
+#                    does not look like a hang.
+verify_deadline=300
+verify_poll=2
+verify_settle=10
+verify_progress=60
+
+# Where this run's service output lands, plus how to bound it to this run so a
+# diagnosis never quotes a previous run's crash. Set by note_log_start.
+log_desc=""
+log_file=""
+log_offset=0
+log_unit=""
+log_since=""
+restart_hint=""
+
+# Record where the service log ends, and how to restart the service once a
+# human has fixed the cause. Callers run this BEFORE starting/restarting the
+# service: a daemon that fails the instant it starts must still land inside
+# the boundary, so capturing it any later could exclude the very failure
+# verify_daemon needs to quote.
+#
+# macOS: the LaunchAgent's StandardErrorPath, built from the same $HOME the
+# plist writer interpolates (the label does not affect the log path).
+# Linux: the unit sets no StandardError, so output goes to the journal.
+note_log_start() {
+  if [ "$os" = "Darwin" ]; then
+    log_file="$HOME/Library/Logs/intentd.err.log"
+    log_desc="$log_file"
+    # Guarded: an unopenable file makes the *shell* report the failed
+    # redirect, which `wc 2>/dev/null` cannot suppress — and a first install
+    # has no log yet, so that would be noise on the happy path.
+    log_offset=0
+    if [ -r "$log_file" ]; then
+      # The pipeline's status is tr's, so a failed wc surfaces as empty
+      # output, not a failed command: check the value, not the status.
+      log_offset=$(wc -c <"$log_file" | tr -d '[:space:]')
+      [ -n "$log_offset" ] || log_offset=0
+    fi
+    restart_hint="launchctl kickstart -k gui/$(id -u)/${INTENTD_SERVICE_NAME:-com.intenthq.intentd}"
+  else
+    log_unit=${INTENTD_SERVICE_NAME:-intentd}
+    log_desc="journalctl --user -u $log_unit"
+    # Second granularity may pull in the last second of an earlier run; that
+    # is close enough to keep the diagnosis about this start.
+    log_since=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || log_since=""
+    restart_hint="systemctl --user restart $log_unit"
+  fi
+}
+
+# Echo this run's service output, bounded to $log_tail_lines lines. Echoes
+# nothing when there is nothing to read: the log may not exist yet, be empty
+# or unreadable, or — on a Linux box without systemd — there may be no journal.
+service_log_tail() {
+  if [ -n "$log_file" ]; then
+    [ -r "$log_file" ] || return 0
+    size=$(wc -c <"$log_file" 2>/dev/null | tr -d '[:space:]') || size=""
+    # A rotated or replaced log invalidates the offset; read it whole.
+    if [ -z "$size" ] || [ "$size" -lt "$log_offset" ]; then
+      log_offset=0
+    fi
+    # The offset is a byte count, so the first line can start mid-word when
+    # the service was already writing as we took it; the lines that matter
+    # come after it.
+    tail -c "+$((log_offset + 1))" "$log_file" 2>/dev/null | tail -n "$log_tail_lines"
+  elif [ -n "$log_unit" ] && command -v journalctl >/dev/null 2>&1; then
+    if [ -n "$log_since" ]; then
+      journalctl --user -u "$log_unit" --since "$log_since" -n "$log_tail_lines" --no-pager 2>/dev/null || true
+    else
+      journalctl --user -u "$log_unit" -n "$log_tail_lines" --no-pager 2>/dev/null || true
+    fi
+  fi
+}
+
+# Quote the captured log on stderr, ahead of the error that explains it (both
+# on stderr so the two cannot interleave out of order).
+report_daemon_log() {
+  printf '%s\n' "install.sh: the service's output for this start (from $log_desc):" >&2
+  printf '%s\n' "$1" | sed 's/^/  | /' >&2
+}
+
+# An explicit on/off auto-resume answer is applied only once the daemon is
+# reachable (apply_auto_resume runs after verify_daemon), so any outcome short
+# of "up" drops it — say so instead of dropping it silently.
+auto_resume_pending_note() {
+  case "${auto_resume:-}" in
+    on | off) printf '%s' "
+Your auto-resume choice ('$auto_resume') was not applied; once the daemon is up, apply it with:
+  intentd settings agents.resumeInterruptedOnStart $auto_resume" ;;
+  esac
+}
+
+# Wait for the first daemon start to resolve into an outcome: up, failed, or —
+# only when the deadline runs out with nothing decided — unknown. Returns 0
+# when the daemon answers, exits non-zero when the service log proves it is
+# failing, and returns 1 when the deadline is reached undecided.
+#
+# The caller must have called note_log_start before starting the service, so
+# the log window read here covers the whole start.
+#
+# Polling both signals — `intentd status` and this run's service log — is what
+# keeps the wait from racing the outcome. The old fixed 60s window classified
+# the log once, at the end: a sitter still resolving a channel or downloading
+# at that point had not crashed yet, so the install exited 0 with "may still be
+# downloading" while the daemon that could never start crashed seconds later.
+# Success still returns the moment the daemon answers, so a working install is
+# no slower to report.
 verify_daemon() {
   info "waiting for the daemon to respond (first start downloads the daemon binary)..."
   waited=0
-  while [ "$waited" -lt 60 ]; do
+  crash_out=""
+  crash_at=-1
+  progress_shown=0
+  while :; do
     if "$install_dir/intentd" status >/dev/null 2>&1; then
       info "daemon is up — 'intentd status' responds"
       return 0
     fi
-    sleep 2
-    waited=$((waited + 2))
+
+    # The substrings matched below are the sitter's own log lines — a detection
+    # contract with crates/intentd-sitter/src/supervisor.rs and install.ps1,
+    # pinned by the install_log_contract_* tests in
+    # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in lockstep.
+    log_out=$(service_log_tail)
+    case "$log_out" in
+      *"times in a row without ever staying up"*)
+        # Terminal: the sitter has stopped trying, so nothing more can happen.
+        report_daemon_log "$log_out"
+        fail "the daemon could not start and the sitter has given up — the service is stopped.
+Fix the cause reported above, then start it again with:
+  $restart_hint$(auto_resume_pending_note)" ;;
+      *"exited unexpectedly"* | *"failed to spawn"* | *"failed waiting on intentd"*)
+        # A crash is not yet a verdict: the sitter respawns, and a daemon that
+        # died once can still come up. Keep polling for verify_settle seconds —
+        # the loop returns 0 above if it does — and only then call it a failure.
+        crash_out="$log_out"
+        if [ "$crash_at" -lt 0 ]; then
+          crash_at="$waited"
+        fi
+        if [ $((waited - crash_at)) -ge "$verify_settle" ]; then
+          break
+        fi ;;
+    esac
+
+    if [ "$waited" -ge "$verify_deadline" ]; then
+      break
+    fi
+    if [ "$progress_shown" -eq 0 ] && [ "$waited" -ge "$verify_progress" ]; then
+      info "still waiting (${waited}s) — nothing has failed yet; a first download over a slow link can take a few minutes"
+      progress_shown=1
+    fi
+    sleep "$verify_poll"
+    waited=$((waited + verify_poll))
   done
-  warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
+
+  # Crash evidence anywhere in this run's window is a failure, whether the
+  # settle grace expired or the deadline cut it short.
+  if [ -n "$crash_out" ]; then
+    report_daemon_log "$crash_out"
+    fail "the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.
+Fix the cause reported above, then start it again with:
+  $restart_hint$(auto_resume_pending_note)"
+  fi
+
+  # Undecided: no answer, and nothing in the log says anything failed. Say
+  # exactly that rather than asserting a slow download.
+  warn "the daemon has not responded in ${waited}s and nothing in this run's service log reports a failure — this install could not tell whether the daemon binary is still downloading or the service is stuck.
+The service is registered and started; its output is in $log_desc.
+Check on it with:
+  intentd status
+If it is still not responding in a few minutes, restart it and re-read that log:
+  $restart_hint$(auto_resume_pending_note)"
+  return 1
 }
 
-# Lowercase a flag/env auto-resume value so validation is case-insensitive,
-# matching the interactive prompt (and install.ps1).
+# Normalize an auto-resume value from the flag, the env var, or the prompt:
+# lowercase it so matching is case-insensitive, and fold the unambiguous
+# yes/no spellings onto the canonical on/off — the question reads as a yes/no
+# question, so `no` must mean off rather than being rejected in favour of the
+# opposite default. Anything else passes through lowercased, for
+# validate_auto_resume or the prompt to reject.
 normalize_auto_resume() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+  auto_resume_lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$auto_resume_lower" in
+    y | yes | true) printf 'on' ;;
+    n | no | false) printf 'off' ;;
+    *) printf '%s' "$auto_resume_lower" ;;
+  esac
 }
 
 # Fail fast on a bogus auto-resume value from the flag or env var
-# (already lowercased via normalize_auto_resume).
+# (already lowercased and folded via normalize_auto_resume).
 validate_auto_resume() {
   case "$1" in
     auto | on | off) ;;
@@ -110,6 +316,198 @@ apply_auto_resume() {
   fi
 }
 
+# Lowercase a flag/env channel value so validation is case-insensitive,
+# matching the auto-resume pair above.
+normalize_channel() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Fail fast on a bogus channel value from the flag or env var (already
+# lowercased via normalize_channel). Mirrors the sitter's own Channel::parse,
+# so install.sh rejects exactly what the sitter would reject.
+validate_channel() {
+  case "$1" in
+    stable | beta | alpha) ;;
+    *) fail "invalid channel '$1' (expected stable, beta, or alpha)" ;;
+  esac
+}
+
+# Pin a non-default channel in the sitter's config.toml via its own CLI.
+#
+# The config pin — not a --sitter-channel flag baked into the unit/plist — is
+# what makes the choice durable: the sitter resolves flag > env > config.toml >
+# stable, and service definitions deliberately pass neither flag nor env, so
+# config.toml is the level built for exactly this. It also survives a unit
+# being regenerated by a later .deb/brew install, and `intentd update` reports
+# "the channel the service follows" by reading this pin alone.
+#
+# Runs before service setup: `sitter channel` only writes the pin and never
+# touches a running daemon, so the service's very first daemon download already
+# uses the chosen channel. A failure here is fatal — continuing would silently
+# install stable after the user explicitly asked for something else.
+pin_channel() {
+  if pin_out=$("$install_dir/intentd" sitter channel "$channel" 2>&1); then
+    info "update channel pinned to '$channel' — the service follows it across restarts and updates"
+  else
+    printf '%s\n' "$pin_out" | sed 's/^/  | /' >&2
+    fail "could not pin the update channel to '$channel' (reported above); the daemon would install from stable instead"
+  fi
+}
+
+# Report the just-installed binary's version by probing it with
+# --sitter-version. A probe FAILURE (the binary won't run: wrong arch,
+# missing libs, a bad env making it bail) is surfaced as a warning quoting
+# the probe's output — it must never be conflated with the probe succeeding
+# without printing a version, which stays the quiet no-version report.
+# Non-fatal by design: the binary is installed either way, and later steps
+# (pin_channel, service verification) fail hard on a binary that can't run.
+report_installed_version() {
+  if version=$("$install_dir/intentd" --sitter-version 2>&1); then
+    if [ -n "$version" ]; then
+      info "installed $version to $install_dir/intentd"
+    else
+      info "installed intentd to $install_dir/intentd"
+    fi
+  else
+    warn "installed intentd to $install_dir/intentd, but probing it with --sitter-version failed: ${version:-no output}"
+  fi
+}
+
+# The absolute data dir the service registered below would serve: the explicit
+# override, else the daemon's own platform default. Kept in step with
+# intent_core::Config::resolve (crates/intent-core/src/config.rs), which reads
+# INTENTD_DATA_DIR first and otherwise takes the `directories` crate's per-app
+# data dir — `~/Library/Application Support/intentd` on macOS,
+# `$XDG_DATA_HOME/intentd` (default `~/.local/share/intentd`) elsewhere.
+#
+# A relative override is anchored to the directory the installer runs in. The
+# override is carried into the unit/plist, and neither a systemd user unit nor
+# a LaunchAgent inherits this shell's working directory, so a bare `./data`
+# would otherwise name one dir here — where the ownership check looks — and a
+# different one once the service starts. Anchoring it leaves a single dir that
+# this check, the unit/plist and the `intentd` calls below all agree on.
+# Idempotent, so it stays the same dir however many times it is resolved.
+resolve_data_dir() {
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    case "$INTENTD_DATA_DIR" in
+      /*) printf '%s' "$INTENTD_DATA_DIR" ;;
+      *) printf '%s' "$(pwd)/${INTENTD_DATA_DIR#./}" ;;
+    esac
+  elif [ "$os" = "Darwin" ]; then
+    printf '%s' "$HOME/Library/Application Support/intentd"
+  else
+    printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}/intentd"
+  fi
+}
+
+# Is this pid a live process? `kill -0` sends no signal and only asks whether
+# the pid can be signalled; it fails with EPERM on another user's process,
+# which still proves the process exists, so fall back to `ps -p` (POSIX, and
+# owner-blind). Mirrors the daemon's own pid_is_alive, which counts EPERM as
+# alive.
+pid_is_alive() {
+  kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1
+}
+
+# Print the pid of the live daemon that owns <data_dir>, or nothing at all.
+#
+# `<data_dir>/intentd.pid` names the owner, and only a live owner counts: a
+# missing, unreadable or malformed pidfile — and the stale pidfile a crash or a
+# hard reboot leaves behind — all mean "not owned", exactly as the daemon
+# itself reads them (it deletes a stale pidfile and starts).
+#
+# "Malformed" has to mean the same thing on both sides, so this mirrors the
+# daemon's read_pid (crates/intentd/src/main.rs) literally: the *whole* file,
+# trimmed of surrounding whitespace, parsed as a u32. Reading just the first
+# line, or deleting whitespace from anywhere in the file, would find an owner
+# where the daemon finds none — `123\nnot-a-pid` and `1 23` are both malformed
+# to it, not pid 123 — and an unrelated live pid would then abort a legitimate
+# install with nothing the user could do about it. A false "not owned" only
+# costs the crash-loop this check is a shortcut around, so where the two
+# cannot agree, err that way:
+#
+#   * leading `+` is accepted, as u32::from_str accepts it;
+#   * leading zeros are stripped, so the pid probed here is the number the
+#     daemon read and never what a `kill` reading octal would make of it;
+#   * pid 0 is refused outright — `kill -0 0` probes our own process group, so
+#     it would look alive whatever wrote it, and no daemon ever writes it;
+#   * `.trim()` also strips non-ASCII whitespace, which `[:space:]` in the C
+#     locale does not; such a pidfile reads as unowned here.
+data_dir_owner_pid() {
+  pid_file="$1/intentd.pid"
+  [ -r "$pid_file" ] || return 0
+  owner=$(cat "$pid_file" 2>/dev/null) || owner=""
+  # Trim surrounding whitespace only: any left inside is what makes the file
+  # unparseable for the daemon, and must stay visible to the digit check.
+  owner=${owner#"${owner%%[![:space:]]*}"}
+  owner=${owner%"${owner##*[![:space:]]}"}
+  case "$owner" in
+    +*) owner=${owner#+} ;;
+  esac
+  case "$owner" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  while :; do
+    case "$owner" in
+      0?*) owner=${owner#0} ;;
+      *) break ;;
+    esac
+  done
+  # Past u32 the daemon's own parse fails; the length guard keeps the numeric
+  # comparison itself inside what a shell can represent.
+  [ "${#owner}" -le 10 ] || return 0
+  [ "$owner" -le 4294967295 ] || return 0
+  [ "$owner" != 0 ] || return 0
+  pid_is_alive "$owner" || return 0
+  printf '%s' "$owner"
+}
+
+# Best-effort executable path for a pid, so a refusal names the program holding
+# the data dir (a desktop app's bundled daemon, a brew service, a stray
+# `intentd serve` in another terminal) instead of a bare number — which is also
+# what makes the rare recycled-pid case visible to the reader. Empty when it
+# cannot be determined; never fatal.
+process_path() {
+  if [ -r "/proc/$1/exe" ]; then
+    # Linux: `ps -o comm=` reports the command name, sometimes truncated; the
+    # exe link is the real path.
+    readlink "/proc/$1/exe" 2>/dev/null || true
+  else
+    ps -o comm= -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true
+  fi
+}
+
+# Refuse to register a service against a data dir a live daemon already owns.
+#
+# The daemon holds an exclusive lock on its data dir for as long as it runs and
+# refuses to start when it cannot take it ("intentd data dir ... is locked by
+# another running instance"), so a second service on the same dir never serves
+# anything — it crash-loops until the sitter gives up, while the daemon it is
+# fighting is usually the one the user wants to keep.
+#
+# Decidable instantly and without guessing: either a live process holds the dir
+# or it does not. Callers run this before anything about a service is written,
+# so a refusal leaves no unit, plist or enabled service behind.
+check_data_dir_not_owned() {
+  data_dir=$(resolve_data_dir)
+  owner_pid=$(data_dir_owner_pid "$data_dir")
+  [ -n "$owner_pid" ] || return 0
+  owner_path=$(process_path "$owner_pid")
+  owner_desc="pid $owner_pid"
+  [ -z "$owner_path" ] || owner_desc="pid $owner_pid ($owner_path)"
+  fail "an intentd daemon is already running and owns the data dir this service would use:
+  data dir: $data_dir
+  owner:    $owner_desc
+A daemon locks its data dir for as long as it runs, so a second service on the same dir cannot start — it would only crash-loop. Nothing has been registered.
+Pick one:
+  * keep the daemon that is already running — it serves this data dir now:
+      $install_dir/intentd status
+  * stop it first (quit the app that started it, or stop its service), then re-run this installer
+  * give this service its own data dir, separate from the running daemon's:
+      INTENTD_DATA_DIR=\"\$HOME/.intentd-service\" INTENTD_INSTALL_SERVICE=1 <re-run this installer>
+  * install just the binary, with no service: re-run with INTENTD_INSTALL_SERVICE=0"
+}
+
 setup_service_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
@@ -121,10 +519,12 @@ setup_service_linux() {
   unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir" || fail "cannot create $unit_dir"
   # Carry a custom data dir into the service so it serves the same data dir
-  # the install-time CLI used.
+  # the install-time CLI used — resolved, so a relative override names the same
+  # dir the ownership check tested and not whatever the unit's own working
+  # directory happens to be.
   env_line=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
-    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$INTENTD_DATA_DIR")\""
+    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$(resolve_data_dir)")\""
   fi
   # Same unit the .deb ships (packaging/deb/intentd.service), pointed at the
   # installed binary. ExecStart/ExecStop are quoted: install dirs can contain
@@ -163,6 +563,9 @@ EOF
   systemctl --user daemon-reload
   systemctl --user enable "$unit_name.service" 2>/dev/null \
     || warn "systemctl --user enable $unit_name failed — the service will not start at login"
+  # Log boundary before the start: a failure during the restart itself must
+  # land inside the window verify_daemon quotes.
+  note_log_start
   # restart, not start: a re-run replaces the binary and must pick it up.
   systemctl --user restart "$unit_name.service" \
     || fail "systemctl --user restart $unit_name failed — inspect with: systemctl --user status $unit_name"
@@ -178,8 +581,11 @@ EOF
     fi
   fi
 
-  verify_daemon
-  apply_auto_resume
+  # apply_auto_resume only when the daemon actually answered: an undecided
+  # wait already told the user how to apply the setting themselves.
+  if verify_daemon; then
+    apply_auto_resume
+  fi
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
   info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
@@ -193,13 +599,15 @@ setup_service_macos() {
   xml_bin=$(xml_escape "$install_dir/intentd")
   xml_home=$(xml_escape "$HOME")
   # Carry a custom data dir into the service so it serves the same data dir
-  # the install-time CLI used.
+  # the install-time CLI used — resolved, so a relative override names the same
+  # dir the ownership check tested and not whatever working directory launchd
+  # gives the agent.
   env_block=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
     env_block="	<key>EnvironmentVariables</key>
 	<dict>
 		<key>INTENTD_DATA_DIR</key>
-		<string>$(xml_escape "$INTENTD_DATA_DIR")</string>
+		<string>$(xml_escape "$(resolve_data_dir)")</string>
 	</dict>
 "
   fi
@@ -248,12 +656,20 @@ EOF
       waited=$((waited + 1))
     done
   fi
+  # Log boundary after the old agent is fully torn down (its shutdown noise
+  # stays out of the window) but before bootstrap starts the new one, so a
+  # failure during the start itself lands inside the window verify_daemon
+  # quotes.
+  note_log_start
   launchctl bootstrap "gui/$uid" "$plist" \
     || fail "launchctl bootstrap failed for $plist"
   info "LaunchAgent installed and started: $plist"
 
-  verify_daemon
-  apply_auto_resume
+  # apply_auto_resume only when the daemon actually answered: an undecided
+  # wait already told the user how to apply the setting themselves.
+  if verify_daemon; then
+    apply_auto_resume
+  fi
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
   info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
@@ -261,6 +677,7 @@ EOF
 main() {
   service_arg=""
   auto_resume_arg=""
+  channel_arg=""
   for arg in "$@"; do
     case "$arg" in
       --service) service_arg="yes" ;;
@@ -269,7 +686,11 @@ main() {
         auto_resume_arg=$(normalize_auto_resume "${arg#--auto-resume=}")
         validate_auto_resume "$auto_resume_arg"
         ;;
-      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off)" ;;
+      --channel=*)
+        channel_arg=$(normalize_channel "${arg#--channel=}")
+        validate_channel "$channel_arg"
+        ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha)" ;;
     esac
   done
   # Validated before any download so garbage fails fast, interactive or not.
@@ -277,6 +698,26 @@ main() {
   if [ -n "${INTENTD_AUTO_RESUME:-}" ]; then
     auto_resume_env=$(normalize_auto_resume "$INTENTD_AUTO_RESUME")
     validate_auto_resume "$auto_resume_env"
+  fi
+  # Channel choice: flag beats the env var, same precedence as auto-resume.
+  # Empty means "not asked for" — no pin is written and the sitter's own
+  # stable default applies, so a re-install never clobbers a hand-set pin.
+  channel="$channel_arg"
+  if [ -z "$channel" ]; then
+    if [ -n "${INTENTD_CHANNEL:-}" ]; then
+      channel=$(normalize_channel "$INTENTD_CHANNEL")
+      validate_channel "$channel"
+    fi
+  fi
+  # Every intentd call below inherits this environment. The current sitter
+  # parses INTENTD_CHANNEL case-insensitively (and lets the flag lose to it
+  # only when no flag is given), but re-exporting the normalized, effective
+  # value stays as defense in depth: it keeps a `--channel` flag from being
+  # undercut by a stale env var, and protects sitters that predate the
+  # case-insensitive parse from rejecting their own environment.
+  if [ -n "$channel" ]; then
+    INTENTD_CHANNEL="$channel"
+    export INTENTD_CHANNEL
   fi
 
   os=$(uname -s)
@@ -288,6 +729,15 @@ main() {
   powershell -c \"irm $BASE_URL/install.ps1 | iex\"" ;;
     *) fail "unsupported operating system '$os' (supported: Linux, Darwin/macOS)" ;;
   esac
+
+  # Anchor a relative override once, here, so every `intentd` invoked below
+  # inherits the same absolute dir the ownership check tests and the
+  # unit/plist carries. resolve_data_dir is idempotent, so this only ever
+  # rewrites the relative case.
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    INTENTD_DATA_DIR=$(resolve_data_dir)
+    export INTENTD_DATA_DIR
+  fi
 
   arch=$(uname -m)
   case "$arch" in
@@ -374,18 +824,19 @@ main() {
     || fail "cannot install to $install_dir/intentd"
   staged=""
 
-  version=$("$install_dir/intentd" --sitter-version 2>/dev/null) || version=""
-  if [ -n "$version" ]; then
-    info "installed $version to $install_dir/intentd"
-  else
-    info "installed intentd to $install_dir/intentd"
-  fi
+  report_installed_version
 
   case ":$PATH:" in
     *":$install_dir:"*) ;;
     *) warn "$install_dir is not on your PATH — add it, e.g.:
   export PATH=\"$install_dir:\$PATH\"" ;;
   esac
+
+  # Before the service decision: a manual `intentd serve` should honour the
+  # requested channel just as the service does.
+  if [ -n "$channel" ]; then
+    pin_channel
+  fi
 
   # Service setup decision: flags beat the env var beats the prompt. The
   # prompt talks to /dev/tty because `curl | sh` occupies stdin; when no
@@ -415,6 +866,10 @@ main() {
   fi
 
   if [ "$service_mode" = "yes" ]; then
+    # Before anything is asked or written: a data dir a live daemon already
+    # owns cannot host a second service, so refuse now rather than register a
+    # service that can only crash-loop.
+    check_data_dir_not_owned
     # Auto-resume choice: flag beats the env var beats the prompt (both were
     # lowercased + validated above). Same /dev/tty pattern as the service
     # prompt; `auto` — or no terminal — is the daemon default and writes
@@ -428,18 +883,28 @@ main() {
     fi
     if [ -z "$auto_resume" ]; then
       if (exec </dev/tty) 2>/dev/null; then
-        printf 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto) ' >/dev/tty
-        reply=""
-        read -r reply </dev/tty || reply=""
-        case "$reply" in
-          [Oo][Nn]) auto_resume="on" ;;
-          [Oo][Ff][Ff]) auto_resume="off" ;;
-          '' | [Aa][Uu][Tt][Oo]) auto_resume="auto" ;;
-          *)
-            warn "unrecognized answer '$reply' — keeping the default (auto)"
-            auto_resume="auto"
-            ;;
-        esac
+        # Ask again on an answer we genuinely cannot read, rather than
+        # silently installing the default the answer may have been rejecting.
+        # Bounded, and an empty answer (including EOF, which read reports by
+        # leaving reply empty) still takes the default, so a scripted or
+        # garbage-fed terminal cannot hold the install open.
+        auto_resume_tries=0
+        while [ -z "$auto_resume" ] && [ "$auto_resume_tries" -lt 3 ]; do
+          auto_resume_tries=$((auto_resume_tries + 1))
+          printf 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto) ' >/dev/tty
+          reply=""
+          read -r reply </dev/tty || reply=""
+          case "$(normalize_auto_resume "$reply")" in
+            '' | auto) auto_resume="auto" ;;
+            on) auto_resume="on" ;;
+            off) auto_resume="off" ;;
+            *) warn "unrecognized answer '$reply' — answer auto, on, or off (yes/no also work)" ;;
+          esac
+        done
+        if [ -z "$auto_resume" ]; then
+          warn "still no recognized answer — keeping the default (auto)"
+          auto_resume="auto"
+        fi
       else
         auto_resume="auto"
       fi

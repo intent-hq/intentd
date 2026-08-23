@@ -11,6 +11,10 @@ use crate::Store;
 impl Store {
     /// Upsert the latest attribution snapshot for `note_id`. Replaces any
     /// prior row (attribution is a full snapshot, not a delta).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_note_line_attribution(&self, data: &LineAttributionData) -> Result<()> {
         let attributions_json = serde_json::to_string(&data.attributions).map_err(|e| {
             Error::Internal(format!(
@@ -37,6 +41,10 @@ impl Store {
     /// Load the persisted attribution snapshot for a note, or `None` if never
     /// computed. `workspace_id` scopes the lookup so a cross-workspace note-id
     /// collision surfaces as a miss rather than a cross-workspace leak.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_note_line_attribution(
         &self,
         workspace_id: &WorkspaceId,

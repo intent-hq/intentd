@@ -32,7 +32,7 @@ use crate::shell::{default_shell, scrubbed_env_vars_except, shell_args};
 use crate::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
-const AUTO_RESTART_DELAY: Duration = Duration::from_millis(1000);
+const AUTO_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Max consecutive auto-restarts for a service (mirrors `AUTO_RESTART_MAX_RETRIES`).
 const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 /// A run shorter than this is treated as a config error — do not auto-restart.
@@ -289,7 +289,7 @@ impl ScriptManager {
             },
         );
         publish_event(
-            &self.bus,
+            self.bus.as_ref(),
             script_event(
                 &workspace_id,
                 SCRIPT_CHANGED,
@@ -504,7 +504,7 @@ impl ScriptManager {
         }
         self.store.remove_script(script_id).await?;
         publish_event(
-            &self.bus,
+            self.bus.as_ref(),
             script_event(
                 workspace_id,
                 SCRIPT_CHANGED,
@@ -540,7 +540,7 @@ impl ScriptManager {
         script_id: &str,
         max_lines: Option<i64>,
         paginate: bool,
-        page_token: Option<String>,
+        page_token: Option<&String>,
     ) -> Result<Value> {
         let pty_id = {
             let guard = self.scripts.lock().unwrap();
@@ -560,7 +560,7 @@ impl ScriptManager {
             return Ok(crate::pagination::paginate_text_lines(
                 &buffer,
                 max_lines,
-                page_token.as_deref(),
+                page_token.map(std::string::String::as_str),
             ));
         }
         let line_count = clamp_line_count(max_lines, 100);
@@ -855,7 +855,7 @@ impl ScriptManager {
                 return Err(e);
             }
         };
-        let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
+        let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
             Ok(id) => id,
             Err(e) => {
                 reservation.armed = false;
@@ -885,21 +885,20 @@ impl ScriptManager {
                 mgr.pty.kill(pty_id).await;
                 return (None, false);
             }
-            let timed_out = match timeout_seconds.filter(|s| *s > 0) {
-                Some(s) => {
-                    let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
-                    match tokio::time::timeout(Duration::from_secs(s as u64), fut).await {
-                        Ok(_) => false,
-                        Err(_) => {
-                            mgr.pty.kill(pty_id).await;
-                            true
-                        }
-                    }
-                }
-                None => {
-                    mgr.run_one(&ws_task, &sid, pty_id, false).await;
+            let timed_out = if let Some(s) = timeout_seconds.filter(|s| *s > 0) {
+                let fut = mgr.run_one(&ws_task, &sid, pty_id, false);
+                if tokio::time::timeout(Duration::from_secs(s.cast_unsigned()), fut)
+                    .await
+                    .is_ok()
+                {
                     false
+                } else {
+                    mgr.pty.kill(pty_id).await;
+                    true
                 }
+            } else {
+                mgr.run_one(&ws_task, &sid, pty_id, false).await;
+                false
             };
             // Group-keyed liveness (monorepo#1300): before the
             // exit is recorded, reap group members that outlived the shell
@@ -918,10 +917,10 @@ impl ScriptManager {
         let bytes = self.pty.scrollback(pty_id).unwrap_or_default();
         let mut output = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(n) = max_lines.filter(|n| *n > 0) {
-            output = last_n_lines(&output, n as usize);
+            output = last_n_lines(&output, usize::try_from(n).expect("value fits in usize"));
         }
         Ok(json!({
-            "exitCode": exit.map(|e| e.exit_code as i64),
+            "exitCode": exit.map(|e| i64::from(e.exit_code)),
             "output": output,
             "timedOut": timed_out,
         }))
@@ -948,7 +947,7 @@ impl ScriptManager {
             if let Some(old) = prev.take() {
                 self.pty.kill(old).await;
             }
-            let pty_id = match self.pty.spawn(self.build_spec(&ws, &def, &cwd)) {
+            let pty_id = match self.pty.spawn(Self::build_spec(&ws, &def, cwd.as_ref())) {
                 Ok(id) => id,
                 Err(e) => {
                     self.fail(&ws, &script_id, generation, &e.to_string()).await;
@@ -985,11 +984,11 @@ impl ScriptManager {
             // whole group is gone — the script can never sit `running` (or
             // flip to `exited`) while trapped survivors linger.
             self.pty.reap_group_stragglers(pty_id).await;
-            let (stopped_by_user, restart_count) =
-                match self.mark_exited(&ws, &script_id, generation, exit).await {
-                    Some(v) => v,
-                    None => return,
-                };
+            let Some((stopped_by_user, restart_count)) =
+                self.mark_exited(&ws, &script_id, generation, exit).await
+            else {
+                return;
+            };
             if stopped_by_user || def.mode != ScriptMode::Service {
                 break;
             }
@@ -1051,9 +1050,8 @@ impl ScriptManager {
         pty_id: PtyId,
         detect_url: bool,
     ) -> Option<PtyExit> {
-        let attachment = match self.pty.attach(pty_id) {
-            Ok(a) => a,
-            Err(_) => return self.pty.try_exit(pty_id).ok().flatten(),
+        let Ok(attachment) = self.pty.attach(pty_id) else {
+            return self.pty.try_exit(pty_id).ok().flatten();
         };
         let mut live = attachment.live;
         let mut url_done = !detect_url;
@@ -1074,10 +1072,10 @@ impl ScriptManager {
                             url_done = self.try_detect_url(ws, script_id, &chunk).await;
                         }
                     }
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Lagged(_)) => {},
                     Err(RecvError::Closed) => break,
                 },
-                _ = tokio::time::sleep(EXIT_POLL) => {
+                () = tokio::time::sleep(EXIT_POLL) => {
                     if matches!(self.pty.try_exit(pty_id), Ok(Some(_))) {
                         loop {
                             match live.try_recv() {
@@ -1088,8 +1086,8 @@ impl ScriptManager {
                                             self.try_detect_url(ws, script_id, &chunk).await;
                                     }
                                 }
-                                Err(TryRecvError::Lagged(_)) => continue,
-                                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                                Err(TryRecvError::Lagged(_)) => {},
+                                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                             }
                         }
                         break;
@@ -1132,7 +1130,7 @@ impl ScriptManager {
     /// `stopped_by_user` flag set concurrently — a `stop`/`stop_all` landing
     /// between the supervisor's post-backoff stopped check and this
     /// registration (monorepo#1526) — also refuses: the stop keyed its PTY
-    /// kill on the *previous* pty_id, so letting this registration through
+    /// kill on the *previous* `pty_id`, so letting this registration through
     /// would leave the fresh PTY running unstopped. `run()`'s completion path
     /// keeps `false`: its reservation flow owns the stop interaction.
     ///
@@ -1198,7 +1196,7 @@ impl ScriptManager {
                 .get_mut(&(ws.clone(), script_id.to_string()))
                 .filter(|m| m.generation == generation)?;
             m.state.status = ScriptStatus::Exited;
-            m.state.exit_code = exit.as_ref().map(|e| e.exit_code as i64);
+            m.state.exit_code = exit.as_ref().map(|e| i64::from(e.exit_code));
             m.state.stopped_at = Some(now_iso());
             (
                 m.state.clone(),
@@ -1250,7 +1248,7 @@ impl ScriptManager {
     ///
     /// Transient (broadcast-only, never persisted — same path as
     /// `chat:stream:delta` / `terminal:data`): script PTY output is
-    /// high-volume and must not serialize behind a durable SQLite commit per
+    /// high-volume and must not serialize behind a durable `SQLite` commit per
     /// chunk. Scrollback replay reads the PTY host ring buffer via
     /// `script.output`, so nothing consumes persisted `script:output` rows.
     /// All durable `script:state` transitions are emitted on the same
@@ -1260,8 +1258,8 @@ impl ScriptManager {
     fn emit_output(&self, ws: &WorkspaceId, script_id: &str, bytes: &[u8]) {
         let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
         publish_event_transient(
-            &self.bus,
-            script_event(
+            self.bus.as_ref(),
+            &script_event(
                 ws,
                 SCRIPT_OUTPUT,
                 json!({ "scriptId": script_id, "chunk": chunk }),
@@ -1276,7 +1274,7 @@ impl ScriptManager {
         if let Value::Object(ref mut map) = data {
             map.insert("scriptId".to_string(), json!(script_id));
         }
-        publish_event(&self.bus, script_event(ws, SCRIPT_STATE, data)).await;
+        publish_event(self.bus.as_ref(), script_event(ws, SCRIPT_STATE, data)).await;
     }
 
     /// Stream a synthetic separator line (e.g. restart notices) as `script:output`.
@@ -1307,14 +1305,14 @@ impl ScriptManager {
     }
 
     /// Build the [`SpawnSpec`] for a run: login shell + `-c command`, workspace
-    /// scope, and the FORCE_COLOR/TERM + enhanced-PATH + script env overlay,
+    /// scope, and the `FORCE_COLOR/TERM` + enhanced-PATH + script env overlay,
     /// with an inherited `npm_config_prefix` scrubbed so nvm's login-shell init
     /// succeeds. An explicit script env value is preserved.
-    fn build_spec(&self, ws: &WorkspaceId, def: &Script, cwd: &Option<PathBuf>) -> SpawnSpec {
+    fn build_spec(ws: &WorkspaceId, def: &Script, cwd: Option<&PathBuf>) -> SpawnSpec {
         let shell = default_shell();
         let mut spec = SpawnSpec::new(ws.as_str(), shell.clone());
         spec.args = shell_args(&shell, &def.command);
-        spec.cwd = cwd.clone();
+        spec.cwd = cwd.cloned();
         spec.env = spawn_env_overlay(def.env.as_ref());
         spec.env_remove = scrubbed_env_vars_except(&spec.env);
         spec.listed = false;
@@ -1322,7 +1320,7 @@ impl ScriptManager {
     }
 }
 
-/// Build the env overlay for a spawned script/agent shell: FORCE_COLOR/TERM, an
+/// Build the env overlay for a spawned script/agent shell: `FORCE_COLOR/TERM`, an
 /// enhanced PATH (essential system dirs + homebrew + node/version-manager dirs),
 /// then the script's own `env` last so it can override. The enhanced PATH keeps
 /// git/node resolvable even when the daemon inherited a sparse Finder/launchd
@@ -1361,7 +1359,12 @@ fn enhanced_shell_path() -> Option<String> {
 /// Clamp a caller-supplied `maxLines` to a sane positive count (mirrors
 /// `clampLineCount`): use `fallback` when absent, then bound to `1..=10_000`.
 fn clamp_line_count(max_lines: Option<i64>, fallback: usize) -> usize {
-    max_lines.unwrap_or(fallback as i64).clamp(1, 10_000) as usize
+    usize::try_from(
+        max_lines
+            .unwrap_or(i64::try_from(fallback).expect("value fits in i64"))
+            .clamp(1, 10_000),
+    )
+    .expect("value fits in usize")
 }
 
 /// The trailing `n` newline-delimited lines of `text` (mirrors `getLastText`).
@@ -1461,7 +1464,7 @@ fn match_local_url(rest: &str) -> Option<String> {
     let after_colon = after_scheme[host.len()..].strip_prefix(':')?;
     let digits: String = after_colon
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect();
     if digits.is_empty() {
         return None;
@@ -2086,7 +2089,7 @@ mod tests {
         let listed = h.services.script_list(h.ws.clone()).await.expect("list");
         let scripts = listed["scripts"].as_array().expect("scripts array");
         let mut names: Vec<&str> = scripts.iter().filter_map(|s| s["name"].as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["a", "b"], "workspace-scoped");
     }
 
@@ -2453,14 +2456,14 @@ mod tests {
                 break;
             }
             match tokio::time::timeout(remaining, sub.recv()).await {
-                Err(_) => break,
-                Ok(None) => break,
+                Err(_) | Ok(None) => break,
                 Ok(Some(batch)) => {
                     for ev in &batch {
                         let v = serde_json::to_value(ev).expect("serialize");
-                        if v["type"] == "script:state" && v["data"]["status"] == "running" {
-                            panic!("redundant start re-emitted `running`: {v}");
-                        }
+                        assert!(
+                            !(v["type"] == "script:state" && v["data"]["status"] == "running"),
+                            "redundant start re-emitted `running`: {v}"
+                        );
                     }
                 }
             }
@@ -3221,7 +3224,12 @@ mod tests {
         // only has to outlast a login-shell spawn stall under parallel load.
         let out = h
             .services
-            .script_run(h.ws.clone(), id, Some(2), Some(LIVENESS.as_secs() as i64))
+            .script_run(
+                h.ws.clone(),
+                id,
+                Some(2),
+                Some(LIVENESS.as_secs().cast_signed()),
+            )
             .await
             .expect("run");
         let text = out["output"].as_str().unwrap_or("");
@@ -3239,7 +3247,7 @@ mod tests {
                 h.ws.clone(),
                 id.clone(),
                 None,
-                Some(LIVENESS.as_secs() as i64),
+                Some(LIVENESS.as_secs().cast_signed()),
             )
             .await
             .expect("run");
@@ -3267,7 +3275,7 @@ mod tests {
                 h.ws.clone(),
                 id.clone(),
                 None,
-                Some(LIVENESS.as_secs() as i64),
+                Some(LIVENESS.as_secs().cast_signed()),
             )
             .await
             .expect("run");

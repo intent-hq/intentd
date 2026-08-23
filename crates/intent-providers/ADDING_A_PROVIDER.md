@@ -49,9 +49,14 @@ needs. Fields that matter most:
   ACP `session/new` / `session/load` (claude-code, codex, droid, grok). See §3c.
 - **`model_flag`** — CLI model selection (auggie/droid: `--model`). Providers that select
   models post-session via `session/set_model` (grok) set `supports_set_model: true` and no
-  flag; see `AgentManager::maybe_apply_session_model`
-  (`crates/intent-services/src/agent_manager.rs`). codex takes `-c model=…` config
-  overrides instead — `apply_codex_config_args` (`crates/intent-providers/src/args.rs`).
+  flag; providers whose adapter exposes the model as a `configOptions[id="model"]` select
+  (claude-code, pi, codex) set `supports_config_option_model: true` instead; see
+  `AgentManager::maybe_apply_session_model`
+  (`crates/intent-services/src/agent_manager.rs`). codex also emits `-c model=…` config
+  overrides for the native binary path — `apply_codex_config_args`
+  (`crates/intent-providers/src/args.rs`) — and sets
+  `config_option_model_strips_effort: true` so a `{base}/{effort}` id is stripped to its
+  base before it is sent as the config-option value.
 - **`remove_tool_flag`** — CLI-side tool stripping (auggie: `--remove-tool`), used for
   subagent denial (§6). `None` means spawn-time restrictions are silently dropped for
   this provider and only the MCP-side denylist applies.
@@ -94,7 +99,7 @@ intentd assembles one effective system prompt per agent (`assemble_system_prompt
 | Mechanism | Providers | Wiring |
 |---|---|---|
 | `RulesFileFlag` | auggie (`--rules`), droid (`--append-system-prompt-file`) | `create_agent` writes a temp rules file; `build_provider_args` (`crates/intent-providers/src/args.rs`) appends `rules_flag` + path, gated on `supports_rules_file`. |
-| `SessionMeta` | claude-code | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta` sent on `session/new` **and** `session/load` (and the recreate path): claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": … } }`. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
+| `SessionMeta` | claude-code (system prompt), codex (session title only) | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta`: claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>" }` (a string `systemPrompt` fully replaces the claude_code preset prompt — at adapter 0.66.0 the string is passed to the SDK as-is and treated as a custom prompt, so the model sees only our assembled instructions), sent on `session/new` **and** `session/load` (and the recreate path); codex `{ "sessionTitle": "<agent name>" }`, sent on `session/new` only (create + recreate; never on `session/load` — monorepo#3151), while its system prompt still travels via `FirstTurnPrepend` below. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
 | `EnvConfig` | opencode | `build_provider_env` (`crates/intent-providers/src/args.rs`) emits `OPENCODE_CONFIG_CONTENT` with an `instructions: [<rules file path>]` key (plus `model`, `permission`, `mcp` — see §3b and §6). |
 | `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
 | `None` | — | Provider gets no system prompt. Avoid if at all possible. |

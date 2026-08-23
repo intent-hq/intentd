@@ -61,8 +61,9 @@ pub(crate) fn parse_max_terms_setting(raw: Option<&str>) -> usize {
         Some(s) => serde_json::from_str::<serde_json::Value>(s)
             .ok()
             .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(DEFAULT_MAX_TERMS),
+            .map_or(DEFAULT_MAX_TERMS, |n| {
+                usize::try_from(n).expect("value fits in usize")
+            }),
     }
 }
 
@@ -85,12 +86,13 @@ pub(crate) async fn resolve_max_terms(store: &Store) -> usize {
 /// (the settings service returns numbers as JSON floats): a non-negative
 /// finite number is truncated and honored (`0` disables derivation); absent
 /// or malformed degrades to [`DEFAULT_MAX_TERMS`] — never an error.
+// Guarded finite + non-negative; the float→int cast saturates at usize::MAX.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn parse_max_terms_value(value: Option<&serde_json::Value>) -> usize {
     value
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .filter(|n| n.is_finite() && *n >= 0.0)
-        .map(|n| n as usize)
-        .unwrap_or(DEFAULT_MAX_TERMS)
+        .map_or(DEFAULT_MAX_TERMS, |n| n as usize)
 }
 
 /// One stat-probed candidate source file (exists, regular file, within the
@@ -223,7 +225,7 @@ fn child_dirs(dir: &Path) -> Vec<PathBuf> {
     };
     let mut names: Vec<String> = entries
         .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| !n.starts_with('.') && !SKIP_DIRS.contains(&n.as_str()))
         .collect();

@@ -60,15 +60,21 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid } — when MOCK_AGENT_SESSION_LOG points at a file.
-// Lets e2e tests assert exactly which session ids the daemon offered to which
-// child process (e.g. that a cross-provider switch never issues session/load
-// with the old provider's id — monorepo#907).
-function logSessionCall(method, sessionId) {
+// { method, sessionId, pid, meta } — when MOCK_AGENT_SESSION_LOG points at a
+// file. Lets e2e tests assert exactly which session ids the daemon offered to
+// which child process (e.g. that a cross-provider switch never issues
+// session/load with the old provider's id — monorepo#907). `meta` carries the
+// request's `_meta` verbatim (null when absent) so tests can assert the exact
+// provider-specific payload on the wire (e.g. codex `sessionTitle`,
+// monorepo#3151).
+function logSessionCall(method, sessionId, meta) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
-    fs.appendFileSync(path, JSON.stringify({ method, sessionId, pid: process.pid }) + '\n');
+    fs.appendFileSync(
+      path,
+      JSON.stringify({ method, sessionId, pid: process.pid, meta: meta ?? null }) + '\n'
+    );
   } catch (err) {
     log(`session log write failed: ${err.message}`);
   }
@@ -471,6 +477,44 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
+  // Wedged-transport e2e (intent-hq/monorepo#3039): stream one chunk (so the
+  // turn is live), STOP draining stdin, then fire `requestCount` (default
+  // 2000) fs/read_text_file requests WITHOUT awaiting their responses. The
+  // daemon's serve loop answers every one; with nothing reading this
+  // process's stdin the OS pipe fills, the daemon's writer task blocks
+  // mid-write, and its bounded writer channel saturates — the incident's
+  // exact wedge. The prompt never resolves and no session/cancel can ever be
+  // delivered; only a hard child teardown settles the turn. The default read
+  // path is outside any sandbox so each response is a deterministic
+  // small error frame regardless of the spawn cwd.
+  if (behavior.wedgeTransport && promptCount === 1) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'streaming-before-wedge\n' },
+      },
+    });
+    const count = Number.isFinite(behavior.wedgeTransport.requestCount)
+      ? behavior.wedgeTransport.requestCount
+      : 2000;
+    log(`wedging transport: pausing stdin, firing ${count} unawaited fs reads`);
+    process.stdin.pause();
+    // Pausing stdin unrefs its handle; once stdout flushes, node would exit
+    // (closing stdout → a plain transport-closed, NOT the wedge). Keep the
+    // event loop alive so the process sits wedged until the daemon kills it.
+    setInterval(() => {}, 1000);
+    for (let i = 0; i < count; i++) {
+      send({
+        jsonrpc: '2.0',
+        id: nextClientCallId++,
+        method: 'fs/read_text_file',
+        params: { sessionId: SESSION_ID, path: '/outside/any/sandbox/wedge-3039' },
+      });
+    }
+    pendingPromptIds.push(id);
+    return;
+  }
   // Idle-timeout warn-and-continue e2e: the first N turns go COMPLETELY silent
   // — no session/update at all — and park until `session/cancel` resolves them
   // (stopReason `cancelled`), modelling an agent whose turn hangs without any
@@ -805,7 +849,7 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
-      logSessionCall('session/new', SESSION_ID);
+      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions() });
     }
     case 'session/load':
@@ -814,7 +858,7 @@ async function dispatch(msg) {
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
-      logSessionCall('session/load', msg.params && msg.params.sessionId);
+      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta);
       // With `loadSession: true` behavior, accept ANY session id — including a
       // foreign one — modelling the worst-case provider monorepo#907 guards
       // against. With `advertiseLoadSession`, accept the resume (all
@@ -832,6 +876,33 @@ async function dispatch(msg) {
     case 'session/set_mode':
       // Accept any mode change request (no-op for the mock).
       return result(msg.id, {});
+    case 'session/set_model': {
+      // Post-session model application for set_model providers (grok-like).
+      // Record the exact wire params — one JSON line per call
+      // ({ sessionId, modelId }) — when MOCK_AGENT_CONFIG_LOG points at a
+      // file, so e2e tests can assert the daemon issued the call with the
+      // stored model. The daemon only checks for success; an empty result
+      // suffices.
+      const setModelLog = process.env.MOCK_AGENT_CONFIG_LOG;
+      if (setModelLog) {
+        try {
+          fs.appendFileSync(setModelLog, JSON.stringify(msg.params || {}) + '\n');
+        } catch (err) {
+          log(`config log write failed: ${err.message}`);
+        }
+      }
+      // Deterministic failure mode: reject the call (unknown model id) so
+      // tests can assert the daemon logs a warning and the turn still
+      // completes on the provider's default model.
+      if (behavior.rejectSetModel) {
+        return send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32602, message: 'unknown model id' },
+        });
+      }
+      return result(msg.id, {});
+    }
     case 'session/set_config_option': {
       // Post-session model application for config-option-model providers
       // (claude-code-like). Record the exact wire params — one JSON line per
@@ -956,6 +1027,9 @@ if (treePidFile) {
 // waking the child on its own (compaction notice, background task output):
 // the daemon must stream the burst as an implicit agent-initiated turn.
 // One-shot per process; the test controls timing by creating the file.
+// The literal token `<NEWLINE_ONLY>` on a line emits one chunk whose text is
+// a bare "\n" (the monorepo#3262 incident shape — a whitespace-only wake
+// response); plain whitespace-only lines stay filtered as before.
 const wakeTriggerFile = process.env.MOCK_AGENT_WAKE_TRIGGER_FILE;
 if (wakeTriggerFile) {
   const poll = setInterval(() => {
@@ -970,7 +1044,8 @@ if (wakeTriggerFile) {
     }
     clearInterval(poll);
     log(`wake trigger fired: emitting ${lines.length} unsolicited chunk(s)`);
-    for (const text of lines) {
+    for (const line of lines) {
+      const text = line === '<NEWLINE_ONLY>' ? '\n' : line;
       note('session/update', {
         sessionId: SESSION_ID,
         update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },

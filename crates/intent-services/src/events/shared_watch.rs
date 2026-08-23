@@ -1,4 +1,4 @@
-//! Shared FSEvents streams + in-process demux.
+//! Shared `FSEvents` streams + in-process demux.
 //!
 //! Every watcher family used to own its own `notify` watcher, and each
 //! `RecommendedWatcher` is one OS-level stream (on macOS: one
@@ -256,8 +256,7 @@ impl SharedWatchHub {
         };
         let group_key = root
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.clone());
+            .map_or_else(|| root.clone(), Path::to_path_buf);
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut state = match self.state.lock() {
@@ -444,7 +443,7 @@ fn spawn_registrar(sinks: Arc<Mutex<Vec<Sink>>>, group: PathBuf) -> std::sync::m
 /// is the whole contract that keeps demuxed workspaces isolated.
 ///
 /// The cheap `starts_with` pass runs first and is the only one needed in
-/// practice: the roots are canonicalized at subscribe time and FSEvents reports
+/// practice: the roots are canonicalized at subscribe time and `FSEvents` reports
 /// canonical paths. Resolution (a symlinked root, or a deleted path that cannot
 /// be canonicalized directly) is attempted only for the paths that no sink
 /// matched raw, so a busy stream costs no filesystem syscalls per event. Doing
@@ -636,7 +635,7 @@ mod tests {
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(event)) if event.paths.iter().any(|p| p == &want) => return Some(event),
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {}
                 _ => return None,
             }
         }
@@ -650,7 +649,7 @@ mod tests {
     async fn sibling_roots_share_one_stream_and_stay_isolated() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parent = TempDir::new("siblings");
         let a = parent.path.join("ws-a");
         let b = parent.path.join("ws-b");
@@ -729,7 +728,7 @@ mod tests {
     async fn dropping_the_last_subscription_retires_the_stream() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parent = TempDir::new("retire");
         let root = parent.path.join("ws");
         std::fs::create_dir_all(&root).expect("mk ws");

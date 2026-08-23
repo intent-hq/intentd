@@ -41,7 +41,7 @@ fn free_port() -> u16 {
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
-    /// If false, skip data_dir cleanup in Drop (for tests that reuse the same data_dir)
+    /// If false, skip `data_dir` cleanup in Drop (for tests that reuse the same `data_dir`)
     cleanup_data_dir: bool,
 }
 
@@ -52,7 +52,7 @@ impl Drop for Daemon {
         if self.cleanup_data_dir {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
             let _ = std::fs::remove_dir_all(&self.data_dir);
         }
@@ -257,7 +257,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -282,9 +282,12 @@ async fn runtime_ws_listener_toggle_over_wss() {
     // Get the actual bound port from system.status (INTENTD_TCP_PORT=0 seam:
     // every listener start binds a fresh OS-assigned ephemeral port)
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let initial_port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let initial_port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -347,9 +350,12 @@ async fn runtime_ws_listener_toggle_over_wss() {
     // (settings-port reuse on re-enable is covered seam-free by
     // runtime_toggled_wss_serves_system_status below).
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let new_port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set after re-enable") as u16;
+    let new_port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set after re-enable"),
+    )
+    .expect("value fits in u16");
 
     // Connect over WSS again and verify RPCs work
     let mut ws2 = connect_ws(new_port, cfg.clone()).await;
@@ -376,6 +382,8 @@ async fn runtime_ws_listener_toggle_over_wss() {
 /// enabled the WSS listener via the UI toggle. Before the fix, the persisted
 /// setting was ignored at boot and the listener stayed down until manual toggle.
 #[tokio::test]
+// Port numbers are far below 2^53: loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let data_dir = temp_data_dir();
     let port_s = free_port().to_string();
@@ -383,7 +391,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 
     // STEP 1: Boot UDS-only, persist server.wsApi.enabled=true
     let child = spawn_serve(&data_dir, "uds", &env);
-    let mut _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
         cleanup_data_dir: false, // Don't cleanup - we'll reuse this data_dir for second boot
@@ -447,9 +455,12 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 
     // Verify system.status shows the WSS listener is running (poll — start is async)
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let first_boot_port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set after enable") as u16;
+    let first_boot_port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set after enable"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")
@@ -497,7 +508,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let exit_deadline = tokio::time::Instant::now() + exit_budget;
     let mut exited = false;
     while tokio::time::Instant::now() < exit_deadline {
-        if matches!(_daemon.child.try_wait(), Ok(Some(_))) {
+        if matches!(daemon.child.try_wait(), Ok(Some(_))) {
             exited = true;
             break;
         }
@@ -508,7 +519,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
         "daemon did not exit within {exit_budget:?} after system.shutdown"
     );
     // Drop the first daemon without cleanup; process already exited
-    drop(_daemon);
+    drop(daemon);
 
     // STEP 3: Boot again UDS-only (same data dir, persisted setting is true)
     let child2 = spawn_serve(&data_dir, "uds", &env);
@@ -523,10 +534,12 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     // (before the fix, port would be null because persisted setting was
     // ignored). Poll — the boot auto-start is async relative to UDS readiness.
     let status2 = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let reboot_port = status2["result"]["port"]
-        .as_u64()
-        .expect("port should be set at reboot with persisted enabled=true")
-        as u16;
+    let reboot_port = u16::try_from(
+        status2["result"]["port"]
+            .as_u64()
+            .expect("port should be set at reboot with persisted enabled=true"),
+    )
+    .expect("value fits in u16");
     assert_eq!(
         reboot_port, first_boot_port,
         "listener should bind the same port after reboot"
@@ -548,9 +561,12 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 
     // Verify server.pairingInfo returns the port (FE uses this for QR code)
     let pairing = uds_rpc(&socket, 5, "server.pairingInfo", json!({})).await;
-    let pairing_port = pairing["result"]["port"]
-        .as_u64()
-        .expect("pairingInfo port should be set") as u16;
+    let pairing_port = u16::try_from(
+        pairing["result"]["port"]
+            .as_u64()
+            .expect("pairingInfo port should be set"),
+    )
+    .expect("value fits in u16");
     assert_eq!(
         pairing_port, reboot_port,
         "pairingInfo port should match system.status port"
@@ -606,9 +622,12 @@ async fn batch_hook_ordering_port_before_enable() {
     // Verify system.status shows the listener bound to the NEW port (poll —
     // the runtime listener start is async)
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set after batch enable") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set after batch enable"),
+    )
+    .expect("value fits in u16");
     assert_eq!(port, new_port, "listener should bind the NEW port");
 
     // Connect over WSS to verify the listener is functional
@@ -647,7 +666,8 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 
     // Get status over UDS to find WSS port + fingerprint
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -767,7 +787,8 @@ async fn wss_system_status_reports_budget_fields_when_installed() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -851,9 +872,12 @@ async fn runtime_toggled_wss_serves_system_status() {
 
     // Verify WSS is now running (poll — the runtime listener start is async)
     let status_after = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let runtime_port = status_after["result"]["port"]
-        .as_u64()
-        .expect("port after toggle") as u16;
+    let runtime_port = u16::try_from(
+        status_after["result"]["port"]
+            .as_u64()
+            .expect("port after toggle"),
+    )
+    .expect("value fits in u16");
     assert_eq!(runtime_port, port, "WSS should bind to configured port");
 
     // Connect over WSS and verify system.status works
@@ -935,9 +959,12 @@ async fn runtime_bind_address_change_restarts_listener() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"]
-        .as_u64()
-        .expect("port should be set at boot") as u16;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint should be set")

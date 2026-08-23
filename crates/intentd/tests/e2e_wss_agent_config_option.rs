@@ -21,6 +21,18 @@
 //! the LIVE session after an `agent.update` change, so it lands before the
 //! next prompt without a respawn.
 //!
+//! It also covers the sibling `session/set_model` path
+//! (`supports_set_model`; grok today): with the mock flipped into that mode
+//! (`MOCK_AGENT_SET_MODEL=1`), the daemon issues
+//! `session/set_model { sessionId, modelId }` once on the fresh session,
+//! with the bare model id.
+//!
+//! codex rides the config-option path with an extra wrinkle
+//! (`config_option_model_strips_effort`): its stored ids may embed a
+//! reasoning effort (`{base}/{effort}`), and the adapter's model select
+//! values are bare base ids, so the daemon strips the suffix before sending.
+//! Covered here with `MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT=1`.
+//!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
 #![cfg(unix)]
@@ -206,7 +218,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -231,7 +243,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -311,7 +323,8 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -403,6 +416,336 @@ async fn stored_model_applied_via_set_config_option_over_wss() {
     );
 }
 
+/// The stored model reaches a `set_model` provider (grok-like) as
+/// `session/set_model { sessionId, modelId }` once per fresh session — with
+/// the bare model id (compound `mock:` prefix stripped) — and is not
+/// re-issued on a second turn over the same live child.
+#[tokio::test]
+async fn stored_model_applied_via_set_model_over_wss() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok" }).to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_SET_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "SetModel E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    // Compound stored model — the daemon strips the `mock:` provider prefix
+    // and sends the bare id.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "SetModel",
+            "model": "mock:grok-4.5",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // Exactly one session/set_model on the fresh session, with the wire
+    // shape { sessionId, modelId } and the bare model id.
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "one set_model after turn 1: {log:?}");
+    assert_eq!(
+        log[0]["modelId"], "grok-4.5",
+        "bare id with the mock: prefix stripped: {:?}",
+        log[0]
+    );
+    assert!(
+        log[0]["sessionId"].is_string(),
+        "sessionId present: {:?}",
+        log[0]
+    );
+
+    // Turn 2 reuses the live session — no re-application.
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second turn" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "second sendMessage ok: {sent2}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    let log = read_config_log(&config_log);
+    assert_eq!(
+        log.len(),
+        1,
+        "no re-issue on a reused live session: {log:?}"
+    );
+}
+
+/// A codex-like config-option-model provider whose stored ids embed a
+/// reasoning effort (`config_option_model_strips_effort`): the daemon strips
+/// the `{base}/{effort}` suffix before sending, because the adapter's
+/// `configOptions[id="model"]` select values are bare base ids (and its
+/// `session/set_model` handler rejects both bare and `/`-compound ids, so
+/// that path is unusable — intent-hq/monorepo#3174).
+#[tokio::test]
+async fn stored_model_effort_suffix_stripped_for_config_option_over_wss() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok" }).to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL_STRIPS_EFFORT", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "StripEffort E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    // Compound stored model with a `{base}/{effort}` suffix — the daemon
+    // strips both the `mock:` provider prefix AND the `/high` effort suffix.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "StripEffort",
+            "model": "mock:gpt-5.3-codex/high",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // Exactly one session/set_config_option { configId: "model" } on the
+    // fresh session, with the BARE BASE id — no effort suffix.
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "one set_config_option after turn 1: {log:?}");
+    assert_eq!(log[0]["configId"], "model", "configId: {:?}", log[0]);
+    assert_eq!(
+        log[0]["value"], "gpt-5.3-codex",
+        "effort suffix stripped from the config-option value: {:?}",
+        log[0]
+    );
+    assert!(
+        log[0]["sessionId"].is_string(),
+        "sessionId present: {:?}",
+        log[0]
+    );
+}
+
+/// A rejected `session/set_model` (e.g. an unknown model id) is best-effort:
+/// the daemon logs a warning, the provider keeps its default model, and the
+/// turn still completes.
+#[tokio::test]
+async fn set_model_failure_does_not_fail_the_turn() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok", "rejectSetModel": true }).to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_SET_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "SetModel Reject E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SetModelReject", "model": "mock:bogus-model" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "turn despite rejection" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    // The turn must still complete (stream:end) even though the provider
+    // rejected the set_model call.
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // The daemon did attempt the call (with the bare stored id) …
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "set_model was attempted: {log:?}");
+    assert_eq!(log[0]["modelId"], "bogus-model", "modelId: {:?}", log[0]);
+
+    // … and the agent is still healthy: transcript has the mock's response.
+    let messages = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let rendered = messages.to_string();
+    assert!(
+        rendered.contains("\"ok\""),
+        "assistant response landed despite the rejected set_model: {rendered}"
+    );
+}
+
 /// A rejected `session/set_config_option` (e.g. an unknown model id) is
 /// best-effort: the daemon logs a warning, the provider keeps its default
 /// model, and the turn still completes.
@@ -432,7 +775,8 @@ async fn set_config_option_failure_does_not_fail_the_turn() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -537,7 +881,8 @@ async fn reasoning_effort_applied_and_reapplied_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -682,7 +1027,8 @@ async fn effort_levels_persisted_and_served_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -801,7 +1147,8 @@ async fn reasoning_effort_is_a_no_op_without_a_thought_level_option() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

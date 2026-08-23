@@ -98,8 +98,7 @@ impl AgentListProjectionCache {
             .lock()
             .unwrap()
             .get(workspace_id)
-            .map(|s| s.epoch)
-            .unwrap_or(0)
+            .map_or(0, |s| s.epoch)
     }
 
     fn lookup(
@@ -122,27 +121,24 @@ impl AgentListProjectionCache {
         projections: HashMap<String, SessionMessageProjection>,
     ) {
         let mut states = self.states.lock().unwrap();
-        match states.get_mut(workspace_id) {
-            Some(state) => {
-                if state.epoch != epoch {
-                    return;
-                }
-                state.projections = Some(projections);
+        if let Some(state) = states.get_mut(workspace_id) {
+            if state.epoch != epoch {
+                return;
             }
-            None => {
-                // No state yet means the workspace was never invalidated, so
-                // only the implicit epoch 0 may publish.
-                if epoch != 0 {
-                    return;
-                }
-                states.insert(
-                    workspace_id.to_string(),
-                    WorkspaceState {
-                        epoch: 0,
-                        projections: Some(projections),
-                    },
-                );
+            state.projections = Some(projections);
+        } else {
+            // No state yet means the workspace was never invalidated, so
+            // only the implicit epoch 0 may publish.
+            if epoch != 0 {
+                return;
             }
+            states.insert(
+                workspace_id.to_string(),
+                WorkspaceState {
+                    epoch: 0,
+                    projections: Some(projections),
+                },
+            );
         }
     }
 

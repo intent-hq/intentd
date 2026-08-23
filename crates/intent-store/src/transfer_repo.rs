@@ -184,36 +184,93 @@ impl Store {
     /// an estimate of the payload carried by an export, not on-disk size.
     /// Read-only. Tables with zero rows are still listed (count 0), so the
     /// manifest shape is stable across workspaces.
+    ///
+    /// Batched to exactly two statements — one `pragma_table_info` join for
+    /// every table's columns, one `UNION ALL` aggregate over all tables — so
+    /// the `workspace.transfer.plan` dispatch stays within the `rpc_profile`
+    /// statement budget instead of issuing 2 statements per table
+    /// (intent-hq/monorepo#2994).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if either aggregate query fails.
     pub async fn transfer_table_stats(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TransferTableStat>> {
-        let mut stats = Vec::with_capacity(TRANSFER_TABLES.len());
-        for (table, predicate) in TRANSFER_TABLES {
-            let columns = self.table_columns(table).await?;
-            let size_expr = if columns.is_empty() {
-                "0".to_string()
-            } else {
-                columns
-                    .iter()
-                    .map(|c| format!("COALESCE(LENGTH(CAST(\"{c}\" AS BLOB)), 0)"))
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            };
-            let sql = format!(
-                "SELECT COUNT(*) AS n, COALESCE(SUM({size_expr}), 0) AS b \
-                 FROM \"{table}\" WHERE {predicate}"
-            );
-            let row = sqlx::query_as::<_, (i64, i64)>(&sql)
-                .bind(&workspace_id.0)
-                .fetch_one(self.read_pool())
-                .await
-                .map_err(|e| Error::Internal(format!("transfer stats for {table} failed: {e}")))?;
-            stats.push(TransferTableStat {
+        // Statement 1: column names of every transfer table, in declaration
+        // order (same source of truth as `table_columns`, one round-trip).
+        // The names are interpolated as single-quoted literals, which relies
+        // on TRANSFER_TABLES entries never containing a quote — a name with
+        // one would silently drop out of the column map and report size 0.
+        debug_assert!(
+            TRANSFER_TABLES.iter().all(|(t, _)| !t.contains('\'')),
+            "TRANSFER_TABLES names must not contain quotes"
+        );
+        let names = TRANSFER_TABLES
+            .iter()
+            .map(|(t, _)| format!("'{t}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let col_rows = sqlx::query_as::<_, (String, String)>(&format!(
+            "SELECT m.name, p.name FROM sqlite_master m \
+             JOIN pragma_table_info(m.name) p \
+             WHERE m.type = 'table' AND m.name IN ({names}) \
+             ORDER BY m.name, p.cid"
+        ))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("transfer stats table_info failed: {e}")))?;
+        let mut columns: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (table, col) in col_rows {
+            columns.entry(table).or_default().push(col);
+        }
+
+        // Statement 2: one aggregate arm per table, UNION ALL'd; `?1` is the
+        // workspace id in every arm's predicate. The literal arm index keys
+        // the merge back into TRANSFER_TABLES order.
+        let sql = TRANSFER_TABLES
+            .iter()
+            .enumerate()
+            .map(|(i, (table, predicate))| {
+                let size_expr = match columns.get(*table) {
+                    Some(cols) if !cols.is_empty() => cols
+                        .iter()
+                        .map(|c| format!("COALESCE(LENGTH(CAST(\"{c}\" AS BLOB)), 0)"))
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                    _ => "0".to_string(),
+                };
+                format!(
+                    "SELECT {i} AS i, COUNT(*) AS n, COALESCE(SUM({size_expr}), 0) AS b \
+                     FROM \"{table}\" WHERE {predicate}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("transfer stats aggregate failed: {e}")))?;
+
+        let mut stats: Vec<TransferTableStat> = TRANSFER_TABLES
+            .iter()
+            .map(|(table, _)| TransferTableStat {
                 name: (*table).to_string(),
-                row_count: row.0,
-                approx_bytes: row.1,
-            });
+                row_count: 0,
+                approx_bytes: 0,
+            })
+            .collect();
+        for (i, n, b) in rows {
+            let Some(stat) = usize::try_from(i).ok().and_then(|i| stats.get_mut(i)) else {
+                return Err(Error::Internal(format!(
+                    "transfer stats aggregate returned unknown arm index {i}"
+                )));
+            };
+            stat.row_count = n;
+            stat.approx_bytes = b;
         }
         Ok(stats)
     }
@@ -230,11 +287,15 @@ impl Store {
     }
 
     /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
-    /// (`column name → value`), in table order. Values map SQLite storage
+    /// (`column name → value`), in table order. Values map `SQLite` storage
     /// classes to JSON: NULL → `null`, INTEGER → number, REAL → number,
     /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
     /// payload the export archive writes to `rows/<table>.jsonl` and
     /// [`Store::transfer_import_rows`] round-trips on the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn transfer_export_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -265,6 +326,10 @@ impl Store {
     /// their children. Every row's keys are validated against the live
     /// schema. Nothing is visible unless the whole batch commits. Returns
     /// the number of rows inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when a row names a table outside the transfer set, is not a JSON object, or carries a key with no matching column; `Error::Internal` if the transaction fails.
     pub async fn transfer_import_rows(
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
@@ -333,7 +398,7 @@ impl Store {
     }
 }
 
-/// Serialize one SQLite row to a JSON object keyed by column name (see
+/// Serialize one `SQLite` row to a JSON object keyed by column name (see
 /// [`Store::transfer_export_rows`] for the storage-class mapping).
 fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json::Value> {
     let mut object = serde_json::Map::with_capacity(row.columns().len());
@@ -367,7 +432,7 @@ fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json:
     Ok(serde_json::Value::Object(object))
 }
 
-/// Bind one exported JSON value back to its SQLite storage class (the inverse
+/// Bind one exported JSON value back to its `SQLite` storage class (the inverse
 /// of [`row_to_json`]).
 fn bind_json_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
@@ -377,7 +442,7 @@ fn bind_json_value<'q>(
 ) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
     Ok(match value {
         serde_json::Value::Null => query.bind(Option::<String>::None),
-        serde_json::Value::Bool(b) => query.bind(*b as i64),
+        serde_json::Value::Bool(b) => query.bind(i64::from(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 query.bind(i)
@@ -438,6 +503,8 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
+// Byte extraction from a 24-bit accumulator: truncation is the point.
+#[allow(clippy::cast_possible_truncation)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -475,6 +542,7 @@ mod tests {
     use super::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
     use crate::Store;
     use intent_core::WorkspaceId;
+    use std::fmt::Write as _;
     use uuid::Uuid;
 
     /// A unique temp DB path cleaned up on drop (mirrors `crate::tests::TempDb`,
@@ -782,7 +850,7 @@ attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_p
             .fetch_all(store.read_pool())
             .await
             .expect("table_info");
-            actual.push_str(&format!("{table}: {}\n", cols.join(", ")));
+            let _ = writeln!(actual, "{table}: {}", cols.join(", "));
         }
         let actual = actual.trim_end();
 

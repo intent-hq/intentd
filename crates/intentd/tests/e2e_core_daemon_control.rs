@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Verify token generation and persistence via AsyncTokenStore.
+/// Verify token generation and persistence via `AsyncTokenStore`.
 #[tokio::test]
 async fn token_generation_and_persistence() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-token-{}", uuid::Uuid::new_v4()));
@@ -18,11 +18,11 @@ async fn token_generation_and_persistence() {
     let secrets_file = tmp_dir.join("secrets.json");
 
     let store_async = {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
         let store = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
         std::env::remove_var("INTENTD_SECRETS_FILE");
-        drop(_guard);
+        drop(guard);
         store
     };
 
@@ -52,11 +52,11 @@ async fn token_rotation_replaces_old() {
     let secrets_file = tmp_dir.join("secrets.json");
 
     let store_async = {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("INTENTD_SECRETS_FILE", &secrets_file);
         let store = AsyncTokenStore::new(Arc::new(FileTokenStore::default()));
         std::env::remove_var("INTENTD_SECRETS_FILE");
-        drop(_guard);
+        drop(guard);
         store
     };
 
@@ -76,17 +76,17 @@ async fn token_rotation_replaces_old() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Verify Config::resolve correctly sets daemon paths.
+/// Verify `Config::resolve` correctly sets daemon paths.
 #[tokio::test]
 async fn config_paths_include_daemon_files() {
     let tmp_dir = std::env::temp_dir().join(format!("intentd-cfg-{}", uuid::Uuid::new_v4()));
 
     let config = {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("INTENTD_DATA_DIR", &tmp_dir);
         let cfg = Config::resolve().expect("resolve config");
         std::env::remove_var("INTENTD_DATA_DIR");
-        drop(_guard);
+        drop(guard);
         cfg
     };
 

@@ -2,9 +2,10 @@
 //!
 //! Ports `gitService.stageFiles` (`git add -- <paths>`): each path is normalized
 //! relative to the worktree and staged. A path that is gone from the worktree
-//! but tracked stages its deletion; a path that matches nothing errors like
-//! `git add`. The CSV/array parse and the `.`/`*`/`--all` rejection are wire
-//! policy and live in `intent-services` (the TS `ws.git.stage` builder).
+//! but tracked stages its deletion. Unmatched or ignored untracked paths are
+//! skipped when another requested path matches, while a fully unmatched batch
+//! errors like `git add`. Unsafe and stage-all paths reject the whole batch
+//! before index mutation.
 
 use std::io::Write;
 use std::path::Path;
@@ -18,6 +19,8 @@ use crate::submodule::{
     ignores_case, is_submodule_path, reject_submodule_internal_paths, submodule_paths,
 };
 
+const STAGE_ALL_MSG: &str = "Staging all files is not allowed. Please specify individual file paths to stage. Use git_status to see which files you have modified, then stage only those specific files.";
+
 /// Stage `paths` (already split and validated) in the worktree. Refuses any
 /// path strictly inside a registered submodule (parity with `git add`'s
 /// "is in submodule" pathspec error) before touching the index, so a caller
@@ -27,23 +30,58 @@ use crate::submodule::{
 /// absolute path (`/repo/sub/a.txt`) is refused exactly like its relative
 /// spelling — it would otherwise slip past the guard and be normalized into
 /// `sub/a.txt` on the way to `index.add_path`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository has no working directory, a pathspec matches no files, or another libgit2 operation fails.
 pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
-    reject_submodule_internal_paths(&repo, paths)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
         .to_path_buf();
-    let mut index = repo.index().map_err(map_git_err)?;
+
+    // Validate the complete batch before loading or changing the index. A
+    // valid path must never turn a prohibited stage-all token or traversal
+    // entry into a partial success.
+    let mut normalized = Vec::with_capacity(paths.len());
     for raw in paths {
-        let rel = normalize_rel(&workdir, raw);
+        if is_stage_all(raw) {
+            return Err(Error::Internal(STAGE_ALL_MSG.to_string()));
+        }
+        let rel = normalize_stage_rel(&workdir, worktree_path, raw);
+        if !is_safe_rel(&workdir, &rel) {
+            return Err(Error::InvalidParams(format!(
+                "Path escapes the worktree: {rel}"
+            )));
+        }
+        normalized.push((raw, rel));
+    }
+    reject_submodule_internal_paths(&repo, paths)?;
+
+    let mut index = repo.index().map_err(map_git_err)?;
+    let mut matched_any = false;
+    let mut first_unmatched = None;
+    for (raw, rel) in normalized {
         let rel_path = Path::new(&rel);
-        if workdir.join(&rel).exists() {
+        let tracked = index.get_path(rel_path, 0).is_some();
+        if workdir.join(&rel).symlink_metadata().is_ok() {
+            if !tracked && repo.status_should_ignore(rel_path).map_err(map_git_err)? {
+                first_unmatched.get_or_insert(raw);
+                continue;
+            }
             index.add_path(rel_path).map_err(map_git_err)?;
-        } else if index.get_path(rel_path, 0).is_some() {
+            matched_any = true;
+        } else if tracked {
             // Tracked but deleted from the worktree → stage the removal.
             index.remove_path(rel_path).map_err(map_git_err)?;
+            matched_any = true;
         } else {
+            first_unmatched.get_or_insert(raw);
+        }
+    }
+    if !matched_any {
+        if let Some(raw) = first_unmatched {
             return Err(Error::Internal(format!(
                 "fatal: pathspec '{raw}' did not match any files"
             )));
@@ -53,11 +91,38 @@ pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn is_stage_all(raw: &str) -> bool {
+    let path = raw.trim();
+    path == "." || path == "*" || path.contains("--all")
+}
+
+fn normalize_stage_rel(workdir: &Path, requested_root: &Path, raw: &str) -> String {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        if let Ok(rel) = path.strip_prefix(workdir) {
+            return drop_curdir(rel);
+        }
+        if let Ok(rel) = path.strip_prefix(requested_root) {
+            return drop_curdir(rel);
+        }
+        if let (Ok(path), Ok(root)) = (path.canonicalize(), workdir.canonicalize()) {
+            if let Ok(rel) = path.strip_prefix(root) {
+                return drop_curdir(rel);
+            }
+        }
+    }
+    normalize_rel(workdir, raw)
+}
+
 /// Unstage `paths` (already split and validated), mirroring `git reset -- <paths>`:
 /// each path's index entry is reset to its `HEAD` version, or removed from the
 /// index when the path is absent from `HEAD` (a newly added file). With no
 /// commit yet (unborn `HEAD`) every path is reset against the empty tree, so a
 /// staged add is dropped from the index.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository has no working directory or another libgit2 operation fails.
 pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let workdir = repo
@@ -116,6 +181,10 @@ pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
 /// it, not the other way round. It stays safe because the index entries under
 /// the `packages/` prefix classify it as tracked, routing it through
 /// `checkout_index`, which leaves the `160000` entry alone.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if a path escapes the worktree; `Error::Internal` if the repository has no working directory, a pathspec matches no files, or another libgit2 operation fails.
 pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     reject_submodule_internal_paths(&repo, paths)?;
@@ -280,8 +349,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
     let p = Path::new(raw);
     if p.is_absolute() {
         p.strip_prefix(workdir)
-            .map(drop_curdir)
-            .unwrap_or_else(|_| drop_curdir(p))
+            .map_or_else(|_| drop_curdir(p), drop_curdir)
     } else {
         drop_curdir(p)
     }
@@ -297,7 +365,7 @@ fn normalize_rel(workdir: &Path, raw: &str) -> String {
 fn drop_curdir(p: &Path) -> String {
     p.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .map(|c| c.as_os_str())
+        .map(std::path::Component::as_os_str)
         .collect::<std::path::PathBuf>()
         .to_string_lossy()
         .to_string()
@@ -312,6 +380,10 @@ fn drop_curdir(p: &Path) -> String {
 /// client cannot slip a multi-file or path-mismatched patch through the
 /// single-file wire contract (`-32602` on mismatch). The patch is streamed on
 /// stdin so no temp file is written.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if the patch targets more than one file or a path other than `file_path`; `Error::Internal` if `git apply` fails even with the three-way fallback.
 pub fn stage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<()> {
     validate_single_file_patch(file_path, patch)?;
     apply_patch_cached(worktree_path, patch, false)
@@ -322,6 +394,10 @@ pub fn stage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<
 /// unstaging the rest of `file_path`. Mirrors `gitService.unstageHunk`; the
 /// direct-then-`--3way` fallback and the single-file header check match
 /// [`stage_hunk`].
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` if the patch targets more than one file or a path other than `file_path`; `Error::Internal` if `git apply` fails even with the three-way fallback.
 pub fn unstage_hunk(worktree_path: &Path, file_path: &str, patch: &str) -> Result<()> {
     validate_single_file_patch(file_path, patch)?;
     apply_patch_cached(worktree_path, patch, true)
@@ -436,6 +512,11 @@ mod tests {
     use crate::testutil::{commit_file, init_repo, write_file};
     use intent_core::GitFileStatus;
 
+    fn index_bytes(worktree: &Path) -> Vec<u8> {
+        let repo = Repository::open(worktree).unwrap();
+        std::fs::read(repo.path().join("index")).unwrap()
+    }
+
     #[test]
     fn stages_a_new_file() {
         let dir = init_repo("stage-new");
@@ -448,6 +529,34 @@ mod tests {
         assert_eq!(f.status, GitFileStatus::Added);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stages_dangling_symlink_with_valid_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = init_repo("stage-dangling-symlink");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "valid.txt", "valid\n");
+        let link = dir.path().join("dangling-link");
+        symlink("missing-target", &link).unwrap();
+        assert!(!link.exists());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+
+        stage(
+            dir.path(),
+            &["valid.txt".to_string(), "dangling-link".to_string()],
+        )
+        .unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(Path::new("valid.txt"), 0).is_some());
+        let link_entry = index
+            .get_path(Path::new("dangling-link"), 0)
+            .expect("dangling symlink is staged");
+        assert_eq!(link_entry.mode, 0o120_000);
+    }
+
     #[test]
     fn stages_a_deletion() {
         let dir = init_repo("stage-del");
@@ -458,6 +567,116 @@ mod tests {
         let f = st.files.iter().find(|f| f.path == "gone.txt").unwrap();
         assert!(f.staged);
         assert_eq!(f.status, GitFileStatus::Deleted);
+    }
+
+    #[test]
+    fn stages_valid_path_when_batch_also_contains_unmatched_path() {
+        let dir = init_repo("stage-mixed-stale");
+        commit_file(dir.path(), "tracked.txt", "one\n");
+        write_file(dir.path(), "tracked.txt", "two\n");
+
+        stage(
+            dir.path(),
+            &["vanished.txt".to_string(), "tracked.txt".to_string()],
+        )
+        .unwrap();
+
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "tracked.txt").unwrap();
+        assert!(f.staged);
+        assert_eq!(f.status, GitFileStatus::Modified);
+        assert!(st.files.iter().all(|f| f.path != "vanished.txt"));
+    }
+
+    #[test]
+    fn stage_rejects_prohibited_batch_before_index_mutation() {
+        for prohibited in [".", "*", "--all", "git add --all"] {
+            let dir = init_repo("stage-prohibited-batch");
+            commit_file(dir.path(), "tracked.txt", "one\n");
+            write_file(dir.path(), "tracked.txt", "two\n");
+            let before = index_bytes(dir.path());
+
+            let err = stage(
+                dir.path(),
+                &["tracked.txt".to_string(), prohibited.to_string()],
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, Error::Internal(_)), "{prohibited}: {err}");
+            assert_eq!(index_bytes(dir.path()), before, "{prohibited}");
+        }
+    }
+
+    #[test]
+    fn stage_rejects_unsafe_batch_before_index_mutation() {
+        for unsafe_path in ["../outside.txt", "dir/../tracked.txt"] {
+            let dir = init_repo("stage-unsafe-batch");
+            commit_file(dir.path(), "tracked.txt", "one\n");
+            write_file(dir.path(), "tracked.txt", "two\n");
+            let before = index_bytes(dir.path());
+
+            let err = stage(
+                dir.path(),
+                &["tracked.txt".to_string(), unsafe_path.to_string()],
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "{unsafe_path}: {err}"
+            );
+            assert_eq!(index_bytes(dir.path()), before, "{unsafe_path}");
+        }
+    }
+
+    #[test]
+    fn stage_skips_ignored_untracked_path_in_valid_batch() {
+        let dir = init_repo("stage-mixed-ignored");
+        commit_file(dir.path(), "tracked.txt", "one\n");
+        commit_file(dir.path(), ".gitignore", "*.log\n");
+        write_file(dir.path(), "tracked.txt", "two\n");
+        write_file(dir.path(), "ignored.log", "ignored\n");
+
+        stage(
+            dir.path(),
+            &["ignored.log".to_string(), "tracked.txt".to_string()],
+        )
+        .unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(index.get_path(Path::new("ignored.log"), 0).is_none());
+        let st = status(dir.path()).unwrap();
+        let tracked = st.files.iter().find(|f| f.path == "tracked.txt").unwrap();
+        assert!(tracked.staged);
+    }
+
+    #[test]
+    fn stage_ignored_only_batch_fails_without_index_mutation() {
+        let dir = init_repo("stage-ignored-only");
+        commit_file(dir.path(), ".gitignore", "*.log\n");
+        write_file(dir.path(), "ignored.log", "ignored\n");
+        let before = index_bytes(dir.path());
+
+        let err = stage(dir.path(), &["ignored.log".to_string()]).unwrap_err();
+
+        assert!(format!("{err}").contains("did not match any files"));
+        assert_eq!(index_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn stage_tracked_file_that_matches_ignore_rule() {
+        let dir = init_repo("stage-tracked-ignored");
+        commit_file(dir.path(), "tracked.log", "one\n");
+        commit_file(dir.path(), ".gitignore", "*.log\n");
+        write_file(dir.path(), "tracked.log", "two\n");
+
+        stage(dir.path(), &["tracked.log".to_string()]).unwrap();
+
+        let st = status(dir.path()).unwrap();
+        let tracked = st.files.iter().find(|f| f.path == "tracked.log").unwrap();
+        assert!(tracked.staged);
+        assert_eq!(tracked.status, GitFileStatus::Modified);
     }
 
     #[test]
@@ -803,7 +1022,7 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = discard(dir.path(), &[".".to_string()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
-        let err = discard(dir.path(), &["".to_string()]).unwrap_err();
+        let err = discard(dir.path(), &[String::new()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
     }
 

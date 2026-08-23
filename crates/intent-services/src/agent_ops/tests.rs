@@ -1,4 +1,4 @@
-//! `agent.*` service tests over a temp SQLite store: the [`AgentLite`]
+//! `agent.*` service tests over a temp `SQLite` store: the [`AgentLite`]
 //! projection (digest/lastResponse), conversation truncation, the queue
 //! lifecycle, send/force semantics, summary, model catalog, and subscriptions.
 
@@ -48,10 +48,28 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".config.toml"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
         }
     }
+}
+
+/// A settings registry (backed by a config file next to the temp db, removed
+/// by [`TempDb`]'s drop) seeding a configured default provider: since
+/// monorepo#3044 there is no positional fallback, so ops that resolve a
+/// provider need `providers.active` set. The `providers.paths` override
+/// points auggie at a deterministic executable so availability checks
+/// (`agent.delegate`) pass without the real binary on the test host.
+pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::SettingsRegistry> {
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[
+            ("providers.active".into(), json!("auggie")),
+            ("providers.paths".into(), json!({ "auggie": "/bin/sh" })),
+        ])
+        .expect("seed default provider");
+    registry
 }
 
 pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
@@ -107,7 +125,8 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    let registry = test_registry_with_default_provider(&tmp);
+    let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 
@@ -129,11 +148,9 @@ async fn setup_with_task_graph(
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
-    if enabled {
-        registry
-            .apply(&[("agentFeatures.taskGraph".into(), json!(true))])
-            .expect("enable taskGraph");
-    }
+    registry
+        .apply(&[("agentFeatures.taskGraph".into(), json!(enabled))])
+        .expect("set taskGraph");
     let services = Services::new(store).with_settings_registry(Arc::clone(&registry));
     (tmp, services, ws, registry, config_dir)
 }
@@ -143,7 +160,8 @@ async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
+    let registry = test_registry_with_default_provider(&tmp);
+    let services = Services::new(store).with_settings_registry(registry);
     let bus = EventBus::new(services.store().clone());
     let services = services.with_event_bus(bus.clone());
     (tmp, services, ws, bus)
@@ -428,7 +446,7 @@ async fn busy_interim_idle_neither_delivers_nor_retires_watch() {
 /// event arrives. The worker-exit redelivery hook
 /// (`redeliver_completion_after_queue_mutation` once the slot is released)
 /// must synthesize the real completion: exactly one wake, watch retired,
-/// open after_all group sealed and settled.
+/// open `after_all` group sealed and settled.
 #[tokio::test]
 async fn busy_misclassified_terminal_idle_heals_on_worker_exit_redelivery() {
     let (_t, svc, ws) = setup().await;
@@ -474,7 +492,7 @@ async fn busy_misclassified_terminal_idle_heals_on_worker_exit_redelivery() {
 }
 
 /// monorepo#1297 heal path (group sealing): a coordinator whose terminal
-/// idle was busy-misclassified still gets its open after_all group sealed
+/// idle was busy-misclassified still gets its open `after_all` group sealed
 /// and settled by the worker-exit redelivery.
 #[tokio::test]
 async fn busy_misclassified_terminal_idle_heal_seals_group() {
@@ -742,7 +760,7 @@ async fn report_delivered_watch_survives_interim_idle_and_retires_at_completion(
 
 /// Grouped watches are exempt from the interim-idle gate: a grouped child's
 /// idle with a pending queue still records its group completion (settlement
-/// accounting must see every completion or an after_all batch can hang).
+/// accounting must see every completion or an `after_all` batch can hang).
 #[tokio::test]
 async fn grouped_watch_records_completion_on_interim_idle() {
     let (_t, svc, ws) = setup().await;
@@ -1235,7 +1253,7 @@ async fn register_watch_scope_gate_rejects_non_chief_cross_workspace_parent() {
     assert_eq!(svc.list_watches_for_parent(&parent).len(), 1);
 }
 
-/// A scope-gate rejection in the after_all delegate path is side-effect free:
+/// A scope-gate rejection in the `after_all` delegate path is side-effect free:
 /// the gate runs before the child is created and before the delegation group
 /// is created/enrolled, so a denied non-chief cross-workspace delegate leaves
 /// no group, no watch, and no orphaned Pending child behind.
@@ -1276,7 +1294,7 @@ async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
     );
 }
 
-/// Chief-anchored after_all group: children in a regular workspace, group
+/// Chief-anchored `after_all` group: children in a regular workspace, group
 /// anchored (and persisted) under `__chief__`. Sealing on the chief parent's
 /// idle and completing both children fires ONE aggregated wake to the chief
 /// parent, and the persisted row carries the chief anchor workspace.
@@ -1360,7 +1378,7 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
     assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
-/// The aggregated after_all wake carries `event_notification` metadata whose
+/// The aggregated `after_all` wake carries `event_notification` metadata whose
 /// `eventCount` equals the group size and whose `events` array preserves each
 /// child's raw completion event (id, type, data, timestamp, actor).
 #[tokio::test]
@@ -1483,7 +1501,7 @@ async fn app_agents_wait_immediate_wakes_from_two_workspaces() {
 }
 
 /// Pair uniqueness on the explicit path: calling waitFor for a target the
-/// caller ALREADY watches is rejected with InvalidParams naming the target
+/// caller ALREADY watches is rejected with `InvalidParams` naming the target
 /// (for BOTH modes), side-effect free — the original watch survives
 /// unchanged and no group is created.
 #[tokio::test]
@@ -1568,7 +1586,7 @@ async fn app_agents_wait_immediate_reconciles_already_settled_target() {
     );
 }
 
-/// Registration-time reconciliation (after_all mode): waitFor on targets
+/// Registration-time reconciliation (`after_all` mode): waitFor on targets
 /// that ALREADY settled records their completions in the still-open group,
 /// so once the caller idles (sealing the group) the single aggregated wake
 /// fires instead of the group hanging forever.
@@ -1626,7 +1644,7 @@ async fn app_agents_wait_after_all_reconciles_already_settled_targets() {
     assert!(svc.delegation_group_for_parent(&caller).is_none());
 }
 
-/// after_all from a chief caller with targets in TWO different workspaces:
+/// `after_all` from a chief caller with targets in TWO different workspaces:
 /// both targets share one chief-anchored group; sealing on the caller's idle
 /// and completing both targets fires ONE aggregated wake.
 #[tokio::test]
@@ -1695,7 +1713,7 @@ async fn app_agents_wait_after_all_across_two_workspaces_single_aggregated_wake(
     assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
-/// Restart-rehydration: an after_all group registered via waitFor persists
+/// Restart-rehydration: an `after_all` group registered via waitFor persists
 /// under the chief anchor; after a simulated restart (fresh Store + Services),
 /// `rehydrate_delegation_groups` reconciles the remaining completed target and
 /// fires the single aggregated wake to the caller.
@@ -1784,7 +1802,7 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     assert!(restarted.delegation_group_for_parent(&caller).is_none());
 }
 
-/// Poll until the persisted completion_watch table reaches `expected` rows
+/// Poll until the persisted `completion_watch` table reaches `expected` rows
 /// (registration/removal persistence is spawned, not awaited).
 async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2064,10 +2082,11 @@ async fn fired_completion_watch_does_not_rehydrate() {
 async fn restart_reconcile_skips_already_delivered_completion() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
+    let registry = test_registry_with_default_provider(&tmp);
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -2261,7 +2280,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
 }
 
 /// PR #1313 review (empty-report dedup): `agent.reportToParent("")` persists
-/// an empty report WITH a completion_report_timestamp, but the #1945
+/// an empty report WITH a `completion_report_timestamp`, but the #1945
 /// non-empty filter classifies the stamped event value as unreported — the
 /// dedup identity must still be derived (raw key presence, not the #1945
 /// filter), or a re-arm on the settled child replays the historical
@@ -2379,10 +2398,26 @@ async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
 
     // Re-arm on the settled child: the reconcile now synthesizes the
     // REPORTED historical idle (hook gone, report + timestamp retained) —
-    // the marker recorded by the settlement wake must suppress it.
-    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
-        .await
-        .expect("re-watch");
+    // the marker recorded by the settlement wake must suppress it. The
+    // monorepo#2972 guard rejects an explicit `agent.watch` on this settled
+    // no-waiting-reason shape, so drive the registration + reconcile through
+    // the internal path (the auto-subscribe shape the guard does not gate)
+    // to keep this marker pin exercised.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-watch");
+    svc.reconcile_watch_child_on_rehydration(
+        &child,
+        &ws,
+        crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+    )
+    .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
         1,
@@ -2439,10 +2474,19 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
     assert!(svc.find_watches_for_child(&child).is_empty());
 
     // The stale wake must NOT have recorded the second cycle's identity: a
-    // re-armed watch still receives the second completion.
-    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
-        .await
-        .expect("re-watch");
+    // re-armed watch still receives the second completion. (Internal
+    // registration path: the monorepo#2972 guard rejects an explicit
+    // `agent.watch` on the settled no-waiting-reason child, and this pin is
+    // about the delivery-path identity, not the registration reconcile.)
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("re-watch");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -2631,7 +2675,7 @@ async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -2713,7 +2757,7 @@ async fn report_without_watch_then_arm_suppresses_same_cycle_completion_wake() {
 
 /// monorepo#2889 guard: a GROUPED child's reportToParent delivers no
 /// immediate wake and must record NO delivery marker — the aggregated
-/// after_all wake is the one report carrier there and keeps today's
+/// `after_all` wake is the one report carrier there and keeps today's
 /// behavior.
 #[tokio::test]
 async fn grouped_report_records_no_marker_and_aggregated_wake_carries_report() {
@@ -2798,7 +2842,7 @@ async fn unreported_completion_wake_delivers_with_summary() {
 }
 
 /// Regression (intent-hq/monorepo#2889, restart edge): the report wake
-/// delivered pre-restart and the watch was re-armed (report_delivered
+/// delivered pre-restart and the watch was re-armed (`report_delivered`
 /// cleared) BEFORE the settlement — the boot reconcile replaying the
 /// child's reported completion post-restart must not re-embed the report;
 /// the re-armed watch stays armed for a future completion.
@@ -2806,10 +2850,11 @@ async fn unreported_completion_wake_delivers_with_summary() {
 async fn restart_reconcile_skips_completion_after_report_wake_and_rearm() {
     let tmp = TempDb::new();
     let ws = WorkspaceId::new();
+    let registry = test_registry_with_default_provider(&tmp);
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -3079,7 +3124,7 @@ async fn rearmed_watch_on_failed_child_waits_for_future_failure() {
 /// intent-hq/monorepo#2862: a FIRST-EVER watch on a child already parked in
 /// Error still receives the failure — the registration reconcile finds no
 /// marker for the pair, delivers the synthesized `agent:failed` (now
-/// carrying the persisted stop_reason as its error text), and records the
+/// carrying the persisted `stop_reason` as its error text), and records the
 /// marker so only replays are suppressed.
 #[tokio::test]
 async fn fresh_watch_on_failed_child_delivers_historical_failure_once() {
@@ -3240,7 +3285,7 @@ async fn app_agents_wait_rejects_non_chief_cross_workspace_caller() {
 }
 
 /// Input validation: empty target list, self-wait, unknown target id, and an
-/// invalid waitMode are all InvalidParams and side-effect free.
+/// invalid waitMode are all `InvalidParams` and side-effect free.
 #[tokio::test]
 async fn app_agents_wait_validation_failures() {
     let (_t, svc, ws) = setup().await;
@@ -3277,7 +3322,7 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -3301,7 +3346,7 @@ async fn create_then_list_and_get_projects_agent_lite() {
 }
 
 /// monorepo#940: `sessionCorrupted` is derived on emit over the persisted
-/// (status, stop_reason) — a client rehydrating via `agent.get`/`agent.list`/
+/// (status, `stop_reason`) — a client rehydrating via `agent.get`/`agent.list`/
 /// `agent.getSession` after the failure event still sees the flag, and an
 /// ordinary error session omits it from the wire entirely.
 #[tokio::test]
@@ -3390,7 +3435,7 @@ async fn agent_create_mints_server_assigned_agent_id() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -3418,7 +3463,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -3606,7 +3651,7 @@ async fn report_to_parent_publishes_refreshed_subscriptions_changed() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -3839,7 +3884,12 @@ async fn agent_lite_overlays_live_turn_text_over_persisted_preview() {
 /// derivation are unaffected.
 #[test]
 fn live_preview_derivation_clips_trailing_partial_line() {
-    let blocks = |texts: &[&str]| texts.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let blocks = |texts: &[&str]| {
+        texts
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+    };
 
     // Completed lines advance; the trailing partial line is excluded.
     let (resp, digest) = live_response_and_digest_from_blocks(
@@ -4033,7 +4083,7 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -4098,9 +4148,11 @@ async fn list_derives_last_response_and_digest() {
 }
 
 /// P1b: multi-MB messages never regress the `AgentLite` previews — the
-/// SQL-capped projection still yields the correct digest, final response
-/// line, and a bounded `lastUserMessage` (the message's head, capped at the
-/// store's per-block limit instead of the full multi-MB text).
+/// SQL-capped projection still yields the correct digest and final response
+/// line, and a bounded `lastUserMessage` (the message's head). The list path
+/// additionally caps the preview at the render-sized list budget
+/// ([`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`]); `agent.get` serves the
+/// store's projection cap ([`intent_store::PROJECTION_TEXT_BLOCK_CAP`]).
 #[tokio::test]
 async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
     let (_t, svc, ws) = setup().await;
@@ -4118,7 +4170,7 @@ async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
             .expect("append");
     }
 
-    let agents = svc.agent_list_op(ws).await.expect("list");
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
     assert_eq!(agents[0].message_count, 2);
     assert_eq!(agents[0].digest.as_deref(), Some("big digest"));
     assert_eq!(
@@ -4128,9 +4180,19 @@ async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
     let last_user = agents[0].last_user_message.as_deref().expect("last user");
     assert!(last_user.starts_with("start of the big ask"));
     assert_eq!(
+        last_user.len(),
+        intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        "list-row lastUserMessage bounded at the render budget"
+    );
+
+    // The detail read keeps the projection-cap-sized head.
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    let last_user = got.last_user_message.as_deref().expect("get last user");
+    assert!(last_user.starts_with("start of the big ask"));
+    assert_eq!(
         last_user.chars().count(),
         intent_store::PROJECTION_TEXT_BLOCK_CAP as usize,
-        "lastUserMessage bounded at the projection cap"
+        "agent.get lastUserMessage bounded at the projection cap"
     );
 }
 
@@ -4705,7 +4767,10 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
     assert_eq!(tu["name"], "view", "name intact for FE classifyTool");
     assert_eq!(tu["toolCallId"], "tc-1", "pairing id intact");
     assert_eq!(tu["inputTruncated"], true);
-    assert!(tu["inputBytes"].as_u64().unwrap() as usize > SLIM_PROJECTION_BUDGET_BYTES);
+    assert!(
+        usize::try_from(tu["inputBytes"].as_u64().unwrap()).expect("value fits in usize")
+            > SLIM_PROJECTION_BUDGET_BYTES
+    );
     assert!(
         tu["input"].get("path").is_some() && tu["input"].get("blob").is_some(),
         "input keys preserved: {:?}",
@@ -4718,7 +4783,10 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
     assert_eq!(tr["tool_use_id"], "tc-1");
     assert_eq!(tr["is_error"], false);
     assert_eq!(tr["outputTruncated"], true);
-    assert_eq!(tr["outputBytes"].as_u64().unwrap() as usize, big.len());
+    assert_eq!(
+        usize::try_from(tr["outputBytes"].as_u64().unwrap()).expect("value fits in usize"),
+        big.len()
+    );
     assert!(tr["output"].as_str().unwrap().len() <= SLIM_PROJECTION_BUDGET_BYTES);
     // Under-budget blocks: byte-identical, no flags.
     assert_eq!(blocks[0], content[0]);
@@ -4732,6 +4800,7 @@ async fn get_conversation_slim_truncates_oversized_tool_blocks() {
 /// under-budget image passes through untouched.
 #[tokio::test]
 async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
+    use base64::Engine as _;
     use intent_core::{ConversationProjection, SLIM_PROJECTION_BUDGET_BYTES};
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "SlimImg").await;
@@ -4745,7 +4814,6 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     image::DynamicImage::ImageRgb8(img)
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .expect("encode test png");
-    use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(&buf);
     assert!(data.len() > SLIM_PROJECTION_BUDGET_BYTES);
     let small = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
@@ -4795,7 +4863,10 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     let thumbed = &blocks[0];
     assert_eq!(thumbed["dataTruncated"], true);
     assert_eq!(thumbed["dataIsThumbnail"], true);
-    assert_eq!(thumbed["dataBytes"].as_u64().unwrap() as usize, data.len());
+    assert_eq!(
+        usize::try_from(thumbed["dataBytes"].as_u64().unwrap()).expect("value fits in usize"),
+        data.len()
+    );
     let served = thumbed["data"].as_str().expect("thumbnail data served");
     assert!(
         served.len() < data.len(),
@@ -4819,7 +4890,7 @@ async fn get_conversation_slim_serves_thumbnails_and_omits_legacy_data() {
     assert!(legacy.get("data").is_none(), "unrenderable data omitted");
     assert_eq!(legacy["dataTruncated"], true);
     assert_eq!(
-        legacy["dataBytes"].as_u64().unwrap() as usize,
+        usize::try_from(legacy["dataBytes"].as_u64().unwrap()).expect("value fits in usize"),
         garbage.len()
     );
     assert_eq!(legacy["mimeType"], "image/png", "mimeType intact");
@@ -5146,7 +5217,7 @@ async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
         .expect_err("unknown message id");
     match err {
         Error::InvalidParams(msg) => {
-            assert!(msg.contains("m-missing"), "names the message id: {msg}")
+            assert!(msg.contains("m-missing"), "names the message id: {msg}");
         }
         other => panic!("expected InvalidParams, got {other:?}"),
     }
@@ -5157,7 +5228,7 @@ async fn get_message_block_rejects_unknown_ids_and_workspace_mismatch() {
         .expect_err("out-of-range synthetic block id");
     match err {
         Error::InvalidParams(msg) => {
-            assert!(msg.contains(":9"), "names the block id: {msg}")
+            assert!(msg.contains(":9"), "names the block id: {msg}");
         }
         other => panic!("expected InvalidParams, got {other:?}"),
     }
@@ -5233,7 +5304,7 @@ fn stamp_synthetic_block_ids_is_additive_and_index_stable() {
 /// `agent_last_message_event_payload` (PROTOCOL §6.5): the id-only echo
 /// enriched with the preview projections derived from the appended row —
 /// assistant rows carry `lastAgentResponse` (+ `lastToolUse` when the row
-/// has a tool_use block), user rows carry `lastUserMessage`, system rows
+/// has a `tool_use` block), user rows carry `lastUserMessage`, system rows
 /// keep the base echo shape (no preview fields), and every optional field
 /// is omitted rather than `null`.
 #[test]
@@ -5413,7 +5484,7 @@ async fn set_model_clears_resolved_display_model() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -5458,7 +5529,7 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -5499,7 +5570,7 @@ async fn set_model_reconciles_provider_after_first_real_use() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -5552,7 +5623,7 @@ async fn set_model_preserves_provider_for_bare_or_same_provider() {
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
 
-/// `agent.create` hard-fails (-32602 InvalidParams) when the resolved provider
+/// `agent.create` hard-fails (-32602 `InvalidParams`) when the resolved provider
 /// is unknown — explicit `provider` param or a compound-prefix derivation —
 /// and persists no session row.
 #[tokio::test]
@@ -5592,7 +5663,7 @@ async fn create_rejects_unknown_provider() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect_err("unknown compound-prefix provider must be rejected");
@@ -5652,7 +5723,7 @@ async fn create_records_session_started_usage_stats() {
         None,
         None,
         false,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("create with model");
@@ -5666,7 +5737,7 @@ async fn create_records_session_started_usage_stats() {
         None,
         None,
         false,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("create without model");
@@ -5713,7 +5784,7 @@ async fn create_records_session_started_usage_stats() {
 }
 
 /// `agent.setModel` rejects an unknown compound-prefix provider with -32602
-/// InvalidParams and leaves session.model / session.provider untouched.
+/// `InvalidParams` and leaves session.model / session.provider untouched.
 #[tokio::test]
 async fn set_model_rejects_unknown_provider() {
     let (_t, svc, ws) = setup().await;
@@ -5737,7 +5808,7 @@ async fn set_model_rejects_unknown_provider() {
     );
 }
 
-/// Regression for monorepo#607: `agent.create` rejects (-32602 InvalidParams)
+/// Regression for monorepo#607: `agent.create` rejects (-32602 `InvalidParams`)
 /// an incident-shaped payload — an explicit `provider` plus a bare model id
 /// whose ownership by that provider is affirmatively disproven by cached
 /// catalogs (another provider's cache claims the id AND the requested
@@ -5749,7 +5820,7 @@ async fn create_rejects_bare_model_owned_by_other_provider() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -5806,7 +5877,7 @@ async fn create_rejects_bare_model_owned_by_other_provider() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect_err("bare cortex model with defaulted provider must be rejected");
@@ -5909,7 +5980,7 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
         None,
         None,
         false,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("unknown bare id with defaulted provider");
@@ -5925,7 +5996,7 @@ async fn create_rejects_bare_dynamic_model_via_cached_catalog() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         now,
     );
@@ -5978,8 +6049,12 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
     let auggie_rows = vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })];
     // Auggie claims fable-5, but grok has no cached catalog: ownership by
     // grok is not disproven, so the id passes.
-    svc.models_catalog
-        .test_store("auggie", "", auggie_rows.clone(), now);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        auggie_rows.clone(),
+        now,
+    );
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
         ..Default::default()
@@ -6020,7 +6095,7 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
     .await
     .expect("shared id claimed by the requested provider's own catalog");
     // Fresh services: auggie's claiming entry sits under a stale version key
-    // (auggie's current key is "" — no version pin), so it is not evidence
+    // under a stale version key, so it is not evidence
     // even though grok's own catalog disproves ownership.
     let (_t2, svc2, ws2) = setup().await;
     svc2.models_catalog
@@ -6059,7 +6134,7 @@ async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         now,
     );
@@ -6122,7 +6197,7 @@ async fn set_model_rejects_bare_model_owned_by_other_provider() {
     );
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -6179,7 +6254,7 @@ async fn set_model_normalizes_legacy_provider_aliases() {
     );
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -6228,7 +6303,7 @@ async fn set_model_bare_model_with_explicit_provider_id() {
     );
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" })],
         now,
     );
@@ -6416,7 +6491,7 @@ async fn rename_skip_if_explicitly_set() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create auto-named");
@@ -6557,6 +6632,117 @@ async fn create_persists_and_reserves_gap_fields() {
     );
 }
 
+/// List-payload cost contract (extending monorepo#2932): `agent.list` rows
+/// bound every render-preview field — `lastAgentResponse`, `lastUserMessage`,
+/// `digest`, `lastToolUse`, `metadata.completionReport` — to
+/// [`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`], while `agent.get` keeps
+/// serving the full values for the same session.
+#[tokio::test]
+async fn list_caps_previews_get_serves_full_values() {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Verbose").await;
+
+    let long_user = format!("user ask starts {}", "u".repeat(BUDGET * 3));
+    let long_line = format!("final answer {}", "a".repeat(BUDGET * 3));
+    let long_digest = format!("digest {}", "d".repeat(BUDGET * 3));
+    let long_report = format!("report {}", "r".repeat(BUDGET * 3));
+    let user = json!([{ "type": "text", "text": long_user }]);
+    svc.store()
+        .append_agent_message(&id, "user", &user, &now_iso())
+        .await
+        .expect("append user");
+    // A tool_use whose input is over the list budget but under the persisted
+    // preview budget (2048), so the 0098 column keeps it whole and only the
+    // list path caps it.
+    let assistant = json!([
+        {
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": { "path": "/tmp/a.txt", "content": "x".repeat(BUDGET * 3) },
+            "toolCallId": "t1",
+        },
+        {
+            "type": "text",
+            "text": format!("{long_line}\n<agent_digest>{long_digest}</agent_digest>"),
+        },
+    ]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &assistant, &now_iso())
+        .await
+        .expect("append assistant");
+    svc.agent_update_op(id.clone(), json!({ "completionReport": long_report }))
+        .await
+        .expect("set report");
+
+    // `agent.get` serves the full values.
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some(long_line.as_str()));
+    assert_eq!(got.digest.as_deref(), Some(long_digest.as_str()));
+    assert_eq!(got.last_user_message.as_deref(), Some(long_user.as_str()));
+    assert_eq!(
+        got.metadata.completion_report.as_deref(),
+        Some(long_report.as_str())
+    );
+    let got_tool = got.last_tool_use.as_ref().expect("get lastToolUse");
+    assert_eq!(
+        got_tool["input"]["content"].as_str().map(str::len),
+        Some(BUDGET * 3)
+    );
+
+    // `agent.list` rows cap every preview field to the render budget.
+    let agents = svc.agent_list_op(ws).await.expect("list");
+    assert_eq!(agents.len(), 1);
+    let row = &agents[0];
+    assert_eq!(
+        row.last_agent_response.as_deref().map(str::len),
+        Some(BUDGET),
+        "lastAgentResponse capped on list rows"
+    );
+    assert_eq!(
+        row.digest.as_deref().map(str::len),
+        Some(BUDGET),
+        "digest capped on list rows"
+    );
+    assert_eq!(
+        row.last_user_message.as_deref().map(str::len),
+        Some(BUDGET),
+        "lastUserMessage capped on list rows"
+    );
+    assert_eq!(
+        row.metadata.completion_report.as_deref().map(str::len),
+        Some(BUDGET),
+        "metadata.completionReport capped (not omitted) on list rows"
+    );
+    let tool_use = row.last_tool_use.as_ref().expect("list lastToolUse");
+    assert_eq!(
+        tool_use["name"], "write_file",
+        "tool name survives the capped preview"
+    );
+    // The list-path re-cap keeps the §5.5 preview contract: an over-budget
+    // input is flagged with `inputTruncated`/`inputBytes` (the persisted
+    // preview was whole — under 2048 — so the flags are stamped here).
+    assert_eq!(
+        tool_use["inputTruncated"],
+        json!(true),
+        "list-capped lastToolUse stamps inputTruncated"
+    );
+    assert!(
+        usize::try_from(tool_use["inputBytes"].as_u64().unwrap()).expect("fits usize") > BUDGET,
+        "inputBytes names the original input's serialized size"
+    );
+    let served = serde_json::to_string(&tool_use["input"]).unwrap();
+    assert!(
+        served.len() <= BUDGET * 2,
+        "capped lastToolUse input stays near the budget, got {} bytes",
+        served.len()
+    );
+    // The capped fields keep the original heads (truncation, not
+    // replacement).
+    assert!(long_line.starts_with(row.last_agent_response.as_deref().unwrap()));
+    assert!(long_user.starts_with(row.last_user_message.as_deref().unwrap()));
+    assert!(long_report.starts_with(row.metadata.completion_report.as_deref().unwrap()));
+}
+
 /// The top-level `isBackground` param wins over the `metadata` fallback, and
 /// an agent created with neither defaults to foreground (G-A1/P3-1.2c).
 #[tokio::test]
@@ -6690,7 +6876,7 @@ async fn report_to_parent_persists_completion_report() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6753,7 +6939,7 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6818,7 +7004,7 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6846,7 +7032,7 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
 /// bumps `updated_at` and `rev` before checking for a status change, so
 /// short-circuiting on the current status is what keeps repeated
 /// child-reports from churning the note (unresolved copilot review
-/// thread PRRT_kwDOS9Wxuc6QIRcj on PR #104).
+/// thread `PRRT_kwDOS9Wxuc6QIRcj` on PR #104).
 #[tokio::test]
 async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
     let (_t, svc, ws) = setup().await;
@@ -6888,7 +7074,7 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6957,7 +7143,7 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -6977,7 +7163,7 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
     assert_eq!(session.completion_report.as_deref(), Some("no task"));
 }
 
-/// Workspace-scoping (Copilot review PRRT_kwDOS9Wxuc6QIaRJ on PR #104):
+/// Workspace-scoping (Copilot review `PRRT_kwDOS9Wxuc6QIaRJ` on PR #104):
 /// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
 /// is workspace-scoped. Passing a `taskNoteId` that belongs to another
 /// workspace must NOT leak the foreign note's title/content into the TASK-C
@@ -7038,7 +7224,7 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     );
 }
 
-/// Workspace-scoping (Copilot review PRRT_kwDOS9Wxuc6QIaRP on PR #104):
+/// Workspace-scoping (Copilot review `PRRT_kwDOS9Wxuc6QIaRP` on PR #104):
 /// `transition_linked_task_to_review_required` must load the linked task note
 /// via the workspace-scoped `crate::fetch_note` accessor. When a session is
 /// linked to a task note that lives in a different workspace, the fetch
@@ -7102,7 +7288,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
             Some(parent.clone()),
             Some(foreign.id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -7133,7 +7319,7 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
     );
 }
 
-/// Copilot #104 (thread PRRT_kwDOS9Wxuc6QKTPK): `agent.reportToParent` must
+/// Copilot #104 (thread `PRRT_kwDOS9Wxuc6QKTPK`): `agent.reportToParent` must
 /// scope-guard the caller-supplied `workspace_id` the same way `agent.get` /
 /// `agent.getConversation` do — a call whose `workspace_id` does not match
 /// the caller session's own workspace is rejected with `NotFound` before any
@@ -7159,7 +7345,7 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -7397,7 +7583,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -7469,9 +7655,9 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
 }
 
 /// Regression for PR #237: after a child calls reportToParent (which marks the
-/// watch as report_delivered and delivers an immediate wake), `agent:failed` and
+/// watch as `report_delivered` and delivers an immediate wake), `agent:failed` and
 /// `agent:deleted` events STILL deliver their completion wake to the parent.
-/// Only `agent:idle` is suppressed by the report_delivered flag.
+/// Only `agent:idle` is suppressed by the `report_delivered` flag.
 #[tokio::test]
 async fn report_to_parent_then_failed_or_deleted_still_wakes_parent() {
     let (_t, svc, ws) = setup().await;
@@ -7643,7 +7829,7 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
     );
 }
 
-/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt): if a live
+/// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKPyt`): if a live
 /// ungrouped watch is removed concurrently between find and refresh (by
 /// [`Services::deliver_completion_to_watches`] dropping a fired watch), the
 /// follow-up `agent.wakeOrCreate` must fall through to CREATING a new live
@@ -7827,9 +8013,9 @@ async fn create_rejects_when_parent_at_max_depth() {
     .expect("create under a shallow parent succeeds");
 }
 
-/// When workspace.cowIsolation is enabled, the delegate logic attempts CoW
+/// When workspace.cowIsolation is enabled, the delegate logic attempts `CoW`
 /// provisioning; when the workspace has a repository and worktree, effectiveIsolation
-/// reports "cow". This test uses a workspace without repository_path, so CoW cannot
+/// reports "cow". This test uses a workspace without `repository_path`, so `CoW` cannot
 /// provision and effectiveIsolation is absent (graceful fallback to shared mode).
 /// The setting is read and respected; actual provisioning is workspace-dependent.
 #[tokio::test]
@@ -7969,10 +8155,10 @@ async fn delegate_setting_flip_on_does_not_sandbox_direct_environment_workspace(
 /// "shared"` param cannot turn sandboxing off either.
 #[tokio::test]
 async fn delegate_setting_off_does_not_unsandbox_cow_environment_workspace() {
-    let (_t, svc, _ws) = setup().await;
+    let (tmp, svc, _ws) = setup().await;
     // The cow path reaches real (background) provisioning — pin a hermetic
     // workspaces root so the test never touches $HOME/intent/workspaces.
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     // workspace.cowIsolation defaults to false — deliberately left OFF.
     let ws = WorkspaceId::new();
     let mut w = workspace(&ws);
@@ -8025,7 +8211,7 @@ async fn delegate_setting_off_does_not_unsandbox_cow_environment_workspace() {
 
 /// Execution-environment authority: an explicit `isolation: "cow"` param on a
 /// workspace persisted with `execution_environment: direct` does NOT sandbox
-/// — there is no turning CoW on on the fly within a workspace.
+/// — there is no turning `CoW` on on the fly within a workspace.
 #[tokio::test]
 async fn delegate_cow_param_does_not_sandbox_direct_environment_workspace() {
     let (_t, svc, _ws) = setup().await;
@@ -8732,8 +8918,8 @@ async fn send_message_auto_queues_on_store_failure_for_existing_agent() {
     assert_eq!(r["queuedMessage"]["content"], "hi");
 }
 
-/// STAB-7: agent_send_message_op fallback must preserve image_blocks and
-/// file_blocks when auto-queueing on store failure (matching the runtime
+/// STAB-7: `agent_send_message_op` fallback must preserve `image_blocks` and
+/// `file_blocks` when auto-queueing on store failure (matching the runtime
 /// manager path's behavior). Uses a duplicate messageId on an EXISTING agent
 /// to force the store failure (monorepo#564: unknown agents now fail closed).
 #[tokio::test]
@@ -9018,7 +9204,7 @@ fn effort_guard_rejects_only_against_cached_evidence() {
     let cache = crate::model_catalog::ModelCatalogCache::new(None);
     cache.store_for_test(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -9059,7 +9245,7 @@ async fn create_validates_reasoning_effort_against_cached_effort_levels() {
     let (_t, svc, ws) = setup().await;
     svc.models_catalog.test_store(
         "auggie",
-        "",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -9147,7 +9333,7 @@ fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
         { "shortName": "old-model", "displayName": "Old", "isLegacyModel": true },
         { "displayName": "No shortName" },
         { "shortName": "haiku4.5", "displayName": "Haiku", "description": "",
-          "badges": [], "effortLevels": [] }
+          "badges": [], "effortLevels": [], "isLegacyModel": false }
     ] }"#;
     let rows = parse_model_list_json(out).expect("parsed");
     assert_eq!(rows.len(), 3, "row without shortName is skipped");
@@ -9168,6 +9354,7 @@ fn parse_model_list_json_maps_rich_rows_and_skips_incomplete() {
     assert!(!haiku.contains_key("description"));
     assert!(!haiku.contains_key("badges"));
     assert!(!haiku.contains_key("effortLevels"));
+    assert!(!haiku.contains_key("isLegacyModel"));
 }
 
 #[test]
@@ -9178,7 +9365,7 @@ fn parse_model_list_json_rejects_non_catalog_payloads() {
 }
 
 #[test]
-fn finalize_model_rows_filters_legacy_and_sorts() {
+fn finalize_model_rows_preserves_legacy_metadata_and_sorts() {
     let rows = vec![
         json!({ "id": "z", "name": "Zeta", "provider": "auggie" }),
         json!({ "id": "old", "name": "Old", "provider": "auggie", "isLegacyModel": true }),
@@ -9192,10 +9379,39 @@ fn finalize_model_rows_filters_legacy_and_sorts() {
     let out = finalize_model_rows(rows);
     let ids: Vec<&str> = out.iter().map(|r| r["id"].as_str().unwrap()).collect();
     // Group asc, then priority asc, then name; missing priorities sort last.
-    assert_eq!(ids, vec!["a2", "a", "b", "z"]);
-    assert!(out
+    assert_eq!(ids, vec!["a2", "a", "b", "old", "z"]);
+    assert_eq!(out[3]["isLegacyModel"], true);
+    assert!(out[..3]
         .iter()
-        .all(|r| r.as_object().unwrap().get("isLegacyModel").is_none()));
+        .chain(&out[4..])
+        .all(|r| r.get("isLegacyModel").is_none()));
+}
+
+#[test]
+fn finalize_model_rows_preserves_full_mixed_catalog() {
+    let current = (0..12).map(|i| {
+        json!({ "id": format!("current-{i:02}"), "name": format!("Current {i:02}"),
+                "provider": "auggie" })
+    });
+    let legacy = (0..21).map(|i| {
+        json!({ "id": format!("legacy-{i:02}"), "name": format!("Legacy {i:02}"),
+                "provider": "auggie", "isLegacyModel": true })
+    });
+    let out = finalize_model_rows(current.chain(legacy).collect());
+
+    assert_eq!(out.len(), 33);
+    assert_eq!(
+        out.iter()
+            .filter(|row| row["isLegacyModel"] == true)
+            .count(),
+        21
+    );
+    assert_eq!(
+        out.iter()
+            .filter(|row| row.get("isLegacyModel").is_none())
+            .count(),
+        12
+    );
 }
 
 #[test]
@@ -9389,11 +9605,16 @@ async fn models_list_cortex_gate_is_open_and_serves_empty_list() {
     );
 }
 
-/// Seed the unified model cache under the legacy auggie key `("auggie", "")`
-/// (the timestamp is irrelevant to serving — entries never expire).
+/// Seed the unified model cache under the current Auggie catalog key.
+/// The timestamp is irrelevant to serving because entries never expire.
 fn seed_auggie_cache(svc: &Services, rows: Vec<serde_json::Value>) {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
-    svc.models_catalog.test_store("auggie", "", rows, now);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        rows,
+        now,
+    );
 }
 
 /// The test clock for the legacy-path tests (unix-ms shaped, arbitrary).
@@ -9504,7 +9725,9 @@ async fn models_list_legacy_negative_window_expires_then_refetches() {
         .expect("failed fetch");
     assert_eq!(res["source"], "static");
     // Past the negative TTL the fetch runs again; success clears the entry.
-    let later = legacy_now() + crate::model_catalog::MODELS_NEGATIVE_TTL.as_millis() as u64 + 1;
+    let later = legacy_now()
+        + u64::try_from(crate::model_catalog::MODELS_NEGATIVE_TTL.as_millis()).unwrap_or(u64::MAX)
+        + 1;
     let recovered = vec![json!({ "id": "rec", "name": "Rec", "provider": "auggie" })];
     let expected = recovered.clone();
     let res = svc
@@ -9517,7 +9740,11 @@ async fn models_list_legacy_negative_window_expires_then_refetches() {
     assert_eq!(res["source"], "auggie");
     assert!(svc
         .models_catalog
-        .test_negative_reason("auggie", "", later)
+        .test_negative_reason(
+            "auggie",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
+            later
+        )
         .is_none());
 }
 
@@ -9564,7 +9791,11 @@ async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
     assert!(res["warning"].is_string());
     assert!(svc
         .models_catalog
-        .test_negative_reason("auggie", "", legacy_now())
+        .test_negative_reason(
+            "auggie",
+            crate::model_catalog::AUGGIE_CATALOG_VERSION,
+            legacy_now()
+        )
         .is_some());
 }
 
@@ -9575,8 +9806,12 @@ async fn models_list_legacy_cache_hit_ignores_negative_window() {
     // non-forced read to the stale fallback: the entry is served plainly.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "nw", "name": "NW", "provider": "auggie" })];
-    svc.models_catalog
-        .test_store("auggie", "", sentinel.clone(), 0);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        sentinel.clone(),
+        0,
+    );
     // A forced failed probe arms the negative window (stale fallback).
     let res = svc
         .models_list_auggie_with(true, legacy_now(), || Box::pin(async { None }))
@@ -9602,8 +9837,12 @@ async fn models_list_legacy_old_entry_served_without_probe() {
     // a non-forced read must never spawn a CLI probe when an entry exists.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "lg2", "name": "LG2", "provider": "auggie" })];
-    svc.models_catalog
-        .test_store("auggie", "", sentinel.clone(), 0);
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        sentinel.clone(),
+        0,
+    );
     let res = svc
         .models_list_auggie_with(false, legacy_now(), || {
             panic!("must not probe when an entry exists")
@@ -9614,6 +9853,36 @@ async fn models_list_legacy_old_entry_served_without_probe() {
     assert_eq!(res["source"], "auggie");
     assert!(res["stale"].is_null() || res["stale"] == false, "{res}");
     assert!(res["warning"].is_null(), "{res}");
+}
+
+#[tokio::test]
+async fn models_list_auggie_empty_fallback_warning_matches_wire_shape() {
+    let (_t, svc, _ws) = setup().await;
+    let svc = svc.with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let internal = svc
+        .models_list_auggie_with(false, now, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch fallback");
+    assert_eq!(
+        internal["warning"],
+        "auggie CLI unavailable or returned no models"
+    );
+
+    let legacy = svc.models_list_op(None, false).await.expect("legacy read");
+    assert_eq!(legacy["source"], "static");
+    assert!(legacy.get("warning").is_none(), "{legacy}");
+
+    let provider = svc
+        .models_list_op(Some("auggie".to_string()), false)
+        .await
+        .expect("provider read");
+    assert_eq!(provider["providerId"], "auggie");
+    assert_eq!(provider["source"], "static");
+    assert_eq!(
+        provider["warning"],
+        "auggie CLI unavailable or returned no models"
+    );
 }
 
 #[tokio::test]
@@ -10303,6 +10572,15 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
 /// attached). Diagnostics-only: the field never rides `agent.list` payloads.
 #[tokio::test]
 async fn diagnostics_reports_subtree_memory_bytes() {
+    struct FixedProbe(HashMap<AgentId, u64>);
+    impl TreeMemoryProbe for FixedProbe {
+        fn sample(&self) -> Option<(u64, u64)> {
+            Some((self.0.values().sum(), 1))
+        }
+        fn agent_samples(&self) -> HashMap<AgentId, u64> {
+            self.0.clone()
+        }
+    }
     use crate::agent_manager::TreeMemoryProbe;
     use std::collections::HashMap;
 
@@ -10320,16 +10598,6 @@ async fn diagnostics_reports_subtree_memory_bytes() {
             row.get("subtreeMemoryBytes").is_none(),
             "no probe, no field: {row}"
         );
-    }
-
-    struct FixedProbe(HashMap<AgentId, u64>);
-    impl TreeMemoryProbe for FixedProbe {
-        fn sample(&self) -> Option<(u64, u64)> {
-            Some((self.0.values().sum(), 1))
-        }
-        fn agent_samples(&self) -> HashMap<AgentId, u64> {
-            self.0.clone()
-        }
     }
 
     let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
@@ -10617,8 +10885,16 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         let mut guard = svc.agent_queues.lock().unwrap();
         guard.get_mut(&target).expect("queue")[0].queued_at = "2020-01-01T00:00:00Z".into();
     }
-    svc.record_pending_questions_marker(&ws, &target, "q-msg-1")
-        .await;
+    let question = svc
+        .store()
+        .append_agent_message(&target, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append held question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &target, &question.id)
+            .await,
+        "real question row must arm the hold"
+    );
     // The marker write bumps the session's `updated_at` — re-mark the agent
     // idle so the phases below exercise the hold logic, not the
     // actively-responding skip.
@@ -10834,7 +11110,7 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
 /// Report-time wake: a delegated caller's `reportToParent` delivers an
 /// immediate parent wake containing the report. The report is persisted on the
 /// child session (`completion_report`) and the TS-shaped result is returned.
-/// The watch is marked as report_delivered, so the child's subsequent
+/// The watch is marked as `report_delivered`, so the child's subsequent
 /// `agent:idle` does NOT deliver a second wake (suppressed), which is asserted
 /// by the sibling `report_to_parent_delivers_immediate_wake_then_idle_suppressed`
 /// test.
@@ -10851,7 +11127,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create delegated child");
@@ -10864,7 +11140,10 @@ async fn report_to_parent_delivers_for_delegated_caller() {
         .expect("report delivered");
     assert_eq!(result["ok"], json!(true));
     assert_eq!(result["parentAgentId"].as_str(), Some(parent.0.as_str()));
-    assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
+    assert_eq!(
+        result["reportLength"],
+        json!(i64::try_from(report.chars().count()).expect("count fits in i64"))
+    );
     assert!(result["savedAt"].is_string());
 
     // Report-time wake: reportToParent now delivers an immediate wake to the parent.
@@ -10912,7 +11191,7 @@ async fn report_to_parent_rejects_non_delegated_caller() {
         .expect_err("not delegated");
     match err {
         Error::Internal(m) => {
-            assert_eq!(m, "report_to_parent is only available to delegated agents")
+            assert_eq!(m, "report_to_parent is only available to delegated agents");
         }
         other => panic!("expected Internal, got {other:?}"),
     }
@@ -10929,7 +11208,7 @@ async fn report_to_parent_rejects_rpc_front_door() {
         .expect_err("no caller context");
     match err {
         Error::Internal(m) => {
-            assert_eq!(m, "report_to_parent is only available to delegated agents")
+            assert_eq!(m, "report_to_parent is only available to delegated agents");
         }
         other => panic!("expected Internal, got {other:?}"),
     }
@@ -11485,7 +11764,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// delivers an immediate parent wake; the report is persisted on the child
 /// session and the parent receives the wake containing the report immediately.
 /// The same report tool through a caller-less server (the RPC / no-caller path)
-/// yields an `isError: true` workspace_api tool result. This is the
+/// yields an `isError: true` `workspace_api` tool result. This is the
 /// service-level integration coverage chosen over a node-gated UDS E2E so the
 /// full loop is exercised deterministically without an external `node`
 /// dependency.
@@ -11663,7 +11942,7 @@ async fn completion_watch_registry_register_find_list_remove() {
 
 // ── (parent, child) watch uniqueness ────────────────────────────────────────
 
-/// Footer-bug regression: an ungrouped watch and after_all group membership
+/// Footer-bug regression: an ungrouped watch and `after_all` group membership
 /// on the SAME child must not coexist as two watches. The grouped
 /// registration adopts the existing ungrouped watch in place (same
 /// subscription id, now grouped), so the child's completion routes ONLY into
@@ -11901,7 +12180,7 @@ async fn delegate_rpc_path_registers_no_watch() {
 }
 
 /// `wait_mode == "after_all"` (AS-4): the child is enrolled in the parent's
-/// delegation group and a grouped watch (group_id = Some) is registered
+/// delegation group and a grouped watch (`group_id` = Some) is registered
 /// instead of an immediate ungrouped watch.
 #[tokio::test]
 async fn delegate_after_all_enrolls_group_and_registers_group_watch() {
@@ -12118,7 +12397,7 @@ async fn sender_watch_skips_child_sending_to_parent() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -12180,7 +12459,7 @@ async fn sender_watch_still_registers_for_child_sending_to_non_parent() {
             Some(parent),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -12213,7 +12492,7 @@ async fn sender_watch_still_registers_for_parent_sending_to_child() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -12267,7 +12546,7 @@ async fn wake_or_create_woke_existing_subscribes_caller() {
     assert_eq!(watches[0].child_agent_id, target);
 }
 
-/// monorepo#926: the created_new branch must ALSO auto-subscribe the caller
+/// monorepo#926: the `created_new` branch must ALSO auto-subscribe the caller
 /// to the created agent's completion (SUB-1 parity with the wake branches).
 /// The caller gets a completion watch on the freshly created agent, the response
 /// carries `subscriptionId` + the notification line, and the child's terminal
@@ -12536,7 +12815,7 @@ async fn wake_or_create_skips_watch_when_caller_deleted_wake_branch() {
     assert!(svc.find_watches_for_child(&target).is_empty());
 }
 
-/// monorepo#994: the created_new branch must NOT register a SUB-1 watch for a
+/// monorepo#994: the `created_new` branch must NOT register a SUB-1 watch for a
 /// Deleted caller either — parity with the wake branch guard above.
 #[tokio::test]
 async fn wake_or_create_skips_watch_when_caller_deleted_create_branch() {
@@ -12670,7 +12949,7 @@ async fn wake_or_create_queued_registers_watch() {
     manager.release_slot(&target).await;
 }
 
-/// SUB-2 (PR #104 thread PRRT_kwDOS9Wxuc6QIRcq), updated for pair
+/// SUB-2 (PR #104 thread `PRRT_kwDOS9Wxuc6QIRcq`), updated for pair
 /// uniqueness: a queued wake ADOPTS the pre-existing watch for the pair
 /// (same subscription id, exactly one watch) instead of stacking a second
 /// watch next to it. A pre-seeded watch (registered via
@@ -12739,7 +13018,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
     manager.release_slot(&target).await;
 }
 
-/// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKWuU):
+/// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
 /// when the caller's display name cannot be resolved
 /// (`store.get_agent_session` failed), the reuse path must still return
 /// the live subscription id — but must NOT overwrite the watch's stored
@@ -12901,8 +13180,7 @@ async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> St
         .expect("contentBlocks array")
         .iter()
         .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(str::to_owned))
-        .collect::<Vec<_>>()
-        .join("")
+        .collect::<String>()
 }
 
 /// Explicit `agentInstructions` become the child's first message.
@@ -13267,7 +13545,7 @@ async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() 
         None,
         None,
         None,
-        Default::default(),
+        AgentCreateExtra::default(),
     )
     .await
     .expect("create");
@@ -13551,7 +13829,7 @@ async fn create_without_name_keeps_generic_agent_fallback() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -13764,7 +14042,7 @@ async fn completion_wake_without_hooks_stays_plain() {
     );
 }
 
-/// Idle-visibility deferral (c) in after_all groups: a hook-waiting child
+/// Idle-visibility deferral (c) in `after_all` groups: a hook-waiting child
 /// does NOT count as settled — the sealed group stays open past its idle —
 /// and the group settles with one aggregated wake when the child later
 /// completes for real (idle with no active hooks).
@@ -14012,7 +14290,7 @@ async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
     );
 }
 
-/// Unified external-wait classification in after_all groups: a
+/// Unified external-wait classification in `after_all` groups: a
 /// pr-monitor-waiting child does NOT count as settled — the sealed group
 /// stays open past its idle — and settles with one aggregated wake once the
 /// monitor resolves, mirroring `after_all_group_waits_for_hook_waiting_child`.
@@ -14572,7 +14850,7 @@ async fn mutual_idle_two_cycle_does_not_defer() {
 }
 
 /// Agent-waiting deferral (grouped): a parent P delegates child B in an
-/// after_all group, and B itself watches C. B idling while it watches C does
+/// `after_all` group, and B itself watches C. B idling while it watches C does
 /// NOT record in P's group — the sealed group stays open. When C completes and
 /// B idles again (watchless), the group settles with one aggregated wake.
 #[tokio::test]
@@ -14933,7 +15211,7 @@ async fn agent_failed_wakes_immediately_despite_outgoing_watch() {
 }
 
 /// Agent-waiting deferral at registration-time reconciliation: re-arming
-/// `agent.watch` on a child that is RuntimeIdle WITH a completion report (the
+/// `agent.watch` on a child that is `RuntimeIdle` WITH a completion report (the
 /// STAB-108 "genuinely complete" shape) but still holding an outgoing watch on
 /// a third agent does NOT fire synthetically — the watch stays armed, and the
 /// `agent.unwatch` backstop settles it when the waiting reason disappears.
@@ -15015,7 +15293,7 @@ async fn rearm_watch_on_failed_child_with_outgoing_watch_fires_immediately() {
 }
 
 /// Agent-waiting deferral across a restart: a rehydrated watch on a child
-/// that is RuntimeIdle + report but itself watches a third agent must not
+/// that is `RuntimeIdle` + report but itself watches a third agent must not
 /// refire at boot. Also verifies the heal ordering — ALL persisted rows load
 /// into the registry before any child reconciliation runs, so B's outgoing
 /// watch on C is visible to the waiting classification.
@@ -15069,8 +15347,8 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
     );
 }
 
-/// Agent-waiting deferral in group rehydration: an after_all group whose
-/// child is RuntimeIdle + report but itself watches a third agent does NOT
+/// Agent-waiting deferral in group rehydration: an `after_all` group whose
+/// child is `RuntimeIdle` + report but itself watches a third agent does NOT
 /// record that child at rehydration — the group stays open (no aggregated
 /// wake) until the child's genuine completion. Group rehydration runs BEFORE
 /// the watch registry loads at startup, so this exercises the persisted-row
@@ -15374,7 +15652,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_pr_monitors() {
     );
 }
 
-/// Two after_all delegates from one parent share a single group whose expected
+/// Two `after_all` delegates from one parent share a single group whose expected
 /// set has both children, with two grouped watches and zero ungrouped watches.
 #[tokio::test]
 async fn two_after_all_delegates_share_one_group() {
@@ -15555,7 +15833,7 @@ async fn group_no_double_fire() {
 }
 
 /// monorepo#1281 regression: a coordinator idling with a ready-to-send queued
-/// redrive is an INTERIM idle — it must NOT seal the open after_all group. A
+/// redrive is an INTERIM idle — it must NOT seal the open `after_all` group. A
 /// delegation made in the redriven turn joins the same group, the real
 /// (queue-drained) completion seals it, and settlement covers BOTH children
 /// with a single aggregated wake.
@@ -15638,7 +15916,7 @@ async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
 /// monorepo#1297 regression: a coordinator idling while its worker is
 /// already BUSY in a redriven turn (the enqueue was drained before the idle
 /// was delivered, so the queue is empty) is an INTERIM idle — it must NOT
-/// seal the open after_all group. A delegation made in the redriven turn
+/// seal the open `after_all` group. A delegation made in the redriven turn
 /// joins the same group, the redriven turn's terminal idle seals it, and
 /// settlement covers BOTH children with a single aggregated wake.
 #[tokio::test]
@@ -15848,7 +16126,7 @@ async fn queue_retraction_synthesized_idle_seals_group() {
 }
 
 /// monorepo#1483 regression: a coordinator that owns an ACTIVE background
-/// hook still seals its open after_all group when it goes queue-idle — the
+/// hook still seals its open `after_all` group when it goes queue-idle — the
 /// hook-waiting classification defers only the agent's own settlement as a
 /// child, never the parent-side seal. Once every child settles, the
 /// aggregated wake is claimed and delivered and the group is removed.
@@ -15969,7 +16247,7 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
 }
 
 /// monorepo#1483 regression, PR-monitor variant: a coordinator that owns an
-/// ACTIVE PR monitor still seals its open after_all group when it goes
+/// ACTIVE PR monitor still seals its open `after_all` group when it goes
 /// queue-idle — the pr-monitor-waiting classification defers only the
 /// agent's own settlement as a child, never the parent-side seal. Mirrors
 /// `hook_owning_parent_idle_seals_group_and_wake_delivers`.
@@ -16095,7 +16373,7 @@ async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
 }
 
 /// monorepo#1945 regression: a grouped child whose terminal idle carries a
-/// completionReport (set via `agent.reportToParent`) settles its after_all
+/// completionReport (set via `agent.reportToParent`) settles its `after_all`
 /// group DESPITE owning an active PR monitor — the report is the child's
 /// explicit completion signal, so the pr-monitor-waiting deferral must not
 /// starve the parent's aggregated wake (the merge decision the withheld wake
@@ -16159,7 +16437,7 @@ async fn completion_report_idle_settles_group_despite_active_pr_monitor() {
 }
 
 /// monorepo#1945, hook variant: a grouped child whose terminal idle carries a
-/// completionReport settles its after_all group despite owning an active
+/// completionReport settles its `after_all` group despite owning an active
 /// background hook, and settlement leaves the hook armed.
 #[tokio::test]
 async fn completion_report_idle_settles_group_despite_active_hook() {
@@ -16300,7 +16578,7 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
     assert_eq!(svc.active_pr_monitors_for_agent(&b).await.len(), 1);
 }
 
-/// monorepo#1945, group-rehydration path: a RuntimeIdle child with a
+/// monorepo#1945, group-rehydration path: a `RuntimeIdle` child with a
 /// persisted completionReport and an active PR monitor IS recorded at
 /// rehydration — the sealed group fires instead of starving until the
 /// monitor terminates; the persisted monitor row stays active.
@@ -16371,7 +16649,7 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
 }
 
 /// monorepo#1945, watch-rehydration path: a rehydrated watch on a child that
-/// is RuntimeIdle with a persisted completionReport and an active PR monitor
+/// is `RuntimeIdle` with a persisted completionReport and an active PR monitor
 /// DOES refire at boot — the report bypasses the pr-monitor-waiting deferral,
 /// and the monitor row stays active.
 #[tokio::test]
@@ -16529,7 +16807,7 @@ async fn rearm_after_report_resets_report_delivered_and_fires_next_idle() {
 }
 
 /// monorepo#2532 Gap B (`agent.watch` call site): a registration-time
-/// reconcile against a reported, RuntimeIdle child that still owns an ACTIVE
+/// reconcile against a reported, `RuntimeIdle` child that still owns an ACTIVE
 /// hook must DEFER — no instant synthetic wake with the stale report; the
 /// watch stays armed with the interim-skip marker recorded, and the hook's
 /// terminal-transition backstop settles it.
@@ -16635,6 +16913,446 @@ async fn wait_for_reconcile_defers_on_reported_idle_child_with_active_monitor() 
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "settled watch retired"
+    );
+}
+
+/// monorepo#2972 (settled flavor): `agent.watch` on a `RuntimeIdle` target
+/// with a persisted completion report and NO waiting reasons (no hooks, PR
+/// monitors, queued messages, outgoing watches, or interrupted row) is
+/// rejected with an actionable error — pre-fix the registration-time
+/// reconcile fired an instant synthetic wake replaying the stale report.
+#[tokio::test]
+async fn agent_watch_rejects_settled_idle_target_with_no_waiting_reasons() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("done a while ago".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+
+    let err = svc
+        .agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect_err("idle target with no waiting reasons must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => {
+            assert!(msg.contains(&target.0), "error names the target: {msg}");
+            assert!(
+                msg.contains("agent.send") && msg.contains("wakeOrCreate"),
+                "error points at the wake alternatives: {msg}"
+            );
+        }
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "rejection is side-effect free — no watch registered"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant synthetic wake replaying the stale report"
+    );
+}
+
+/// monorepo#2972 (dead-watch flavor): `agent.watch` on a `RuntimeIdle` target
+/// WITHOUT a completion report and no waiting reasons is rejected too —
+/// pre-fix the conservative reconcile left the watch permanently armed for
+/// a completion that could never come (observed live: watch a173ced6, armed
+/// 25+ hours on a long-idle agent).
+#[tokio::test]
+async fn agent_watch_rejects_unreported_idle_target_with_no_waiting_reasons() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+
+    let err = svc
+        .agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect_err("unreported idle target with no waiting reasons must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}"
+    );
+    assert!(
+        svc.list_watches_for_parent(&watcher).is_empty(),
+        "no permanently-armed dead watch left behind"
+    );
+}
+
+/// monorepo#2972 (`app.agents.waitFor` call site): the same idle-target
+/// guard rejects BOTH modes, side-effect free — no watches (not even for a
+/// valid co-target listed first) and no group.
+#[tokio::test]
+async fn app_agents_wait_rejects_idle_target_with_no_waiting_reasons() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let live = create_agent(&svc, &ws, "Live").await;
+    let idle = create_agent(&svc, &ws, "Idle").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&idle)
+        .await
+        .expect("idle session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("finished earlier".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark idle");
+
+    for mode in [None, Some("after_all".to_string())] {
+        let err = svc
+            .app_agents_wait_op(
+                ws.clone(),
+                caller.clone(),
+                vec![live.0.clone(), idle.0.clone()],
+                mode.clone(),
+            )
+            .await
+            .expect_err("waitFor including an idle no-waiting-reason target must be rejected");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&idle.0),
+                "error names the offending target: {msg}"
+            ),
+            other => panic!("expected Error::InvalidParams, got {other:?}"),
+        }
+        assert!(
+            svc.list_watches_for_parent(&caller).is_empty(),
+            "rejection leaves no watches (not even for the valid live target)"
+        );
+        assert!(
+            svc.delegation_group_for_parent(&caller).is_none(),
+            "rejection leaves no partially-initialized group"
+        );
+    }
+}
+
+/// monorepo#2972 guard boundary: a `RuntimeIdle` target whose pending message
+/// queue holds a ready-to-send entry WILL run again — the registration is
+/// accepted, no instant wake fires (the queue-interim classification defers
+/// the settled replay), and the watch stays armed for the real completion.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_queued_message() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("reported before the queue filled".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.enqueue_message(
+        &target,
+        "follow-up work".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("queued-message target is accepted");
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant synthetic wake — the queued message defers the replay"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed for the redriven turn's real completion"
+    );
+}
+
+/// monorepo#2972 guard boundary: an idle target with an unresolved attention
+/// request (blocker/discussion) is waiting on user input, not settled — the
+/// registration is accepted and the watch stays armed.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_pending_attention() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.store()
+        .set_attention_request(&ws, &target, "blocker", "sandbox exploded", &now_iso())
+        .await
+        .expect("set attention request");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("attention-pending target is accepted");
+    assert_eq!(parent_message_count(&svc, &watcher).await, 0);
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed until the blocker resolves and the agent completes"
+    );
+}
+
+/// monorepo#2972 guard boundary: an idle target with an interrupted row is
+/// mid-heal — the resume sweep will run it again, so the registration is
+/// accepted and defers (the settled predicate already excludes interrupted
+/// rows, so no instant wake fires either).
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_interrupted_row() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("interrupted mid-cycle".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.store()
+        .insert_interrupted_agent(&target, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("interrupted target is accepted");
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant wake — the interrupted row blocks the settled predicate"
+    );
+    assert_eq!(svc.find_watches_for_child(&target).len(), 1);
+}
+
+/// monorepo#2972 guard boundary: an idle target parked on a live
+/// `ws.event.subscribe` subscription is woken by matching events and will
+/// produce a real completion — same accept-and-defer shape as an active
+/// hook, so the registration is accepted.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_event_subscription() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("parked on events".into());
+    s.completion_report_timestamp = Some(now_iso());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+    svc.register_event_subscription(
+        &ws,
+        Some(target.clone()),
+        &["file:*".to_string()],
+        None,
+        None,
+    )
+    .await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("event-subscribed target is accepted");
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed for the event-driven turn's real completion"
+    );
+}
+
+/// monorepo#2972 guard boundary: an idle target holding pending structured
+/// questions is parked on user input that will run it when answered — same
+/// waiting shape as an attention request, so the registration is accepted.
+#[tokio::test]
+async fn agent_watch_accepts_idle_target_with_pending_question() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let question_block = json!({
+        "type": "resource",
+        "resource": {
+            "mimeType": intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+            "uri": "intent-question://q-guard",
+            "text": "{}"
+        }
+    });
+    let msg = svc
+        .store()
+        .append_agent_message(&target, "assistant", &json!([question_block]), &now_iso())
+        .await
+        .expect("append question message");
+    svc.record_pending_questions_marker(&ws, &target, &msg.id)
+        .await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("question-holding target is accepted");
+    assert_eq!(
+        svc.find_watches_for_child(&target).len(),
+        1,
+        "watch stays armed until the answer runs the target to a real completion"
+    );
+}
+
+/// monorepo#2972 gate ordering: a non-chief caller naming a cross-workspace
+/// dead-idle target fails on scope ALONE at both call sites — the scope
+/// error, not the idle-guard error, so the guard cannot leak a foreign
+/// agent's idle/nothing-pending state.
+#[tokio::test]
+async fn watch_scope_gate_precedes_idle_target_guard() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let caller = create_agent(&svc, &ws_a, "Caller").await;
+    let remote = create_agent(&svc, &ws_b, "Remote").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&remote)
+        .await
+        .expect("remote session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("settled elsewhere".into());
+    svc.store()
+        .update_agent_session(&ws_b, &s)
+        .await
+        .expect("mark remote");
+
+    let watch_err = svc
+        .agent_watch_op(ws_a.clone(), caller.clone(), remote.clone())
+        .await
+        .expect_err("cross-workspace watch rejected");
+    match &watch_err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("cross-workspace") && !msg.contains("nothing pending"),
+            "agent.watch fails on scope alone, not the idle guard: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+
+    let wait_err = svc
+        .app_agents_wait_op(ws_a.clone(), caller.clone(), vec![remote.0.clone()], None)
+        .await
+        .expect_err("cross-workspace wait rejected");
+    match &wait_err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("cross-workspace") && !msg.contains("nothing pending"),
+            "app.agents.waitFor fails on scope alone, not the idle guard: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// monorepo#2972 rehydration parity: the idle-target guard applies ONLY at
+/// explicit registration. A watch armed while the target was still working
+/// and rehydrated after a restart with the target parked `RuntimeIdle` +
+/// report (no waiting reasons) still fires its missed wake at boot — report
+/// = settlement semantics unchanged.
+#[tokio::test]
+async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (watcher, target) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let watcher = create_agent(&svc, &ws, "Watcher").await;
+        let target = create_agent(&svc, &ws, "Target").await;
+        // Registered while the target is still un-run (guard passes), then
+        // the target settles and the daemon dies before the wake delivers.
+        svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+            .await
+            .expect("watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        let mut s = svc
+            .store()
+            .get_agent_session(&target)
+            .await
+            .expect("target session");
+        s.status = intent_core::AgentStatus::RuntimeIdle;
+        s.completion_report = Some("finished while daemon was down".into());
+        s.completion_report_timestamp = Some(now_iso());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark target");
+        (watcher, target)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &watcher).await,
+        1,
+        "missed wake still delivers at boot — rehydration semantics unchanged"
+    );
+    let text = parent_messages_text(&restarted, &watcher).await;
+    assert!(text.contains("finished while daemon was down"), "{text}");
+    assert!(
+        restarted.find_watches_for_child(&target).is_empty(),
+        "reconciled watch consumed"
     );
 }
 
@@ -16943,7 +17661,7 @@ async fn cancel_subscriptions_drops_waiting_without_display_status_event() {
     assert_display_status_silent(&mut sub).await;
 }
 
-/// `reportToParent` from a child enrolled in an undelivered after_all group is
+/// `reportToParent` from a child enrolled in an undelivered `after_all` group is
 /// suppressed: no immediate parent message, the report is still persisted, and
 /// it reaches the parent only inside the single aggregated wake (as that
 /// child's `Report:` line).
@@ -17146,7 +17864,7 @@ async fn request_attention_transitions_linked_task_per_kind() {
                 Some(parent.clone()),
                 Some(note_id.clone()),
                 false,
-                Default::default(),
+                AgentCreateExtra::default(),
             )
             .await
             .expect("create child");
@@ -17200,7 +17918,7 @@ async fn request_attention_repeat_at_target_status_does_not_churn_note() {
             Some(parent.clone()),
             Some(note_id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -17272,7 +17990,7 @@ async fn request_attention_does_not_overwrite_terminal_task_status() {
             None,
             Some(note_id.clone()),
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -17710,12 +18428,12 @@ async fn wait_for_group_children(
 }
 
 /// One joined service-level integration test that drives the full
-/// auto-subscription loop through the real spawn_completion_delivery_loop worker
-/// and the EventBus publish path (not handle_completion_event directly):
+/// auto-subscription loop through the real `spawn_completion_delivery_loop` worker
+/// and the `EventBus` publish path (not `handle_completion_event` directly):
 ///   (a) an immediate delegate registers an ungrouped watch; the child's agent:idle
 ///       published on the bus wakes the parent exactly once and the watch is
 ///       cleared from the registry;
-///   (b) an after_all group of two children yields no wake until the parent
+///   (b) an `after_all` group of two children yields no wake until the parent
 ///       seals on its own agent:idle and both children complete -- a deleted
 ///       child still counts -- then exactly one aggregated partial wake;
 ///   (c) agent.getSubscriptions / agent.cancelSubscriptions reflect the live
@@ -18188,7 +18906,7 @@ async fn diagnostics_after_all_group_with_responding_children_is_info() {
     assert_eq!(risk["severity"], json!("info"), "risk: {risk}");
 }
 
-/// monorepo#1694: a responding-but-STALE pending child (updated_at beyond the
+/// monorepo#1694: a responding-but-STALE pending child (`updated_at` beyond the
 /// stale threshold) does not qualify for the `info` downgrade — the
 /// stuck-risk stays at the `warning` default.
 #[tokio::test]
@@ -18380,7 +19098,7 @@ async fn agent_get_session_projects_full_session_shape() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -18571,7 +19289,7 @@ async fn agent_update_model_change_clears_resolved_model() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create");
@@ -18807,13 +19525,24 @@ async fn agent_edit_truncate_drops_edited_message_and_tail() {
         json!("first question")
     );
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_UPDATED
-        && e.data["truncatedCount"] == json!(2)
-        && e.data["remainingCount"] == json!(2)));
+    // Marker reconciliation can emit the marker-aware empty clear before the
+    // truncate summary. An unbatched subscription delivers those as separate
+    // batches, so wait for the event this assertion owns instead of assuming
+    // it is in the first batch.
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let batch = sub.recv().await.expect("open");
+            if batch.iter().any(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["truncatedCount"] == json!(2)
+                    && e.data["remainingCount"] == json!(2)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("truncate summary event");
 }
 
 /// Truncating at the FIRST user message empties the transcript.
@@ -18991,7 +19720,7 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create old");
@@ -19004,7 +19733,7 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create new");
@@ -19045,7 +19774,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create live");
@@ -19058,7 +19787,7 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create stale");
@@ -19168,7 +19897,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create prev");
@@ -19329,7 +20058,10 @@ async fn setup_with_manager() -> (
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
+    let registry = test_registry_with_default_provider(&tmp);
+    let services = Services::new(store)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
     let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus.clone()));
     let manager = Arc::new(crate::agent_manager::AgentManager::new(
         services.clone(),
@@ -19559,7 +20291,7 @@ async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
 /// coordination messages (triggering SUB-1 auto-watch), the parent should receive exactly
 /// ONE aggregated wake (not individual wakes + aggregated).
 ///
-/// Repro: parent delegates 2 children with after_all, triggers SUB-1 watch registration
+/// Repro: parent delegates 2 children with `after_all`, triggers SUB-1 watch registration
 /// for each (simulating sendToTask/agent.send), both children complete.
 /// Before fix: parent received individual wake for child A, aggregated "All 2 settled"
 /// wake, AND duplicate individual wake for child B.
@@ -19703,9 +20435,10 @@ async fn sub1_sendtotask_after_all_no_duplicate_wake() {
             break;
         }
         attempts += 1;
-        if attempts > 100 {
-            panic!("Timeout waiting for aggregated wake content in transcript");
-        }
+        assert!(
+            attempts <= 100,
+            "Timeout waiting for aggregated wake content in transcript"
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
@@ -19807,7 +20540,7 @@ async fn agent_ops_reject_cross_workspace_bare_id_probes() {
 
 /// Store-layer defense-in-depth: even if an op-layer guard were bypassed, the
 /// UPDATE/DELETE queries scope by `(id, workspace_id)` so a mutation issued
-/// with the wrong workspace_id affects zero rows and surfaces `NotFound`.
+/// with the wrong `workspace_id` affects zero rows and surfaces `NotFound`.
 #[tokio::test]
 async fn agent_store_mutations_reject_cross_workspace_writes() {
     let (_t, svc, ws_a) = setup().await;
@@ -19881,12 +20614,12 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
 /// recreate observes zero ghost agents and no residual event traffic.
 #[tokio::test]
 async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state() {
-    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let (tmp, svc, ws, bus) = setup_with_bus().await;
     // The delete path walks `workspaces_root` to unlink the daemon-owned
     // workspace dir; pin a hermetic tempdir so it never falls through to the
     // real user home. The dir need not exist — `remove_dir_all` swallows
     // `NotFound`.
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let a = create_agent(&svc, &ws, "Alpha").await;
     let b = create_agent(&svc, &ws, "Beta").await;
     let c = create_agent(&svc, &ws, "Gamma").await;
@@ -19981,8 +20714,8 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
 /// the same event delivers nothing (no duplicate wake).
 #[tokio::test]
 async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
-    let (_t, svc, ws) = setup().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief_ws, "Chief").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -20048,14 +20781,14 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     assert_eq!(parent_session.messages.len(), 1, "duplicate wake delivered");
 }
 
-/// monorepo#463 regression: a chief-anchored after_all group expecting a child
+/// monorepo#463 regression: a chief-anchored `after_all` group expecting a child
 /// in the deleted workspace records that child in `deleted_agent_ids` at
 /// delete time (no bus wired, no restart needed), and the grouped watch no
 /// longer references the deleted workspace as its child side.
 #[tokio::test]
 async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
-    let (_t, svc, ws) = setup().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief_ws, "Chief").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -20095,8 +20828,8 @@ async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
 /// settles.
 #[tokio::test]
 async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
-    let (_t, svc, ws, bus) = setup_with_bus().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws, bus) = setup_with_bus().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let chief_ws = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief_ws, "Chief").await;
     let child = create_agent(&svc, &ws, "Child").await;
@@ -20141,8 +20874,8 @@ async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
 /// groups that live entirely in another workspace are untouched.
 #[tokio::test]
 async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
-    let (_t, svc, ws_a) = setup().await;
-    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let (tmp, svc, ws_a) = setup().await;
+    let svc = svc.with_workspaces_root(tmp.path.with_extension("workspaces"));
     let ws_b = WorkspaceId::new();
     svc.store()
         .insert_workspace(&workspace(&ws_b))
@@ -20215,7 +20948,7 @@ async fn clear_completion_report_on_turn_begin() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -20322,7 +21055,7 @@ async fn clear_attention_request_on_next_message() {
     assert!(!cleared, "no request on second clear");
 }
 
-/// `agent_send_message_op` (store-only fallback when no AgentManager is attached)
+/// `agent_send_message_op` (store-only fallback when no `AgentManager` is attached)
 /// emits `agent:message` with the persisted row's id.
 #[tokio::test]
 async fn agent_send_message_emits_agent_message_event() {
@@ -20362,7 +21095,7 @@ async fn agent_send_message_emits_agent_message_event() {
 }
 
 /// `agent_send_queued_message_now_op` (store-only fallback when no
-/// AgentManager is attached) emits `agent:message` with the persisted row's
+/// `AgentManager` is attached) emits `agent:message` with the persisted row's
 /// id (the queue entry's own id).
 #[tokio::test]
 async fn agent_send_queued_message_now_emits_agent_message_event() {
@@ -21355,7 +22088,7 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
     assert!(persisted_queue(&svc, &target).await.is_empty());
     {
         let guard = svc.agent_queues.lock().unwrap();
-        assert!(guard.get(&target).is_none_or(|q| q.is_empty()));
+        assert!(guard.get(&target).is_none_or(std::vec::Vec::is_empty));
         let parked = guard.get(&poisoned).expect("still parked");
         assert_eq!(parked.len(), 2);
         assert_eq!(parked[0].id, "m-0");
@@ -21757,7 +22490,7 @@ async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
             Some(parent.clone()),
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create child");
@@ -22010,7 +22743,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
             None,
             None,
             false,
-            Default::default(),
+            AgentCreateExtra::default(),
         )
         .await
         .expect("create prev");
@@ -22218,7 +22951,7 @@ async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
     ));
 }
 
-/// monorepo#847: NotFound and soft-Deleted stale assignments keep the
+/// monorepo#847: `NotFound` and soft-Deleted stale assignments keep the
 /// cleanup-only behavior — stripped and reported, but never run through
 /// migration/GC (the soft-Deleted row and its parked queue survive).
 #[tokio::test]
@@ -22593,7 +23326,7 @@ async fn watch_registration_resets_failure_wake_dedup_for_pair() {
 }
 
 /// monorepo#840 (PR #573 review): `agent.delete` clears failure-wake dedup
-/// records naming the deleted agent in EITHER role, so (deleted_parent,
+/// records naming the deleted agent in EITHER role, so (`deleted_parent`,
 /// child) entries don't leak; and `agent.retry`'s dedup clear is exercised
 /// via the helper (`clear_failure_wake_dedup`) semantics.
 #[tokio::test]
@@ -22621,7 +23354,7 @@ async fn delete_clears_failure_wake_dedup_in_both_roles() {
     );
 }
 
-/// Simulate a completed CoW clone (on-disk dir + store record) for
+/// Simulate a completed `CoW` clone (on-disk dir + store record) for
 /// `settle_provisioned_sandbox` tests: the real `provision_sandbox` needs a
 /// CoW-capable filesystem, but settlement only needs the artifacts.
 async fn fake_provisioned_sandbox(
@@ -23567,7 +24300,7 @@ async fn stall_annotation_skipped_for_agent_failed() {
     assert!(!text.contains(STALL_MARKER), "no stall annotation: {text}");
 }
 
-/// Grouped after_all path: a suspected-stall child's per-child line in the
+/// Grouped `after_all` path: a suspected-stall child's per-child line in the
 /// aggregated wake carries the annotation, and the aggregated metadata lifts
 /// `stallSuspected: true` from the annotated raw event.
 #[tokio::test]
@@ -23763,7 +24496,7 @@ async fn stall_annotation_skipped_when_task_review_required() {
 /// `completionReport` means the child DID report — the wake must carry
 /// neither the contradictory "No completion report … may have stalled" tail
 /// nor the machine-readable `stallSuspected` metadata, in both the
-/// standalone wake and the grouped after_all per-child line.
+/// standalone wake and the grouped `after_all` per-child line.
 #[tokio::test]
 async fn stall_tail_never_contradicts_rendered_report() {
     let (_t, svc, ws) = setup().await;
@@ -23985,6 +24718,190 @@ async fn truncation_redrive_counter_and_handoff_semantics() {
         !svc.take_truncation_redrive(&agent),
         "the take consumed the flag"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Empty harness-wake recovery (intent-hq/monorepo#3262)
+// ---------------------------------------------------------------------------
+
+/// The empty-response classifier: whitespace-only text/thinking blocks (the
+/// incident's single bare newline) classify as empty; any meaningful text,
+/// tool block, or resource block does not.
+#[test]
+fn harness_wake_empty_response_classifier() {
+    use crate::agent_session::harness_wake_response_is_empty;
+    // The incident shape: one text block containing "\n".
+    assert!(harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "\n" })
+    ]));
+    assert!(harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "  \n\t" }),
+        json!({ "type": "thinking", "id": "b1", "text": "" }),
+    ]));
+    // Meaningful text is not empty.
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "resuming the plan" })
+    ]));
+    // Tool blocks always count as meaningful (no `text` field is NOT
+    // whitespace-only-text).
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "tool_use", "id": "t0", "name": "view", "input": {} })
+    ]));
+    // Question/resource blocks count as meaningful.
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "resource", "resource": { "uri": "intent-question://q-1" } })
+    ]));
+    // Mixed: one meaningful block rescues the burst.
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "\n" }),
+        json!({ "type": "tool_use", "id": "t0", "name": "view", "input": {} }),
+    ]));
+}
+
+/// The recovery's attention arm: a ROOT (non-delegated) agent whose wake
+/// produced nothing gets a `"blocker"` attention request with the harness's
+/// turn-ended-unexpectedly reason — the workspace shows `needs_attention`
+/// instead of looking healthy.
+#[tokio::test]
+async fn empty_wake_recovery_raises_attention_for_root_agent() {
+    let (_t, svc, ws) = setup().await;
+    let root = create_agent(&svc, &ws, "Coordinator").await;
+
+    let nudged = svc.recover_empty_harness_wake(&root, &ws).await;
+    assert!(!nudged, "root agents are not redrive-eligible — no nudge");
+
+    let session = svc.store().get_agent_session(&root).await.expect("session");
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "attention request persisted"
+    );
+    assert_eq!(
+        session.attention_request_reason.as_deref(),
+        Some(
+            crate::harness::latest()
+                .empty_wake_attention_reason()
+                .as_str()
+        ),
+        "reason is the harness's turn-ended-unexpectedly text"
+    );
+    assert!(
+        !svc.has_ready_to_send(&root),
+        "no recovery nudge enqueued for the attention arm"
+    );
+}
+
+/// The recovery's redrive arm: a delegated in-task agent gets the harness's
+/// empty-wake nudge enqueued (tagged `{"type": "empty_wake_redrive"}`)
+/// instead of an attention request — bounded by the shared consecutive
+/// counter, past which the attention arm takes over.
+#[tokio::test]
+async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
+    use crate::agent_session::MAX_CONSECUTIVE_TRUNCATION_REDRIVES;
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
+    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    s.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("link parent");
+
+    assert!(
+        svc.recover_empty_harness_wake(&child, &ws).await,
+        "eligible child gets the recovery nudge"
+    );
+    let entry = svc
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&child)
+        .and_then(|q| q.first().cloned())
+        .expect("nudge enqueued");
+    assert_eq!(
+        entry.content,
+        crate::harness::latest().empty_wake_redrive_nudge(),
+        "nudge text comes from the harness surface"
+    );
+    assert_eq!(
+        entry.message_metadata,
+        Some(json!({ "type": "empty_wake_redrive" })),
+        "nudge row is attributable"
+    );
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(
+        session.attention_request_kind.is_none(),
+        "redrive arm raises no attention"
+    );
+
+    // Drain the queue between calls (a ready-to-send entry short-circuits
+    // the recovery) and spend the shared consecutive counter.
+    svc.agent_queues.lock().unwrap().remove(&child);
+    for _ in 1..MAX_CONSECUTIVE_TRUNCATION_REDRIVES {
+        assert!(
+            svc.recover_empty_harness_wake(&child, &ws).await,
+            "still within the consecutive cap"
+        );
+        svc.agent_queues.lock().unwrap().remove(&child);
+    }
+    // Cap spent: the next empty wake falls through to the attention arm.
+    assert!(
+        !svc.recover_empty_harness_wake(&child, &ws).await,
+        "cap spent — no further nudges"
+    );
+    assert!(
+        !svc.has_ready_to_send(&child),
+        "no nudge enqueued past the cap"
+    );
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "cap exhaustion surfaces the attention request"
+    );
+}
+
+/// The recovery's skip guards: a ready-to-send queue entry (the imminent
+/// drain is itself the nudge) and an already-pending attention request both
+/// short-circuit — no nudge, no stacked attention.
+#[tokio::test]
+async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
+    let (_t, svc, ws) = setup().await;
+
+    // Ready-to-send entry → skip entirely.
+    let queued = create_agent(&svc, &ws, "Queued").await;
+    svc.enqueue_message(
+        &queued,
+        "pending user prompt".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    assert!(!svc.recover_empty_harness_wake(&queued, &ws).await);
+    let session = svc.store().get_agent_session(&queued).await.expect("s");
+    assert!(
+        session.attention_request_kind.is_none(),
+        "imminent drain suppresses the recovery"
+    );
+
+    // Pending attention request → skip (do not stack a second request).
+    let raised = create_agent(&svc, &ws, "Raised").await;
+    svc.store()
+        .set_attention_request(&ws, &raised, "discussion", "waiting on input", &now_iso())
+        .await
+        .expect("seed attention");
+    assert!(!svc.recover_empty_harness_wake(&raised, &ws).await);
+    let session = svc.store().get_agent_session(&raised).await.expect("s");
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("discussion"),
+        "existing request left untouched"
+    );
+    assert!(!svc.has_ready_to_send(&raised), "no nudge enqueued");
 }
 
 // ---------------------------------------------------------------------------
@@ -24385,6 +25302,80 @@ async fn dismiss_questions_fails_closed() {
 /// A `question_answers` `messageMetadata` tag naming `answered`.
 fn answer_metadata(answered: &str) -> serde_json::Value {
     json!({ "type": "question_answers", "answeredQuestionsMessageId": answered })
+}
+
+/// The client-visible, transcript-free projections and their update
+/// invalidations preserve all marker states: absent for legacy sessions,
+/// non-empty while pending, and written-empty after a matching answer.
+#[tokio::test]
+async fn pending_marker_projects_on_list_get_and_update_events() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    let legacy_get = svc
+        .agent_get_op(id.clone(), None)
+        .await
+        .expect("legacy get");
+    assert_eq!(legacy_get.metadata.pending_questions_message_id, None);
+    let legacy_list = svc.agent_list_op(ws.clone()).await.expect("legacy list");
+    assert_eq!(legacy_list[0].metadata.pending_questions_message_id, None);
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let asked = svc
+        .agent_append_message_op(id.clone(), "assistant".into(), question_blocks(), None)
+        .await
+        .expect("append question");
+    let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
+    let set_event = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("set event timed out")
+        .expect("subscription closed");
+    assert_eq!(set_event[0].data["pendingQuestionsMessageId"], asked_id);
+
+    let set_get = svc.agent_get_op(id.clone(), None).await.expect("set get");
+    assert_eq!(
+        set_get.metadata.pending_questions_message_id.as_deref(),
+        Some(asked_id.as_str())
+    );
+    let set_list = svc.agent_list_op(ws.clone()).await.expect("set list");
+    assert_eq!(
+        set_list[0].metadata.pending_questions_message_id.as_deref(),
+        Some(asked_id.as_str())
+    );
+
+    svc.agent_append_message_op(
+        id.clone(),
+        "user".into(),
+        json!([{ "type": "text", "text": "Q: x\nA: y" }]),
+        Some(answer_metadata(&asked_id)),
+    )
+    .await
+    .expect("append answer");
+    let clear_event = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("clear event timed out")
+        .expect("subscription closed");
+    assert_eq!(clear_event[0].data["pendingQuestionsMessageId"], "");
+
+    let cleared_get = svc
+        .agent_get_op(id.clone(), None)
+        .await
+        .expect("cleared get");
+    assert_eq!(
+        cleared_get.metadata.pending_questions_message_id.as_deref(),
+        Some("")
+    );
+    let cleared_list = svc.agent_list_op(ws).await.expect("cleared list");
+    assert_eq!(
+        cleared_list[0]
+            .metadata
+            .pending_questions_message_id
+            .as_deref(),
+        Some("")
+    );
 }
 
 /// The marker is written on a question-bearing append, is OVERWRITTEN (not
@@ -25615,7 +26606,7 @@ async fn delegate_occupied_task_rejected_unless_forced() {
     );
 }
 
-/// Stale (NotFound), soft-Deleted, and poisoned assignees do NOT count as
+/// Stale (`NotFound`), soft-Deleted, and poisoned assignees do NOT count as
 /// occupancy — a new delegate still succeeds without `force`.
 #[tokio::test]
 async fn delegate_with_only_dead_assignees_succeeds_without_force() {
@@ -25733,7 +26724,8 @@ async fn assign_agent_occupancy_guard_and_idempotent_reassign() {
 // agent.watch / agent.unwatch (monorepo#1229): explicit watches
 // ===========================================================================
 
-/// `agent.watch` registers a wake_on_attention watch; like every ungrouped
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+/// `agent.watch` registers a `wake_on_attention` watch; like every ungrouped
 /// watch it is deliver-once — the `agent:idle` wake retires it, and a second
 /// idle with no re-arm delivers nothing.
 #[tokio::test]
@@ -26236,8 +27228,9 @@ async fn agent_watch_unwatch_validation_and_removal() {
     ));
 }
 
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
 /// Restart durability: an explicit watch survives daemon restart with its
-/// wake_on_attention flag intact.
+/// `wake_on_attention` flag intact.
 #[tokio::test]
 async fn agent_watch_rehydrates_with_flags_after_restart() {
     let tmp = TempDb::new();
@@ -26992,6 +27985,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
                     task_note_id: note_id.clone(),
                     specialist: None,
                     model: None,
+                    provider: None,
                     reasoning_effort: None,
                     agent_instructions: Some("do it my way".into()),
                 })]),
@@ -27241,6 +28235,12 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
     let (_t, svc, ws) = setup().await;
     let plain = seed_task(&svc, &ws, "Plain").await;
     let custom = seed_task(&svc, &ws, "Custom").await;
+    // The top-level compound `model` default is availability-gated up front
+    // (monorepo#3178); satisfy mock's env gate so the batch proceeds.
+    let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+        "MOCK_AGENT_SCRIPT_PATH",
+        "/tmp/does-not-need-to-exist.js",
+    )]);
 
     let resp = svc
         .agent_delegate_op(
@@ -27252,6 +28252,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
                         task_note_id: custom.clone(),
                         specialist: Some("verifier".into()),
                         model: Some("mock:override".into()),
+                        provider: None,
                         reasoning_effort: Some("high".into()),
                         agent_instructions: None,
                     }),
@@ -27344,7 +28345,7 @@ use crate::agent_ops::ready_delta::{UNBLOCKED_SECTION_PREFIX, UNBLOCKED_TRIGGER_
 
 /// A task-linked child's genuine `agent:idle` completion stamps ONLY the
 /// trigger task id on the wake metadata (no unblocked enumeration at enqueue),
-/// and the store-only delivery path (no AgentManager attached — delivery IS
+/// and the store-only delivery path (no `AgentManager` attached — delivery IS
 /// the persist) resolves the section fresh: the dependent task's row names it
 /// with an `intent://local/task/` link and the deps-satisfied reason.
 #[tokio::test]
@@ -27591,7 +28592,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
     );
 }
 
-/// after_all aggregated wake: every idle-settled task-linked member
+/// `after_all` aggregated wake: every idle-settled task-linked member
 /// contributes its trigger id to the group wake's metadata (the enumeration
 /// still resolves at delivery).
 #[tokio::test]
@@ -27942,7 +28943,7 @@ async fn report_to_parent_wake_stamps_and_consumes_flips() {
     );
 }
 
-/// after_all aggregated wake: a settled member's flipped completions are
+/// `after_all` aggregated wake: a settled member's flipped completions are
 /// captured (and consumed) at group RECORD time and survive into the
 /// aggregated wake's trigger stamp alongside every member's own task.
 #[tokio::test]
@@ -28026,7 +29027,7 @@ async fn group_wake_includes_flipped_completion_triggers() {
 }
 
 /// The no-manager `agent.sendQueuedMessageNow` path (question-hold park →
-/// explicit send with no AgentManager attached) resolves the unblocked
+/// explicit send with no `AgentManager` attached) resolves the unblocked
 /// section at persist time — parity with the manager path and the store-only
 /// `deliver_parent_wake` branch.
 #[tokio::test]
@@ -28086,13 +29087,12 @@ async fn no_manager_send_now_resolves_unblocked_section() {
 }
 
 /// `agentFeatures.taskGraph` gates the advisory section
-/// (intent-hq/monorepo#2445): with the toggle at its default (off), the same
-/// trigger stamp that would render a section yields `None` — the wake
-/// delivers unannotated. The default-off value is captured when the session is
-/// created.
+/// (intent-hq/monorepo#2445): with the toggle opted out, the same trigger
+/// stamp that would render a section yields `None` — the wake delivers
+/// unannotated. The opted-out value is captured when the session is created.
 #[tokio::test]
 async fn task_graph_off_suppresses_unblocked_section() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _registry, _config) = setup_with_task_graph(false).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let done = seed_task(&svc, &ws, "Done task").await;
     let gated = seed_task(&svc, &ws, "Gated task").await;
@@ -28111,7 +29111,7 @@ async fn task_graph_off_suppresses_unblocked_section() {
         svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
-        "taskGraph off (the default) must suppress the section"
+        "taskGraph off must suppress the section"
     );
 }
 

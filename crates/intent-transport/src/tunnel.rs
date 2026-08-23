@@ -180,6 +180,7 @@ impl std::error::Error for FrameError {}
 
 impl Frame {
     /// The stream this frame belongs to.
+    #[must_use]
     pub fn stream_id(&self) -> u32 {
         match self {
             Self::Open { stream_id, .. }
@@ -192,6 +193,7 @@ impl Frame {
     }
 
     /// Encode into the `[opcode u8][streamId u32 BE][payload]` wire form.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         fn build(opcode: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -215,6 +217,14 @@ impl Frame {
     /// Decode one wire frame. Rejects short buffers, unknown opcodes, wrong
     /// `OPEN` payload sizes, payloads on payload-less opcodes, and non-UTF-8
     /// `OPEN_ERR` messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FrameError`] for short buffers, unknown opcodes, wrong `OPEN` payload sizes, payloads on payload-less opcodes, or non-UTF-8 `OPEN_ERR` messages.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: the header slice converted into the stream-id array is always exactly 4 bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         if bytes.len() < HEADER_LEN {
             return Err(FrameError::TooShort);
@@ -286,7 +296,6 @@ pub(crate) async fn run_tunnel_connection<S>(
     loop {
         tokio::select! {
             incoming = stream.next() => match incoming {
-                None => break,
                 Some(Err(e)) => {
                     // Over-limit inbound message/frame: tell the client why
                     // with a 1009 close, mirroring the `/ws` connection loop.
@@ -330,7 +339,7 @@ pub(crate) async fn run_tunnel_connection<S>(
                     }
                 }
                 Some(Ok(Message::Pong(_))) => last_pong.store(now_ms(), Ordering::Relaxed),
-                Some(Ok(Message::Close(_))) => break,
+                None | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(Message::Text(_))) => {
                     protocol_close(&mut sink, "text frames not allowed on /tunnel").await;
                     break;
@@ -510,7 +519,7 @@ where
                     return false;
                 }
             }
-            _ = &mut deadline => {
+            () = &mut deadline => {
                 if let Some(handle) = streams.remove(&stream_id) {
                     handle.abort.abort();
                 }
@@ -626,7 +635,7 @@ async fn run_stream(
                 }
                 None => break,
             },
-            _ = &mut idle => break,
+            () = &mut idle => break,
         }
     }
     let _ = out_tx.send(Frame::Close { stream_id }).await;

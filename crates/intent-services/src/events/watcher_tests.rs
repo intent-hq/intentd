@@ -1,4 +1,4 @@
-//! Integration test for [`FileWatcher`] over a real temp directory + SQLite
+//! Integration test for [`FileWatcher`] over a real temp directory + `SQLite`
 //! store: writing/removing a file under the watched root publishes debounced
 //! `file:*` events (create → `file:created`, delete → `file:deleted`, modify →
 //! `file:changed`) whose payload matches the TS `FileChangedEvent` shape.
@@ -80,7 +80,7 @@ async fn next_for(
                         continue;
                     }
                     match action {
-                        Some(a) if ev.data["action"] != a => continue,
+                        Some(a) if ev.data["action"] != a => {}
                         _ => return Some(ev),
                     }
                 }
@@ -99,15 +99,15 @@ async fn create_and_delete_emit_distinct_file_events() {
 
     let dir = TempDir::new("cd");
     let ws = WorkspaceId::from("ws-1");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
 
     // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let file = dir.path.join("foo.txt");
@@ -149,13 +149,13 @@ async fn ignored_paths_emit_nothing() {
 
     let dir = TempDir::new("ig");
     std::fs::create_dir_all(dir.path.join("node_modules")).expect("mk node_modules");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-1"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("node_modules/dep.js"), b"x").expect("write ignored");
@@ -185,13 +185,13 @@ async fn modifying_pre_existing_file_emits_changed_event() {
     std::fs::write(&file, b"v1").expect("write v1");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-1"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     std::fs::write(&file, b"v2 longer content").expect("write v2");
@@ -223,13 +223,13 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
 
     let dir = TempDir::new("burst");
     let ws = WorkspaceId::from("ws-burst");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Create 150 files rapidly (all within a few ms) so they accumulate in the
@@ -258,7 +258,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         // longer than the overall deadline), then exit. Otherwise keep polling
         // until the deadline.
         let poll_timeout = if seen_burst {
-            Duration::from_millis(1000).min(remaining)
+            Duration::from_secs(1).min(remaining)
         } else {
             remaining
         };
@@ -266,7 +266,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type.starts_with("file:") {
-                        if ev.data.get("burst").and_then(|v| v.as_bool()) == Some(true) {
+                        if ev.data.get("burst").and_then(serde_json::Value::as_bool) == Some(true) {
                             seen_burst = true;
                         }
                         eprintln!(
@@ -285,13 +285,12 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
             }
             Ok(None) => {
                 // Subscription closed unexpectedly
-                if !seen_burst {
-                    panic!(
-                        "Event subscription closed before burst was observed; \
-                         got {} events total",
-                        events.len()
-                    );
-                }
+                assert!(
+                    seen_burst,
+                    "Event subscription closed before burst was observed; \
+                     got {} events total",
+                    events.len()
+                );
                 break;
             }
             Err(_) => {
@@ -325,7 +324,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
     // At least one event should have burst=true indicating coalescing occurred.
     let burst_events: Vec<_> = events
         .iter()
-        .filter(|e| e.data.get("burst").and_then(|v| v.as_bool()) == Some(true))
+        .filter(|e| e.data.get("burst").and_then(serde_json::Value::as_bool) == Some(true))
         .collect();
     assert!(
         !burst_events.is_empty(),
@@ -336,7 +335,11 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
     // Verify burst events report the files they collapsed.
     let total_affected: u64 = burst_events
         .iter()
-        .filter_map(|e| e.data.get("affectedCount").and_then(|v| v.as_u64()))
+        .filter_map(|e| {
+            e.data
+                .get("affectedCount")
+                .and_then(serde_json::Value::as_u64)
+        })
         .sum();
     assert!(
         total_affected >= 50,
@@ -353,13 +356,13 @@ async fn normal_single_file_edit_still_emits_individual_event() {
 
     let dir = TempDir::new("single");
     let ws = WorkspaceId::from("ws-single");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let file = dir.path.join("single.txt");
@@ -392,13 +395,17 @@ async fn drain_file_events(sub: &mut super::bus::Subscription, quiet: Duration) 
 }
 
 fn burst_flag(ev: &Event) -> Option<bool> {
-    ev.data.get("burst").and_then(|v| v.as_bool())
+    ev.data.get("burst").and_then(serde_json::Value::as_bool)
 }
 
 fn affected_sum(events: &[Event]) -> u64 {
     events
         .iter()
-        .filter_map(|e| e.data.get("affectedCount").and_then(|v| v.as_u64()))
+        .filter_map(|e| {
+            e.data
+                .get("affectedCount")
+                .and_then(serde_json::Value::as_u64)
+        })
         .sum()
 }
 
@@ -600,13 +607,13 @@ async fn dedupe_within_window_emits_one_event_per_path() {
 
     let dir = TempDir::new("dedupe");
     let ws = WorkspaceId::from("ws-dedupe");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         ws.clone(),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let file = dir.path.join("dedupe.txt");
@@ -749,13 +756,13 @@ async fn gitignored_generated_dir_is_suppressed() {
     git_init(&dir.path);
     std::fs::write(dir.path.join(".gitignore"), ".svelte-kit/\n").expect("write .gitignore");
     std::fs::create_dir_all(dir.path.join(".svelte-kit/output")).expect("mk .svelte-kit");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join(".svelte-kit/output/x.d.ts"), b"x").expect("write ignored");
@@ -785,13 +792,13 @@ async fn user_ignored_path_suppressed_across_create_modify_delete() {
     let dir = TempDir::new("gi-user");
     git_init(&dir.path);
     std::fs::write(dir.path.join(".gitignore"), "scratch.txt\n").expect("write .gitignore");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let scratch = dir.path.join("scratch.txt");
@@ -817,13 +824,13 @@ async fn nested_gitignore_applies_only_under_its_directory() {
     git_init(&dir.path);
     std::fs::create_dir_all(dir.path.join("sub")).expect("mk sub");
     std::fs::write(dir.path.join("sub/.gitignore"), "*.secret\n").expect("write nested");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("sub/data.secret"), b"x").expect("write ignored");
@@ -847,13 +854,13 @@ async fn git_info_exclude_is_honored() {
     std::fs::create_dir_all(dir.path.join(".git/info")).expect("mk info");
     std::fs::write(dir.path.join(".git/info/exclude"), "excluded-local.txt\n")
         .expect("write exclude");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("excluded-local.txt"), b"x").expect("write ignored");
@@ -875,13 +882,13 @@ async fn negation_reincludes_file_in_ignored_dir() {
     std::fs::write(dir.path.join(".gitignore"), "dist2/\n!dist2/keep.txt\n")
         .expect("write .gitignore");
     std::fs::create_dir_all(dir.path.join("dist2")).expect("mk dist2");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("dist2/other.txt"), b"x").expect("write ignored");
@@ -902,13 +909,13 @@ async fn gitignore_edit_takes_effect_without_restart() {
     let dir = TempDir::new("gi-edit");
     git_init(&dir.path);
     std::fs::write(dir.path.join(".gitignore"), "initial-ignored.txt\n").expect("write .gitignore");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Not ignored yet: must emit.
@@ -947,13 +954,13 @@ async fn default_patterns_apply_without_gitignore_rule() {
     // The repo's .gitignore does NOT mention *.log or .env — the TS-parity
     // defaults must suppress them on their own.
     std::fs::write(dir.path.join(".gitignore"), "unrelated.txt\n").expect("write .gitignore");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("app.log"), b"x").expect("write log");
@@ -982,13 +989,13 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
     git_init(&dir.path);
     std::fs::create_dir_all(dir.path.join(".git/info")).expect("mk info");
     std::fs::create_dir_all(dir.path.join("dist")).expect("mk dist");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Edit info/exclude at runtime: the raw event for this path is the ONLY
@@ -1017,13 +1024,13 @@ async fn user_negation_overrides_default_pattern() {
     // negation must win over both.
     std::fs::write(dir.path.join(".gitignore"), "!dist\n").expect("write .gitignore");
     std::fs::create_dir_all(dir.path.join("dist")).expect("mk dist");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
@@ -1043,13 +1050,13 @@ async fn non_git_root_still_applies_default_patterns() {
     // No git init: defaults must still suppress, non-default files still emit.
     let dir = TempDir::new("gi-nongit");
     std::fs::create_dir_all(dir.path.join(".svelte-kit")).expect("mk .svelte-kit");
-    let _watcher = FileWatcher::start(
+    let watcher = FileWatcher::start(
         &SharedWatchHub::new(),
         bus.clone(),
         WorkspaceId::from("ws-gi"),
-        dir.path.clone(),
+        &dir.path.clone(),
     );
-    _watcher.wait_established(LIVENESS).await;
+    watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join(".svelte-kit/x.js"), b"x").expect("write ignored");

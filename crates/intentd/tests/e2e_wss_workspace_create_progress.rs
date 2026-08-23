@@ -143,9 +143,8 @@ async fn drain_progress_events(ws: &mut PlainWs, progress_id: &str, secs: u64) -
         if remaining.is_zero() {
             return out;
         }
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(x) => x,
-            Err(_) => return out,
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            return out;
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -167,9 +166,8 @@ async fn drain_progress_events(ws: &mut PlainWs, progress_id: &str, secs: u64) -
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
-            None => return out,
-            Some(Err(_)) => return out,
+            Some(Ok(_)) => {}
+            None | Some(Err(_)) => return out,
         }
     }
 }
@@ -383,7 +381,7 @@ async fn workspace_create_without_progress_id_stays_silent_over_wss() {
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = sub.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Ok(_))) => {}
             _ => break,
         }
     }

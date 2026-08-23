@@ -226,8 +226,8 @@ pub(crate) fn normalize_diff_paths(worktree: &Path, paths: Vec<String>) -> Vec<S
         .collect()
 }
 
-/// Parse the `git.stage` `paths` param and enforce the stage-all rejection,
-/// mirroring the TS builder exactly. Rejections and an empty result surface as
+/// Parse the `git.stage` `paths` param and enforce the stage-all rejection in
+/// every accepted shape. Rejections and an empty result surface as
 /// [`Error::Internal`] (→ `-32603`).
 pub(crate) fn parse_stage_paths(paths: &Value) -> Result<Vec<String>> {
     // Reject staging everything — operates on the original value (TS parity):
@@ -252,6 +252,12 @@ pub(crate) fn parse_stage_paths(paths: &Value) -> Result<Vec<String>> {
             .collect(),
         _ => Vec::new(),
     };
+
+    for path in &list {
+        if path == "." || path == "*" || path.contains("--all") {
+            return Err(Error::Internal(STAGE_ALL_MSG.to_string()));
+        }
+    }
 
     if list.is_empty() {
         return Err(Error::Internal(NO_PATHS_MSG.to_string()));
@@ -541,7 +547,7 @@ pub(crate) fn build_diffs(
     Ok(Value::Array(out))
 }
 /// Build the `git.commitDetails` wire result for a single commit. Returns the
-/// flattened shape consumed by the FE ChangesTabType: metadata plus the
+/// flattened shape consumed by the FE `ChangesTabType`: metadata plus the
 /// per-file `fileDetails: [{ path, additions, deletions }]` array (`files` is
 /// the flat path-string list, kept for callers that only want names).
 pub(crate) fn build_commit_details(worktree: &Path, commit_hash: &str) -> Result<Value> {
@@ -624,7 +630,7 @@ pub(crate) fn build_numstat(
 /// two-dot `<boundary>..<target_ref>` range, carrying the full file contents
 /// at the boundary and the target so the FE branch-base viewer can render the
 /// diff from `oldContent`/`newContent` alone (parity with
-/// `batchedGitBranchBaseDiff` / TrackedChangeDiffViewer). `chunks` is always
+/// `batchedGitBranchBaseDiff` / `TrackedChangeDiffViewer`). `chunks` is always
 /// an empty array — the FE consumer ignores it for the branch-base shape.
 /// Boundary resolution matches [`build_numstat`]; an unresolved boundary
 /// yields an empty array.
@@ -833,7 +839,14 @@ mod tests {
 
     #[test]
     fn rejects_stage_all_forms() {
-        for v in [json!("."), json!("*"), json!("git add --all")] {
+        for v in [
+            json!("."),
+            json!("*"),
+            json!("git add --all"),
+            json!(["tracked.txt", "*"]),
+            json!(["tracked.txt", "--all"]),
+            json!("tracked.txt,*"),
+        ] {
             let err = parse_stage_paths(&v).unwrap_err();
             assert!(matches!(err, Error::Internal(_)));
             assert!(format!("{err}").contains("Staging all files is not allowed"));
@@ -934,7 +947,7 @@ mod tests {
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: 0o160000,
+                mode: 0o160_000,
                 uid: 0,
                 gid: 0,
                 file_size: 0,
@@ -956,7 +969,7 @@ mod tests {
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: 0o160000,
+                mode: 0o160_000,
                 uid: 0,
                 gid: 0,
                 file_size: 0,

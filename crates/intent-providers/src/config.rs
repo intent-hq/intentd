@@ -31,10 +31,10 @@ pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
 /// the pin.
 pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 
-/// Pinned npx package spec for the codex ACP fallback. Matches the
-/// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
-/// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.14";
+/// Pinned npx package spec for the codex ACP fallback. intentd is the only
+/// pin site (cloudlands-fe no longer pins a managed codex-acp version);
+/// bumping the version is a deliberate code change.
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.6.2";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
@@ -51,6 +51,18 @@ pub const PI_CLI_MIN_VERSION: &str = "0.80.4";
 /// [`PI_CLI_MIN_VERSION`]; re-check when bumping the pin.
 pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.80.4+";
 
+/// Minimum `auggie` CLI version the ACP agent-spawn path requires. The daemon
+/// launches auggie with `--acp --allow-indexing --model … --remove-tool …`;
+/// the full flag set landed in auggie 0.7.0 (ACP with model selection and
+/// `--allow-indexing`), so an older binary rejects the launch with an "Unknown
+/// arguments" error. Feeds the pure version-gate decision in
+/// [`crate::version_gate`]; re-check when the launch flags change.
+pub const AUGGIE_CLI_MIN_VERSION: &str = "0.7.0";
+
+/// Auggie CLI version requirement for user-facing messages. Must match
+/// [`AUGGIE_CLI_MIN_VERSION`]; re-check when bumping the minimum.
+pub const AUGGIE_CLI_REQUIREMENT: &str = "auggie 0.7.0+";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
@@ -61,7 +73,7 @@ pub enum ProviderRuntime {
     Node,
     /// Electron binary run with `ELECTRON_RUN_AS_NODE=1` (still V8).
     Electron,
-    /// Natively-compiled binary — not V8, no NODE_OPTIONS handling.
+    /// Natively-compiled binary — not V8, no `NODE_OPTIONS` handling.
     Native,
 }
 
@@ -86,6 +98,9 @@ pub enum InjectionMechanism {
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
 /// intentionally omitted — they are Electron IPC / renderer concerns and are
 /// not part of the §6.9 field list.
+// Static registry entries port the TS `ACPProviderConfig` field-for-field;
+// the independent capability bools stay flat for parity.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderConfig {
     /// Unique identifier (e.g., `auggie`, `opencode`).
@@ -104,7 +119,7 @@ pub struct ProviderConfig {
     /// Flag for model selection (e.g., `--model`). `None` when the provider
     /// passes model config through other mechanisms (env vars, custom args).
     pub model_flag: Option<&'static str>,
-    /// Default agent name for the ACP session (e.g., `build` for OpenCode).
+    /// Default agent name for the ACP session (e.g., `build` for `OpenCode`).
     pub default_agent: Option<&'static str>,
     /// Whether the provider implements the ACP `authenticate` method.
     pub supports_authenticate: bool,
@@ -119,6 +134,13 @@ pub struct ProviderConfig {
     /// it via `session/set_config_option` after session establishment
     /// (claude-code's pinned adapter).
     pub supports_config_option_model: bool,
+    /// Whether the provider's stored model ids may embed a reasoning effort
+    /// as a `{base}/{effort}` suffix that must be stripped before the id is
+    /// sent as the post-session `session/set_config_option` model value
+    /// (codex: the adapter's `configOptions[id="model"]` select values are
+    /// bare base ids, and the effort rides the separate `reasoning_effort`
+    /// option). Only meaningful alongside `supports_config_option_model`.
+    pub config_option_model_strips_effort: bool,
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
@@ -188,6 +210,12 @@ pub struct ProviderConfig {
     /// Grok Build's ACP adapter does this (`/bin/bash -lc '…'` in `command`);
     /// argv-only clients (most providers) leave this false.
     pub terminal_requires_shell: bool,
+    /// When true, the provider's client silently truncates long MCP tool
+    /// descriptions (claude-code cuts at ~2k chars — see
+    /// <https://github.com/anthropics/claude-code/issues/53933>), so the
+    /// `workspace_api` tool is served a compact description and the full
+    /// `ws.*` API reference is appended to the system prompt instead.
+    pub truncates_tool_descriptions: bool,
 }
 
 impl ProviderConfig {
@@ -209,6 +237,7 @@ impl ProviderConfig {
             supports_set_mode: false,
             supports_set_model: false,
             supports_config_option_model: false,
+            config_option_model_strips_effort: false,
             supports_mcp_config: false,
             supports_session_mcp_servers: false,
             mcp_via_pi_extension: false,
@@ -231,6 +260,7 @@ impl ProviderConfig {
             npx_only_package: None,
             requires_secondary_binary: None,
             terminal_requires_shell: false,
+            truncates_tool_descriptions: false,
         }
     }
 
@@ -241,6 +271,7 @@ impl ProviderConfig {
     /// targets the `unsloth` CLI itself (the secondary binary the
     /// daemon-managed server lifecycle shells out to). Every other provider
     /// owns its own primary.
+    #[must_use]
     pub fn primary_binary_provider_id(&self) -> &'static str {
         match self.id {
             "unsloth" => "opencode",
@@ -309,6 +340,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
         short_name: "Claude Code",
+        // Claude Code silently truncates MCP tool descriptions at ~2k chars
+        // (anthropics/claude-code#53933): serve the compact `workspace_api`
+        // description and carry the full API reference in the system prompt.
+        truncates_tool_descriptions: true,
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
@@ -318,15 +353,32 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // time and DOES get the NODE_OPTIONS heap cap
         // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
         can_be_disabled: true,
-        // The pinned @agentclientprotocol/codex-acp adapter (1.1.14) ignores
-        // `_meta.developerInstructions` (verified empirically, #479), so the
-        // system prompt is delivered via the first-turn `<system>` prepend
-        // instead of SessionMeta.
+        // The pinned @agentclientprotocol/codex-acp adapter (1.6.2) ignores
+        // `_meta.developerInstructions` (verified empirically, #479; still
+        // true at 1.6.2 — the adapter never reads that key from session
+        // params), so the system prompt is delivered via the first-turn
+        // `<system>` prepend instead of SessionMeta.
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         // codex-acp folds `session/new` `mcpServers` (stdio + http) into its
         // session config (`build_session_config`), so the workspace bridge
         // rides the ACP request rather than `-c mcp_servers.*` overrides.
         supports_session_mcp_servers: true,
+        // The npx fallback adapter ignores `-c model=…` argv overrides (its
+        // CLI parses no config flags), and its `session/set_model` handler
+        // (1.1.14) is unusable for our ids — `ModelId.fromString` accepts
+        // only `{base}[{effort}]` with the effort REQUIRED, rejecting both
+        // bare and `{base}/{effort}` ids. The stored model is instead
+        // applied post-session via `session/set_config_option`: the adapter
+        // advertises the model as a `configOptions[id="model"]` select over
+        // bare base ids (`createModelConfigOption`), falling back to the
+        // current/default reasoning effort when the model changes. A
+        // `{base}/{effort}` suffix is stripped daemon-side before sending
+        // (`config_option_model_target`); the effort itself rides the
+        // generic `thought_level` option (`reasoning_effort`). The `-c`
+        // args (`apply_codex_config_args`) are kept for the native Rust
+        // codex-acp binary path, which does consume them.
+        supports_config_option_model: true,
+        config_option_model_strips_effort: true,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
@@ -449,6 +501,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
 ];
 
 /// Find a provider by id, or `None` if unknown.
+#[must_use]
 pub fn find_provider(provider_id: &str) -> Option<&'static ProviderConfig> {
     ACP_PROVIDERS.iter().find(|p| p.id == provider_id)
 }
@@ -464,6 +517,7 @@ pub(crate) fn first_provider_config() -> &'static ProviderConfig {
 }
 
 /// The first registered provider id (see [`first_provider_config`]).
+#[must_use]
 pub fn first_provider_id() -> &'static str {
     first_provider_config().id
 }
@@ -477,6 +531,7 @@ const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 /// when unknown. Unknown ids warn (see [`warns_on_unknown_provider`]) so
 /// registry gaps surface in logs instead of silently spawning the fallback
 /// agent. Port of `getProviderConfig`.
+#[must_use]
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
     find_provider(provider_id).unwrap_or_else(|| {
         let fallback = first_provider_config();
@@ -499,6 +554,7 @@ pub(crate) fn warns_on_unknown_provider(provider_id: &str) -> bool {
 }
 
 /// All registered provider ids, in definition order. Port of `getAllProviderIds`.
+#[must_use]
 pub fn all_provider_ids() -> Vec<&'static str> {
     ACP_PROVIDERS.iter().map(|p| p.id).collect()
 }
@@ -523,10 +579,10 @@ pub(crate) fn always_enabled_providers() -> Vec<&'static ProviderConfig> {
 /// `{command} login`). Port of `getProviderAuthErrorMessage`.
 pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
     let config = provider_config(provider_id);
-    let login_cmd = config
-        .login_command_hint
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| format!("{} login", config.command));
+    let login_cmd = config.login_command_hint.map_or_else(
+        || format!("{} login", config.command),
+        std::string::ToString::to_string,
+    );
 
     if is_remote {
         format!(
@@ -544,6 +600,7 @@ pub fn auth_error_message(provider_id: &str, is_remote: bool) -> String {
 /// Whether an error message indicates the provider needs authentication,
 /// using the provider's configured `auth_error_patterns` (case-insensitive).
 /// Port of `isProviderAuthenticationError`.
+#[must_use]
 pub fn is_provider_authentication_error(provider_id: &str, error_message: &str) -> bool {
     let config = provider_config(provider_id);
     let Some(patterns) = config.auth_error_patterns else {

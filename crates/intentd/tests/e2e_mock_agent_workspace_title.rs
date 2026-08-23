@@ -103,6 +103,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let ws_root = common::hermetic_workspaces_root();
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
 
     // A fresh workspace whose title still matches its id — the initial-agent
@@ -121,7 +122,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

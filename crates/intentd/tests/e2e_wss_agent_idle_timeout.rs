@@ -48,7 +48,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -198,7 +198,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -222,7 +222,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -431,7 +431,8 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -612,11 +613,11 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
 ///   (`turn=2`, one warning row, no `agent:failed`).
 #[tokio::test]
 async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
+    const TAIL_MARKER: &str = "TAIL-AFTER-CANCEL";
     let Some(script) = gate("WSS idle-timeout tail-bleed regression E2E") else {
         return;
     };
 
-    const TAIL_MARKER: &str = "TAIL-AFTER-CANCEL";
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({
@@ -640,7 +641,8 @@ async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -776,12 +778,12 @@ async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
 ///   `session/prompt` is that process's turn 1, not the old child's turn 2).
 #[tokio::test]
 async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
+    const TAIL_MARKER: &str = "TAIL-AFTER-CANCEL";
+    const PARK_MARKER: &str = "PARK-FIRST-TURN-1599";
     let Some(script) = gate("WSS idle-timeout unresolved-cancel teardown E2E") else {
         return;
     };
 
-    const TAIL_MARKER: &str = "TAIL-AFTER-CANCEL";
-    const PARK_MARKER: &str = "PARK-FIRST-TURN-1599";
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
@@ -809,7 +811,8 @@ async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -963,14 +966,14 @@ async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
 ///   parent).
 #[tokio::test]
 async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
+    const PARENT_GO: &str = "IDLETO_PARENT_GO";
+    const CHILD_MARKER: &str = "IDLETO_CHILD_SILENT";
     let Some(script) = gate("WSS delegated-child idle-timeout E2E") else {
         return;
     };
 
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
-    const PARENT_GO: &str = "IDLETO_PARENT_GO";
-    const CHILD_MARKER: &str = "IDLETO_CHILD_SILENT";
     let delegate_js = format!(
         "return await ws.agent.delegate({{ agentInstructions: {}, waitMode: 'immediate', model: 'mock:default' }});",
         json!(CHILD_MARKER),
@@ -1023,7 +1026,8 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1239,7 +1243,8 @@ async fn idle_timeout_cap_fails_terminally_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

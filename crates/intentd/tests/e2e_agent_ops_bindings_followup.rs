@@ -1,7 +1,7 @@
-//! E2E coverage follow-up for agent_ops.rs reachable operations.
+//! E2E coverage follow-up for `agent_ops.rs` reachable operations.
 //!
-//! Exercises agent_send_message, agent_send_to_task, agent_wake_or_create,
-//! agent_cancel_subscriptions, agent_get_subscriptions, and agent_delegate via in-process
+//! Exercises `agent_send_message`, `agent_send_to_task`, `agent_wake_or_create`,
+//! `agent_cancel_subscriptions`, `agent_get_subscriptions`, and `agent_delegate` via in-process
 //! Services calls. Hermetic tests asserting BE state changes.
 
 #![cfg(unix)]
@@ -84,6 +84,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -108,7 +109,7 @@ async fn agent_send_message_persists_without_manager() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create target");
@@ -187,7 +188,7 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create assigned agent");
@@ -238,7 +239,7 @@ async fn agent_cancel_subscriptions_idempotent() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -336,7 +337,7 @@ async fn agent_get_subscriptions_returns_empty_for_new_agent() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

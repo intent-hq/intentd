@@ -132,6 +132,14 @@ pub enum Error {
         waited_ms: u64,
         limit: u32,
     },
+
+    /// The source-control forge rate-limited a request (REST 403/429 with an
+    /// exhausted quota). Distinct from `Internal` so background sweeps can
+    /// detect the class and pause globally until the quota window resets, and
+    /// so logs stop misreporting quota exhaustion as
+    /// "source control auth error" (monorepo#2961). Surfaces as `-32603`.
+    #[error("source control rate limited: {0}")]
+    RateLimited(String),
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -165,6 +173,7 @@ pub enum CloneErrorCategory {
 
 impl CloneErrorCategory {
     /// Stable wire identifier for this category (`error.data.code`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             CloneErrorCategory::PathInvalid => "path-invalid",
@@ -181,13 +190,15 @@ impl CloneErrorCategory {
 
 impl Error {
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
+    #[must_use]
     pub fn code(&self) -> i32 {
         match self {
             Error::InvalidParams(_)
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
-            | Error::NotAFile { .. } => -32602,
+            | Error::NotAFile { .. }
+            | Error::ExecutionEnvironmentUnavailable { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -203,11 +214,12 @@ impl Error {
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
             | Error::WarmInFlight { .. }
-            | Error::AdapterBusy { .. } => -32603,
+            | Error::AdapterBusy { .. }
+            | Error::RateLimited(_)
+            // Unsupported: map to internal error for now
+            | Error::Unsupported(_)
+            | Error::ExecutionEnvironmentNotImplemented { .. } => -32603,
             Error::Conflict { .. } => -32005,
-            Error::Unsupported(_) => -32603, // Map to internal error for now
-            Error::ExecutionEnvironmentUnavailable { .. } => -32602,
-            Error::ExecutionEnvironmentNotImplemented { .. } => -32603,
         }
     }
 }

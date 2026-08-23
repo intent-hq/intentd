@@ -37,7 +37,7 @@ pub(crate) fn workspace_root(ws: &Workspace) -> String {
 }
 
 /// Load the workspace and resolve its filesystem root, preferring the calling
-/// agent's sandbox path when available (CoW containment). A missing workspace
+/// agent's sandbox path when available (`CoW` containment). A missing workspace
 /// (or any load error) falls through to an empty root, mirroring the TS handler
 /// which swallows `getWorkspace` failures and proceeds with `workspacePath=''`.
 pub(crate) async fn resolve_root(
@@ -137,7 +137,7 @@ fn resolve_within(root: &str, rel: &str) -> Result<PathBuf> {
     }
 }
 
-fn io_err(e: std::io::Error) -> Error {
+fn io_err(e: &std::io::Error) -> Error {
     Error::Internal(e.to_string())
 }
 
@@ -155,7 +155,7 @@ pub(crate) fn resolve_attachment_source(
 /// `file.read` → bare UTF-8 string.
 pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
-    let content = std::fs::read_to_string(&full).map_err(io_err)?;
+    let content = std::fs::read_to_string(&full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(Value::String(content))
 }
 
@@ -195,7 +195,7 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
         )));
     }
     let full = resolve_within(root, path)?;
-    let md = std::fs::metadata(&full).map_err(io_err)?;
+    let md = std::fs::metadata(&full).map_err(|e: std::io::Error| io_err(&e))?;
     if md.is_dir() {
         return Err(Error::InvalidParams(format!(
             "path is a directory — file.readChunk serves regular files: {path}"
@@ -205,14 +205,15 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
     let len = if offset >= size {
         0
     } else {
-        (size - offset).min(length) as usize
+        usize::try_from((size - offset).min(length)).expect("value fits in usize")
     };
     let mut buf = vec![0u8; len];
     if len > 0 {
-        let mut file = std::fs::File::open(&full).map_err(io_err)?;
+        let mut file = std::fs::File::open(&full).map_err(|e: std::io::Error| io_err(&e))?;
         file.seek(std::io::SeekFrom::Start(offset))
-            .map_err(io_err)?;
-        file.read_exact(&mut buf).map_err(io_err)?;
+            .map_err(|e: std::io::Error| io_err(&e))?;
+        file.read_exact(&mut buf)
+            .map_err(|e: std::io::Error| io_err(&e))?;
     }
     let content = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok(json!({ "content": content, "bytesRead": len, "size": size }))
@@ -223,9 +224,9 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
 pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).map_err(io_err)?;
+        std::fs::create_dir_all(parent).map_err(|e: std::io::Error| io_err(&e))?;
     }
-    std::fs::write(&full, content).map_err(io_err)?;
+    std::fs::write(&full, content).map_err(|e: std::io::Error| io_err(&e))?;
     let size = content.encode_utf16().count();
     Ok(json!({ "ok": true, "path": path, "size": size }))
 }
@@ -249,7 +250,7 @@ pub(crate) fn sanitize_attachment_name(file_name: &str) -> Option<String> {
 /// `report.tar.gz` → (`report.tar`, `.gz`), `Makefile` → (`Makefile`, ``),
 /// `.env` → (`.env`, ``) — a leading dot is part of the stem, not an extension.
 fn split_name(name: &str) -> (&str, &str) {
-    let first = name.chars().next().map(char::len_utf8).unwrap_or(0);
+    let first = name.chars().next().map_or(0, char::len_utf8);
     match name[first..].rfind('.') {
         Some(i) => name.split_at(first + i),
         None => (name, ""),
@@ -277,7 +278,7 @@ pub(crate) enum AttachmentSource<'a> {
 pub(crate) fn place_attachment(
     root: &str,
     file_name: &str,
-    source: AttachmentSource<'_>,
+    source: &AttachmentSource<'_>,
 ) -> Result<Value> {
     let name = sanitize_attachment_name(file_name).ok_or_else(|| {
         Error::InvalidParams(format!("invalid attachment fileName: {file_name:?}"))
@@ -324,14 +325,14 @@ pub(crate) fn place_attachment(
         }
     }
     let dir = resolve_within(root, ATTACHMENTS_DIR)?;
-    std::fs::create_dir_all(&dir).map_err(io_err)?;
+    std::fs::create_dir_all(&dir).map_err(|e: std::io::Error| io_err(&e))?;
     // Belt-and-braces exclusion: an ignore-all `.gitignore` inside the
     // attachments directory keeps placed files out of git even when the
     // repo carries a customized `.intent/.gitignore` that does not cover
     // `attachments/`.
     let marker = dir.join(".gitignore");
     if !marker.exists() {
-        std::fs::write(&marker, "*\n").map_err(io_err)?;
+        std::fs::write(&marker, "*\n").map_err(|e: std::io::Error| io_err(&e))?;
     }
 
     let (stem, ext) = split_name(&name);
@@ -353,13 +354,13 @@ pub(crate) fn place_attachment(
                 };
                 n += 1;
             }
-            Err(e) => return Err(io_err(e)),
+            Err(e) => return Err(io_err(&e)),
         }
     };
 
     let size = match source {
         AttachmentSource::Bytes(bytes) => {
-            std::fs::write(&full, bytes).map_err(io_err)?;
+            std::fs::write(&full, bytes).map_err(|e: std::io::Error| io_err(&e))?;
             bytes.len() as u64
         }
         // The stat above classified the common cases; this residual arm
@@ -432,12 +433,12 @@ pub(crate) fn get_attachment(
     }
     let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
     let dest_dir_full = resolve_within(dest_root, dir)?;
-    std::fs::create_dir_all(&dest_dir_full).map_err(io_err)?;
+    std::fs::create_dir_all(&dest_dir_full).map_err(|e: std::io::Error| io_err(&e))?;
     // Keep retrieved copies out of git tracking (same ignore-all marker
     // `place_attachment` drops), whatever directory the caller picked.
     let marker = dest_dir_full.join(".gitignore");
     if !marker.exists() {
-        std::fs::write(&marker, "*\n").map_err(io_err)?;
+        std::fs::write(&marker, "*\n").map_err(|e: std::io::Error| io_err(&e))?;
     }
     // resolve_within on the joined relative path guards a crafted fileName.
     let rel = format!("{}/{}", dir.trim_end_matches('/'), record.file_name);
@@ -482,16 +483,20 @@ pub(crate) fn get_attachment(
 pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&full).map_err(|e| {
+    for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::NotFound(format!("Directory not found: {path}"))
         } else {
-            io_err(e)
+            io_err(&e)
         }
     })? {
-        let entry = entry.map_err(io_err)?;
+        let entry = entry.map_err(|e: std::io::Error| io_err(&e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let kind = if entry.file_type().map_err(io_err)?.is_dir() {
+        let kind = if entry
+            .file_type()
+            .map_err(|e: std::io::Error| io_err(&e))?
+            .is_dir()
+        {
             "directory"
         } else {
             "file"
@@ -521,10 +526,13 @@ fn join_rel(base: &str, name: &str) -> String {
 pub(crate) fn tree(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&full).map_err(io_err)? {
-        let entry = entry.map_err(io_err)?;
+    for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| io_err(&e))? {
+        let entry = entry.map_err(|e: std::io::Error| io_err(&e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_directory = entry.file_type().map_err(io_err)?.is_dir();
+        let is_directory = entry
+            .file_type()
+            .map_err(|e: std::io::Error| io_err(&e))?
+            .is_dir();
         let rel = join_rel(path, &name);
         entries.push(json!({ "path": rel, "name": name, "isDirectory": is_directory }));
     }
@@ -542,7 +550,7 @@ pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
             "Cannot delete directory with this method: {path}"
         )));
     }
-    std::fs::remove_file(&full).map_err(io_err)?;
+    std::fs::remove_file(&full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(json!({ "ok": true, "path": path, "deleted": true }))
 }
 
@@ -557,7 +565,7 @@ pub(crate) fn mkdir(root: &str, path: &str) -> Result<Value> {
             "Path exists but is not a directory: {path}"
         )));
     }
-    std::fs::create_dir_all(&full).map_err(io_err)?;
+    std::fs::create_dir_all(&full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(json!({ "ok": true, "path": path, "created": true }))
 }
 
@@ -588,18 +596,17 @@ pub(crate) fn exists(root: &str, path: &str) -> Result<Value> {
 /// entry is a symlink), and `permissions` is the octal mode string ("0644").
 pub(crate) fn stat(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
-    let lmd = std::fs::symlink_metadata(&full).map_err(io_err)?;
+    let lmd = std::fs::symlink_metadata(&full).map_err(|e: std::io::Error| io_err(&e))?;
     let is_symlink = lmd.file_type().is_symlink();
     let md = if is_symlink {
-        std::fs::metadata(&full).map_err(io_err)?
+        std::fs::metadata(&full).map_err(|e: std::io::Error| io_err(&e))?
     } else {
         lmd
     };
     let mtime = md
         .modified()
         .ok()
-        .map(mtime_iso)
-        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+        .map_or_else(|| "1970-01-01T00:00:00.000Z".to_string(), mtime_iso);
     let permissions = permissions_octal(&md);
     Ok(json!({
         "size": md.len(),
@@ -616,7 +623,7 @@ pub(crate) fn stat(root: &str, path: &str) -> Result<Value> {
 /// to the epoch when the timestamp is outside the representable range.
 fn mtime_iso(t: std::time::SystemTime) -> String {
     let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let secs = dur.as_secs() as i64;
+    let secs = dur.as_secs().cast_signed();
     let ms = dur.subsec_millis();
     match time::OffsetDateTime::from_unix_timestamp(secs) {
         Ok(dt) => format!(
@@ -640,7 +647,7 @@ fn mtime_iso(t: std::time::SystemTime) -> String {
 fn permissions_octal(md: &std::fs::Metadata) -> String {
     use std::os::unix::fs::PermissionsExt;
     let mode = md.permissions().mode() & 0o777;
-    format!("0{:o}", mode)
+    format!("0{mode:o}")
 }
 
 #[cfg(not(unix))]
@@ -668,13 +675,11 @@ pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value
     // `symlink_metadata` (no follow): a symlink-to-directory is renamed and
     // attributed as the single symlink entry git actually tracks — walking the
     // link target would record rows for paths git never reports.
-    let is_directory = std::fs::symlink_metadata(&old_full)
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
+    let is_directory = std::fs::symlink_metadata(&old_full).is_ok_and(|m| m.is_dir());
     if let Some(parent) = new_full.parent() {
-        std::fs::create_dir_all(parent).map_err(io_err)?;
+        std::fs::create_dir_all(parent).map_err(|e: std::io::Error| io_err(&e))?;
     }
-    std::fs::rename(&old_full, &new_full).map_err(io_err)?;
+    std::fs::rename(&old_full, &new_full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(json!({
         "ok": true,
         "oldPath": old_path,
@@ -1024,7 +1029,7 @@ mod tests {
         // Directory → -32602 naming the cause.
         match read_chunk(&root, "dir", 0, 16) {
             Err(Error::InvalidParams(m)) => {
-                assert!(m.contains("directory"), "unexpected message: {m}")
+                assert!(m.contains("directory"), "unexpected message: {m}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1034,7 +1039,7 @@ mod tests {
                 assert!(
                     m.contains(&READ_CHUNK_MAX_BYTES.to_string()),
                     "unexpected message: {m}"
-                )
+                );
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1058,7 +1063,7 @@ mod tests {
     }
 
     fn place_bytes(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {
-        place_attachment(root, file_name, AttachmentSource::Bytes(bytes))
+        place_attachment(root, file_name, &AttachmentSource::Bytes(bytes))
     }
 
     #[test]
@@ -1114,6 +1119,7 @@ mod tests {
     /// multi-byte UTF-8 must not panic in `split_name` — placement and
     /// collision suffixing both work.
     #[test]
+    #[allow(clippy::many_single_char_names)] // sequential placement results a..e
     fn place_attachment_multibyte_leading_names() {
         let t = TempRoot::new();
         let root = t.root();
@@ -1152,7 +1158,7 @@ mod tests {
         let root = t.root();
         let src = std::path::Path::new(&root).join("src.bin");
         std::fs::write(&src, b"copied bytes").unwrap();
-        let r = place_attachment(&root, "src.bin", AttachmentSource::CopyFrom(&src)).unwrap();
+        let r = place_attachment(&root, "src.bin", &AttachmentSource::CopyFrom(&src)).unwrap();
         assert_eq!(r["fileName"], json!("src.bin"));
         assert_eq!(r["size"], json!(12));
         assert_eq!(
@@ -1162,10 +1168,10 @@ mod tests {
         // A missing source fails as classified InvalidParams (monorepo#2144)
         // without leaving the claimed placeholder behind.
         let missing = std::path::Path::new(&root).join("nope.bin");
-        let err = place_attachment(&root, "gone.bin", AttachmentSource::CopyFrom(&missing));
+        let err = place_attachment(&root, "gone.bin", &AttachmentSource::CopyFrom(&missing));
         match err {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1176,17 +1182,17 @@ mod tests {
 
     /// Regression (monorepo#2144): a dragged FOLDER used to fail the copy step
     /// with an opaque -32603 "Internal error"; it must be rejected up front as
-    /// InvalidParams naming the cause, with no placeholder left behind.
+    /// `InvalidParams` naming the cause, with no placeholder left behind.
     #[test]
     fn place_attachment_copy_from_directory_is_classified() {
         let t = TempRoot::new();
         let root = t.root();
         let subdir = std::path::Path::new(&root).join("some-folder");
         std::fs::create_dir_all(&subdir).unwrap();
-        let err = place_attachment(&root, "some-folder", AttachmentSource::CopyFrom(&subdir));
+        let err = place_attachment(&root, "some-folder", &AttachmentSource::CopyFrom(&subdir));
         match err {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("directory"), "unexpected message: {msg}")
+                assert!(msg.contains("directory"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1205,10 +1211,10 @@ mod tests {
         let file = std::path::Path::new(&root).join("plain.txt");
         std::fs::write(&file, b"x").unwrap();
         let bogus = file.join("child.txt");
-        let err = place_attachment(&root, "child.txt", AttachmentSource::CopyFrom(&bogus));
+        let err = place_attachment(&root, "child.txt", &AttachmentSource::CopyFrom(&bogus));
         match err {
             Err(Error::InvalidParams(msg)) => {
-                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidParams, got {other:?}"),
         }
@@ -1226,7 +1232,7 @@ mod tests {
         std::fs::write(&target, b"linked").unwrap();
         let link = std::path::Path::new(&root).join("alias.txt");
         symlink(&target, &link).unwrap();
-        let r = place_attachment(&root, "alias.txt", AttachmentSource::CopyFrom(&link)).unwrap();
+        let r = place_attachment(&root, "alias.txt", &AttachmentSource::CopyFrom(&link)).unwrap();
         assert_eq!(r["fileName"], json!("alias.txt"));
         assert_eq!(r["size"], json!(6));
     }

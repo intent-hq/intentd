@@ -7,6 +7,7 @@
 /// a display unless the process was reached over SSH (no local console). Public
 /// so the CLI `status`/`doctor` surfaces (§5.7) report the same value
 /// `host.status` returns.
+#[must_use]
 pub fn detect_has_display() -> bool {
     has_display(
         std::env::var_os("DISPLAY").is_some(),
@@ -20,6 +21,9 @@ pub fn detect_has_display() -> bool {
 /// explicit X11/Wayland display always wins; otherwise GUI platforms
 /// (macOS/Windows) assume a console unless reached over SSH; headless Unix
 /// without a display server has none.
+// The four independent env probes ARE the inputs of this pure policy fn;
+// bundling them into a struct would only obscure the truth table.
+#[allow(clippy::fn_params_excessive_bools)]
 fn has_display(display: bool, wayland: bool, over_ssh: bool, gui_platform: bool) -> bool {
     if display || wayland {
         return true;
@@ -47,6 +51,7 @@ pub(crate) fn detect_display_server() -> Option<String> {
 /// Local OS hostname (`os.hostname()` equivalent), or `intent` on failure.
 /// Public so the composition root can include it in the `system.status`
 /// snapshot alongside `host.status` and `server.pairingInfo`.
+#[must_use]
 pub fn local_hostname() -> String {
     whoami::hostname()
         .ok()

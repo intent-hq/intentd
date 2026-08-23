@@ -8,7 +8,11 @@ use intent_core::settings_file::SettingsFile;
 fn resolve_provider_id_from_compound_model() {
     // Compound model id takes precedence over provider field
     let provider_id = resolve_provider_id(Some("opencode:kimi-k3"), Some("claude-code"), None);
-    assert_eq!(provider_id, "opencode", "compound model prefix wins");
+    assert_eq!(
+        provider_id.as_deref(),
+        Some("opencode"),
+        "compound model prefix wins"
+    );
 }
 
 #[test]
@@ -16,30 +20,31 @@ fn resolve_provider_id_from_provider_field() {
     // Bare model id (no colon) falls back to provider field
     let provider_id = resolve_provider_id(Some("gpt-5.3-codex"), Some("codex"), None);
     assert_eq!(
-        provider_id, "codex",
+        provider_id.as_deref(),
+        Some("codex"),
         "provider field is fallback for bare model"
     );
 }
 
+/// Regression (monorepo#3044): with nothing to resolve from there is NO
+/// positional last resort — resolution yields `None` and callers fail loudly.
 #[test]
-fn resolve_provider_id_none_uses_default() {
-    // Both None -> default provider
+fn resolve_provider_id_none_yields_none() {
     let provider_id = resolve_provider_id(None, None, None);
     assert_eq!(
-        provider_id,
-        intent_providers::first_provider_id(),
-        "None model + None provider -> default"
+        provider_id, None,
+        "None model + None provider + no default -> None (no positional fallback)"
     );
 }
 
+/// Regression (monorepo#3044): a bare model carries no provider — with no
+/// provider field and no configured default there is nothing to resolve to.
 #[test]
-fn resolve_provider_id_bare_model_none_provider_uses_default() {
-    // Bare model + None provider -> default provider
+fn resolve_provider_id_bare_model_none_provider_yields_none() {
     let provider_id = resolve_provider_id(Some("sonnet4.5"), None, None);
     assert_eq!(
-        provider_id,
-        intent_providers::first_provider_id(),
-        "bare model + None provider -> default"
+        provider_id, None,
+        "bare model + None provider + no default -> None (no positional fallback)"
     );
 }
 
@@ -124,7 +129,7 @@ fn derived_default_provider_both_unset_yields_none() {
     assert_eq!(
         derived_default_provider(&s),
         None,
-        "neither setting set -> None (callers use the positional last resort)"
+        "neither setting set -> None (callers fail loudly, monorepo#3044)"
     );
 }
 
@@ -133,36 +138,35 @@ fn resolve_provider_id_malformed_compound_falls_back() {
     // Malformed compound id like ":sonnet" yields empty prefix -> falls back to provider field
     let provider_id = resolve_provider_id(Some(":sonnet"), Some("codex"), None);
     assert_eq!(
-        provider_id, "codex",
+        provider_id.as_deref(),
+        Some("codex"),
         "malformed compound :sonnet falls back to provider field"
     );
 
-    // Malformed compound with no provider field -> default
+    // Malformed compound with no provider field and no default -> None
     let provider_id = resolve_provider_id(Some(":sonnet"), None, None);
     assert_eq!(
-        provider_id,
-        intent_providers::first_provider_id(),
-        "malformed compound :sonnet with no provider -> default"
+        provider_id, None,
+        "malformed compound :sonnet with no provider -> None"
     );
 
-    // Empty provider field falls back to default
+    // Empty provider field with no default -> None
     let provider_id = resolve_provider_id(Some("gpt-4"), Some(""), None);
     assert_eq!(
-        provider_id,
-        intent_providers::first_provider_id(),
-        "empty provider string falls back to default"
+        provider_id, None,
+        "empty provider string with no default -> None"
     );
 }
 
-/// `configured_default` (spec Decision D2) sits above the hardcoded default
-/// provider (Auggie) when neither the model's compound prefix nor the
-/// `provider` field resolve one.
+/// `configured_default` (spec Decision D2) resolves when neither the model's
+/// compound prefix nor the `provider` field yield one.
 #[test]
-fn resolve_provider_id_prefers_configured_default_over_hardcoded_default() {
+fn resolve_provider_id_uses_configured_default() {
     let provider_id = resolve_provider_id(None, None, Some("claude-code"));
     assert_eq!(
-        provider_id, "claude-code",
-        "configured default wins over the hardcoded default provider"
+        provider_id.as_deref(),
+        Some("claude-code"),
+        "configured default resolves when nothing stronger is present"
     );
 }
 
@@ -172,7 +176,7 @@ fn resolve_provider_id_prefers_configured_default_over_hardcoded_default() {
 #[test]
 fn resolve_provider_id_compound_model_wins_over_configured_default() {
     let provider_id = resolve_provider_id(Some("opencode:kimi-k3"), None, Some("claude-code"));
-    assert_eq!(provider_id, "opencode");
+    assert_eq!(provider_id.as_deref(), Some("opencode"));
 }
 
 /// The session's `provider` field still wins over `configured_default` — a
@@ -181,21 +185,21 @@ fn resolve_provider_id_compound_model_wins_over_configured_default() {
 #[test]
 fn resolve_provider_id_provider_field_wins_over_configured_default() {
     let provider_id = resolve_provider_id(Some("sonnet4.5"), Some("codex"), Some("claude-code"));
-    assert_eq!(provider_id, "codex");
+    assert_eq!(provider_id.as_deref(), Some("codex"));
 }
 
-/// An empty `configured_default` is treated the same as `None` — it falls
-/// through to the hardcoded default rather than resolving to an empty
-/// provider id.
+/// An empty `configured_default` is treated the same as `None` — resolution
+/// yields `None` rather than an empty provider id (monorepo#3044: no
+/// positional fallback).
 #[test]
-fn resolve_provider_id_empty_configured_default_falls_back_to_hardcoded_default() {
+fn resolve_provider_id_empty_configured_default_yields_none() {
     let provider_id = resolve_provider_id(None, None, Some(""));
-    assert_eq!(provider_id, intent_providers::first_provider_id());
+    assert_eq!(provider_id, None);
 }
 
 #[test]
-fn claude_code_meta_appends_system_prompt() {
-    let meta = build_session_meta("claude-code", Some("Test prompt"));
+fn claude_code_meta_replaces_system_prompt() {
+    let meta = build_session_meta("claude-code", Some("Test prompt"), Some("Builder"));
     assert!(meta.is_some(), "claude-code gets _meta");
     let meta_map = meta.unwrap();
     assert_eq!(
@@ -220,52 +224,70 @@ fn claude_code_meta_appends_system_prompt() {
     assert_eq!(disallowed.len(), 1);
     assert_eq!(disallowed[0].as_str(), Some("Task"));
 
-    // Check systemPrompt.append
+    // Check systemPrompt is a plain string (full replacement of the
+    // claude_code preset prompt — not the { append, ... } object shape).
     let system_prompt_value = meta_map.get("systemPrompt");
     assert!(
         system_prompt_value.is_some(),
         "claude-code _meta contains systemPrompt"
     );
-    let system_prompt_obj = system_prompt_value.unwrap().as_object();
-    assert!(
-        system_prompt_obj.is_some(),
-        "claude-code _meta.systemPrompt is an object"
-    );
-    let obj = system_prompt_obj.unwrap();
     assert_eq!(
-        obj.len(),
-        1,
-        "claude-code _meta.systemPrompt has exactly one key"
-    );
-    let append_value = obj.get("append");
-    assert!(
-        append_value.is_some(),
-        "claude-code _meta.systemPrompt contains append"
-    );
-    assert_eq!(
-        append_value.unwrap().as_str(),
+        system_prompt_value.unwrap().as_str(),
         Some("Test prompt"),
-        "claude-code _meta.systemPrompt.append is the prompt text"
+        "claude-code _meta.systemPrompt is the prompt text as a plain string (full replacement)"
     );
 }
 
+/// monorepo#3151: codex `_meta` carries ONLY `sessionTitle` (the task-derived
+/// agent name) — the system prompt stays on the first-turn prepend fallback
+/// (#479) and is never moved into `_meta`, regardless of the prompt.
 #[test]
-fn codex_gets_no_meta() {
-    // The pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`
-    // (#479); codex uses the first-turn prepend fallback, so no _meta is built
-    // regardless of the prompt.
+fn codex_meta_carries_session_title_only() {
     for prompt in [Some("Test prompt"), None, Some(""), Some("   \n\t  ")] {
-        let meta = build_session_meta("codex", prompt);
+        let meta = build_session_meta("codex", prompt, Some("Fix login bug"));
+        let meta_map = meta.expect("codex gets _meta when a session title is present");
+        assert_eq!(
+            meta_map.len(),
+            1,
+            "codex _meta has exactly one key (sessionTitle) — no systemPrompt (prompt {prompt:?})"
+        );
+        assert_eq!(
+            meta_map.get("sessionTitle").and_then(|v| v.as_str()),
+            Some("Fix login bug"),
+            "codex _meta.sessionTitle is the task-derived agent name"
+        );
+    }
+}
+
+/// monorepo#3151: the session title is trimmed before emission.
+#[test]
+fn codex_session_title_is_trimmed() {
+    let meta = build_session_meta("codex", None, Some("  Fix login bug  "));
+    let meta_map = meta.expect("codex gets _meta");
+    assert_eq!(
+        meta_map.get("sessionTitle").and_then(|v| v.as_str()),
+        Some("Fix login bug"),
+        "sessionTitle is trimmed"
+    );
+}
+
+/// monorepo#3151: without a usable title codex builds NO `_meta` — the
+/// resume (`session/load`) path passes `None` and stays unchanged, and blank
+/// names never emit an empty title.
+#[test]
+fn codex_without_title_gets_no_meta() {
+    for title in [None, Some(""), Some("   \n\t  ")] {
+        let meta = build_session_meta("codex", Some("Test prompt"), title);
         assert!(
             meta.is_none(),
-            "codex uses first-turn prepend fallback, not _meta (prompt {prompt:?})"
+            "codex without a non-blank title builds no _meta (title {title:?})"
         );
     }
 }
 
 #[test]
 fn auggie_gets_no_meta() {
-    let meta = build_session_meta("auggie", Some("Test prompt"));
+    let meta = build_session_meta("auggie", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "auggie uses --rules flag, not _meta injection"
@@ -274,7 +296,7 @@ fn auggie_gets_no_meta() {
 
 #[test]
 fn droid_gets_no_meta() {
-    let meta = build_session_meta("droid", Some("Test prompt"));
+    let meta = build_session_meta("droid", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "droid uses --append-system-prompt-file flag, not _meta"
@@ -283,7 +305,7 @@ fn droid_gets_no_meta() {
 
 #[test]
 fn opencode_gets_no_meta() {
-    let meta = build_session_meta("opencode", Some("Test prompt"));
+    let meta = build_session_meta("opencode", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "opencode uses OPENCODE_CONFIG_CONTENT env, not _meta"
@@ -292,7 +314,7 @@ fn opencode_gets_no_meta() {
 
 #[test]
 fn cortex_gets_no_meta() {
-    let meta = build_session_meta("cortex", Some("Test prompt"));
+    let meta = build_session_meta("cortex", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "cortex uses first-turn prepend fallback, not _meta"
@@ -301,7 +323,7 @@ fn cortex_gets_no_meta() {
 
 #[test]
 fn mock_gets_no_meta() {
-    let meta = build_session_meta("mock", Some("Test prompt"));
+    let meta = build_session_meta("mock", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "mock uses first-turn prepend fallback, not _meta"
@@ -311,8 +333,9 @@ fn mock_gets_no_meta() {
 #[test]
 fn resolved_provider_with_claude_code_compound_model_gets_meta() {
     // When model is "claude-code:sonnet4.5", resolve_provider_id extracts "claude-code"
-    let provider_id = resolve_provider_id(Some("claude-code:sonnet4.5"), Some("auggie"), None);
-    let meta = build_session_meta(&provider_id, Some("Test prompt"));
+    let provider_id =
+        resolve_provider_id(Some("claude-code:sonnet4.5"), Some("auggie"), None).unwrap();
+    let meta = build_session_meta(&provider_id, Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_some(),
         "claude-code compound model → claude-code provider → _meta"
@@ -321,7 +344,7 @@ fn resolved_provider_with_claude_code_compound_model_gets_meta() {
 
 #[test]
 fn claude_code_no_prompt_still_injects_disallowed_tools() {
-    let meta = build_session_meta("claude-code", None);
+    let meta = build_session_meta("claude-code", None, Some("Builder"));
     assert!(
         meta.is_some(),
         "claude-code always gets _meta (disallowedTools)"
@@ -353,21 +376,20 @@ fn claude_code_no_prompt_still_injects_disallowed_tools() {
     assert!(meta_map.get("systemPrompt").is_none());
 }
 
+/// Regression (monorepo#3044): with nothing to resolve from, resolution
+/// yields `None` instead of a positional default provider.
 #[test]
 fn resolved_default_provider_with_no_model_no_provider_returns_none() {
-    // When both model and provider are None, resolve_provider_id returns default provider
     let provider_id = resolve_provider_id(None, None, None);
-    // Default provider (auggie) doesn't use _meta
-    let meta = build_session_meta(&provider_id, Some("Test prompt"));
-    assert!(
-        meta.is_none(),
-        "default provider (auggie) + prompt → no _meta (uses --rules)"
+    assert_eq!(
+        provider_id, None,
+        "no model, no provider, no default → None (callers fail loudly)"
     );
 }
 
 #[test]
 fn unknown_provider_returns_none() {
-    let meta = build_session_meta("unknown-provider", Some("Test prompt"));
+    let meta = build_session_meta("unknown-provider", Some("Test prompt"), Some("Builder"));
     assert!(
         meta.is_none(),
         "unknown provider id → no _meta (fallback to first-turn prepend)"
@@ -376,7 +398,7 @@ fn unknown_provider_returns_none() {
 
 #[test]
 fn claude_code_blank_prompt_still_injects_disallowed_tools() {
-    let meta = build_session_meta("claude-code", Some(""));
+    let meta = build_session_meta("claude-code", Some(""), Some("Builder"));
     assert!(
         meta.is_some(),
         "claude-code always gets _meta (disallowedTools)"

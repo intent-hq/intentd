@@ -1,4 +1,4 @@
-//! Sandbox repository: CRUD for agent sandboxes (CoW isolation).
+//! Sandbox repository: CRUD for agent sandboxes (`CoW` isolation).
 
 use intent_core::{AgentId, Result, WorkspaceId};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use sqlx::Row;
 
 use crate::Store;
 
-/// Sandbox status lifecycle. Wire values are the snake_case names — the same
+/// Sandbox status lifecycle. Wire values are the `snake_case` names — the same
 /// strings `to_db` writes — so clients never see undocumented spellings like
 /// `mergepending` (the old `lowercase` rename collapsed the separator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +103,10 @@ const COLUMNS: &str = "id, workspace_id, agent_id, path, branch, base_commit_sha
 
 impl Store {
     /// Insert a new sandbox record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
         let sql = format!(
             "INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -134,6 +138,10 @@ impl Store {
     }
 
     /// Get a sandbox by workspace and agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_sandbox(
         &self,
         workspace_id: &WorkspaceId,
@@ -150,6 +158,10 @@ impl Store {
     }
 
     /// Update a sandbox status and timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn update_sandbox_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -175,6 +187,10 @@ impl Store {
     /// `conflict` (terminal) and `conflict_bounced` (agent reconciling) with
     /// the clash's paths, and for `merged` with an empty slice — which
     /// stores NULL, clearing any stale paths from an earlier bounce.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the write fails.
     pub async fn set_sandbox_status_with_conflicts(
         &self,
         workspace_id: &WorkspaceId,
@@ -206,6 +222,10 @@ impl Store {
     /// Record the tip of the last successfully merged range for a sandbox.
     /// Persistent sandboxes merge repeatedly; the next merge cherry-picks
     /// only commits after this SHA.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` when the write fails.
     pub async fn set_sandbox_last_merged_commit(
         &self,
         workspace_id: &WorkspaceId,
@@ -230,6 +250,10 @@ impl Store {
     }
 
     /// Delete a sandbox by workspace and agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_sandbox(
         &self,
         workspace_id: &WorkspaceId,
@@ -245,6 +269,10 @@ impl Store {
     }
 
     /// List all sandboxes for a workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_sandboxes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE workspace_id = ?");
         let rows = sqlx::query(&sql)
@@ -256,6 +284,10 @@ impl Store {
     }
 
     /// List all sandbox records (for GC).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_sandboxes(&self) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox");
         let rows = sqlx::query(&sql)
@@ -267,6 +299,10 @@ impl Store {
 
     /// List all sandbox records in a given status (across every workspace).
     /// Used by the daemon's merge retry sweep to find `merge_pending` sandboxes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_sandboxes_by_status(&self, status: SandboxStatus) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE status = ?");
         let rows = sqlx::query(&sql)
@@ -285,6 +321,10 @@ impl Store {
     /// path already moved it — the compare-and-swap that lets the merge
     /// retry sweep claim `merge_pending → merging` without double-merging
     /// against a concurrent `sandbox.cow.merge` RPC or a second sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn try_transition_sandbox_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -311,6 +351,10 @@ impl Store {
     }
 
     /// Get the retry count for a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_sandbox_retry_count(
         &self,
         workspace_id: &WorkspaceId,
@@ -326,12 +370,14 @@ impl Store {
                     intent_core::Error::Internal(format!("get sandbox retry count failed: {e}"))
                 })?;
 
-        Ok(row
-            .map(|r| r.try_get("retry_count").unwrap_or(0))
-            .unwrap_or(0))
+        Ok(row.map_or(0, |r| r.try_get("retry_count").unwrap_or(0)))
     }
 
     /// Increment the retry count for a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn increment_sandbox_retry_count(
         &self,
         workspace_id: &WorkspaceId,
@@ -347,6 +393,10 @@ impl Store {
     }
 
     /// Clear the retry count for a sandbox (on successful merge).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_sandbox_retry_count(
         &self,
         workspace_id: &WorkspaceId,

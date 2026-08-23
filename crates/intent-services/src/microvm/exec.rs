@@ -61,6 +61,11 @@ pub struct GuestExec {
 
 /// Connect to the exec agent's forwarded unix socket and start `req`,
 /// returning the stream positioned right after the status line.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::Exec` when the connection, header exchange, or
+/// guest-side start fails.
 pub async fn start(socket: &Path, req: &ExecRequest) -> Result<GuestExec, MicrovmError> {
     let mut stream = UnixStream::connect(socket)
         .await
@@ -104,6 +109,10 @@ pub async fn start(socket: &Path, req: &ExecRequest) -> Result<GuestExec, Microv
 /// Connect + start `req`, then wait for the child to exit (EOF), returning
 /// everything the child wrote to the socket. Used for setup commands that
 /// must complete before the provider launches.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::Exec` when the exec fails or `timeout` elapses.
 pub async fn run_to_completion(
     socket: &Path,
     req: &ExecRequest,
@@ -156,12 +165,12 @@ mod tests {
 
     /// Fake guest exec agent: accept one connection, parse the header line,
     /// reply with `status`, then echo `payload` and close.
-    async fn fake_agent(
-        socket: std::path::PathBuf,
+    fn fake_agent(
+        socket: &std::path::Path,
         status: String,
         payload: &'static [u8],
     ) -> tokio::task::JoinHandle<serde_json::Value> {
-        let listener = UnixListener::bind(&socket).expect("bind fake agent");
+        let listener = UnixListener::bind(socket).expect("bind fake agent");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut reader = tokio::io::BufReader::new(stream);
@@ -189,11 +198,10 @@ mod tests {
         let sock = sock_path("ok");
         let _ = std::fs::remove_file(&sock);
         let server = fake_agent(
-            sock.clone(),
+            &sock,
             format!(r#"{{"ok":true,"protocol":"{EXEC_PROTOCOL}","pid":42}}"#),
             b"hello from guest",
-        )
-        .await;
+        );
 
         let req = ExecRequest {
             argv: vec!["/bin/echo".into(), "hi".into()],
@@ -231,7 +239,7 @@ mod tests {
         ] {
             let sock = sock_path(name);
             let _ = std::fs::remove_file(&sock);
-            let _server = fake_agent(sock.clone(), status, b"").await;
+            let _server = fake_agent(&sock, status, b"");
             let req = ExecRequest {
                 argv: vec!["/bin/true".into()],
                 env: BTreeMap::new(),

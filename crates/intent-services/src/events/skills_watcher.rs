@@ -50,7 +50,7 @@ impl Drop for SkillsWatcher {
 
 impl SkillsWatcher {
     /// Start watching skills directories for all workspaces.
-    /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
+    /// `workspaces` is a list of (`workspace_id`, `workspace_path`) pairs.
     pub(super) fn start(
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,
@@ -89,11 +89,12 @@ impl SkillsWatcher {
     /// path first so events from the new watches (including the promotion
     /// catch-up for tier roots created later) are attributable, then the
     /// project-tier roots are watched. Re-registering replaces the watches.
-    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
-        let _ = self
-            .raw_tx
-            .send(SkillsMsg::Add(workspace_id.clone(), workspace_path.clone()));
-        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+    pub(crate) fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: &Path) {
+        let _ = self.raw_tx.send(SkillsMsg::Add(
+            workspace_id.clone(),
+            workspace_path.to_path_buf(),
+        ));
+        let watch = start_project_watch(&self.hub, &workspace_id, workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watch);
         }
@@ -105,6 +106,7 @@ impl SkillsWatcher {
     /// ride the shared stream and need no separate sync point — subscribing is
     /// synchronous bookkeeping.
     #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
@@ -153,12 +155,12 @@ impl SkillsWatcher {
     /// schedule one catch-up flush compared against the fingerprint retained
     /// by [`Self::pause_workspace`], so an unchanged tree emits nothing and an
     /// edit made while suspended emits exactly once.
-    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+    pub(crate) fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: &Path) {
         let _ = self.raw_tx.send(SkillsMsg::Resume(
             workspace_id.clone(),
-            workspace_path.clone(),
+            workspace_path.to_path_buf(),
         ));
-        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
             map.insert(workspace_id, watch);
         }
@@ -327,7 +329,7 @@ async fn debounce_loop(
                     return;
                 }
             },
-            _ = sleep_until(next_deadline), if next_deadline.is_some() => {
+            () = sleep_until(next_deadline), if next_deadline.is_some() => {
                 flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
             }
         }
@@ -528,7 +530,7 @@ mod tests {
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("dyn-ws");
         let ws_id = WorkspaceId::from("ws-skills-dyn");
@@ -541,7 +543,7 @@ mod tests {
         watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        watcher.add_workspace(ws_id.clone(), &ws.path.clone());
         watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -587,7 +589,7 @@ mod tests {
     async fn resume_catch_up_survives_a_discovery_cache_refresh_while_suspended() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_db, bus, mut sub) = bus_and_sub().await;
         let ws = TempDir::new("pause-ws");
         let ws_id = WorkspaceId::from("ws-skills-pause");
@@ -617,7 +619,7 @@ mod tests {
         std::fs::write(added.join("SKILL.md"), skill_md("added-skill")).expect("write skill");
         crate::skills::discover_skills(&ws.path.to_string_lossy()).await;
 
-        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        watcher.resume_workspace(ws_id.clone(), &ws.path.clone());
         let events = drain_skills_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert!(
             events.iter().any(|e| e.workspace_id == ws_id),

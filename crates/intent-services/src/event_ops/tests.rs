@@ -18,7 +18,7 @@ fn ev(
         event_type: event_type.to_string(),
         actor: EventActor {
             actor_type,
-            id: actor_id.map(|s| s.to_string()),
+            id: actor_id.map(std::string::ToString::to_string),
             name: actor_id.map(|s| format!("name-{s}")),
             ..Default::default()
         },
@@ -117,6 +117,7 @@ fn aggregate_skips_events_without_actor_id() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
 fn workspace_summary_rate_recent_and_top_changed() {
     let events = vec![
         ev(

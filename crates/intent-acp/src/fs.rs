@@ -25,6 +25,7 @@ pub enum FileAction {
 
 impl FileAction {
     /// Lowercase wire value carried on `file:changed.data.action`.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             FileAction::Create => "create",
@@ -67,6 +68,7 @@ impl FileService {
     /// Alias an absolute prefix onto the root: requests under `alias` are
     /// rebased onto `root` (e.g. guest `/workspace/src/x.rs` → host
     /// `<sandbox>/src/x.rs` for microVM sessions, monorepo#1120 EE-5).
+    #[must_use]
     pub fn with_alias(mut self, alias: impl Into<PathBuf>) -> Self {
         self.alias = Some(alias.into());
         self
@@ -84,6 +86,10 @@ impl FileService {
     /// escapes it. Absolute paths are honoured but must still fall inside the
     /// base; relative paths join onto it. Resolution is lexical (no reliance on
     /// the file existing), so traversal via `..` is caught even for writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Fs`] if the resolved path escapes the sandbox base.
     pub fn resolve(&self, requested: &Path) -> AcpResult<PathBuf> {
         let base = normalize_lexical(&self.base());
         let requested = match &self.alias {
@@ -110,6 +116,10 @@ impl FileService {
     }
 
     /// Read a UTF-8 text file inside the sandbox (`fs/read_text_file`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Fs`] if the path escapes the sandbox or the file cannot be read as UTF-8.
     pub async fn read(&self, requested: &Path) -> AcpResult<String> {
         let path = self.resolve(requested)?;
         tokio::fs::read_to_string(&path)
@@ -119,6 +129,10 @@ impl FileService {
 
     /// Write a UTF-8 text file inside the sandbox, creating parent directories
     /// (`fs/write_text_file`). Returns the [`FileChange`] the handler publishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Fs`] if the path escapes the sandbox or creating parent directories / writing the file fails.
     pub async fn write(&self, requested: &Path, content: &str) -> AcpResult<FileChange> {
         let path = self.resolve(requested)?;
         let existed = tokio::fs::metadata(&path).await.is_ok();

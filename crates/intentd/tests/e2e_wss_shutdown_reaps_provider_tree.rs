@@ -185,7 +185,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -203,9 +203,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => panic!("wss event timed out"),
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => panic!("wss event timed out"),
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            panic!("wss event timed out")
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -217,7 +216,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected event frame, got {other:?}"),
         }
     }
@@ -258,13 +257,12 @@ fn pid_dead(pid: i32) -> bool {
             .args(["-o", "state=", "-p"])
             .arg(pid.to_string())
             .output()
-            .map(|o| {
+            .is_ok_and(|o| {
                 !o.status.success()
                     || String::from_utf8_lossy(&o.stdout)
                         .trim_start()
                         .starts_with('Z')
-            })
-            .unwrap_or(false),
+            }),
     }
 }
 
@@ -330,7 +328,8 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let cfg = client_config(&fp);
 
     // Subscriber BEFORE the turn so the parked-chunk signal cannot be missed.
@@ -396,8 +395,10 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         }
         parsed.expect("mock never wrote MOCK_AGENT_TREE_PID_FILE")
     };
-    let child_pid = pids["childPid"].as_i64().expect("childPid") as i32;
-    let grandchild_pid = pids["grandchildPid"].as_i64().expect("grandchildPid") as i32;
+    let child_pid =
+        i32::try_from(pids["childPid"].as_i64().expect("childPid")).expect("pid fits in i32");
+    let grandchild_pid = i32::try_from(pids["grandchildPid"].as_i64().expect("grandchildPid"))
+        .expect("pid fits in i32");
     assert!(!pid_dead(child_pid), "provider child live before shutdown");
     assert!(!pid_dead(grandchild_pid), "grandchild live before shutdown");
 

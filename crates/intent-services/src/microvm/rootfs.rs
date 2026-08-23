@@ -4,7 +4,7 @@
 //! per rootfs digest. Booting needs a *directory tree* the helper can expose
 //! over virtio-fs, and each VM needs its own writable copy (staged
 //! credentials, provider caches). Extraction is expensive, so it runs once
-//! per digest into `<cache entry>/tree/`; each VM then takes a cheap CoW
+//! per digest into `<cache entry>/tree/`; each VM then takes a cheap `CoW`
 //! reflink clone of that tree ([`intent_git::cow_clone`] — microVM workspaces
 //! require a CoW-capable filesystem by design, so no byte-copy fallback).
 
@@ -26,6 +26,10 @@ static EXTRACT_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Ensure `<entry_dir>/tree/` holds the extracted rootfs for the cached
 /// archive at `rootfs_path`, extracting on first use. Returns the tree path.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::Extract` when the extraction fails.
 pub async fn ensure_extracted_tree(rootfs_path: &Path) -> Result<PathBuf, MicrovmError> {
     let entry_dir = rootfs_path
         .parent()
@@ -93,7 +97,11 @@ pub async fn ensure_extracted_tree(rootfs_path: &Path) -> Result<PathBuf, Microv
 
 /// CoW-clone the extracted tree into the per-VM rootfs directory. `dst` must
 /// not exist. No byte-copy fallback: a clone failure is a hard spawn error
-/// (microVM requires CoW support by design).
+/// (microVM requires `CoW` support by design).
+///
+/// # Errors
+///
+/// Returns `MicrovmError::RootfsClone` when the `CoW` clone fails.
 pub async fn clone_vm_rootfs(tree: &Path, dst: &Path) -> Result<(), MicrovmError> {
     let tree = tree.to_path_buf();
     let dst_owned = dst.to_path_buf();

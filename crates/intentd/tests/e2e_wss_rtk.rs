@@ -41,7 +41,7 @@ impl Drop for Daemon {
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             if !log.is_empty() {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -187,20 +187,14 @@ async fn wss_rpc(
             .expect("ws rpc timeout")
             .expect("ws closed")
             .expect("ws error");
-        match msg {
-            Message::Text(text) => {
-                let v: Value = serde_json::from_str(&text).expect("invalid json");
-                if v["id"] == id {
-                    return v;
-                }
-                // Skip responses for other requests
+        if let Message::Text(text) = msg {
+            let v: Value = serde_json::from_str(&text).expect("invalid json");
+            if v["id"] == id {
+                return v;
             }
-            Message::Ping(_) | Message::Pong(_) => {
-                // Skip ping/pong frames
-            }
-            _ => {
-                // Skip other frame types
-            }
+            // Skip responses for other requests
+        } else {
+            // Skip other frame types
         }
     }
 }
@@ -220,9 +214,6 @@ async fn wss_event(
                     return v;
                 }
                 // Skip non-event messages (e.g., RPC responses)
-            }
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                // Skip ping/pong frames
             }
             Some(Ok(Message::Close(_))) => {
                 panic!("websocket closed while waiting for event");
@@ -269,7 +260,8 @@ async fn rtk_settings_integration() {
     let fp = status_resp["result"]["fingerprint"]
         .as_str()
         .expect("no fingerprint");
-    let bound_port = status_resp["result"]["port"].as_u64().expect("no port") as u16;
+    let bound_port = u16::try_from(status_resp["result"]["port"].as_u64().expect("no port"))
+        .expect("value fits in u16");
     assert_ne!(bound_port, 0, "bound port should be non-zero");
 
     let cfg = client_config(fp);
@@ -393,7 +385,8 @@ async fn rtk_prompt_injection_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

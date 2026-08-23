@@ -71,9 +71,19 @@ fn no_version() -> String {
     String::new()
 }
 
-/// auggie source: the rich CLI fetch already backing `models.list`
-/// (discovery via `resolve_auggie_bin` — registry sources are plain fns with
-/// no `Services` handle, so the `auggie_bin` test seam is unavailable here).
+/// Auggie catalog wire-shape version. Bump when daemon-side filtering or
+/// metadata projection changes so persisted rows from the old shape cannot be
+/// served indefinitely by the last-good cache.
+pub(crate) const AUGGIE_CATALOG_VERSION: &str = "preserve-legacy-v1";
+
+fn auggie_catalog_version() -> String {
+    AUGGIE_CATALOG_VERSION.to_string()
+}
+
+/// Auggie registry source. The models.list handler uses its Services-aware
+/// fetch so tests and configured binaries keep working; this plain function is
+/// retained for registry uniformity while the entry supplies the shared cache
+/// version key and remains usable by registry-level consumers.
 fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
         match crate::agent_ops::fetch_auggie_models_rich(None).await {
@@ -202,7 +212,7 @@ fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
 static SOURCES: &[ModelSource] = &[
     ModelSource {
         provider_id: "auggie",
-        version_key: no_version,
+        version_key: auggie_catalog_version,
         fetch: auggie_fetch,
     },
     ModelSource {
@@ -322,8 +332,7 @@ impl ModelCatalogCache {
     pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     }
 
     /// The last successfully fetched rows for `provider_id` regardless of
@@ -386,6 +395,32 @@ impl ModelCatalogCache {
             (entry.version_key.clone(), default_id)
         };
         (entry_version_key == (source.version_key)()).then_some(default_id)
+    }
+
+    /// The cached catalog's default-model id for `provider_id`, falling back
+    /// to the FIRST row of the provider's last-good entry when no row is
+    /// marked `isDefault` (default-provider self-heal, monorepo#3044). Same
+    /// synchronous, read-only, probe-free contract as
+    /// [`Self::cached_default_model`]: an unregistered provider, cold cache,
+    /// stale-pin entry, or an empty catalog all return `None` (the caller
+    /// then persists the provider without a model).
+    pub(crate) fn cached_default_or_first_model(&self, provider_id: &str) -> Option<String> {
+        if let Some(m) = self.cached_default_model(provider_id) {
+            return Some(m);
+        }
+        let source = source_for(provider_id)?;
+        let (entry_version_key, first_id) = {
+            let entries = self.entries.lock().expect("model catalog cache poisoned");
+            let entry = entries.get(provider_id)?;
+            let first_id = entry
+                .models
+                .first()
+                .and_then(|row| row.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            (entry.version_key.clone(), first_id)
+        };
+        (entry_version_key == (source.version_key)()).then_some(first_id)
     }
 
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
@@ -497,7 +532,8 @@ impl ModelCatalogCache {
             return None;
         }
         let age = now_ms - entry.failed_at_ms;
-        (age < MODELS_NEGATIVE_TTL.as_millis() as u64).then(|| entry.reason.clone())
+        (age < u64::try_from(MODELS_NEGATIVE_TTL.as_millis()).unwrap_or(u64::MAX))
+            .then(|| entry.reason.clone())
     }
 
     /// Record a probe failure so non-forced reads within
@@ -577,11 +613,44 @@ impl ModelCatalogCache {
 }
 
 /// Read the persisted snapshot, discarding unreadable or version-mismatched
-/// files.
+/// files. Loaded entries are sanitized: an adapter's `default` pseudo-row is
+/// dropped when real rows exist next to it — a snapshot persisted by a daemon
+/// predating the parse-time pseudo-row resolution stays valid under the same
+/// version key (the adapter pin, not the daemon version), so without this the
+/// stale row would be served indefinitely.
 fn load_persisted(path: &Path) -> Option<HashMap<String, CacheEntry>> {
     let bytes = std::fs::read(path).ok()?;
     let persisted: PersistedCache = serde_json::from_slice(&bytes).ok()?;
-    (persisted.version == PERSIST_VERSION).then_some(persisted.entries)
+    (persisted.version == PERSIST_VERSION)
+        .then_some(persisted.entries)
+        .map(|mut entries| {
+            for (provider_id, entry) in &mut entries {
+                if PSEUDO_ROW_RESOLVING_PROVIDERS.contains(&provider_id.as_str()) {
+                    drop_stale_pseudo_row(&mut entry.models);
+                }
+            }
+            entries
+        })
+}
+
+/// Providers whose catalogs go through the shared ACP row parser and its
+/// `default` pseudo-row resolution (`parse_acp_models`). Only their persisted
+/// entries are sanitized on load — for any other provider a row with id
+/// `default` would be a legitimate model the parse path serves as-is.
+const PSEUDO_ROW_RESOLVING_PROVIDERS: [&str; 3] = ["claude-code", "pi", "droid"];
+
+/// Drop the `default` pseudo-row(s) from a persisted row list when at least
+/// one real (non-pseudo) row exists (mirrors the parse-time rule in
+/// [`crate::provider_models::is_default_pseudo_row`]'s caller): a list with
+/// no real rows is left untouched so a catalog never loads empty because of
+/// this.
+fn drop_stale_pseudo_row(models: &mut Vec<Value>) {
+    if models
+        .iter()
+        .any(|row| !crate::provider_models::is_default_pseudo_row(row))
+    {
+        models.retain(|row| !crate::provider_models::is_default_pseudo_row(row));
+    }
 }
 
 /// Outcome of [`resolve_with_cache`]: the rows to serve (or `None` when the
@@ -640,38 +709,34 @@ where
     let fetched = cell
         .get_or_init(|| async {
             let fetched = fetch().await;
-            match &fetched.models {
-                Some(models) => {
-                    cache.clear_negative(provider_id);
-                    if !models.is_empty() {
-                        cache.store(provider_id, version_key, models.clone(), now_ms);
-                    }
+            if let Some(models) = &fetched.models {
+                cache.clear_negative(provider_id);
+                if !models.is_empty() {
+                    cache.store(provider_id, version_key, models.clone(), now_ms);
                 }
-                None => {
-                    let reason = fetched
-                        .warning
-                        .clone()
-                        .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-                    cache.store_negative(provider_id, version_key, reason, now_ms);
-                }
+            } else {
+                let reason = fetched
+                    .warning
+                    .clone()
+                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+                cache.store_negative(provider_id, version_key, reason, now_ms);
             }
             fetched
         })
         .await
         .clone();
     cache.finish_inflight(provider_id, version_key, &cell);
-    match fetched.models {
-        Some(models) => ResolvedModels {
+    if let Some(models) = fetched.models {
+        ResolvedModels {
             models: Some(models),
             stale: false,
             warning: fetched.warning,
-        },
-        None => {
-            let reason = fetched
-                .warning
-                .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-            failure_fallback(cache, provider_id, version_key, reason)
         }
+    } else {
+        let reason = fetched
+            .warning
+            .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+        failure_fallback(cache, provider_id, version_key, reason)
     }
 }
 

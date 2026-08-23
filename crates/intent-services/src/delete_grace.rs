@@ -47,7 +47,7 @@ impl PendingDeletes {
     pub(crate) fn deadline(&self, key: &str) -> Option<String> {
         self.inner
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .map(|p| p.delete_at.clone())
     }
@@ -68,7 +68,10 @@ impl PendingDeletes {
         delete_at: String,
         spawn: impl FnOnce(u64) -> tokio::task::JoinHandle<()>,
     ) -> Option<String> {
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = map.get(&key) {
             return Some(existing.delete_at.clone());
         }
@@ -90,7 +93,10 @@ impl PendingDeletes {
     /// the commit; `false` means the entry was cancelled or superseded and
     /// the timer must do nothing.
     pub(crate) fn claim(&self, key: &str, generation: u64) -> bool {
-        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match map.get(key) {
             Some(p) if p.generation == generation => {
                 map.remove(key);
@@ -107,7 +113,7 @@ impl PendingDeletes {
         let removed = self
             .inner
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
         match removed {
             Some(p) => {

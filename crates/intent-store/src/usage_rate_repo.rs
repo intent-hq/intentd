@@ -30,6 +30,7 @@ pub struct UsageRateDelta {
 impl UsageRateDelta {
     /// True when every counter is zero — such deltas are skipped by writers
     /// (an all-zero turn adds nothing and would only churn the table).
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         *self == Self::default()
     }
@@ -52,6 +53,10 @@ impl Store {
     /// row when absent: all counters are summed. `bucket_utc` MUST be a UTC
     /// minute floor (`"YYYY-MM-DDTHH:MM:00Z"`) — this layer stores what it
     /// is given.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn add_usage_rate(&self, bucket_utc: &str, delta: &UsageRateDelta) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage_rate_minutely (
@@ -66,11 +71,11 @@ impl Store {
                 thought_tokens = thought_tokens + excluded.thought_tokens",
         )
         .bind(bucket_utc)
-        .bind(delta.input_tokens as i64)
-        .bind(delta.output_tokens as i64)
-        .bind(delta.cache_read_tokens as i64)
-        .bind(delta.cache_creation_tokens as i64)
-        .bind(delta.thought_tokens as i64)
+        .bind(delta.input_tokens.cast_signed())
+        .bind(delta.output_tokens.cast_signed())
+        .bind(delta.cache_read_tokens.cast_signed())
+        .bind(delta.cache_creation_tokens.cast_signed())
+        .bind(delta.thought_tokens.cast_signed())
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("add usage rate failed: {e}")))?;
@@ -80,6 +85,10 @@ impl Store {
     /// List the `usage_rate_minutely` rows with `bucket_utc >= since`,
     /// ordered ascending — the read surface the `stats.getRateHistory`
     /// zero-fill builds on (RFC-3339 UTC keys compare lexicographically).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_rate_since(&self, since: &str) -> Result<Vec<UsageRateRow>> {
         let rows = sqlx::query(
             "SELECT bucket_utc, input_tokens, output_tokens, cache_read_tokens,
@@ -96,11 +105,11 @@ impl Store {
             .iter()
             .map(|row| UsageRateRow {
                 bucket_utc: row.get("bucket_utc"),
-                input_tokens: row.get::<i64, _>("input_tokens") as u64,
-                output_tokens: row.get::<i64, _>("output_tokens") as u64,
-                cache_read_tokens: row.get::<i64, _>("cache_read_tokens") as u64,
-                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens") as u64,
-                thought_tokens: row.get::<i64, _>("thought_tokens") as u64,
+                input_tokens: row.get::<i64, _>("input_tokens").cast_unsigned(),
+                output_tokens: row.get::<i64, _>("output_tokens").cast_unsigned(),
+                cache_read_tokens: row.get::<i64, _>("cache_read_tokens").cast_unsigned(),
+                cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens").cast_unsigned(),
+                thought_tokens: row.get::<i64, _>("thought_tokens").cast_unsigned(),
             })
             .collect())
     }
@@ -110,6 +119,10 @@ impl Store {
     /// Inclusive so a sweep landing exactly on a minute boundary still leaves
     /// at most 1440 buckets (cutoff bucket removed, cutoff+1 .. now retained).
     /// Idempotent — a re-run with the same cutoff removes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_usage_rate_before(&self, cutoff: &str) -> Result<u64> {
         let result = sqlx::query("DELETE FROM usage_rate_minutely WHERE bucket_utc <= ?")
             .bind(cutoff)

@@ -92,7 +92,7 @@ pub(crate) async fn handle(
             return None;
         }
         return Some(error_frame(
-            req.id_echo,
+            &req.id_echo,
             -32001,
             "server.* methods are local-only",
         ));
@@ -111,8 +111,8 @@ pub(crate) async fn handle(
         return None;
     }
     match result {
-        Ok(v) => Some(success_frame(req.id_echo, v)),
-        Err((code, msg)) => Some(error_frame(req.id_echo, code, &msg)),
+        Ok(v) => Some(success_frame(&req.id_echo, &v)),
+        Err((code, msg)) => Some(error_frame(&req.id_echo, code, &msg)),
     }
 }
 
@@ -134,13 +134,10 @@ async fn pairing_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     }))
 }
 
-/// Build the `server.rotateToken` result JSON. Returns an error when INTENTD_AUTH_TOKEN is set.
+/// Build the `server.rotateToken` result JSON. Returns an error when `INTENTD_AUTH_TOKEN` is set.
 async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     // Check if INTENTD_AUTH_TOKEN is set (token is fixed by env).
-    if std::env::var("INTENTD_AUTH_TOKEN")
-        .map(|t| !t.is_empty())
-        .unwrap_or(false)
-    {
+    if std::env::var("INTENTD_AUTH_TOKEN").is_ok_and(|t| !t.is_empty()) {
         return Err(Error::InvalidParams(
             "cannot rotate token: INTENTD_AUTH_TOKEN is set (token is fixed by env)".to_string(),
         ));
@@ -204,6 +201,7 @@ fn collect_local_ipv6s() -> Vec<String> {
 /// bind-address picker: loopback included (listed first), virtual/container
 /// interfaces skipped (same prefixes as [`collect_local_ips`]), one entry per
 /// distinct address.
+#[must_use]
 pub fn collect_bind_interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
     let mut out: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
@@ -229,6 +227,7 @@ pub fn collect_bind_interfaces() -> Vec<(String, std::net::Ipv4Addr)> {
 /// from `tls::collect_san` but returns only the local IPs (no localhost/loopback).
 /// Shared with the `pairing.getInfo` fast-path and the `system.status` snapshot
 /// (composition root) so all surfaces report the same hosts.
+#[must_use]
 pub fn collect_local_ips() -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {

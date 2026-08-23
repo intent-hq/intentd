@@ -2,7 +2,7 @@
 //! `mcp.oauth.*` RPC family manages the opaque OAuth bag associated with each
 //! external MCP server id; bags are secret material. Every wire response is
 //! **presence-only** — the bag itself never leaves the daemon over the wire.
-//! Storage lives in the `mcp_oauth_tokens` SQLite table (§9.4); internal
+//! Storage lives in the `mcp_oauth_tokens` `SQLite` table (§9.4); internal
 //! consumers (e.g. an outbound HTTP request built inside the daemon) read the
 //! raw bag through [`Store::get_mcp_oauth_token`], never through the wire.
 
@@ -81,6 +81,37 @@ impl<'a> McpOauthService<'a> {
         let server_id = Self::require_server_id(server_id)?;
         self.store.delete_mcp_oauth_token(server_id).await?;
         Ok(json!({ "success": true }))
+    }
+
+    /// Build the `Authorization` header value from the stored bag for
+    /// `server_id`, when one exists and carries an `access_token`. Internal
+    /// consumer seam (§5.22.1): the raw bag is read from the store to build an
+    /// outbound request and never crosses the wire. A lowercase `bearer` token
+    /// type is capitalized (OAuth servers may return it lowercase); a missing
+    /// `token_type` defaults to `Bearer`.
+    pub(crate) async fn authorization_header(&self, server_id: &str) -> Result<Option<String>> {
+        let Some(raw) = self.store.get_mcp_oauth_token(server_id).await? else {
+            return Ok(None);
+        };
+        let bag: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        let Some(token) = bag
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let token_type = bag
+            .get("token_type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Bearer");
+        let token_type = if token_type.eq_ignore_ascii_case("bearer") {
+            "Bearer"
+        } else {
+            token_type
+        };
+        Ok(Some(format!("{token_type} {token}")))
     }
 }
 
@@ -245,5 +276,57 @@ mod tests {
             .expect("bag persisted");
         assert!(raw.contains("\"v\":2"));
         assert!(raw.contains(DUMMY_BAG_LITERAL));
+    }
+
+    #[tokio::test]
+    async fn authorization_header_builds_from_stored_bag() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        svc.set(
+            "srv",
+            json!({ "access_token": "tok123", "token_type": "Bearer" }),
+        )
+        .await
+        .unwrap();
+        let hdr = svc.authorization_header("srv").await.unwrap();
+        assert_eq!(hdr.as_deref(), Some("Bearer tok123"));
+    }
+
+    #[tokio::test]
+    async fn authorization_header_capitalizes_lowercase_bearer_and_defaults() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        svc.set(
+            "lower",
+            json!({ "access_token": "t1", "token_type": "bearer" }),
+        )
+        .await
+        .unwrap();
+        svc.set("none", json!({ "access_token": "t2" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.authorization_header("lower").await.unwrap().as_deref(),
+            Some("Bearer t1")
+        );
+        assert_eq!(
+            svc.authorization_header("none").await.unwrap().as_deref(),
+            Some("Bearer t2")
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_header_absent_bag_or_token_is_none() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        assert!(svc.authorization_header("ghost").await.unwrap().is_none());
+        svc.set("no-token", json!({ "refresh_token": "r" }))
+            .await
+            .unwrap();
+        assert!(svc
+            .authorization_header("no-token")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

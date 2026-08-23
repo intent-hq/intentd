@@ -57,11 +57,20 @@ fn counting_fetch(
     }
 }
 
+// `try_from` is not const-callable; the TTL is far below `u64::MAX` millis.
+#[allow(clippy::cast_possible_truncation)]
 const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
 /// An arbitrarily large age (~10 years in ms): cached entries have no TTL,
 /// so an entry this old must still be served without a probe.
 const OLD_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
+
+#[test]
+fn auggie_catalog_version_invalidates_pre_legacy_cache() {
+    let source = source_for("auggie").expect("auggie source");
+    assert_eq!((source.version_key)(), AUGGIE_CATALOG_VERSION);
+    assert_ne!((source.version_key)(), "");
+}
 
 #[tokio::test]
 async fn cache_hit_skips_fetch() {
@@ -185,6 +194,81 @@ fn persistence_roundtrips_across_instances() {
     assert!(corrupt.last_good("p", "v1").is_none());
 }
 
+#[test]
+fn persistence_roundtrips_model_metadata_without_transform() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MODELS_CACHE_FILE);
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let models = vec![json!({
+        "id": "legacy", "name": "Legacy", "provider": "auggie",
+        "isLegacyModel": true
+    })];
+    cache.store("auggie", AUGGIE_CATALOG_VERSION, models.clone(), 1_000);
+
+    let reloaded = ModelCatalogCache::new(Some(path));
+    assert_eq!(
+        reloaded.last_good("auggie", AUGGIE_CATALOG_VERSION),
+        Some(models)
+    );
+}
+
+#[test]
+fn persistence_load_drops_stale_default_pseudo_row() {
+    // A snapshot persisted by a daemon predating the parse-time pseudo-row
+    // resolution stays valid under the same version key (the adapter pin), so
+    // the load path must drop the pseudo-row when real rows exist next to it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MODELS_CACHE_FILE);
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let stale = vec![
+        json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code",
+                "description": "Opus 5 with 1M context · Best for everyday, complex tasks" }),
+        json!({ "id": "opus[1m]", "name": "Opus (1M context)", "provider": "claude-code",
+                "description": "Opus 5 with 1M context · Best for everyday, complex tasks" }),
+        json!({ "id": "sonnet", "name": "Sonnet", "provider": "claude-code" }),
+    ];
+    cache.store("claude-code", "pin@1", stale, 1_000);
+
+    let reloaded = ModelCatalogCache::new(Some(path.clone()));
+    let served = reloaded.last_good("claude-code", "pin@1").unwrap();
+    let ids: Vec<&str> = served.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["opus[1m]", "sonnet"]);
+
+    // A sole pseudo-row is kept — the load never empties a catalog (D1).
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let only_default = vec![
+        json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code" }),
+    ];
+    cache.store("claude-code", "pin@1", only_default.clone(), 2_000);
+    let reloaded = ModelCatalogCache::new(Some(path.clone()));
+    assert_eq!(
+        reloaded.last_good("claude-code", "pin@1"),
+        Some(only_default)
+    );
+
+    // A list with no real rows (even several pseudo-rows) is left untouched —
+    // retain never produces a stored-empty entry.
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let all_pseudo = vec![
+        json!({ "id": "default", "name": "Default", "provider": "claude-code" }),
+        json!({ "id": "DEFAULT", "name": "Default (dup)", "provider": "claude-code" }),
+    ];
+    cache.store("claude-code", "pin@1", all_pseudo.clone(), 3_000);
+    let reloaded = ModelCatalogCache::new(Some(path.clone()));
+    assert_eq!(reloaded.last_good("claude-code", "pin@1"), Some(all_pseudo));
+
+    // Sanitization is scoped to the pseudo-row-resolving providers: for any
+    // other provider a `default` id is a legitimate model and survives load.
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let opencode = vec![
+        json!({ "id": "default", "name": "Default", "provider": "opencode" }),
+        json!({ "id": "gpt-6", "name": "GPT-6", "provider": "opencode" }),
+    ];
+    cache.store("opencode", "pin@1", opencode.clone(), 4_000);
+    let reloaded = ModelCatalogCache::new(Some(path));
+    assert_eq!(reloaded.last_good("opencode", "pin@1"), Some(opencode));
+}
+
 /// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
 /// list with no warning — the provider CLI owns model selection.
 #[tokio::test]
@@ -215,7 +299,7 @@ fn registry_covers_all_nine_providers() {
 #[test]
 fn registry_version_keys_follow_adapter_pins() {
     let key = |provider: &str| (source_for(provider).unwrap().version_key)();
-    assert_eq!(key("auggie"), "");
+    assert_eq!(key("auggie"), AUGGIE_CATALOG_VERSION);
     assert_eq!(key("cortex"), "");
     // Keyed on the full npx package spec (name + version), not just the
     // version constant, so a package rename also invalidates cache entries.
@@ -443,14 +527,14 @@ async fn negative_entry_is_version_key_scoped() {
 
 // --- cached-catalog ownership evidence (monorepo#607) ---
 // These use real registry provider ids (`source_for` gates the lookup):
-// auggie and grok are both version-pin-free (`no_version` → "").
+// auggie uses a wire-shape version; grok remains version-pin-free.
 
 #[test]
 fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
     let cache = ModelCatalogCache::new(None);
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "auggie:fable-6", "name": "Fable 6", "provider": "auggie" }),
@@ -481,7 +565,7 @@ fn cached_effort_levels_reads_matching_row() {
     let cache = ModelCatalogCache::new(None);
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie",
                     "effortLevels": ["low", "high"] }),
@@ -531,7 +615,7 @@ fn cached_default_model_reads_is_default_row() {
     let cache = ModelCatalogCache::new(None);
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
@@ -553,7 +637,7 @@ fn cached_default_model_none_without_usable_entry() {
     // Catalog without an isDefault row (including an explicit false) → None.
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
@@ -590,7 +674,7 @@ fn providers_claiming_model_cached_walks_registry() {
     assert!(cache.providers_claiming_model_cached("fable-5").is_empty());
     cache.store(
         "auggie",
-        "",
+        AUGGIE_CATALOG_VERSION,
         vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         1_000,
     );

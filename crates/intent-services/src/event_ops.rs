@@ -99,7 +99,7 @@ pub(crate) fn aggregate_agent_activity(events: &[Event]) -> Vec<AgentActivity> {
             }
         });
         entry.event_count += 1;
-        entry.last_active = ev.timestamp.clone();
+        entry.last_active.clone_from(&ev.timestamp);
         if ev.event_type == AGENT_TOOL_CALL {
             entry.tool_calls += 1;
             if let Some(files) = ev.data.get("filesModified").and_then(Value::as_array) {
@@ -145,6 +145,8 @@ pub(crate) fn build_workspace_summary(
         .cloned()
         .collect();
     let active_agents = aggregate_agent_activity(&agent_events);
+    // Event counts and window sizes are far below 2^53: loss-free in f64.
+    #[allow(clippy::cast_precision_loss)]
     let event_rate = all_events.len() as f64 / minutes_ago as f64;
 
     let mut order: Vec<String> = Vec::new();

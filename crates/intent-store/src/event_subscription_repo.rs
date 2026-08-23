@@ -29,9 +29,13 @@ pub struct PersistedEventSubscription {
 }
 
 impl Store {
-    /// Insert an event_subscription row, or update its mutable columns on id
-    /// conflict. The identity columns — workspace, subscriber, created_at —
+    /// Insert an `event_subscription` row, or update its mutable columns on id
+    /// conflict. The identity columns — workspace, subscriber, `created_at` —
     /// are fixed at registration and intentionally not overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_event_subscription(&self, s: &PersistedEventSubscription) -> Result<()> {
         let event_types = serde_json::to_string(&s.event_types)
             .map_err(|e| Error::Internal(format!("encode event_types: {e}")))?;
@@ -49,7 +53,7 @@ impl Store {
         .bind(&s.workspace_id.0)
         .bind(&s.subscriber_agent_id.0)
         .bind(event_types)
-        .bind(s.exclude_self as i64)
+        .bind(i64::from(s.exclude_self))
         .bind(s.batch_window_ms)
         .bind(&s.created_at)
         .execute(self.write_pool())
@@ -58,8 +62,12 @@ impl Store {
         Ok(())
     }
 
-    /// Load every persisted event_subscription row (the registry is
+    /// Load every persisted `event_subscription` row (the registry is
     /// daemon-global, so startup rehydration loads all rows in one pass).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_event_subscriptions(&self) -> Result<Vec<PersistedEventSubscription>> {
         let rows = sqlx::query(
             "SELECT id, workspace_id, subscriber_agent_id, event_types,
@@ -74,7 +82,11 @@ impl Store {
         rows.iter().map(decode_subscription_row).collect()
     }
 
-    /// Delete an event_subscription row (`event.unsubscribe`, startup prune).
+    /// Delete an `event_subscription` row (`event.unsubscribe`, startup prune).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_event_subscription(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM event_subscription WHERE id = ?")
             .bind(id)
@@ -84,8 +96,12 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every event_subscription row registered by `subscriber_agent_id`
+    /// Delete every `event_subscription` row registered by `subscriber_agent_id`
     /// (subscriber agent deleted).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_event_subscriptions_for_agent(
         &self,
         subscriber_agent_id: &AgentId,
@@ -100,9 +116,13 @@ impl Store {
         Ok(())
     }
 
-    /// Delete every event_subscription row scoped to `workspace_id`
+    /// Delete every `event_subscription` row scoped to `workspace_id`
     /// (workspace deleted — the subscriptions can never match again, see
     /// monorepo#947).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn delete_event_subscriptions_for_workspace(
         &self,
         workspace_id: &WorkspaceId,

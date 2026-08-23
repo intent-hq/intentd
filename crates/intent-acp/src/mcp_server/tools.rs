@@ -215,17 +215,17 @@ API:
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
-    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
+    `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
+    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
-  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested. Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage, activity timestamps, and the pending message queue (`queue` + `queueLength`; entries in the getQueue shape with `content` truncated to 200 chars). Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
@@ -266,19 +266,19 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
-  ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
+  ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root, and an omitted `cwd` defaults to the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
   ws.hook.schedule({ name, code, delayMs, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
     The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 86400000 (24 hours; values are clamped into [10000, 86400000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
     `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it.
-  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 24 h from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 24 h from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?` (an evicting run's fatal error — or, on an active hook, a warning naming the last run's failed host exec calls: nonzero exit or timeout without a throw), `lastState?` (the carry-over state JSON from the most recent run).
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI), `showTab` (reveal a hidden owned tab — activates it in a visible panel without stealing focus; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
@@ -448,17 +448,17 @@ API:
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
-    `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
+    `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
+    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. Delivers with interrupt priority by DEFAULT: the target is stopped mid-response and the message is delivered immediately. Pass `priority="queue"` to opt out and queue the message if the target is busy.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. Same interrupt-by-default delivery as `send()`; `priority="queue"` opts out.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
   ws.agent.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Compatibility alias for `ws.event.unsubscribe()`.
-  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId).
+  ws.agent.watch(agentId) → { ok, subscriptionId, agentId }  // Watch another agent: you are woken once, at its next completion (it goes idle with an empty pending message queue, fails, or is deleted), and the watch is then retired. Blocker/discussion attention wakes are delivered along the way without ending the watch. Watch again if you care about future turns. A watch adopted into an `after_all` delegation group ends at group settlement and cannot be unwatched while grouped (use `agent.cancelSubscriptions` with the groupId). An idle target with nothing pending (no active hooks, PR monitors, event subscriptions, queued messages, outgoing waits, or unresolved blocker/discussion/question, among other waiting reasons) is rejected — it has no future completion; wake it instead (`ws.agent.send` auto-arms a watch on you).
   ws.agent.unwatch(subscriptionIdOrAgentId) → { ok, removed }  // Stop watching an agent (accepts the watch's subscriptionId or the watched agentId).
   ws.agent.list(includeCompleted?) → [agents]  // Lists agents in this workspace; completed agents are omitted unless requested. Sandboxed agents carry `metadata.sandboxId`/`sandboxPath`/`sandboxBranch`.
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
@@ -502,12 +502,12 @@ API:
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 86400000 (24 hours; values are clamped into [10000, 86400000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
     `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it.
-  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 24 h from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 24 h from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?` (an evicting run's fatal error — or, on an active hook, a warning naming the last run's failed host exec calls: nonzero exit or timeout without a throw), `lastState?` (the carry-over state JSON from the most recent run).
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
-    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs` (`scope: "mine"|"unclaimed"|"all"`, with per-tab owner + sizing + visibility info), `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab` (optional `width`/`height`, default 1280×800; hidden by default — pass `visible: true` to open into the UI), `showTab` (reveal a hidden owned tab — activates it in a visible panel without stealing focus; `focus: true` also focuses it), `claimTab` (claim an unowned user tab; `width` required), `resizeTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
+    Tabs are agent-owned: you may only manipulate tabs you own — claim unowned (user) tabs with `claimTab` first; ops on tabs you do not own fail with the structured `not-owner` / `already-claimed` action-result errors. Agent-opened tabs start hidden (`visibility: "hidden"` in `listTabs`); reveal them with `showTab` — `focusTab` fails on hidden tabs. Actions work even when the workspace is not visible in the app: focus/activation applies to the saved layout, and `showTab {focus:true}` / `focusTab` / `openTab {visible:true}` skip the UI focus attempt, carrying a workspace-not-visible `warning` string in their result.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, ownership/sizing rules, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
@@ -626,7 +626,7 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
 const REPORT_TO_PARENT_ATTENTION_XREF: &str = " — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead";
 
 /// Sandbox doc clauses scrubbed from the assembled description when the
-/// workspace is NOT CoW-capable (no CoW filesystem support and not a microVM
+/// workspace is NOT CoW-capable (no `CoW` filesystem support and not a microVM
 /// workspace): the `mergeOnTurnEnd` continuation line under
 /// `ws.agent.create`/`ws.agent.delegate` (whole line, scrubbed twice per
 /// variant), the `mergeOnTurnEnd?` arg in the delegate signature, and the
@@ -680,7 +680,7 @@ const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 const TASK_GRAPH_DELEGATE_PARAMS: &str = ", tasks? })";
 const TASK_GRAPH_DELEGATE_PARAMS_OFF: &str = " })";
 const TASK_GRAPH_UNBLOCKED_WAKE_XREF: &str = " Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.";
-const TASK_GRAPH_BATCH_FORM_LINE: &str = "    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.\n";
+const TASK_GRAPH_BATCH_FORM_LINE: &str = "    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.\n";
 const TASK_GRAPH_SETCONTENT_XREF: &str = "; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`";
 const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR: &str = " The fence line takes optional attributes — `@@@task key=api dependsOn=a,b conflictsWith=c effort=2h` — bare tokens, comma-separated lists, whitespace-tolerant; `dependsOn`/`conflictsWith` values resolve against sibling block `key=`s, then exact sibling titles, then existing task-note ids, and `effort` seeds the estimated effort.\n    Conversion never fails on bad attributes: blocks always convert, and unresolvable/ambiguous references or rejected edges (cycle, tree ancestor/descendant) are skipped with a warning naming the block and reference. `createdTasks` is `[{ key?, title, noteId }]` in block order; check `warnings` after converting.";
 const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR_OFF: &str =
@@ -718,10 +718,10 @@ pub(super) fn denied_feature(
 /// `[agentFeatures]` (a method line and its indented continuation lines drop
 /// together; doubled blank lines left by a removed namespace paragraph
 /// collapse to one), then scrubbing the sandbox doc clauses when the
-/// workspace is not CoW-capable. With every toggle on — including the opt-in
-/// `taskGraph` — and `cow_capable`, this returns the static const unchanged,
-/// so the every-gate-open description is byte-identical to today's by
-/// construction.
+/// workspace is not `CoW`-capable. With every toggle on — including the
+/// opt-in `taskGraph` — and `cow_capable`, this returns the static const
+/// unchanged, so the every-gate-open description is byte-identical to
+/// today's by construction.
 pub fn workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
@@ -830,6 +830,59 @@ pub fn workspace_api_description(
             );
     }
     Cow::Owned(out)
+}
+
+/// The `Namespaces` index header line as it appears verbatim in both static
+/// description variants. [`compact_workspace_api_description`] anchors on it,
+/// and the `namespace_index_header_present_in_both_variants` drift test pins
+/// it to the consts.
+pub(crate) const NAMESPACE_INDEX_HEADER: &str =
+    "Namespaces (index — full signatures in API below):";
+
+/// The header [`compact_workspace_api_description`] swaps in: same index, but
+/// the full signatures live in the system prompt (under
+/// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) rather than below, with
+/// `ws.help()` as the in-tool fallback.
+pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — full docs: \"Workspace API Reference\" in your system prompt, or ws.help()):";
+
+/// Heading of the system-prompt section that carries the full `ws.*` API
+/// reference for providers whose client truncates long MCP tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`). The compact description's
+/// index header points at this section by name, so the two must not drift.
+pub const WORKSPACE_API_SYSTEM_PROMPT_HEADING: &str = "# Workspace API Reference";
+
+/// Compact `workspace_api` description for providers whose MCP client
+/// silently truncates long tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`; claude-code cuts at ~2k
+/// chars — anthropics/claude-code#53933). Derived from the SAME
+/// [`workspace_api_description`] assembly as the full text — chief-ness and
+/// `[agentFeatures]` gating apply identically, no second source — by cutting
+/// at the end of the `Namespaces` index block and swapping the index header
+/// for one that points at the full reference in the system prompt (see
+/// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) and `ws.help()`. Specialist
+/// model options are NOT injected here (they sit in the delegate docs past
+/// the cut); the system-prompt copy carries them instead.
+pub fn compact_workspace_api_description(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    cow_capable: bool,
+) -> String {
+    let full = workspace_api_description(is_chief, features, cow_capable);
+    let Some(header_start) = full.find(NAMESPACE_INDEX_HEADER) else {
+        // Unreachable while the drift test pins the header into both static
+        // variants; degrade to the full text rather than panic.
+        return full.into_owned();
+    };
+    // The index block ends at the first blank line after its header.
+    let index_end = full[header_start..]
+        .find("\n\n")
+        .map_or(full.len(), |i| header_start + i);
+    let mut out = String::with_capacity(index_end + NAMESPACE_INDEX_HEADER_COMPACT.len());
+    out.push_str(&full[..header_start]);
+    out.push_str(NAMESPACE_INDEX_HEADER_COMPACT);
+    out.push_str(&full[header_start + NAMESPACE_INDEX_HEADER.len()..index_end]);
+    out.push('\n');
+    out
 }
 
 /// `ws.help()` — the runtime docs index. Returns the `Namespaces` block of
@@ -1078,14 +1131,16 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        denied_feature, help_index, help_namespace, workspace_api_description,
-        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
-        MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
-        HOOK_HOST_EXEC_INDEX_XREF, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
-        PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
-        REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
+        compact_workspace_api_description, denied_feature, help_index, help_namespace,
+        workspace_api_description, workspace_api_description_with_model_options,
+        AgentFeaturesSettings, Cow, MicrovmSpawnHints, SpecialistModelOption,
+        SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF, HOOK_HOST_EXEC_INDEX_XREF,
+        NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT, PR_MONITOR_HOOK_XREF,
+        PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS,
+        PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
         TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
         TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1164,8 +1219,7 @@ mod tests {
         all_namespaces()
             .iter()
             .find(|(ns, _)| *ns == namespace)
-            .map(|(_, src)| *src)
-            .unwrap_or("")
+            .map_or("", |(_, src)| *src)
     }
 
     // Methods whose dispatch arm exists solely to surface a
@@ -1461,10 +1515,7 @@ mod tests {
                     .find("Namespaces")
                     .unwrap_or_else(|| panic!("chief={is_chief} {label}: no Namespaces index"));
                 // The index block ends at the first blank line after its header.
-                let end = desc[start..]
-                    .find("\n\n")
-                    .map(|i| start + i)
-                    .unwrap_or(desc.len());
+                let end = desc[start..].find("\n\n").map_or(desc.len(), |i| start + i);
                 assert!(
                     end <= BUDGET,
                     "chief={is_chief} {label}: description prefix through the end of the \
@@ -1475,6 +1526,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- compact description (truncating providers) tests ------------------
+
+    // The index header const the compact cut anchors on must appear verbatim
+    // in both static variants — a reworded header would silently turn the
+    // compact function into a full-description passthrough.
+    #[test]
+    fn namespace_index_header_present_in_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(desc.contains(NAMESPACE_INDEX_HEADER));
+        }
+    }
+
+    // The compact description is a pure derivation of the full assembly: the
+    // text before the index header is byte-identical, the index entries are
+    // byte-identical, only the header line differs (it points at the system
+    // prompt + ws.help), and nothing after the index survives. Swept across
+    // both chief variants and every gating combination so the compact cut
+    // can never drift from the gated full text.
+    #[test]
+    fn compact_description_derives_from_full_assembly() {
+        let mut feature_sets: Vec<AgentFeaturesSettings> = vec![AgentFeaturesSettings::default()];
+        for (_, disable) in feature_cases() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            feature_sets.push(features);
+        }
+        for is_chief in [false, true] {
+            for features in &feature_sets {
+                let full = workspace_api_description(is_chief, features, true);
+                let compact = compact_workspace_api_description(is_chief, features, true);
+                let header_start = full.find(NAMESPACE_INDEX_HEADER).unwrap();
+                let index_end = full[header_start..]
+                    .find("\n\n")
+                    .map_or(full.len(), |i| header_start + i);
+                let mut expected = String::new();
+                expected.push_str(&full[..header_start]);
+                expected.push_str(NAMESPACE_INDEX_HEADER_COMPACT);
+                expected.push_str(&full[header_start + NAMESPACE_INDEX_HEADER.len()..index_end]);
+                expected.push('\n');
+                assert_eq!(
+                    compact, expected,
+                    "chief={is_chief}: compact description drifted from the full assembly"
+                );
+                assert!(
+                    !compact.contains("\nAPI:"),
+                    "chief={is_chief}: compact description must cut before the API sections"
+                );
+                // Implementation-independent cut-placement guards (the
+                // `expected` splice above mirrors the production algorithm, so
+                // by itself it cannot catch a mis-placed cut): every index
+                // entry line of the full description survives verbatim, and
+                // the compact text ends exactly at the index's last entry.
+                let index_lines: Vec<&str> = full[..index_end]
+                    .lines()
+                    .filter(|l| l.starts_with("  ws."))
+                    .collect();
+                assert!(
+                    !index_lines.is_empty(),
+                    "chief={is_chief}: full description has no index entry lines"
+                );
+                for line in &index_lines {
+                    assert!(
+                        compact.contains(&format!("\n{line}\n")),
+                        "chief={is_chief}: compact description dropped index line {line:?}"
+                    );
+                }
+                assert!(
+                    compact.ends_with(&format!("{}\n", index_lines.last().unwrap())),
+                    "chief={is_chief}: compact description must end at the last index entry"
+                );
+            }
+        }
+    }
+
+    // Whole-description budget: the compact variant must fit ENTIRELY under
+    // the ~2k truncation cutoff (anthropics/claude-code#53933) — that is its
+    // reason to exist — for both chief variants and every gating combination
+    // (all-defaults is the longest; gating only removes index lines).
+    // Passing here strictly implies `namespace_index_fits_within_truncation_budget`
+    // passes (the compact text is the full description's prefix through the
+    // index, plus a longer header line); that test is kept because it guards
+    // the FULL description's prefix independently of the compact feature.
+    #[test]
+    fn compact_description_fits_within_truncation_budget() {
+        const BUDGET: usize = 2000;
+        let mut feature_sets: Vec<(String, AgentFeaturesSettings)> = vec![
+            ("all-defaults".into(), AgentFeaturesSettings::default()),
+            ("all-gates-open".into(), all_gates_open()),
+        ];
+        for (i, (prefixes, disable)) in feature_cases().into_iter().enumerate() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            feature_sets.push((format!("case-{i}-{prefixes:?}"), features));
+        }
+        for is_chief in [false, true] {
+            for (label, features) in &feature_sets {
+                let compact = compact_workspace_api_description(is_chief, features, true);
+                assert!(
+                    compact.len() <= BUDGET,
+                    "chief={is_chief} {label}: compact description is {} bytes, over the \
+                     {BUDGET}-byte truncation budget",
+                    compact.len()
+                );
+            }
+        }
+    }
+
+    // The compact header's pointer text names the system-prompt section
+    // heading — pin the two together so a heading rename cannot orphan the
+    // pointer.
+    #[test]
+    fn compact_header_points_at_system_prompt_heading() {
+        let section_name = WORKSPACE_API_SYSTEM_PROMPT_HEADING
+            .trim_start_matches('#')
+            .trim();
+        assert!(
+            NAMESPACE_INDEX_HEADER_COMPACT.contains(section_name),
+            "compact index header must name the `{section_name}` system-prompt section"
+        );
+        assert!(NAMESPACE_INDEX_HEADER_COMPACT.contains("ws.help()"));
     }
 
     // ---- ws.help() runtime docs tests --------------------------------------
@@ -1658,17 +1831,14 @@ mod tests {
         ]
     }
 
-    // Every gate open: the defaults plus the opt-in `taskGraph`.
+    // Every gate open: the defaults (all toggles on, `taskGraph` included
+    // since the default flip).
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings {
-            task_graph: true,
-            ..AgentFeaturesSettings::default()
-        }
+        AgentFeaturesSettings::default()
     }
 
-    // Hard requirement: with every gate open (the defaults plus the opt-in
-    // `taskGraph`), the assembled description IS the static const —
-    // byte-identical, both variants.
+    // Hard requirement: with every gate open (the defaults), the assembled
+    // description IS the static const — byte-identical, both variants.
     #[test]
     fn all_gates_open_description_is_byte_identical() {
         let features = all_gates_open();
@@ -1717,7 +1887,7 @@ mod tests {
             assert!(!desc.contains("greedy"));
             assert!(desc.contains("nothing auto-starts — delegate the ones you want started."));
             assert!(desc.contains(
-                "bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }`"
+                "bare taskNoteId or `{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }`"
             ));
             assert!(desc.contains("delegate a held task individually to force it past the hold"));
             // Relation-less annotation (monorepo#2457 part 3): the batch form
@@ -1728,14 +1898,16 @@ mod tests {
         }
     }
 
-    // `taskGraph` off (the default) scrubs the teaching text — batch-delegate
-    // params/line, unblocked-wake advisory, fence-attribute grammar — while
-    // every method line survives (docs-only gate: nothing joins
-    // `gated_prefixes`, so no method is pruned or denied).
+    // `taskGraph` off (explicit opt-out; it defaults on) scrubs the teaching
+    // text — batch-delegate params/line, unblocked-wake advisory,
+    // fence-attribute grammar — while every method line survives (docs-only
+    // gate: nothing joins `gated_prefixes`, so no method is pruned or denied).
     #[test]
     fn task_graph_off_scrubs_teaching_but_keeps_methods() {
-        let features = AgentFeaturesSettings::default();
-        assert!(!features.task_graph, "taskGraph must be opt-in");
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..AgentFeaturesSettings::default()
+        };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features, true);
             for gone in [
@@ -1759,7 +1931,7 @@ mod tests {
             // included (non-goal: older relation APIs stay documented) —
             // survives untouched.
             for kept in [
-                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? })",
+                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? })",
                 "ws.task.convertBlocks(noteId)",
                 "ws.task.setRelations(noteId, { dependsOn?, conflictsWith? })",
                 "ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? })",
@@ -1782,7 +1954,10 @@ mod tests {
     // `taskGraph` is docs-only: it must never join the dispatch-deny table.
     #[test]
     fn task_graph_off_never_denies_dispatch() {
-        let features = AgentFeaturesSettings::default();
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..AgentFeaturesSettings::default()
+        };
         for method in ["agent.delegate", "task.convertBlocks", "task.setRelations"] {
             assert_eq!(
                 denied_feature(&features, method),

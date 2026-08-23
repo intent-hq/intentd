@@ -28,8 +28,7 @@ const MAX_RULE_CONTENT_LEN: usize = 50_000;
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Wrap user-rule content for prompt injection (port of
@@ -67,8 +66,7 @@ fn file_mtime_ms(path: &Path) -> i64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Strip an optional leading YAML frontmatter block, returning the body (port of
@@ -314,23 +312,23 @@ pub(crate) struct SpecialistPromptInjection {
     pub role_reminder: Option<String>,
 }
 
-/// Build the mode-dependent isolation hint for Task 6 (CoW agent sandboxes).
+/// Build the mode-dependent isolation hint for Task 6 (`CoW` agent sandboxes).
 /// Returns `Some(hint)` when the agent's isolation mode and specialist warrant
 /// a context block, `None` otherwise. The hint selection keys off the agent's
-/// actual effective isolation (session.sandbox_path presence) and workspace mode,
+/// actual effective isolation (`session.sandbox_path` presence) and workspace mode,
 /// not just the workspace cowIsolation setting, so it reflects what the agent is
 /// actually running under.
 ///
 /// Hint matrix (per spec line 104-110; microVM per monorepo#1120, EE-5):
-/// - microVM workspace (workspace.execution_environment=microvm): every agent
-///   runs inside its own VM with a CoW workspace clone mounted at the guest
+/// - microVM workspace (`workspace.execution_environment=microvm`): every agent
+///   runs inside its own VM with a `CoW` workspace clone mounted at the guest
 ///   workspace dir, so all agents get a microVM isolation block. Checked first:
 ///   the session's sandbox fields hold host-side paths that are meaningless
 ///   inside the guest.
-/// - Sandboxed agent (session.sandbox_path present, any specialist): isolation
+/// - Sandboxed agent (`session.sandbox_path` present, any specialist): isolation
 ///   context block with sandbox path, branch, base commit, caches-warm notice,
 ///   branch-switching warning, and conflict-bounce resolution instructions. Keyed
-///   off sandbox_path alone — every sandboxed agent must know about the no-branch-
+///   off `sandbox_path` alone — every sandboxed agent must know about the no-branch-
 ///   switch constraint and the bounce protocol, not just implementors.
 /// - Coordinator in a sandbox-eligible workspace (specialist
 ///   "coordinator"/"spec-writer"): parallel delegation safety guidance.
@@ -339,7 +337,7 @@ pub(crate) struct SpecialistPromptInjection {
 ///   and provisioning cannot disagree: `cow` fires (uniform per-agent
 ///   isolation; the hint states EVERY agent runs in its own sandbox and the
 ///   param/setting are ignored), `direct`/`worktree` suppress. Legacy rows
-///   (unset environment) keep the derived predicate (cow_supported=true +
+///   (unset environment) keep the derived predicate (`cow_supported=true` +
 ///   direct mode or a standalone Cow/Direct checkout) and the delegate-scoped,
 ///   param/setting-driven wording.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
@@ -399,7 +397,7 @@ pub(crate) fn build_isolation_hint(
                 (ws.skip_worktree || ws.worktree_path.is_none()) && ws.repository_path.is_some();
             let is_standalone_checkout = matches!(
                 ws.checkout_mode,
-                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+                Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
             ) && ws.worktree_path.is_some();
             let cow_supported = ws.cow_supported.unwrap_or(false);
             let eligible = match ws.execution_environment {
@@ -472,9 +470,9 @@ async fn build_rtk_instruction(
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
 /// `.augment/agent-rules/{type}.md` → bundled built-in) → workspace override →
-/// live workspace rule files → mode-dependent isolation hints (Task 6: CoW
+/// live workspace rule files → mode-dependent isolation hints (Task 6: `CoW`
 /// sandboxing context for implementors, parallel delegation safety for
-/// coordinators when CoW is enabled) → specialist role section (PP-1, reference
+/// coordinators when `CoW` is enabled) → specialist role section (PP-1, reference
 /// layer 4.8: after specialization/user rules, when the session has one) →
 /// mandatory-actions footer (recency; the reference `getMandatoryActionsFooter`)
 /// which contributes the `## Role Reminder` (specialist agents only) and — for
@@ -499,6 +497,14 @@ async fn build_rtk_instruction(
 /// (via the harness registry), so an existing session keeps the exact prompt
 /// text it was created with even after the binary ships a newer doctrine set;
 /// a `None` session resolves to the latest.
+///
+/// `workspace_api_docs` — the full `workspace_api` tool description for
+/// providers whose MCP client truncates long tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`): the bridge serves the
+/// compact description, and this carries the full `ws.*` reference into the
+/// prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
+/// section the compact header points at). `None` — every non-flagged
+/// provider — leaves the prompt byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
@@ -511,6 +517,7 @@ pub(crate) async fn assemble_system_prompt(
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
 ) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
@@ -580,6 +587,18 @@ pub(crate) async fn assemble_system_prompt(
             }
         }
     }
+    // Workspace API reference layer (truncating providers only): the full
+    // `workspace_api` description under the heading the compact tool
+    // description points at. Placed with the other reference material —
+    // after skills, before isolation hint / specialist role.
+    if let Some(docs) = workspace_api_docs.map(str::trim).filter(|d| !d.is_empty()) {
+        parts.push(format!(
+            "{}\n\nThe full `workspace_api` (ws.*) API reference. The MCP tool description \
+             you see is a compact index of the same surface; consult this section for full \
+             signatures and semantics.\n\n{docs}",
+            intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
+        ));
+    }
     // Mode-dependent isolation hints (Task 6): inject context about CoW
     // sandboxing for implementors and parallel delegation safety for coordinators
     // when appropriate, before the specialist role section so the specialist
@@ -636,7 +655,7 @@ pub(crate) async fn assemble_system_prompt(
         // effective state even when the workspace toggle is currently on. The
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
-            auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
+            auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
         parts.push(harness.suggested_next_steps_block(effective_auto_commit));
     }
     if parts.is_empty() {
@@ -789,7 +808,7 @@ mod tests {
     }
 
     /// Helper to create a test workspace with a repository path
-    fn make_test_workspace(repo_path: PathBuf) -> Workspace {
+    fn make_test_workspace(repo_path: &Path) -> Workspace {
         let ts = intent_core::now_iso();
         Workspace {
             id: intent_core::WorkspaceId("test-ws".to_string()),
@@ -844,20 +863,20 @@ mod tests {
         let skills_dir = repo_path.join(".augment").join("skills").join("test-skill");
         tokio::fs::create_dir_all(&skills_dir).await.unwrap();
 
-        let skill_content = r#"---
+        let skill_content = r"---
 name: test-skill
 description: A test skill for prompt assembly
 ---
 
 This is a test skill.
-"#;
+";
         tokio::fs::write(skills_dir.join("SKILL.md"), skill_content)
             .await
             .unwrap();
 
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
-        let workspace = make_test_workspace(repo_path.to_path_buf());
+        let workspace = make_test_workspace(repo_path);
 
         let prompt = assemble_system_prompt(
             &store,
@@ -869,6 +888,7 @@ This is a test skill.
             false,
             &AgentFeaturesSettings::default(),
             Some(&workspace),
+            None,
             None,
         )
         .await;
@@ -915,7 +935,7 @@ This is a test skill.
 
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
-        let workspace = make_test_workspace(repo_path.to_path_buf());
+        let workspace = make_test_workspace(repo_path);
 
         let prompt = assemble_system_prompt(
             &store,
@@ -927,6 +947,7 @@ This is a test skill.
             false,
             &AgentFeaturesSettings::default(),
             Some(&workspace),
+            None,
             None,
         )
         .await;
@@ -957,6 +978,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await;
 
@@ -968,6 +990,85 @@ This is a test skill.
             !prompt_text.contains("<available_skills>"),
             "Skills catalog block should be absent when no workspace provided"
         );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_api_docs_layer() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        // `None` (every non-flagged provider): byte-identical to before —
+        // no heading, no docs.
+        let without = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !without.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+            "no docs supplied: prompt must not carry the API reference section"
+        );
+
+        // `Some(docs)` (truncating providers): the docs appear under the
+        // heading the compact tool description points at, and the rest of
+        // the prompt is unchanged.
+        let docs = "ws.note.read(id) → { id, title, content }";
+        let with = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+            Some(docs),
+        )
+        .await
+        .unwrap();
+        assert!(
+            with.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+            "docs supplied: prompt must carry the API reference heading"
+        );
+        assert!(
+            with.contains(docs),
+            "docs supplied: prompt must carry the docs verbatim"
+        );
+        let heading_pos = with
+            .find(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING)
+            .unwrap();
+        let docs_pos = with.find(docs).unwrap();
+        assert!(heading_pos < docs_pos, "docs must sit under the heading");
+
+        // Empty/whitespace docs: treated as absent.
+        let blank = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+            Some("  \n"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blank, without, "blank docs must leave the prompt unchanged");
     }
 
     #[tokio::test]
@@ -984,6 +1085,7 @@ This is a test skill.
             false,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1019,6 +1121,7 @@ This is a test skill.
             false,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1060,6 +1163,7 @@ This is a test skill.
             true,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1146,6 +1250,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             None,
             Some(&session),
+            None,
         )
         .await
         .unwrap();
@@ -1184,6 +1289,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1196,6 +1302,7 @@ This is a test skill.
             true,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1230,6 +1337,7 @@ This is a test skill.
             false,
             false,
             &features,
+            None,
             None,
             None,
         )
@@ -1270,6 +1378,7 @@ This is a test skill.
             &features,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1306,6 +1415,7 @@ This is a test skill.
             false,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )

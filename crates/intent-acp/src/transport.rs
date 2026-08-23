@@ -130,14 +130,13 @@ impl StderrLogSink {
     /// error) the line is dropped — capture is best-effort by design.
     fn send_line(&mut self, line: &str) {
         match self.tx.try_send(line.to_string()) {
-            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !self.drop_warned {
                     self.drop_warned = true;
                     tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }
@@ -252,12 +251,13 @@ fn truncate_middle(s: &str, max: usize) -> String {
 /// see [`PendingEntryGuard`]) still advances the watermark. This is
 /// client-side bookkeeping only; nothing changes on the wire.
 fn dispatch(
-    value: Value,
+    value: &Value,
     pending: &PendingMap,
-    requests: &Option<mpsc::UnboundedSender<IncomingRequest>>,
-    notifications: &Option<mpsc::UnboundedSender<IncomingNotification>>,
+    requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
+    notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
     response_seq: &AtomicU64,
     response_notify: &Notify,
+    client_request_seq: &AtomicU64,
 ) {
     let Some(obj) = value.as_object() else { return };
     let method = obj.get("method").and_then(|m| m.as_str());
@@ -268,6 +268,10 @@ fn dispatch(
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
         match id {
             Some(id) => {
+                // Count BEFORE forwarding: the watermark must never read
+                // lower than the number of requests already handed to a
+                // handler that may side-effect (fs writes, terminal exec).
+                client_request_seq.fetch_add(1, Ordering::SeqCst);
                 if let Some(tx) = requests {
                     let _ = tx.send(IncomingRequest { id, method, params });
                 }
@@ -315,6 +319,7 @@ pub struct Connection {
     next_id: AtomicI64,
     response_seq: Arc<AtomicU64>,
     response_notify: Arc<Notify>,
+    client_request_seq: Arc<AtomicU64>,
     stderr: Arc<Mutex<StderrBuffer>>,
     auth_error: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
@@ -322,6 +327,10 @@ pub struct Connection {
 
 impl Connection {
     /// Wire up the writer/reader/stderr tasks around a child's piped stdio.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn new<W, R>(
         stdin: W,
         stdout: R,
@@ -335,6 +344,7 @@ impl Connection {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let response_seq = Arc::new(AtomicU64::new(0));
         let response_notify = Arc::new(Notify::new());
+        let client_request_seq = Arc::new(AtomicU64::new(0));
         let stderr_buf = Arc::new(Mutex::new(StderrBuffer::default()));
         let auth_error = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
@@ -357,6 +367,7 @@ impl Connection {
         let pending_reader = Arc::clone(&pending);
         let seq_reader = Arc::clone(&response_seq);
         let notify_reader = Arc::clone(&response_notify);
+        let client_req_seq_reader = Arc::clone(&client_request_seq);
         let requests = hooks.requests;
         let notifications = hooks.notifications;
         tasks.push(tokio::spawn(async move {
@@ -367,12 +378,13 @@ impl Connection {
                 }
                 match serde_json::from_str::<Value>(&line) {
                     Ok(value) => dispatch(
-                        value,
+                        &value,
                         &pending_reader,
-                        &requests,
-                        &notifications,
+                        requests.as_ref(),
+                        notifications.as_ref(),
                         &seq_reader,
                         &notify_reader,
+                        &client_req_seq_reader,
                     ),
                     Err(e) => tracing::warn!(error = %e, "failed to parse ACP stdout line"),
                 }
@@ -433,6 +445,7 @@ impl Connection {
             next_id: AtomicI64::new(1),
             response_seq,
             response_notify,
+            client_request_seq,
             stderr: stderr_buf,
             auth_error,
             tasks,
@@ -440,12 +453,24 @@ impl Connection {
     }
 
     /// Send a request and await its response with the default timeout (§6.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails; [`AcpError::Rpc`] if the agent answers with a JSON-RPC error; [`AcpError::Timeout`] if no response arrives in time.
     pub async fn request(&self, method: &str, params: Value) -> AcpResult<Value> {
         self.request_timeout(method, params, DEFAULT_REQUEST_TIMEOUT)
             .await
     }
 
     /// Send a request and await its response with an explicit timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails; [`AcpError::Rpc`] if the agent answers with a JSON-RPC error; [`AcpError::Timeout`] if no response arrives in time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn request_timeout(
         &self,
         method: &str,
@@ -493,6 +518,17 @@ impl Connection {
         self.response_seq.load(Ordering::SeqCst)
     }
 
+    /// Current agent→client request watermark: the number of agent-initiated
+    /// requests (`fs/*`, `terminal/*`, `session/request_permission`, …) the
+    /// reader has forwarded to the client-served handler so far. Bumped
+    /// BEFORE the forward, so a caller comparing watermarks across a
+    /// `session/prompt` attempt sees every request that may have
+    /// side-effected (file writes, terminal commands) even if its handler is
+    /// still running. Client-side transport bookkeeping only.
+    pub fn client_request_seq(&self) -> u64 {
+        self.client_request_seq.load(Ordering::SeqCst)
+    }
+
     /// Wait until the response watermark advances past `since` (i.e.
     /// `response_seq() > since`), returning `true` when it does and `false`
     /// on timeout. Lets a caller that abandoned a request (dropped its
@@ -523,6 +559,10 @@ impl Connection {
     }
 
     /// Send a notification (no id, no response).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn notify(&self, method: &str, params: Value) -> AcpResult<()> {
         let line = encode_message(None, method, &params)?;
         self.writer_tx
@@ -532,6 +572,10 @@ impl Connection {
     }
 
     /// Send a successful response to an agent→client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn respond_result(&self, id: Value, result: Value) -> AcpResult<()> {
         let msg = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
         let line = format!("{}\n", serde_json::to_string(&msg)?);
@@ -542,6 +586,10 @@ impl Connection {
     }
 
     /// Send an error response to an agent→client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] if the connection is closed or the write fails.
     pub async fn respond_error(&self, id: Value, error: JsonRpcError) -> AcpResult<()> {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
@@ -556,6 +604,10 @@ impl Connection {
     }
 
     /// Recent stderr lines captured from the agent (newest last).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn recent_stderr(&self) -> Vec<String> {
         self.stderr.lock().unwrap().recent()
     }
@@ -623,7 +675,7 @@ mod watermark_tests {
             Box::pin(conn.request_timeout("session/prompt", json!({}), Duration::from_secs(60)));
         tokio::select! {
             _ = &mut fut => panic!("request must still be pending"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         drop(fut);
         assert!(!conn.has_pending_requests(), "drop guard removed the entry");
@@ -684,7 +736,7 @@ mod watermark_tests {
             Box::pin(conn.request_timeout("session/ping", json!({}), Duration::from_secs(60)));
         tokio::select! {
             _ = &mut fut => panic!("request must still be pending"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         assert!(conn.has_pending_requests(), "in-flight request: pending");
 
@@ -695,5 +747,55 @@ mod watermark_tests {
         a2c_agent.flush().await.unwrap();
         fut.await.expect("request resolves");
         assert!(!conn.has_pending_requests(), "settled request: none");
+    }
+
+    /// Agent→client requests bump the client-request watermark; responses
+    /// and notifications do not. The bump happens even with no request sink
+    /// wired (`ConnectionHooks::default()`), so the watermark is trustworthy
+    /// regardless of handler wiring.
+    #[tokio::test]
+    async fn client_request_seq_counts_only_agent_requests() {
+        let (conn, _c2a_agent, mut a2c_agent) = silent_connection();
+        assert_eq!(conn.client_request_seq(), 0);
+
+        // A notification (method, no id) does NOT bump it.
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        // A response (id, no method) does NOT bump it.
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{}}\n")
+            .await
+            .unwrap();
+        // Agent→client requests (id + method) DO bump it.
+        a2c_agent
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"fs/write_text_file\",\"params\":{}}\n",
+            )
+            .await
+            .unwrap();
+        a2c_agent
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"terminal/create\",\"params\":{}}\n",
+            )
+            .await
+            .unwrap();
+        a2c_agent.flush().await.unwrap();
+
+        // Wait for the reader to process all four lines (the response line
+        // bumps the response watermark, giving us an ordering fence past
+        // line 2; poll briefly for the request lines behind it).
+        assert!(conn.await_response_after(0, Duration::from_secs(2)).await);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while conn.client_request_seq() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(conn.client_request_seq(), 2, "exactly the two requests");
+        assert_eq!(
+            conn.response_seq(),
+            1,
+            "response watermark untouched by requests"
+        );
     }
 }

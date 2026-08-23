@@ -1,6 +1,6 @@
-//! intent-store — SQLite persistence (§9.2, §9.4).
+//! intent-store — `SQLite` persistence (§9.2, §9.4).
 //!
-//! Depends on `intent-core` only (§3.2). Opens a WAL-mode SQLite pool with the
+//! Depends on `intent-core` only (§3.2). Opens a WAL-mode `SQLite` pool with the
 //! required PRAGMAs, runs the embedded migrations, and exposes minimal
 //! repository methods for the vertical slice (insert/list workspace and note).
 
@@ -53,7 +53,8 @@ pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    MessageFtsMatch, ReplaceMessage, SessionMessageProjection, PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, ReplaceMessage, SessionMessageProjection, UserMessageIndexItem,
+    PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::AttachmentRecord;
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -71,15 +72,15 @@ pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 
-/// Total retry window for the SQLITE_BUSY retry helpers (monorepo#1139).
+/// Total retry window for the `SQLITE_BUSY` retry helpers (monorepo#1139).
 const BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// True when an error message carries a SQLITE_BUSY-family result code.
-/// sqlx formats SQLite errors as `(code: {extended_code}) …` where the code
+/// sqlx formats `SQLite` errors as `(code: {extended_code}) …` where the code
 /// is always the extended result code, so match the busy family explicitly:
-/// 5 (SQLITE_BUSY), 261 (SQLITE_BUSY_RECOVERY), 517 (SQLITE_BUSY_SNAPSHOT),
-/// 773 (SQLITE_BUSY_TIMEOUT). A bare `code: 5` substring would false-positive
-/// on unrelated 5xx codes (e.g. 516 SQLITE_ABORT_ROLLBACK) and miss the
+/// 5 (`SQLITE_BUSY`), 261 (`SQLITE_BUSY_RECOVERY`), 517 (`SQLITE_BUSY_SNAPSHOT`),
+/// 773 (`SQLITE_BUSY_TIMEOUT`). A bare `code: 5` substring would false-positive
+/// on unrelated 5xx codes (e.g. 516 `SQLITE_ABORT_ROLLBACK`) and miss the
 /// extended busy variants.
 fn is_busy_message(msg: &str) -> bool {
     ["(code: 5)", "(code: 261)", "(code: 517)", "(code: 773)"]
@@ -87,9 +88,9 @@ fn is_busy_message(msg: &str) -> bool {
         .any(|code| msg.contains(code))
 }
 
-/// Shared SQLITE_BUSY retry loop backing [`with_write_txn_retry`] and
+/// Shared `SQLITE_BUSY` retry loop backing [`with_write_txn_retry`] and
 /// [`with_read_retry`]. Executes the given async closure, retrying only when
-/// the error is a transient SQLITE_BUSY (`Error::Internal` whose message
+/// the error is a transient `SQLITE_BUSY` (`Error::Internal` whose message
 /// carries a busy-family result code, see [`is_busy_message`]). Backoff is
 /// jittered exponential: ~50ms base doubling per attempt (±25% jitter), with
 /// each sleep capped at 5s and clamped to the remaining `deadline` so the
@@ -133,12 +134,12 @@ where
     }
 }
 
-/// Retry helper for write transactions that may hit SQLITE_BUSY during lock upgrade
+/// Retry helper for write transactions that may hit `SQLITE_BUSY` during lock upgrade
 /// (STAB-7). Executes the given async transaction closure via the shared
 /// [`with_busy_retry`] loop (~30s total window, monorepo#1139). Returns the
 /// result on success or the last error after the retry window is exhausted.
 ///
-/// Use this for any write transaction that uses .begin() (DEFERRED mode) to eliminate
+/// Use this for any write transaction that uses .`begin()` (DEFERRED mode) to eliminate
 /// the intermittent "database is locked" (code 5) failures that occur when multiple
 /// transactions try to upgrade from shared to exclusive lock simultaneously.
 async fn with_write_txn_retry<F, Fut, T>(f: F) -> Result<T>
@@ -150,7 +151,7 @@ where
 }
 
 /// Retry helper for single-shot idempotent reads that may hit transient
-/// SQLITE_BUSY under heavy write load (monorepo#1139: "get note failed:
+/// `SQLITE_BUSY` under heavy write load (monorepo#1139: "get note failed:
 /// ... (code: 5) database is locked" surfaced to a production client).
 /// Same shared [`with_busy_retry`] loop as [`with_write_txn_retry`]:
 /// retries only `code: 5` errors, jittered exponential backoff, ~30s total
@@ -248,8 +249,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// SQLite-backed persistence handle. Cheaply cloneable (the pools are `Arc`-ed).
 ///
 /// Holds two pools over the same DB file: a single-connection **write pool**
-/// (max_connections=1) to serialize all mutations and eliminate in-process
-/// writer-vs-writer busy_timeout contention, and a **read pool** (32 connections)
+/// (`max_connections=1`) to serialize all mutations and eliminate in-process
+/// writer-vs-writer `busy_timeout` contention, and a **read pool** (32 connections)
 /// intended for concurrent read (SELECT) queries — a convention, not an enforced
 /// constraint. See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
@@ -261,6 +262,10 @@ pub struct Store {
 impl Store {
     /// Open (creating if needed) the database at `db_path` and run migrations.
     /// Builds two pools: a single-connection write pool and a 32-connection read pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
         let write_pool = connect_write(db_path).await?;
         let read_pool = connect_read(db_path).await?;
@@ -280,11 +285,13 @@ impl Store {
     }
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
+    #[must_use]
     pub fn write_pool(&self) -> &SqlitePool {
         &self.write_pool
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
+    #[must_use]
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
     }
@@ -292,16 +299,18 @@ impl Store {
     /// Deprecated alias for `read_pool()`. External callers should migrate to
     /// explicit `read_pool()` / `write_pool()` usage.
     #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
+    #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.read_pool
     }
 
-    /// Spawn a background task that periodically runs PRAGMA wal_checkpoint(PASSIVE)
+    /// Spawn a background task that periodically runs PRAGMA `wal_checkpoint(PASSIVE)`
     /// to prevent unbounded WAL growth when continuous readers hold long-lived
     /// transactions. Returns a handle that can be aborted to stop the task.
     ///
     /// Call this after `open()` in the daemon composition root; the task will run
     /// every ~60s until the returned handle is dropped or aborted.
+    #[must_use]
     pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
         let write_pool = self.write_pool.clone();
         tokio::spawn(async move {
@@ -321,6 +330,10 @@ impl Store {
     /// pages emptied by deletes that have not yet been reclaimed. On an
     /// incremental-auto-vacuum database these are the pages
     /// [`Self::incremental_vacuum`] can release back to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn freelist_count(&self) -> Result<i64> {
         sqlx::query("PRAGMA freelist_count")
             .fetch_one(&self.write_pool)
@@ -353,6 +366,10 @@ impl Store {
     /// blocked by the rebuild. Callers should treat a failure as non-fatal —
     /// the daemon runs exactly as before, it just cannot return freelist
     /// pages to the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn activate_incremental_vacuum(&self) -> Result<AutoVacuumActivation> {
         let mode = sqlx::query("PRAGMA auto_vacuum")
             .fetch_one(&self.write_pool)
@@ -388,6 +405,10 @@ impl Store {
     /// single-connection write pool is never held for long; call it
     /// periodically (e.g. after retention sweeps) to reclaim space
     /// incrementally. Returns the number of pages actually freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn incremental_vacuum(&self, max_pages: u32) -> Result<u64> {
         let before = self.freelist_count().await?;
         sqlx::query(&format!("PRAGMA incremental_vacuum({max_pages})"))
@@ -395,14 +416,18 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
         let after = self.freelist_count().await?;
-        Ok((before - after).max(0) as u64)
+        Ok((before - after).max(0).cast_unsigned())
     }
 
     /// Run `PRAGMA optimize` on the write connection. Cheap when called
-    /// repeatedly (SQLite only re-analyzes tables whose content changed
+    /// repeatedly (`SQLite` only re-analyzes tables whose content changed
     /// enough to matter); intended to run periodically after retention
     /// sweeps so the query planner statistics track the shrinking event
     /// table. See <https://sqlite.org/pragma.html#pragma_optimize>.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn optimize(&self) -> Result<()> {
         sqlx::query("PRAGMA optimize")
             .execute(&self.write_pool)
@@ -426,6 +451,10 @@ impl Store {
 
     /// Compare the migrations embedded in the binary against the versions
     /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn migration_status(&self) -> Result<MigrationStatus> {
         let expected: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         let applied: Vec<i64> =
@@ -465,14 +494,15 @@ pub struct MigrationStatus {
 
 impl MigrationStatus {
     /// True when every embedded migration version has been applied.
+    #[must_use]
     pub fn is_current(&self) -> bool {
         self.expected.iter().all(|v| self.applied.contains(v))
     }
 }
 
-/// Open a WAL-mode SQLite **write pool** with `max_connections=1` (§9.4).
+/// Open a WAL-mode `SQLite` **write pool** with `max_connections=1` (§9.4).
 /// The single-connection write pool serializes all mutations (INSERT/UPDATE/DELETE)
-/// and eliminates in-process writer-vs-writer busy_timeout contention.
+/// and eliminates in-process writer-vs-writer `busy_timeout` contention.
 ///
 /// **WAL + synchronous=NORMAL pairing** (finding F4, fsync half): WAL mode
 /// ensures crash safety with only periodic WAL checkpoints needing full fsyncs;
@@ -488,12 +518,12 @@ impl MigrationStatus {
 /// manual sqlite3 CLI probes during development), though in-process contention
 /// is eliminated by the single-writer design.
 ///
-/// **auto_vacuum = INCREMENTAL**: without auto_vacuum, pages emptied by
+/// **`auto_vacuum` = INCREMENTAL**: without `auto_vacuum`, pages emptied by
 /// deletes (retention sweeps) accumulate on the freelist forever and the file
 /// only ever grows. sqlx applies the `auto_vacuum` pragma before
 /// `journal_mode`, so a **new** database is created in incremental mode and
 /// [`Store::incremental_vacuum`] can release freelist pages in bounded slices.
-/// On an **existing** database created without auto_vacuum the pragma is
+/// On an **existing** database created without `auto_vacuum` the pragma is
 /// recorded but inert until a one-time `VACUUM` rebuilds the file. The daemon
 /// performs that activation automatically at startup — `intentd serve` calls
 /// [`Store::activate_incremental_vacuum`] right after [`Store::open`], before
@@ -504,9 +534,13 @@ impl MigrationStatus {
 /// sqlite3 ~/.intentd/intentd.db "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
 /// ```
 ///
-/// `intentd doctor` reports the current auto_vacuum mode and freelist size,
+/// `intentd doctor` reports the current `auto_vacuum` mode and freelist size,
 /// and notes the next-start activation when the database is still in NONE
 /// mode.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
 pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
@@ -514,7 +548,7 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
         .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000))
+        .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
@@ -530,14 +564,14 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
         })
 }
 
-/// Open a WAL-mode SQLite **read pool** with `max_connections=32` (§9.4).
+/// Open a WAL-mode `SQLite` **read pool** with `max_connections=32` (§9.4).
 /// The read pool is intended for read (SELECT) queries — by convention, not an
 /// enforced read-only configuration — and supports concurrent readers without
-/// contention (SQLite WAL mode allows many simultaneous readers).
+/// contention (`SQLite` WAL mode allows many simultaneous readers).
 ///
 /// The PRAGMAs match the write pool — `journal_mode = WAL`, `foreign_keys =
 /// ON`, `busy_timeout = 5000`, `synchronous = NORMAL` — except `auto_vacuum`,
-/// which is deliberately NOT set here: auto_vacuum is a property of the
+/// which is deliberately NOT set here: `auto_vacuum` is a property of the
 /// database file, established at creation by [`connect_write`] ([`Store::open`]
 /// opens the write pool first) or by the startup activation VACUUM
 /// ([`Store::activate_incremental_vacuum`]), and only
@@ -564,7 +598,7 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
         .create_if_missing(false)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000))
+        .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
@@ -580,8 +614,12 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
         })
 }
 
-/// Legacy test helper: builds a single pool (max_connections=20) for tests
+/// Legacy test helper: builds a single pool (`max_connections=20`) for tests
 /// that predate the write/read pool split. New tests should use `Store::open`.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
 #[cfg(test)]
 pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
@@ -590,7 +628,7 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000))
+        .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
@@ -616,11 +654,11 @@ pub(crate) fn tags_from_db(s: &str) -> Result<Vec<String>> {
     serde_json::from_str(s).map_err(|e| Error::Internal(format!("decode tags failed: {e}")))
 }
 
-/// Encode an enum to its lowercase/snake_case string DB form via serde.
+/// Encode an enum to its `lowercase/snake_case` string DB form via serde.
 pub(crate) fn enum_to_db<T: serde::Serialize>(v: &T) -> Result<String> {
     serde_json::to_value(v)
         .ok()
-        .and_then(|x| x.as_str().map(|s| s.to_string()))
+        .and_then(|x| x.as_str().map(std::string::ToString::to_string))
         .ok_or_else(|| Error::Internal("failed to encode enum".to_string()))
 }
 

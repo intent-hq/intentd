@@ -29,11 +29,15 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// the graceful "not configured" path (§8.3) surfaces the same way.
 /// `Unsupported` (§7.2/§7.4 capability gating) maps onto a stable wire message
 /// with the `unsupported by provider:` prefix so clients can match on it.
+/// `RateLimited` keeps its class ([`Error::RateLimited`], same `-32603` wire
+/// code) so the background sweeps can detect quota exhaustion and pause
+/// instead of misreporting it as an auth/internal error (monorepo#2961).
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
     match e {
         intent_sourcecontrol::Error::Unsupported(msg) => {
             Error::Internal(format!("unsupported by provider: {msg}"))
         }
+        intent_sourcecontrol::Error::RateLimited(msg) => Error::RateLimited(msg),
         other => Error::Internal(other.to_string()),
     }
 }
@@ -136,6 +140,9 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrRefreshOutcome {
     /// Not eligible (remote/archived workspace, no repo, or no branch).
+    /// Git-root refreshes still run the repo-scoped stale-pool heal on a
+    /// branchless root ([`refresh_stale_pool_entries`]), upgrading to
+    /// `Updated` when it changed the pool.
     Skipped,
     /// Eligible but nothing changed (linked PR snapshot identical; or no
     /// matching PR found during discovery).
@@ -331,6 +338,80 @@ pub(crate) fn upsert_pr_info(
     true
 }
 
+/// Cap on stale `pull_requests` re-fetches per git root per sweep
+/// (monorepo#3127). Bounds the forge calls added by
+/// [`refresh_stale_pool_entries`] so a long PR history stays within the
+/// sweep's per-root `PR_REFRESH_FETCH_TIMEOUT` budget; entries beyond the
+/// cap converge over successive sweeps (oldest-updated first).
+pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
+
+/// Heal persisted staleness in a `pull_requests` list by re-fetching entries
+/// against the forge and upserting their fresh snapshots (monorepo#3127).
+/// Sweep-time work only — never attach this to an RPC read path (see the
+/// RPC cost contract).
+///
+/// Every non-Merged entry (Open, Draft, AND Closed) is a candidate: Merged
+/// is the only irreversible forge state — a Closed PR can be reopened, and
+/// the list PR pool merge is deliberately one-way (a terminal entry is never
+/// downgraded by a candidate), so only this authoritative re-fetch can move
+/// a persisted Closed entry back to Open. `exclude` names PR numbers already
+/// fetched fresh this pass (the linked / just-discovered PR). At most
+/// [`MAX_STALE_POOL_REFETCHES`] entries are re-fetched per call, oldest
+/// `updatedAt` first (unparseable timestamps sort oldest, ties by number);
+/// fail-soft per entry — a forge error logs and keeps the persisted
+/// snapshot, and each re-fetch is bounded by `per_entry_timeout` so one
+/// hung connection (monorepo#1988 lineage) can never eat the caller's whole
+/// per-root budget and starve the linked-PR delta persist that follows the
+/// heal. Returns whether the list changed, plus the rate-limit detail when a
+/// re-fetch hit the forge's quota (monorepo#2961) — the one non-fail-soft
+/// class: the remaining candidates are skipped (they would burn the
+/// exhausted quota for the same answer) and the caller pauses the sweeps
+/// instead of this loop WARN-ing per entry.
+pub(crate) async fn refresh_stale_pool_entries(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    list: &mut Option<Vec<PullRequestInfo>>,
+    exclude: &[u64],
+    per_entry_timeout: std::time::Duration,
+) -> (bool, Option<String>) {
+    let Some(items) = list.as_deref() else {
+        return (false, None);
+    };
+    let mut candidates: Vec<(Option<OffsetDateTime>, u64)> = items
+        .iter()
+        .filter(|p| p.status != PullRequestStatus::Merged && !exclude.contains(&p.number))
+        .map(|p| (parse_iso(&p.updated_at), p.number))
+        .collect();
+    candidates.sort();
+    candidates.truncate(MAX_STALE_POOL_REFETCHES);
+    let mut changed = false;
+    for (_, number) in candidates {
+        match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
+            Ok(Ok(pr)) => {
+                changed |= upsert_pr_info(list, &build_pr_info(&pr));
+            }
+            Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
+                return (changed, Some(detail));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    pr_number = number,
+                    error = %e,
+                    "stale PR pool re-fetch failed; keeping persisted snapshot"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pr_number = number,
+                    timeout = ?per_entry_timeout,
+                    "stale PR pool re-fetch timed out; keeping persisted snapshot"
+                );
+            }
+        }
+    }
+    (changed, None)
+}
+
 /// Derive the persisted [`PullRequestStatus`] from a forge PR (draft wins over
 /// open; merged/closed map directly), mirroring [`derive_status_state`].
 pub(crate) fn derive_pr_status(pr: &PullRequest) -> PullRequestStatus {
@@ -477,8 +558,12 @@ pub(crate) fn aggregate_reviews(reviews: &[Review]) -> ReviewAggregate {
 /// of inline review comments across `threads` (EVERY thread comment counts,
 /// including replies inside a thread) and the number of unresolved threads.
 pub(crate) fn count_thread_comments(threads: &[ReviewThread]) -> (i64, i64) {
-    let review_comment_count = threads.iter().map(|t| t.comments.len() as i64).sum();
-    let unresolved = threads.iter().filter(|t| !t.is_resolved).count() as i64;
+    let review_comment_count = threads
+        .iter()
+        .map(|t| i64::try_from(t.comments.len()).expect("value fits in i64"))
+        .sum();
+    let unresolved = i64::try_from(threads.iter().filter(|t| !t.is_resolved).count())
+        .expect("value fits in i64");
     (review_comment_count, unresolved)
 }
 
@@ -606,19 +691,18 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
             line: c.line,
             created_at: c.created_at,
         };
-        match map.get_mut(&root) {
-            Some(thread) => thread.comments.push(tc),
-            None => {
-                order.push(root);
-                map.insert(
-                    root,
-                    ReviewThread {
-                        id: format!("rest-thread-{root}"),
-                        is_resolved: false,
-                        comments: vec![tc],
-                    },
-                );
-            }
+        if let Some(thread) = map.get_mut(&root) {
+            thread.comments.push(tc);
+        } else {
+            order.push(root);
+            map.insert(
+                root,
+                ReviewThread {
+                    id: format!("rest-thread-{root}"),
+                    is_resolved: false,
+                    comments: vec![tc],
+                },
+            );
         }
     }
     order.into_iter().filter_map(|id| map.remove(&id)).collect()
@@ -696,6 +780,9 @@ pub struct MergeRequirementsThreads {
 /// [`merge_requirements`] from a [`PullRequest`] snapshot, the host's
 /// [`MergeRequirementSignals`], and the already-aggregated review / thread
 /// rollups.
+// The bool fields mirror the wire checklist shape; grouping them would
+// change the serialized contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirements {
@@ -787,7 +874,9 @@ pub(crate) fn merge_requirements(
             })
             .collect(),
     };
-    let tally = |word: &str| items.iter().filter(|c| c.status == word).count() as i64;
+    let tally = |word: &str| {
+        i64::try_from(items.iter().filter(|c| c.status == word).count()).expect("value fits in i64")
+    };
     let names = |word: &str| {
         items
             .iter()
@@ -796,7 +885,7 @@ pub(crate) fn merge_requirements(
             .collect::<Vec<_>>()
     };
     let checks = MergeRequirementsChecks {
-        total: items.len() as i64,
+        total: i64::try_from(items.len()).expect("value fits in i64"),
         passed: tally("passed"),
         failed: tally("failed"),
         pending: tally("pending"),
@@ -974,8 +1063,8 @@ pub(crate) async fn merge_requirements_for_pr(
 
 /// Validate/default the `mergeMethod` argument (TS `validateMergeMethod`,
 /// default `merge`); an invalid value throws → `-32603`.
-pub(crate) fn validate_merge_method(method: Option<String>) -> Result<MergeMethod> {
-    match method.as_deref() {
+pub(crate) fn validate_merge_method(method: Option<&str>) -> Result<MergeMethod> {
+    match method {
         None | Some("merge") => Ok(MergeMethod::Merge),
         Some("squash") => Ok(MergeMethod::Squash),
         Some("rebase") => Ok(MergeMethod::Rebase),
@@ -1635,13 +1724,13 @@ mod tests {
     fn validates_merge_method_with_default() {
         assert_eq!(validate_merge_method(None).unwrap(), MergeMethod::Merge);
         assert_eq!(
-            validate_merge_method(Some("squash".into())).unwrap(),
+            validate_merge_method(Some("squash")).unwrap(),
             MergeMethod::Squash
         );
         assert_eq!(
-            validate_merge_method(Some("rebase".into())).unwrap(),
+            validate_merge_method(Some("rebase")).unwrap(),
             MergeMethod::Rebase
         );
-        assert!(validate_merge_method(Some("bad".into())).is_err());
+        assert!(validate_merge_method(Some("bad")).is_err());
     }
 }

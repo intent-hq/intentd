@@ -1,15 +1,15 @@
 //! E2E coverage for agent.queueMessage / agent.getQueue / agent.removeQueuedMessage /
 //! agent.readConversation / agent.summary / agent.diagnostics
-//! (intent-services agent_ops.rs coverage boost).
+//! (intent-services `agent_ops.rs` coverage boost).
 //!
-//! Tests call intent_services::Services directly (not via WSS transport) for hermetic
+//! Tests call `intent_services::Services` directly (not via WSS transport) for hermetic
 //! in-process coverage. Asserts on backend state changes.
 
 #![cfg(unix)]
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::{
@@ -20,14 +20,14 @@ use intent_services::{EventBus, Services};
 use intent_store::Store;
 use serde_json::json;
 
-/// Clean up SQLite database including -wal and -shm sidecars.
+/// Clean up `SQLite` database including -wal and -shm sidecars.
 fn cleanup_db(db: &PathBuf) {
     std::fs::remove_file(db).ok();
     std::fs::remove_file(db.with_extension("db-wal")).ok();
     std::fs::remove_file(db.with_extension("db-shm")).ok();
 }
 
-fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
+fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
     let ts = now_iso();
     Workspace {
         id: id.clone(),
@@ -88,17 +88,19 @@ async fn setup() -> (Arc<Services>, WorkspaceId, PathBuf, PathBuf) {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root.clone()))
         .await
         .expect("insert ws");
 
     (Arc::new(services), ws, ws_root, db)
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn agent_queue_add_get_remove_lifecycle() {
     let (services, ws, ws_root, db) = setup().await;
@@ -112,7 +114,7 @@ async fn agent_queue_add_get_remove_lifecycle() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -188,7 +190,7 @@ async fn agent_conversation_and_summary() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");
@@ -273,7 +275,7 @@ async fn agent_diagnostics_baseline() {
             None,
             None,
             None,
-            Default::default(),
+            intent_core::AgentCreateExtra::default(),
         )
         .await
         .expect("create agent");

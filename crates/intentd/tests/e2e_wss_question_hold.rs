@@ -63,7 +63,7 @@ use uuid::Uuid;
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// MIME type the FE renders as QuestionCards (PROTOCOL §7.x question resource).
+/// MIME type the FE renders as `QuestionCards` (PROTOCOL §7.x question resource).
 const QUESTION_MIME: &str = "application/vnd.intent.question+json";
 
 /// Turn-1 trigger for the asker: the mock's rule matches on this so the
@@ -89,7 +89,7 @@ const HELD_DISMISS: &str = "held until dismissal";
 /// two distinct pending question messages).
 const ASK_AGAIN_MARKER: &str = "ASK_SECOND_QUESTION_NOW_E2E";
 
-/// The flattened `Q:`/`A:` answer a user sends after filling the QuestionCard.
+/// The flattened `Q:`/`A:` answer a user sends after filling the `QuestionCard`.
 const ANSWER_TEXT: &str = "Q: Which environment should I deploy to?\nA: Staging";
 /// An UNTAGGED user message sent while questions are pending: never held
 /// (user origin), but carries no `question_answers` tag, so it must NOT
@@ -127,7 +127,7 @@ impl Drop for Daemon {
         if std::thread::panicking() {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
-                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+                eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -281,7 +281,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -306,7 +306,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -346,7 +346,24 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
-/// Pre-seed the daemon's SQLite store with a regular (NON-chief) workspace.
+async fn await_pending_marker_event<S>(sub: &mut WebSocketStream<S>, agent_id: &str, expected: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:updated"
+            && event["data"]["agentId"].as_str() == Some(agent_id)
+            && event["data"]["pendingQuestionsMessageId"].as_str() == Some(expected)
+        {
+            return;
+        }
+    }
+    panic!("no pendingQuestionsMessageId={expected:?} event for {agent_id}");
+}
+
+/// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace.
 async fn seed_workspace_only(data_dir: &Path) -> String {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -468,7 +485,8 @@ async fn boot(script: &str, behavior: &str) -> (Daemon, String, u16, Arc<ClientC
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -518,7 +536,24 @@ where
     )
     .await;
     assert_eq!(sent["success"], true, "ask kickoff ok: {sent}");
-    await_stream_end(sub, asker_id).await;
+    let mut marker_event = None;
+    let mut saw_stream_end = false;
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:updated" && event["data"]["agentId"].as_str() == Some(asker_id) {
+            if let Some(marker) = event["data"]["pendingQuestionsMessageId"].as_str() {
+                marker_event = Some(marker.to_string());
+            }
+        }
+        if event["type"] == "agent:stream:end"
+            && event["data"]["agentId"].as_str() == Some(asker_id)
+        {
+            saw_stream_end = true;
+            break;
+        }
+    }
+    assert!(saw_stream_end, "no agent:stream:end for {asker_id}");
 
     let conv = wss_rpc(
         rpc,
@@ -539,10 +574,21 @@ where
         trailing["resource"]["mimeType"], QUESTION_MIME,
         "trailing block is the question resource: {trailing}"
     );
-    last["id"]
+    let message_id = last["id"]
         .as_str()
         .expect("question message id")
-        .to_string()
+        .to_string();
+    assert_eq!(
+        marker_event.as_deref(),
+        Some(message_id.as_str()),
+        "question completion emits the set marker"
+    );
+    let got = wss_rpc(rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], message_id,
+        "AgentLite projects the additive set marker: {got}"
+    );
+    message_id
 }
 
 /// Read a sender-captured results note by title and return its parsed JSON.
@@ -978,6 +1024,12 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
         answered.get("heldForQuestions").is_none(),
         "user answer is never held: {answered}"
     );
+    await_pending_marker_event(&mut sub, &asker_id, "").await;
+    let got = wss_rpc(&mut rpc, "agent.get", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        got["agent"]["metadata"]["pendingQuestionsMessageId"], "",
+        "AgentLite preserves the written-empty clear marker: {got}"
+    );
 
     // The answer lands, the marker clears, and the queue fully drains.
     let conv = await_conversation(
@@ -1283,7 +1335,7 @@ async fn dismiss_questions_idle_empty_queue_starts_notice_turn_over_wss() {
 ///    A's hold is active).
 /// 2. Dismissing A while B still holds automatic deliveries PARKS A's
 ///    notice: `agent.getQueue` surfaces the entry at the queue HEAD with its
-///    `questions_dismissed` metadata — the DoD's undelivered-entry shape.
+///    `questions_dismissed` metadata — the `DoD`'s undelivered-entry shape.
 /// 3. Dismissing B releases the hold: B's notice delivers first (immediate),
 ///    A's parked notice drains behind it — transcript order B-notice →
 ///    A-notice, queue empty.

@@ -39,7 +39,7 @@ const GUEST_STDERR_LOG: &str = "/intent/acp.err";
 /// `intentd mcp-bridge --connect` (the macOS daemon binary cannot run in the
 /// Linux guest; TSI routes the TCP connect to the host loopback listener).
 /// Both sides speak line-framed JSON-RPC, so a plain byte pipe suffices.
-pub const GUEST_MCP_BRIDGE_SOURCE: &str = r#"import net from 'node:net';
+pub const GUEST_MCP_BRIDGE_SOURCE: &str = r"import net from 'node:net';
 const addr = process.argv[2] || '';
 const idx = addr.lastIndexOf(':');
 if (idx <= 0) { console.error('usage: mcp-bridge.mjs <host:port>'); process.exit(2); }
@@ -48,7 +48,7 @@ sock.on('error', () => process.exit(1));
 sock.on('close', () => process.exit(0));
 process.stdin.pipe(sock);
 sock.pipe(process.stdout);
-"#;
+";
 
 /// Guest path of the staged MCP bridge script.
 pub const GUEST_MCP_BRIDGE_PATH: &str = "/intent/mcp-bridge.mjs";
@@ -61,7 +61,7 @@ pub struct MicrovmSpawnSpec {
     pub helper_exe: PathBuf,
     /// The verified cached image (manifest + rootfs archive).
     pub image: CachedImage,
-    /// Host path of the agent's CoW workspace clone (mounted at
+    /// Host path of the agent's `CoW` workspace clone (mounted at
     /// [`GUEST_WORKSPACE_DIR`] via virtio-fs).
     pub workspace_dir: PathBuf,
     /// Host home directory for credential staging.
@@ -77,11 +77,11 @@ pub struct MicrovmSpawnSpec {
 pub struct MicrovmVm {
     /// Per-VM state dir (rootfs clone, console log).
     pub vm_dir: PathBuf,
-    /// The per-VM rootfs tree (CoW clone of the extracted image).
+    /// The per-VM rootfs tree (`CoW` clone of the extracted image).
     pub rootfs: PathBuf,
     /// Host unix socket forwarded to the guest exec agent's vsock port.
     /// Lives in the system temp dir, not `vm_dir` — see
-    /// [`super::exec_sock_path`] (SUN_LEN).
+    /// [`super::exec_sock_path`] (`SUN_LEN`).
     pub exec_sock: PathBuf,
     /// The helper process; killed (whole group) to tear the VM down. Taken
     /// by the caller for handle ownership.
@@ -96,6 +96,10 @@ pub struct MicrovmVm {
 
 /// Resolve the helper binary: `$INTENTD_MICROVM_HELPER` override, else
 /// `intentd-microvm-helper` next to the current executable.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::HelperMissing` when no helper binary can be found.
 pub fn resolve_helper_exe() -> Result<PathBuf, MicrovmError> {
     if let Some(p) = std::env::var_os(HELPER_EXE_ENV) {
         let p = PathBuf::from(p);
@@ -173,9 +177,14 @@ async fn await_pending_scrub(dir: &Path) {
 }
 
 impl MicrovmVm {
-    /// Boot a VM per `spec`: materialize the per-VM rootfs (CoW clone of the
+    /// Boot a VM per `spec`: materialize the per-VM rootfs (`CoW` clone of the
     /// extracted image tree), stage credentials + spawn material into it,
     /// spawn the helper, and wait for the guest exec agent to answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `MicrovmError` when any boot phase (rootfs, staging,
+    /// helper spawn, exec-agent readiness) fails.
     pub async fn boot(spec: &MicrovmSpawnSpec) -> Result<Self, MicrovmError> {
         // A prior VM for this agent may still be scrubbing this very path on
         // a detached thread (e.g. the silent-redrive teardown immediately
@@ -299,7 +308,7 @@ impl MicrovmVm {
             let _ = tokio::fs::remove_file(&exec_sock).await;
             return Err(e);
         }
-        let boot_ms = started.elapsed().as_millis() as u64;
+        let boot_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // 5. Rotation watcher for the staged credentials.
         let rotation_watcher = match auth::watch_rotations(staged, guest_home) {
@@ -324,14 +333,18 @@ impl MicrovmVm {
 
     /// Run the in-guest setup sequence: mount the workspace share and wire the
     /// gh git credential helper. Must complete before the provider launches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MicrovmError::Exec` when the in-guest setup command fails.
     pub async fn guest_setup(&self) -> Result<(), MicrovmError> {
         // Mount the workspace virtio-fs share. Idempotent-ish: a second mount
         // attempt on a mounted target fails, but each VM runs this once.
+        let ws = GUEST_WORKSPACE_DIR;
+        let tag = WORKSPACE_VIRTIOFS_TAG;
         let script = format!(
             "mkdir -p {ws} && mount -t virtiofs {tag} {ws} && \
-             (gh auth setup-git >/dev/null 2>&1 || true)",
-            ws = GUEST_WORKSPACE_DIR,
-            tag = WORKSPACE_VIRTIOFS_TAG,
+             (gh auth setup-git >/dev/null 2>&1 || true)"
         );
         let req = ExecRequest {
             argv: vec!["/bin/sh".into(), "-c".into(), script],
@@ -362,6 +375,10 @@ impl MicrovmVm {
     }
 
     /// Stage the guest MCP bridge script into `/intent/mcp-bridge.mjs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MicrovmError::Io` when the write fails.
     pub async fn stage_mcp_bridge(&self) -> Result<(), MicrovmError> {
         let path = self.rootfs.join(GUEST_INTENT_DIR).join("mcp-bridge.mjs");
         tokio::fs::write(&path, GUEST_MCP_BRIDGE_SOURCE)
@@ -372,6 +389,10 @@ impl MicrovmVm {
 
     /// Write `content` into the guest at `/intent/<name>`, returning the
     /// guest-absolute path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MicrovmError::Io` when the write fails.
     pub async fn stage_intent_file(
         &self,
         name: &str,
@@ -389,6 +410,11 @@ impl MicrovmVm {
     /// shell that re-redirects stderr to [`GUEST_STDERR_LOG`] (host-visible
     /// through the rootfs) so the socket carries ONLY the ACP stdio bytes —
     /// stdin stays a pipe, never a TTY.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MicrovmError::Exec` when the provider cannot be started in
+    /// the guest.
     pub async fn start_provider(
         &self,
         argv: &[String],
@@ -546,7 +572,7 @@ fn tail_file(path: PathBuf) -> Box<dyn AsyncRead + Unpin + Send> {
                 continue;
             };
             if (data.len() as u64) > offset {
-                let chunk = &data[offset as usize..];
+                let chunk = &data[usize::try_from(offset).unwrap_or(usize::MAX)..];
                 if writer.write_all(chunk).await.is_err() {
                     return; // reader side dropped (connection torn down)
                 }

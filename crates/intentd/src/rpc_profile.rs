@@ -15,17 +15,17 @@
 //!
 //! Duration budgets are tiered: methods that fan out to a network-bound
 //! upstream ([`is_network_tier_method`] — `github.*`, `linear.*`, `sentry.*`,
-//! `pr.refresh`, `pr.state`) get a higher default budget
+//! `pr.refresh`, `pr.state`, `workspace.create`) get a higher default budget
 //! ([`DEFAULT_NETWORK_DURATION_WARN_MS`]) so normal upstream latency doesn't
 //! drown out the local-regression signal; every other method keeps the
 //! default budget ([`DEFAULT_DURATION_WARN_MS`]; catches fs walks / git scans
-//! that never touch SQLite). The statement-count budget is tiered the same
+//! that never touch `SQLite`). The statement-count budget is tiered the same
 //! way: legitimately compound multi-entity ops
-//! ([`is_compound_statement_method`] — `workspace.create`) get a higher
-//! default budget ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`]) so their
-//! deterministic statement count doesn't drown out the N+1 signal; every
-//! other method keeps the default budget
-//! ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
+//! ([`is_compound_statement_method`] — `workspace.create`,
+//! `workspace.delete`, `workspace.import.commit`) get a higher default
+//! budget ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`]) so their by-design
+//! statement count doesn't drown out the N+1 signal; every other method
+//! keeps the default budget ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
 //!
 //! All thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
 //! [`COMPOUND_STATEMENT_THRESHOLD_ENV`], [`DURATION_THRESHOLD_ENV`], and
@@ -51,8 +51,12 @@ pub const DEFAULT_STATEMENT_WARN_THRESHOLD: u64 = 25;
 /// [`is_compound_statement_method`]): a dispatch executing more than this
 /// many SQL statements draws a WARN. Higher than
 /// [`DEFAULT_STATEMENT_WARN_THRESHOLD`] so a legitimately compound
-/// multi-entity op doesn't trip the guardrail.
-pub const DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD: u64 = 50;
+/// multi-entity op doesn't trip the guardrail. Sized off observed dispatch
+/// counts — `workspace.create` deterministically runs ~40 statements and
+/// `workspace.delete` scales with workspace contents (26–72 observed,
+/// intent-hq/monorepo#3074) — while staying an order of magnitude below the
+/// hundreds a real N+1 regression produces.
+pub const DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD: u64 = 100;
 /// Default duration threshold in milliseconds for non-network-tier methods: a
 /// dispatch running longer than this draws a WARN.
 pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
@@ -76,8 +80,11 @@ pub const NETWORK_DURATION_THRESHOLD_ENV: &str = "INTENTD_RPC_NETWORK_DURATION_W
 /// [`is_network_tier_method`]).
 const NETWORK_TIER_PREFIXES: &[&str] = &["github.", "linear.", "sentry."];
 /// Exact method names (outside the prefix list) that identify a network-bound
-/// RPC (see [`is_network_tier_method`]).
-const NETWORK_TIER_METHODS: &[&str] = &["pr.refresh", "pr.state"];
+/// RPC (see [`is_network_tier_method`]). `workspace.create` belongs here
+/// because its dominant cost is git provisioning — clone/fetch from the
+/// remote plus worktree checkout — so its normal duration tracks upstream
+/// and disk latency, not local SQL work (intent-hq/monorepo#2994).
+const NETWORK_TIER_METHODS: &[&str] = &["pr.refresh", "pr.state", "workspace.create"];
 
 /// Whether `method` fans out to a network-bound upstream and should use the
 /// network-tier duration budget ([`DEFAULT_NETWORK_DURATION_WARN_MS`] /
@@ -90,14 +97,29 @@ fn is_network_tier_method(method: &str) -> bool {
 }
 
 /// Exact method names of legitimately compound multi-entity ops (see
-/// [`is_compound_statement_method`]).
-const COMPOUND_STATEMENT_METHODS: &[&str] = &["workspace.create"];
+/// [`is_compound_statement_method`]). `workspace.delete` belongs here
+/// because deletion fans out over the workspace's contents — per-session
+/// teardown, completion-watch and subscription sweeps, then the store
+/// cascade — so its statement count scales with workspace size
+/// (intent-hq/monorepo#3074). `workspace.import.commit` likewise inserts one
+/// row per transferred row inside the dispatch, so its count scales with the
+/// imported workspace's contents. Import counts are unbounded (322 observed
+/// on a large import), so a big import can still overrun the compound budget
+/// — that residual WARN on a rare, deliberate op is accepted rather than
+/// raising the shared threshold high enough to blunt the N+1 signal for the
+/// bounded members.
+const COMPOUND_STATEMENT_METHODS: &[&str] = &[
+    "workspace.create",
+    "workspace.delete",
+    "workspace.import.commit",
+];
 
 /// Whether `method` is a legitimately compound multi-entity op — it
-/// deterministically executes many statements by design (e.g.
-/// `workspace.create` persists the workspace, spec note, initial agent, and
-/// bookkeeping rows in one dispatch) — and should use the compound-op
-/// statement budget ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`] /
+/// executes many statements by design (e.g. `workspace.create` persists the
+/// workspace, spec note, initial agent, and bookkeeping rows in one
+/// dispatch; `workspace.delete` tears all of that down) — and should use the
+/// compound-op statement budget
+/// ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`] /
 /// [`COMPOUND_STATEMENT_THRESHOLD_ENV`]) instead of the default one.
 fn is_compound_statement_method(method: &str) -> bool {
     COMPOUND_STATEMENT_METHODS.contains(&method)
@@ -119,6 +141,7 @@ pub fn profile_filter() -> Targets {
 
 /// Tracing layer that counts SQL statements and times each RPC dispatch,
 /// warning when either exceeds its budget. See the module docs.
+#[allow(clippy::struct_field_names)] // each field is a distinct named threshold; the suffix is the meaning
 pub struct RpcProfileLayer {
     statement_threshold: u64,
     compound_statement_threshold: u64,
@@ -262,7 +285,8 @@ where
             return;
         };
         let elapsed = profile.started.elapsed();
-        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         let statement_threshold = self.statement_threshold_for(&profile.method);
         if profile.statements > statement_threshold {
             tracing::warn!(
@@ -280,7 +304,7 @@ where
                 target: WARN_TARGET,
                 method = %profile.method,
                 statements = profile.statements,
-                threshold_ms = duration_threshold.as_millis().min(u128::from(u64::MAX)) as u64,
+                threshold_ms = u64::try_from(duration_threshold.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
                 elapsed_ms,
                 "rpc dispatch exceeded duration budget"
             );
@@ -578,17 +602,22 @@ mod tests {
         assert!(is_network_tier_method("sentry.listIssues"));
         assert!(is_network_tier_method("pr.refresh"));
         assert!(is_network_tier_method("pr.state"));
+        assert!(is_network_tier_method("workspace.create"));
         assert!(!is_network_tier_method("workspace.list"));
         assert!(!is_network_tier_method("pr.list"));
         assert!(!is_network_tier_method("github"));
     }
 
     #[test]
-    fn is_compound_statement_method_matches_workspace_create_only() {
+    fn is_compound_statement_method_matches_exact_members_only() {
         assert!(is_compound_statement_method("workspace.create"));
+        assert!(is_compound_statement_method("workspace.delete"));
+        assert!(is_compound_statement_method("workspace.import.commit"));
         assert!(!is_compound_statement_method("workspace.list"));
         assert!(!is_compound_statement_method("workspace.get"));
+        assert!(!is_compound_statement_method("workspace.archive"));
         assert!(!is_compound_statement_method("workspace.duplicate"));
+        assert!(!is_compound_statement_method("workspace.import.begin"));
         assert!(!is_compound_statement_method("workspace"));
     }
 
@@ -597,6 +626,14 @@ mod tests {
         let layer = RpcProfileLayer::from_env_with(|_| None);
         assert_eq!(
             layer.statement_threshold_for("workspace.create"),
+            DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
+            layer.statement_threshold_for("workspace.delete"),
+            DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
+            layer.statement_threshold_for("workspace.import.commit"),
             DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
         );
         assert_eq!(

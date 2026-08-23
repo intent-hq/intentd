@@ -21,6 +21,10 @@ impl Store {
     /// Re-recording the same pair refreshes `recorded_at` (dedup by primary
     /// key); rows beyond [`AGENT_FLIPPED_COMPLETIONS_CAP`] are evicted
     /// oldest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn record_agent_flipped_completion(
         &self,
         agent_id: &AgentId,
@@ -62,6 +66,10 @@ impl Store {
     /// Remove every agent's recorded flip of `task_note_id` — called when the
     /// task transitions back out of `complete`, which stales the flip
     /// regardless of who reverted it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn remove_agent_flipped_completions_for_task(
         &self,
         workspace_id: &WorkspaceId,
@@ -87,6 +95,10 @@ impl Store {
     /// is either returned by it or left for the next one — never silently
     /// consumed without attribution. `RETURNING` row order is unspecified,
     /// so the oldest-first ordering is applied after the fetch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn take_agent_flipped_completions(
         &self,
         agent_id: &AgentId,
@@ -130,6 +142,10 @@ impl Store {
     }
 
     /// The agent's recorded flipped completions, oldest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_agent_flipped_completions(
         &self,
         agent_id: &AgentId,

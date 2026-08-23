@@ -17,6 +17,10 @@ impl Store {
     /// now, or — on a re-hello — update `name`/`capabilities` and touch
     /// `last_seen` while preserving the original `first_seen`. `capabilities` is
     /// stored as a JSON-text bag (defaulting to `{}` when absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_client(
         &self,
         id: &ClientId,

@@ -33,7 +33,7 @@ impl Drop for TempDir {
     }
 }
 
-/// One in-process daemon stack: its own SQLite store, workspaces root, and
+/// One in-process daemon stack: its own `SQLite` store, workspaces root, and
 /// assets root — the same wiring the export/import unit suites use.
 async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
     let db = std::env::temp_dir().join(format!("roundtrip-test-{}.db", uuid::Uuid::new_v4()));
@@ -185,7 +185,7 @@ fn ready_meta(svc: &Services, export_id: &str) -> (u64, String, TransferManifest
     let exports = svc.transfer_exports.lock().unwrap();
     match &exports.get(export_id).expect("session").state {
         ExportState::Ready(r) => (r.size_bytes, r.sha256.clone(), r.manifest.clone()),
-        _ => panic!("session not ready"),
+        ExportState::Building { .. } => panic!("session not ready"),
     }
 }
 
@@ -569,8 +569,7 @@ async fn transfer_round_trip_between_two_stacks() {
             .tables
             .iter()
             .find(|t| t.name == n)
-            .map(|t| t.row_count)
-            .unwrap_or(-1)
+            .map_or(-1, |t| t.row_count)
     };
     assert_eq!(plan_rows("agent_session"), 3);
     assert_eq!(plan_rows("agent_message"), 3);
@@ -611,8 +610,7 @@ async fn transfer_round_trip_between_two_stacks() {
         stats
             .iter()
             .find(|s| s.name == n)
-            .map(|s| s.row_count)
-            .unwrap_or(-1)
+            .map_or(-1, |s| s.row_count)
     };
     assert_eq!(rows("workspace"), 1);
     assert_eq!(rows("note"), 2);

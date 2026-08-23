@@ -2,6 +2,226 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.46] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- Lint macOS-gated code in CI and fix pedantic clippy warnings ([#1425](https://github.com/intent-hq/intentd/pull/1425))
+
+
+## [0.7.45] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- *(services)* Always drop the ACP default pseudo-row when real rows exist ([#1419](https://github.com/intent-hq/intentd/pull/1419))
+
+
+## [0.7.44] - 2026-08-23
+
+### 🚀 Features
+
+- *(acp)* Replace claude-code preset system prompt with assembled prompt ([#1421](https://github.com/intent-hq/intentd/pull/1421))
+
+### ⚡ Performance
+
+- *(services)* Cap agent.list row previews to a render-sized budget ([#1422](https://github.com/intent-hq/intentd/pull/1422))
+
+
+## [0.7.43] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- Treat empty harness-wake responses as failed recovery, not completion ([#1418](https://github.com/intent-hq/intentd/pull/1418))
+
+
+## [0.7.42] - 2026-08-23
+
+### 🚀 Features
+
+- *(acp)* Serve compact workspace_api description to truncating providers ([#1415](https://github.com/intent-hq/intentd/pull/1415))
+- *(acp)* Send excludeDynamicSections in claude-code systemPrompt meta ([#1413](https://github.com/intent-hq/intentd/pull/1413))
+
+### 🐛 Bug Fixes
+
+- Close the LRU/cap eviction TOCTOU with claim-before-kill ([#1416](https://github.com/intent-hq/intentd/pull/1416))
+
+
+## [0.7.41] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- Rate-limit backoff for pr refresh + git root sweeps ([#1412](https://github.com/intent-hq/intentd/pull/1412))
+
+
+## [0.7.40] - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- Default host.exec cwd to the workspace root and surface in-hook exec failures
+
+
+## [0.7.39] - 2026-08-22
+
+### 🚀 Features
+
+- Add mcp.testConnection connection/auth probe RPC (protocol 7.3) ([#1408](https://github.com/intent-hq/intentd/pull/1408))
+- *(rpc)* Add agent.listUserMessages returning a bounded user-message index ([#1407](https://github.com/intent-hq/intentd/pull/1407))
+
+
+## [0.7.38] - 2026-08-22
+
+### 🚀 Features
+
+- *(settings)* Flip agentFeatures.taskGraph default to on ([#1405](https://github.com/intent-hq/intentd/pull/1405))
+
+
+## [0.7.37] - 2026-08-22
+
+### 🚀 Features
+
+- *(agents)* Fail fast on disabled or unavailable providers at create/delegate ([#1403](https://github.com/intent-hq/intentd/pull/1403))
+
+### 🐛 Bug Fixes
+
+- *(services)* Re-resolve model.default when providers.active switches ([#1401](https://github.com/intent-hq/intentd/pull/1401))
+
+
+## [0.7.36] - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- *(providers)* Apply codex model via session/set_config_option ([#1395](https://github.com/intent-hq/intentd/pull/1395))
+- Make pending question markers authoritative ([#1350](https://github.com/intent-hq/intentd/pull/1350))
+- *(services)* Derive pr_ready only when the PR is truly mergeable ([#1402](https://github.com/intent-hq/intentd/pull/1402))
+
+
+## [0.7.35] - 2026-08-22
+
+### 🚀 Features
+
+- Send task-derived agent name as session/new _meta.sessionTitle for codex ([#1392](https://github.com/intent-hq/intentd/pull/1392))
+- Preserve Auggie legacy model metadata ([#1333](https://github.com/intent-hq/intentd/pull/1333))
+
+### 🐛 Bug Fixes
+
+- *(providers)* Bump codex-acp npx pin to 1.6.2 ([#1394](https://github.com/intent-hq/intentd/pull/1394))
+- Harden stale-path staging and status refresh ([#1334](https://github.com/intent-hq/intentd/pull/1334))
+- Make delegate tests hermetic — no real auggie dependency ([#1393](https://github.com/intent-hq/intentd/pull/1393))
+
+
+## [0.7.34] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- *(services)* Re-fetch stale non-Merged PR pool entries during the git-root sweep ([#1390](https://github.com/intent-hq/intentd/pull/1390))
+
+
+## [0.7.33] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- *(services)* Terminal PR verdicts override stale entries in the list PR pool ([#1387](https://github.com/intent-hq/intentd/pull/1387))
+
+
+## [0.7.32] - 2026-08-21
+
+### 📚 Documentation
+
+- ShowTab reveals by activating in a visible panel without stealing focus ([#1384](https://github.com/intent-hq/intentd/pull/1384))
+
+
+## [0.7.31] - 2026-08-21
+
+### 🔧 Refactor
+
+- Complete the pedantic clippy burndown, empty the temporary allowlist ([#1382](https://github.com/intent-hq/intentd/pull/1382))
+
+
+## [0.7.30] - 2026-08-21
+
+### 🔧 Refactor
+
+- Burn down pedantic must_use, cast, and signature-adjacent lints ([#1379](https://github.com/intent-hq/intentd/pull/1379))
+
+### ⚡ Performance
+
+- Keep workspace.list/get enrichment off note bodies and duplicate session reads ([#1378](https://github.com/intent-hq/intentd/pull/1378))
+
+
+## [0.7.29] - 2026-08-21
+
+### 🚀 Features
+
+- First-class provider param on agent.delegate ([#1375](https://github.com/intent-hq/intentd/pull/1375))
+
+### 🐛 Bug Fixes
+
+- *(git)* Order intentd's credential helper ahead of OS-default ones ([#1364](https://github.com/intent-hq/intentd/pull/1364))
+- Add workspace.delete to the compound-op statement tier ([#3074](https://github.com/intent-hq/intentd/pull/3074))
+- Self-heal default provider settings and remove positional auggie fallback ([#1373](https://github.com/intent-hq/intentd/pull/1373))
+- Surface a client-visible terminal state for wedged turns ([#1374](https://github.com/intent-hq/intentd/pull/1374))
+
+### 📚 Documentation
+
+- Burn down pedantic missing_errors_doc and missing_panics_doc ([#1371](https://github.com/intent-hq/intentd/pull/1371))
+- Burn down pedantic doc_markdown ([#1367](https://github.com/intent-hq/intentd/pull/1367))
+
+
+## [0.7.28] - 2026-08-21
+
+### 🔧 Refactor
+
+- Burn down pedantic style and Option/format lints ([#1360](https://github.com/intent-hq/intentd/pull/1360))
+
+### 🧪 Testing
+
+- De-flake hook rehydration countdown tests racing the run loop
+
+
+## [0.7.27] - 2026-08-21
+
+### 🐛 Bug Fixes
+
+- Make dev-env intent-services tests hermetic and macOS-safe ([#1355](https://github.com/intent-hq/intentd/pull/1355))
+- *(acp)* Truncate oversized workspace_api output inline when file redirect fails ([#1354](https://github.com/intent-hq/intentd/pull/1354))
+- Preserve structured browser.exec action-result errors on the agent surface ([#1363](https://github.com/intent-hq/intentd/pull/1363))
+- Batch agent.getSubscriptions status reads into one IN-list query ([#1357](https://github.com/intent-hq/intentd/pull/1357))
+- Emit agent:process:evicted with reason idle-ttl from the TTL idle sweep ([#1356](https://github.com/intent-hq/intentd/pull/1356))
+- Stop serving tokenUsage on workspace.list rows and agentSummary on archived rows ([#1359](https://github.com/intent-hq/intentd/pull/1359))
+
+### 📚 Documentation
+
+- Document hidden-by-default tabs, showTab action, and listTabs visibility ([#1358](https://github.com/intent-hq/intentd/pull/1358))
+- Workspace-inactive semantics for showTab/focusTab/openTab ([#1362](https://github.com/intent-hq/intentd/pull/1362))
+
+
+## [0.7.26] - 2026-08-20
+
+### ⚙️ Miscellaneous Tasks
+
+- Add clippy pedantic ratchet scaffold ([#1351](https://github.com/intent-hq/intentd/pull/1351))
+
+
+## [0.7.25] - 2026-08-20
+
+### 🐛 Bug Fixes
+
+- Retry transient provider fetch failures instead of failing the turn terminally ([#1347](https://github.com/intent-hq/intentd/pull/1347))
+
+
+## [0.7.24] - 2026-08-20
+
+### 🚀 Features
+
+- Stamp agent-flipped completions as wake triggers ([#1340](https://github.com/intent-hq/intentd/pull/1340))
+
+### 🐛 Bug Fixes
+
+- *(providers)* Version-gate auggie spawn and honor auggie-path marker ([#1299](https://github.com/intent-hq/intentd/pull/1299))
+- Reject agent.watch on idle target with no waiting reasons ([#1341](https://github.com/intent-hq/intentd/pull/1341))
+- Resolve rpc_profile budget warnings for transfer.plan, create, and list ([#1344](https://github.com/intent-hq/intentd/pull/1344))
+
+
 ## [0.7.23] - 2026-08-20
 
 ### 🚀 Features

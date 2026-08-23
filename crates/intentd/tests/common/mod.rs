@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 #[cfg(unix)]
+use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -106,6 +107,33 @@ pub fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir for debugging.
 pub fn hermetic_workspaces_root() -> tempfile::TempDir {
     test_tempdir("itd-ws-")
+}
+
+/// A settings registry (backed by `config.toml` under `dir`) seeding
+/// `providers.active = "auggie"`: since monorepo#3044 there is no positional
+/// provider fallback, so in-process tests that create/delegate agents without
+/// an explicit provider or model must chain
+/// `.with_settings_registry(common::registry_with_default_provider(dir))`
+/// onto `Services::new(...)` to have a configured default to resolve to. The
+/// `providers.paths` override points auggie at a deterministic executable so
+/// availability checks (`agent.delegate`) pass without the real binary on
+/// the test host.
+pub fn registry_with_default_provider(
+    dir: &std::path::Path,
+) -> Arc<intent_services::SettingsRegistry> {
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.join("config.toml")).expect("load registry"),
+    );
+    registry
+        .apply(&[
+            ("providers.active".to_string(), serde_json::json!("auggie")),
+            (
+                "providers.paths".to_string(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
+        .expect("seed default provider");
+    registry
 }
 
 /// Wait until a freshly spawned `intentd serve` child accepts connections on
@@ -282,7 +310,7 @@ async fn await_wss_status_impl(socket: &Path, log_path: Option<&Path>) -> serde_
 /// it additionally dumps the log tail on timeout (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped(socket: &Path) {
-    await_wss_stopped_impl(socket, None).await
+    await_wss_stopped_impl(socket, None).await;
 }
 
 /// [`await_wss_stopped`] variant that also surfaces the tail of the daemon
@@ -290,7 +318,7 @@ pub async fn await_wss_stopped(socket: &Path) {
 /// attributable from the failure output alone (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped_logged(socket: &Path, log_path: &Path) {
-    await_wss_stopped_impl(socket, Some(log_path)).await
+    await_wss_stopped_impl(socket, Some(log_path)).await;
 }
 
 #[cfg(unix)]
@@ -374,10 +402,40 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
-        "\n[server.wsApi]\nenabled = true\nport = {port}\n"
-    ));
+    let _ = write!(text, "\n[server.wsApi]\nenabled = true\nport = {port}\n");
     std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
+}
+
+/// Seed the daemon's `config.toml` under `data_dir` with
+/// `[providers] active = "auggie"`: since monorepo#3044 there is no
+/// positional provider fallback, so spawned-daemon suites whose tests
+/// create/delegate agents without an explicit provider or model must seed a
+/// configured default before boot. Also seeds a `providers.paths` override
+/// pointing `auggie` at `/bin/sh` so availability checks (e.g.
+/// `agent.delegate`'s `ensure_provider_available`) stay hermetic — no real
+/// auggie binary required on the test host (monorepo#3162). Appends to an
+/// existing seeded config; no-op if a `[providers]` table is already present.
+pub fn seed_default_provider(data_dir: &std::path::Path) {
+    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+    let path = data_dir.join("config.toml");
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("read {}: {e}", path.display()),
+    };
+    if text
+        .lines()
+        .any(|l| l.trim_start().starts_with("[providers]"))
+    {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(
+        "\n[providers]\nactive = \"auggie\"\n\n[providers.paths]\nauggie = \"/bin/sh\"\n",
+    );
+    std::fs::write(&path, text).expect("seed config.toml with providers.active");
 }
 
 /// Seed `config.toml` with `[agents] resumeInterruptedOnStart = "off"` so a

@@ -41,8 +41,12 @@ pub struct DiffRow {
 
 impl Store {
     /// Upsert a diff keyed by the `UNIQUE(workspace_id, file_path, staged)` index:
-    /// insert with a minted UUIDv7 id, or refresh the content/hunks of the
+    /// insert with a minted `UUIDv7` id, or refresh the content/hunks of the
     /// existing row in place (its id + `created_at` are preserved).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_diff(&self, d: &NewDiff) -> Result<()> {
         let id = Uuid::now_v7().to_string();
         let now = now_iso();
@@ -56,7 +60,7 @@ impl Store {
             .bind(&id)
             .bind(&d.workspace_id.0)
             .bind(&d.file_path)
-            .bind(d.staged as i64)
+            .bind(i64::from(d.staged))
             .bind(&d.old_content)
             .bind(&d.new_content)
             .bind(&d.hunks_json)
@@ -70,6 +74,10 @@ impl Store {
 
     /// List a workspace's stored diffs, oldest first. Internal read used by the
     /// pipeline + tests (UI-facing diffs surface via file-tracking reads, M4.8).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_diffs(&self, workspace_id: &WorkspaceId) -> Result<Vec<DiffRow>> {
         let sql =
             format!("SELECT {DIFF_COLUMNS} FROM diffs WHERE workspace_id = ? ORDER BY created_at");
@@ -82,6 +90,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // row mapper; call sites collect::<Result<_>> uniformly
 fn map_diff_row(r: &SqliteRow) -> Result<DiffRow> {
     Ok(DiffRow {
         id: r.get("id"),

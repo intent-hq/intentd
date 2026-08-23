@@ -1,8 +1,8 @@
 //! Integration tests for sandbox merge-back on agent completion (completion-interception path).
 //!
-//! These tests exercise the handle_completion_event → handle_sandbox_merge_on_completion wiring:
+//! These tests exercise the `handle_completion_event` → `handle_sandbox_merge_on_completion` wiring:
 //! - (a) Clean merge → completion propagates with merged status; sandbox:cow:merged event; commits in canonical
-//! - (b) Conflict → completion NOT delivered; bounce message queued; canonical pristine; retry_count incremented
+//! - (b) Conflict → completion NOT delivered; bounce message queued; canonical pristine; `retry_count` incremented
 //! - (c) Retry cap exhausted → completion propagates with merge-pending
 //! - (d) Bounce refreshes sandbox with canonical HEAD without re-provisioning
 
@@ -51,7 +51,7 @@ mod tests {
         (store, db)
     }
 
-    /// Create a test repo under target/ for same-volume CoW.
+    /// Create a test repo under target/ for same-volume `CoW`.
     fn temp_repo_in_target(name: &str) -> (PathBuf, PathBuf) {
         let workspace_root = std::env::current_dir()
             .unwrap()
@@ -1253,7 +1253,7 @@ mod tests {
 
     /// Provision a sandbox with one clean commit and strand it `merge_pending`,
     /// returning `(test_root, repo_path, sandbox_path, ws, services, bus)`.
-    /// Returns `None` when CoW is unsupported (test should skip).
+    /// Returns `None` when `CoW` is unsupported (test should skip).
     #[allow(clippy::type_complexity)]
     async fn setup_merge_pending_sandbox(
         store: &Store,
@@ -1800,7 +1800,7 @@ mod tests {
     /// Provision a sandbox for an agent whose session metadata opts out of
     /// turn-end merges (`mergeOnTurnEnd: false` — the delegate/create path
     /// stamps this), with one clean commit in the sandbox. Returns `None`
-    /// when CoW is unsupported (test should skip).
+    /// when `CoW` is unsupported (test should skip).
     #[allow(clippy::type_complexity)]
     async fn setup_no_merge_sandbox(
         store: &Store,

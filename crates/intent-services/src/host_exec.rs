@@ -36,7 +36,7 @@ use tokio::process::Command;
 use crate::file_ops;
 
 /// Grace period between SIGTERM and SIGKILL when reaping a timed-out child,
-/// mirroring `mcp_servers::reap`'s TERM_GRACE.
+/// mirroring `mcp_servers::reap`'s `TERM_GRACE`.
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Wire error codes surfaced by `host.exec` (PROTOCOL §9: `-32602` for invalid
@@ -50,6 +50,10 @@ pub const INTERNAL_ERROR: i32 = -32603;
 pub trait ExecPolicy: Send + Sync {
     /// `Ok(())` allows the invocation; `Err(reason)` rejects it with `reason`
     /// surfaced as `-32603` at the transport layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(reason)` when the policy rejects the invocation.
     fn evaluate(&self, command: &str, args: &[String]) -> Result<(), String>;
 }
 
@@ -108,6 +112,10 @@ impl HostExecError {
 
 /// Parse a JSON-RPC params object into [`HostExecArgs`]. Rejects a missing /
 /// empty `command`, non-string `args`/`env`, and negative `timeoutMs`.
+///
+/// # Errors
+///
+/// Returns an invalid-params `HostExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecError> {
     let command = params
         .get("command")
@@ -296,11 +304,55 @@ fn cwd_within_root(root: &Path, full: &Path) -> bool {
     full.starts_with(root)
 }
 
+/// Default `cwd` for an exec that names a workspace but supplies no explicit
+/// `cwd`: the workspace's filesystem root, so relative paths in the command
+/// (e.g. `git -C .worktrees/x`) resolve against the workspace instead of the
+/// daemon's own process cwd (intent-hq/monorepo#3231 — in-hook `git fetch`
+/// silently ran from the daemon's cwd). Falls back to `None` (daemon cwd)
+/// when the workspace cannot be loaded, has no filesystem root (remote /
+/// skip-worktree rows), or the root no longer exists on disk (`current_dir`
+/// on a missing path would fail the spawn outright), preserving the previous
+/// behavior for rootless workspaces — there is no caller-supplied `cwd`
+/// here, so the fallback is a functional default, not a containment escape.
+pub(crate) async fn default_cwd_for_workspace(
+    api: &dyn WorkspaceApi,
+    workspace_id: &str,
+) -> Option<PathBuf> {
+    let ws = api
+        .get_workspace(WorkspaceId::from(workspace_id))
+        .await
+        .ok()?;
+    let root = file_ops::workspace_root(&ws);
+    if root.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(root);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// The calling agent's sandbox root, when the caller is a sandboxed agent:
+/// the default `cwd` for its execs, so a sandboxed agent's `ws.host.exec`
+/// runs inside its sandbox rather than the canonical checkout. `None` for
+/// non-agent callers, unknown sessions, and unsandboxed agents.
+async fn sandbox_root_for(
+    api: &dyn WorkspaceApi,
+    caller_agent_id: Option<&intent_core::AgentId>,
+) -> Option<PathBuf> {
+    let agent_id = caller_agent_id?;
+    let session = api.agent_get_session(agent_id.clone(), None).await.ok()?;
+    session.sandbox_path.map(PathBuf::from)
+}
+
 /// Assemble the tokio `Command` for a validated exec request. Pipes stdio,
 /// sets `kill_on_drop`, puts the child in its own process group (unix), and
 /// assembles the child env per the precedence contract in the module doc
 /// (caller `env` > daemon process env > captured login-shell credential vars;
 /// enhanced PATH with caller `env["PATH"]` winning). Exposed for tests.
+#[must_use]
 pub fn build_command(args: &HostExecArgs, cwd_resolved: Option<&Path>) -> Command {
     build_command_with_captured(
         args,
@@ -365,12 +417,16 @@ fn captured_env_to_apply<'a>(
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Execute one `host.exec` request end-to-end: validate policy + `cwd`, spawn,
 /// wait (with `timeoutMs`), reap the process group on timeout, and collect
 /// stdout/stderr. Returns the `{ stdout, stderr, exitCode, timedOut? }` JSON.
+///
+/// # Errors
+///
+/// Returns an internal `HostExecError` if the policy rejects the command, `cwd` cannot be resolved, or spawning/waiting on the process fails.
 pub async fn run(
     api: &dyn WorkspaceApi,
     args: HostExecArgs,
@@ -380,21 +436,20 @@ pub async fn run(
         .evaluate(&args.command, &args.args)
         .map_err(HostExecError::internal)?;
 
-    // Resolve the working directory. An omitted `cwd` defaults to "." —
-    // the workspace root (or the calling agent's sandbox root) — instead of
-    // silently inheriting the daemon process's own cwd, which is an
-    // unrelated directory from the caller's perspective.
-    let cwd_resolved = match args.workspace_id.as_deref() {
-        Some(ws_id) => Some(
-            resolve_cwd_within_workspace(
-                api,
-                ws_id,
-                args.cwd.as_deref().unwrap_or("."),
-                args.caller_agent_id.as_ref(),
-            )
-            .await?,
+    let cwd_resolved = match (args.cwd.as_deref(), args.workspace_id.as_deref()) {
+        (Some(cwd), Some(ws_id)) => Some(
+            resolve_cwd_within_workspace(api, ws_id, cwd, args.caller_agent_id.as_ref()).await?,
         ),
-        None => None,
+        // No explicit `cwd` but a workspace caller: a sandboxed agent's
+        // default cwd is its sandbox root; everyone else defaults to the
+        // workspace root (monorepo#3231) instead of inheriting the daemon's
+        // cwd — a functional default that degrades to `None` for rootless
+        // workspaces, not a containment guard.
+        (None, Some(ws_id)) => match sandbox_root_for(api, args.caller_agent_id.as_ref()).await {
+            Some(sandbox_root) => Some(sandbox_root),
+            None => default_cwd_for_workspace(api, ws_id).await,
+        },
+        _ => None,
     };
 
     let mut cmd = build_command(&args, cwd_resolved.as_deref());
@@ -425,41 +480,42 @@ pub async fn run(
     };
 
     let (stdout_bytes, stderr_bytes, wait_result, timed_out) = if let Some(ms) = args.timeout_ms {
-        match tokio::time::timeout(Duration::from_millis(ms), wait_fut).await {
-            Ok((out, err, status)) => (out, err, status, false),
-            Err(_) => {
-                // Reap the whole process group: SIGTERM → grace → SIGKILL,
-                // plus a snapshot-before-kill descendant sweep for anything
-                // that escaped into its own process group
-                // (`intent_acp::descendant_sweep`). On non-unix `kill_on_drop`
-                // will still reap the direct child when `child` is dropped by
-                // the returned future's scope.
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    let descendants = intent_acp::descendant_pids(pid).await;
-                    kill_group(pid, nix::sys::signal::Signal::SIGTERM);
-                    tokio::time::sleep(TERM_GRACE).await;
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        // exited during grace
-                    } else {
-                        kill_group(pid, nix::sys::signal::Signal::SIGKILL);
-                    }
-                    intent_acp::sweep_escaped_descendants(&descendants).await;
+        if let Ok((out, err, status)) =
+            tokio::time::timeout(Duration::from_millis(ms), wait_fut).await
+        {
+            (out, err, status, false)
+        } else {
+            // Reap the whole process group: SIGTERM → grace → SIGKILL,
+            // plus a snapshot-before-kill descendant sweep for anything
+            // that escaped into its own process group
+            // (`intent_acp::descendant_sweep`). On non-unix `kill_on_drop`
+            // will still reap the direct child when `child` is dropped by
+            // the returned future's scope.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let descendants = intent_acp::descendant_pids(pid).await;
+                kill_group(pid, nix::sys::signal::Signal::SIGTERM);
+                tokio::time::sleep(TERM_GRACE).await;
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    // exited during grace
+                } else {
+                    kill_group(pid, nix::sys::signal::Signal::SIGKILL);
                 }
-                #[cfg(not(unix))]
-                let _ = pid;
-                // Best-effort drain of whatever the child produced pre-timeout.
-                let status = child.wait().await;
-                let mut out = Vec::new();
-                if let Some(mut r) = stdout_reader.take() {
-                    let _ = r.read_to_end(&mut out).await;
-                }
-                let mut err = Vec::new();
-                if let Some(mut r) = stderr_reader.take() {
-                    let _ = r.read_to_end(&mut err).await;
-                }
-                (out, err, status, true)
+                intent_acp::sweep_escaped_descendants(&descendants).await;
             }
+            #[cfg(not(unix))]
+            let _ = pid;
+            // Best-effort drain of whatever the child produced pre-timeout.
+            let status = child.wait().await;
+            let mut out = Vec::new();
+            if let Some(mut r) = stdout_reader.take() {
+                let _ = r.read_to_end(&mut out).await;
+            }
+            let mut err = Vec::new();
+            if let Some(mut r) = stderr_reader.take() {
+                let _ = r.read_to_end(&mut err).await;
+            }
+            (out, err, status, true)
         }
     } else {
         let (out, err, status) = wait_fut.await;
@@ -480,6 +536,10 @@ pub async fn run(
 }
 
 /// Convenience for the transport layer: run with the default v1 policy.
+///
+/// # Errors
+///
+/// Returns an internal `HostExecError` if `cwd` cannot be resolved or spawning/waiting on the process fails.
 pub async fn run_default(
     api: &dyn WorkspaceApi,
     args: HostExecArgs,
@@ -493,6 +553,10 @@ pub async fn run_default(
 /// caller-supplied `workspaceId` is overwritten before parsing), run with the
 /// default policy, and fold [`HostExecError`] codes onto the domain error enum
 /// (`-32602` → `InvalidParams`, else `Internal`).
+///
+/// # Errors
+///
+/// Returns `Error::InvalidParams` when `params` is not an object or fails validation; execution failures surface as `Error::Internal`.
 pub async fn run_for_workspace(
     api: &dyn WorkspaceApi,
     workspace_id: WorkspaceId,
@@ -528,26 +592,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn map(v: Value) -> Map<String, Value> {
+    fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
     }
 
     #[test]
     fn parse_args_requires_command() {
-        let err = parse_args(&map(json!({}))).unwrap_err();
+        let err = parse_args(&map(&json!({}))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("command"));
     }
 
     #[test]
     fn parse_args_rejects_non_string_args() {
-        let err = parse_args(&map(json!({ "command": "echo", "args": [1, 2] }))).unwrap_err();
+        let err = parse_args(&map(&json!({ "command": "echo", "args": [1, 2] }))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[test]
     fn parse_args_caps_timeout() {
-        let a = parse_args(&map(json!({
+        let a = parse_args(&map(&json!({
             "command": "echo",
             "timeoutMs": MAX_TIMEOUT_MS + 1_000,
         })))
@@ -557,14 +621,14 @@ mod tests {
 
     #[test]
     fn parse_args_cwd_requires_workspace_id() {
-        let err = parse_args(&map(json!({ "command": "echo", "cwd": "/tmp" }))).unwrap_err();
+        let err = parse_args(&map(&json!({ "command": "echo", "cwd": "/tmp" }))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("workspaceId"));
     }
 
     #[test]
     fn parse_args_defaults_are_empty() {
-        let a = parse_args(&map(json!({ "command": "echo" }))).unwrap();
+        let a = parse_args(&map(&json!({ "command": "echo" }))).unwrap();
         assert!(a.args.is_empty());
         assert!(a.env.is_empty());
         assert!(a.cwd.is_none());

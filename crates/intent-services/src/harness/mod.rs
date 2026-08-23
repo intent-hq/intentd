@@ -106,7 +106,7 @@ pub(crate) trait Harness: Send + Sync {
     /// sandbox-eligible CoW-capable workspace. `uniform_isolation` is true
     /// for `executionEnvironment: cow` workspaces (EVERY agent is sandboxed,
     /// param/setting ignored); `standalone_cow_checkout` is true when the
-    /// workspace checkout is itself a standalone CoW clone (`checkoutMode:
+    /// workspace checkout is itself a standalone `CoW` clone (`checkoutMode:
     /// cow`), adding the checkout-level-isolation note for legacy rows.
     fn coordinator_cow_hint(
         &self,
@@ -128,7 +128,7 @@ pub(crate) trait Harness: Send + Sync {
 
     // --- Turn envelope (`agent_manager::build_turn_prompt`) ---
 
-    /// `<system>`-wrapped assembled system prompt for the FirstTurnPrepend
+    /// `<system>`-wrapped assembled system prompt for the `FirstTurnPrepend`
     /// fallback.
     fn first_turn_prepend_block(&self, prompt: &str) -> String;
     /// The per-turn state snapshot line around the serialized snapshot JSON.
@@ -141,7 +141,7 @@ pub(crate) trait Harness: Send + Sync {
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
-    /// (FirstTurnPrepend → snapshot → Context → naming nudge → role reminder
+    /// (`FirstTurnPrepend` → snapshot → Context → naming nudge → role reminder
     /// → body) is itself versioned.
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String;
 
@@ -160,6 +160,14 @@ pub(crate) trait Harness: Send + Sync {
     /// `[SYSTEM NOTE]` auto-redrive nudge injected after a suspected-truncated
     /// turn on a delegated in-task agent (intent-hq/monorepo#2863).
     fn truncation_redrive_nudge(&self) -> String;
+    /// `[SYSTEM NOTE]` auto-recovery nudge injected after a harness-wake turn
+    /// that produced no meaningful output on a delegated in-task agent
+    /// (intent-hq/monorepo#3262).
+    fn empty_wake_redrive_nudge(&self) -> String;
+    /// Attention-request reason recorded when an empty harness-wake recovery
+    /// cannot be redriven — root/user-facing or taskless agent, or the
+    /// consecutive-redrive cap is spent (intent-hq/monorepo#3262).
+    fn empty_wake_attention_reason(&self) -> String;
 
     // --- Prompt notices (`agent_manager.rs`) ---
 
@@ -181,7 +189,7 @@ pub(crate) trait Harness: Send + Sync {
     /// `[WORKSPACE EVENTS] Child agent {label} {kind}.` completion wake with
     /// report/summary/error tail and the #2051 watch-retired notes.
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String;
-    /// One `- {label} {kind}.…` per-child line of an after_all group wake,
+    /// One `- {label} {kind}.…` per-child line of an `after_all` group wake,
     /// including the attention fold.
     fn group_child_line(&self, params: &ChildSettlementParams<'_>) -> String;
     /// The aggregated group-settlement wake: header plus accumulated
@@ -228,6 +236,12 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String;
     /// Log-line warning for a returned hook `state` exceeding the byte cap.
     fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String;
+    /// Diagnostic summary for a run whose `ws.host.exec` calls failed
+    /// (nonzero exit / timeout) without the script throwing — persisted to
+    /// `lastError` so silent check failures stay observable (monorepo#3231).
+    /// `total` is the uncapped failure count; when it exceeds `lines.len()`
+    /// (the per-run capture cap) the summary flags the omitted rest.
+    fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String;
     /// `[Background hook "{name}"] {message}` framing plus the optional
     /// trailing state note.
     fn hook_wake_framing(&self, hook_name: &str, message: &str, state_note: Option<&str>)
@@ -367,16 +381,15 @@ pub(crate) fn latest() -> &'static dyn Harness {
 /// versions fall back to the latest with a WARN (never fail a turn over a
 /// stale or corrupt stamp).
 pub(crate) fn resolve_entry(version: &str) -> &'static HarnessEntry {
-    match REGISTRY.iter().find(|e| e.version == version) {
-        Some(e) => e,
-        None => {
-            tracing::warn!(
-                version = %version,
-                latest = LATEST_VERSION,
-                "unknown harness version; falling back to latest"
-            );
-            latest_entry()
-        }
+    if let Some(e) = REGISTRY.iter().find(|e| e.version == version) {
+        e
+    } else {
+        tracing::warn!(
+            version = %version,
+            latest = LATEST_VERSION,
+            "unknown harness version; falling back to latest"
+        );
+        latest_entry()
     }
 }
 
@@ -385,7 +398,7 @@ mod tests {
     use super::*;
 
     fn data_ptr(h: &'static dyn Harness) -> *const () {
-        h as *const dyn Harness as *const ()
+        std::ptr::from_ref::<dyn Harness>(h).cast::<()>()
     }
 
     /// The registry keys on the exact version string sessions are stamped

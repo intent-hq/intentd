@@ -88,7 +88,7 @@ fn is_nested_repo_path(workdir: &Path, rel: &Path) -> bool {
 /// slash). These are what [`stage_all_skipping_nested`] skips when staging.
 /// Deliberately broader than [`is_dirty`]'s exclusion (`contains` vs exact
 /// `WT_NEW`): a tracked submodule staged for removal with its checkout still
-/// on disk (`INDEX_DELETED | WT_NEW`) must ALSO be skipped by add_all —
+/// on disk (`INDEX_DELETED | WT_NEW`) must ALSO be skipped by `add_all` —
 /// re-adding it would fail or undo the staged deletion — while still counting
 /// as dirt so the snapshot commit captures the removal.
 pub(crate) fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<PathBuf>> {
@@ -126,13 +126,8 @@ pub(crate) fn stage_all_skipping_nested(
     let nested = untracked_nested_repo_dirs(repo)?;
     // `Path` equality compares components, so a trailing `/` on the matched
     // path is ignored.
-    let mut skip_nested = |path: &Path, _spec: &[u8]| -> i32 {
-        if nested.iter().any(|n| n == path) {
-            1 // skip
-        } else {
-            0 // add
-        }
-    };
+    let mut skip_nested =
+        |path: &Path, _spec: &[u8]| -> i32 { i32::from(nested.iter().any(|n| n == path)) };
     index
         .add_all(
             ["*"].iter(),

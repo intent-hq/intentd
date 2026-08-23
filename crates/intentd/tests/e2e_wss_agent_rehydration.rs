@@ -1,6 +1,6 @@
 //! WSS end-to-end conversation rehydration (P3-1.2): a multi-message
 //! conversation (user / assistant-with-tool-blocks / tool) persisted in the
-//! daemon's SQLite store BEFORE the daemon boots must round-trip through
+//! daemon's `SQLite` store BEFORE the daemon boots must round-trip through
 //! `agent.get` / `agent.getConversation` over a real pinned-TLS WebSocket with
 //! exact ordering, roles, ids, content blocks and timestamps — the FE
 //! rehydration path once `UnifiedPersistence` reads move to the daemon
@@ -198,7 +198,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -253,7 +253,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     }
 }
 
-/// Pre-seed the daemon's SQLite store with a workspace, a settled agent
+/// Pre-seed the daemon's `SQLite` store with a workspace, a settled agent
 /// session, and a 5-message conversation exercising every persisted role
 /// (`user`, `assistant`, `tool`) and block type (`text`, `tool_use`,
 /// `tool_result`). Returns `(ws_id, agent_id, expected_wire_messages)` where
@@ -341,7 +341,7 @@ async fn seed_conversation(data_dir: &Path) -> (String, String, Vec<Value>) {
         expected.push(json!({
             "id": m[seq],
             "agentId": agent_id.0,
-            "seq": seq as i64,
+            "seq": i64::try_from(seq).expect("value fits in i64"),
             "role": role,
             "contentBlocks": blocks,
             "timestamp": ts,
@@ -370,7 +370,8 @@ async fn seeded_conversation_rehydrates_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

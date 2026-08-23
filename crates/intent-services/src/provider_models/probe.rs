@@ -91,7 +91,7 @@ where
         .await
         .map_err(|e| match e {
             SpawnError::QueueTimeout { waited, limit } => ProbeError::QueueTimeout {
-                waited_ms: waited.as_millis() as u64,
+                waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
                 limit,
             },
             SpawnError::Spawn(detail) => ProbeError::Spawn(detail),

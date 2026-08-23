@@ -49,6 +49,8 @@ mod testutil;
 pub(crate) const SLOW_GIT_WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Map a libgit2 error into the domain [`Error::Internal`] (`-32603`).
+// By-value so it slots point-free into `map_err(map_git_err)` everywhere.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
     Error::Internal(e.message().to_string())
 }
@@ -57,6 +59,7 @@ pub(crate) fn map_git_err(e: git2::Error) -> Error {
 /// worktree). Read-only probe backing the `repoPath` validation of the
 /// path-based branch reads (`git.getBranches`, `git.branchStatus`) in
 /// `intent-services`.
+#[must_use]
 pub fn is_repository(path: &std::path::Path) -> bool {
     git2::Repository::open(path).is_ok()
 }

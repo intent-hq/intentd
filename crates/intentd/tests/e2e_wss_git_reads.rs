@@ -191,7 +191,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -262,7 +262,8 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     assert!(await_uds(&socket).await, "daemon did not start");
     let status =
         common::await_wss_status_logged(&socket, &daemon.data_dir.join("daemon.log")).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -527,7 +528,7 @@ async fn git_get_config_over_wss() {
     let (daemon, port, cfg) = boot(&root).await;
     let repo = make_source_repo(&daemon.scratch);
     let mut ws = connect_ws(port, cfg).await;
-    let (ws_id, _wt) = create_workspace(&mut ws, &repo, "Git Read E2E — getConfig").await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Read E2E — getConfig").await;
 
     // Success: should return raw .git/config content.
     let resp = wss_rpc(&mut ws, 3, "git.getConfig", json!({ "workspaceId": ws_id })).await;
@@ -545,8 +546,7 @@ async fn git_get_config_over_wss() {
             .as_str()
             .unwrap()
             .contains("workspaceId"),
-        "error mentions workspaceId: {:?}",
-        resp
+        "error mentions workspaceId: {resp:?}"
     );
 
     // Non-existent workspace → -32602.
@@ -580,7 +580,7 @@ async fn git_get_config_over_wss() {
     assert_eq!(config_resp["result"]["config"], json!(""));
 
     // Non-repo workspace: remove .git file/directory → empty string.
-    let git_path = _wt.join(".git");
+    let git_path = wt.join(".git");
     if git_path.is_file() {
         std::fs::remove_file(&git_path).expect("remove .git file");
     } else if git_path.is_dir() {

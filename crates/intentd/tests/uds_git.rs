@@ -1086,7 +1086,7 @@ async fn uds_git_commit_details_round_trip() {
 }
 
 /// Over-the-wire `git.branchStatus` slice: path-based ahead/behind + dirty-tree
-/// flag for the workspace-initializer BranchSelector seam (PROTOCOL §5.6).
+/// flag for the workspace-initializer `BranchSelector` seam (PROTOCOL §5.6).
 #[tokio::test]
 async fn uds_git_branch_status_round_trip() {
     let short = uuid::Uuid::new_v4().simple().to_string();
@@ -1241,7 +1241,7 @@ async fn uds_git_branch_status_round_trip() {
 }
 
 /// Over-the-wire `git.getBranches` slice: the path-based branch listing used by
-/// the workspace-initializer BranchSelector (PROTOCOL §5.6). The repo does NOT
+/// the workspace-initializer `BranchSelector` (PROTOCOL §5.6). The repo does NOT
 /// need to be a registered workspace — the create flow lists branches before
 /// the workspace exists — but nonexistent paths and non-git directories are
 /// rejected with distinct -32602 errors.
@@ -1376,6 +1376,7 @@ async fn uds_git_get_branches_round_trip() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Over-the-wire `git.pull` slice: the workspace-create auto-pull (PROTOCOL
 /// §5.6). Path-based like `git.getBranches` — the repo does NOT need to be a
 /// registered workspace. Covers the checked-out fast-forward pull (with a

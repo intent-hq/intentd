@@ -7,7 +7,7 @@
 //! (the note's stored content at request start). Subsequent full-content
 //! writes compute a single-hunk char-level diff of the new content against the
 //! doc's current text and apply it inside a `yrs` transaction; the merged
-//! resulting text is returned so the caller persists it to SQLite via the
+//! resulting text is returned so the caller persists it to `SQLite` via the
 //! normal `note.*` mutation flow (§5.2). The `yrs` state itself is never
 //! persisted.
 //!
@@ -216,7 +216,11 @@ fn apply_diff(txn: &mut TransactionMut<'_>, text: &yrs::TextRef, current: &str, 
     let insert_slice = &tgt[prefix..tgt.len() - suffix];
 
     if delete_len > 0 {
-        text.remove_range(txn, prefix as u32, delete_len as u32);
+        text.remove_range(
+            txn,
+            u32::try_from(prefix).expect("note text fits in u32"),
+            u32::try_from(delete_len).expect("note text fits in u32"),
+        );
     }
     if !insert_slice.is_empty() {
         // `encode_utf16` always yields well-formed pairs, and the surrogate
@@ -224,7 +228,11 @@ fn apply_diff(txn: &mut TransactionMut<'_>, text: &yrs::TextRef, current: &str, 
         // `from_utf16` on the middle segment is safe.
         let insert_text = String::from_utf16(insert_slice)
             .expect("utf-16 middle segment is well-formed after surrogate back-off");
-        text.insert(txn, prefix as u32, &insert_text);
+        text.insert(
+            txn,
+            u32::try_from(prefix).expect("note text fits in u32"),
+            &insert_text,
+        );
     }
 }
 

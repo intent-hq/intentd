@@ -26,7 +26,7 @@ static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Recorded (trimmed) response from
 /// `https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000`
 /// (captured 2026-07-27), covering: a dense model (`Ornith-1.0-35B-GGUF`), an
-/// MoE model whose name carries both total and active param counts
+/// `MoE` model whose name carries both total and active param counts
 /// (`Qwen3.6-35B-A3B-GGUF`), a huge dense model that must be filtered out on
 /// a typical machine (`Ornith-1.0-397B-GGUF`), a small dense model
 /// (`gpt-oss-20b-GGUF`), a repo with no parseable size in its name
@@ -206,10 +206,40 @@ fn parse_acp_models_resolves_default_pseudo_row_via_family_match() {
 }
 
 #[test]
-fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
-    // Fail-soft: a pseudo-row whose name/description carry no version-bearing
-    // family (or whose family matches zero or several siblings) is kept as-is
-    // and nothing is marked isDefault.
+fn parse_acp_models_drops_pseudo_row_for_live_opus_5_payload() {
+    // Repro of the live claude-agent-acp payload observed on intentd v0.7.42
+    // (2026-08, monorepo model-picker screenshot): the pseudo-row and the
+    // "Opus (1M context)" sibling share the same description, the model
+    // select's currentValue is "default". The pseudo-row must never reach the
+    // wire catalog while real rows exist.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "name": "Model", "category": "model", "type": "select",
+              "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)",
+                  "description": "Opus 5 with 1M context · Best for everyday, complex tasks" },
+                { "value": "opus[1m]", "name": "Opus (1M context)",
+                  "description": "Opus 5 with 1M context · Best for everyday, complex tasks" },
+                { "value": "claude-fable-5", "name": "Fable",
+                  "description": "Fable 5 · Most capable for your hardest and longest tasks" },
+                { "value": "sonnet", "name": "Sonnet",
+                  "description": "Sonnet 5 · Efficient for routine tasks" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["opus[1m]", "claude-fable-5", "sonnet"]);
+    assert_eq!(rows[0]["isDefault"], json!(true));
+}
+
+#[test]
+fn parse_acp_models_drops_unresolvable_default_pseudo_row() {
+    // An unresolvable pseudo-row — no version-bearing family in its
+    // name/description, or a family matching zero or several siblings — is
+    // still dropped when real rows exist; nothing is marked isDefault (no
+    // guessing).
     let no_family = json!({
         "configOptions": [
             { "id": "model", "currentValue": "default",
@@ -232,15 +262,15 @@ fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
     });
     for payload in [no_family, ambiguous] {
         let rows = parse_acp_models(&payload, "claude-code");
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["id"], "default");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r["id"] != "default"));
         assert!(rows
             .iter()
             .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
     }
 
-    // A lone pseudo-row can never resolve — the catalog must not come back
-    // empty.
+    // A catalog whose ONLY row is the pseudo-row keeps it — the catalog must
+    // not come back empty (D1).
     let only_default = json!({
         "configOptions": [
             { "id": "model", "currentValue": "default",
@@ -250,6 +280,45 @@ fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
     let rows = parse_acp_models(&only_default, "claude-code");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "default");
+
+    // The drop requires a real (non-pseudo) row: a pathological catalog of
+    // only duplicate pseudo-rows is served unchanged and nothing is marked
+    // isDefault.
+    let all_pseudo = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "DEFAULT", "name": "Default (dup)" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&all_pseudo, "claude-code");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
+}
+
+#[test]
+fn parse_acp_models_drops_every_pseudo_row_when_a_real_row_exists() {
+    // EVERY pseudo-row is dropped once a real row exists — not just the
+    // first — matching the cache-load sanitization: a `default` id must
+    // never ship next to a real model row.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "sonnet",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "DEFAULT", "name": "Default (dup)" },
+                { "value": "sonnet", "name": "Sonnet" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "sonnet");
+    assert_eq!(rows[0]["isDefault"], json!(true));
 }
 
 #[test]
@@ -294,13 +363,13 @@ fn parse_acp_models_current_value_wins_over_unresolvable_pseudo_row() {
 }
 
 #[test]
-fn parse_acp_models_family_less_default_row_stays_without_config_options() {
+fn parse_acp_models_family_less_default_row_drops_without_config_options() {
     // Catalogs from the models.availableModels shapes have no model select to
     // read a currentValue from, so only the family-match fallback applies.
-    // This family-less "default" row cannot resolve — it stays and no row is
-    // marked, matching the pre-resolution behavior. (A legacy default row
-    // whose name/description DOES carry a version-bearing family shared with
-    // exactly one sibling would still resolve via the fallback.)
+    // This family-less "default" row cannot resolve — it is still dropped
+    // (a real sibling exists) and no row is marked isDefault. (A legacy
+    // default row whose name/description DOES carry a version-bearing family
+    // shared with exactly one sibling would still resolve via the fallback.)
     let payload = json!({
         "models": {
             "availableModels": [
@@ -311,7 +380,8 @@ fn parse_acp_models_family_less_default_row_stays_without_config_options() {
         }
     });
     let rows = parse_acp_models(&payload, "claude-code");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "opus");
     assert!(rows
         .iter()
         .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
@@ -887,6 +957,7 @@ fn grok_outcome_rows_win_over_failed_exit() {
 // concurrently and starve one another.
 #[allow(clippy::await_holding_lock)]
 async fn opencode_models_cli_child_path_includes_binary_dir() {
+    use std::os::unix::fs::PermissionsExt;
     // A fake opencode whose success is gated on its own parent dir being on
     // the child's $PATH — the enhanced-path contract shared with the ACP
     // probe spawns. The temp dir is not on the process PATH, so the run only
@@ -897,8 +968,9 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     // timeout path, and under full parallel-suite load (plus a first-exec
     // Gatekeeper scan on macOS) the spawn alone can take seconds
     // (monorepo#921).
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    use std::os::unix::fs::PermissionsExt;
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
     let script = format!(
@@ -917,11 +989,13 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_models_cli_child_path_includes_binary_dir() {
+    use std::os::unix::fs::PermissionsExt;
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
     // only succeeds when its own parent dir is on the child's $PATH. Same
     // generous timeout rationale as the opencode analog above (monorepo#921).
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    use std::os::unix::fs::PermissionsExt;
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
     let script = format!(
@@ -941,20 +1015,22 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_cli_timeout_flows_into_attributed_warning() {
+    use std::os::unix::fs::PermissionsExt;
     // A wedged `grok models` must be cut short and the timeout reason must
     // surface through the fetch attribution (`grok: ...`). No wall-clock
     // bound (parity with the opencode analog): a first-exec Gatekeeper scan
     // on macOS can delay the spawn itself by seconds, and the attributed
     // warning already proves the timeout path fired.
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    use std::os::unix::fs::PermissionsExt;
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
     std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "grok",
-        super::run_grok_models_cli(bin, std::time::Duration::from_millis(5000))
+        super::run_grok_models_cli(bin, std::time::Duration::from_secs(5))
             .await
             .unwrap_err(),
     );
@@ -1290,13 +1366,15 @@ async fn probe_rpc_error_survives_dead_child() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
+    use std::os::unix::fs::PermissionsExt;
     // A wedged `opencode models` must be reaped when the timeout elapses and
     // the failure must be attributable as a timeout. The fake CLI records its
     // PID first thing, then sleeps far past the injected timeout — a ~5s
     // budget leaves slow runners ample time to write the PID file before the
     // deadline even under full-suite parallel load.
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    use std::os::unix::fs::PermissionsExt;
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("pid");
     let bin = dir.path().join("opencode");
@@ -1308,7 +1386,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let start = std::time::Instant::now();
-    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_millis(5000))
+    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
         .await
         .unwrap_err();
     assert!(
@@ -1341,17 +1419,19 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_timeout_flows_into_attributed_warning() {
+    use std::os::unix::fs::PermissionsExt;
     // The timeout reason must surface through the fetch result attribution
     // (`opencode: ...`), matching what models.list callers see.
-    let _serial = CHILD_SPAWN_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    use std::os::unix::fs::PermissionsExt;
+    let _serial = CHILD_SPAWN_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
     std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fetch = super::ProviderModelsFetch::unavailable(
         "opencode",
-        super::run_opencode_models_cli(bin, std::time::Duration::from_millis(5000))
+        super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
             .await
             .unwrap_err(),
     );
@@ -1398,6 +1478,8 @@ fn parse_param_count_billions_handles_dense_and_moe_names() {
 }
 
 #[test]
+// Small test constants: float→int casts are exact and saturating.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn fits_within_ram_applies_the_seventy_percent_threshold() {
     // A 20B dense model: ~20e9 * 0.6 + 1GiB headroom ≈ 12.99 GB. Comfortably
     // under 70% of 32 GiB (~22.4 GB).
@@ -1412,6 +1494,12 @@ fn fits_within_ram_applies_the_seventy_percent_threshold() {
 }
 
 #[test]
+// Small test constants: float↔int casts are exact and saturating.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn gguf_bytes_fit_within_ram_shares_the_catalog_budget() {
     // 15 GB of weights + 1 GiB headroom ≈ 16.07 GB, under 70% of 32 GiB
     // (~24.05 GB) but over 70% of 16 GiB (~12.03 GB).

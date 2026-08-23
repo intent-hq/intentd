@@ -115,7 +115,7 @@ fn parsed(frame: Option<String>) -> Value {
     serde_json::from_str(&frame.expect("a response frame")).unwrap()
 }
 
-fn req(id: i64, method: &str, params: Value) -> DraftRequest {
+fn req(id: i64, method: &str, params: &Value) -> DraftRequest {
     classify(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).unwrap()
 }
 
@@ -128,7 +128,7 @@ async fn get_is_null_for_anonymous_without_minting() {
             req(
                 1,
                 "drafts.get",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -149,7 +149,7 @@ async fn set_then_get_round_trips_and_mints_anonymous_client() {
             req(
                 1,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "hi" }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "hi" }),
             ),
             &api,
             &mut binding,
@@ -168,7 +168,7 @@ async fn set_then_get_round_trips_and_mints_anonymous_client() {
             req(
                 2,
                 "drafts.get",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -186,7 +186,7 @@ async fn set_empty_text_is_a_clear() {
         req(
             1,
             "drafts.set",
-            json!({ "workspaceId": "ws", "agentId": "a", "text": "draft" }),
+            &json!({ "workspaceId": "ws", "agentId": "a", "text": "draft" }),
         ),
         &api,
         &mut binding,
@@ -197,7 +197,7 @@ async fn set_empty_text_is_a_clear() {
             req(
                 2,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "" }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "" }),
             ),
             &api,
             &mut binding,
@@ -223,7 +223,7 @@ async fn clear_is_idempotent_success() {
             req(
                 1,
                 "drafts.clear",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -239,7 +239,7 @@ async fn missing_params_are_invalid_params() {
     let mut binding: Option<ClientId> = None;
     let no_agent = parsed(
         handle(
-            req(1, "drafts.get", json!({ "workspaceId": "ws" })),
+            req(1, "drafts.get", &json!({ "workspaceId": "ws" })),
             &api,
             &mut binding,
         )
@@ -252,7 +252,7 @@ async fn missing_params_are_invalid_params() {
             req(
                 2,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -272,7 +272,7 @@ async fn two_clients_are_isolated() {
         req(
             1,
             "drafts.set",
-            json!({ "workspaceId": "ws", "agentId": "ag", "text": "from-a" }),
+            &json!({ "workspaceId": "ws", "agentId": "ag", "text": "from-a" }),
         ),
         &api,
         &mut a,
@@ -283,7 +283,7 @@ async fn two_clients_are_isolated() {
             req(
                 2,
                 "drafts.get",
-                json!({ "workspaceId": "ws", "agentId": "ag" }),
+                &json!({ "workspaceId": "ws", "agentId": "ag" }),
             ),
             &api,
             &mut b,
@@ -308,7 +308,7 @@ async fn set_with_attachments_round_trips() {
             req(
                 1,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "hi", "attachments": attachments }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "hi", "attachments": attachments }),
             ),
             &api,
             &mut binding,
@@ -321,7 +321,7 @@ async fn set_with_attachments_round_trips() {
             req(
                 2,
                 "drafts.get",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -343,7 +343,7 @@ async fn get_omits_attachments_when_none_stored() {
         req(
             1,
             "drafts.set",
-            json!({ "workspaceId": "ws", "agentId": "a", "text": "hi" }),
+            &json!({ "workspaceId": "ws", "agentId": "a", "text": "hi" }),
         ),
         &api,
         &mut binding,
@@ -354,7 +354,7 @@ async fn get_omits_attachments_when_none_stored() {
             req(
                 2,
                 "drafts.get",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -377,7 +377,7 @@ async fn empty_text_with_attachments_persists() {
             req(
                 1,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "", "attachments": attachments }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "", "attachments": attachments }),
             ),
             &api,
             &mut binding,
@@ -394,7 +394,7 @@ async fn empty_text_with_attachments_persists() {
             req(
                 2,
                 "drafts.get",
-                json!({ "workspaceId": "ws", "agentId": "a" }),
+                &json!({ "workspaceId": "ws", "agentId": "a" }),
             ),
             &api,
             &mut binding,
@@ -415,7 +415,7 @@ async fn empty_text_with_empty_attachments_array_clears() {
         req(
             1,
             "drafts.set",
-            json!({ "workspaceId": "ws", "agentId": "a", "text": "draft" }),
+            &json!({ "workspaceId": "ws", "agentId": "a", "text": "draft" }),
         ),
         &api,
         &mut binding,
@@ -426,7 +426,7 @@ async fn empty_text_with_empty_attachments_array_clears() {
             req(
                 2,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "", "attachments": [] }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "", "attachments": [] }),
             ),
             &api,
             &mut binding,
@@ -450,7 +450,7 @@ async fn non_array_attachments_is_invalid_params() {
             req(
                 1,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "hi", "attachments": { "not": "an array" } }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "hi", "attachments": { "not": "an array" } }),
             ),
             &api,
             &mut binding,
@@ -472,7 +472,7 @@ async fn oversized_attachments_are_rejected() {
             req(
                 1,
                 "drafts.set",
-                json!({ "workspaceId": "ws", "agentId": "a", "text": "", "attachments": oversized }),
+                &json!({ "workspaceId": "ws", "agentId": "a", "text": "", "attachments": oversized }),
             ),
             &api,
             &mut binding,

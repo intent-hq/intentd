@@ -889,7 +889,7 @@ fn build_env_json_is_secret_safe_and_well_shaped() {
         &raw_path,
         "/bin/zsh",
         &home,
-        vec!["PATH".to_string(), "SECRET_TOKEN".to_string()],
+        &["PATH".to_string(), "SECRET_TOKEN".to_string()],
     );
     assert_eq!(v["path"], raw_path);
     assert_eq!(v["shell"], "/bin/zsh");
@@ -1222,7 +1222,7 @@ fn list_installed_editors_with_windows_uses_binary_resolver() {
     assert!(editors.iter().any(|e| e["id"] == "powershell"));
 }
 
-/// Regression test: run_version_with() enriches PATH with binary's parent dir,
+/// Regression test: `run_version_with()` enriches PATH with binary's parent dir,
 /// enabling scripts that invoke co-located dependencies via PATH lookup to succeed.
 ///
 /// Mirrors the real nvm layout where 'node' is co-located with npm-installed

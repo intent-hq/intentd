@@ -163,9 +163,8 @@ pub(crate) fn attribute_lines(
                 continue;
             }
             let mapped = current_to_version.get(i).copied().flatten();
-            let version_line_num = match mapped {
-                Some(n) => n,
-                None => continue,
+            let Some(version_line_num) = mapped else {
+                continue;
             };
             let version_line = version_lines
                 .get(version_line_num.saturating_sub(1))

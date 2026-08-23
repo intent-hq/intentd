@@ -13,6 +13,10 @@ use crate::Store;
 impl Store {
     /// List context items for a workspace, ordered by insertion (`ordinal`).
     /// Returns an empty vec when nothing is stored yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_workspace_context_items(
         &self,
         workspace_id: &WorkspaceId,
@@ -35,8 +39,12 @@ impl Store {
     /// Returns the persisted list read back from the store so callers can
     /// forward it verbatim to `workspace:context-changed` subscribers.
     ///
-    /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
+    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
     pub async fn replace_workspace_context_items(
         &self,
         workspace_id: &WorkspaceId,
@@ -65,7 +73,7 @@ impl Store {
                 )
                 .bind(&workspace_id.0)
                 .bind(&item.id)
-                .bind(idx as i64)
+                .bind(i64::try_from(idx).unwrap_or(i64::MAX))
                 .bind(payload)
                 .execute(&mut *tx)
                 .await

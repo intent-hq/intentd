@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_str, req_str};
 
-pub(crate) const PRELUDE: &str = r#"
+pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.comment = {
         add: (noteId, options) =>
@@ -25,7 +25,7 @@ pub(crate) const PRELUDE: &str = r#"
         delete: (noteId, commentId) =>
             host({ method: 'comment.delete', args: { noteId, commentId } }),
     };
-"#;
+";
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,

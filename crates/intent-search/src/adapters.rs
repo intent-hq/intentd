@@ -62,6 +62,7 @@ pub struct CodebaseMatch {
 }
 
 /// Case-insensitive substring test (the renderer's literal-search default).
+#[must_use]
 pub fn contains_ci(haystack: &str, query: &str) -> bool {
     if query.is_empty() {
         return false;
@@ -75,6 +76,7 @@ const PREVIEW_MAX: usize = 160;
 /// Build a single-line preview snippet centered on the first case-insensitive
 /// match of `query` in `text`. Newlines/tabs collapse to spaces; long previews
 /// are windowed with leading/trailing ellipses.
+#[must_use]
 pub fn make_preview(text: &str, query: &str) -> String {
     let flat: String = text
         .chars()
@@ -110,6 +112,7 @@ pub fn make_preview(text: &str, query: &str) -> String {
 /// matches as a prefix (`("tok" OR "tok"*)`): the plain branch is porter-
 /// stemmed like the index, while the starred branch catches partial words the
 /// stemmer would miss.
+#[must_use]
 pub fn fts_match_expr(raw: &str) -> Option<String> {
     let tokens: Vec<&str> = raw
         .split(|c: char| !c.is_alphanumeric())
@@ -125,6 +128,7 @@ pub fn fts_match_expr(raw: &str) -> Option<String> {
 /// token that occurs literally (case-insensitively) in `text`, falling back to
 /// the head of the text when no token appears verbatim (porter stemming can
 /// match without a literal occurrence).
+#[must_use]
 pub fn fts_preview(text: &str, raw_query: &str) -> String {
     let term = raw_query
         .split(|c: char| !c.is_alphanumeric())
@@ -172,6 +176,7 @@ const SYMBOL_KEYWORDS: &[&str] = &[
 
 /// Lightweight symbol heuristic: if `line` looks like a definition (`fn foo`,
 /// `struct Bar`, `class Baz`, `def qux`, …), return the declared identifier.
+#[must_use]
 pub fn extract_symbol(line: &str) -> Option<String> {
     let tokens: Vec<&str> = line
         .split(|c: char| c.is_whitespace() || c == '(')

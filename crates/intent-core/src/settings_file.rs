@@ -20,7 +20,7 @@
 //!   high-churn state that stays SQLite-backed.
 //!
 //! Keys that older daemons **used to** persist here but that have since moved
-//! back to SQLite or been removed outright are listed in
+//! back to `SQLite` or been removed outright are listed in
 //! [`LEGACY_SETTINGS_PATHS`]. A file containing one of them still parses (the
 //! value is captured for a one-time boot import-or-discard-and-strip by the
 //! composition root); any other unknown key remains a hard parse error.
@@ -142,8 +142,8 @@ pub struct WorkspaceSettings {
     pub ssh_key_path: Option<String>,
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
-    /// `workspace.cowIsolation` — CoW workspace provisioning and per-agent
-    /// sandboxing (requires CoW filesystem support on the workspaces root;
+    /// `workspace.cowIsolation` — `CoW` workspace provisioning and per-agent
+    /// sandboxing (requires `CoW` filesystem support on the workspaces root;
     /// workspace creation fails when unsupported).
     pub cow_isolation: bool,
 }
@@ -164,7 +164,7 @@ impl Default for GitSettings {
 
 /// `[sandbox]` — execution-environment profiles (`sandbox.*`): which
 /// environment types are enabled and which one workspace creation defaults
-/// to. Availability (CoW filesystem support, microVM host capability) is
+/// to. Availability (`CoW` filesystem support, microVM host capability) is
 /// probed at runtime and resolved via `sandbox.options` — these settings
 /// express user intent only.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -196,6 +196,7 @@ pub enum SandboxType {
 
 impl SandboxType {
     /// Wire spelling of the type (`direct` | `worktree` | `cow` | `microvm`).
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             SandboxType::Direct => "direct",
@@ -237,11 +238,11 @@ impl Default for SandboxWorktreeSettings {
     }
 }
 
-/// `[sandbox.cow]` — CoW environment (`sandbox.cow.*`).
+/// `[sandbox.cow]` — `CoW` environment (`sandbox.cow.*`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SandboxCowSettings {
-    /// `sandbox.cow.enabled` — offer the CoW environment (requires CoW
+    /// `sandbox.cow.enabled` — offer the `CoW` environment (requires `CoW`
     /// filesystem support on the workspaces root).
     pub enabled: bool,
 }
@@ -251,7 +252,7 @@ pub struct SandboxCowSettings {
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SandboxMicrovmSettings {
     /// `sandbox.microvm.enabled` — offer the microVM environment (requires
-    /// microVM host capability AND CoW filesystem support).
+    /// microVM host capability AND `CoW` filesystem support).
     pub enabled: bool,
     /// `sandbox.microvm.image` — optional default guest-image override
     /// (`{ manifestUrl, sha256 }`); `None` uses the built-in image pin.
@@ -532,7 +533,7 @@ pub struct VoiceSettings {
     /// code, e.g. `"en"`) applied when a `voice.transcribe` call carries no
     /// per-call `language`. Unset/empty → provider auto-detection.
     pub language: Option<String>,
-    /// `[voice.openai]` — OpenAI provider tuning.
+    /// `[voice.openai]` — `OpenAI` provider tuning.
     pub openai: VoiceOpenAiSettings,
     /// `[voice.workspaceVocabulary]` — auto-derived workspace vocabulary.
     pub workspace_vocabulary: VoiceWorkspaceVocabularySettings,
@@ -547,7 +548,7 @@ pub enum VoiceProvider {
     Openai,
 }
 
-/// `[voice.openai]` — OpenAI speech-to-text tuning (`voice.openai.*`,
+/// `[voice.openai]` — `OpenAI` speech-to-text tuning (`voice.openai.*`,
 /// non-secret; the API key is a secret in `secrets.json`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -722,6 +723,7 @@ pub enum ResumeInterruptedOnStart {
 
 impl ResumeInterruptedOnStart {
     /// The wire/TOML string for this value.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             ResumeInterruptedOnStart::Auto => "auto",
@@ -831,8 +833,11 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on** except `taskGraph` (opt-in);
-/// changes apply to new agent sessions only.
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
+// One bool per independent settings toggle; the flat shape IS the settings
+// file contract.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {
@@ -877,8 +882,8 @@ pub struct AgentFeaturesSettings {
     /// APIs are never dispatch-denied. Prompt/help gating and unblocked-wake
     /// teaching use the value captured when the parent session is created;
     /// changing the live setting does not affect existing sessions' wakes.
-    /// Defaults **off** (opt-in), unlike the other toggles
-    /// (intent-hq/monorepo#2445).
+    /// Defaults **on** like the other toggles (originally opt-in —
+    /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
 }
 
@@ -895,7 +900,7 @@ impl Default for AgentFeaturesSettings {
             attention_requests: true,
             state_snapshot: true,
             pr_monitor: true,
-            task_graph: false,
+            task_graph: true,
         }
     }
 }
@@ -958,9 +963,13 @@ where
         fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<f64, E> {
             Ok(v)
         }
+        // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
+        #[allow(clippy::cast_precision_loss)]
         fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
+        // Precision loss beyond 2^53 is accepted for JSON-sourced numbers.
+        #[allow(clippy::cast_precision_loss)]
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<f64, E> {
             Ok(v as f64)
         }
@@ -980,7 +989,7 @@ where
 }
 
 /// Dotted wire paths that older daemons persisted in `config.toml` but that
-/// have since moved back to the SQLite `settings` table or been removed from
+/// have since moved back to the `SQLite` `settings` table or been removed from
 /// the product entirely. A file containing one of these still parses via
 /// [`SettingsFile::parse_str_with_legacy`] — the value is captured so the
 /// composition root can run a one-time import-into-SQLite (or discard, for
@@ -1012,6 +1021,10 @@ impl SettingsFile {
     /// [`LEGACY_SETTINGS_PATHS`]), wrong types, and bad enum values are
     /// rejected; the error message names the offending key path (camelCase,
     /// dotted) plus the TOML line/column context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the TOML fails to parse, contains unknown keys or wrong types, or fails semantic validation.
     pub fn parse_str(text: &str) -> Result<Self> {
         let de = toml::de::Deserializer::parse(text).map_err(|e| {
             let detail = e.to_string();
@@ -1034,8 +1047,12 @@ impl SettingsFile {
     /// Parse `text` like [`SettingsFile::parse_str`], but tolerate the known
     /// [`LEGACY_SETTINGS_PATHS`]: their values are removed from the document
     /// before the strict parse and returned in the legacy map (dotted wire
-    /// path → JSON value) so the caller can import them into SQLite and strip
+    /// path → JSON value) so the caller can import them into `SQLite` and strip
     /// the file. Every **other** unknown key is still a hard error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` under the same conditions as [`SettingsFile::parse_str`], with the legacy paths tolerated.
     pub fn parse_str_with_legacy(text: &str) -> Result<(Self, LegacySettings)> {
         let raw: toml::Table = text.parse().map_err(|e: toml::de::Error| {
             Error::InvalidInput(format!("invalid config.toml: {e}"))
@@ -1074,27 +1091,31 @@ impl SettingsFile {
 
     /// Range/semantic checks the type system cannot express. Errors name the
     /// offending key with its dotted camelCase path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` naming the offending key when a value is out of range.
     pub fn validate(&self) -> Result<()> {
-        fn bad(key: &str, msg: String) -> Error {
+        fn bad(key: &str, msg: &str) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
         }
         let v = self.notifications.volume;
         if !(0.0..=1.0).contains(&v) {
             return Err(bad(
                 "notifications.volume",
-                format!("must be between 0 and 1, got {v}"),
+                &format!("must be between 0 and 1, got {v}"),
             ));
         }
         if self.server.port < 1024 {
             return Err(bad(
                 "server.port",
-                format!("must be between 1024 and 65535, got {}", self.server.port),
+                &format!("must be between 1024 and 65535, got {}", self.server.port),
             ));
         }
         if self.server.ws_api.port < 1024 {
             return Err(bad(
                 "server.wsApi.port",
-                format!(
+                &format!(
                     "must be between 1024 and 65535, got {}",
                     self.server.ws_api.port
                 ),
@@ -1111,7 +1132,7 @@ impl SettingsFile {
         {
             return Err(bad(
                 "server.bindAddress",
-                format!(
+                &format!(
                     "must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {:?}",
                     self.server.bind_address
                 ),
@@ -1122,7 +1143,7 @@ impl SettingsFile {
         if self.server.max_outstanding_rpcs > 100_000 {
             return Err(bad(
                 "server.maxOutstandingRpcs",
-                format!(
+                &format!(
                     "must be 0 (unlimited) or between 1 and 100000, got {}",
                     self.server.max_outstanding_rpcs
                 ),
@@ -1131,7 +1152,7 @@ impl SettingsFile {
         if self.agents.max_concurrent > 200 {
             return Err(bad(
                 "agents.maxConcurrent",
-                format!(
+                &format!(
                     "must be between 0 and 200, got {}",
                     self.agents.max_concurrent
                 ),
@@ -1141,7 +1162,7 @@ impl SettingsFile {
             if mb > 1_024_000 {
                 return Err(bad(
                     "agents.memoryBudgetMb",
-                    format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
+                    &format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
                 ));
             }
         }
@@ -1152,14 +1173,14 @@ impl SettingsFile {
         if !(1..=MAX_CONCURRENT_ADAPTERS_LIMIT).contains(&adapters) {
             return Err(bad(
                 "agents.maxConcurrentAdapters",
-                format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
+                &format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
             ));
         }
         let chars = self.workspace_api.max_output_chars;
         if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
             return Err(bad(
                 "workspaceApi.maxOutputChars",
-                format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
+                &format!("must be 0 (unlimited) or between 1000 and 10000000, got {chars}"),
             ));
         }
         // Direct is always on — it is the universal fallback every creation
@@ -1168,8 +1189,7 @@ impl SettingsFile {
         if !self.sandbox.direct.enabled {
             return Err(bad(
                 "sandbox.direct.enabled",
-                "the direct execution environment is always enabled and cannot be disabled"
-                    .to_string(),
+                "the direct execution environment is always enabled and cannot be disabled",
             ));
         }
         let default_type_enabled = match self.sandbox.default_type {
@@ -1181,7 +1201,7 @@ impl SettingsFile {
         if !default_type_enabled {
             return Err(bad(
                 "sandbox.defaultType",
-                format!(
+                &format!(
                     "must name an enabled execution environment, but `{}` is disabled",
                     self.sandbox.default_type.as_str()
                 ),
@@ -1191,21 +1211,21 @@ impl SettingsFile {
         if vcpus == 0 || vcpus > MAX_MICROVM_VCPUS {
             return Err(bad(
                 "sandbox.microvm.vcpus",
-                format!("must be between 1 and {MAX_MICROVM_VCPUS}, got {vcpus}"),
+                &format!("must be between 1 and {MAX_MICROVM_VCPUS}, got {vcpus}"),
             ));
         }
         let mem = self.sandbox.microvm.mem_mib;
         if mem < MIN_MICROVM_MEM_MIB {
             return Err(bad(
                 "sandbox.microvm.memMib",
-                format!("must be >= {MIN_MICROVM_MEM_MIB}, got {mem}"),
+                &format!("must be >= {MIN_MICROVM_MEM_MIB}, got {mem}"),
             ));
         }
         let terms = self.voice.workspace_vocabulary.max_terms;
         if terms > 100 {
             return Err(bad(
                 "voice.workspaceVocabulary.maxTerms",
-                format!("must be between 0 and 100, got {terms}"),
+                &format!("must be between 0 and 100, got {terms}"),
             ));
         }
         Ok(())
@@ -1217,6 +1237,10 @@ impl SettingsFile {
     /// [`LEGACY_SETTINGS_PATHS`] (tolerated so a daemon upgrade can boot and
     /// import them; see [`SettingsFile::load_or_init_with_legacy`]) — any
     /// other malformed content is an error, never silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the file is malformed; `Error::Internal` if reading it or writing the default template fails.
     pub fn load_or_init(path: &Path) -> Result<Self> {
         Self::load_or_init_with_legacy(path).map(|(file, _)| file)
     }
@@ -1224,6 +1248,10 @@ impl SettingsFile {
     /// Like [`SettingsFile::load_or_init`], but also return the captured
     /// legacy values (dotted wire path → JSON value; empty when the file has
     /// none) so the composition root can run the one-time import-and-strip.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` if the file is malformed; `Error::Internal` if reading it or writing the default template fails.
     pub fn load_or_init_with_legacy(path: &Path) -> Result<(Self, LegacySettings)> {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse_str_with_legacy(&text).map_err(|e| match e {
@@ -1273,12 +1301,12 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// The fully-commented default `config.toml` written by
 /// [`SettingsFile::load_or_init`] when no file exists. Every key appears with
 /// its default value (or a commented-out example when there is no default),
-/// annotated with its catalog label and description — except the opt-in
+/// annotated with its catalog label and description — except
 /// `agentFeatures.taskGraph`, deliberately not seeded so configs without the
-/// key pick up a future default flip automatically (intent-hq/monorepo#2643).
+/// key track default flips automatically (intent-hq/monorepo#2643).
 /// Parsing this template must yield exactly [`SettingsFile::default`]
 /// (enforced by a unit test).
-pub const DEFAULT_CONFIG_TEMPLATE: &str = r##"# intentd configuration (non-secret settings).
+pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret settings).
 #
 # Strictly parsed: unknown keys, wrong types, and out-of-range values are
 # startup errors. Secrets (API tokens, MCP server configs) never live here --
@@ -1609,7 +1637,7 @@ debounceSeconds = 60
 # PR monitor poll seconds -- how often (in seconds) the centralized loop polls
 # each monitored PR (minimum 10).
 pollSeconds = 30
-"##;
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -1632,6 +1660,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn defaults_match_catalog() {
         let d = SettingsFile::default();
         assert_eq!(d.providers.active, None);
@@ -1753,8 +1782,7 @@ mod tests {
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
-        // `taskGraph` is the one opt-in toggle: absent → off.
-        assert!(!parsed.agent_features.task_graph);
+        assert!(parsed.agent_features.task_graph);
     }
 
     #[test]
@@ -1766,16 +1794,16 @@ mod tests {
     }
 
     #[test]
-    fn task_graph_defaults_off_and_opts_in() {
-        // Opt-in (intent-hq/monorepo#2445): empty file resolves to off, and
-        // the shipped template no longer seeds the key (monorepo#2643), so
-        // first-boot configs pick up a future default flip automatically; an
-        // explicit `taskGraph = true` opts in.
+    fn task_graph_defaults_on_and_opts_out() {
+        // Default on (flipped from the intent-hq/monorepo#2445 opt-in): empty
+        // file resolves to on, and the shipped template does not seed the key
+        // (monorepo#2643), so configs without it track the default; an
+        // explicit `taskGraph = false` opts out.
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
-        assert!(!parsed.agent_features.task_graph);
+        assert!(parsed.agent_features.task_graph);
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("taskGraph"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
-        assert!(!templated.agent_features.task_graph);
+        assert!(templated.agent_features.task_graph);
         let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = true\n")
             .expect("override parses");
         assert!(parsed.agent_features.task_graph);
@@ -2032,6 +2060,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn floats_accept_integer_literals() {
         let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);

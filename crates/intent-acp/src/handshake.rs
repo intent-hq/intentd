@@ -76,6 +76,10 @@ pub struct HandshakeResult {
 
 /// Run the full connection handshake: `initialize` then conditional
 /// `authenticate`.
+///
+/// # Errors
+///
+/// Propagates errors from [`initialize`] and [`authenticate`].
 pub async fn handshake(conn: &Connection, provider: &ProviderConfig) -> AcpResult<HandshakeResult> {
     let initialize = initialize(conn).await?;
     let authenticated = authenticate(conn, provider).await?;
@@ -86,6 +90,10 @@ pub async fn handshake(conn: &Connection, provider: &ProviderConfig) -> AcpResul
 }
 
 /// Send `initialize`, advertising client capabilities and client info (§6.4.1).
+///
+/// # Errors
+///
+/// Returns [`AcpError::Protocol`] if the response does not deserialize; otherwise propagates the transport/RPC error from the request.
 pub async fn initialize(conn: &Connection) -> AcpResult<InitializeResponse> {
     let request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(
@@ -110,6 +118,10 @@ pub async fn initialize(conn: &Connection) -> AcpResult<InitializeResponse> {
 /// Returns `Ok(false)` when the provider does not implement authentication.
 /// On an auth failure, returns [`AcpError::Auth`] carrying the provider login
 /// hint; other errors are propagated unchanged.
+///
+/// # Errors
+///
+/// Returns [`AcpError::Auth`] (with the provider login hint) on an authentication failure; other request errors are propagated unchanged.
 pub async fn authenticate(conn: &Connection, provider: &ProviderConfig) -> AcpResult<bool> {
     if !provider.supports_authenticate {
         return Ok(false);
@@ -159,6 +171,7 @@ pub(crate) async fn set_session_mode(
 /// 2. Otherwise [`BYPASS_PERMISSIONS_MODE`] if present in `available_modes`.
 /// 3. Otherwise `None` — the caller skips the call so we never ask a provider
 ///    for a mode it never offered.
+#[must_use]
 pub fn select_preferred_mode<'a>(
     mode_map: Option<&'a [(&'a str, &'a str)]>,
     available_modes: &'a [agent_client_protocol::schema::v1::SessionMode],

@@ -33,6 +33,7 @@ pub struct StagedAuthFile {
 
 /// The plain-file staging catalog (validated by FC-Spike 5): host path →
 /// guest-home-relative destination. `home` is the host home directory.
+#[must_use]
 pub fn staging_catalog(home: &Path) -> Vec<StagedAuthFile> {
     let f = |host: PathBuf, guest_rel: &'static str, provider: &'static str| StagedAuthFile {
         host,
@@ -84,6 +85,10 @@ pub fn staging_catalog(home: &Path) -> Vec<StagedAuthFile> {
 /// already holds identical bytes — refreshers rewrite credential files on a
 /// timer without changing them, and re-pushing those would spam the rotation
 /// log and guest I/O for nothing.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::AuthStage` when a filesystem step fails.
 pub fn stage_file(entry: &StagedAuthFile, guest_home: &Path) -> Result<bool, MicrovmError> {
     if !entry.host.is_file() {
         return Ok(false);
@@ -115,6 +120,10 @@ pub fn stage_file(entry: &StagedAuthFile, guest_home: &Path) -> Result<bool, Mic
 /// actually staged (host file present). Presence — not `stage_file`'s
 /// "wrote bytes" bool — decides membership, so an entry whose destination
 /// already matched still gets rotation-watched.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::AuthStage` when staging an entry fails.
 pub fn stage_all(home: &Path, guest_home: &Path) -> Result<Vec<StagedAuthFile>, MicrovmError> {
     let mut staged = Vec::new();
     for entry in staging_catalog(home) {
@@ -130,6 +139,7 @@ pub fn stage_all(home: &Path, guest_home: &Path) -> Result<Vec<StagedAuthFile>, 
 /// Host `.gitconfig` filtered for guest use: any `helper = …osxkeychain…`
 /// line is dropped (the macOS keychain does not exist in-guest; gh's helper
 /// is configured by `gh auth setup-git` during guest setup instead).
+#[must_use]
 pub fn filtered_gitconfig(host_gitconfig: &str) -> String {
     host_gitconfig
         .lines()
@@ -143,6 +153,10 @@ pub fn filtered_gitconfig(host_gitconfig: &str) -> String {
 
 /// Stage the host git identity: `~/.gitconfig` copied through
 /// [`filtered_gitconfig`]. Missing host file ⇒ no-op.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::AuthStage` when writing the filtered file fails.
 pub fn stage_gitconfig(home: &Path, guest_home: &Path) -> Result<(), MicrovmError> {
     let src = home.join(".gitconfig");
     let Ok(content) = std::fs::read_to_string(&src) else {
@@ -177,6 +191,10 @@ impl Drop for RotationWatcher {
 /// Start a rotation watcher pushing `staged` entries from the host into
 /// `guest_home`. Only entries that were staged at spawn are watched — a file
 /// that did not exist then cannot rotate into the VM (next spawn picks it up).
+///
+/// # Errors
+///
+/// Returns `MicrovmError::AuthStage` when the filesystem watcher cannot start.
 pub fn watch_rotations(
     staged: Vec<StagedAuthFile>,
     guest_home: PathBuf,

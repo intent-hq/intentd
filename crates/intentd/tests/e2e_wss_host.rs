@@ -215,7 +215,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -234,7 +234,8 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -697,6 +698,28 @@ async fn host_exec_over_wss() {
         canonical
     );
 
+    // 2b) workspaceId with cwd OMITTED defaults to the workspace root
+    // (monorepo#3231) — previously the child inherited the daemon's own cwd.
+    let defaulted = wss_rpc(
+        &mut ws,
+        205,
+        "host.exec",
+        json!({
+            "command": "pwd",
+            "workspaceId": ws_id,
+            "timeoutMs": 5000,
+        }),
+    )
+    .await;
+    assert_eq!(defaulted["exitCode"], 0, "default cwd ⇒ ok: {defaulted}");
+    let printed = defaulted["stdout"].as_str().unwrap().trim();
+    assert!(
+        printed == root.to_string_lossy() || printed == canonical,
+        "omitted cwd defaults to the workspace root ({} or {}): {printed}",
+        root.display(),
+        canonical
+    );
+
     // 3) cwd OUTSIDE the workspace ⇒ -32603 with a clear containment message.
     let frame = json!({
         "jsonrpc": "2.0", "id": 202, "method": "host.exec",
@@ -782,7 +805,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -911,7 +934,7 @@ async fn host_exec_stream_over_wss() {
                     exit_ok = event["data"]["ok"].as_bool();
                     break;
                 }
-                _ => continue,
+                _ => {}
             }
         }
     }
@@ -1122,7 +1145,7 @@ async fn host_exec_stream_acp_handshake_probe_over_wss() {
                     String::from_utf8_lossy(&acc)
                 );
             }
-            _ => continue,
+            _ => {}
         }
     }
     let parsed = parsed.expect("received a JSON-RPC reply line on stdout");
@@ -1243,7 +1266,8 @@ async fn host_find_binary_uses_login_shell_path() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1294,7 +1318,8 @@ async fn host_provider_discovery_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1548,7 +1573,8 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1633,7 +1659,8 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1676,6 +1703,121 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for the default-provider self-heal (monorepo#3044): calling
+/// `host.providerDiscovery` on a daemon with UNSET default settings and a
+/// provider forced installed (via a `providers.paths` override, as in the
+/// override test above) must persist `providers.active` through the
+/// transport → `WorkspaceApi::settings_heal_default_provider` seam — the
+/// only production trigger — observable via `settings.get` on the same
+/// connection. `model.default` stays unset (cold catalog cache), and a
+/// repeat discovery call is idempotent.
+#[tokio::test]
+async fn host_provider_discovery_self_heals_default_provider_over_wss() {
+    let data_dir = temp_data_dir();
+
+    // Force one registered provider to report installed regardless of the
+    // real host: point its providers.paths override(s) at fake executables.
+    let bin_dir = data_dir.join("override-bins");
+    std::fs::create_dir_all(&bin_dir).expect("mkdir override bins");
+    let opencode = bin_dir.join("opencode");
+    let unsloth_bin = bin_dir.join("unsloth");
+    for bin in [&opencode, &unsloth_bin] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(bin, "#!/bin/sh\nexit 0\n").expect("write fake bin");
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake bin");
+    }
+    std::fs::write(
+        data_dir.join("config.toml"),
+        format!(
+            "[providers.paths]\nopencode = \"{}\"\nunsloth = \"{}\"\n",
+            opencode.display(),
+            unsloth_bin.display()
+        ),
+    )
+    .expect("seed config.toml with providers.paths");
+
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Precondition: no default provider configured.
+    let before = wss_rpc(
+        &mut ws,
+        1,
+        "settings.get",
+        json!({ "path": "providers.active" }),
+    )
+    .await;
+    assert!(
+        before["value"].is_null(),
+        "providers.active must start unset: {before}"
+    );
+
+    // Discovery reports installed providers → the daemon self-heals.
+    let result = wss_rpc(&mut ws, 2, "host.providerDiscovery", json!({})).await;
+    let installed: Vec<&str> = result["providers"]
+        .as_array()
+        .expect("providers array")
+        .iter()
+        .filter(|p| p["installed"] == json!(true))
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    assert!(
+        installed.contains(&"unsloth"),
+        "override-forced unsloth must report installed: {result}"
+    );
+
+    let healed = wss_rpc(
+        &mut ws,
+        3,
+        "settings.get",
+        json!({ "path": "providers.active" }),
+    )
+    .await;
+    let active = healed["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("providers.active must be healed to a string: {healed}"));
+    assert!(
+        installed.contains(&active),
+        "healed providers.active ({active}) must be one of the installed providers: {healed}"
+    );
+    assert_eq!(healed["origin"], json!("file"), "{healed}");
+
+    // Idempotent: a repeat discovery call never rewrites the healed value.
+    let _ = wss_rpc(&mut ws, 4, "host.providerDiscovery", json!({})).await;
+    let again = wss_rpc(
+        &mut ws,
+        5,
+        "settings.get",
+        json!({ "path": "providers.active" }),
+    )
+    .await;
+    assert_eq!(
+        again["value"],
+        json!(active),
+        "repeat discovery must not rewrite the healed value: {again}"
+    );
+
+    drop(daemon);
+}
+
 /// WSS e2e for host.createDirectory (§5.14): success with an absolute path,
 /// `~` expansion against the daemon-host home (pinned via `HOME` on the spawned
 /// daemon), idempotent already-exists success, `-32602` on a missing/empty
@@ -1701,7 +1843,8 @@ async fn host_create_directory_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1837,7 +1980,8 @@ async fn host_list_directory_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -1902,7 +2046,8 @@ async fn host_discovery_cache_positive_and_negative_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

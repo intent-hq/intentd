@@ -55,7 +55,7 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 const WRITER_BATCH_SIZE: usize = 64;
 
 /// Total attempts for a batch insert that fails transiently (write-pool
-/// acquire timeout / SQLITE_BUSY under contention — the write pool has
+/// acquire timeout / `SQLITE_BUSY` under contention — the write pool has
 /// `max_connections=1`, so bursts serialize at `pool.acquire()`). Because the
 /// bus is append-then-broadcast, a failed batch is lost for live subscribers
 /// too (monorepo#2673), so transient contention is worth a couple of retries
@@ -101,6 +101,7 @@ pub struct EventBus {
 
 impl EventBus {
     /// Wire a bus over a persistence handle and spawn the writer task.
+    #[must_use]
     pub fn new(store: Store) -> Self {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
@@ -114,6 +115,7 @@ impl EventBus {
     }
 
     /// Borrow the underlying store.
+    #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
     }
@@ -122,6 +124,7 @@ impl EventBus {
     /// observability used to assert per-connection subscription cleanup; each
     /// [`EventBus::subscribe`] adds one and dropping the [`Subscription`]
     /// removes it.
+    #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
     }
@@ -132,8 +135,12 @@ impl EventBus {
     /// writer task has shut down or the send fails.
     ///
     /// Non-agent `file:*` events are downgraded to a transient broadcast
-    /// ([`is_transient_file_event`]) so watcher noise never reaches SQLite;
+    /// ([`is_transient_file_event`]) so watcher noise never reaches `SQLite`;
     /// callers see the same `Ok(Event)` shape either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the event writer task has shut down or dropped the response.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
         if is_transient_file_event(ev) {
             let event = self.publish_transient(ev);
@@ -157,7 +164,7 @@ impl EventBus {
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
     }
 
-    /// Mint an event id (UUIDv7) + timestamp and broadcast to live subscribers
+    /// Mint an event id (`UUIDv7`) + timestamp and broadcast to live subscribers
     /// WITHOUT persisting. Used for high-volume ephemeral events (e.g.
     /// `chat:stream:delta`) that do not need durable storage. The wire shape
     /// matches persisted events exactly (same id/timestamp minting as
@@ -169,6 +176,7 @@ impl EventBus {
     /// publisher A calls `publish_transient(ev1)` and publisher B calls
     /// `publish(ev2).await` concurrently, A's transient event may broadcast before
     /// B's persisted event commits, even if B's call started first.
+    #[must_use]
     pub fn publish_transient(&self, ev: &NewEvent) -> Event {
         let id = Uuid::now_v7().to_string();
         let event = Event {
@@ -192,6 +200,7 @@ impl EventBus {
     /// Subscribe with `filter`. The returned [`Subscription`] yields batches of
     /// matched events; when `filter.batch_window` is `None` each matched event
     /// is delivered immediately as a single-element batch.
+    #[must_use]
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
         let rx = self.tx.subscribe();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
@@ -241,7 +250,7 @@ impl Subscription {
         loop {
             match self.rx.recv().await? {
                 Delivery::Batch(batch) => return Some(batch),
-                Delivery::Lagged(_) => continue,
+                Delivery::Lagged(_) => {}
             }
         }
     }
@@ -266,15 +275,15 @@ impl Drop for Subscription {
 }
 
 /// Writer task: drains events from the inbound channel, batch-persists them in
-/// a single transaction (up to WRITER_BATCH_SIZE per batch), resolves each
+/// a single transaction (up to `WRITER_BATCH_SIZE` per batch), resolves each
 /// oneshot with the result, and broadcasts each stored event in order. Stops
-/// when the channel closes (all EventBus handles dropped).
+/// when the channel closes (all `EventBus` handles dropped).
 ///
 /// **Latency/batching**: after awaiting the first event, the task greedily
 /// drains whatever is already queued (`try_recv`) and flushes immediately — a
 /// lone publish commits without any artificial batch-window wait, while
 /// sustained bursts still coalesce because events that queue during the
-/// previous flush's SQLite commit drain into the next batch.
+/// previous flush's `SQLite` commit drain into the next batch.
 ///
 /// **Shutdown invariant**: The task receives `None` from `rx.recv()` only after
 /// all `EventBus` clones (and their `writer_tx` senders) have been dropped. This
@@ -339,7 +348,7 @@ async fn flush_batch(
 /// oneshots resolve with the error.
 ///
 /// Worst-case stall: the backoff sleeps are small, but each attempt can
-/// itself block for the write pool's acquire timeout (10s) or SQLite's
+/// itself block for the write pool's acquire timeout (10s) or `SQLite`'s
 /// `busy_timeout` (5s) on `BEGIN IMMEDIATE`, so a hard stall costs up to
 /// roughly 3× today's single-attempt bound per batch before the drop —
 /// accepted for monorepo#2673, where observed contention clears in tens of
@@ -417,7 +426,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
 /// Whether a batch-insert error is transient — worth retrying because it
 /// reflects momentary contention, not a defect in the batch itself: the
 /// single-connection write pool's acquire timed out (`insert_events` maps
-/// this to "acquire connection failed: pool timed out …"), or SQLite
+/// this to "acquire connection failed: pool timed out …"), or `SQLite`
 /// reported the database busy/locked (a cross-process writer holding the
 /// lock past `busy_timeout`). Everything else (constraint violations,
 /// payload serialization failures, I/O errors) is permanent and fails the
@@ -524,7 +533,6 @@ async fn delivery_task(
                     if out.send(Delivery::Lagged(n)).await.is_err() {
                         return;
                     }
-                    continue;
                 }
                 // Bus dropped: flush any buffered batch, then stop.
                 Err(broadcast::error::RecvError::Closed) => {
@@ -535,7 +543,7 @@ async fn delivery_task(
                 }
             },
             // Batch window elapsed → flush the coalesced events.
-            _ = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
+            () = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
                 deadline = None;
                 if !buffer.is_empty()
                     && out
@@ -631,9 +639,7 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
 
 /// Byte length of a value's serialized JSON (what `insert_events` writes).
 fn json_byte_len(v: &Value) -> usize {
-    serde_json::to_string(v)
-        .map(|s| s.len())
-        .unwrap_or(usize::MAX)
+    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
 }
 
 /// The longest prefix of `s` that is at most `max_bytes` bytes and ends on a

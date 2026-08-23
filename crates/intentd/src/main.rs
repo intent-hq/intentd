@@ -126,7 +126,7 @@ enum Command {
         #[arg(long)]
         connect: String,
     },
-    /// Migrate an existing Intent (Electron) install into intentd's SQLite store
+    /// Migrate an existing Intent (Electron) install into intentd's `SQLite` store
     /// (§9.7): read `<dir>/workspaces.json` and each workspace's `.workspace/`
     /// entities and idempotently upsert them. Read-only toward the source.
     Import {
@@ -135,7 +135,7 @@ enum Command {
         from: PathBuf,
     },
     /// Import legacy per-directory Intent workspaces
-    /// (`<root>/<id>/.workspace/workspace.json`) into the SQLite store. Scans
+    /// (`<root>/<id>/.workspace/workspace.json`) into the `SQLite` store. Scans
     /// `~/intent/workspaces`, `~/intent`, and `~/.workspaces` by default;
     /// idempotent (ids already in the DB are skipped) and read-only toward the
     /// source. The same module backs the automatic first-boot import in `serve`.
@@ -393,8 +393,7 @@ async fn enable_wss_listener(
         Some(addr) => addr.to_string(),
         None => current_bind_address(socket)
             .await
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+            .map_or_else(|| "127.0.0.1".to_string(), |a| a.to_string()),
     };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
@@ -665,7 +664,7 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
-/// Migrate a legacy Intent `userData` dir into intentd's SQLite store (§9.7).
+/// Migrate a legacy Intent `userData` dir into intentd's `SQLite` store (§9.7).
 /// Opens (creating + migrating) the configured DB, runs the idempotent import,
 /// and prints the per-domain summary. Exits non-zero on a hard source failure.
 async fn cmd_import(from: &Path) -> anyhow::Result<()> {
@@ -679,7 +678,7 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Import legacy per-directory Intent workspaces into the configured SQLite
+/// Import legacy per-directory Intent workspaces into the configured `SQLite`
 /// store. `--root` (repeatable) narrows the scan to explicit directories
 /// (each must exist); otherwise the default legacy roots are scanned. The
 /// first-boot completion marker does not gate explicit CLI runs. A
@@ -814,7 +813,10 @@ fn init_tracing() {
 
     // Create the data directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        eprintln!("WARN: failed to create log directory {:?}: {}", log_dir, e);
+        eprintln!(
+            "WARN: failed to create log directory {}: {e}",
+            log_dir.display()
+        );
     }
 
     // Set up file appender with rotation: keep ~5 files, rotate daily
@@ -831,8 +833,7 @@ fn init_tracing() {
         Ok(appender) => Some(appender),
         Err(e) => {
             eprintln!(
-                "WARN: failed to create log file appender: {}, continuing with stderr-only logging",
-                e
+                "WARN: failed to create log file appender: {e}, continuing with stderr-only logging"
             );
             None
         }
@@ -866,23 +867,17 @@ fn init_tracing() {
             .with_ansi(false)
             .with_filter(output_filter());
         match subscriber.with(file_layer).try_init() {
-            Ok(_) => {
+            Ok(()) => {
                 // Store the guard in a static to keep it alive for the process lifetime.
                 // Dropping it would stop the background file writer thread.
                 let _ = LOG_GUARD.set(guard);
             }
-            Err(e) => eprintln!(
-                "WARN: failed to initialize tracing (already initialized?): {}",
-                e
-            ),
+            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {e}"),
         }
     } else {
         match subscriber.try_init() {
-            Ok(_) => {}
-            Err(e) => eprintln!(
-                "WARN: failed to initialize tracing (already initialized?): {}",
-                e
-            ),
+            Ok(()) => {}
+            Err(e) => eprintln!("WARN: failed to initialize tracing (already initialized?): {e}"),
         }
     }
 }
@@ -898,7 +893,7 @@ const SIGPIPE_EXIT_CODE: i32 = 141;
 
 /// Install a panic hook that logs the panic message and backtrace to the
 /// tracing log. This ensures panic details are written to the rotating log
-/// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
+/// file (`INTENTD_DATA_DIR/intentd.log`) for post-mortem diagnosis of unexpected
 /// daemon deaths. Chains the default panic hook to preserve standard Rust
 /// panic formatting (thread name, etc.). The process will panic/unwind/abort
 /// according to Rust's standard behavior after both hooks run.
@@ -907,10 +902,10 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |panic_info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
 
-        let location = panic_info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown location".to_string());
+        let location = panic_info.location().map_or_else(
+            || "unknown location".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
 
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             s.to_string()
@@ -942,8 +937,8 @@ fn install_panic_hook() {
         );
 
         // Also write to stderr so it's visible in immediate context
-        eprintln!("PANIC at {}: {}", location, message);
-        eprintln!("Backtrace:\n{}", backtrace);
+        eprintln!("PANIC at {location}: {message}");
+        eprintln!("Backtrace:\n{backtrace}");
 
         // Chain the default hook to preserve standard Rust panic formatting
         default_hook(panic_info);
@@ -1023,7 +1018,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             pages_before,
             pages_after,
         }) => tracing::info!(
-            duration_ms = duration.as_millis() as u64,
+            duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             pages_before,
             pages_after,
             "auto_vacuum activated: one-time VACUUM converted the database to incremental mode"
@@ -1185,15 +1180,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // resume-event stream further down).
     let suspend_tracker: Option<Arc<suspend::SuspendTracker>> =
         config.wake_resume_enabled.then(|| {
-            suspend::spawn_suspend_detector(Duration::from_secs(
-                config.wake_resume_threshold_seconds as u64,
-            ))
+            suspend::spawn_suspend_detector(Duration::from_secs(u64::from(
+                config.wake_resume_threshold_seconds,
+            )))
         });
 
     let services = Services::new(store)
         .with_assets_root(assets_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
-        .with_models_cache_dir(config.data_dir.clone())
+        .with_models_cache_dir(&config.data_dir.clone())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
@@ -1306,24 +1301,22 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         sys.total_memory()
     };
     let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
-    let budget_enabled =
-        match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
-            Some(budget_bytes) => {
-                manager
-                    .registry()
-                    .set_memory_budget(budget_bytes, child_usage.clone());
-                tracing::info!(
-                    budget_bytes,
-                    recommended_bytes,
-                    "aggregate agent memory budget enabled"
-                );
-                true
-            }
-            None => {
-                tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
-                false
-            }
-        };
+    let budget_enabled = if let Some(budget_bytes) =
+        agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes)
+    {
+        manager
+            .registry()
+            .set_memory_budget(budget_bytes, child_usage.clone());
+        tracing::info!(
+            budget_bytes,
+            recommended_bytes,
+            "aggregate agent memory budget enabled"
+        );
+        true
+    } else {
+        tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
+        false
+    };
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1566,12 +1559,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // monorepo#2900). An unparseable persisted value falls back to loopback
     // with a warning rather than silently widening the bind (defense in
     // depth — SettingsFile::validate rejects non-IP values at load time).
-    match boot_settings.effective.server.bind_address.parse() {
-        Ok(addr) => ws_options.bind_address = addr,
-        Err(_) => tracing::warn!(
+    if let Ok(addr) = boot_settings.effective.server.bind_address.parse() {
+        ws_options.bind_address = addr;
+    } else {
+        tracing::warn!(
             value = %boot_settings.effective.server.bind_address,
             "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
-        ),
+        );
     }
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
@@ -1646,7 +1640,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
-    spawn_child_tree_sampler(manager.clone(), child_usage.clone());
+    spawn_child_tree_sampler(manager.clone(), &child_usage.clone());
     let route_info = spawn_route_info_sampler();
     // Workspaces-root disk sampler: report the volume `workspace.create`
     // actually provisions under, resolved with the same precedence as the
@@ -1692,9 +1686,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
     // serve system.status (§5.7). This breaks the circular Arc dependency between
     // DaemonControl and WsRuntimeControl.
-    if runtime.control.set(control.clone()).is_err() {
-        panic!("control OnceLock should only be set once");
-    }
+    assert!(
+        runtime.control.set(control.clone()).is_ok(),
+        "control OnceLock should only be set once"
+    );
 
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
     // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
@@ -1808,8 +1803,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         let notify = shutdown_notify.clone();
         async move {
             tokio::select! {
-                _ = shutdown_signal() => {}
-                _ = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
+                () = shutdown_signal() => {}
+                () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
         }
     };
@@ -1823,10 +1818,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
     // wakeResume is disabled (no tracker exists), honoring the config gate.
     if let Some(tracker) = suspend_tracker.clone() {
-        let services_clone = services.clone();
-        let mut resume_rx = tracker.subscribe();
         // Coalesce wake events landing within this window into one sweep.
         const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
+        let services_clone = services.clone();
+        let mut resume_rx = tracker.subscribe();
         tokio::spawn(async move {
             use tokio::sync::broadcast::error::RecvError;
             loop {
@@ -1840,9 +1835,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         // arrive within the window before running one sweep.
                         loop {
                             tokio::select! {
-                                _ = tokio::time::sleep(WAKE_RESUME_DEBOUNCE) => break,
+                                () = tokio::time::sleep(WAKE_RESUME_DEBOUNCE) => break,
                                 drained = resume_rx.recv() => match drained {
-                                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                                    Ok(_) | Err(RecvError::Lagged(_)) => {},
                                     Err(RecvError::Closed) => break,
                                 },
                             }
@@ -1917,16 +1912,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // survive (`kill_on_drop` only covers the direct child). Letting the sweep
     // settle first puts every child it spawned in the map, so `shutdown` reaps
     // them. Only if the grace expires do we abort and accept the drop path.
-    match tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await {
-        Ok(_) => {}
-        Err(_) => {
-            tracing::warn!(
-                grace_ms = MCP_START_JOIN_GRACE.as_millis() as u64,
-                "deferred MCP start sweep did not settle within the shutdown grace; \
-                 aborting it — a server mid-handshake may leave orphan grandchildren"
-            );
-            mcp_start_task.abort();
-        }
+    if tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            grace_ms = u64::try_from(MCP_START_JOIN_GRACE.as_millis()).unwrap_or(u64::MAX),
+            "deferred MCP start sweep did not settle within the shutdown grace; \
+             aborting it — a server mid-handshake may leave orphan grandchildren"
+        );
+        mcp_start_task.abort();
     }
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
@@ -1972,7 +1967,7 @@ struct DaemonControl {
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
-    /// WsApiServer construction args so `start_ws_listener` can build a fresh
+    /// `WsApiServer` construction args so `start_ws_listener` can build a fresh
     /// server when toggled on. Always present so the runtime toggle works
     /// whether or not the listener was boot-started.
     ws_runtime: Arc<WsRuntimeControl>,
@@ -2440,7 +2435,7 @@ fn descendant_tree_usage(
         &|pid| {
             sys.process(pid)
                 .filter(|p| p.thread_kind().is_none())
-                .map(|p| p.memory())
+                .map(sysinfo::Process::memory)
         },
         root,
         agent_roots,
@@ -2493,7 +2488,7 @@ fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep 
 /// decides what each poll costs: a full sweep every [`CHILD_TREE_BASE_PERIOD`],
 /// a peak-only sweep in between while an ephemeral adapter chain is live, and
 /// nothing at all otherwise.
-fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsage>) {
+fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsage>) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let Ok(pid) = sysinfo::get_current_pid() else {
@@ -2505,6 +2500,13 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
         sys.refresh_memory();
         match sys.total_memory() {
             0 => CHILD_TREE_WARN_FALLBACK_BYTES,
+            // RAM sizes are far below 2^53 (loss-free in f64); the fraction
+            // is in (0, 1) and the float→int cast saturates anyway.
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
             total => (total as f64 * CHILD_TREE_WARN_FRACTION) as u64,
         }
     };
@@ -2577,8 +2579,8 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
     });
 }
 
-/// Runtime control for the WSS listener, shared between DaemonControl and
-/// the lifecycle hooks (§5.12). Holds WsApiServer construction args plus mutable
+/// Runtime control for the WSS listener, shared between `DaemonControl` and
+/// the lifecycle hooks (§5.12). Holds `WsApiServer` construction args plus mutable
 /// state guarded by a Mutex so settings.update can start/stop the listener.
 struct WsRuntimeControl {
     api: Arc<dyn WorkspaceApi>,
@@ -2587,12 +2589,12 @@ struct WsRuntimeControl {
     token_store: Option<Arc<AsyncTokenStore>>,
     ws_options: WsOptions,
     reverse_registry: Arc<PrimaryReverseRegistry>,
-    /// Data directory for building pairing info provider (§5.2) in start_ws_listener.
+    /// Data directory for building pairing info provider (§5.2) in `start_ws_listener`.
     data_dir: PathBuf,
-    /// Mutable runtime state: the live WsApiServer (when started).
+    /// Mutable runtime state: the live `WsApiServer` (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
     /// System control surface (§5.7) for system.status/shutdown over WSS. Set via
-    /// OnceLock after DaemonControl construction to break circular Arc dependency.
+    /// `OnceLock` after `DaemonControl` construction to break circular Arc dependency.
     control: std::sync::OnceLock<Arc<dyn SystemControl>>,
 }
 
@@ -2611,7 +2613,7 @@ struct DaemonPairingInfo {
     data_dir: PathBuf,
     token_store: Arc<AsyncTokenStore>,
     /// Runtime control reference to read the current bound port. Always present
-    /// (WsRuntimeControl is always constructed; the WSS listener boot-starts
+    /// (`WsRuntimeControl` is always constructed; the WSS listener boot-starts
     /// only when server.wsApi.enabled is true, but can be started at runtime
     /// via settings regardless).
     ws_runtime: Arc<WsRuntimeControl>,
@@ -2654,8 +2656,7 @@ impl SystemControl for DaemonControl {
             let clients = state
                 .ws_server
                 .as_ref()
-                .map(|s| s.client_count())
-                .unwrap_or(0);
+                .map_or(0, intent_transport::WsApiServer::client_count);
             (port, fingerprint, clients)
         } else {
             (None, None, 0)
@@ -2837,8 +2838,14 @@ impl intent_core::ServerControl for DaemonControl {
             {
                 Ok(result) => result
                     .get("value")
-                    .and_then(|v| v.as_f64())
-                    .map(|p| p as u16),
+                    .and_then(serde_json::Value::as_f64)
+                    // Settings schema bounds the port to u16 range; the
+                    // float→int cast saturates anyway.
+                    .map(|p| {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let p = p as u16;
+                        p
+                    }),
                 Err(_) => None,
             };
             let desired_port = resolve_ws_listener_port(
@@ -2859,9 +2866,8 @@ impl intent_core::ServerControl for DaemonControl {
                 Ok(result) => match result.get("value").and_then(|v| v.as_str()) {
                     Some(raw) => Some(raw.parse::<std::net::IpAddr>().map_err(|_| {
                         intent_core::Error::InvalidParams(format!(
-                            "server.bindAddress {:?} is not a valid IP address — fix it in \
-                             config.toml ([server] bindAddress) or via settings",
-                            raw
+                            "server.bindAddress {raw:?} is not a valid IP address — fix it in \
+                             config.toml ([server] bindAddress) or via settings"
                         ))
                     })?),
                     None => None,
@@ -2893,7 +2899,7 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.api.clone(),
                     runtime.bus.clone(),
                     tls,
-                    token_store.clone(),
+                    &token_store,
                     ws_options,
                     runtime.reverse_registry.clone(),
                     system_control.clone(),
@@ -2926,15 +2932,13 @@ impl intent_core::ServerControl for DaemonControl {
                 let error_kind = e.kind();
                 let error_msg = if error_kind == std::io::ErrorKind::AddrInUse {
                     format!(
-                        "Port {} is already in use — choose a different port or stop the process using it",
-                        desired_port
+                        "Port {desired_port} is already in use — choose a different port or stop the process using it"
                     )
                 } else {
                     // Other bind errors: name the address (server.bindAddress)
                     // + port and include the OS error text
                     format!(
-                        "failed to bind {}:{} (server.bindAddress): {}",
-                        bind_address, desired_port, e
+                        "failed to bind {bind_address}:{desired_port} (server.bindAddress): {e}"
                     )
                 };
                 intent_core::Error::Internal(error_msg)
@@ -3169,7 +3173,7 @@ fn env_flag(name: &str) -> bool {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("1" | "true" | "yes")
     )
 }
 
@@ -3185,7 +3189,6 @@ fn parse_permission_policy(raw: Option<&str>) -> PermissionPolicy {
     match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         Some("interactive") => PermissionPolicy::Interactive,
         Some("auto") => PermissionPolicy::AutoByRisk,
-        Some("allow") => PermissionPolicy::AllowAll,
         Some("deny") => PermissionPolicy::DenyAll,
         _ => PermissionPolicy::AllowAll,
     }
@@ -3227,7 +3230,7 @@ fn pid_is_alive(pid: u32) -> bool {
     use nix::unistd::Pid;
     // `EPERM` means the process exists but we may not signal it — still alive.
     matches!(
-        kill(Pid::from_raw(pid as i32), None),
+        kill(Pid::from_raw(pid.cast_signed()), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
 }
@@ -3419,27 +3422,24 @@ fn spawn_idle_reap_loop(
     // time below the budget-only cadence (an early TTL sweep is harmless: it
     // just finds nothing old enough).
     let budget_floor = Duration::from_secs(30);
-    let interval = match timings {
-        Some((ttl, interval)) => {
-            let interval = if budget_enabled {
-                interval.min(budget_floor)
-            } else {
-                interval
-            };
-            tracing::info!(
-                ttl_ms = ttl.as_millis() as u64,
-                interval_ms = interval.as_millis() as u64,
-                "idle agent reaping enabled"
-            );
+    let interval = if let Some((ttl, interval)) = timings {
+        let interval = if budget_enabled {
+            interval.min(budget_floor)
+        } else {
             interval
-        }
-        None => {
-            tracing::info!(
-                interval_ms = budget_floor.as_millis() as u64,
-                "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
-            );
-            budget_floor
-        }
+        };
+        tracing::info!(
+            ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+            interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
+            "idle agent reaping enabled"
+        );
+        interval
+    } else {
+        tracing::info!(
+            interval_ms = u64::try_from(budget_floor.as_millis()).unwrap_or(u64::MAX),
+            "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+        );
+        budget_floor
     };
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -3479,7 +3479,7 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     if idle_reap_minutes == 0 {
         return None;
     }
-    let ttl = Duration::from_secs(idle_reap_minutes as u64 * 60);
+    let ttl = Duration::from_secs(u64::from(idle_reap_minutes) * 60);
     let interval = (ttl / 4).clamp(Duration::from_secs(30), Duration::from_secs(300));
     Some((ttl, interval))
 }
@@ -3524,7 +3524,7 @@ fn spawn_stream_retention_loop(
         tracing::info!("event retention sweep disabled (events.streamRetentionHours = 0)");
         return None;
     }
-    let ttl = Duration::from_secs(stream_retention_hours as u64 * 3600);
+    let ttl = Duration::from_secs(u64::from(stream_retention_hours) * 3600);
     let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
     tracing::info!(
         ttl_hours = stream_retention_hours,
@@ -3537,7 +3537,7 @@ fn spawn_stream_retention_loop(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let cutoff = intent_core::iso_minutes_ago(stream_retention_hours as i64 * 60);
+            let cutoff = intent_core::iso_minutes_ago(i64::from(stream_retention_hours) * 60);
             match store.delete_ephemeral_events_before(&cutoff).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(
@@ -3549,7 +3549,8 @@ fn spawn_stream_retention_loop(
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
             }
-            let tool_cutoff = intent_core::iso_minutes_ago(TOOL_CALL_RETENTION_HOURS as i64 * 60);
+            let tool_cutoff =
+                intent_core::iso_minutes_ago(i64::from(TOOL_CALL_RETENTION_HOURS) * 60);
             match store.delete_tool_call_events_before(&tool_cutoff).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(
@@ -3733,7 +3734,7 @@ fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
 /// created/opened after boot gain watching and deleted/closed workspaces are
 /// torn down without a restart.
 ///
-/// Spawned rather than awaited inline because each FSEvents registration is a
+/// Spawned rather than awaited inline because each `FSEvents` registration is a
 /// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
 /// which would otherwise delay the UDS bind past the FE sidecar's probe window
 /// (monorepo#1581), and run under `block_in_place` so the blocking registration
@@ -3760,7 +3761,7 @@ fn spawn_watcher_registry_init(
                         .as_deref(),
                 ) {
                     tracing::warn!(
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "watcher registry startup: artificial delay (test seam)"
                     );
                     // A *blocking* sleep, standing in for the synchronous
@@ -3783,7 +3784,7 @@ fn spawn_watcher_registry_init(
 /// hold it for the task's lifetime.
 ///
 /// Spawned rather than started inline for the same reason as
-/// [`spawn_watcher_registry_init`]: `notify`'s FSEvents registration is a
+/// [`spawn_watcher_registry_init`]: `notify`'s `FSEvents` registration is a
 /// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
 /// which would otherwise delay the UDS bind past the FE sidecar's probe window
 /// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
@@ -4028,15 +4029,6 @@ extern "C" fn restore_echo_on_signal(sig: libc::c_int) {
 /// echo, so print one to keep output aligned.
 #[cfg(unix)]
 fn read_line_no_echo() -> anyhow::Result<String> {
-    use std::io::BufRead;
-    use std::sync::atomic::Ordering;
-    let fd = libc::STDIN_FILENO;
-    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let orig = unsafe { orig.assume_init() };
-
     // Publish the saved attrs and install the restoring handlers BEFORE
     // disabling echo, so no window exists where a signal skips the restore.
     const SIGNALS: [libc::c_int; 5] = [
@@ -4046,6 +4038,15 @@ fn read_line_no_echo() -> anyhow::Result<String> {
         libc::SIGHUP,
         libc::SIGTSTP,
     ];
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let fd = libc::STDIN_FILENO;
+    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let orig = unsafe { orig.assume_init() };
+
     unsafe { (&raw mut HIDDEN_READ_ORIG).write(std::mem::MaybeUninit::new(orig)) };
     HIDDEN_READ_ACTIVE.store(true, Ordering::SeqCst);
     let handler = restore_echo_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -4053,12 +4054,12 @@ fn read_line_no_echo() -> anyhow::Result<String> {
 
     let mut noecho = orig;
     noecho.c_lflag &= !libc::ECHO;
-    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const noecho) } != 0 {
         Err(anyhow::Error::from(std::io::Error::last_os_error()))
     } else {
         let mut line = String::new();
         let read = std::io::stdin().lock().read_line(&mut line);
-        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
+        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const orig) };
         eprintln!();
         match read {
             Err(e) => Err(e.into()),
@@ -4140,6 +4141,7 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
 
 /// Print one setting (`settings.get` output shape) from the already-fetched
 /// `settings.get` result: value, type, default, origin, description.
+#[allow(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
 fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");
@@ -4532,12 +4534,12 @@ impl Signaller for NixSignaller {
     fn term(&self, pid: u32) {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        let _ = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM);
     }
     fn kill(&self, pid: u32) {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
     }
 }
 
@@ -4704,7 +4706,7 @@ async fn report_context_engine() {
             println!("[ok] context engine: {name} available (version {version})");
         }
         EngineAvailability::Unavailable { reason } => {
-            println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully")
+            println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully");
         }
     }
 }
@@ -4798,8 +4800,8 @@ fn report_host_capabilities() {
     );
 }
 
-/// Probe CoW support for the workspaces root at daemon startup. This populates
-/// the cache so later cow_probe calls for the same volume pair are instant. Best-effort;
+/// Probe `CoW` support for the workspaces root at daemon startup. This populates
+/// the cache so later `cow_probe` calls for the same volume pair are instant. Best-effort;
 /// failures are silent (the probe will be retried on demand if needed).
 fn probe_cow_at_startup(config: &Config) {
     // CoW sandboxes are temporarily locked to macOS (the service layer's
@@ -4814,9 +4816,9 @@ fn probe_cow_at_startup(config: &Config) {
     }
 }
 
-/// CoW isolation support: probe the workspaces root for copy-on-write capability.
-/// Non-fatal — CoW isolation degrades gracefully when unsupported (shared mode).
-/// Uses the cached result if available (populated by probe_cow_at_startup).
+/// `CoW` isolation support: probe the workspaces root for copy-on-write capability.
+/// Non-fatal — `CoW` isolation degrades gracefully when unsupported (shared mode).
+/// Uses the cached result if available (populated by `probe_cow_at_startup`).
 fn report_cow_support(config: &Config) {
     // Temporarily locked to macOS — mirror the service layer's choke point
     // (which reports unsupported on other OSes without probing).
@@ -4906,10 +4908,10 @@ async fn report_provider_availability(config: &Config) {
                             npx.display()
                         ),
                         Some((false, verdict)) => {
-                            println!("  [--] {} unavailable{verdict}", provider.id)
+                            println!("  [--] {} unavailable{verdict}", provider.id);
                         }
                         None => {
-                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display())
+                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display());
                         }
                     }
                 }
@@ -4947,11 +4949,10 @@ async fn report_provider_availability(config: &Config) {
             .unwrap_or_default();
         // Spawn via the resolved path when available (grok's binary may live
         // outside PATH at ~/.grok/bin/grok), else the bare command.
-        let program = provider
-            .resolved_path
-            .as_ref()
-            .map(|p| p.as_os_str().to_os_string())
-            .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
+        let program = provider.resolved_path.as_ref().map_or_else(
+            || std::ffi::OsString::from(provider.command),
+            |p| p.as_os_str().to_os_string(),
+        );
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
     }
@@ -4973,8 +4974,7 @@ async fn report_pi_cli_verdict() -> (bool, String) {
             let path = status
                 .resolved_path
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| status.command.clone());
+                .map_or_else(|| status.command.clone(), |p| p.display().to_string());
             let version = status.version_output.as_deref().unwrap_or("unknown");
             (true, format!(" (pi CLI {version}: {path})"))
         }
@@ -5077,7 +5077,7 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
 }
 
 /// Report database health metrics for diagnostics (STAB-15 observability).
-/// Runs PRAGMA integrity_check, PRAGMA wal_checkpoint(PASSIVE), and reports
+/// Runs PRAGMA `integrity_check`, PRAGMA `wal_checkpoint(PASSIVE)`, and reports
 /// connection pool stats. Never fails the doctor check — all checks are
 /// informational.
 async fn report_db_health(store: &Store) {
@@ -5094,21 +5094,21 @@ async fn report_db_health(store: &Store) {
             if rows.len() == 1 {
                 match rows[0].try_get::<String, _>(0) {
                     Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
-                    Ok(result) => println!("  [WARN] integrity_check: {}", result),
-                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {}", e),
+                    Ok(result) => println!("  [WARN] integrity_check: {result}"),
+                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {e}"),
                 }
             } else {
                 println!("  [WARN] integrity_check: {} issues found", rows.len());
                 for row in rows {
                     match row.try_get::<String, _>(0) {
-                        Ok(result) => println!("    - {}", result),
-                        Err(e) => println!("    - [decode error: {}]", e),
+                        Ok(result) => println!("    - {result}"),
+                        Err(e) => println!("    - [decode error: {e}]"),
                     }
                 }
             }
         }
         Err(e) => {
-            println!("  [WARN] integrity_check failed: {}", e);
+            println!("  [WARN] integrity_check failed: {e}");
         }
     }
 
@@ -5129,18 +5129,15 @@ async fn report_db_health(store: &Store) {
                 (Ok(busy), Ok(log), Ok(checkpointed)) => {
                     if busy != 0 {
                         println!(
-                            "  [WARN] wal_checkpoint(PASSIVE): busy={}, log={} frames, checkpointed={} frames (checkpoint incomplete)",
-                            busy, log, checkpointed
+                            "  [WARN] wal_checkpoint(PASSIVE): busy={busy}, log={log} frames, checkpointed={checkpointed} frames (checkpoint incomplete)"
                         );
                     } else if checkpointed < log {
                         println!(
-                            "  [WARN] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames (partial checkpoint)",
-                            log, checkpointed
+                            "  [WARN] wal_checkpoint(PASSIVE): log={log} frames, checkpointed={checkpointed} frames (partial checkpoint)"
                         );
                     } else {
                         println!(
-                            "  [ok] wal_checkpoint(PASSIVE): log={} frames, checkpointed={} frames",
-                            log, checkpointed
+                            "  [ok] wal_checkpoint(PASSIVE): log={log} frames, checkpointed={checkpointed} frames"
                         );
                     }
                 }
@@ -5150,7 +5147,7 @@ async fn report_db_health(store: &Store) {
             }
         }
         Err(e) => {
-            println!("  [WARN] wal_checkpoint failed: {}", e);
+            println!("  [WARN] wal_checkpoint failed: {e}");
         }
     }
 
@@ -5167,15 +5164,13 @@ async fn report_db_health(store: &Store) {
         .and_then(|row| row.try_get::<i64, _>(0).ok());
     let freelist = store.freelist_count().await;
     match (auto_vacuum, &freelist) {
-        (Some(2), Ok(freelist)) => println!(
-            "  [ok] auto_vacuum: INCREMENTAL (freelist_count={} pages)",
-            freelist
-        ),
+        (Some(2), Ok(freelist)) => {
+            println!("  [ok] auto_vacuum: INCREMENTAL (freelist_count={freelist} pages)");
+        }
         (Some(mode), Ok(freelist)) => {
             let label = if mode == 1 { "FULL" } else { "NONE" };
             println!(
-                "  [WARN] auto_vacuum: {} (freelist_count={} pages; deleted pages are not returned to the filesystem)",
-                label, freelist
+                "  [WARN] auto_vacuum: {label} (freelist_count={freelist} pages; deleted pages are not returned to the filesystem)"
             );
             if mode == 0 {
                 println!(
@@ -5194,20 +5189,16 @@ async fn report_db_health(store: &Store) {
     let read_size = read_pool.size();
     let read_idle = read_pool.num_idle();
     println!(
-        "  [ok] write_pool: size={}, idle={} | read_pool: size={}, idle={}",
-        write_size, write_idle, read_size, read_idle
+        "  [ok] write_pool: size={write_size}, idle={write_idle} | read_pool: size={read_size}, idle={read_idle}"
     );
 }
 
 #[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -5228,7 +5219,7 @@ mod tests {
     #[test]
     fn bind_choices_list_interfaces_then_all_interfaces_option() {
         let ifaces = vec![
-            ("lo".to_string(), std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            ("lo".to_string(), std::net::Ipv4Addr::LOCALHOST),
             ("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5)),
         ];
         let choices = build_bind_choices(&ifaces);
@@ -5687,7 +5678,7 @@ mod tests {
         );
         assert_eq!(
             test_watcher_init_delay(Some(" 5000 ")),
-            Some(Duration::from_millis(5000))
+            Some(Duration::from_secs(5))
         );
     }
 
@@ -6374,7 +6365,7 @@ mod tests {
         loop {
             match lines.next() {
                 Some(Ok(line)) if line.contains("READY") => break,
-                Some(_) => continue,
+                Some(_) => {}
                 None => panic!("child exited before READY"),
             }
         }

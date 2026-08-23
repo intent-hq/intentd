@@ -1,8 +1,10 @@
-//! Driver tests over a temp SQLite store + a mock ACP agent: a prompt turn
+//! Driver tests over a temp `SQLite` store + a mock ACP agent: a prompt turn
 //! accumulates chunks, publishes events in order with a single terminal
 //! `stream:end`, persists `acpSessionId`, and gates resume on the capability.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use intent_acp::session::{ContentBlock, InitializeResponse};
@@ -82,7 +84,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => prompt_result.clone(),
                 _ => json!({}),
             };
@@ -125,8 +126,8 @@ fn prompt_updates() -> Vec<String> {
 }
 
 /// A prompt turn that streams one text chunk, a `tool_call` (started), then a
-/// `tool_call_update` that completes it with output — exercises tool_use +
-/// tool_result block accumulation (CS-0 D6).
+/// `tool_call_update` that completes it with output — exercises `tool_use` +
+/// `tool_result` block accumulation (CS-0 D6).
 fn prompt_updates_with_tool_result() -> Vec<String> {
     let chunk = json!({
         "jsonrpc": "2.0",
@@ -531,7 +532,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 "session/prompt" => json!({ "stopReason": "end_turn" }),
                 _ => json!({}),
             };
@@ -605,6 +605,71 @@ fn connect_with_session_result(
     };
     let conn = Connection::new(c2a_client, a2c_client, None, hooks);
     (conn, note_rx, agent)
+}
+
+/// Mock agent that RECORDS every incoming request frame into `seen` before
+/// answering like the standard mock — lets tests assert the exact wire params
+/// (e.g. `session/new` `_meta`, monorepo#3151).
+fn spawn_recording_mock_agent<R, W>(
+    read: R,
+    write: W,
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            seen.lock().unwrap().push(value.clone());
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against the recording mock; also returns the recorded frames.
+#[allow(clippy::type_complexity)]
+fn connect_recording() -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<Value>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_recording_mock_agent(c2a_agent, a2c_agent, seen.clone());
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, seen)
 }
 
 async fn setup() -> (TempDb, Services, EventBus, AgentId, WorkspaceId) {
@@ -688,7 +753,10 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         model: None,
         reasoning_effort: None,
         effort_levels: None,
-        provider: None,
+        // Pinned explicitly: seeded sessions predate monorepo#3044, when a
+        // `None` provider still resolved positionally to auggie; resolution
+        // now fails loudly with no provider and no configured default.
+        provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
         status: AgentStatus::Pending,
@@ -2152,6 +2220,218 @@ fn question_blocks() -> Value {
     }])
 }
 
+fn marker_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
+    bus.subscribe(SubscriptionFilter {
+        workspace_id: Some(workspace_id.0.clone()),
+        event_types: vec!["agent:updated".to_string()],
+        ..Default::default()
+    })
+}
+
+async fn assert_only_marker_event(sub: &mut crate::events::Subscription, expected: &str) {
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("marker event delivered")
+        .expect("subscription open");
+    let markers: Vec<&str> = batch
+        .iter()
+        .filter_map(|event| event.data["pendingQuestionsMessageId"].as_str())
+        .collect();
+    assert_eq!(markers, vec![expected]);
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "stale marker mutation must not emit a later event"
+    );
+}
+
+/// A tagged answer can observe question A and then pause before its clear.
+/// Question B commits in that window; the answer's exact-value CAS must lose,
+/// leave B pending, and emit no stale clear event.
+#[tokio::test]
+async fn old_answer_cannot_clear_newer_pending_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let asked = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append question A");
+    let asked_id = asked["message"]["id"].as_str().unwrap().to_string();
+
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("clear"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let answering = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let asked_id = asked_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(
+                    agent_id,
+                    "user".to_string(),
+                    json!([{ "type": "text", "text": "late answer" }]),
+                    Some(json!({
+                        "type": "question_answers",
+                        "answeredQuestionsMessageId": asked_id,
+                    })),
+                )
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("old answer reached clear window");
+
+    let newer = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append question B");
+    let newer_id = newer["message"]["id"].as_str().unwrap().to_string();
+    park.release.notify_waiters();
+    answering
+        .await
+        .unwrap()
+        .expect("old answer append succeeds");
+
+    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(newer_id.as_str())
+    );
+    assert_only_marker_event(&mut sub, &newer_id).await;
+}
+
+/// Question A persists first, then pauses before its marker write. Question B
+/// persists and commits its marker. When A resumes, transcript `seq` ordering
+/// must reject it and suppress its stale event.
+#[tokio::test]
+async fn older_question_completion_cannot_overwrite_newer_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("set"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let older = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(agent_id, "assistant".to_string(), question_blocks(), None)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("older question reached marker window");
+
+    let newer = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
+        .await
+        .expect("append newer question");
+    let newer_id = newer["message"]["id"].as_str().unwrap().to_string();
+    park.release.notify_waiters();
+    older
+        .await
+        .unwrap()
+        .expect("older question append succeeds");
+
+    let session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(newer_id.as_str())
+    );
+    assert_only_marker_event(&mut sub, &newer_id).await;
+}
+
+/// A question row can persist and pause before its marker lock. When its exact
+/// tagged answer persists and observes no marker in that window, the delayed
+/// set must observe the later answer atomically and emit no stale marker event.
+#[tokio::test]
+async fn delayed_question_set_cannot_resurrect_answered_marker() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let park = Arc::new(crate::PendingMarkerMutationPark::new("set"));
+    let services = services.with_pending_marker_mutation_park(Arc::clone(&park));
+    let mut sub = marker_sub(&bus, &workspace_id);
+    let asking = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        tokio::spawn(async move {
+            services
+                .agent_append_message_op(agent_id, "assistant".to_string(), question_blocks(), None)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(2), park.entered.notified())
+        .await
+        .expect("question reached the pre-lock marker window");
+
+    let question = bus
+        .store()
+        .get_last_non_system_message(&agent_id)
+        .await
+        .expect("read persisted question")
+        .expect("question row exists");
+    assert_eq!(question.role, "assistant");
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "answer before marker set" }]),
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": question.id,
+            })),
+        )
+        .await
+        .expect("answer persists while marker is absent");
+    assert_eq!(
+        bus.store()
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session before delayed set")
+            .pending_questions_message_id(),
+        None
+    );
+
+    park.release.notify_waiters();
+    let asked = asking
+        .await
+        .expect("question task joins")
+        .expect("question append succeeds");
+    assert_eq!(asked["message"]["id"], question.id);
+    assert_eq!(
+        bus.store()
+            .get_agent_session(&agent_id)
+            .await
+            .expect("session after delayed set")
+            .pending_questions_message_id(),
+        None,
+        "delayed set must not resurrect the answered marker"
+    );
+    assert!(!services.question_hold_active(&agent_id).await);
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "a rejected delayed set must not emit a marker event"
+    );
+}
+
 /// The `workspace:displayStatus-changed`-only subscription the monorepo#1266
 /// regression tests below assert against.
 fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subscription {
@@ -2689,6 +2969,106 @@ async fn recreate_acp_session_replaces_stored_id() {
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }
 
+/// Seed a second agent session with the codex provider and a task-derived
+/// name (monorepo#3151 wire tests).
+async fn insert_codex_agent(bus: &EventBus, workspace_id: &WorkspaceId) -> AgentId {
+    let agent_id = AgentId::from("agent-codex");
+    let mut session = new_session(&agent_id, workspace_id);
+    session.provider = Some("codex".to_string());
+    session.name = "Fix login bug".to_string();
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert codex agent session");
+    agent_id
+}
+
+/// The recorded `session/new` frame for monorepo#3151 assertions.
+fn recorded_session_new(seen: &Arc<std::sync::Mutex<Vec<Value>>>) -> Value {
+    let frames = seen.lock().unwrap();
+    frames
+        .iter()
+        .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
+        .cloned()
+        .expect("session/new frame recorded")
+}
+
+/// monorepo#3151: `open_acp_session` for a codex agent sends the task-derived
+/// agent name as `session/new` `_meta.sessionTitle` — and nothing else in
+/// `_meta` (the system prompt stays on the first-turn prepend).
+#[tokio::test]
+async fn open_acp_session_codex_sends_session_title_meta() {
+    let (_tmp, services, bus, _agent_id, ws) = setup().await;
+    let codex_id = insert_codex_agent(&bus, &ws).await;
+    let (conn, _rx, _agent, seen) = connect_recording();
+
+    services
+        .open_acp_session(&conn, &codex_id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+
+    let frame = recorded_session_new(&seen);
+    assert_eq!(
+        frame["params"]["_meta"],
+        json!({ "sessionTitle": "Fix login bug" }),
+        "codex session/new carries only _meta.sessionTitle"
+    );
+}
+
+/// monorepo#3151: the recreate path (`session/new` replacing a lost id) sends
+/// the same `_meta.sessionTitle` as the create path.
+#[tokio::test]
+async fn recreate_acp_session_codex_sends_session_title_meta() {
+    let (_tmp, services, bus, _agent_id, ws) = setup().await;
+    let codex_id = insert_codex_agent(&bus, &ws).await;
+    let (conn, _rx, _agent, seen) = connect_recording();
+
+    bus.store()
+        .set_acp_session_id(&ws, &codex_id, "stale-id")
+        .await
+        .unwrap();
+    services
+        .recreate_acp_session(&conn, &codex_id, "stale-id", "/tmp/ws", Vec::new())
+        .await
+        .expect("recreate session");
+
+    let frame = recorded_session_new(&seen);
+    assert_eq!(
+        frame["params"]["_meta"],
+        json!({ "sessionTitle": "Fix login bug" }),
+        "codex recreate session/new carries only _meta.sessionTitle"
+    );
+}
+
+/// monorepo#3151: the resume path stays unchanged — a codex `session/load`
+/// carries NO `_meta` (the durable thread already has its title).
+#[tokio::test]
+async fn resume_acp_session_codex_sends_no_meta() {
+    let (_tmp, services, bus, _agent_id, ws) = setup().await;
+    let codex_id = insert_codex_agent(&bus, &ws).await;
+    let (conn, _rx, _agent, seen) = connect_recording();
+
+    bus.store()
+        .set_acp_session_id(&ws, &codex_id, ACP_SID)
+        .await
+        .unwrap();
+    services
+        .resume_acp_session(&conn, &init_caps(true), &codex_id, "/tmp/ws", Vec::new())
+        .await
+        .expect("resume session")
+        .expect("session loaded");
+
+    let frames = seen.lock().unwrap();
+    let load = frames
+        .iter()
+        .find(|f| f.get("method").and_then(Value::as_str) == Some("session/load"))
+        .expect("session/load frame recorded");
+    assert!(
+        load["params"].get("_meta").is_none(),
+        "codex session/load carries no _meta (resume unchanged)"
+    );
+}
+
 /// `resume_acp_session` on the happy path emits the `session-load` status
 /// hint ahead of the `session/load` wire call so the pre-first-token spinner
 /// can render "Resuming session…" (STAT-1 / PROTOCOL §7).
@@ -2928,7 +3308,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3013,7 +3392,6 @@ where
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
-                "session/load" => json!({}),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -3173,6 +3551,418 @@ async fn streaming_benign_cancel_does_not_persist_error() {
     assert!(
         services.take_pending_terminal_error(&agent_id).is_none(),
         "nothing stashed for a benign cancel"
+    );
+}
+
+/// Mock agent whose `session/prompt` fails the first `failures` calls with a
+/// JSON-RPC `-32603` carrying `error_data` (the provider-fetch failure shape,
+/// monorepo#3007), then serves the NEXT call normally: streams `updates` and
+/// resolves `end_turn`. Returns the shared prompt-call counter so the test
+/// can assert how many attempts the driver made.
+fn spawn_mock_agent_failing_prompts_then_success<R, W>(
+    read: R,
+    write: W,
+    failures: usize,
+    error_data: String,
+    updates: Vec<String>,
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                let call = counter.fetch_add(1, Ordering::SeqCst);
+                if call < failures {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32603, "message": "Internal error", "data": error_data },
+                    });
+                    write
+                        .write_all(format!("{resp}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                    continue;
+                }
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    });
+    (handle, prompt_calls)
+}
+
+/// [`connect`] against the failing-then-succeeding mock above.
+fn connect_with_failing_prompts_then_success(
+    failures: usize,
+    error_data: &str,
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    Arc<AtomicUsize>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (agent, prompt_calls) = spawn_mock_agent_failing_prompts_then_success(
+        c2a_agent,
+        a2c_agent,
+        failures,
+        error_data.to_string(),
+        updates,
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, prompt_calls)
+}
+
+/// The observed monorepo#3007 `data` payload: a Node fetch EPIPE with the
+/// provider's `apiStatus: unavailable` JSON.
+const FETCH_EPIPE_UNAVAILABLE: &str = "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
+    {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}";
+
+/// Regression for monorepo#3007: a transient provider-fetch failure (`-32603`
+/// wrapping an EPIPE connect + `apiStatus: unavailable`) on an output-free
+/// attempt is retried in place — the turn completes normally instead of
+/// failing terminally, and no Error status is persisted.
+#[tokio::test]
+async fn transient_provider_fetch_failure_retries_and_turn_completes() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_failing_prompts_then_success(2, FETCH_EPIPE_UNAVAILABLE, prompt_updates());
+
+    let stop = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect("transient fetch failures are retried, not terminal (monorepo#3007)");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        3,
+        "two failed attempts + the succeeding retry"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(
+        stored.status,
+        AgentStatus::Error,
+        "a recovered transient fetch failure must not park the session in Error"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_none(),
+        "nothing stashed for a recovered turn"
+    );
+    // The retried attempt's streamed output persisted as the turn's message.
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the successful attempt's output persisted"
+    );
+}
+
+/// The retry budget is bounded (monorepo#3007): a provider that keeps failing
+/// transiently exhausts the attempts and the turn fails through the existing
+/// terminal path (Error persisted, context stashed for the worker).
+#[tokio::test]
+async fn transient_provider_fetch_failure_exhausts_bounded_retries() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    // More consecutive failures than 1 initial attempt + 2 retries.
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_failing_prompts_then_success(10, FETCH_EPIPE_UNAVAILABLE, Vec::new());
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("exhausted retries surface the terminal error");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "exhausted retries keep the ordinary terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        3,
+        "1 initial attempt + 2 bounded retries, then terminal"
+    );
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "the exhausted turn still persists the terminal Error status"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker as before"
+    );
+}
+
+/// Fail-fast guard (monorepo#3007): a genuinely terminal provider error (an
+/// auth rejection) is NOT retried — exactly one `session/prompt` attempt is
+/// made and the turn fails terminally as today.
+#[tokio::test]
+async fn terminal_provider_error_fails_fast_without_retry() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, prompt_calls) = connect_with_failing_prompts_then_success(
+        10,
+        "fetch failed: 401 Unauthorized: invalid api key",
+        Vec::new(),
+    );
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a terminal provider error still fails the turn");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "terminal error keeps the wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "a terminal error is never retried"
+    );
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error, "fails fast as today");
+}
+
+/// Once the attempt streamed ANY output the retry is off the table
+/// (monorepo#3007 idempotency guard): a transient-shaped failure after
+/// streamed updates fails through the existing terminal path on the first
+/// attempt — re-dispatching would duplicate the streamed output.
+#[tokio::test]
+async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    // The mock streams updates only on the SUCCESS path, so reuse the plain
+    // rpc-error mock that streams updates BEFORE failing.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(prompt_updates(), FETCH_EPIPE_UNAVAILABLE);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-output failure is not retried in place");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-output failure keeps the terminal wrapper: {err}"
+    );
+    // The streamed partial persisted as the turn's assistant row (unchanged
+    // from today's post-output failure handling).
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "streamed partial persisted, not duplicated"
+    );
+}
+
+/// Mock agent that issues one side-effecting agent→client request
+/// (`fs/write_text_file`) and then fails `session/prompt` with a
+/// transient-shaped `-32603` — the request line is written BEFORE the error
+/// response on the same pipe, so the reader is guaranteed to bump the
+/// client-request watermark before the prompt future resolves.
+fn spawn_mock_agent_with_client_request_then_transient_failure<R, W>(
+    read: R,
+    write: W,
+    error_data: String,
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let req = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1000,
+                    "method": "fs/write_text_file",
+                    "params": { "sessionId": ACP_SID, "path": "/tmp/x", "content": "x" },
+                });
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": "Internal error", "data": error_data },
+                });
+                write
+                    .write_all(format!("{req}\n{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    });
+    (handle, prompt_calls)
+}
+
+/// Side-effect guard (monorepo#3007): a transient-shaped failure on an
+/// attempt that already issued an agent→client request (`fs/write_text_file`)
+/// is NOT retried — the handler may have side-effected (file written,
+/// terminal command run), so re-dispatching is no longer provably idempotent
+/// even though no `session/update` streamed.
+#[tokio::test]
+async fn transient_fetch_failure_after_client_request_is_not_retried() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (_agent, prompt_calls) = spawn_mock_agent_with_client_request_then_transient_failure(
+        c2a_agent,
+        a2c_agent,
+        FETCH_EPIPE_UNAVAILABLE.to_string(),
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-request failure is not retried in place");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-request failure keeps the terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "no retry after a side-effecting client request"
     );
 }
 
@@ -4409,7 +5199,7 @@ fn surfaced_levels_filters_default_sentinel() {
 }
 
 /// Regression (PROTOCOL §5.5, Option C): a claude-code-shaped `configOptions`
-/// (thought_level select with default/low/medium/high/max) yields
+/// (`thought_level` select with default/low/medium/high/max) yields
 /// `effortLevels: ["low","medium","high","max"]` on the wire — persisted by
 /// `open_acp_session` itself, carried by the `AgentLite` projection, and
 /// announced by ONE `agent:updated`; the identical re-discovery on the next
@@ -5541,13 +6331,12 @@ async fn thought_text_is_absent_from_text_block_extraction() {
 /// more tool calls, asserting the invariant after EVERY step.
 #[tokio::test]
 async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persist() {
+    const GROUP_TEXT: &str =
+        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let mut transcript = super::Transcript::new("m1".to_string());
     services.set_live_turn(&agent_id, "m1", Vec::new());
-
-    const GROUP_TEXT: &str =
-        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
 
     let tool_note = |id: &str, title: &str| IncomingNotification {
         method: "session/update".to_string(),
@@ -5588,10 +6377,7 @@ async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persi
                 json!(format!("m1:{index}")),
                 "{step}: block ids stay {{messageId}}:{{index}}"
             );
-            if matches!(
-                block["type"].as_str(),
-                Some("tool_use") | Some("tool_result")
-            ) {
+            if matches!(block["type"].as_str(), Some("tool_use" | "tool_result")) {
                 assert!(index > 0, "{step}: no tool block precedes the group open");
             }
         }

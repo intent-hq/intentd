@@ -72,6 +72,10 @@ pub fn load(path: &Path) -> SitterState {
 
 /// Persist state to `path` (creating parent directories), writing via a
 /// temp file + rename so a crash never leaves a truncated `state.json`.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if serialization, creating parent directories, writing the temp file, or the rename fails.
 pub fn save(path: &Path, state: &SitterState) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

@@ -47,6 +47,7 @@ pub struct ReverseChannel {
 impl ReverseChannel {
     /// Build a channel that pushes reverse requests through `out_tx` (the
     /// connection's outbound frame queue).
+    #[must_use]
     pub fn new(out_tx: mpsc::Sender<String>) -> Self {
         Self {
             out_tx,
@@ -64,6 +65,14 @@ impl ReverseChannel {
     /// Issue a reverse request to the connected client and await its response.
     /// Fails if the connection is closed, the response channel is dropped, or
     /// the client does not reply within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReverseError`] if the connection is closed, the response channel is dropped, or the client does not reply within `timeout`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pending-request mutex is poisoned (a prior panic while holding the lock).
     pub async fn request(
         &self,
         method: &str,

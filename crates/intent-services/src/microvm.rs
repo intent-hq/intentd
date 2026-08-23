@@ -2,8 +2,8 @@
 //! stream bridged over vsock (monorepo#1120, EE-5).
 //!
 //! One VM per agent. Each VM boots the resolved guest image
-//! ([`crate::sandbox_image`]) from a per-VM CoW clone of the extracted rootfs
-//! tree, virtio-fs-mounts the agent's own CoW workspace clone
+//! ([`crate::sandbox_image`]) from a per-VM `CoW` clone of the extracted rootfs
+//! tree, virtio-fs-mounts the agent's own `CoW` workspace clone
 //! ([`crate::sandbox_ops`]) at `/workspace`, and runs the provider through the
 //! image's `intent-exec/1` vsock exec agent. The resulting byte stream is
 //! handed to the existing [`intent_acp::Connection`] machinery unchanged —
@@ -11,7 +11,7 @@
 //!
 //! Module layout:
 //! - [`exec`] — `intent-exec/1` client over the helper's forwarded unix socket
-//! - [`rootfs`] — rootfs archive extraction cache + per-VM CoW clone
+//! - [`rootfs`] — rootfs archive extraction cache + per-VM `CoW` clone
 //! - [`auth`] — credential staging into the guest home, rotation watcher,
 //!   teardown scrub (the per-VM directory removal deletes every staged copy)
 //! - [`orchestrator`] — helper boot, guest setup, provider exec, teardown
@@ -53,17 +53,18 @@ pub const WORKSPACE_VIRTIOFS_TAG: &str = "work";
 pub const GUEST_WORKSPACE_DIR: &str = "/workspace";
 
 /// Per-VM state directory for an agent.
+#[must_use]
 pub fn vm_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
     data_dir.join(MICROVM_STATE_DIR).join(agent_id)
 }
 
 /// Unix socket paths must fit `sockaddr_un.sun_path`: 104 bytes on macOS
-/// (SUN_LEN), 108 on Linux. Keep the conservative bound.
+/// (`SUN_LEN`), 108 on Linux. Keep the conservative bound.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 
 /// Short host rendezvous path for the per-VM exec socket. It deliberately
 /// does NOT live in the per-VM state dir: a deep data dir pushes
-/// `<vm_dir>/exec.sock` past the SUN_LEN limit and both libkrun's bind and
+/// `<vm_dir>/exec.sock` past the `SUN_LEN` limit and both libkrun's bind and
 /// the daemon's connect reject it. The socket sits in a private per-user
 /// 0700 directory under the system temp dir instead, named by a sha256
 /// prefix of the agent id — deterministic (the pre-boot stale scrub finds
@@ -75,11 +76,20 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 /// per-user 0700; the extra `intentd-vm-<uid>` parent (created/verified by
 /// [`ensure_private_dir`]) covers hosts where the temp dir is shared, and
 /// the `/tmp` length fallback never uses bare world-writable `/tmp`.
+///
+/// # Errors
+///
+/// Returns `MicrovmError::Boot` when no candidate path fits the socket
+/// length limit or the private parent directory cannot be secured.
 #[cfg(unix)]
 pub fn exec_sock_path(agent_id: &str) -> Result<PathBuf, MicrovmError> {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let digest = Sha256::digest(agent_id.as_bytes());
-    let hash: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let hash: String = digest.iter().take(6).fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
     let file = format!("{hash}.sock");
     let uid = unsafe { libc::getuid() };
     let parent_name = format!("intentd-vm-{uid}");

@@ -88,6 +88,18 @@ fn registry_field_parity() {
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
     assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
     assert_eq!(cc.fallback_npx_package, None);
+    // Claude Code truncates MCP tool descriptions at ~2k chars
+    // (anthropics/claude-code#53933): it gets the compact `workspace_api`
+    // description + system-prompt API reference. Every other provider keeps
+    // the full tool description byte-identical to before.
+    assert!(cc.truncates_tool_descriptions);
+    for p in ACP_PROVIDERS.iter().filter(|p| p.id != "claude-code") {
+        assert!(
+            !p.truncates_tool_descriptions,
+            "{} must keep the full workspace_api tool description",
+            p.id
+        );
+    }
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));
@@ -194,14 +206,15 @@ fn session_mcp_servers_partition() {
     }
 }
 
-/// Exactly claude-code and pi apply the stored model post-session via
+/// Exactly claude-code, pi, and codex apply the stored model post-session via
 /// `session/set_config_option { configId: "model" }` (their pinned adapters
-/// expose the model as a `configOptions[id="model"]` select and have no CLI
-/// model flag). Asserted over the full registry so a newly added provider
-/// can't accidentally opt in without updating this partition.
+/// expose the model as a `configOptions[id="model"]` select; claude-code and
+/// pi have no CLI model flag, and codex's npx-fallback adapter ignores the
+/// `-c model=…` argv overrides). Asserted over the full registry so a newly
+/// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "pi"];
+    let opted_in = ["claude-code", "codex", "pi"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -215,6 +228,19 @@ fn config_option_model_partition() {
         assert!(
             !(p.supports_set_model && p.supports_config_option_model),
             "{id}: supports_set_model and supports_config_option_model are mutually exclusive"
+        );
+        // Only codex embeds a reasoning effort in its stored model ids
+        // (`{base}/{effort}`), so only codex needs the daemon-side strip
+        // before the config-option value is sent — and the strip flag is
+        // meaningless without the config-option path itself.
+        assert_eq!(
+            p.config_option_model_strips_effort,
+            id == "codex",
+            "{id}: config_option_model_strips_effort is a codex-only quirk"
+        );
+        assert!(
+            !p.config_option_model_strips_effort || p.supports_config_option_model,
+            "{id}: config_option_model_strips_effort requires supports_config_option_model"
         );
     }
     // claude-code and pi additionally have no CLI model flag and no
@@ -541,7 +567,7 @@ fn json_escape_handles_control_characters() {
     // Verify the expected escaping.
     assert_eq!(escaped, r"/tmp/rules\b\f\u0001.md");
     // The escaped value can be embedded in a JSON string.
-    let json = format!(r#"{{"path":"{}"}}"#, escaped);
+    let json = format!(r#"{{"path":"{escaped}"}}"#);
     assert_eq!(json, r#"{"path":"/tmp/rules\b\f\u0001.md"}"#);
 }
 
@@ -575,7 +601,7 @@ impl Drop for EnvGuard {
     }
 }
 
-/// STAB-50: NODE_OPTIONS heap-cap injection for V8-runtime (Node/Electron)
+/// STAB-50: `NODE_OPTIONS` heap-cap injection for V8-runtime (Node/Electron)
 /// providers. All scenarios run inside one test fn because they mutate
 /// process-global env vars — parallel test threads must not race on
 /// `NODE_OPTIONS` / the override seam.
@@ -990,7 +1016,7 @@ fn registry_invariants() {
     // ids are unique.
     let ids = all_provider_ids();
     let mut sorted = ids.clone();
-    sorted.sort();
+    sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len());
     // Every provider has a non-empty id / display_name / command.
@@ -1016,7 +1042,7 @@ fn injection_mechanism_registry() {
         find_provider("claude-code").unwrap().injection_mechanism,
         SessionMeta
     );
-    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.14)
+    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.6.2)
     // ignores `_meta.developerInstructions` (#479).
     assert_eq!(
         find_provider("codex").unwrap().injection_mechanism,
@@ -1127,7 +1153,7 @@ fn unsloth_endpoint() -> UnslothEndpoint {
         model_id: "unsloth/stub-model-GGUF".to_string(),
         model_display_name: Some("Stub Model".to_string()),
         limit: Some(UnslothModelLimit {
-            context: 262144,
+            context: 262_144,
             output: 8192,
         }),
         compaction_reserved: Some(8192),
@@ -1332,13 +1358,22 @@ fn grok_arg_assembly_has_no_model_or_rules_flags() {
     );
 }
 
+/// Exactly grok applies the stored model post-session via
+/// `session/set_model` (its `agent stdio` subcommand has no CLI model flag).
+/// codex is NOT in this set: its pinned npx-fallback adapter's
+/// `session/set_model` handler accepts only `{base}[{effort}]` ids (effort
+/// required) and rejects both bare and `{base}/{effort}` ids, so codex rides
+/// the config-option path instead (see `config_option_model_partition`).
+/// Asserted over the full registry so a newly added provider can't
+/// accidentally opt in without updating this partition.
 #[test]
-fn grok_is_the_only_set_model_provider() {
+fn set_model_provider_partition() {
+    let opted_in = ["grok"];
     for p in ACP_PROVIDERS {
         assert_eq!(
             p.supports_set_model,
-            p.id == "grok",
-            "{} supports_set_model mismatch",
+            opted_in.contains(&p.id),
+            "{}: supports_set_model must match the pinned opt-in set {opted_in:?}",
             p.id
         );
     }
@@ -1357,7 +1392,7 @@ fn grok_parses_initialize_models_after_update_banner_preamble() {
                     "currentModelId": "grok-build",
                     "availableModels": [
                         { "modelId": "grok-build", "name": "Grok Build", "description": "Default Grok build model" },
-                        { "modelId": "gpt-5-5", "name": "GPT-5.5", "agentType": "reasoning", "contextWindow": 1048576 }
+                        { "modelId": "gpt-5-5", "name": "GPT-5.5", "agentType": "reasoning", "contextWindow": 1_048_576 }
                     ]
                 }
             }

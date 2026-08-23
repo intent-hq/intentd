@@ -200,7 +200,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -233,7 +233,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -246,8 +246,7 @@ fn node_available() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Spawn the mock MCP server in `--http` mode and return (child, base url).
@@ -304,7 +303,8 @@ async fn mcp_servers_remote_probe_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -452,4 +452,114 @@ async fn mcp_servers_remote_probe_over_wss() {
     assert_eq!(deleted["success"], json!(true));
     let list = wss_rpc(&mut rpc, 11, "mcp.servers.list", json!({})).await;
     assert_eq!(list["servers"].as_array().expect("servers array").len(), 0);
+}
+
+/// Send one JSON-RPC frame and return the raw `error` object whose id
+/// matches (the §9 error-envelope counterpart of [`wss_rpc`]).
+async fn wss_rpc_expect_error<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(common::rpc_read_timeout(), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], json!("2.0"), "envelope jsonrpc");
+                    assert!(v.get("result").is_none(), "rpc {method} succeeded: {v}");
+                    return v["error"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// `mcp.testConnection` (§5.22.2) over the production WSS transport:
+/// connected against the live mock fixture, error (no statusCode) against a
+/// dead port, and the `-32602` caller error for a missing `url`.
+#[tokio::test]
+async fn mcp_test_connection_over_wss() {
+    if !node_available() {
+        eprintln!("skipping mcp.testConnection WSS E2E: node not on PATH");
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    );
+    if !PathBuf::from(script).exists() {
+        eprintln!("skipping mcp.testConnection WSS E2E: fixture not found at {script}");
+        return;
+    }
+    let (_fixture, base_url) = spawn_http_fixture(script).await;
+
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Live MCP endpoint → connected with the HTTP status.
+    let ok = wss_rpc(
+        &mut rpc,
+        1,
+        "mcp.testConnection",
+        json!({ "url": base_url, "headers": { "X-Test": "1" } }),
+    )
+    .await;
+    assert_eq!(ok["status"], json!("connected"));
+    assert_eq!(ok["statusCode"], json!(200));
+    assert!(ok.get("errorMessage").is_none(), "got: {ok}");
+
+    // Dead port → error, no statusCode, actionable message.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        drop(listener);
+        url
+    };
+    let err = wss_rpc(&mut rpc, 2, "mcp.testConnection", json!({ "url": dead })).await;
+    assert_eq!(err["status"], json!("error"));
+    assert!(err.get("statusCode").is_none(), "got: {err}");
+    assert!(
+        err["errorMessage"]
+            .as_str()
+            .expect("errorMessage")
+            .contains("unreachable from daemon host"),
+        "got: {err}"
+    );
+
+    // Missing url → -32602 caller error.
+    let e = wss_rpc_expect_error(&mut rpc, 3, "mcp.testConnection", json!({})).await;
+    assert_eq!(e["code"], json!(-32602));
 }

@@ -151,7 +151,7 @@ impl Services {
 
         let db_row_bytes: u64 = tables
             .iter()
-            .map(|t: &TransferTableStat| t.approx_bytes.max(0) as u64)
+            .map(|t: &TransferTableStat| t.approx_bytes.max(0).cast_unsigned())
             .sum();
         let asset_bytes: u64 = assets.iter().map(|a| a.size_bytes).sum();
         let attachment_bytes: u64 = attachments.iter().map(|a| a.size_bytes).sum();
@@ -206,7 +206,7 @@ impl Services {
                     file_ops::resolve_attachment_source(&root, &r.stored_path)
                         .ok()
                         .and_then(|p| std::fs::metadata(p).ok())
-                        .filter(|m| m.is_file())
+                        .filter(std::fs::Metadata::is_file)
                         .map(|m| m.len())
                 };
                 TransferAttachment {
@@ -259,7 +259,7 @@ impl Services {
 ///
 /// Sandbox branches are resolved in the worktree repo, while the bundler
 /// (`transfer_git`) fetches each branch from its sandbox's own repo — so for
-/// CoW sandboxes whose branch exists only in the sandbox repo, the estimate
+/// `CoW` sandboxes whose branch exists only in the sandbox repo, the estimate
 /// may undercount those refs.
 fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
     let mut refs: Vec<String> = vec!["HEAD".to_string()];
@@ -270,8 +270,7 @@ fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}"))
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if exists {
             // Push the unambiguous form: a worktree path or `-`-prefixed name
             // matching the short branch name would otherwise break rev-list.

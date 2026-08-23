@@ -9,7 +9,7 @@
 //! `git.diffs`, so the per-worktree diff cache (and its event-driven
 //! invalidation subscriber) has been removed.
 //!
-//! ## CoW probe cache
+//! ## `CoW` probe cache
 //!
 //! Machine capability of the workspaces root; lifetime cache with
 //! single-flight + serialized live probes. Over-budget calls omit the field;
@@ -23,7 +23,14 @@ use std::time::{Duration, Instant};
 
 /// Wall-clock budget one list/get call spends waiting for a single aggregate
 /// before degrading to the last known value / omission.
-const AGGREGATE_BUDGET: Duration = Duration::from_millis(1_500);
+///
+/// Kept below the `rpc_profile` duration budget for hot RPCs (1000 ms): a cold
+/// `CoW` probe used to wait up to 1500 ms inside the `workspace.list` dispatch,
+/// so the first list after daemon start was guaranteed to draw a
+/// duration-budget WARN regardless of actual list cost
+/// (intent-hq/monorepo#2994). An over-budget probe still completes detached
+/// and backfills the cache for the next poll.
+const AGGREGATE_BUDGET: Duration = Duration::from_millis(900);
 
 /// Cap on concurrent per-workspace enrichment tasks in `workspace.list`, so a
 /// large workspace count doesn't burst-issue unbounded concurrent store reads.
@@ -33,13 +40,13 @@ pub(crate) const MAX_CONCURRENT_ENRICHMENTS: usize = 8;
 /// an `Arc` field on `Services` so every clone (and thus every concurrent
 /// list/get call) observes the same cache and single-flight state.
 pub(crate) struct WorkspaceAggregateCache {
-    /// CoW support per workspaces root. This is a second layer over
+    /// `CoW` support per workspaces root. This is a second layer over
     /// `intent_git::cow_probe`'s own process-wide cache: a hit here skips the
     /// `tokio::spawn` + probe-gate + `spawn_blocking` round-trip entirely.
     cow: Mutex<HashMap<PathBuf, bool>>,
     /// Roots with a probe currently in flight (single-flight guard).
     cow_in_flight: Arc<Mutex<HashSet<PathBuf>>>,
-    /// Serializes live CoW probes (shared `.cow_probe_temp` collision guard).
+    /// Serializes live `CoW` probes (shared `.cow_probe_temp` collision guard).
     cow_probe_gate: tokio::sync::Mutex<()>,
     budget: Duration,
 }
@@ -85,7 +92,7 @@ impl WorkspaceAggregateCache {
 
     /// Compute (or serve from cache) the `cowSupported` aggregate for a
     /// workspaces root. The probe runs root→root, so it reports whether the
-    /// root's filesystem supports CoW cloning — a machine capability,
+    /// root's filesystem supports `CoW` cloning — a machine capability,
     /// independent of any repository. Completed probes are cached for the
     /// daemon's lifetime (support is invariant per root); an over-budget
     /// probe yields `None` for this call but keeps running detached and
@@ -135,7 +142,7 @@ impl WorkspaceAggregateCache {
                     cache.cow.lock().unwrap().insert(key, supported);
                     tracing::debug!(
                         supported,
-                        total_ms = started.elapsed().as_millis() as u64,
+                        total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "workspace aggregates: cow probe"
                     );
                     Some(supported)
@@ -171,7 +178,7 @@ impl WorkspaceAggregateCache {
                 // Over budget: the detached probe keeps running and backfills
                 // the cache for the next poll.
                 tracing::debug!(
-                    budget_ms = self.budget.as_millis() as u64,
+                    budget_ms = u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
                     "workspace aggregates: cow probe over budget; omitting cowSupported"
                 );
                 None

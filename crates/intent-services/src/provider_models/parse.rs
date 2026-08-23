@@ -11,9 +11,11 @@
 //! and collapsed variants, other providers from adapter-advertised per-model
 //! `supportedEffortLevels` / `effortLevels`, falling back to the session's
 //! global `thought_level` select. The adapter's `default` pseudo-row is
-//! resolved to the real model it stands for — that row is marked
-//! `isDefault: true` and the pseudo-row is dropped; an unresolvable
-//! pseudo-row is kept as-is (fail-soft).
+//! dropped whenever at least one real model row exists; when it resolves to
+//! the real model it stands for, that row is marked `isDefault: true` (an
+//! unresolvable pseudo-row is still dropped, just with no `isDefault`
+//! marking). A catalog whose only row is the pseudo-row keeps it, so the
+//! list never comes back empty.
 
 use serde_json::{json, Map, Value};
 
@@ -280,7 +282,8 @@ struct CodexModelGroup {
 /// carry per-model effort metadata when present, else levels from the session's
 /// global `thought_level` select. The catalog's default is resolved via
 /// [`resolve_default_row`]: the real default row is marked `isDefault: true`
-/// and the adapter's `default` pseudo-row is dropped when it resolves.
+/// and the adapter's `default` pseudo-row is dropped whenever a real row
+/// exists (kept only when it is the catalog's sole row).
 pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
@@ -331,7 +334,9 @@ fn extract_model_current_value(payload: &Value) -> Option<&str> {
 
 /// Whether a wire row is the adapter's `default` pseudo-row (id `"default"`,
 /// case-insensitive) — a stand-in for a real sibling model, not a model.
-fn is_default_pseudo_row(row: &Value) -> bool {
+/// Crate-visible so the model-catalog cache can drop stale persisted
+/// pseudo-rows on load (entries fetched by a pre-resolution daemon).
+pub(crate) fn is_default_pseudo_row(row: &Value) -> bool {
     row.get("id")
         .and_then(Value::as_str)
         .is_some_and(|id| id.eq_ignore_ascii_case("default"))
@@ -366,9 +371,13 @@ fn resolve_pseudo_default_sibling(rows: &[Value], pseudo: usize) -> Option<usize
 /// and drop the adapter's `default` pseudo-row. The real default is the model
 /// select's `currentValue` when it names a real (non-`default`) row; else the
 /// pseudo-row is resolved to the unique sibling sharing its version-bearing
-/// model family ([`resolve_pseudo_default_sibling`]). Fail-soft: when neither
-/// resolves, the rows are returned unchanged — the pseudo-row is kept, nothing
-/// is marked, and the catalog never comes back empty because of this logic.
+/// model family ([`resolve_pseudo_default_sibling`]). The pseudo-row is
+/// dropped **unconditionally** whenever at least one real (non-pseudo) row
+/// exists — resolved or not; when the resolution fails nothing is marked
+/// `isDefault` (no guessing). Every pseudo-row is dropped, not just the
+/// first, matching the cache-load sanitization in `model_catalog`. A catalog
+/// with no real rows keeps its pseudo-row(s), so this logic never empties a
+/// catalog.
 fn resolve_default_row(rows: &mut Vec<Value>, current_value: Option<&str>) {
     let pseudo = rows.iter().position(is_default_pseudo_row);
     let target = current_value
@@ -378,14 +387,13 @@ fn resolve_default_row(rows: &mut Vec<Value>, current_value: Option<&str>) {
                 .position(|row| row.get("id").and_then(Value::as_str) == Some(value))
         })
         .or_else(|| pseudo.and_then(|pseudo| resolve_pseudo_default_sibling(rows, pseudo)));
-    let Some(target) = target else {
-        return;
-    };
-    if let Some(row) = rows[target].as_object_mut() {
-        row.insert("isDefault".to_string(), json!(true));
+    if let Some(target) = target {
+        if let Some(row) = rows[target].as_object_mut() {
+            row.insert("isDefault".to_string(), json!(true));
+        }
     }
-    if let Some(pseudo) = pseudo.filter(|pseudo| *pseudo != target) {
-        rows.remove(pseudo);
+    if rows.iter().any(|row| !is_default_pseudo_row(row)) {
+        rows.retain(|row| !is_default_pseudo_row(row));
     }
 }
 
@@ -449,7 +457,7 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
                             .chain(&group.inferred_levels)
                             .any(|level| level.eq_ignore_ascii_case(effort))
                     })
-                    .map(|effort| effort.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect();
                 push_unique(
                     &mut levels,
@@ -576,7 +584,7 @@ pub(super) fn parse_hf_unsloth_response(body: &str) -> Vec<HfRepo> {
 }
 
 /// Bytes-per-parameter estimate for a Q4-class GGUF quant (the middle of the
-/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to Q4_K_M.
+/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to `Q4_K_M`.
 const BYTES_PER_PARAM_Q4: f64 = 0.6;
 
 /// Fixed headroom (KV cache, context, runtime overhead) added on top of the
@@ -598,6 +606,8 @@ pub(super) fn estimate_model_bytes(params_billion: f64) -> f64 {
 
 /// Whether a model with `params_billion` total parameters is estimated to
 /// fit within [`RAM_FIT_FRACTION`] of `total_ram_bytes`.
+// RAM sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool {
     estimate_model_bytes(params_billion) <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
@@ -608,12 +618,14 @@ pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool
 /// param-count estimate bakes in. Shared with the spawn-time quant-variant
 /// selection ([`crate::unsloth_server`]) so both fit checks apply one
 /// consistent headroom policy.
+// RAM/model sizes above 2^53 bytes (8 PiB) do not occur; loss-free in f64.
+#[allow(clippy::cast_precision_loss)]
 pub(crate) fn gguf_bytes_fit_within_ram(model_bytes: u64, total_ram_bytes: u64) -> bool {
     (model_bytes as f64) + FIT_HEADROOM_BYTES <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
 
 /// Parse the total parameter count (in billions) out of an HF repo id's model
-/// name, tolerating both dense names (`27B`) and MoE names that also carry an
+/// name, tolerating both dense names (`27B`) and `MoE` names that also carry an
 /// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the
 /// active count and is skipped). Returns `None` when no size token is found
 /// (e.g. `grok-2-GGUF`, `Qwen3-Coder-Next-GGUF`) — the catalog treats an
@@ -627,7 +639,7 @@ pub(super) fn parse_param_count_billions(repo_id: &str) -> Option<f64> {
 }
 
 /// Parse one `-`/`_`-delimited name token as a total-parameter size
-/// (`27B`, `0.8B`, `270M`), skipping MoE active-parameter markers (`A3B`).
+/// (`27B`, `0.8B`, `270M`), skipping `MoE` active-parameter markers (`A3B`).
 fn parse_size_token(token: &str) -> Option<f64> {
     let lower = token.to_ascii_lowercase();
     let mut chars = lower.chars();

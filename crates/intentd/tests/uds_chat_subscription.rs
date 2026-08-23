@@ -80,7 +80,7 @@ async fn rpc(
     resp["result"].clone()
 }
 
-async fn boot(
+fn boot(
     bus: &EventBus,
 ) -> (
     PathBuf,
@@ -100,6 +100,7 @@ async fn boot(
     let services = Arc::new(
         Services::new(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
             .with_event_bus(bus.clone()),
     );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
@@ -133,7 +134,7 @@ async fn setup() -> (
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
     (
         socket,
         server,
@@ -162,7 +163,7 @@ async fn setup_with_bus() -> (
     };
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
-    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus).await;
+    let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
     (
         socket,
         server,
@@ -454,8 +455,8 @@ async fn chat_subscribe_isolates_snapshot_per_agent() {
 /// CS-3 reconciliation invariant: the seq-0 snapshot reduced with the live
 /// `chat:stream:delta`/`tool:call`/`stream:end` deltas equals a fresh
 /// `agent.getConversation` snapshot. Drives a mock turn — two text chunks that
-/// coalesce onto one block (added → updated), a tool call (tool_use → tool_use
-/// updated + tool_result added), then trailing text — persists the assistant
+/// coalesce onto one block (added → updated), a tool call (`tool_use` → `tool_use`
+/// updated + `tool_result` added), then trailing text — persists the assistant
 /// message exactly as `run_prompt_turn` would, and finally emits `stream:end`.
 #[tokio::test]
 async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
@@ -893,6 +894,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
 /// superseding the Iter#1c heal-gate assertion this test used to make (that a
 /// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
@@ -1033,6 +1035,7 @@ async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let _ = server.await;
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// CS-4 cross-agent isolation: a `chat.subscribe` for agent A must NOT receive
 /// agent B's `agent:stream:*` events — the forwarder filters on
 /// `sessionId == agentId`. B's chunk is published first (and dropped); the next
@@ -1703,20 +1706,20 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
         metadata: None,
         data,
     };
-    bus.publish_transient(&stream_event(
+    let _ = bus.publish_transient(&stream_event(
         CHAT_STREAM_DELTA,
         json!({
             "agentId": agent_id, "content": "the tests.", "messageId": mid,
             "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
         }),
     ));
-    bus.publish_transient(&stream_event(
+    let _ = bus.publish_transient(&stream_event(
         AGENT_STREAM_END,
         json!({ "agentId": agent_id }),
     ));
     // 2048 filler events push the ring (capacity 1024) far past the tail.
     for _ in 0..2048 {
-        bus.publish_transient(&NewEvent {
+        let _ = bus.publish_transient(&NewEvent {
             workspace_id: WorkspaceId::from(ws_id.as_str()),
             timestamp: now_iso(),
             event_type: "note:created".to_string(),

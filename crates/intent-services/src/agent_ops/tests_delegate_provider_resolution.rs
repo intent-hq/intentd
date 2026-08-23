@@ -22,7 +22,10 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentDelegateInput, WorkspaceId};
+use intent_core::{
+    AgentDelegateInput, BatchTaskEntry, BatchTaskOptions, NoteCreate, NoteId, WorkspaceApi,
+    WorkspaceId,
+};
 use intent_store::Store;
 use serde_json::json;
 use tempfile::TempDir;
@@ -261,17 +264,16 @@ async fn delegate_specialist_coding_agent_unavailable_errors_instead_of_auggie()
     );
 }
 
-/// Nothing configured (no specialist `codingAgent`, no `providers.active`):
-/// `agent.delegate` still succeeds and leaves `provider` unset, exactly the
-/// pre-existing "no configured default" model-resolution behavior — this is
-/// NOT the "unavailable" error case (D2 step 3's `Ok(None)` branch), and
-/// must not regress the large existing test suite that delegates without
-/// ever configuring a default provider.
+/// Nothing configured (no specialist `codingAgent`, no `providers.active`,
+/// no compound `model.default`): `agent.delegate` fails loudly with the
+/// clear no-default `-32602` (monorepo#3044) — the former residual behavior
+/// left `provider` unset and the spawn silently bottomed out at the
+/// positional first registered provider (auggie), installed or not.
 #[tokio::test]
-async fn delegate_with_nothing_configured_leaves_provider_unset() {
+async fn delegate_with_nothing_configured_fails_loudly() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
 
-    let resp = svc
+    let err = svc
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
@@ -281,50 +283,796 @@ async fn delegate_with_nothing_configured_leaves_provider_unset() {
             None,
         )
         .await
-        .expect("delegate succeeds with nothing configured");
-    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        .expect_err("delegate with nothing configured must fail loudly");
     assert!(
-        resp.get("provider").is_none(),
-        "delegate result omits `provider` when the session has none (never null): {resp}"
+        matches!(&err, intent_core::Error::InvalidParams(m)
+            if m.contains("no default provider/model is configured")),
+        "clear no-default error, got: {err:?}"
     );
-
-    let got = svc.agent_get_op(agent_id, None).await.expect("get");
-    assert_eq!(got.provider, None, "no configured default to resolve to");
 }
 
 /// An explicit `model` param (even a bare, non-compound one) opts out of D2
 /// resolution entirely — the caller made its own provider-adjacent choice by
-/// supplying a model.
+/// supplying a model. The compound prefix's own availability gate
+/// (monorepo#3178) still applies, so the model targets the available mock
+/// provider while D2 — had it run — would have failed loudly (nothing
+/// configured at all).
 #[tokio::test]
 async fn delegate_with_explicit_model_skips_d2_resolution() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
-    // A configured default that would error if D2 ran (unavailable "mock").
-    set(&svc, "providers.active", json!("mock"));
-    let _env = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
 
     let resp = svc
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
                 agent_instructions: Some("do the thing".into()),
-                model: Some("opencode:kimi-k3".into()),
+                model: Some("mock:test-model".into()),
                 ..Default::default()
             },
             None,
         )
         .await
-        .expect("explicit model bypasses D2 entirely, so the unavailable default never errors");
+        .expect("explicit model bypasses D2 entirely, so the missing default never errors");
     let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
     assert_eq!(
         resp["provider"].as_str(),
-        Some("opencode"),
+        Some("mock"),
         "delegate result surfaces the compound-model provider prefix: {resp}"
     );
 
     let got = svc.agent_get_op(agent_id, None).await.expect("get");
     assert_eq!(
         got.provider.as_deref(),
-        Some("opencode"),
+        Some("mock"),
         "explicit compound model's provider prefix wins, untouched by D2"
     );
+}
+
+/// An explicit `provider` param pins the child's provider, outranking the
+/// settings-derived default (PROTOCOL §5.5: param > compound prefix >
+/// specialist frontmatter > settings default).
+#[tokio::test]
+async fn delegate_explicit_provider_param_beats_configured_default() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    // The configured default names a DIFFERENT provider — the explicit
+    // param must win over it.
+    set(&svc, "providers.active", json!("codex"));
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("explicit provider param pins the provider");
+    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        resp["provider"].as_str(),
+        Some("mock"),
+        "delegate result surfaces the explicit provider param: {resp}"
+    );
+
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "explicit provider param wins over the configured default"
+    );
+}
+
+/// The explicit `provider` param also outranks the specialist's frontmatter
+/// `codingAgent` (D2 step 1) — the caller's word is final.
+#[tokio::test]
+async fn delegate_explicit_provider_param_beats_specialist_coding_agent() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    // The specialist pins a DIFFERENT (unavailable) provider — if the param
+    // did not win, resolution would target codex and fail on availability.
+    create_specialist_with_coding_agent(specialists_dir.path(), "codex-specialist", "codex");
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("codex-specialist".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("explicit provider param outranks the specialist's codingAgent");
+    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "explicit provider param wins over specialist frontmatter"
+    );
+}
+
+/// An explicit `provider` alongside a BARE `model` disambiguates which
+/// provider serves the model — the exact multi-provider-model use case the
+/// param exists for (monorepo#3044).
+#[tokio::test]
+async fn delegate_explicit_provider_with_bare_model_pins_provider() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    set(&svc, "providers.active", json!("codex"));
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                model: Some("shared-model".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("explicit provider disambiguates the bare model");
+    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "bare model runs on the explicitly named provider"
+    );
+    assert_eq!(
+        got.model.as_deref(),
+        Some("shared-model"),
+        "the bare model id persists unchanged"
+    );
+}
+
+/// An explicit `provider` that AGREES with the compound `model` prefix is
+/// redundant but valid.
+#[tokio::test]
+async fn delegate_explicit_provider_matching_compound_model_prefix_is_valid() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                model: Some("mock:test-model".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("provider matching the compound prefix is redundant but valid");
+    let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(got.provider.as_deref(), Some("mock"));
+}
+
+/// An explicit `provider` that CONTRADICTS the compound `model` prefix is
+/// rejected with `-32602` naming both sides — never silently resolved in
+/// either direction.
+#[tokio::test]
+async fn delegate_explicit_provider_contradicting_compound_model_errors() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                model: Some("codex:gpt-5.6".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("contradicting provider/model must be rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "contradiction is InvalidParams (-32602): {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("codex") && message.contains("mock"),
+        "error names both the model's provider and the param: {message}"
+    );
+}
+
+/// An unknown explicit `provider` is rejected with `-32602` naming the known
+/// providers, before any side effect.
+#[tokio::test]
+async fn delegate_unknown_explicit_provider_errors() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                provider: Some("typo-provider".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("unknown provider must be rejected");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "unknown provider is InvalidParams (-32602): {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("unknown provider: typo-provider"),
+        "error names the bad id: {message}"
+    );
+}
+
+/// A known-but-unavailable explicit `provider` fails with a clear error
+/// (same availability contract as the derived-resolution rungs).
+#[tokio::test]
+async fn delegate_unavailable_explicit_provider_errors() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("unavailable explicit provider must fail clearly");
+    let message = err.to_string();
+    assert!(
+        message.contains("mock"),
+        "error names the unavailable provider: {message}"
+    );
+}
+
+// ── Batch form ──────────────────────────────────────────────────────────────
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some(format!("{title} body")),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+    svc.mark_as_task(
+        ws.clone(),
+        note.id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    note.id
+}
+
+/// A bad TOP-LEVEL batch `provider` (the default shared by every entry that
+/// doesn't override it) is validated up front: the whole call rejects with
+/// `-32602` before the classification loop can start ANY task — never a
+/// partial batch where earlier rows spawned before a later row surfaced the
+/// same shared failure.
+#[tokio::test]
+async fn batch_delegate_bad_top_level_provider_rejects_before_any_start() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    // "mock" is known but unavailable (env gate off); also cover unknown.
+    let _env = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+
+    for provider in ["typo-provider", "mock"] {
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    tasks: Some(vec![
+                        BatchTaskEntry::Id(t1.clone()),
+                        BatchTaskEntry::Id(t2.clone()),
+                    ]),
+                    provider: Some(provider.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("bad top-level batch provider rejects the whole call");
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(_)),
+            "up-front rejection is InvalidParams (-32602): {err}"
+        );
+        assert!(err.to_string().contains(provider), "{err}");
+    }
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(
+        agents.is_empty(),
+        "no task started before the up-front rejection: {agents:?}"
+    );
+}
+
+/// Batch `provider` semantics: an entry without an override inherits the
+/// top-level default (and starts on it), while a per-entry override beats it
+/// — and, being per-entry, a bad override surfaces as that row's `error`
+/// disposition without failing rows that already started (the documented
+/// non-transactional batch contract, same as `model`/`specialist`).
+#[tokio::test]
+async fn batch_delegate_provider_top_level_inherited_and_per_entry_override_wins() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let t1 = seed_task(&svc, &ws, "Inherits").await;
+    let t2 = seed_task(&svc, &ws, "Overrides").await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    BatchTaskEntry::Id(t1.clone()),
+                    BatchTaskEntry::Options(BatchTaskOptions {
+                        task_note_id: t2.clone(),
+                        specialist: None,
+                        model: None,
+                        // Deterministically invalid (unknown id) — proves
+                        // the override is applied to THIS row (the valid
+                        // top-level "mock" would have started it) and stays
+                        // a per-row error.
+                        provider: Some("typo-provider".into()),
+                        reasoning_effort: None,
+                        agent_instructions: None,
+                    }),
+                ]),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("valid top-level provider: the batch call itself succeeds");
+
+    let rows = resp["tasks"].as_array().expect("tasks array");
+    let row = |id: &NoteId| {
+        rows.iter()
+            .find(|r| r["taskNoteId"] == json!(id.0))
+            .unwrap_or_else(|| panic!("row for {} in {resp}", id.0))
+    };
+
+    let r1 = row(&t1);
+    assert_eq!(r1["disposition"], "started", "{resp}");
+    let agent_id = intent_core::AgentId::from(r1["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.provider.as_deref(),
+        Some("mock"),
+        "entry without an override inherits the top-level batch provider"
+    );
+
+    let r2 = row(&t2);
+    assert_eq!(
+        r2["disposition"], "error",
+        "per-entry override beats the top-level default and fails per-row: {resp}"
+    );
+    assert!(
+        r2["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("typo-provider"),
+        "error row names the overriding provider: {resp}"
+    );
+}
+
+// ── Disabled / unrunnable providers (monorepo#3178) ─────────────────────────
+
+/// Build a [`intent_providers::ProviderAvailability`] for the injectable
+/// runnability gate tests (deterministic — no host PATH probing).
+fn availability(
+    installed: bool,
+    has_npx_fallback: bool,
+    gated_off: Option<String>,
+) -> intent_providers::ProviderAvailability {
+    intent_providers::ProviderAvailability {
+        id: "codex",
+        display_name: "OpenAI Codex",
+        command: "codex-acp",
+        installed,
+        resolved_path: None,
+        gated_off,
+        auth_check_args: None,
+        has_npx_fallback,
+        npx_only_package: None,
+        secondary_binary: None,
+    }
+}
+
+/// A provider whose local binary is missing but that declares an npx
+/// fallback (codex) counts as runnable when npx resolves — aligned with what
+/// `resolve_spawn` can actually run — and stays rejected when npx is absent.
+#[test]
+fn runnable_gate_codex_accepted_via_npx_fallback() {
+    super::ensure_provider_runnable(
+        "agent.delegate",
+        "codex",
+        Some(availability(false, true, None)),
+        &|| true,
+    )
+    .expect("npx fallback makes codex runnable");
+
+    let err = super::ensure_provider_runnable(
+        "agent.delegate",
+        "codex",
+        Some(availability(false, true, None)),
+        &|| false,
+    )
+    .expect_err("no binary and no npx: not runnable");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not installed")),
+        "not-installed rejection: {err:?}"
+    );
+
+    // Installed providers never consult the npx probe.
+    super::ensure_provider_runnable(
+        "agent.delegate",
+        "codex",
+        Some(availability(true, false, None)),
+        &|| false,
+    )
+    .expect("installed provider is runnable regardless of npx");
+}
+
+/// A gated-off provider (missing env var / feature code) is rejected with
+/// the gate reason rather than a generic not-installed message.
+#[test]
+fn runnable_gate_reports_gate_reason() {
+    let err = super::ensure_provider_runnable(
+        "agent.delegate",
+        "codex",
+        Some(availability(
+            false,
+            true,
+            Some("requires env var FOO".into()),
+        )),
+        &|| true,
+    )
+    .expect_err("gated-off provider must be rejected");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("requires env var FOO")),
+        "gate reason surfaced: {err:?}"
+    );
+}
+
+/// `providers.enabled[id] == false` rejects with the distinct "not enabled"
+/// message — including npx-only providers (claude-code), whose npx-based
+/// `installed` status must not bypass the disabled check. Absent maps,
+/// absent entries, and `true` entries stay enabled.
+#[test]
+fn enabled_gate_rejects_explicitly_disabled_providers() {
+    let disabled: std::collections::BTreeMap<String, bool> = [
+        ("codex".to_string(), false),
+        ("claude-code".to_string(), false),
+    ]
+    .into();
+    for id in ["codex", "claude-code"] {
+        let err = super::ensure_provider_enabled("agent.delegate", id, Some(&disabled))
+            .expect_err("disabled provider must be rejected");
+        assert!(
+            matches!(&err, intent_core::Error::InvalidParams(m)
+                if m.contains("not enabled") && m.contains("Settings > Agents")),
+            "distinct not-enabled rejection for {id}: {err:?}"
+        );
+    }
+
+    let enabled: std::collections::BTreeMap<String, bool> = [("codex".to_string(), true)].into();
+    super::ensure_provider_enabled("agent.delegate", "codex", Some(&enabled))
+        .expect("explicitly enabled");
+    super::ensure_provider_enabled(
+        "agent.delegate",
+        "codex",
+        Some(&std::collections::BTreeMap::default()),
+    )
+    .expect("absent entry means enabled");
+    super::ensure_provider_enabled("agent.delegate", "codex", None)
+        .expect("absent map means enabled");
+}
+
+/// End to end through `agent.delegate`: a provider that is installed and
+/// available but explicitly disabled in `providers.enabled` fails fast with
+/// the "not enabled" `-32602` — on the explicit `provider` param and on the
+/// settings-derived default alike — and never persists a session row.
+#[tokio::test]
+async fn delegate_disabled_provider_rejected_with_not_enabled() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    // mock is fully available (env gate satisfied) — only `enabled` blocks it.
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    set(&svc, "providers.enabled", json!({ "mock": false }));
+
+    // Explicit `provider` param.
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                provider: Some("mock".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("disabled explicit provider must fail fast");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not enabled")),
+        "distinct not-enabled rejection: {err:?}"
+    );
+
+    // Settings-derived default (D2 step 2).
+    set(&svc, "providers.active", json!("mock"));
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("disabled derived default must fail fast");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not enabled")),
+        "distinct not-enabled rejection: {err:?}"
+    );
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+}
+
+/// The spawn path gives a compound `model` prefix precedence over the
+/// explicit `provider` field (`resolve_provider_id`), so the enabled gate
+/// must gate the PREFIX: an enabled, available explicit `provider` must not
+/// smuggle in a disabled compound-model provider through `agent.create`.
+#[tokio::test]
+async fn create_disabled_compound_model_prefix_rejected_despite_enabled_provider() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    set(&svc, "providers.enabled", json!({ "codex": false }));
+
+    // `provider: mock` is enabled and available, but spawn would run the
+    // model's `codex` prefix — the disabled prefix is what must be gated.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("mock".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Smuggle".into()),
+            Some("codex:gpt-5.6".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("disabled compound-model prefix must be rejected despite the enabled provider");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m)
+            if m.contains("not enabled") && m.contains("codex")),
+        "gate applies to the spawn-precedence provider (the prefix): {err:?}"
+    );
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+}
+
+/// A compound `model` alone (no `provider` param) pins its own provider via
+/// the prefix, so `agent.delegate` runs the FULL availability gate on that
+/// prefix — disabled and unrunnable (env-gated/uninstalled) alike fail fast
+/// instead of persisting a session that dies at spawn.
+#[tokio::test]
+async fn delegate_compound_model_only_gated_on_full_availability() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+
+    // Unrunnable: mock's env gate is off.
+    {
+        let _env = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    agent_instructions: Some("do the thing".into()),
+                    model: Some("mock:test-model".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("env-gated compound-model provider must fail fast at delegate");
+        assert!(
+            matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("mock")),
+            "error names the unrunnable prefix provider: {err:?}"
+        );
+    }
+
+    // Disabled: mock is runnable but switched off in providers.enabled.
+    {
+        let _env =
+            EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+        set(&svc, "providers.enabled", json!({ "mock": false }));
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    agent_instructions: Some("do the thing".into()),
+                    model: Some("mock:test-model".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("disabled compound-model provider must fail fast at delegate");
+        assert!(
+            matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not enabled")),
+            "distinct not-enabled rejection: {err:?}"
+        );
+        set(&svc, "providers.enabled", json!({ "mock": true }));
+    }
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+
+    // Sanity: the same compound model delegates fine once available+enabled.
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    svc.agent_delegate_op(
+        ws.clone(),
+        AgentDelegateInput {
+            agent_instructions: Some("do the thing".into()),
+            model: Some("mock:test-model".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("available+enabled compound model delegates normally");
+}
+
+/// A bad TOP-LEVEL batch compound `model` default gets the same up-front
+/// gate as a bad top-level `provider`: the whole call rejects before the
+/// classification loop can start ANY task.
+#[tokio::test]
+async fn batch_delegate_unavailable_top_level_compound_model_rejects_before_any_start() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    let _env = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    BatchTaskEntry::Id(t1.clone()),
+                    BatchTaskEntry::Id(t2.clone()),
+                ]),
+                model: Some("mock:test-model".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("unavailable top-level compound-model default rejects the whole call");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("mock")),
+        "up-front rejection names the prefix provider: {err:?}"
+    );
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(
+        agents.is_empty(),
+        "no task started before the up-front rejection: {agents:?}"
+    );
+}
+
+/// End to end through `agent.create` (the shared seam `agent.wakeOrCreate`
+/// and delegate's child creation also funnel through): a disabled provider —
+/// explicit param or settings-derived default — is rejected with the "not
+/// enabled" `-32602` before any session row is persisted.
+#[tokio::test]
+async fn create_disabled_provider_rejected_with_not_enabled() {
+    let (_t, svc, ws, _specialists, _cfg) = setup().await;
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    set(&svc, "providers.enabled", json!({ "mock": false }));
+
+    // Explicit provider on the create payload.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("mock".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Blocked".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("disabled explicit provider must fail fast");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not enabled")),
+        "distinct not-enabled rejection: {err:?}"
+    );
+
+    // Settings-derived default provider.
+    set(&svc, "providers.active", json!("mock"));
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Blocked2".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("disabled derived default must fail fast");
+    assert!(
+        matches!(&err, intent_core::Error::InvalidParams(m) if m.contains("not enabled")),
+        "distinct not-enabled rejection: {err:?}"
+    );
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+
+    // Re-enabling unblocks creation on the same provider.
+    set(&svc, "providers.enabled", json!({ "mock": true }));
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK".into()),
+        None,
+        None,
+        None,
+        None,
+        false,
+        intent_core::AgentCreateExtra::default(),
+    )
+    .await
+    .expect("re-enabled provider creates normally");
 }

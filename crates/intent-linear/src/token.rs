@@ -62,8 +62,8 @@ async fn file_store_token() -> Option<String> {
     let handle =
         tokio::task::spawn_blocking(|| intent_core::FileSecretStore::new().load(SECRET_ACCOUNT));
     match timeout(SECRET_LOAD_TIMEOUT, handle).await {
-        Ok(Ok(Ok(Some(v)))) => non_empty(v),
-        Ok(Ok(Ok(None))) => None,
+        Ok(Ok(Ok(Some(v)))) => non_empty(&v),
+        Ok(Ok(Ok(None)) | Err(_)) => None,
         Ok(Ok(Err(e))) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,
@@ -72,7 +72,6 @@ async fn file_store_token() -> Option<String> {
             );
             None
         }
-        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!(
                 account = %SECRET_ACCOUNT,
@@ -85,16 +84,16 @@ async fn file_store_token() -> Option<String> {
 
 /// Read `LINEAR_API_KEY` from the environment.
 fn env_token() -> Option<String> {
-    pick_env_token(std::env::var("LINEAR_API_KEY").ok())
+    pick_env_token(std::env::var("LINEAR_API_KEY").ok().as_deref())
 }
 
 /// Pure selection of the env key (testable), ignoring empty values.
-pub(crate) fn pick_env_token(linear: Option<String>) -> Option<String> {
+pub(crate) fn pick_env_token(linear: Option<&str>) -> Option<String> {
     linear.and_then(non_empty)
 }
 
 /// `Some(s)` only when `s` is non-empty after trimming.
-fn non_empty(s: String) -> Option<String> {
+fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         None
@@ -110,14 +109,14 @@ mod tests {
     #[test]
     fn picks_non_empty_env_key() {
         assert_eq!(
-            pick_env_token(Some("lin_api_abc".into())).as_deref(),
+            pick_env_token(Some("lin_api_abc")).as_deref(),
             Some("lin_api_abc")
         );
     }
 
     #[test]
     fn ignores_empty_values() {
-        assert_eq!(pick_env_token(Some("   ".into())), None);
+        assert_eq!(pick_env_token(Some("   ")), None);
         assert_eq!(pick_env_token(None), None);
     }
 

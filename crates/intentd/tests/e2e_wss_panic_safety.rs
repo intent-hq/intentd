@@ -151,7 +151,7 @@ async fn start_server() -> (WsApiServer, u16, Arc<ClientConfig>, tempfile::TempD
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     (ws, port, cfg, dir)
@@ -189,7 +189,7 @@ async fn next_text(ws: &mut WsClient) -> Value {
             .expect("timed out waiting for text frame")
         {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -271,7 +271,7 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => break,
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
             Ok(other) => panic!("unexpected trailing frame: {other:?}"),
         }
     }

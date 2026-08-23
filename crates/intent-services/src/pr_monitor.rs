@@ -131,7 +131,7 @@ impl SharedPrSnapshot {
             head_sha: self.head_sha.clone(),
             conversation_count: self
                 .conversation_count
-                .unwrap_or_else(|| previous.map(|p| p.conversation_count).unwrap_or(0)),
+                .unwrap_or_else(|| previous.map_or(0, |p| p.conversation_count)),
             review_comment_count: self.review_comment_count,
             requirements: self.requirements.clone(),
         }
@@ -149,7 +149,7 @@ pub(crate) async fn fetch_shared_snapshot(
     let (pr, requirements, review_comment_count) =
         pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     let conversation_count = match sc.list_comments(repo_ref, number).await {
-        Ok(comments) => Some(comments.len() as i64),
+        Ok(comments) => Some(i64::try_from(comments.len()).expect("value fits in i64")),
         Err(e) => {
             tracing::debug!(
                 error = %e,
@@ -225,10 +225,47 @@ pub(crate) fn monitor_label(m: &PrMonitor) -> String {
     crate::harness::latest().pr_monitor_label(&m.repo_owner, &m.repo_name, m.pr_number)
 }
 
+/// Whether a snapshot's merge-requirements checklist reads as truly
+/// mergeable — the `ready` signal gate. GitHub's `mergeable` flag alone
+/// only means "no merge conflicts": a PR blocked by required checks,
+/// missing reviews, or branch protection still reports `mergeable: true`,
+/// so every checklist blocker must be clear — no failing/pending required
+/// checks, no changes-requested/review-required approvals decision (nor a
+/// `none` decision while the branch rules still demand approvals the PR
+/// does not have), no unresolved threads when resolution is required, no
+/// `merge_blocked_reason`, and no blocked/behind/dirty/unknown
+/// `merge_state_status` (`UNKNOWN` means the forge has not established
+/// mergeability yet, so it never promotes).
+fn requirements_ready(req: &MergeRequirements) -> bool {
+    req.state == "open"
+        && !req.is_draft
+        && req.mergeable == Some(true)
+        && !req.has_conflicts
+        && !req.is_behind
+        && req.merge_blocked_reason.is_none()
+        && req.checks.failing_required.is_empty()
+        && req.checks.pending_required.is_empty()
+        && !matches!(
+            req.approvals.decision.as_str(),
+            "changes_requested" | "review_required"
+        )
+        && !(req.approvals.decision == "none"
+            && req
+                .approvals
+                .needed
+                .is_some_and(|needed| req.approvals.have < i64::from(needed)))
+        && !(req.threads.unresolved > 0 && req.threads.resolution_required == Some(true))
+        && !matches!(
+            req.merge_state_status.as_deref(),
+            Some("BLOCKED" | "BEHIND" | "DIRTY" | "UNKNOWN")
+        )
+}
+
 /// Fold a workspace's monitor rows into the displayStatus PR signals
 /// (§6.5): an ACTIVE row whose persisted `last_snapshot` shows the PR
-/// open/draft raises `open` — and `ready` when the snapshot says mergeable
-/// and not draft (the same mapping as a linked open PR) — while the LATEST
+/// open/draft raises `open` — and `ready` only when the snapshot's full
+/// merge-requirements checklist is clear ([`requirements_ready`]; truly
+/// mergeable, not just conflict-free) — while the LATEST
 /// (most recently updated) COMPLETED row raises `merged` when its final
 /// snapshot shows `merged` — matching linked-PR step-6 "latest" semantics,
 /// so an older merged monitor never shadows a newer closed-unmerged one.
@@ -254,7 +291,7 @@ pub(crate) fn fold_monitor_pr_signals(monitors: &[PrMonitor]) -> MonitorPrSignal
                 let req = &snapshot.requirements;
                 if matches!(req.state.as_str(), "open" | "draft") {
                     signals.open = true;
-                    if req.mergeable == Some(true) && !req.is_draft {
+                    if requirements_ready(req) {
                         signals.ready = true;
                     }
                 }
@@ -322,19 +359,22 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitor) -> PullRequestInfo {
         _ if m.state == PrMonitorState::Completed => PullRequestStatus::Closed,
         _ => PullRequestStatus::Open,
     };
-    let url = snapshot.as_ref().map(|s| s.url.clone()).unwrap_or_else(|| {
-        format!(
-            "https://github.com/{}/{}/pull/{}",
-            m.repo_owner, m.repo_name, m.pr_number
-        )
-    });
-    let title = snapshot
-        .as_ref()
-        .map(|s| s.title.clone())
-        .unwrap_or_else(|| format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number));
+    let url = snapshot.as_ref().map_or_else(
+        || {
+            format!(
+                "https://github.com/{}/{}/pull/{}",
+                m.repo_owner, m.repo_name, m.pr_number
+            )
+        },
+        |s| s.url.clone(),
+    );
+    let title = snapshot.as_ref().map_or_else(
+        || format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number),
+        |s| s.title.clone(),
+    );
     PullRequestInfo {
         id: m.pr_number.to_string(),
-        number: m.pr_number as u64,
+        number: m.pr_number.cast_unsigned(),
         url,
         title,
         status,
@@ -514,6 +554,10 @@ impl Services {
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
     /// than persisting a monitor that could never poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -524,7 +568,7 @@ impl Services {
     ) -> Result<(PrMonitor, MergeRequirements)> {
         let existing = self
             .store
-            .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number as i64)
+            .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
             .await?;
         if existing.is_none() {
             let cap = self.pr_monitors_max_per_agent as usize;
@@ -559,7 +603,7 @@ impl Services {
                 agent_id: agent_id.clone(),
                 repo_owner: repo_owner.to_string(),
                 repo_name: repo_name.to_string(),
-                pr_number: pr_number as i64,
+                pr_number: pr_number.cast_signed(),
                 state: PrMonitorState::Active,
                 last_snapshot: baseline.clone(),
                 baseline_snapshot: baseline.clone(),
@@ -575,7 +619,7 @@ impl Services {
                 monitor = Some(m);
             } else if let Some(winner) = self
                 .store
-                .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number as i64)
+                .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
                 .await?
             {
                 // Lost an insert race against a concurrent register of the
@@ -736,6 +780,10 @@ impl Services {
     /// (`ws.pr.unmonitor`): a non-owner is rejected and the owner gets no
     /// self-wake. The FE path (`caller = None`, `prMonitor.cancel`) cancels
     /// any monitor and notifies the owning agent that its monitor is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the monitor does not exist in the workspace; `Error::InvalidParams` if the caller does not own the monitor or the monitor is not active.
     pub async fn pr_monitor_cancel(
         &self,
         workspace_id: &WorkspaceId,
@@ -820,11 +868,11 @@ impl Services {
         match wake_notice {
             Some(notice) => {
                 self.wake_pr_monitor_owner(&monitor, notice, "cancelled")
-                    .await
+                    .await;
             }
             None => {
                 self.resettle_owner_after_pr_monitor_terminal(&monitor)
-                    .await
+                    .await;
             }
         }
         // A cancelled monitor's open-PR signal lapses — the derived
@@ -932,7 +980,9 @@ impl Services {
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
         let shared =
-            match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64).await {
+            match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number.cast_unsigned())
+                .await
+            {
                 Ok(shared) => shared,
                 Err(e) => {
                     self.record_pr_monitor_error(&monitor, &e.to_string()).await;
@@ -955,6 +1005,7 @@ impl Services {
     /// Spawn the ONE centralized poll loop: every `[prMonitor] pollSeconds`
     /// (re-read each tick), poll every DUE active monitor. Returns the task
     /// handle so the composition root can hold/abort it.
+    #[must_use]
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         tokio::spawn(async move {
@@ -1039,7 +1090,11 @@ impl Services {
                     // wedging the sweep for every other monitor.
                     let fetched = match tokio::time::timeout(
                         self.pr_monitor_fetch_timeout,
-                        fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64),
+                        fetch_shared_snapshot(
+                            sc.as_ref(),
+                            &repo_ref,
+                            monitor.pr_number.cast_unsigned(),
+                        ),
                     )
                     .await
                     {
@@ -1091,7 +1146,8 @@ impl Services {
         let Some(at) = monitor.last_polled_at.as_deref().and_then(parse_iso) else {
             return false;
         };
-        let interval = time::Duration::seconds(self.pr_monitor_poll_interval().as_secs() as i64);
+        let interval =
+            time::Duration::seconds(self.pr_monitor_poll_interval().as_secs().cast_signed());
         time::OffsetDateTime::now_utc() - at < interval
     }
 
@@ -1116,8 +1172,7 @@ impl Services {
         // the EMIT baseline instead, so the two diffs serve distinct roles.
         let poll_activity = previous
             .as_ref()
-            .map(|prev| !diff_snapshots(prev, &fresh).is_empty())
-            .unwrap_or(false);
+            .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -1267,7 +1322,7 @@ impl Services {
     /// An unparseable/absent anchor emits immediately rather than stranding
     /// a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
-        let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs() as i64);
+        let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs().cast_signed());
         let now = time::OffsetDateTime::now_utc();
         if let Some(since) = monitor.pending_since.as_deref().and_then(parse_iso) {
             if now - since >= window * PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR {
@@ -1360,8 +1415,10 @@ impl Services {
             .baseline_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
-            .map(|base| diff_snapshots(&base, snapshot))
-            .unwrap_or_else(|| monitor.pending_changes.clone());
+            .map_or_else(
+                || monitor.pending_changes.clone(),
+                |base| diff_snapshots(&base, snapshot),
+            );
         let message = render_terminal_wake(monitor, &changes, snapshot);
         let now = now_iso();
         if !self
@@ -1494,14 +1551,21 @@ impl Services {
     /// backfilled the baseline to the last poll's snapshot) is delivered
     /// as-is BEFORE that first poll — a wake awaiting delivery at upgrade
     /// time is never dropped. Returns the number of resumed monitors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if loading the persisted monitors, an owner status lookup, or re-emitting pending changes fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_pr_monitors(&self) -> Result<usize> {
         let monitors = self.store.load_active_pr_monitors().await?;
         let mut resumed = 0;
         for mut monitor in monitors {
             let owner_gone = match self.store.get_agent_session_status(&monitor.agent_id).await {
-                Ok(AgentStatus::Deleted) => true,
+                Ok(AgentStatus::Deleted) | Err(Error::NotFound(_)) => true,
                 Ok(_) => false,
-                Err(Error::NotFound(_)) => true,
                 Err(e) => return Err(e),
             };
             if owner_gone {
@@ -1597,12 +1661,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         repo: Option<String>,
     ) -> Result<(String, String)> {
-        match repo {
-            Some(slug) => pr_ops::parse_repo_slug(&slug),
-            None => {
-                let ws = self.store.get_workspace(workspace_id).await?;
-                pr_ops::repo_of(&ws)
-            }
+        if let Some(slug) = repo {
+            pr_ops::parse_repo_slug(&slug)
+        } else {
+            let ws = self.store.get_workspace(workspace_id).await?;
+            pr_ops::repo_of(&ws)
         }
     }
 
@@ -1640,7 +1703,7 @@ impl Services {
         let (owner, name) = self.resolve_monitor_repo(workspace_id, repo).await?;
         let existing = self
             .store
-            .find_active_pr_monitor(agent_id, &owner, &name, pr_number as i64)
+            .find_active_pr_monitor(agent_id, &owner, &name, pr_number.cast_signed())
             .await?
             .ok_or_else(|| {
                 Error::NotFound(format!(
@@ -1852,7 +1915,7 @@ impl Services {
             metadata: None,
             data,
         };
-        publish_event(&self.event_bus, event).await;
+        publish_event(self.event_bus.as_ref(), event).await;
     }
 }
 
@@ -2432,6 +2495,19 @@ mod tests {
         };
         f(&mut s);
         s
+    }
+
+    /// Clear every merge-requirements blocker on the [`snapshot`] fixture —
+    /// the truly-mergeable checklist shape [`requirements_ready`] accepts.
+    fn ready_requirements(req: &mut MergeRequirements) {
+        req.checks.passed = 1;
+        req.checks.pending = 0;
+        req.checks.items[0].status = "passed".into();
+        req.checks.pending_required.clear();
+        req.approvals.decision = "approved".into();
+        req.approvals.have = 1;
+        req.threads.unresolved = 0;
+        req.merge_state_status = Some("CLEAN".into());
     }
 
     #[test]
@@ -4148,17 +4224,22 @@ mod tests {
     /// An ACTIVE PR monitor on an open PR both sets the orthogonal
     /// `waiting` flag on the list/get enrichment path AND feeds the PR
     /// rungs of the derived `displayStatus`: with every task done the
-    /// rollup reads `pr_ready` (the stub PR is open + mergeable, not
-    /// draft) instead of falling through to `complete`. Cancelling the
+    /// rollup reads `pr_ready` (the stub PR is open, not draft, and its
+    /// merge-requirements checklist is clear once the required check
+    /// passes) instead of falling through to `complete`. Cancelling the
     /// monitor lapses both — the flag drops and the rollup returns to the
     /// base `complete`.
     #[tokio::test]
     async fn active_pr_monitor_sets_waiting_and_feeds_the_pr_rungs() {
-        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
         svc.store()
             .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
             .await
             .expect("insert task");
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         let monitor = register(&svc, &ws, &owner).await;
 
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
@@ -4188,11 +4269,28 @@ mod tests {
         );
     }
 
+    /// Regression: an active monitor on an open PR that is merely
+    /// conflict-free (`mergeable: true`) but still blocked by its
+    /// merge-requirements checklist (the default stub: a pending required
+    /// check) reads `pr_open`, never `pr_ready`.
+    #[tokio::test]
+    async fn active_pr_monitor_blocked_checklist_reads_pr_open() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrOpen),
+            "a blocked checklist keeps the rollup at pr_open"
+        );
+    }
+
     /// The snapshot→signal fold: active open/draft rows raise `open` (and
-    /// `ready` only when mergeable + not draft), completed merged rows
-    /// raise `merged`, and rows with no/unparseable snapshots, non-merged
-    /// completed rows, or active rows already showing a terminal snapshot
-    /// contribute nothing.
+    /// `ready` only when the full merge-requirements checklist is clear +
+    /// not draft), completed merged rows raise `merged`, and rows with
+    /// no/unparseable snapshots, non-merged completed rows, or active rows
+    /// already showing a terminal snapshot contribute nothing.
     #[test]
     fn fold_monitor_pr_signals_maps_rows_to_signals() {
         let ws = WorkspaceId::new();
@@ -4222,8 +4320,11 @@ mod tests {
             Some(serde_json::to_string(&s).unwrap())
         };
 
-        // Active + open + mergeable + not draft → open and ready.
-        let ready = mk(PrMonitorState::Active, snap(|_| {}));
+        // Active + open + clear checklist + not draft → open and ready.
+        let ready = mk(
+            PrMonitorState::Active,
+            snap(|s| ready_requirements(&mut s.requirements)),
+        );
         assert_eq!(
             fold_monitor_pr_signals(std::slice::from_ref(&ready)),
             MonitorPrSignals {
@@ -4232,7 +4333,10 @@ mod tests {
                 merged: false
             }
         );
-        // Draft, or not mergeable → open only.
+        // Draft, not mergeable, or a blocked checklist (the default
+        // fixture: pending required check, review required, unresolved
+        // thread, BLOCKED merge state — despite `mergeable: Some(true)`,
+        // the intent-hq/intentd#1350 regression shape) → open only.
         let draft = mk(
             PrMonitorState::Active,
             snap(|s| {
@@ -4244,7 +4348,33 @@ mod tests {
             PrMonitorState::Active,
             snap(|s| s.requirements.mergeable = Some(false)),
         );
-        for m in [&draft, &unmergeable] {
+        let blocked = mk(PrMonitorState::Active, snap(|_| {}));
+        // A `none` decision (provider reviewDecision unavailable) while the
+        // branch rules still demand an approval the PR does not have.
+        let missing_required_approval = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.requirements.approvals.decision = "none".into();
+                s.requirements.approvals.have = 0;
+                s.requirements.approvals.needed = Some(1);
+            }),
+        );
+        // GraphQL `UNKNOWN` merge state: mergeability not yet established.
+        let unknown_state = mk(
+            PrMonitorState::Active,
+            snap(|s| {
+                ready_requirements(&mut s.requirements);
+                s.requirements.merge_state_status = Some("UNKNOWN".into());
+            }),
+        );
+        for m in [
+            &draft,
+            &unmergeable,
+            &blocked,
+            &missing_required_approval,
+            &unknown_state,
+        ] {
             assert_eq!(
                 fold_monitor_pr_signals(std::slice::from_ref(m)),
                 MonitorPrSignals {
@@ -4350,7 +4480,7 @@ mod tests {
             head_sha: None,
             author: None,
             mergeable: Some(true),
-            mergeable_state: None,
+            mergeable_state: Some("clean".into()),
             is_draft: Some(false),
         });
         svc.store().update_workspace(&row).await.expect("update");
@@ -4416,13 +4546,17 @@ mod tests {
     }
 
     /// Monitor lifecycle transitions move the derived `displayStatus`
-    /// through the PR rungs (§6.5): registering on an open mergeable PR
-    /// emits the `pr_ready` promotion, a no-op recompute stays silent, and
-    /// cancelling emits the demotion back to the base rollup (`idle` here:
-    /// no tasks, no linked PR).
+    /// through the PR rungs (§6.5): registering on an open PR with a clear
+    /// merge-requirements checklist emits the `pr_ready` promotion, a
+    /// no-op recompute stays silent, and cancelling emits the demotion
+    /// back to the base rollup (`idle` here: no tasks, no linked PR).
     #[tokio::test]
     async fn monitor_transitions_emit_display_status_through_the_pr_rungs() {
-        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
@@ -4432,7 +4566,7 @@ mod tests {
         assert_eq!(
             display_status_events(&svc, &ws).await,
             vec!["pr_ready".to_string()],
-            "an active monitor on an open mergeable PR promotes to pr_ready"
+            "an active monitor on an open truly-mergeable PR promotes to pr_ready"
         );
 
         // Re-running the recompute without a transition emits nothing.
@@ -4460,6 +4594,10 @@ mod tests {
     #[tokio::test]
     async fn completion_and_rehydration_cancel_drop_the_waiting_flag() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         svc.maybe_emit_display_status_changed(&ws).await;
 
         register(&svc, &ws, &owner).await;
@@ -4555,6 +4693,10 @@ mod tests {
     async fn archive_cancels_active_pr_monitors_and_drops_waiting() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.approvals.push("reviewer".into());
+        });
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         // A terminal (`completed`, not `cancelled`) monitor first — merged

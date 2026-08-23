@@ -379,6 +379,7 @@ async fn merge_squash_creates_single_commit_on_trunk() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 #[tokio::test]
 async fn undo_push_rewinds_remote_branch() {
     let base = tmp_base("undo-push");

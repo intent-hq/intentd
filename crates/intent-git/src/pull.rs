@@ -1,7 +1,7 @@
 //! Branch pull (`git.pull`), porting the legacy `git:pullBranch` IPC handler.
 //!
 //! The workspace-create flow auto-pulls a behind branch before creating the
-//! workspace. Semantics ported from the TS handler (`git.ipc.ts` PULL_BRANCH):
+//! workspace. Semantics ported from the TS handler (`git.ipc.ts` `PULL_BRANCH`):
 //! when `branch_name` is not the checked-out branch, a fetch of
 //! `origin/<branch>` is sufficient (worktrees are created from the
 //! remote-tracking ref); when it is checked out, run the equivalent of
@@ -33,6 +33,10 @@ const POP_CONFLICT_MSG: &str = "Pull succeeded but your local changes conflict w
 /// workflow. `token` is an optional caller-resolved GitHub token forwarded to
 /// the fetch step (see [`crate::fetch::fetch`]). Returns the outcome rather
 /// than an `Err` for the expected failure paths (matching the TS contract).
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository cannot be opened or the fetch step fails; expected pull/stash conflicts are reported in the returned outcome, not as `Err`.
 pub fn pull_branch(
     repo_path: &Path,
     branch_name: &str,
@@ -128,7 +132,7 @@ pub fn pull_branch(
 /// markers). Returns whether the apply left index conflicts.
 fn pop_stash(repo: &mut Repository) -> std::result::Result<bool, git2::Error> {
     repo.stash_apply(0, None)?;
-    let conflicted = repo.index().map(|i| i.has_conflicts()).unwrap_or(false);
+    let conflicted = repo.index().is_ok_and(|i| i.has_conflicts());
     if !conflicted {
         repo.stash_drop(0)?;
     }

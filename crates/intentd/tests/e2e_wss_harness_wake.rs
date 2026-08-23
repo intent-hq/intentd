@@ -42,7 +42,7 @@ use uuid::Uuid;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 /// The three unsolicited chunk texts the mock emits on wake — one
-/// `session/update` agent_message_chunk per trigger-file line.
+/// `session/update` `agent_message_chunk` per trigger-file line.
 const WAKE_LINES: [&str; 3] = [
     "[compaction] context window compacted. ",
     "Background task finished: ",
@@ -60,7 +60,7 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
@@ -208,7 +208,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -232,7 +232,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -356,7 +356,8 @@ async fn wake_setup(script: &str, behavior: &str) -> WakeSetup {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -557,6 +558,85 @@ async fn harness_wake_burst_streams_as_agent_initiated_turn_over_wss() {
     }
 }
 
+/// WAKE-3 (intent-hq/monorepo#3262): a harness-wake burst whose entire
+/// output is one whitespace-only chunk (the incident's bare "\n") is a
+/// FAILED recovery, not a successful completion. The agent here is
+/// root/user-facing (not redrive-eligible), so over the wire the daemon
+/// must: emit `agent:attention-requested` `{ kind: "blocker" }`, stamp the
+/// wake `agent:idle` with `emptyWakeResponse: true`, and leave the
+/// persisted session carrying `attentionRequest*` fields — the workspace
+/// shows "turn ended unexpectedly" instead of idling silently.
+#[tokio::test]
+async fn empty_wake_response_surfaces_attention_over_wss() {
+    let Some(script) = gate("WSS empty-wake attention E2E") else {
+        return;
+    };
+    let behavior = json!({ "response": "warmup done" }).to_string();
+    let mut setup = wake_setup(&script, &behavior).await;
+    let agent_id = setup.agent_id.clone();
+
+    // Fire the incident-shaped burst: ONE chunk containing a bare newline.
+    std::fs::write(&setup.trigger_file, "<NEWLINE_ONLY>\n").expect("write wake trigger");
+
+    let mut saw_attention = false;
+    let mut saw_idle = false;
+    let mut idle_frame = Value::Null;
+    for _ in 0..300 {
+        let frame = wss_event(&mut setup.sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:attention-requested") => {
+                assert_eq!(
+                    event["data"]["kind"], "blocker",
+                    "empty-wake attention is a blocker: {frame}"
+                );
+                let reason = event["data"]["reason"].as_str().unwrap_or_default();
+                assert!(
+                    reason.contains("Turn ended unexpectedly"),
+                    "reason names the unexpected turn end: {frame}"
+                );
+                saw_attention = true;
+            }
+            Some("agent:idle") => {
+                assert_eq!(
+                    event["data"]["reason"], "harness_wake_complete",
+                    "wake idle reason: {frame}"
+                );
+                saw_idle = true;
+                idle_frame = frame.clone();
+            }
+            Some("agent:failed") => panic!("agent:failed during empty-wake scenario: {frame}"),
+            _ => {}
+        }
+        if saw_attention && saw_idle {
+            break;
+        }
+    }
+    assert!(saw_attention, "agent:attention-requested observed");
+    assert!(saw_idle, "wake agent:idle observed");
+    assert_eq!(
+        idle_frame["params"]["event"]["data"]["emptyWakeResponse"],
+        json!(true),
+        "wake idle carries the advisory emptyWakeResponse flag: {idle_frame}"
+    );
+
+    // The attention request is durable on the session (agent.getSession).
+    let got = wss_rpc(
+        &mut setup.rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": setup.ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        got["session"]["attentionRequestKind"], "blocker",
+        "session carries the persisted attention request: {got}"
+    );
+}
+
 /// WAKE-2 (monorepo#855): a user `agent.sendMessage` racing in mid-wake
 /// queues behind the wake turn's single-flight slot (never interleaves),
 /// preempts the settle window, suppresses the wake `agent:idle`, and
@@ -640,17 +720,7 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
         match event["type"].as_str() {
             Some("chat:stream:delta") => {
                 let data = serde_json::to_string(&event["data"]).unwrap_or_default();
-                if !saw_wake_end {
-                    assert_eq!(
-                        event["data"]["messageId"].as_str(),
-                        Some(wake_message_id.as_str()),
-                        "pre-end chunks belong to the wake turn: {frame}"
-                    );
-                    assert!(
-                        !data.contains("racing turn response"),
-                        "racing response must not interleave with the wake turn: {frame}"
-                    );
-                } else {
+                if saw_wake_end {
                     let mid = event["data"]["messageId"]
                         .as_str()
                         .expect("racing chunk messageId")
@@ -661,23 +731,33 @@ async fn racing_user_send_queues_behind_wake_turn_over_wss() {
                     );
                     racing_message_id = Some(mid);
                     racing_text.push_str(&data);
-                }
-            }
-            Some("agent:stream:end") => {
-                if !saw_wake_end {
+                } else {
                     assert_eq!(
                         event["data"]["messageId"].as_str(),
                         Some(wake_message_id.as_str()),
-                        "wake turn's terminal stream:end carries its messageId: {frame}"
+                        "pre-end chunks belong to the wake turn: {frame}"
                     );
-                    saw_wake_end = true;
-                } else {
+                    assert!(
+                        !data.contains("racing turn response"),
+                        "racing response must not interleave with the wake turn: {frame}"
+                    );
+                }
+            }
+            Some("agent:stream:end") => {
+                if saw_wake_end {
                     assert_eq!(
                         event["data"]["messageId"].as_str(),
                         racing_message_id.as_deref(),
                         "racing turn's stream:end carries its own messageId: {frame}"
                     );
                     saw_racing_end = true;
+                } else {
+                    assert_eq!(
+                        event["data"]["messageId"].as_str(),
+                        Some(wake_message_id.as_str()),
+                        "wake turn's terminal stream:end carries its messageId: {frame}"
+                    );
+                    saw_wake_end = true;
                 }
             }
             Some("agent:idle") => {

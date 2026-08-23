@@ -1,5 +1,5 @@
 //! Transport + handshake tests against an in-memory mock agent and (on unix) a
-//! real `sh` mock child process (§6.2–§6.4 DoD).
+//! real `sh` mock child process (§6.2–§6.4 `DoD`).
 
 use std::time::Duration;
 
@@ -198,7 +198,7 @@ async fn dropped_request_future_cleans_pending_map_entry() {
     // Drive the future far enough to write the request and insert the entry.
     tokio::select! {
         _ = &mut fut => panic!("request must still be pending"),
-        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
     assert_eq!(conn.pending_len(), 1, "in-flight request is correlated");
     drop(fut);
@@ -243,7 +243,9 @@ async fn stderr_captured_and_auth_flagged() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stderr_capture_written_to_daily_log_file() {
+    // STAB-56: the capture dir and daily log file are created owner-only.
     use crate::spawn::{spawn_provider, SpawnOptions};
+    use std::os::unix::fs::PermissionsExt;
 
     let tmp = test_temp_dir("intent-acp-stderr-");
     let dir = tmp.path().join("logs");
@@ -298,8 +300,6 @@ async fn stderr_capture_written_to_daily_log_file() {
         "second stderr line captured; got: {content:?}"
     );
 
-    // STAB-56: the capture dir and daily log file are created owner-only.
-    use std::os::unix::fs::PermissionsExt;
     let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "capture dir must be owner-only");
     let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
@@ -364,7 +364,7 @@ async fn spawn_real_child_handshake() {
     agent.kill().await.ok();
 }
 
-/// Session-lifecycle + streaming-mapping tests (§6.5/§6.6 DoD).
+/// Session-lifecycle + streaming-mapping tests (§6.5/§6.6 `DoD`).
 mod session_tests {
     use super::*;
 
@@ -409,7 +409,6 @@ mod session_tests {
                         json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
                     }
                     "session/new" => json!({ "sessionId": "acp-session-1" }),
-                    "session/load" => json!({}),
                     "session/prompt" => prompt_result.clone(),
                     _ => json!({}),
                 };
@@ -465,7 +464,7 @@ mod session_tests {
                 }
             }),
         );
-        meta.insert("systemPrompt".to_string(), json!({"append": "test prompt"}));
+        meta.insert("systemPrompt".to_string(), json!("test prompt"));
 
         let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
             .await
@@ -485,9 +484,9 @@ mod session_tests {
             "session/new for claude-code must inject disallowedTools"
         );
         assert_eq!(
-            meta_payload["systemPrompt"]["append"],
+            meta_payload["systemPrompt"],
             json!("test prompt"),
-            "session/new systemPrompt.append preserved"
+            "session/new systemPrompt string (full replacement) preserved"
         );
     }
 
@@ -564,12 +563,7 @@ mod session_tests {
                 }
             }),
         );
-        let mut system_prompt_obj = serde_json::Map::new();
-        system_prompt_obj.insert("append".to_string(), json!("Resumed prompt"));
-        meta.insert(
-            "systemPrompt".to_string(),
-            serde_json::Value::Object(system_prompt_obj),
-        );
+        meta.insert("systemPrompt".to_string(), json!("Resumed prompt"));
 
         session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new(), Some(meta))
             .await
@@ -587,9 +581,9 @@ mod session_tests {
             "session/load for claude-code must inject disallowedTools"
         );
         assert_eq!(
-            meta_payload["systemPrompt"]["append"],
+            meta_payload["systemPrompt"],
             json!("Resumed prompt"),
-            "session/load for claude-code must inject systemPrompt.append when provided"
+            "session/load systemPrompt string (full replacement) preserved"
         );
     }
 
@@ -1536,7 +1530,7 @@ mod session_tests {
 }
 
 /// Agent→BE MCP server, config conversions, env baseline/redaction, and the
-/// per-agent-type tool denylist (§6.8 / §18.4 DoD).
+/// per-agent-type tool denylist (§6.8 / §18.4 `DoD`).
 mod mcp_tests {
     use std::ffi::OsStr;
     use std::path::Path;
@@ -1566,10 +1560,10 @@ mod mcp_tests {
 
     /// A `WorkspaceApi` that records the `add_to_note` calls it receives so a tool
     /// call through the MCP server can be observed as a state change.
-    /// A recorded `git_agent_commit` call: (message, agent_id, linked_note_id).
+    /// A recorded `git_agent_commit` call: (message, `agent_id`, `linked_note_id`).
     type CommitRecord = (String, Option<String>, Option<String>);
     /// A recorded `agent_create` call:
-    /// (name, specialist, parent_agent_id, idempotency_key, metadata).
+    /// (name, specialist, `parent_agent_id`, `idempotency_key`, metadata).
     type AgentCreateRecord = (
         Option<String>,
         Option<String>,
@@ -1582,18 +1576,18 @@ mod mcp_tests {
     pub(super) struct MockApi {
         pub(super) added: Mutex<Vec<(String, String)>>,
         pub(super) committed: Mutex<Vec<CommitRecord>>,
-        /// Recorded `create_note` calls: (title, idempotency_key).
+        /// Recorded `create_note` calls: (title, `idempotency_key`).
         pub(super) created: Mutex<Vec<(String, Option<String>)>>,
         pub(super) agent_creates: Mutex<Vec<AgentCreateRecord>>,
-        /// Recorded `agent_send_message` calls: (agent_id, content).
+        /// Recorded `agent_send_message` calls: (`agent_id`, content).
         pub(super) sent: Mutex<Vec<(String, String)>>,
-        /// Recorded `assign_agent` calls: (note_id, agent_id).
+        /// Recorded `assign_agent` calls: (`note_id`, `agent_id`).
         pub(super) assigned: Mutex<Vec<(String, String)>>,
-        /// Recorded `agent_watch_completion` calls: (parent_id, child_id).
+        /// Recorded `agent_watch_completion` calls: (`parent_id`, `child_id`).
         pub(super) watched: Mutex<Vec<(String, String)>>,
-        /// Recorded `agent_watch_completion_for_sender` calls: (caller_id, target_id).
+        /// Recorded `agent_watch_completion_for_sender` calls: (`caller_id`, `target_id`).
         pub(super) sender_watched: Mutex<Vec<(String, String)>>,
-        /// Recorded `get_my_task` calls: task_note_id.
+        /// Recorded `get_my_task` calls: `task_note_id`.
         pub(super) get_my_task_calls: Mutex<Vec<String>>,
     }
 
@@ -1616,14 +1610,14 @@ mod mcp_tests {
                         workspace_id,
                         title: input.title,
                         content: input.content.unwrap_or_default(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 0,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -2310,7 +2304,7 @@ mod mcp_tests {
 }
 
 /// Client-served handler tests: fs sandbox + events, permission resolve/timeout,
-/// and the terminal stub (§6.7 / PROTOCOL §8 DoD).
+/// and the terminal stub (§6.7 / PROTOCOL §8 `DoD`).
 mod client_served_tests {
     use super::*;
 
@@ -4026,7 +4020,8 @@ mod mcp_bridge_tests {
                         guard.armed = false;
                     }
                     let payload_len =
-                        message["params"]["payload_len"].as_u64().unwrap_or(0) as usize;
+                        usize::try_from(message["params"]["payload_len"].as_u64().unwrap_or(0))
+                            .expect("value fits in usize");
                     Some(json!({
                         "jsonrpc": "2.0", "id": id,
                         "result": { "ok": true, "payload": "x".repeat(payload_len) }
@@ -4146,7 +4141,7 @@ mod mcp_bridge_tests {
             for _ in 0..n {
                 let resp = read_response(&mut reader).await;
                 let id = resp["id"].as_i64().expect("id must survive intact");
-                let expected_len = (64 * 1024 + id) as usize;
+                let expected_len = usize::try_from(64 * 1024 + id).expect("value fits in usize");
                 assert_eq!(
                     resp["result"]["payload"].as_str().unwrap().len(),
                     expected_len,
@@ -4154,7 +4149,7 @@ mod mcp_bridge_tests {
                 );
                 assert!(seen.insert(id), "duplicate response for id {id}");
             }
-            assert_eq!(seen.len(), n as usize);
+            assert_eq!(seen.len(), usize::try_from(n).expect("value fits in usize"));
         }
 
         #[tokio::test]
@@ -4641,7 +4636,7 @@ mod mcp_bridge_tests {
         async fn initial_buffer_overflow_falls_back_to_retryable_error() {
             let addr = reserve_free_addr().await;
             let mut bridge = spawn_bridge(addr, fast_cfg());
-            for id in 0..(INITIAL_BUFFER_MAX_LINES as i64) {
+            for id in 0..(i64::try_from(INITIAL_BUFFER_MAX_LINES).expect("small const")) {
                 bridge.send_request(id).await;
             }
             // The line past the cap is rejected with the retryable error.
@@ -5829,13 +5824,9 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Byte-identity needs every gate open, `taskGraph` (opt-in) included.
-        let all_on_srv = server("amber-forest", None).with_agent_features(
-            intent_core::settings_file::AgentFeaturesSettings {
-                task_graph: true,
-                ..Default::default()
-            },
-        );
+        // Byte-identity needs every gate open (the defaults).
+        let all_on_srv = server("amber-forest", None)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -5880,6 +5871,52 @@ mod workspace_api_tool_tests {
         assert!(
             !desc.contains("ws.hook."),
             "feature pruning must still apply alongside the options injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_compact_flag_serves_compact_description() {
+        // A bridge flagged for a truncating provider serves the compact
+        // `workspace_api` description (whole text under the ~2k cutoff, no
+        // API sections), while `full_workspace_api_description()` returns
+        // exactly what the unflagged bridge's tools/list serves — the text
+        // the spawn path appends to the system prompt.
+        let compact_srv = server("amber-forest", None)
+            .with_agent_features(no_hooks_features())
+            .with_compact_tool_descriptions(true);
+        let resp = compact_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let compact = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            compact.len() <= 2000,
+            "compact description is {} bytes, over the ~2k truncation cutoff",
+            compact.len()
+        );
+        assert!(
+            !compact.contains("\nAPI:"),
+            "compact description must not carry the API sections"
+        );
+        assert!(
+            !compact.contains("ws.hook."),
+            "feature pruning must still apply to the compact description"
+        );
+        assert!(
+            compact.contains("system prompt"),
+            "compact description must point at the system-prompt reference"
+        );
+
+        let full_srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = full_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let full = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            compact_srv.full_workspace_api_description(),
+            full,
+            "full_workspace_api_description must match the unflagged tools/list text"
         );
     }
 
@@ -6016,14 +6053,11 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A top-level bridge with every gate open (`taskGraph` opted in)
-        // stays byte-identical to the static const.
+        // A top-level bridge with every gate open (the defaults) stays
+        // byte-identical to the static const.
         let top = server("amber-forest", None)
             .with_sub_agent(false)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
-                task_graph: true,
-                ..Default::default()
-            });
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -6137,6 +6171,7 @@ mod wsapi3_bindings_tests {
     /// test can inspect the peel result; unknown noteIds surface `NotFound`
     /// so the error-path tests can prove JS-visible failures.
     #[derive(Default)]
+    #[allow(clippy::struct_field_names)] // fields mirror the recorded method names
     struct FakeApi {
         get_note_calls: Mutex<Vec<String>>,
         create_note_calls: Mutex<Vec<CreateNoteCall>>,
@@ -6171,13 +6206,13 @@ mod wsapi3_bindings_tests {
             workspace_id: ws.clone(),
             title: format!("title-{id}"),
             content: "line one\nline two\n![alt](workspace-asset://ws/asset-1)".to_string(),
-            content_type: Default::default(),
+            content_type: intent_core::ContentType::default(),
             tags: vec!["a".to_string()],
             is_pinned: false,
             is_archived: false,
             is_default: false,
             parent_id: None,
-            visibility: Default::default(),
+            visibility: intent_core::NoteVisibility::default(),
             metadata: NoteMetadata { task },
             created_at: "2026-01-01T00:00:00Z".to_string(),
             rev: 1,
@@ -6236,14 +6271,14 @@ mod wsapi3_bindings_tests {
                         workspace_id: ws.clone(),
                         title: "First".to_string(),
                         content: String::new(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: vec!["red".to_string()],
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6253,14 +6288,14 @@ mod wsapi3_bindings_tests {
                         workspace_id: ws,
                         title: "Second".to_string(),
                         content: String::new(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: vec!["blue".to_string()],
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6289,14 +6324,14 @@ mod wsapi3_bindings_tests {
                         workspace_id,
                         title: input.title,
                         content: input.content.unwrap_or_default(),
-                        content_type: Default::default(),
+                        content_type: intent_core::ContentType::default(),
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
                         is_archived: false,
                         is_default: false,
                         parent_id: None,
-                        visibility: Default::default(),
-                        metadata: Default::default(),
+                        visibility: intent_core::NoteVisibility::default(),
+                        metadata: intent_core::NoteMetadata::default(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         rev: 1,
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6796,10 +6831,10 @@ mod wsapi3_bindings_tests {
                         kind: CommentType::Comment,
                         content: "root".to_string(),
                         author: "Agent".to_string(),
-                        author_type: Default::default(),
-                        status: Default::default(),
+                        author_type: intent_core::AuthorType::default(),
+                        status: intent_core::CommentStatus::default(),
                         parent_id: None,
-                        anchor: Default::default(),
+                        anchor: Option::default(),
                         anchor_text: None,
                         anchor_context: None,
                         suggestion_diff: None,
@@ -6846,10 +6881,10 @@ mod wsapi3_bindings_tests {
                         kind: CommentType::Comment,
                         content: comment,
                         author: "Agent".to_string(),
-                        author_type: Default::default(),
-                        status: Default::default(),
+                        author_type: intent_core::AuthorType::default(),
+                        status: intent_core::CommentStatus::default(),
                         parent_id: None,
-                        anchor: Default::default(),
+                        anchor: Option::default(),
                         anchor_text: None,
                         anchor_context: None,
                         suggestion_diff: None,
@@ -7521,14 +7556,14 @@ mod wsapi3_bindings_tests {
         let (srv, api) = server();
         let resp = call(
             &srv,
-            r#"
+            r"
             const [a, b, c] = await Promise.all([
                 ws.note.list(),
                 ws.note.listTasks('n-1'),
                 ws.task.getMyTask('task-1'),
             ]);
             return { listLen: a.length, taskRows: b.length, taskTitle: c.title };
-            "#,
+            ",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7568,6 +7603,11 @@ mod wsapi6_bindings_tests {
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
+        /// When set, `browser_exec` shapes this raw FE envelope through the
+        /// real `intent_services::browser_ops::shape_agent_result` — the same
+        /// seam the production `Services::browser_exec` uses — so the JS
+        /// dispatch tests exercise real shaping instead of canned replies.
+        browser_exec_fe_envelope: Mutex<Option<Value>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -7671,10 +7711,18 @@ mod wsapi6_bindings_tests {
                 tab_id,
                 agent_id.map(|a| a.as_str().to_string()),
             ));
+            let fe_envelope = self.browser_exec_fe_envelope.lock().unwrap().clone();
             // Reference parity: a single-action batch yields the sole action's
             // envelope; multi-action yields `{ results: [...] }`. The fake
             // stands in for what the reverse channel would have returned.
             Box::pin(async move {
+                if let Some(envelope) = fe_envelope {
+                    return intent_services::browser_ops::shape_agent_result(
+                        &envelope,
+                        actions.len(),
+                    )
+                    .map_err(|e| intent_core::Error::Internal(e.message));
+                }
                 if actions.len() == 1 {
                     Ok(json!({
                         "action": "listTabs",
@@ -7906,7 +7954,7 @@ mod wsapi6_bindings_tests {
         let (srv, api) = server_with_caller("agent-77");
         let resp = call(
             &srv,
-            r#"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');"#,
+            r"return await ws.browser.exec([{ action: 'listTabs' }], 'tab-1');",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7930,10 +7978,10 @@ mod wsapi6_bindings_tests {
         let (srv, _api) = server();
         let resp = call(
             &srv,
-            r#"return await ws.browser.exec([
+            r"return await ws.browser.exec([
                 { action: 'listTabs' },
                 { action: 'screenshot' }
-            ]);"#,
+            ]);",
         )
         .await;
         assert_eq!(resp["result"]["isError"], json!(false));
@@ -7941,6 +7989,130 @@ mod wsapi6_bindings_tests {
         // Multi-action batch → { results: [...] } passthrough from the fake
         // reverse channel; matches transport `shape_result` behaviour.
         assert_eq!(v["results"].as_array().unwrap().len(), 2);
+    }
+
+    // Regression (monorepo#3042): structured per-action ownership errors
+    // (not-owner / already-claimed) must reach the JS caller as data —
+    // `errorCode` / `ownerAgentId` readable from the returned object — not
+    // flattened into a thrown prose error.
+    #[tokio::test]
+    async fn browser_exec_single_action_ownership_failure_is_structured_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": null,
+                "error": "Tab tab-9 is not owned by you (owner: none). Claim it with claimTab first."
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r"
+            const r = await ws.browser.exec([{ action: 'resizeTab', tabId: 'tab-9', width: 375 }]);
+            return { code: r.errorCode, owner: r.ownerAgentId, ok: r.success };
+            ",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!(Value::Null));
+        assert_eq!(v["ok"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_multi_action_partial_failure_is_structured_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "1 of 2 actions failed",
+            "results": [
+                { "action": "listTabs", "success": true, "result": [] },
+                {
+                    "action": "claimTab",
+                    "success": false,
+                    "errorCode": "already-claimed",
+                    "ownerAgentId": "agent-42",
+                    "error": "Tab tab-3 is owned by agent agent-42"
+                }
+            ],
+        }));
+        let resp = call(
+            &srv,
+            r"
+            const r = await ws.browser.exec([
+                { action: 'listTabs' },
+                { action: 'claimTab', tabId: 'tab-3', width: 1280 }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, code: failed.errorCode, owner: failed.ownerAgentId };
+            ",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["code"], json!("already-claimed"));
+        assert_eq!(v["owner"], json!("agent-42"));
+    }
+
+    // The FE aborts a batch on the first failing action, so the reply's
+    // partial `results` can be shorter than the request. A multi-action JS
+    // caller must still receive the `{ success, results, error }` envelope
+    // (never a bare action envelope), so `r.results.find(...)` always works.
+    #[tokio::test]
+    async fn browser_exec_multi_action_first_failure_keeps_envelope_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "Tab tab-9 is not owned by you",
+            "results": [{
+                "action": "resizeTab",
+                "success": false,
+                "errorCode": "not-owner",
+                "ownerAgentId": "agent-7",
+                "error": "Tab tab-9 is owned by agent agent-7"
+            }],
+        }));
+        let resp = call(
+            &srv,
+            r"
+            const r = await ws.browser.exec([
+                { action: 'resizeTab', tabId: 'tab-9', width: 375 },
+                { action: 'screenshot' },
+                { action: 'listTabs' }
+            ]);
+            const failed = r.results.find(x => !x.success);
+            return { ok: r.success, count: r.results.length, code: failed.errorCode, owner: failed.ownerAgentId };
+            ",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["count"], json!(1));
+        assert_eq!(v["code"], json!("not-owner"));
+        assert_eq!(v["owner"], json!("agent-7"));
+    }
+
+    #[tokio::test]
+    async fn browser_exec_failure_without_results_still_throws_in_js() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "CDP not attached",
+        }));
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'listTabs' }]);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("CDP not attached"));
     }
 
     #[tokio::test]
@@ -8103,6 +8275,7 @@ mod wsapi4_bindings_tests {
                 sandbox_path: None,
                 sandbox_branch: None,
                 dismissed_questions_message_id: None,
+                pending_questions_message_id: None,
                 last_seen_message_id: None,
                 is_initial_agent: None,
             },
@@ -8723,7 +8896,9 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let v = body(&resp);
-        assert!(v.get("subscriptionId").map(|v| v.is_null()).unwrap_or(true));
+        assert!(v
+            .get("subscriptionId")
+            .is_none_or(serde_json::Value::is_null));
         assert!(api.watch_sender_calls.lock().unwrap().is_empty());
     }
 
@@ -9242,7 +9417,8 @@ mod wsapi4_bindings_tests {
 /// `workspaceApi.maxOutputChars` knobs read live per invocation. Covers TOON
 /// on/off, under/over-limit, the oversized-output redirect into the
 /// workspace folder's `tool-outputs/` directory (a SIBLING of the repo
-/// checkout), unlimited (`0`), and the unresolvable-workspace-dir fallback.
+/// checkout), unlimited (`0`), and the unresolvable-workspace-dir inline
+/// truncation fallback.
 #[cfg(test)]
 mod workspace_api_output_limit_tests {
     use std::path::PathBuf;
@@ -9499,14 +9675,28 @@ mod workspace_api_output_limit_tests {
     }
 
     #[tokio::test]
-    async fn unresolvable_workspace_dir_falls_back_to_untruncated_output() {
+    async fn unresolvable_workspace_dir_truncates_output_inline() {
         // No on-disk checkout path: the redirect cannot be written, so the
-        // full body comes back untruncated and the call still succeeds.
+        // body comes back TRUNCATED inline — never the full payload
+        // (monorepo#3038) — and the call still succeeds.
         let srv = server(None, false, 50);
         let resp = call(&srv, "return { data: 'x'.repeat(200) };").await;
         let text = tool_text(&resp);
-        assert!(!text.contains("Output too large:"));
-        let v: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(v["data"].as_str().unwrap().len(), 200);
+
+        // The notice carries total size, limit, and the redirect-failure
+        // reason.
+        let full = serde_json::to_string_pretty(&json!({ "data": "x".repeat(200) })).unwrap();
+        let total = full.chars().count();
+        assert!(text.contains(&format!("Output too large: {total} characters (limit: 50)")));
+        assert!(text.contains("could NOT be written to a file"));
+        assert!(text.contains("workspace has no on-disk checkout path"));
+
+        // The head is the first `max_chars` characters of the output, and
+        // the message never carries more of the output than that.
+        let head: String = full.chars().take(50).collect();
+        assert!(text.contains(&head));
+        let head_plus_one: String = full.chars().take(51).collect();
+        assert!(!text.contains(&head_plus_one));
+        assert!(text.chars().count() < 500, "message must stay bounded");
     }
 }

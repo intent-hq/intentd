@@ -19,6 +19,7 @@
 
 mod common;
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -246,7 +247,7 @@ fn upgrade_req(target: &str, origin: Option<&str>) -> String {
         "GET {target} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
     );
     if let Some(o) = origin {
-        r.push_str(&format!("Origin: {o}\r\n"));
+        let _ = write!(r, "Origin: {o}\r\n");
     }
     r.push_str("\r\n");
     r
@@ -264,14 +265,13 @@ async fn http_status(port: u16, cfg: Arc<ClientConfig>, request: &str) -> u16 {
     let _ = timeout(Duration::from_secs(3), async {
         loop {
             match tls.read(&mut byte).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     buf.push(byte[0]);
                     if buf.ends_with(b"\r\n") {
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
     })
@@ -293,7 +293,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).expect("json"),
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -322,7 +322,8 @@ async fn e2e_transport_full() {
     assert_eq!(r["listenMode"], "both");
     assert_eq!(r["transports"], json!(["uds", "tcp"]));
     assert_eq!(r["host"]["locality"], "local", "UDS control ⇒ local");
-    let bound_port = r["port"].as_u64().expect("bound tcp port") as u16;
+    let bound_port =
+        u16::try_from(r["port"].as_u64().expect("bound tcp port")).expect("value fits in u16");
     let fingerprint = r["fingerprint"]
         .as_str()
         .expect("cert fingerprint")
@@ -332,7 +333,7 @@ async fn e2e_transport_full() {
     // The persisted cert inspected off-process carries the same fingerprint.
     match intent_transport::inspect_cert(&data_dir) {
         intent_transport::CertStatus::Valid { fingerprint: disk } => {
-            assert_eq!(disk, fingerprint, "on-disk cert fp matches status fp")
+            assert_eq!(disk, fingerprint, "on-disk cert fp matches status fp");
         }
         other => panic!("expected a valid persisted cert, got {other:?}"),
     }
@@ -638,7 +639,7 @@ async fn e2e_idle_session_reaping() {
     drop(daemon);
 }
 
-/// One-time auto_vacuum activation at startup (monorepo#720 finding 1): boot a
+/// One-time `auto_vacuum` activation at startup (monorepo#720 finding 1): boot a
 /// REAL `intentd serve` on a pre-seeded legacy database in `auto_vacuum = NONE`
 /// mode and assert the daemon serves normally while the startup VACUUM has
 /// converted the file to incremental mode, so retention-loop
@@ -705,7 +706,7 @@ async fn e2e_auto_vacuum_activation_on_legacy_db() {
     // connection so the daemon's own pragma-carrying pools are not involved.
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(&db_path)
-        .busy_timeout(Duration::from_millis(5000));
+        .busy_timeout(Duration::from_secs(5));
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(opts)

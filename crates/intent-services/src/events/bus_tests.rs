@@ -1,4 +1,4 @@
-//! Integration tests for the [`EventBus`] over a temp SQLite store: publish
+//! Integration tests for the [`EventBus`] over a temp `SQLite` store: publish
 //! appends-to-store-and-broadcasts, type-glob matching, `excludeSelf`, and
 //! `batchWindow` coalescing. Pure matching semantics live in `filter`.
 
@@ -39,7 +39,7 @@ fn new_event(event_type: &str, actor_id: Option<&str>, actor_type: ActorType) ->
         event_type: event_type.to_string(),
         actor: EventActor {
             actor_type,
-            id: actor_id.map(|s| s.to_string()),
+            id: actor_id.map(std::string::ToString::to_string),
             ..Default::default()
         },
         session_id: None,
@@ -94,7 +94,7 @@ async fn publish_appends_to_store_and_broadcasts() {
 }
 
 /// Hybrid `file:*` persistence: non-agent file events broadcast but are never
-/// written to SQLite, while agent-attributed ones stay durable.
+/// written to `SQLite`, while agent-attributed ones stay durable.
 #[tokio::test]
 async fn non_agent_file_events_broadcast_without_persisting() {
     let (_tmp, bus) = bus().await;
@@ -157,13 +157,13 @@ async fn non_agent_file_events_broadcast_without_persisting() {
 /// shutdown `flush_all`.
 #[tokio::test]
 async fn large_transient_file_burst_reaches_a_draining_subscriber() {
+    // Exceed BROADCAST_CAPACITY (1024) in one uninterrupted publish loop.
+    const BURST: usize = 1500;
     let (_tmp, bus) = bus().await;
     let mut filter = SubscriptionFilter::for_subscriber(&["file:*".to_string()], None, false, None);
     filter.batch_window = None;
     let mut sub = bus.subscribe(filter);
 
-    // Exceed BROADCAST_CAPACITY (1024) in one uninterrupted publish loop.
-    const BURST: usize = 1500;
     let consumer = tokio::spawn(async move {
         let mut received = 0usize;
         while received < BURST {
@@ -390,6 +390,9 @@ async fn idle_publish_resolves_without_batch_window_delay() {
 
 #[tokio::test]
 async fn concurrent_burst_batches_events_correctly() {
+    const PUBLISHERS: usize = 30;
+    const EVENTS_PER_PUBLISHER: usize = 17; // ~510 total events
+    const TOTAL_EVENTS: usize = PUBLISHERS * EVENTS_PER_PUBLISHER;
     let (_tmp, bus) = bus().await;
     // Subscribe to capture all events (no batching for simpler per-publisher assertions).
     let filter = SubscriptionFilter {
@@ -397,10 +400,6 @@ async fn concurrent_burst_batches_events_correctly() {
         ..Default::default()
     };
     let mut sub = bus.subscribe(filter);
-
-    const PUBLISHERS: usize = 30;
-    const EVENTS_PER_PUBLISHER: usize = 17; // ~510 total events
-    const TOTAL_EVENTS: usize = PUBLISHERS * EVENTS_PER_PUBLISHER;
 
     // Spawn 30 concurrent tasks, each publishing 17 events.
     let handles: Vec<_> = (0..PUBLISHERS)
@@ -411,7 +410,7 @@ async fn concurrent_burst_batches_events_correctly() {
                 for seq in 0..EVENTS_PER_PUBLISHER {
                     let ev = new_event(
                         "test:burst",
-                        Some(&format!("publisher-{}", publisher_id)),
+                        Some(&format!("publisher-{publisher_id}")),
                         ActorType::Agent,
                     );
                     let mut ev_with_seq = ev;
@@ -477,16 +476,13 @@ async fn concurrent_burst_batches_events_correctly() {
         assert_eq!(
             seqs.len(),
             EVENTS_PER_PUBLISHER,
-            "publisher {} should have {} events",
-            publisher_id,
-            EVENTS_PER_PUBLISHER
+            "publisher {publisher_id} should have {EVENTS_PER_PUBLISHER} events"
         );
         let mut sorted = seqs.clone();
         sorted.sort_unstable();
         assert_eq!(
             seqs, sorted,
-            "publisher {} events should be in order",
-            publisher_id
+            "publisher {publisher_id} events should be in order"
         );
     }
 
@@ -512,8 +508,7 @@ async fn concurrent_burst_batches_events_correctly() {
     // regressions where batching breaks.
     assert!(
         elapsed < Duration::from_secs(3),
-        "burst should complete in <3s with batching; took {:?}",
-        elapsed
+        "burst should complete in <3s with batching; took {elapsed:?}"
     );
 }
 
@@ -537,7 +532,7 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
         let result = bus
             .publish(&new_event(
                 "test:failure",
-                Some(&format!("publisher-{}", i)),
+                Some(&format!("publisher-{i}")),
                 ActorType::Agent,
             ))
             .await;
@@ -549,8 +544,7 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
     for err in &errors {
         assert!(
             err.contains("batch insert failed"),
-            "error should indicate batch insert failure: {}",
-            err
+            "error should indicate batch insert failure: {err}"
         );
     }
 
@@ -563,7 +557,7 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
 }
 
 /// A `NewEvent` for `agent:tool:call` with the given `output` payload.
-fn tool_call_event(output: serde_json::Value) -> NewEvent {
+fn tool_call_event(output: &serde_json::Value) -> NewEvent {
     let mut ev = new_event("agent:tool:call", Some("agent-1"), ActorType::Agent);
     ev.data = json!({
         "toolCallId": "tc-1",
@@ -588,7 +582,7 @@ async fn oversized_tool_call_payload_is_capped_in_store_but_full_on_broadcast() 
     // Output alone (~64 KiB) pushes the payload well past the 16 KiB cap.
     let big_output = "x".repeat(64 * 1024);
     let stored = bus
-        .publish(&tool_call_event(json!(big_output)))
+        .publish(&tool_call_event(&json!(big_output)))
         .await
         .expect("publish");
 
@@ -629,7 +623,7 @@ async fn oversized_tool_call_payload_is_capped_in_store_but_full_on_broadcast() 
 async fn small_tool_call_payload_persists_verbatim() {
     let (_tmp, bus) = bus().await;
     let stored = bus
-        .publish(&tool_call_event(json!("short output")))
+        .publish(&tool_call_event(&json!("short output")))
         .await
         .expect("publish");
 
@@ -970,11 +964,15 @@ fn lag_warn_throttle_rate_limits_and_accumulates() {
     );
 }
 
-/// A subscriber driven past BROADCAST_CAPACITY must surface the loss: the
+/// A subscriber driven past `BROADCAST_CAPACITY` must surface the loss: the
 /// delivery task's `Lagged` arm emits a WARN carrying the skipped count and
 /// the subscription's filter scope (event types + workspace).
 #[tokio::test]
 async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
+    // Flood the broadcast ring in one non-yielding loop (`publish_transient`
+    // never awaits) so the delivery task cannot drain in between: its receiver
+    // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
+    const OVERFLOW: usize = 64;
     let (_tmp, bus) = bus().await;
     let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
     filter.batch_window = None;
@@ -984,12 +982,8 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     let capture = Capture::default();
     let _guard = tracing::subscriber::set_default(capture.clone());
 
-    // Flood the broadcast ring in one non-yielding loop (`publish_transient`
-    // never awaits) so the delivery task cannot drain in between: its receiver
-    // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
-    const OVERFLOW: usize = 64;
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
-        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+        let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
     // Delivery resumes after the lag report: the surviving events arrive.
@@ -1022,21 +1016,21 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     );
 }
 
-/// A subscriber driven past BROADCAST_CAPACITY must ALSO see the loss in-band:
+/// A subscriber driven past `BROADCAST_CAPACITY` must ALSO see the loss in-band:
 /// `recv_delivery` yields a `Delivery::Lagged(n)` marker at the gap position
 /// (before the surviving post-drop events), carrying the ring's skipped count,
 /// so consumers like the chat forwarder can run a bounded recovery. Plain
 /// `recv` consumers keep seeing only event batches.
 #[tokio::test]
 async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
+    const OVERFLOW: usize = 64;
     let (_tmp, bus) = bus().await;
     let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
     filter.batch_window = None;
     let mut sub = bus.subscribe(filter);
 
-    const OVERFLOW: usize = 64;
     for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
-        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+        let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
     let first = timeout(Duration::from_secs(5), sub.recv_delivery())
@@ -1070,7 +1064,7 @@ async fn recv_skips_lag_markers_transparently() {
     let mut sub = bus.subscribe(filter);
 
     for _ in 0..(BROADCAST_CAPACITY + 8) {
-        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+        let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
     let batch = timeout(Duration::from_secs(5), sub.recv())

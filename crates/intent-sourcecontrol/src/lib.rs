@@ -51,6 +51,16 @@ pub trait SourceControl: Send + Sync {
     /// Auth / connectivity probe (used by `settings`/`doctor`).
     async fn check_auth(&self) -> Result<AuthStatus>;
 
+    /// When the host's REST core quota resets, as a unix timestamp (seconds),
+    /// queried after a call failed with [`Error::RateLimited`] so background
+    /// sweeps can pause until the window turns over (monorepo#2961). GitHub's
+    /// `GET /rate_limit` is free (does not count against the quota). Hosts
+    /// without the signal return `Ok(None)` (the default) and callers fall
+    /// back to a fixed pause.
+    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Authenticated user identity (`GET /user`). Backs `github.getUser`.
     async fn get_user(&self) -> Result<UserIdentity>;
 

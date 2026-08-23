@@ -241,7 +241,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -265,7 +265,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -291,7 +291,7 @@ fn gate(test: &str) -> Option<String> {
 
 /// Seed a workspace with a git repo worktree directly in the data dir store
 /// (bypassing the workspace-create dance) so the daemon sees it on boot.
-/// Optionally sets context.auggiePath if an auggie_bin is provided.
+/// Optionally sets context.auggiePath if an `auggie_bin` is provided.
 async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) -> (String, PathBuf) {
     use intent_core::{
         now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
@@ -412,7 +412,8 @@ async fn auto_commit_uses_generated_message_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -516,13 +517,13 @@ async fn auto_commit_uses_generated_message_over_wss() {
     );
 
     // Print daemon logs on failure for debugging
-    if commits["items"].as_array().map(|a| a.len()).unwrap_or(0) < 2 {
+    if commits["items"].as_array().map_or(0, std::vec::Vec::len) < 2 {
         eprintln!("\n=== DAEMON LOGS (last 200 lines) ===");
         if let Ok(logs) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             let lines: Vec<&str> = logs.lines().collect();
             let start = lines.len().saturating_sub(200);
             for line in &lines[start..] {
-                eprintln!("{}", line);
+                eprintln!("{line}");
             }
         }
         eprintln!("===================\n");
@@ -606,7 +607,8 @@ async fn auto_commit_falls_back_when_auggie_missing() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

@@ -153,7 +153,7 @@ pub async fn check_provider_auth_cli(
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
             match tokio::time::timeout(OPENCODE_READY_TIMEOUT, cmd.output()).await {
-                Ok(Ok(output)) if could_not_run(&output.status) => CliAuthProbe::Failed,
+                Ok(Ok(output)) if could_not_run(output.status) => CliAuthProbe::Failed,
                 Ok(Ok(output)) if !output.status.success() => CliAuthProbe::NotAuthenticated,
                 Ok(Ok(output)) => {
                     if opencode_models_ready(&String::from_utf8_lossy(&output.stdout)) {
@@ -175,7 +175,7 @@ pub async fn check_provider_auth_cli(
                 .kill_on_drop(true);
             match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.status()).await {
                 Ok(Ok(status)) if status.success() => CliAuthProbe::Authenticated,
-                Ok(Ok(status)) if could_not_run(&status) => CliAuthProbe::Failed,
+                Ok(Ok(status)) if could_not_run(status) => CliAuthProbe::Failed,
                 Ok(Ok(_)) => CliAuthProbe::NotAuthenticated,
                 Ok(Err(_)) => CliAuthProbe::Failed,
                 Err(_) => CliAuthProbe::TimedOut,
@@ -217,7 +217,7 @@ fn probe_command(program: &OsStr) -> tokio::process::Command {
 /// code (127 — e.g. `env: 'node': No such file or directory` from a
 /// Node-shebang CLI). Such a probe never ran the CLI's auth check, so it
 /// carries no auth verdict.
-fn could_not_run(status: &std::process::ExitStatus) -> bool {
+fn could_not_run(status: std::process::ExitStatus) -> bool {
     status.code() == Some(127)
 }
 
@@ -231,9 +231,8 @@ fn grok_probe_outcome(
     exit_success: bool,
 ) -> CliAuthProbe {
     match (marker, models_empty) {
-        (Some(true), _) => CliAuthProbe::Authenticated,
         (Some(false), _) => CliAuthProbe::NotAuthenticated,
-        (None, false) => CliAuthProbe::Authenticated,
+        (Some(true), _) | (None, false) => CliAuthProbe::Authenticated,
         (None, true) if exit_success => CliAuthProbe::StatusUnknown,
         (None, true) => CliAuthProbe::Failed,
     }
@@ -282,9 +281,10 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
 /// matching spawn resolution. Today every probe-able provider owns its own
 /// primary (only unsloth remaps, and unsloth is not probe-able).
 fn override_key(provider_id: &'static str) -> &'static str {
-    intent_providers::find_provider(provider_id)
-        .map(|cfg| cfg.primary_binary_provider_id())
-        .unwrap_or(provider_id)
+    intent_providers::find_provider(provider_id).map_or(
+        provider_id,
+        intent_providers::ProviderConfig::primary_binary_provider_id,
+    )
 }
 
 /// checkAuggie-parity validation for auggie's threaded override
@@ -331,7 +331,7 @@ fn resolve_probe_binary(
             if let Some(p) = override_path.and_then(resolve_auggie_override) {
                 return Some(p.into_os_string());
             }
-            return crate::auggie_discovery::find_auggie().map(|p| p.into_os_string());
+            return crate::auggie_discovery::find_auggie().map(std::path::PathBuf::into_os_string);
         }
         "claude-code" => "claude",
         "codex" => "codex",
@@ -348,7 +348,7 @@ fn resolve_probe_binary(
         command,
         override_path.filter(|_| override_applies),
     )
-    .map(|p| p.into_os_string())
+    .map(std::path::PathBuf::into_os_string)
 }
 
 /// Per-provider auth-status cache: last outcome + fetch instant, plus a
@@ -367,6 +367,7 @@ impl AuthStatusCache {
         }
     }
 
+    #[allow(clippy::option_option)] // outer = cache freshness, inner = the cached tri-state
     fn fresh(&self, provider_id: &str) -> Option<Option<bool>> {
         let entries = self.entries.lock().expect("auth cache poisoned");
         let (at, value) = entries.get(provider_id)?;
@@ -451,10 +452,14 @@ async fn resolve_auth_status(
 /// threading the discovery surface uses (monorepo#1065). The install gate
 /// applies each provider's override so overridden providers get probed
 /// (monorepo#1086); an empty map preserves auto-detection-only behavior.
-pub async fn provider_auth_status(
+///
+/// # Errors
+///
+/// Returns an error string when `provider_id` names an unknown provider.
+pub async fn provider_auth_status<S: std::hash::BuildHasher>(
     provider_id: Option<&str>,
     force: bool,
-    provider_paths: &HashMap<String, String>,
+    provider_paths: &HashMap<String, String, S>,
 ) -> Result<Value, String> {
     let selected: Vec<&'static str> = match provider_id {
         Some(requested) => match AUTH_PROBE_PROVIDERS.iter().find(|id| **id == requested) {
@@ -569,7 +574,7 @@ mod tests {
     /// `#!/usr/bin/env node` shebang resolves the sibling `node`. The stub
     /// execs a bare-named sibling that only resolves through that prepended
     /// directory (it exists nowhere on the inherited PATH) — before the fix
-    /// the spawn exited 127 and the probe reported NotAuthenticated.
+    /// the spawn exited 127 and the probe reported `NotAuthenticated`.
     #[cfg(unix)]
     #[tokio::test]
     async fn probe_child_path_carries_resolved_binary_dir() {
@@ -587,7 +592,7 @@ mod tests {
 
     /// monorepo#1863 regression: exit 127 is a command-resolution failure —
     /// the probe never ran the CLI's auth check — so it maps to Failed
-    /// (`authenticated: null` on the wire), never to NotAuthenticated. Pinned
+    /// (`authenticated: null` on the wire), never to `NotAuthenticated`. Pinned
     /// on both exit-code arms (generic and opencode).
     #[cfg(unix)]
     #[tokio::test]

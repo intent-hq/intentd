@@ -49,7 +49,7 @@ const STDIN_QUEUE_CAP: usize = 32;
 /// `stdin` payload.
 #[derive(Debug)]
 pub struct HostExecStreamArgs {
-    /// Shared exec fields (command, args, cwd, env, timeout_ms, workspace_id).
+    /// Shared exec fields (command, args, cwd, env, `timeout_ms`, `workspace_id`).
     pub common: HostExecArgs,
     /// Caller-supplied correlation id; a fresh `hexec-<uuid>` is minted when
     /// absent so the response always carries a `requestId` echoable back on
@@ -64,6 +64,10 @@ pub struct HostExecStreamArgs {
 /// Parse a JSON-RPC params object into [`HostExecStreamArgs`]. Layers the
 /// streaming-only fields on top of [`host_exec::parse_args`] so validation is
 /// identical to the one-shot surface.
+///
+/// # Errors
+///
+/// Returns an invalid-params `HostExecError` when parameters are missing or malformed (e.g. both `stdin` and `stdinBase64` are set).
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, HostExecError> {
     let common = host_exec::parse_args(params)?;
     let request_id = params
@@ -72,9 +76,8 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
         .map(str::to_string)
         .filter(|s| !s.is_empty());
     let stdin = match (params.get("stdin"), params.get("stdinBase64")) {
-        (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => None,
-        (Some(Value::Null), Some(Value::Null)) => None,
-        (Some(text), None) | (Some(text), Some(Value::Null)) => match text {
+        (None | Some(Value::Null), None | Some(Value::Null)) => None,
+        (Some(text), None | Some(Value::Null)) => match text {
             Value::String(s) => Some(s.as_bytes().to_vec()),
             _ => {
                 return Err(HostExecError {
@@ -83,7 +86,7 @@ pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecStreamArgs, Hos
                 });
             }
         },
-        (None, Some(b64)) | (Some(Value::Null), Some(b64)) => match b64 {
+        (None | Some(Value::Null), Some(b64)) => match b64 {
             Value::String(s) => Some(decode_base64_field(s, "stdinBase64")?),
             _ => {
                 return Err(HostExecError {
@@ -145,16 +148,23 @@ pub struct HostExecStreamRegistry {
 
 impl HostExecStreamRegistry {
     /// Empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Number of live streams (test/diagnostics use).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.lock().expect("registry poisoned").len()
     }
 
     /// Whether the registry has no live streams.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -177,6 +187,14 @@ impl HostExecStreamRegistry {
     /// stdin after the (possibly empty) payload so a reader-to-EOF exits.
     /// Returns `Err(-32603)` for an unknown / already-finished `requestId` so
     /// the wire surface can surface a clear "no such stream" error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `HostExecError` when the stream is unknown, its stdin is not writable, or the stream has already closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn write(
         &self,
         request_id: &str,
@@ -211,6 +229,11 @@ impl HostExecStreamRegistry {
     /// Signal cancellation. Returns `true` when a live stream was flipped,
     /// `false` for an unknown / already-finished id (still surfaces `ok:true`
     /// on the wire so the surface is idempotent).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn cancel(&self, request_id: &str) -> bool {
         let map = self.inner.lock().expect("registry poisoned");
         match map.get(request_id) {
@@ -236,6 +259,7 @@ pub fn registry() -> &'static HostExecStreamRegistry {
 }
 
 /// Mint a fresh `requestId` for streams that omit one.
+#[must_use]
 pub fn mint_request_id() -> String {
     format!("hexec-{}", uuid::Uuid::new_v4())
 }
@@ -244,6 +268,10 @@ pub fn mint_request_id() -> String {
 /// live and the reader/stdin/wait tasks are running. Errors from validation or
 /// spawn are returned to the caller (mapped to `-32602` / `-32603`); once the
 /// child is up, all further outcomes surface on `host:exec:exit`.
+///
+/// # Errors
+///
+/// Returns a `HostExecError` if `cwd` cannot be resolved or spawning the process fails.
 pub async fn start_stream(
     api: &dyn WorkspaceApi,
     bus: EventBus,
@@ -261,15 +289,17 @@ pub async fn start_stream(
         (Some(cwd), Some(ws_id)) => {
             Some(host_exec::resolve_cwd_within_workspace(api, ws_id, cwd, None).await?)
         }
+        // No explicit `cwd` but a workspace caller: default to the workspace
+        // root (monorepo#3231), same as the one-shot surface.
+        (None, Some(ws_id)) => host_exec::default_cwd_for_workspace(api, ws_id).await,
         _ => None,
     };
 
     let request_id = request_id.unwrap_or_else(mint_request_id);
-    let workspace_id = common
-        .workspace_id
-        .as_deref()
-        .map(WorkspaceId::from)
-        .unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+    let workspace_id = common.workspace_id.as_deref().map_or_else(
+        || WorkspaceId::from_string(String::new()),
+        WorkspaceId::from,
+    );
 
     // Spawn with piped stdin so follow-up writes reach the child.
     let mut cmd = build_command(&common, cwd_resolved.as_deref());
@@ -358,7 +388,7 @@ pub async fn start_stream(
             cancel_token,
             timeout_ms,
         )
-        .await
+        .await;
     });
 
     Ok(request_id)
@@ -369,7 +399,7 @@ pub async fn start_stream(
 /// (broadcast-only, never persisted — same path as `chat:stream:delta`):
 /// streamed output is consumed live by the correlated subscriber and has no
 /// event-table readback, so a chatty child must not serialize behind a durable
-/// SQLite commit per chunk. The terminal `host:exec:exit` stays durable but is
+/// `SQLite` commit per chunk. The terminal `host:exec:exit` stays durable but is
 /// published from [`run_wait_loop`] — a different task from these readers — so
 /// unlike the terminal/script paths there is no exit-never-overtakes-data
 /// guarantee: `child.wait()` can return while a pipe still holds unread bytes,
@@ -387,13 +417,12 @@ fn spawn_reader<R>(
         let mut buf = vec![0u8; READ_BUF_SIZE];
         loop {
             match reader.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    let ev = chunk_event(&workspace_id, &request_id, event_type, chunk);
-                    bus.publish_transient(&ev);
+                    let ev = chunk_event(&workspace_id, &request_id, event_type, &chunk);
+                    let _ = bus.publish_transient(&ev);
                 }
-                Err(_) => break,
             }
         }
     });
@@ -431,9 +460,8 @@ async fn run_wait_loop(
         // Poll every 100ms so a cancel / timeout is observed promptly without
         // burning a task on a tight loop.
         let poll = Duration::from_millis(100);
-        match tokio::time::timeout(poll, child.wait()).await {
-            Ok(status) => break status,
-            Err(_) => continue,
+        if let Ok(status) = tokio::time::timeout(poll, child.wait()).await {
+            break status;
         }
     };
 
@@ -442,9 +470,12 @@ async fn run_wait_loop(
     let exit_code = status
         .as_ref()
         .ok()
-        .and_then(|s| s.code())
-        .map(|c| c as i64);
-    let ok = matches!(status.as_ref().ok().map(|s| s.success()), Some(true));
+        .and_then(std::process::ExitStatus::code)
+        .map(i64::from);
+    let ok = matches!(
+        status.as_ref().ok().map(std::process::ExitStatus::success),
+        Some(true)
+    );
 
     let mut data = json!({
         "requestId": &request_id,
@@ -506,7 +537,7 @@ async fn reap_child_group(child: &mut tokio::process::Child, pid: Option<u32>) {
 fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pid as i32), sig);
+    let _ = killpg(Pid::from_raw(pid.cast_signed()), sig);
 }
 
 /// Build a `host:exec:{stdout,stderr}` event with the base64 chunk payload.
@@ -514,7 +545,7 @@ fn chunk_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     event_type: &'static str,
-    chunk_b64: String,
+    chunk_b64: &str,
 ) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -537,33 +568,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn map(v: Value) -> Map<String, Value> {
+    fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
     }
 
     #[test]
     fn parse_args_defaults_no_stdin_no_request_id() {
-        let a = parse_args(&map(json!({ "command": "echo" }))).unwrap();
+        let a = parse_args(&map(&json!({ "command": "echo" }))).unwrap();
         assert!(a.request_id.is_none());
         assert!(a.stdin.is_none());
     }
 
     #[test]
     fn parse_args_accepts_utf8_stdin() {
-        let a = parse_args(&map(json!({ "command": "cat", "stdin": "hello\n" }))).unwrap();
+        let a = parse_args(&map(&json!({ "command": "cat", "stdin": "hello\n" }))).unwrap();
         assert_eq!(a.stdin.as_deref(), Some(b"hello\n".as_slice()));
     }
 
     #[test]
     fn parse_args_accepts_base64_stdin() {
-        let a = parse_args(&map(json!({ "command": "cat", "stdinBase64": "aGVsbG8K" }))).unwrap();
+        let a = parse_args(&map(
+            &json!({ "command": "cat", "stdinBase64": "aGVsbG8K" }),
+        ))
+        .unwrap();
         assert_eq!(a.stdin.as_deref(), Some(b"hello\n".as_slice()));
     }
 
     #[test]
     fn parse_args_rejects_both_stdin_forms() {
         let err = parse_args(&map(
-            json!({ "command": "cat", "stdin": "x", "stdinBase64": "eA==" }),
+            &json!({ "command": "cat", "stdin": "x", "stdinBase64": "eA==" }),
         ))
         .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
@@ -571,14 +605,14 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_non_string_stdin() {
-        let err = parse_args(&map(json!({ "command": "cat", "stdin": 42 }))).unwrap_err();
+        let err = parse_args(&map(&json!({ "command": "cat", "stdin": 42 }))).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[test]
     fn parse_args_caps_timeout_via_host_exec() {
         use crate::host_exec::MAX_TIMEOUT_MS;
-        let a = parse_args(&map(json!({
+        let a = parse_args(&map(&json!({
             "command": "sleep",
             "timeoutMs": MAX_TIMEOUT_MS + 1_000,
         })))

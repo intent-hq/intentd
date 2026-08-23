@@ -16,7 +16,7 @@
 //! `workspace.list` / `workspace.get` rows (§5.1, monorepo#1396) — the field
 //! was optional, so row shapes remain valid for existing clients. Version 4.3
 //! adds `voice.transcribe` (additive): daemon-side speech-to-text over a
-//! pluggable provider (ElevenLabs Scribe | OpenAI) — 278 router methods,
+//! pluggable provider (`ElevenLabs` Scribe | `OpenAI`) — 278 router methods,
 //! 315 total. Version 4.4 structures the `voice.transcribe` no-API-key error
 //! data as `{ code: "voice-no-api-key", detail }` (§5.41, monorepo#1448) —
 //! same `-32603` / "Internal error" envelope, no method-catalog change.
@@ -199,7 +199,25 @@
 //! user/assistant message's LAST `tool_use` block preview
 //! (`{ name, input?, inputTruncated?, inputBytes? }`, input bounded by the
 //! §5.5 slim budget), denormalized at message-write time
-//! (migration 0098) — 294 router methods, 333 total. Version 7.3 adds
+//! (migration 0098) — 294 router methods, 333 total. Version 7.3 adds the
+//! `mcp.testConnection` router method (additive; §5.22.2): a one-shot
+//! connection/auth probe of an HTTP/SSE MCP endpoint run from the daemon
+//! host — a single JSON-RPC `initialize` POST with optional caller headers
+//! plus the stored `mcp.oauth.*` bag injected as the `Authorization` header
+//! when available (only when the probe URL shares the saved config's
+//! origin) — returning
+//! `{ status: "connected"|"auth_required"|"error", statusCode?,
+//! errorMessage? }`, so the FE no longer contacts MCP server URLs directly —
+//! 295 router methods, 334 total. Version 7.4 adds the
+//! `agent.listUserMessages` router method (additive; §5.5): all user-role
+//! messages of one agent as lightweight index items, oldest→newest —
+//! `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }` —
+//! with `preview` the extracted plain text bounded to `previewChars`
+//! characters (default 300, server-clamped into [1, 2000]) and `metadata`
+//! passed through verbatim when present; non-user rows are never included,
+//! roles are filtered in SQL and the transcript is never hydrated (unknown
+//! agent or workspace mismatch is not-found) — 296 router methods,
+//! 335 total. Version 7.5 adds
 //! the execution-environment surface (additive; §5.35, §5.1, §5.5b): the
 //! `sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
 //! `sandbox.image.check` router methods, the
@@ -207,13 +225,13 @@
 //! `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9) — 298 router methods, 337 total.
+//! error payloads (§9) — 300 router methods, 339 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.3";
+pub const PROTOCOL_VERSION: &str = "7.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
@@ -307,29 +325,26 @@ impl LargeFrameWarnThrottle {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match entries.iter_mut().find(|(m, _)| m == method) {
-            Some((_, last)) => {
-                if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
-                    false
-                } else {
-                    *last = now;
-                    true
-                }
-            }
-            None => {
-                if entries.len() >= MAX_TRACKED_METHODS {
-                    if let Some(stalest) = entries
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (_, last))| *last)
-                        .map(|(i, _)| i)
-                    {
-                        entries.swap_remove(stalest);
-                    }
-                }
-                entries.push((method.to_string(), now));
+        if let Some((_, last)) = entries.iter_mut().find(|(m, _)| m == method) {
+            if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
+                false
+            } else {
+                *last = now;
                 true
             }
+        } else {
+            if entries.len() >= MAX_TRACKED_METHODS {
+                if let Some(stalest) = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(i, _)| i)
+                {
+                    entries.swap_remove(stalest);
+                }
+            }
+            entries.push((method.to_string(), now));
+            true
         }
     }
 

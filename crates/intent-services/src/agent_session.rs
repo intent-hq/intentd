@@ -94,8 +94,7 @@ fn wake_resume_self_heal_debounce() -> Duration {
     std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+        .map_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE, Duration::from_millis)
 }
 
 /// Query surface the turn driver uses to decide whether a failed turn's active
@@ -125,6 +124,25 @@ fn transport_closed_error(err: &AcpError) -> bool {
         AcpError::Rpc(e) => e.code == 0 && e.message == "agent stdout closed",
         _ => false,
     }
+}
+
+/// Max in-place `session/prompt` retries after a transient provider-fetch
+/// failure (intent-hq/monorepo#3007) — 3 attempts total before the error
+/// surfaces through the existing terminal-failure path. Only output-free
+/// attempts are retried (nothing streamed, nothing persisted), so the retried
+/// unit is provably idempotent.
+const MAX_TRANSIENT_PROMPT_FETCH_RETRIES: u32 = 2;
+
+/// Base delay for the exponential backoff between transient-fetch retries
+/// (doubling per attempt: 1s, 2s). Overridable via
+/// `INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS` (test seam).
+fn transient_prompt_retry_base_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    1000
 }
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
@@ -403,29 +421,26 @@ impl Transcript {
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
-                match self.tool_result_index.get(&tc.tool_call_id) {
-                    Some(&ri) => {
-                        result_index = Some(ri);
-                        if let Some(obj) = self.blocks[ri].as_object_mut() {
-                            obj.insert("output".to_string(), output.clone());
-                            obj.insert("is_error".to_string(), Value::Bool(is_error));
-                        }
+                if let Some(&ri) = self.tool_result_index.get(&tc.tool_call_id) {
+                    result_index = Some(ri);
+                    if let Some(obj) = self.blocks[ri].as_object_mut() {
+                        obj.insert("output".to_string(), output.clone());
+                        obj.insert("is_error".to_string(), Value::Bool(is_error));
                     }
-                    None => {
-                        self.flush_text();
-                        let rindex = self.blocks.len();
-                        let rid = self.block_id(rindex);
-                        self.blocks.push(json!({
-                            "type": "tool_result",
-                            "id": rid,
-                            "tool_use_id": tc.tool_call_id,
-                            "output": output,
-                            "is_error": is_error,
-                        }));
-                        self.tool_result_index
-                            .insert(tc.tool_call_id.clone(), rindex);
-                        result_index = Some(rindex);
-                    }
+                } else {
+                    self.flush_text();
+                    let rindex = self.blocks.len();
+                    let rid = self.block_id(rindex);
+                    self.blocks.push(json!({
+                        "type": "tool_result",
+                        "id": rid,
+                        "tool_use_id": tc.tool_call_id,
+                        "output": output,
+                        "is_error": is_error,
+                    }));
+                    self.tool_result_index
+                        .insert(tc.tool_call_id.clone(), rindex);
+                    result_index = Some(rindex);
                 }
                 // §7.1: attach the standalone resource block(s) so the FE can
                 // render them directly (the items also stay in
@@ -451,29 +466,26 @@ impl Transcript {
                         // on re-completion); batch extras append. A claim
                         // consumes its registry batch, so extras cannot
                         // re-attach on a re-completion echo.
-                        match (i == 0)
+                        if let Some(&pi) = (i == 0)
                             .then(|| self.proposal_index.get(&tc.tool_call_id))
                             .flatten()
                         {
-                            Some(&pi) => {
-                                let id = self.block_id(pi);
-                                self.blocks[pi] =
-                                    crate::tool_block::build_proposal_resource_block(&id, &item);
-                                proposal_indices.push(pi);
+                            let id = self.block_id(pi);
+                            self.blocks[pi] =
+                                crate::tool_block::build_proposal_resource_block(&id, &item);
+                            proposal_indices.push(pi);
+                        } else {
+                            self.flush_text();
+                            let pindex = self.blocks.len();
+                            let pid = self.block_id(pindex);
+                            self.blocks
+                                .push(crate::tool_block::build_proposal_resource_block(
+                                    &pid, &item,
+                                ));
+                            if i == 0 {
+                                self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                             }
-                            None => {
-                                self.flush_text();
-                                let pindex = self.blocks.len();
-                                let pid = self.block_id(pindex);
-                                self.blocks
-                                    .push(crate::tool_block::build_proposal_resource_block(
-                                        &pid, &item,
-                                    ));
-                                if i == 0 {
-                                    self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
-                                }
-                                proposal_indices.push(pindex);
-                            }
+                            proposal_indices.push(pindex);
                         }
                     }
                 }
@@ -812,6 +824,44 @@ fn last_response_summary(blocks: &[Value]) -> Option<String> {
     }
 }
 
+/// Whether a finalized harness-wake transcript carries no meaningful content
+/// (intent-hq/monorepo#3262): every block is a `text`/`thinking` block whose
+/// text is whitespace-only, or the transcript is empty. Tool blocks and
+/// question/resource blocks always count as meaningful. Only wake turns that
+/// actually OPENED consult this — status-only bursts never open a turn (the
+/// wake tick drops unmappable variants), so they can never classify as an
+/// empty response.
+pub(crate) fn harness_wake_response_is_empty(blocks: &[Value]) -> bool {
+    blocks.iter().all(|b| {
+        matches!(
+            b.get("type").and_then(Value::as_str),
+            Some("text" | "thinking")
+        ) && b
+            .get("text")
+            .and_then(Value::as_str)
+            .is_none_or(|t| t.trim().is_empty())
+    })
+}
+
+/// The outcome of a finished harness-wake turn (monorepo#855 /
+/// intent-hq/monorepo#3262): the persisted assistant `message_id` (when the
+/// burst persisted a row) plus the empty-response classification the caller
+/// uses to decide whether the wake was a silent no-op needing recovery.
+pub(crate) struct HarnessWakeOutcome {
+    /// The persisted assistant row id, or `None` when the burst persisted
+    /// nothing. The production drive task keys only off `empty_response`
+    /// (the persisted-row event pair already carries the id); exercised by
+    /// the wake-turn unit tests (hence the allow — the lib build has no
+    /// reader).
+    #[allow(dead_code)]
+    pub message_id: Option<String>,
+    /// `true` when the turn's finalized transcript carried no meaningful
+    /// content (see [`harness_wake_response_is_empty`]) — the incident
+    /// signature of a failed post-interrupt recovery wake (a single bare
+    /// newline accepted as `harness_wake_complete`).
+    pub empty_response: bool,
+}
+
 /// Extract the `type: "text"` block strings from content blocks — the input
 /// shape [`last_response_and_digest_from_blocks`] expects.
 pub(crate) fn text_block_strings(blocks: &[Value]) -> Vec<String> {
@@ -894,8 +944,8 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// step instead of being trusted (an unknown `model.default` prefix must not
 /// shadow a perfectly valid `providers.active`). `None` when neither yields
 /// a registered provider — no provider carries a hardcoded default
-/// designation, so callers fall through to [`resolve_provider_id`]'s neutral
-/// positional last resort (the first registered provider).
+/// designation, and there is no positional last resort (monorepo#3044):
+/// resolution that falls through entirely fails loudly at the caller.
 pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
@@ -919,35 +969,49 @@ pub(crate) fn derived_default_provider(
 /// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
 /// yields a non-empty provider) → `provider` field → `configured_default` (the
 /// settings-derived default — see [`derived_default_provider`] — when the
-/// caller has one to offer) → the first registered provider (a neutral
-/// positional last resort; no provider carries a default designation).
-/// Malformed compound ids like `:sonnet` yield an empty prefix and fall
-/// through to the provider field / configured default / last resort. This
-/// ensures `_meta` injection, spawn args, and all provider-keyed logic use a
-/// consistent provider id.
+/// caller has one to offer). Malformed compound ids like `:sonnet` yield an
+/// empty prefix and fall through to the provider field / configured default.
+/// This ensures `_meta` injection, spawn args, and all provider-keyed logic
+/// use a consistent provider id.
 ///
-/// `configured_default` deliberately sits ABOVE the positional last resort
-/// (spec Decision D2): a session with no persisted `provider` (e.g. an older
-/// row, or a creation path that never resolved one) should still prefer the
-/// user's actual configured default. Callers without settings access (e.g.
-/// usage-stats attribution) pass `None`, bottoming out at the first
-/// registered provider for that narrower use.
+/// `None` when nothing resolves (monorepo#3044): the former positional last
+/// resort (the first registered provider, auggie) silently spawned a binary
+/// that may not be installed. Spawn-adjacent callers surface
+/// [`no_default_provider_error`] instead; stats-attribution callers (which
+/// pass `configured_default: None`) fall to their existing `"unknown"` tail.
 pub(crate) fn resolve_provider_id(
     model: Option<&str>,
     provider: Option<&str>,
     configured_default: Option<&str>,
-) -> String {
+) -> Option<String> {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
         .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
-        .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .or_else(|| {
+            provider
+                .filter(|p| !p.is_empty())
+                .map(std::string::ToString::to_string)
+        })
         .or_else(|| {
             configured_default
                 .filter(|p| !p.is_empty())
-                .map(|p| p.to_string())
+                .map(std::string::ToString::to_string)
         })
-        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
+}
+
+/// The loud `-32602`-style error for provider resolution that falls through
+/// entirely (monorepo#3044): no explicit provider/model, no session provider,
+/// and no settings-derived default. Mirrors the resolved-but-unavailable
+/// error style (`ensure_provider_available`) so clients can surface it
+/// directly. `context` names the failing operation (e.g. `agent.delegate`).
+pub(crate) fn no_default_provider_error(context: &str) -> Error {
+    Error::InvalidParams(format!(
+        "{context}: no default provider/model is configured — no explicit \
+         provider or model was given and neither providers.active nor a \
+         compound model.default is set. Choose a provider in Settings > \
+         Agents, or pass an explicit provider/model."
+    ))
 }
 
 /// Resolve the effective model a provider is actually running from the
@@ -1073,15 +1137,29 @@ fn select_entry<'a>(
 }
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
-/// assembled system prompt (§18.1). Returns `None` for providers that do not use
-/// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
-/// use other mechanisms — codex moved to the first-turn prepend fallback because
-/// the pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`,
-/// #479).
+/// assembled system prompt (§18.1) and the agent's name (task-derived for
+/// delegated agents; may be user-assigned or renamed). Returns
+/// `None` for providers that do not use `_meta` injection (auggie, droid,
+/// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
-/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
-///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
-fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<Meta> {
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>"? }`
+///   (disallowedTools always present; systemPrompt present only when non-blank
+///   prompt). A string `systemPrompt` fully REPLACES the `claude_code` preset
+///   prompt (verified against adapter 0.66.0: a string `_meta.systemPrompt` is
+///   passed to the SDK as-is, and SDK 0.3.220 treats a string as a custom
+///   prompt) — the model sees only our assembled prompt, with none of the
+///   preset's tool-usage/dynamic sections that previously diluted it via the
+///   `{ append, excludeDynamicSections }` object shape.
+/// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
+///   `session_title` is supplied — monorepo#3151; older adapters ignore the
+///   unknown field). The system prompt stays on the first-turn prepend fallback
+///   because the pinned codex-acp adapter (1.6.2) ignores
+///   `_meta.developerInstructions` (#479) — it is never moved into `_meta`.
+fn build_session_meta(
+    provider_id: &str,
+    system_prompt: Option<&str>,
+    session_title: Option<&str>,
+) -> Option<Meta> {
     match provider_id {
         "claude-code" => {
             let mut meta = Meta::new();
@@ -1098,17 +1176,27 @@ fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<
                 }),
             );
 
-            // Add systemPrompt.append if non-blank prompt exists
+            // Add systemPrompt as a plain string if a non-blank prompt exists:
+            // the string shape fully replaces the claude_code preset prompt so
+            // the model sees only our assembled instructions.
             if let Some(prompt) = system_prompt {
                 let prompt = prompt.trim();
                 if !prompt.is_empty() {
-                    let mut system_prompt_obj = serde_json::Map::new();
-                    system_prompt_obj
-                        .insert("append".to_string(), Value::String(prompt.to_string()));
-                    meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
+                    meta.insert(
+                        "systemPrompt".to_string(),
+                        Value::String(prompt.to_string()),
+                    );
                 }
             }
 
+            Some(meta)
+        }
+        "codex" => {
+            // Title the durable Codex thread out of band so it stops deriving
+            // its title from the prepended system prompt (monorepo#3151).
+            let title = session_title.map(str::trim).filter(|t| !t.is_empty())?;
+            let mut meta = Meta::new();
+            meta.insert("sessionTitle".to_string(), Value::String(title.to_string()));
             Some(meta)
         }
         _ => None,
@@ -1212,7 +1300,7 @@ impl Services {
     pub(crate) fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone(), silent_tail_ms);
     }
 
@@ -1222,7 +1310,7 @@ impl Services {
     pub(crate) fn last_turn_silent_tail(&self, agent_id: &AgentId) -> Option<u64> {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .copied()
     }
@@ -1232,7 +1320,7 @@ impl Services {
     pub(crate) fn clear_turn_silent_tail(&self, agent_id: &AgentId) {
         self.last_turn_silent_tails
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1245,7 +1333,7 @@ impl Services {
         let mut map = self
             .truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = map.entry(agent_id.clone()).or_insert(0);
         *count += 1;
         *count
@@ -1259,7 +1347,7 @@ impl Services {
     pub(crate) fn clear_truncation_redrives(&self, agent_id: &AgentId) {
         self.truncation_redrives
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -1272,7 +1360,7 @@ impl Services {
     pub(crate) fn arm_truncation_redrive(&self, agent_id: &AgentId) {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(agent_id.clone());
     }
 
@@ -1284,7 +1372,7 @@ impl Services {
     pub(crate) fn take_truncation_redrive(&self, agent_id: &AgentId) -> bool {
         self.pending_truncation_redrive
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id)
     }
 
@@ -1548,7 +1636,7 @@ impl Services {
     /// flush owns releasing it. If the worker already persisted the full turn,
     /// the append collides on the UNIQUE id and is logged at debug (benign —
     /// the full row won; the stale slot, if any, is cleared). Errors are logged
-    /// and swallowed: this must never block shutdown or the interrupted_agent
+    /// and swallowed: this must never block shutdown or the `interrupted_agent`
     /// row insert. On a genuine store error the slot is deliberately KEPT (pin
     /// and all) as the only remaining copy of the content.
     ///
@@ -1821,14 +1909,21 @@ impl Services {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (compound model
-        // prefix → provider field → configured default → default), then build
-        // provider-specific _meta.
+        // prefix → provider field → configured default), then build
+        // provider-specific _meta. Reached only after a successful spawn (which
+        // resolved the same inputs), so a fall-through here is a settings race —
+        // fail loudly rather than fabricating a positional default (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
+        )
+        .ok_or_else(|| no_default_provider_error("session/new"))?;
+        let meta = build_session_meta(
+            &provider_id,
+            stored.system_prompt.as_deref(),
+            Some(&stored.name),
         );
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -1885,13 +1980,19 @@ impl Services {
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection (recreate path sends
-        // the same prompt as new/load).
+        // the same prompt as new/load). Same loud fall-through as
+        // [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
+        )
+        .ok_or_else(|| no_default_provider_error("session/new"))?;
+        let meta = build_session_meta(
+            &provider_id,
+            stored.system_prompt.as_deref(),
+            Some(&stored.name),
         );
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -1958,12 +2059,14 @@ impl Services {
             return Ok(None);
         }
         // Resolve provider using the same precedence as spawn path, then build
-        // provider-specific _meta for system-prompt injection.
+        // provider-specific _meta for system-prompt injection. Same loud
+        // fall-through as [`open_acp_session`] (monorepo#3044).
         let provider_id = resolve_provider_id(
             stored.model.as_deref(),
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
-        );
+        )
+        .ok_or_else(|| no_default_provider_error("session/load"))?;
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -2003,7 +2106,9 @@ impl Services {
                 return Ok(None);
             }
         }
-        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
+        // Resume path: no `sessionTitle` — the durable thread already has its
+        // title and `session/load` behavior must stay unchanged (monorepo#3151).
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref(), None);
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2061,9 +2166,9 @@ impl Services {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => continue, // a straggler arrived → keep draining
-                Ok(None) => break,       // channel closed
-                Err(_) => break,         // quiet for the settle window → done
+                Ok(Some(_)) => {} // a straggler arrived → keep draining
+                Ok(None) | Err(_) => break, // channel closed
+                                   // quiet for the settle window → done
             }
         }
     }
@@ -2076,6 +2181,9 @@ impl Services {
     /// present; bare callers (tests, harness paths) may pass `None` and the
     /// field is omitted.
     #[allow(clippy::too_many_arguments)]
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.
     pub async fn run_prompt_turn(
         &self,
         conn: &Connection,
@@ -2110,8 +2218,6 @@ impl Services {
         .await;
         // Activity tracker for idle-based timeout: reset on every notification.
         let activity = session::ActivityTracker::new();
-        let prompt_fut = session::prompt(conn, acp_session_id, prompt, &activity);
-        tokio::pin!(prompt_fut);
         let mut closed = false;
         // Whether ANY `session/update` for this turn was applied — an input to
         // the silent-redrive eligibility below (monorepo#764): once the
@@ -2123,19 +2229,120 @@ impl Services {
         // return false from `route_notification` but still reset the idle
         // timer). Input to the idle-timeout streamed-activity marker below.
         let mut any_update_received = false;
+        // Bounded in-place retry for transient provider-fetch failures
+        // (intent-hq/monorepo#3007): a `-32603` wrapping a connect-level
+        // fetch fault (EPIPE/ECONNRESET/ECONNREFUSED/timeout) or an explicit
+        // provider `apiStatus: unavailable`/`overloaded` payload is routine
+        // network weather, not a terminal turn failure. The prompt is
+        // re-dispatched on the SAME live connection with exponential backoff,
+        // but ONLY while the attempt is provably output-free (no
+        // `session/update` received at all), side-effect-free (no
+        // agent→client request — `fs/write_text_file`, `terminal/*`,
+        // `session/request_permission` — forwarded since the turn started,
+        // per the connection's client-request watermark) and the
+        // notification channel is still open — nothing was streamed,
+        // persisted, or emitted, so the retried unit is idempotent. Once
+        // anything streamed or side-effected, or once the budget is spent,
+        // the error falls through to the existing classification below
+        // (terminal / silent redrive / sleep-resume) unchanged. Genuinely
+        // terminal errors (auth, invalid request, model-not-found, 4xx)
+        // never classify transient and fail fast.
+        //
+        // Two boundary notes:
+        // - Bridge-side idempotency is assumed, not proven: the guard proves
+        //   the DAEMON attempt was output-free, but whether the provider
+        //   bridge (codex-acp / auggie) already appended the user prompt to
+        //   its session history before the failed fetch is bridge-internal.
+        //   Accepted risk: worst case the retried prompt duplicates the user
+        //   message in provider-side context (never in daemon-persisted
+        //   transcript), which is strictly better than killing the turn.
+        // - No cancel race with the backoff sleep: a user stop is delivered
+        //   by `AgentManager::interrupt`/`stop` aborting this turn worker
+        //   (`worker.abort()`), which drops this whole future — sleep, loop,
+        //   and all — so a retry can never re-dispatch after a stop.
+        let mut fetch_retry_attempt: u32 = 0;
+        // Agent→client request watermark at turn start: any bump means a
+        // client-served handler may have side-effected on behalf of this
+        // turn, so the attempt is no longer provably idempotent.
+        let client_request_watermark = conn.client_request_seq();
         let result = loop {
-            tokio::select! {
-                res = &mut prompt_fut => break res,
-                maybe = notifications.recv(), if !closed => match maybe {
-                    Some(note) => {
+            let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
+            tokio::pin!(prompt_fut);
+            let attempt_result = loop {
+                tokio::select! {
+                    res = &mut prompt_fut => break res,
+                    maybe = notifications.recv(), if !closed => match maybe {
+                        Some(note) => {
+                            activity.touch();
+                            any_update_received = true;
+                            updates_applied |= self
+                                .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                                .await;
+                        }
+                        None => closed = true,
+                    },
+                }
+            };
+            // Drain updates buffered before this attempt settled BEFORE the
+            // retry decision: `prompt_fut` can win the `select!` with streamed
+            // notes still sitting in the channel, and a retry armed on a
+            // stale `any_update_received = false` would re-dispatch a prompt
+            // that did produce output (duplicating it). The post-loop drain
+            // below still runs for the final attempt; draining twice is
+            // harmless (`try_recv` on an empty channel is a no-op).
+            if attempt_result.is_err() {
+                while let Ok(note) = notifications.try_recv() {
+                    activity.touch();
+                    any_update_received = true;
+                    updates_applied |= self
+                        .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                        .await;
+                }
+            }
+            match &attempt_result {
+                Err(e)
+                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                        && !closed
+                        && !any_update_received
+                        && conn.client_request_seq() == client_request_watermark
+                        && intent_acp::is_transient_provider_fetch_failure(e) =>
+                {
+                    fetch_retry_attempt += 1;
+                    let delay = Duration::from_millis(
+                        transient_prompt_retry_base_ms() << (fetch_retry_attempt - 1),
+                    );
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        attempt = fetch_retry_attempt,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
+                    );
+                    tokio::time::sleep(delay).await;
+                    // Re-drain after the backoff: a straggling update (or a
+                    // channel close) can land DURING the sleep, and
+                    // re-dispatching without observing it would duplicate
+                    // output the provider already streamed. If the recheck
+                    // flips any guard, fall through to classification with
+                    // this attempt's error instead of retrying.
+                    while let Ok(note) = notifications.try_recv() {
                         activity.touch();
                         any_update_received = true;
                         updates_applied |= self
                             .route_notification(&note, agent_id, workspace_id, &mut transcript)
                             .await;
                     }
-                    None => closed = true,
-                },
+                    if any_update_received || conn.client_request_seq() != client_request_watermark
+                    {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            attempt = fetch_retry_attempt,
+                            "output arrived during retry backoff — abandoning retry (monorepo#3007)"
+                        );
+                        break attempt_result;
+                    }
+                }
+                _ => break attempt_result,
             }
         };
         // Drain updates buffered before the prompt response resolved. Each
@@ -2402,17 +2609,19 @@ impl Services {
         // — single-slot). A question-FREE turn end deliberately does NOT
         // clear the marker: pendingness survives the agent's later turns
         // until the user answers or dismisses.
-        if message_persisted && questions_persisted {
+        let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
-                .await;
-        }
+                .await
+        } else {
+            false
+        };
         // A question-bearing tail arms the marker above and so RAISES the
         // workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare. A question-FREE tail no longer moves the
         // derivation at all — pendingness now survives the agent's later
         // turns — so those turn ends skip the workspace-wide probe entirely
         // instead of relying on the dedup cache to stay silent.
-        if message_persisted && questions_persisted {
+        if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
@@ -2874,8 +3083,12 @@ impl Services {
     /// was persisted). The `agent:idle` lifecycle emit stays with the caller,
     /// which owns the single-flight slot.
     ///
-    /// Returns the persisted assistant `messageId`, or `None` when the burst
-    /// persisted nothing.
+    /// Returns a [`HarnessWakeOutcome`]: the persisted assistant `messageId`
+    /// (`None` when the burst persisted nothing) plus the empty-response
+    /// classification (intent-hq/monorepo#3262) — `true` when the turn
+    /// OPENED but its finalized transcript carried no meaningful content
+    /// (whitespace-only text/thinking blocks), the signature of a failed
+    /// recovery wake the caller must not accept as a successful completion.
     pub(crate) async fn run_harness_wake_turn(
         &self,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
@@ -2883,7 +3096,7 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         settle: std::time::Duration,
-    ) -> Option<String> {
+    ) -> HarnessWakeOutcome {
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone());
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
@@ -2919,7 +3132,9 @@ impl Services {
             if elapsed >= settle {
                 break;
             }
-            let tick = (settle - elapsed).min(std::time::Duration::from_millis(50));
+            let tick = settle
+                .saturating_sub(elapsed)
+                .min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(tick, notifications.recv()).await {
                 Ok(Some(note)) => {
                     updates_applied |= self
@@ -2941,6 +3156,13 @@ impl Services {
         let blocks = transcript.into_blocks();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Empty-response classification (intent-hq/monorepo#3262): the wake
+        // turn OPENED (a chunk/tool-call materialized content) but finalized
+        // with nothing meaningful — whitespace-only text/thinking blocks, the
+        // incident's single bare "\n". Computed on the finalized blocks
+        // BEFORE the append consumes them; the row (when any) still persists
+        // as the durable record of the no-op wake.
+        let empty_response = harness_wake_response_is_empty(&blocks);
         let mut message_persisted = false;
         if !blocks.is_empty() {
             match self
@@ -2973,13 +3195,15 @@ impl Services {
         // Same stored-on-write pending-questions marker as the prompt-turn
         // persist: a question-bearing wake tail arms the hold (question-free
         // tails leave the marker untouched).
-        if message_persisted && questions_persisted {
+        let marker_moved = if message_persisted && questions_persisted {
             self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
-                .await;
-        }
+                .await
+        } else {
+            false
+        };
         // Same §6.5 step-0 recompute as the prompt-turn persist: only a
         // question-bearing tail moves the question-hold derivation.
-        if message_persisted && questions_persisted {
+        if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
@@ -2993,17 +3217,118 @@ impl Services {
         stamp_preview_fields(&mut end_data, &preview_text_blocks);
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
-        message_persisted.then_some(message_id)
+        HarnessWakeOutcome {
+            message_id: message_persisted.then_some(message_id),
+            empty_response,
+        }
+    }
+
+    /// Recover from an empty harness-wake response (intent-hq/monorepo#3262):
+    /// the wake turn opened but finalized with no meaningful content — the
+    /// post-interrupt incident signature where a bare newline was accepted as
+    /// `harness_wake_complete` and the agent stalled silently. Runs after the
+    /// wake turn's slot is released and BEFORE the wake idle emit:
+    ///
+    /// 1. **Skip** when a ready-to-send queue entry exists (the imminent
+    ///    drain is itself the nudge; the wake idle is suppressed on the same
+    ///    condition) or when an attention request is already pending (the
+    ///    stall is already surfaced — do not stack).
+    /// 2. **Redrive** when the agent is redrive-eligible (delegated, in-task,
+    ///    no report — [`Self::truncation_redrive_eligible`]) and the
+    ///    consecutive counter (shared with the #2863 stall-episode streak) is
+    ///    within [`MAX_CONSECUTIVE_TRUNCATION_REDRIVES`]: the harness's
+    ///    empty-wake nudge is enqueued as a system-origin message tagged
+    ///    `{"type": "empty_wake_redrive"}`; the caller's ready-to-send kick
+    ///    drains it as a normal prompt turn. The streak clears on the next
+    ///    clean completion, same as the prompt-turn redrive.
+    /// 3. **Raise attention** otherwise (root/user-facing or taskless agents,
+    ///    or the cap is spent): a `"blocker"` attention request with the
+    ///    harness's turn-ended-unexpectedly reason, via the standard
+    ///    [`Self::agent_request_attention_op`] surfaces (session fields,
+    ///    transcript notice, `agent:attention-requested`, `needs_attention`
+    ///    display status, parent wake for delegated callers) — the workspace
+    ///    visibly needs input instead of looking healthy.
+    ///
+    /// Returns `true` when a nudge was enqueued (the caller's queue kick
+    /// delivers it), `false` otherwise. Best-effort throughout: store
+    /// failures fall through to the attention arm's own error handling and
+    /// never fail the wake path.
+    pub(crate) async fn recover_empty_harness_wake(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        if self.has_ready_to_send(agent_id) {
+            return false;
+        }
+        if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+            if session.attention_request_kind.is_some() {
+                return false;
+            }
+        }
+        if self.truncation_redrive_eligible(agent_id).await {
+            let streak = self.bump_truncation_redrives(agent_id);
+            if streak <= MAX_CONSECUTIVE_TRUNCATION_REDRIVES {
+                tracing::warn!(
+                    agent = %agent_id,
+                    streak,
+                    "empty harness-wake response on a delegated in-task agent — enqueueing recovery nudge (monorepo#3262)"
+                );
+                let nudge = crate::harness::latest().empty_wake_redrive_nudge();
+                self.enqueue_message_with_origin(
+                    agent_id,
+                    nudge,
+                    None,
+                    None,
+                    Some(json!({ "type": "empty_wake_redrive" })),
+                    None,
+                    false,
+                    false,
+                );
+                self.publish_queue_updated(agent_id).await;
+                return true;
+            }
+            tracing::warn!(
+                agent = %agent_id,
+                streak,
+                "empty harness-wake response — consecutive-redrive cap spent, raising attention (monorepo#3262)"
+            );
+        }
+        // Attention arm: not redrive-eligible (root/user-facing, taskless)
+        // or the cap is spent — surface the stall instead of idling
+        // silently. The op's attention fields are cleared when the agent
+        // next receives a message, so a fresh user prompt retires it.
+        let reason = crate::harness::latest().empty_wake_attention_reason();
+        if let Err(e) = self
+            .agent_request_attention_op(
+                workspace_id.clone(),
+                "blocker".to_string(),
+                reason,
+                Some(agent_id.clone()),
+            )
+            .await
+        {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "empty harness-wake recovery: attention request failed (monorepo#3262)"
+            );
+        }
+        false
     }
 
     /// Emit the `agent:idle` lifecycle signal for a finished harness-wake turn
     /// (monorepo#855), honoring the same ready-to-send suppression as a prompt
     /// turn's idle emit. `reason: "harness_wake_complete"` distinguishes it
-    /// from `stream_complete` for subscribers.
+    /// from `stream_complete` for subscribers. `empty_wake_response` stamps
+    /// the advisory `emptyWakeResponse: true` (intent-hq/monorepo#3262) so
+    /// subscribers can tell a no-op recovery wake from a healthy one; omitted
+    /// otherwise (absent ≠ present-false, additive field).
     pub(crate) async fn publish_harness_wake_idle(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
+        empty_wake_response: bool,
     ) {
         if self.has_ready_to_send(agent_id) {
             tracing::debug!(
@@ -3017,6 +3342,9 @@ impl Services {
             "reason": "harness_wake_complete",
             "status": "idle",
         });
+        if empty_wake_response {
+            data["emptyWakeResponse"] = Value::Bool(true);
+        }
         if let Ok(session) = self.store.get_agent_session(agent_id).await {
             data["agentName"] = Value::String(session.name);
             data["isBackground"] = Value::Bool(session.is_background);
@@ -3213,7 +3541,7 @@ impl Services {
                 prev.as_ref(),
                 &token_usage::snapshot_from_turn_usage(u),
             ),
-            _ => Default::default(),
+            _ => intent_core::TokenUsageTotals::default(),
         };
         let delta = intent_store::UsageStatsDelta {
             input_tokens: tokens.input_tokens,
@@ -3221,9 +3549,9 @@ impl Services {
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
             thought_tokens: tokens.thought_tokens,
-            runs: run_completed as u64,
+            runs: u64::from(run_completed),
             longest_run_ms: if run_completed {
-                turn_duration.as_millis() as u64
+                u64::try_from(turn_duration.as_millis()).unwrap_or(u64::MAX)
             } else {
                 0
             },
@@ -3238,9 +3566,11 @@ impl Services {
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         // Stats attribution only: no configured-default upgrade here (unlike
         // the spawn-adjacent call sites above), matching the pre-existing
-        // `usage_stats.rs` helpers this mirrors — out of scope for D2.
-        let provider_id =
-            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None));
+        // `usage_stats.rs` helpers this mirrors — out of scope for D2. An
+        // unresolvable provider falls to the `"unknown"` stats tail.
+        let provider_id = prev_readable
+            .then(|| resolve_provider_id(model.as_deref(), provider.as_deref(), None))
+            .flatten();
         let model = usage_stats::stats_model_key(
             model.as_deref(),
             resolved_model.as_deref(),
@@ -3308,20 +3638,17 @@ impl Services {
                 // thought↔text switch or a non-text block starts a new one.
                 // Thought chunks flush as `thinking` blocks (Zed's model) and
                 // ride the same `chat:stream:delta` shape.
-                let (block_index, block_type) = match &text {
-                    Some(t) => {
-                        let index = transcript.push_chunk(t, thought);
-                        let block_type = if thought { "thinking" } else { "text" };
-                        (index, block_type.to_string())
-                    }
-                    None => {
-                        let block_type = content
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        (transcript.push_block(content.clone()), block_type)
-                    }
+                let (block_index, block_type) = if let Some(t) = &text {
+                    let index = transcript.push_chunk(t, thought);
+                    let block_type = if thought { "thinking" } else { "text" };
+                    (index, block_type.to_string())
+                } else {
+                    let block_type = content
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (transcript.push_block(content.clone()), block_type)
                 };
                 // Internal chat-channel delta (§7.1): the full content-bearing
                 // payload the per-agent `chat.subscribe` forwarder accumulates
@@ -3395,7 +3722,7 @@ impl Services {
                     self.turn_attachments
                         .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
                         .iter()
-                        .map(|a| a.resource_item())
+                        .map(intent_core::TurnAttachment::resource_item)
                         .collect()
                 } else {
                     Vec::new()
@@ -3605,9 +3932,9 @@ impl Services {
         // only); persist all other agent events (stream:status, stream:end,
         // tool:call, lifecycle, etc.) for durable audit trail.
         if event_type == CHAT_STREAM_DELTA || event_type == AGENT_STREAM_ACTIVITY {
-            crate::publish_event_transient(&self.event_bus, event);
+            crate::publish_event_transient(self.event_bus.as_ref(), &event);
         } else {
-            crate::publish_event(&self.event_bus, event).await;
+            crate::publish_event(self.event_bus.as_ref(), event).await;
         }
     }
 

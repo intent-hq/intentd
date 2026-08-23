@@ -191,12 +191,14 @@ pub(crate) fn build_git_status_value_with(
     // `status_ms` only attributes a scan this call actually ran; with an
     // injected status the scan was paid by (or shared with) another caller's
     // flight, so it logs as absent rather than a misleading ~0.
-    let (status, status_ms) = match scanned {
-        Some(s) => (s, None),
-        None => {
-            let s = std::sync::Arc::new(intent_git::status::status(worktree)?);
-            (s, Some(started.elapsed().as_millis() as u64))
-        }
+    let (status, status_ms) = if let Some(s) = scanned {
+        (s, None)
+    } else {
+        let s = std::sync::Arc::new(intent_git::status::status(worktree)?);
+        (
+            s,
+            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        )
     };
     let branch = if status.branch.is_empty() {
         ws.branch.clone()
@@ -209,15 +211,16 @@ pub(crate) fn build_git_status_value_with(
     let has_remote = remote_url.is_some();
     let is_pushed = has_remote
         && intent_git::remote::remote_tracking_exists(worktree, "origin", &branch).unwrap_or(false);
-    let remote_ms = remote_started.elapsed().as_millis() as u64;
+    let remote_ms = u64::try_from(remote_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let trunk_started = std::time::Instant::now();
     let trunk_ref = resolve_trunk_ref(worktree, &trunk, has_remote);
-    let trunk_ms = trunk_started.elapsed().as_millis() as u64;
+    let trunk_ms = u64::try_from(trunk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let ahead_behind_started = std::time::Instant::now();
     let (ahead, behind) = intent_git::remote::ahead_behind(worktree, &trunk_ref)?;
-    let ahead_behind_ms = ahead_behind_started.elapsed().as_millis() as u64;
+    let ahead_behind_ms =
+        u64::try_from(ahead_behind_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let history_started = std::time::Instant::now();
     // Metadata-only walk: no per-commit tree diffs. `localCommits` entries omit
@@ -225,7 +228,7 @@ pub(crate) fn build_git_status_value_with(
     // `git.commitDetails` (PROTOCOL §5.6).
     let commits = intent_git::history::history_since(worktree, Some(&trunk_ref), 200, false)?;
     let local_commits: Vec<Value> = commits.iter().map(commit_to_value).collect();
-    let history_ms = history_started.elapsed().as_millis() as u64;
+    let history_ms = u64::try_from(history_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut uncommitted = std::collections::HashSet::new();
     let mut staged = std::collections::HashSet::new();
@@ -239,8 +242,7 @@ pub(crate) fn build_git_status_value_with(
     let (owner, repo) = remote_url
         .as_deref()
         .and_then(parse_owner_repo)
-        .map(|(o, r)| (Some(o), Some(r)))
-        .unwrap_or((None, None));
+        .map_or((None, None), |(o, r)| (Some(o), Some(r)));
 
     tracing::debug!(
         files = status.files.len(),
@@ -250,7 +252,7 @@ pub(crate) fn build_git_status_value_with(
         trunk_resolve_ms = trunk_ms,
         ahead_behind_ms,
         history_walk_ms = history_ms,
-        total_ms = started.elapsed().as_millis() as u64,
+        total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "accept-changes.getStatus: status scan + remote/trunk resolve + history walk"
     );
 
@@ -362,28 +364,28 @@ pub(crate) fn build_prepare_value(
     if has_git {
         // Committed range stats (trunk...HEAD): counted but not listed as files.
         for fd in intent_git::diff::diff_range(worktree, &trunk_ref)? {
-            additions += fd.additions as i64;
-            deletions += fd.deletions as i64;
+            additions += i64::try_from(fd.additions).expect("value fits in i64");
+            deletions += i64::try_from(fd.deletions).expect("value fits in i64");
         }
         // Staged changes (HEAD→index).
         for fd in intent_git::diff::diff_head_to_index(worktree)? {
-            additions += fd.additions as i64;
-            deletions += fd.deletions as i64;
+            additions += i64::try_from(fd.additions).expect("value fits in i64");
+            deletions += i64::try_from(fd.deletions).expect("value fits in i64");
             files.push(PrepFile {
                 path: fd.path,
-                additions: fd.additions as i64,
-                deletions: fd.deletions as i64,
+                additions: i64::try_from(fd.additions).expect("value fits in i64"),
+                deletions: i64::try_from(fd.deletions).expect("value fits in i64"),
                 staged: true,
             });
         }
         // Unstaged changes (index→workdir, incl. untracked).
         for fd in intent_git::diff::diff_index_to_workdir(worktree)? {
-            additions += fd.additions as i64;
-            deletions += fd.deletions as i64;
+            additions += i64::try_from(fd.additions).expect("value fits in i64");
+            deletions += i64::try_from(fd.deletions).expect("value fits in i64");
             files.push(PrepFile {
                 path: fd.path,
-                additions: fd.additions as i64,
-                deletions: fd.deletions as i64,
+                additions: i64::try_from(fd.additions).expect("value fits in i64"),
+                deletions: i64::try_from(fd.deletions).expect("value fits in i64"),
                 staged: false,
             });
         }

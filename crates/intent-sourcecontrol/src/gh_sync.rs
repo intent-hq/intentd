@@ -258,8 +258,7 @@ impl GhCli for SystemGhCli {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 
     fn login_with_token(&self, gh: &Path, token: &SecretString) -> bool {
@@ -282,7 +281,7 @@ impl GhCli for SystemGhCli {
             }
             // Dropping the handle closes stdin so `gh` sees EOF.
         }
-        child.wait().map(|s| s.success()).unwrap_or(false)
+        child.wait().is_ok_and(|s| s.success())
     }
 
     fn active_login(&self, gh: &Path) -> Option<String> {
@@ -335,8 +334,7 @@ impl GhCli for SystemGhCli {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 }
 
@@ -390,8 +388,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -408,6 +405,9 @@ mod tests {
 
     /// Scripted [`GhCli`] that records whether a login/logout was attempted —
     /// no real `gh` is ever spawned from tests.
+    // Test mock: independent scenario bools, and `Option<Option<_>>` recorders
+    // distinguishing "never called" from "called with None".
+    #[allow(clippy::struct_excessive_bools, clippy::option_option)]
     struct MockGhCli {
         installed: bool,
         authenticated: bool,
@@ -492,6 +492,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn token() -> Option<SecretString> {
         Some(SecretString::from("gho_test_sync"))
     }
@@ -558,6 +559,7 @@ mod tests {
         sync_token_to_gh(store).await;
     }
 
+    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn revoked() -> Option<SecretString> {
         Some(SecretString::from("gho_test_revoked"))
     }

@@ -383,9 +383,9 @@ fn invalid_config_refuses_startup_with_key_in_error() {
     }
 }
 
-/// An invalid pin value refuses startup: INTENTD_IDLE_REAP_MINUTES parses but
+/// An invalid pin value refuses startup: `INTENTD_IDLE_REAP_MINUTES` parses but
 /// violating the typed schema on another pinned key (out-of-range
-/// INTENTD_TCP_PORT) must exit non-zero naming the flag.
+/// `INTENTD_TCP_PORT`) must exit non-zero naming the flag.
 #[test]
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();

@@ -185,7 +185,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected text frame, got {other:?}"),
         }
     }
@@ -203,9 +203,8 @@ where
             Some(d) if !d.is_zero() => d,
             _ => panic!("wss event timed out"),
         };
-        let next = match timeout(remaining, ws.next()).await {
-            Ok(next) => next,
-            Err(_) => panic!("wss event timed out"),
+        let Ok(next) = timeout(remaining, ws.next()).await else {
+            panic!("wss event timed out")
         };
         match next {
             Some(Ok(Message::Text(text))) => {
@@ -217,7 +216,7 @@ where
             Some(Ok(Message::Ping(p))) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Some(Ok(_)) => continue,
+            Some(Ok(_)) => {}
             other => panic!("expected event frame, got {other:?}"),
         }
     }
@@ -254,7 +253,7 @@ async fn interrupted_agents_persisted_across_restart() {
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("Daemon log:\n{}", log);
+            eprintln!("Daemon log:\n{log}");
         }
         panic!("daemon did not start");
     }
@@ -356,7 +355,8 @@ async fn interrupted_agents_persisted_across_restart() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
 
     // Open WSS connection.
     let cfg = client_config(&fp);
@@ -407,7 +407,8 @@ async fn interrupted_agents_persisted_across_restart() {
         .as_str()
         .expect("fingerprint 2")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port 2") as u16;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port 2"))
+        .expect("value fits in u16");
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
@@ -494,7 +495,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("Daemon log:\n{}", log);
+            eprintln!("Daemon log:\n{log}");
         }
         panic!("daemon did not start");
     }
@@ -505,7 +506,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .as_str()
         .expect("fingerprint")
         .to_string();
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
 
     // Open event subscriber BEFORE creating the agent so we miss no events.
     let cfg = client_config(&fp);
@@ -611,7 +613,8 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .as_str()
         .expect("fingerprint 2")
         .to_string();
-    let port2 = status["result"]["port"].as_u64().expect("port 2") as u16;
+    let port2 = u16::try_from(status["result"]["port"].as_u64().expect("port 2"))
+        .expect("value fits in u16");
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port2, cfg).await;
 
