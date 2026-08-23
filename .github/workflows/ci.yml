@@ -438,6 +438,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
+          # clippy is needed by the macOS lint step below; installing it
+          # matrix-wide keeps this step unconditional (negligible on Windows).
+          components: clippy
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there instead (mirrors the `check` job's
       # burst-runner caching; pure overhead on the self-hosted runners).
@@ -453,6 +456,20 @@ jobs:
       - name: Check (PR compilation proof)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request'
         run: cargo check --workspace --target ${{ matrix.target }}
+      # Clippy over macOS-gated code (intent-hq/monorepo#3285): the `check`
+      # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
+      # compiled, so warnings in macOS-only files land silently and break
+      # `make check` on every macOS dev box. Linting here (PRs only, same
+      # invocation as the check job) closes the gap. It runs on this runner
+      # rather than as a Linux cross-target run because `cargo clippy
+      # --target aarch64-apple-darwin` still executes the native build
+      # scripts (libz-sys and friends try-compile C for the target even when
+      # pkg-config resolves a system lib), which would require a full darwin
+      # cross C toolchain on Linux; the native runner needs nothing extra and
+      # shares this job's warm target dir.
+      - name: Clippy (macOS-gated code)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && runner.os == 'macOS'
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'pull_request'
         run: cargo build --workspace --release --target ${{ matrix.target }}

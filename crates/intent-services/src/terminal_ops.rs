@@ -1474,7 +1474,7 @@ mod tests {
         let env = std::collections::BTreeMap::from([
             // Electron-launched daemons can inherit an empty terminal type.
             // `create` must coerce it before zsh initializes ZLE.
-            ("TERM".to_string(), "".to_string()),
+            ("TERM".to_string(), String::new()),
             ("ZDOTDIR".to_string(), zdotdir.path().display().to_string()),
         ]);
         let res = create(

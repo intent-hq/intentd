@@ -583,9 +583,9 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
 
     let result = unsafe {
         libc::sysctlbyname(
-            name.as_ptr() as *const libc::c_char,
-            &mut size as *mut u64 as *mut libc::c_void,
-            &mut len,
+            name.as_ptr().cast::<libc::c_char>(),
+            (&raw mut size).cast::<libc::c_void>(),
+            &raw mut len,
             ptr::null_mut(),
             0,
         )
