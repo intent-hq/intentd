@@ -301,6 +301,27 @@ fn parse_acp_models_drops_unresolvable_default_pseudo_row() {
 }
 
 #[test]
+fn parse_acp_models_drops_every_pseudo_row_when_a_real_row_exists() {
+    // EVERY pseudo-row is dropped once a real row exists — not just the
+    // first — matching the cache-load sanitization: a `default` id must
+    // never ship next to a real model row.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "sonnet",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "DEFAULT", "name": "Default (dup)" },
+                { "value": "sonnet", "name": "Sonnet" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "sonnet");
+    assert_eq!(rows[0]["isDefault"], json!(true));
+}
+
+#[test]
 fn parse_acp_models_current_value_marks_default_without_pseudo_row() {
     // A real (non-"default") currentValue marks its row isDefault even when
     // the catalog carries no pseudo-row at all.
