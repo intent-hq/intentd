@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.43] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- Treat empty harness-wake responses as failed recovery, not completion ([#1418](https://github.com/intent-hq/intentd/pull/1418))
+
+
 ## [0.7.42] - 2026-08-23
 
 ### 🚀 Features
