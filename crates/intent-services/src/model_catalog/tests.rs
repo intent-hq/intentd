@@ -212,6 +212,41 @@ fn persistence_roundtrips_model_metadata_without_transform() {
     );
 }
 
+#[test]
+fn persistence_load_drops_stale_default_pseudo_row() {
+    // A snapshot persisted by a daemon predating the parse-time pseudo-row
+    // resolution stays valid under the same version key (the adapter pin), so
+    // the load path must drop the pseudo-row when real rows exist next to it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(MODELS_CACHE_FILE);
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let stale = vec![
+        json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code",
+                "description": "Opus 5 with 1M context · Best for everyday, complex tasks" }),
+        json!({ "id": "opus[1m]", "name": "Opus (1M context)", "provider": "claude-code",
+                "description": "Opus 5 with 1M context · Best for everyday, complex tasks" }),
+        json!({ "id": "sonnet", "name": "Sonnet", "provider": "claude-code" }),
+    ];
+    cache.store("claude-code", "pin@1", stale, 1_000);
+
+    let reloaded = ModelCatalogCache::new(Some(path.clone()));
+    let served = reloaded.last_good("claude-code", "pin@1").unwrap();
+    let ids: Vec<&str> = served.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["opus[1m]", "sonnet"]);
+
+    // A sole pseudo-row is kept — the load never empties a catalog (D1).
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let only_default = vec![
+        json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code" }),
+    ];
+    cache.store("claude-code", "pin@1", only_default.clone(), 2_000);
+    let reloaded = ModelCatalogCache::new(Some(path));
+    assert_eq!(
+        reloaded.last_good("claude-code", "pin@1"),
+        Some(only_default)
+    );
+}
+
 /// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
 /// list with no warning — the provider CLI owns model selection.
 #[tokio::test]

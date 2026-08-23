@@ -48,7 +48,7 @@ use serde_json::Value;
 mod parse;
 mod probe;
 
-pub(crate) use parse::gguf_bytes_fit_within_ram;
+pub(crate) use parse::{gguf_bytes_fit_within_ram, is_default_pseudo_row};
 use probe::{run_acp_probe, AcpProbeCommand, ProbeError};
 
 /// Timeout for the one-shot `opencode models` CLI invocation.
@@ -127,7 +127,7 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
 /// adapters (≥ 0.60), `models.availableModels` on older ones — or a
 /// `session/update` notification. The adapter's `default` pseudo-row is
 /// resolved to the real model it stands for (marked `isDefault: true`) and
-/// dropped; an unresolvable pseudo-row is kept as-is.
+/// dropped whenever a real row exists; it is kept only as a sole row.
 pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
     let Some(npx) = find_npx() else {
         return ProviderModelsFetch::unavailable(
