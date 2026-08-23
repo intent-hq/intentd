@@ -1,5 +1,5 @@
-//! macOS CoW implementation: clonefile(2) for whole-tree clones, copyfile(3)
-//! with COPYFILE_CLONE_FORCE for single-file clones (probe path).
+//! macOS `CoW` implementation: clonefile(2) for whole-tree clones, copyfile(3)
+//! with `COPYFILE_CLONE_FORCE` for single-file clones (probe path).
 
 use intent_core::{Error, Result};
 use std::ffi::CString;
@@ -26,6 +26,9 @@ extern "C" {
     fn statfs(path: *const libc::c_char, buf: *mut StatFs) -> libc::c_int;
 }
 
+// The `f_` prefix mirrors the C `struct statfs` field names from
+// sys/mount.h verbatim; renaming would obscure the FFI correspondence.
+#[allow(clippy::struct_field_names)]
 #[repr(C)]
 struct StatFs {
     f_bsize: u32,
@@ -47,7 +50,7 @@ struct StatFs {
     f_reserved: [u32; 7],
 }
 
-/// Get volume IDs (f_fsid) for both paths as a cache key.
+/// Get volume IDs (`f_fsid`) for both paths as a cache key.
 pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
     let src_id = get_volume_id(src)?;
     let dst_id = get_volume_id(dst)?;
@@ -57,12 +60,17 @@ pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
 fn get_volume_id(path: &Path) -> Option<u64> {
     let path_cstr = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: StatFs = unsafe { std::mem::zeroed() };
-    let ret = unsafe { statfs(path_cstr.as_ptr(), &mut stat) };
+    let ret = unsafe { statfs(path_cstr.as_ptr(), &raw mut stat) };
     if ret != 0 {
         return None;
     }
-    // Combine the two i32 fsid values into a u64
-    Some(((stat.f_fsid[0] as u64) << 32) | (stat.f_fsid[1] as u64))
+    // Combine the two i32 fsid values bitwise into a u64: each half is
+    // reinterpreted as its raw 32 bits so a negative component cannot
+    // sign-extend across the other half of the key.
+    Some(
+        (u64::from(stat.f_fsid[0].cast_unsigned()) << 32)
+            | u64::from(stat.f_fsid[1].cast_unsigned()),
+    )
 }
 
 pub fn probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
@@ -161,7 +169,7 @@ pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneSta
     }
 }
 
-/// Best-effort per-entry walk with clone_tree_fast as the subtree fast path:
+/// Best-effort per-entry walk with `clone_tree_fast` as the subtree fast path:
 /// each directory below the root is first cloned whole, and only subtrees
 /// whose directory-level clone fails (or which hold an excluded descendant)
 /// are walked per-entry.
@@ -176,7 +184,7 @@ fn walk(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
 /// aborted on with ENOTSUP. Note that with flags 0 clonefile follows a
 /// symlink root (the clone materializes the target directory), whereas the
 /// recursive copyfile cloned the link itself; callers that must not follow
-/// a symlinked source should canonicalize first (as cow_checkout does).
+/// a symlinked source should canonicalize first (as `cow_checkout` does).
 fn clone_tree_fast(src: &Path, dst: &Path) -> Result<()> {
     let src_cstr = CString::new(src.as_os_str().as_bytes())
         .map_err(|e| Error::Internal(format!("invalid src path: {e}")))?;
@@ -202,6 +210,7 @@ fn clone_tree_fast(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
 
     /// Regression test for the whole-tree fast path on socket-bearing trees
@@ -220,16 +229,13 @@ mod tests {
         fs::create_dir_all(src.join("sub")).unwrap();
         fs::write(src.join("sub/file.txt"), b"data").unwrap();
 
-        match probe(&src, &base) {
-            Ok(CowSupport::Supported) => {}
-            _ => {
-                eprintln!(
-                    "skipping whole_tree_fast_path_clones_tree_with_live_unix_socket: \
-                     CoW not supported on this filesystem"
-                );
-                let _ = fs::remove_dir_all(&base);
-                return;
-            }
+        if !matches!(probe(&src, &base), Ok(CowSupport::Supported)) {
+            eprintln!(
+                "skipping whole_tree_fast_path_clones_tree_with_live_unix_socket: \
+                 CoW not supported on this filesystem"
+            );
+            let _ = fs::remove_dir_all(&base);
+            return;
         }
 
         let listener = UnixListener::bind(src.join("live.sock")).expect("bind unix socket");
@@ -245,7 +251,6 @@ mod tests {
             "data"
         );
         // clonefile(2) carries the socket node itself into the clone.
-        use std::os::unix::fs::FileTypeExt;
         assert!(fs::symlink_metadata(dst.join("live.sock"))
             .unwrap()
             .file_type()
@@ -256,9 +261,9 @@ mod tests {
     }
 
     /// Regression test for the clone-or-fail contract (intent-hq/monorepo#1124):
-    /// with COPYFILE_CLONE_FORCE a cross-volume per-file clone must return
+    /// with `COPYFILE_CLONE_FORCE` a cross-volume per-file clone must return
     /// `Unsupported` instead of silently falling back to a physical byte copy
-    /// (as the best-effort COPYFILE_CLONE did). Needs a second writable volume
+    /// (as the best-effort `COPYFILE_CLONE` did). Needs a second writable volume
     /// to exercise the cross-volume case; skipped when none is mounted.
     #[test]
     fn clone_file_cross_volume_returns_unsupported() {
