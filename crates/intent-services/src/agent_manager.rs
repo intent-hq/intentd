@@ -6528,21 +6528,28 @@ impl AgentManager {
                 .await;
             mgr.registry.mark_idle(&id);
             drop(guard);
+            // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
+            // that finalized with no meaningful content must not be
+            // accepted as a successful completion. Runs while the busy slot
+            // is STILL HELD — after `end_turn` a racing user send could
+            // claim the slot, dequeue its message, and start a prompt turn
+            // (clearing attention state) before this check, leaving a stale
+            // blocker raised against an actively-working agent. Under the
+            // held slot a racing send can only enqueue, so recovery's
+            // `has_ready_to_send` gate sees it and skips (the imminent
+            // drain IS the nudge). The nudge enqueue needs no released
+            // slot — only the drain kick below does — and it lands BEFORE
+            // the idle emit (its ready-to-send entry suppresses the idle;
+            // the attention arm's session fields land before subscribers
+            // see the idle).
+            if outcome.empty_response {
+                mgr.services.recover_empty_harness_wake(&id, &ws).await;
+            }
             // Deregister BEFORE releasing the slot: while the slot is held
             // no concurrent send can spawn (and register) a prompt worker,
             // so this provably removes only this task's own entry.
             mgr.clear_worker(&id);
             mgr.end_turn(&id).await;
-            // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
-            // that finalized with no meaningful content must not be
-            // accepted as a successful completion. Runs AFTER the slot
-            // release (an enqueued nudge drains as a normal prompt turn via
-            // the kick below) and BEFORE the idle emit (the nudge's
-            // ready-to-send entry suppresses the idle; the attention arm's
-            // session fields land before subscribers see the idle).
-            if outcome.empty_response {
-                mgr.services.recover_empty_harness_wake(&id, &ws).await;
-            }
             mgr.services
                 .publish_harness_wake_idle(&id, &ws, outcome.empty_response)
                 .await;
