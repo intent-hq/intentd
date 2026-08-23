@@ -1138,10 +1138,21 @@ async fn wss_agent_list_caps_previews_get_serves_full() {
         Some("write_file"),
         "the tool name survives the capped list preview: {row}"
     );
-    let served_tool = row["lastToolUse"].to_string();
+    // The list re-cap keeps the §5.5 preview contract: the over-budget input
+    // carries `inputTruncated: true` + `inputBytes` (original size).
+    assert_eq!(
+        row["lastToolUse"]["inputTruncated"].as_bool(),
+        Some(true),
+        "agent.list stamps inputTruncated on the capped preview: {row}"
+    );
+    assert!(
+        row["lastToolUse"]["inputBytes"].as_u64().unwrap() > BUDGET as u64,
+        "inputBytes names the original input's serialized size: {row}"
+    );
+    let served_tool = row["lastToolUse"]["input"].to_string();
     assert!(
         served_tool.len() <= BUDGET * 2,
-        "agent.list caps lastToolUse near the budget, got {} bytes: {row}",
+        "agent.list caps lastToolUse input near the budget, got {} bytes: {row}",
         served_tool.len()
     );
 

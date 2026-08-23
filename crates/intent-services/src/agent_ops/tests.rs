@@ -6717,10 +6717,22 @@ async fn list_caps_previews_get_serves_full_values() {
         tool_use["name"], "write_file",
         "tool name survives the capped preview"
     );
-    let served = serde_json::to_string(tool_use).unwrap();
+    // The list-path re-cap keeps the §5.5 preview contract: an over-budget
+    // input is flagged with `inputTruncated`/`inputBytes` (the persisted
+    // preview was whole — under 2048 — so the flags are stamped here).
+    assert_eq!(
+        tool_use["inputTruncated"],
+        json!(true),
+        "list-capped lastToolUse stamps inputTruncated"
+    );
+    assert!(
+        usize::try_from(tool_use["inputBytes"].as_u64().unwrap()).expect("fits usize") > BUDGET,
+        "inputBytes names the original input's serialized size"
+    );
+    let served = serde_json::to_string(&tool_use["input"]).unwrap();
     assert!(
         served.len() <= BUDGET * 2,
-        "capped lastToolUse stays near the budget, got {} bytes",
+        "capped lastToolUse input stays near the budget, got {} bytes",
         served.len()
     );
     // The capped fields keep the original heads (truncation, not

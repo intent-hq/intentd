@@ -2003,6 +2003,12 @@ impl Services {
     /// ([`AgentLite::cap_list_previews`]); the detail reads keep full values.
     /// Together these keep a ~250-session response well under the 1 MiB
     /// outbound frame warn threshold.
+    ///
+    /// Deliberate asymmetry (same shape as the #2932 `initialMessage`
+    /// omission): the agent channel's seq-0 snapshot goes through this op
+    /// (capped rows), while per-agent deltas re-read via `agent.get` (full
+    /// values) — the bound is a property of list-shaped reads, not a channel
+    /// invariant. Delta frames are single-agent, so the size goal holds.
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
         let sessions = self
             .store
