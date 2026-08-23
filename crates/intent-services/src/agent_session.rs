@@ -1142,14 +1142,14 @@ fn select_entry<'a>(
 /// `None` for providers that do not use `_meta` injection (auggie, droid,
 /// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
-/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>", "excludeDynamicSections": true }? }`
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>"? }`
 ///   (disallowedTools always present; systemPrompt present only when non-blank
-///   prompt). `excludeDynamicSections: true` slims the preset system prompt so
-///   the appended instructions carry more weight: at adapter 0.66.0 / SDK
-///   0.3.220 it strips the per-user dynamic sections (working directory,
-///   auto-memory path, git status) from the system prompt and re-injects the
-///   stripped content as the first user message — nothing is lost, only
-///   relocated.
+///   prompt). A string `systemPrompt` fully REPLACES the `claude_code` preset
+///   prompt (verified against adapter 0.66.0: a string `_meta.systemPrompt` is
+///   passed to the SDK as-is, and SDK 0.3.220 treats a string as a custom
+///   prompt) — the model sees only our assembled prompt, with none of the
+///   preset's tool-usage/dynamic sections that previously diluted it via the
+///   `{ append, excludeDynamicSections }` object shape.
 /// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
 ///   `session_title` is supplied — monorepo#3151; older adapters ignore the
 ///   unknown field). The system prompt stays on the first-turn prepend fallback
@@ -1176,18 +1176,16 @@ fn build_session_meta(
                 }),
             );
 
-            // Add systemPrompt.append if non-blank prompt exists, with
-            // excludeDynamicSections so the preset prompt stays slim (the
-            // stripped sections come back as the first user message).
+            // Add systemPrompt as a plain string if a non-blank prompt exists:
+            // the string shape fully replaces the claude_code preset prompt so
+            // the model sees only our assembled instructions.
             if let Some(prompt) = system_prompt {
                 let prompt = prompt.trim();
                 if !prompt.is_empty() {
-                    let mut system_prompt_obj = serde_json::Map::new();
-                    system_prompt_obj
-                        .insert("append".to_string(), Value::String(prompt.to_string()));
-                    system_prompt_obj
-                        .insert("excludeDynamicSections".to_string(), Value::Bool(true));
-                    meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
+                    meta.insert(
+                        "systemPrompt".to_string(),
+                        Value::String(prompt.to_string()),
+                    );
                 }
             }
 

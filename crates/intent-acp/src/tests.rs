@@ -464,10 +464,7 @@ mod session_tests {
                 }
             }),
         );
-        meta.insert(
-            "systemPrompt".to_string(),
-            json!({"append": "test prompt", "excludeDynamicSections": true}),
-        );
+        meta.insert("systemPrompt".to_string(), json!("test prompt"));
 
         let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
             .await
@@ -487,14 +484,9 @@ mod session_tests {
             "session/new for claude-code must inject disallowedTools"
         );
         assert_eq!(
-            meta_payload["systemPrompt"]["append"],
+            meta_payload["systemPrompt"],
             json!("test prompt"),
-            "session/new systemPrompt.append preserved"
-        );
-        assert_eq!(
-            meta_payload["systemPrompt"]["excludeDynamicSections"],
-            json!(true),
-            "session/new systemPrompt.excludeDynamicSections preserved"
+            "session/new systemPrompt string (full replacement) preserved"
         );
     }
 
@@ -571,13 +563,7 @@ mod session_tests {
                 }
             }),
         );
-        let mut system_prompt_obj = serde_json::Map::new();
-        system_prompt_obj.insert("append".to_string(), json!("Resumed prompt"));
-        system_prompt_obj.insert("excludeDynamicSections".to_string(), json!(true));
-        meta.insert(
-            "systemPrompt".to_string(),
-            serde_json::Value::Object(system_prompt_obj),
-        );
+        meta.insert("systemPrompt".to_string(), json!("Resumed prompt"));
 
         session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new(), Some(meta))
             .await
@@ -595,14 +581,9 @@ mod session_tests {
             "session/load for claude-code must inject disallowedTools"
         );
         assert_eq!(
-            meta_payload["systemPrompt"]["append"],
+            meta_payload["systemPrompt"],
             json!("Resumed prompt"),
-            "session/load for claude-code must inject systemPrompt.append when provided"
-        );
-        assert_eq!(
-            meta_payload["systemPrompt"]["excludeDynamicSections"],
-            json!(true),
-            "session/load systemPrompt.excludeDynamicSections preserved"
+            "session/load systemPrompt string (full replacement) preserved"
         );
     }
 
