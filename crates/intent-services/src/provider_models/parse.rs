@@ -11,9 +11,11 @@
 //! and collapsed variants, other providers from adapter-advertised per-model
 //! `supportedEffortLevels` / `effortLevels`, falling back to the session's
 //! global `thought_level` select. The adapter's `default` pseudo-row is
-//! resolved to the real model it stands for — that row is marked
-//! `isDefault: true` and the pseudo-row is dropped; an unresolvable
-//! pseudo-row is kept as-is (fail-soft).
+//! dropped whenever at least one real model row exists; when it resolves to
+//! the real model it stands for, that row is marked `isDefault: true` (an
+//! unresolvable pseudo-row is still dropped, just with no `isDefault`
+//! marking). A catalog whose only row is the pseudo-row keeps it, so the
+//! list never comes back empty.
 
 use serde_json::{json, Map, Value};
 
