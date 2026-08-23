@@ -2410,6 +2410,22 @@ pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::
     Some(Value::Object(preview))
 }
 
+/// Per-field byte budget for `agent.list` row previews (list-payload cost
+/// contract, extending monorepo#2932): the preview fields exist to render a
+/// one-line summary in list contexts (sidebar rows, HUD cells), so each is
+/// bounded to this render-sized budget on the LIST path only — `agent.get` /
+/// `agent.getSession` keep serving full values. See
+/// [`AgentLite::cap_list_previews`]. String fields count JSON-SERIALIZED
+/// content bytes against the budget (escaping-heavy content is truncated
+/// harder, so the wire bound holds); the `lastToolUse` input preview goes
+/// through [`cap_json_value`], whose serialized size stays within a small
+/// constant factor of the budget. Sized against the dogfooding workspace
+/// that motivated the cap (253 sessions, ~1.1 MB `agent.list` frames): at
+/// 400 bytes/field the same response serializes to ~630 KB — well under the
+/// transport's 1 MiB large-frame warn — while keeping each preview long
+/// enough for its one-line render.
+pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
+
 /// Metadata key under which the client-supplied `userAppMessageId` is
 /// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
 /// the router (which folds the top-level param into `messageMetadata`) and
@@ -3143,6 +3159,96 @@ impl AgentLite {
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
+        }
+    }
+
+    /// List-path preview capping (list-payload cost contract, extending
+    /// monorepo#2932): bound every render-preview field to
+    /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — `lastAgentResponse`,
+    /// `lastUserMessage`, `digest`, and `metadata.completionReport` are
+    /// truncated char-boundary safe against their JSON-SERIALIZED size
+    /// (escaping-heavy content cannot defeat the wire-frame goal by
+    /// expanding 6x on serialization). `lastToolUse` keeps the documented §5.5
+    /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
+    /// only an over-budget `input` is replaced by [`cap_json_value`]'s
+    /// structure-preserving preview, with `inputTruncated: true` stamped
+    /// structurally and `inputBytes` recording the input's serialized size —
+    /// a write-time `inputBytes` (already-flagged persisted preview) is kept,
+    /// so it always names the ORIGINAL block's size, mirroring
+    /// [`last_tool_use_preview`]. `name` is never touched, so the FE's tool
+    /// classification keeps working. These fields exist to render a one-line
+    /// summary in list contexts, so `agent.list` applies this to every row;
+    /// the detail reads (`agent.get` / `agent.getSession`) never call it and
+    /// keep serving full values.
+    pub fn cap_list_previews(&mut self) {
+        use serde_json::Value;
+        // JSON-escaped content bytes of `s` as it will hit the wire (quotes
+        // excluded), counted through a discarding writer like
+        // [`slim_body_size`]: escaping-heavy content (`"`/`\`/control chars,
+        // up to 6 bytes per char) must count against the budget, or a
+        // control-character-dense preview would defeat the frame-size goal.
+        fn escaped_len(s: &str) -> usize {
+            struct CountingSink(usize);
+            impl std::io::Write for CountingSink {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0 += buf.len();
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut sink = CountingSink(0);
+            serde_json::to_writer(&mut sink, s).map_or(0, |()| sink.0.saturating_sub(2))
+        }
+        fn cap_string(field: &mut Option<String>) {
+            if let Some(s) = field {
+                let mut end = s.len().min(AGENT_LIST_PREVIEW_BUDGET_BYTES);
+                loop {
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let escaped = escaped_len(&s[..end]);
+                    if escaped <= AGENT_LIST_PREVIEW_BUDGET_BYTES || end == 0 {
+                        break;
+                    }
+                    // Proportional shrink: `escaped > budget` makes the new
+                    // end strictly smaller, so the loop converges without
+                    // overshooting escaping-heavy content to zero.
+                    end = end * AGENT_LIST_PREVIEW_BUDGET_BYTES / escaped;
+                }
+                if end < s.len() {
+                    s.truncate(end);
+                }
+            }
+        }
+        cap_string(&mut self.last_agent_response);
+        cap_string(&mut self.last_user_message);
+        cap_string(&mut self.digest);
+        cap_string(&mut self.metadata.completion_report);
+        match self.last_tool_use.as_mut() {
+            Some(Value::Object(preview)) => {
+                if let Some(input) = preview.get("input") {
+                    let size = slim_body_size(input);
+                    if size > AGENT_LIST_PREVIEW_BUDGET_BYTES {
+                        let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                        let capped = cap_json_value(input, &mut budget);
+                        preview.insert("input".to_string(), capped);
+                        preview.insert("inputTruncated".to_string(), Value::Bool(true));
+                        preview
+                            .entry("inputBytes")
+                            .or_insert_with(|| serde_json::json!(size));
+                    }
+                }
+            }
+            // Defensive: the persisted 0098 preview is always the object
+            // shape above; a non-object value still gets the whole-value
+            // bound so no row can smuggle an unbounded payload.
+            Some(other) if slim_body_size(other) > AGENT_LIST_PREVIEW_BUDGET_BYTES => {
+                let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                *other = cap_json_value(other, &mut budget);
+            }
+            _ => {}
         }
     }
 }
@@ -5007,6 +5113,287 @@ mod tests {
         assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastMessageId"], "msg-last");
         assert_eq!(v["lastActivity"], "t1");
+    }
+
+    /// [`AgentLite::cap_list_previews`] (list-payload cost contract): each
+    /// preview string is truncated to [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
+    /// char-boundary safe, an over-budget `lastToolUse` collapses to the
+    /// bounded [`cap_json_value`] preview with the small `name` key
+    /// surviving, and under-budget values pass through untouched.
+    #[test]
+    fn agent_lite_cap_list_previews_bounds_preview_fields() {
+        let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            // Multi-byte tail: truncation must land on a char boundary.
+            completion_report: Some(format!(
+                "{}{}",
+                "r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES - 1),
+                "é".repeat(8)
+            )),
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let mut lite = AgentLite::from_session(
+            session,
+            2,
+            Some("a".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 4)),
+            Some("short user ask".to_string()),
+            Some("d".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES + 1)),
+            Some("assistant".to_string()),
+            Some("msg-1".to_string()),
+        );
+        lite.last_tool_use = Some(json!({
+            "name": "write_file",
+            "input": {
+                "path": "/tmp/a.txt",
+                "content": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 8),
+            },
+        }));
+
+        lite.cap_list_previews();
+
+        assert_eq!(
+            lite.last_agent_response.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        );
+        assert_eq!(
+            lite.digest.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        );
+        // Under-budget values pass through untouched.
+        assert_eq!(lite.last_user_message.as_deref(), Some("short user ask"));
+        // The multi-byte report truncates on a char boundary at or under the
+        // budget (never mid-`é`).
+        let report = lite.metadata.completion_report.as_deref().unwrap();
+        assert!(report.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        assert!(report.is_char_boundary(report.len()));
+        // The over-budget tool input collapses to the bounded shape with the
+        // structural `name` untouched and the §5.5 truncation flags stamped:
+        // `inputTruncated: true` plus `inputBytes` naming the original
+        // input's serialized size.
+        let tool_use = lite.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "write_file");
+        assert_eq!(tool_use["inputTruncated"], json!(true));
+        let original_input_bytes = slim_body_size(&json!({
+            "path": "/tmp/a.txt",
+            "content": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 8),
+        }));
+        assert_eq!(tool_use["inputBytes"], json!(original_input_bytes));
+        let served = serde_json::to_string(&tool_use["input"]).unwrap();
+        assert!(
+            served.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES * 2,
+            "capped lastToolUse input stays near the budget, got {} bytes",
+            served.len()
+        );
+    }
+
+    /// [`AgentLite::cap_list_previews`] on an ALREADY-FLAGGED persisted
+    /// preview (input was over the write-time 2 KiB budget, so 0098 stored
+    /// `inputTruncated`/`inputBytes` alongside a capped input): the list
+    /// re-cap tightens `input` to the list budget but keeps the write-time
+    /// `inputBytes` — it always names the ORIGINAL block's size — and the
+    /// flags stay structural (never subject to budget admission).
+    /// An under-budget preview passes through untouched, flags absent.
+    #[test]
+    fn agent_lite_cap_list_previews_keeps_write_time_truncation_flags() {
+        let mk = |tool_use: serde_json::Value| {
+            let session = AgentSession {
+                harness_version: CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
+                id: AgentId::from("agent-1"),
+                workspace_id: WorkspaceId::from("ws-1"),
+                parent_agent_id: None,
+                backend_session_id: None,
+                acp_session_id: None,
+                name: "Builder".to_string(),
+                name_explicitly_set: true,
+                model: None,
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: None,
+                system_prompt: None,
+                specialist: None,
+                status: AgentStatus::Active,
+                is_active: true,
+                messages: vec![],
+                stats: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                is_background: false,
+                metadata: None,
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                created_at: "t0".to_string(),
+                updated_at: "t1".to_string(),
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+            };
+            let mut lite = AgentLite::from_session(session, 1, None, None, None, None, None);
+            lite.last_tool_use = Some(tool_use);
+            lite
+        };
+
+        // Write-time-flagged preview: the persisted input (already capped at
+        // 2 KiB by 0098) is still over the list budget; the original block
+        // was 5000 serialized bytes.
+        let mut flagged = mk(json!({
+            "name": "write_file",
+            "input": { "content": "x".repeat(SLIM_PROJECTION_BUDGET_BYTES - 64) },
+            "inputTruncated": true,
+            "inputBytes": 5000,
+        }));
+        flagged.cap_list_previews();
+        let tool_use = flagged.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "write_file");
+        assert_eq!(tool_use["inputTruncated"], json!(true));
+        assert_eq!(
+            tool_use["inputBytes"],
+            json!(5000),
+            "write-time inputBytes (original block size) survives the re-cap"
+        );
+        let served = serde_json::to_string(&tool_use["input"]).unwrap();
+        assert!(
+            served.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES * 2,
+            "re-capped input stays near the list budget, got {} bytes",
+            served.len()
+        );
+
+        // Under-budget preview: untouched, no flags appear.
+        let small = json!({ "name": "read_file", "input": { "path": "/tmp/a.txt" } });
+        let mut unflagged = mk(small.clone());
+        unflagged.cap_list_previews();
+        assert_eq!(unflagged.last_tool_use.as_ref(), Some(&small));
+    }
+
+    /// The string-field cap counts JSON-SERIALIZED bytes: escaping-heavy
+    /// content (control chars expand to `\u00XX`, 6 bytes per char) is
+    /// truncated harder so the serialized preview stays at the budget — a
+    /// 400-char control-character message must not serialize to 2400 wire
+    /// bytes. Plain content is unaffected (escaped size == in-memory size).
+    #[test]
+    fn agent_lite_cap_list_previews_bounds_serialized_bytes() {
+        let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let mut lite = AgentLite::from_session(
+            session,
+            1,
+            // 400 control chars: 400 in-memory bytes, 2400 serialized.
+            Some("\u{1}".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES)),
+            // Escaping-free content at exactly the budget passes untouched.
+            Some("p".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES)),
+            None,
+            Some("assistant".to_string()),
+            Some("msg-1".to_string()),
+        );
+
+        lite.cap_list_previews();
+
+        let response = lite.last_agent_response.as_deref().unwrap();
+        let serialized = serde_json::to_string(response).unwrap();
+        assert!(
+            serialized.len() - 2 <= AGENT_LIST_PREVIEW_BUDGET_BYTES,
+            "escaping-heavy preview bounded at the SERIALIZED budget, got {} bytes",
+            serialized.len() - 2
+        );
+        assert!(!response.is_empty(), "content retained, not zeroed");
+        assert_eq!(
+            lite.last_user_message.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
+            "escaping-free content at exactly the budget passes untouched"
+        );
     }
 
     /// Presence-sensitive `AgentLite` metadata fields preserve their distinct
