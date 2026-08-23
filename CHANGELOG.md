@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.42] - 2026-08-23
+
+### 🚀 Features
+
+- *(acp)* Serve compact workspace_api description to truncating providers ([#1415](https://github.com/intent-hq/intentd/pull/1415))
+- *(acp)* Send excludeDynamicSections in claude-code systemPrompt meta ([#1413](https://github.com/intent-hq/intentd/pull/1413))
+
+### 🐛 Bug Fixes
+
+- Close the LRU/cap eviction TOCTOU with claim-before-kill ([#1416](https://github.com/intent-hq/intentd/pull/1416))
+
+
 ## [0.7.41] - 2026-08-23
 
 ### 🐛 Bug Fixes
