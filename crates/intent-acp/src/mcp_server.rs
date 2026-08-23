@@ -21,7 +21,9 @@ mod dispatch;
 mod tools;
 
 pub(crate) use tools::ToolDef;
-pub use tools::{SpecialistModelOption, SpecialistModelOptions};
+pub use tools::{
+    SpecialistModelOption, SpecialistModelOptions, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+};
 
 // Static description const, exposed for the segment-assembly parity tests
 // in `crate::tests` (the assembled all-defaults description must be
@@ -95,6 +97,13 @@ pub struct WorkspaceMcpServer {
     /// and prelude and denied at dispatch with a redirect to the
     /// attention-request methods. Defaults to `false` (top-level).
     is_sub_agent: bool,
+    /// Whether `tools/list` serves the compact `workspace_api` description
+    /// (`ProviderConfig::truncates_tool_descriptions` — providers whose MCP
+    /// client cuts long descriptions at ~2k chars). The full reference then
+    /// rides the session's system prompt via
+    /// [`Self::full_workspace_api_description`]. Defaults to `false`: every
+    /// non-flagged provider keeps today's full description byte-identical.
+    compact_tool_descriptions: bool,
 }
 
 impl WorkspaceMcpServer {
@@ -114,6 +123,7 @@ impl WorkspaceMcpServer {
             agent_features: AgentFeaturesSettings::default(),
             specialist_model_options: Vec::new(),
             is_sub_agent: false,
+            compact_tool_descriptions: false,
         }
     }
 
@@ -194,6 +204,33 @@ impl WorkspaceMcpServer {
     pub fn with_sub_agent(mut self, is_sub_agent: bool) -> Self {
         self.is_sub_agent = is_sub_agent;
         self
+    }
+
+    /// Serve the compact `workspace_api` description from `tools/list` (the
+    /// spawn-time wiring point for providers with
+    /// `ProviderConfig::truncates_tool_descriptions`). The caller pairs this
+    /// with [`Self::full_workspace_api_description`] appended to the system
+    /// prompt so the full reference survives client-side truncation.
+    #[must_use]
+    pub fn with_compact_tool_descriptions(mut self, compact: bool) -> Self {
+        self.compact_tool_descriptions = compact;
+        self
+    }
+
+    /// The fully assembled `workspace_api` description for THIS bridge —
+    /// chief-ness, effective `[agentFeatures]` gating (sub-agent question
+    /// gate folded in), and specialist model options all applied — exactly
+    /// what a non-truncating provider's `tools/list` serves. Used by the
+    /// spawn path to append the full reference to the system prompt when
+    /// `tools/list` serves the compact variant.
+    #[must_use]
+    pub fn full_workspace_api_description(&self) -> String {
+        tools::workspace_api_description_with_model_options(
+            self.is_chief,
+            &self.effective_agent_features(),
+            &self.specialist_model_options,
+        )
+        .into_owned()
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation
@@ -280,14 +317,19 @@ impl WorkspaceMcpServer {
                 // sub-agent question gate folded in) prune the disabled
                 // surface and specialist `modelOptions` extend the delegate
                 // docs; with all defaults on (and no options, top-level) the
-                // assembled text is the static const unchanged.
+                // assembled text is the static const unchanged. Bridges for
+                // truncating providers serve the compact variant instead —
+                // the full reference rides the system prompt
+                // (`full_workspace_api_description`).
                 let description = if t.name == "workspace_api" {
-                    tools::workspace_api_description_with_model_options(
-                        self.is_chief,
-                        &self.effective_agent_features(),
-                        &self.specialist_model_options,
-                    )
-                    .into_owned()
+                    if self.compact_tool_descriptions {
+                        tools::compact_workspace_api_description(
+                            self.is_chief,
+                            &self.effective_agent_features(),
+                        )
+                    } else {
+                        self.full_workspace_api_description()
+                    }
                 } else {
                     t.description.to_string()
                 };

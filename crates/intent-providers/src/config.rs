@@ -210,6 +210,12 @@ pub struct ProviderConfig {
     /// Grok Build's ACP adapter does this (`/bin/bash -lc '…'` in `command`);
     /// argv-only clients (most providers) leave this false.
     pub terminal_requires_shell: bool,
+    /// When true, the provider's client silently truncates long MCP tool
+    /// descriptions (claude-code cuts at ~2k chars — see
+    /// <https://github.com/anthropics/claude-code/issues/53933>), so the
+    /// `workspace_api` tool is served a compact description and the full
+    /// `ws.*` API reference is appended to the system prompt instead.
+    pub truncates_tool_descriptions: bool,
 }
 
 impl ProviderConfig {
@@ -254,6 +260,7 @@ impl ProviderConfig {
             npx_only_package: None,
             requires_secondary_binary: None,
             terminal_requires_shell: false,
+            truncates_tool_descriptions: false,
         }
     }
 
@@ -333,6 +340,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
         short_name: "Claude Code",
+        // Claude Code silently truncates MCP tool descriptions at ~2k chars
+        // (anthropics/claude-code#53933): serve the compact `workspace_api`
+        // description and carry the full API reference in the system prompt.
+        truncates_tool_descriptions: true,
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {

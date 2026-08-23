@@ -441,6 +441,14 @@ async fn build_rtk_instruction(
 /// (via the harness registry), so an existing session keeps the exact prompt
 /// text it was created with even after the binary ships a newer doctrine set;
 /// a `None` session resolves to the latest.
+///
+/// `workspace_api_docs` — the full `workspace_api` tool description for
+/// providers whose MCP client truncates long tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`): the bridge serves the
+/// compact description, and this carries the full `ws.*` reference into the
+/// prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
+/// section the compact header points at). `None` — every non-flagged
+/// provider — leaves the prompt byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
@@ -453,6 +461,7 @@ pub(crate) async fn assemble_system_prompt(
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
 ) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
@@ -521,6 +530,18 @@ pub(crate) async fn assemble_system_prompt(
                 _ => {}
             }
         }
+    }
+    // Workspace API reference layer (truncating providers only): the full
+    // `workspace_api` description under the heading the compact tool
+    // description points at. Placed with the other reference material —
+    // after skills, before isolation hint / specialist role.
+    if let Some(docs) = workspace_api_docs.map(str::trim).filter(|d| !d.is_empty()) {
+        parts.push(format!(
+            "{}\n\nThe full `workspace_api` (ws.*) API reference. The MCP tool description \
+             you see is a compact index of the same surface; consult this section for full \
+             signatures and semantics.\n\n{docs}",
+            intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
+        ));
     }
     // Mode-dependent isolation hints (Task 6): inject context about CoW
     // sandboxing for implementors and parallel delegation safety for coordinators
@@ -811,6 +832,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             Some(&workspace),
             None,
+            None,
         )
         .await;
 
@@ -869,6 +891,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             Some(&workspace),
             None,
+            None,
         )
         .await;
 
@@ -898,6 +921,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await;
 
@@ -909,6 +933,85 @@ This is a test skill.
             !prompt_text.contains("<available_skills>"),
             "Skills catalog block should be absent when no workspace provided"
         );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_api_docs_layer() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        // `None` (every non-flagged provider): byte-identical to before —
+        // no heading, no docs.
+        let without = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !without.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+            "no docs supplied: prompt must not carry the API reference section"
+        );
+
+        // `Some(docs)` (truncating providers): the docs appear under the
+        // heading the compact tool description points at, and the rest of
+        // the prompt is unchanged.
+        let docs = "ws.note.read(id) → { id, title, content }";
+        let with = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+            Some(docs),
+        )
+        .await
+        .unwrap();
+        assert!(
+            with.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+            "docs supplied: prompt must carry the API reference heading"
+        );
+        assert!(
+            with.contains(docs),
+            "docs supplied: prompt must carry the docs verbatim"
+        );
+        let heading_pos = with
+            .find(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING)
+            .unwrap();
+        let docs_pos = with.find(docs).unwrap();
+        assert!(heading_pos < docs_pos, "docs must sit under the heading");
+
+        // Empty/whitespace docs: treated as absent.
+        let blank = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            &AgentFeaturesSettings::default(),
+            None,
+            None,
+            Some("  \n"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blank, without, "blank docs must leave the prompt unchanged");
     }
 
     #[tokio::test]
@@ -925,6 +1028,7 @@ This is a test skill.
             false,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -960,6 +1064,7 @@ This is a test skill.
             false,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1001,6 +1106,7 @@ This is a test skill.
             true,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1087,6 +1193,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             None,
             Some(&session),
+            None,
         )
         .await
         .unwrap();
@@ -1125,6 +1232,7 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1137,6 +1245,7 @@ This is a test skill.
             true,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -1171,6 +1280,7 @@ This is a test skill.
             false,
             false,
             &features,
+            None,
             None,
             None,
         )
@@ -1211,6 +1321,7 @@ This is a test skill.
             &features,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1247,6 +1358,7 @@ This is a test skill.
             false,
             false,
             &AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )

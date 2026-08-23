@@ -786,6 +786,58 @@ pub fn workspace_api_description(
     Cow::Owned(out)
 }
 
+/// The `Namespaces` index header line as it appears verbatim in both static
+/// description variants. [`compact_workspace_api_description`] anchors on it,
+/// and the `namespace_index_header_present_in_both_variants` drift test pins
+/// it to the consts.
+pub(crate) const NAMESPACE_INDEX_HEADER: &str =
+    "Namespaces (index — full signatures in API below):";
+
+/// The header [`compact_workspace_api_description`] swaps in: same index, but
+/// the full signatures live in the system prompt (under
+/// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) rather than below, with
+/// `ws.help()` as the in-tool fallback.
+pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — full docs: \"Workspace API Reference\" in your system prompt, or ws.help()):";
+
+/// Heading of the system-prompt section that carries the full `ws.*` API
+/// reference for providers whose client truncates long MCP tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`). The compact description's
+/// index header points at this section by name, so the two must not drift.
+pub const WORKSPACE_API_SYSTEM_PROMPT_HEADING: &str = "# Workspace API Reference";
+
+/// Compact `workspace_api` description for providers whose MCP client
+/// silently truncates long tool descriptions
+/// (`ProviderConfig::truncates_tool_descriptions`; claude-code cuts at ~2k
+/// chars — anthropics/claude-code#53933). Derived from the SAME
+/// [`workspace_api_description`] assembly as the full text — chief-ness and
+/// `[agentFeatures]` gating apply identically, no second source — by cutting
+/// at the end of the `Namespaces` index block and swapping the index header
+/// for one that points at the full reference in the system prompt (see
+/// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) and `ws.help()`. Specialist
+/// model options are NOT injected here (they sit in the delegate docs past
+/// the cut); the system-prompt copy carries them instead.
+pub fn compact_workspace_api_description(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+) -> String {
+    let full = workspace_api_description(is_chief, features);
+    let Some(header_start) = full.find(NAMESPACE_INDEX_HEADER) else {
+        // Unreachable while the drift test pins the header into both static
+        // variants; degrade to the full text rather than panic.
+        return full.into_owned();
+    };
+    // The index block ends at the first blank line after its header.
+    let index_end = full[header_start..]
+        .find("\n\n")
+        .map_or(full.len(), |i| header_start + i);
+    let mut out = String::with_capacity(index_end + NAMESPACE_INDEX_HEADER_COMPACT.len());
+    out.push_str(&full[..header_start]);
+    out.push_str(NAMESPACE_INDEX_HEADER_COMPACT);
+    out.push_str(&full[header_start + NAMESPACE_INDEX_HEADER.len()..index_end]);
+    out.push('\n');
+    out
+}
+
 /// `ws.help()` — the runtime docs index. Returns the `Namespaces` block of
 /// the assembled description (header + entries), so chief-ness and
 /// `[agentFeatures]` gating apply exactly as they do to the advertised tool
@@ -985,14 +1037,16 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        denied_feature, help_index, help_namespace, workspace_api_description,
-        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
-        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
-        HOOK_HOST_EXEC_INDEX_XREF, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
+        compact_workspace_api_description, denied_feature, help_index, help_namespace,
+        workspace_api_description, workspace_api_description_with_model_options,
+        AgentFeaturesSettings, Cow, SpecialistModelOption, SpecialistModelOptions,
+        HOOK_HOST_EXEC_DOC_XREF, HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER,
+        NAMESPACE_INDEX_HEADER_COMPACT, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
         PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
         REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
         TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
         TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1378,6 +1432,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- compact description (truncating providers) tests ------------------
+
+    // The index header const the compact cut anchors on must appear verbatim
+    // in both static variants — a reworded header would silently turn the
+    // compact function into a full-description passthrough.
+    #[test]
+    fn namespace_index_header_present_in_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(desc.contains(NAMESPACE_INDEX_HEADER));
+        }
+    }
+
+    // The compact description is a pure derivation of the full assembly: the
+    // text before the index header is byte-identical, the index entries are
+    // byte-identical, only the header line differs (it points at the system
+    // prompt + ws.help), and nothing after the index survives. Swept across
+    // both chief variants and every gating combination so the compact cut
+    // can never drift from the gated full text.
+    #[test]
+    fn compact_description_derives_from_full_assembly() {
+        let mut feature_sets: Vec<AgentFeaturesSettings> = vec![AgentFeaturesSettings::default()];
+        for (_, disable) in feature_cases() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            feature_sets.push(features);
+        }
+        for is_chief in [false, true] {
+            for features in &feature_sets {
+                let full = workspace_api_description(is_chief, features);
+                let compact = compact_workspace_api_description(is_chief, features);
+                let header_start = full.find(NAMESPACE_INDEX_HEADER).unwrap();
+                let index_end = full[header_start..]
+                    .find("\n\n")
+                    .map_or(full.len(), |i| header_start + i);
+                let mut expected = String::new();
+                expected.push_str(&full[..header_start]);
+                expected.push_str(NAMESPACE_INDEX_HEADER_COMPACT);
+                expected.push_str(&full[header_start + NAMESPACE_INDEX_HEADER.len()..index_end]);
+                expected.push('\n');
+                assert_eq!(
+                    compact, expected,
+                    "chief={is_chief}: compact description drifted from the full assembly"
+                );
+                assert!(
+                    !compact.contains("\nAPI:"),
+                    "chief={is_chief}: compact description must cut before the API sections"
+                );
+            }
+        }
+    }
+
+    // Whole-description budget: the compact variant must fit ENTIRELY under
+    // the ~2k truncation cutoff (anthropics/claude-code#53933) — that is its
+    // reason to exist — for both chief variants and every gating combination
+    // (all-defaults is the longest; gating only removes index lines).
+    #[test]
+    fn compact_description_fits_within_truncation_budget() {
+        const BUDGET: usize = 2000;
+        let mut feature_sets: Vec<(String, AgentFeaturesSettings)> = vec![
+            ("all-defaults".into(), AgentFeaturesSettings::default()),
+            ("all-gates-open".into(), all_gates_open()),
+        ];
+        for (i, (prefixes, disable)) in feature_cases().into_iter().enumerate() {
+            let mut features = AgentFeaturesSettings::default();
+            disable(&mut features);
+            feature_sets.push((format!("case-{i}-{prefixes:?}"), features));
+        }
+        for is_chief in [false, true] {
+            for (label, features) in &feature_sets {
+                let compact = compact_workspace_api_description(is_chief, features);
+                assert!(
+                    compact.len() <= BUDGET,
+                    "chief={is_chief} {label}: compact description is {} bytes, over the \
+                     {BUDGET}-byte truncation budget",
+                    compact.len()
+                );
+            }
+        }
+    }
+
+    // The compact header's pointer text names the system-prompt section
+    // heading — pin the two together so a heading rename cannot orphan the
+    // pointer.
+    #[test]
+    fn compact_header_points_at_system_prompt_heading() {
+        let section_name = WORKSPACE_API_SYSTEM_PROMPT_HEADING
+            .trim_start_matches('#')
+            .trim();
+        assert!(
+            NAMESPACE_INDEX_HEADER_COMPACT.contains(section_name),
+            "compact index header must name the `{section_name}` system-prompt section"
+        );
+        assert!(NAMESPACE_INDEX_HEADER_COMPACT.contains("ws.help()"));
     }
 
     // ---- ws.help() runtime docs tests --------------------------------------
