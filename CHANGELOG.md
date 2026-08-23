@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.44] - 2026-08-23
+
+### 🚀 Features
+
+- *(acp)* Replace claude-code preset system prompt with assembled prompt ([#1421](https://github.com/intent-hq/intentd/pull/1421))
+
+### ⚡ Performance
+
+- *(services)* Cap agent.list row previews to a render-sized budget ([#1422](https://github.com/intent-hq/intentd/pull/1422))
+
+
 ## [0.7.43] - 2026-08-23
 
 ### 🐛 Bug Fixes
