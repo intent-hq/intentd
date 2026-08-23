@@ -134,6 +134,15 @@ fn recording_kill(id: AgentId, log: Arc<Mutex<Vec<AgentId>>>) -> KillFn {
     })
 }
 
+/// An always-winning claim (registry-level tests without a manager: no
+/// `try_begin` contention to guard against).
+fn claim_all(_: &AgentId) -> bool {
+    true
+}
+
+/// A no-op claim release, paired with [`claim_all`].
+fn release_none(_: &AgentId) {}
+
 #[test]
 fn title_case_ascii_capitalizes_first_char() {
     assert_eq!(super::title_case_ascii("bearer"), "Bearer");
@@ -231,7 +240,7 @@ async fn acquire_evicts_lru_idle_when_full() {
     reg.set_last_active(&a, 100);
     reg.set_last_active(&b, 200);
 
-    reg.acquire(&c).await;
+    reg.acquire(&c, claim_all, release_none).await;
 
     assert_eq!(*log.lock().unwrap(), vec![a.clone()], "evicts LRU idle");
     assert!(!reg.is_registered(&a));
@@ -248,7 +257,7 @@ async fn acquire_queues_until_a_process_goes_idle() {
     reg.mark_active(&a);
 
     let reg2 = reg.clone();
-    let acquired = tokio::spawn(async move { reg2.acquire(&b).await });
+    let acquired = tokio::spawn(async move { reg2.acquire(&b, claim_all, release_none).await });
     // All processes active → the acquire must block.
     assert!(timeout(Duration::from_millis(50), async {}).await.is_ok());
     assert!(!acquired.is_finished(), "acquire blocks while all active");
@@ -366,9 +375,12 @@ async fn budget_is_off_by_default_and_inert_before_the_first_sample() {
         let (a, b) = (AgentId::from("a"), AgentId::from("b"));
         reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
 
-        timeout(Duration::from_millis(200), reg.acquire(&b))
-            .await
-            .expect("acquire must not queue without a usable budget");
+        timeout(
+            Duration::from_millis(200),
+            reg.acquire(&b, claim_all, release_none),
+        )
+        .await
+        .expect("acquire must not queue without a usable budget");
         assert!(reg.is_registered(&a), "nothing evicted");
     }
 }
@@ -393,7 +405,8 @@ async fn budget_reclaims_idle_processes_before_queueing_a_spawn() {
     // 10 GB charged against a 4 GB budget with a slot free: the idle process is
     // reclaimed rather than the spawn being admitted.
     let reg2 = reg.clone();
-    let handle = tokio::spawn(async move { reg2.acquire(&spawning).await });
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning, claim_all, release_none).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         *log.lock().unwrap(),
@@ -455,7 +468,8 @@ async fn budget_driven_process_events_carry_memory_budget_reason() {
     // Over budget with a slot free: evicts the idle process, then queues.
     let reg2 = reg.clone();
     let spawning2 = spawning.clone();
-    let handle = tokio::spawn(async move { reg2.acquire(&spawning2).await });
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning2, claim_all, release_none).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Under budget again + a deregister → wakes the queued spawn (resumed).
@@ -524,7 +538,8 @@ async fn both_constraints_binding_labels_reason_memory_budget() {
 
     let reg2 = reg.clone();
     let spawning2 = spawning.clone();
-    let handle = tokio::spawn(async move { reg2.acquire(&spawning2).await });
+    let handle =
+        tokio::spawn(async move { reg2.acquire(&spawning2, claim_all, release_none).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     {
@@ -563,9 +578,12 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     let mut admitted = 0usize;
     for n in 0..6 {
         let id = AgentId::from(format!("burst-{n}").as_str());
-        if timeout(Duration::from_millis(50), reg.acquire(&id))
-            .await
-            .is_err()
+        if timeout(
+            Duration::from_millis(50),
+            reg.acquire(&id, claim_all, release_none),
+        )
+        .await
+        .is_err()
         {
             break;
         }
@@ -584,9 +602,12 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     // admitted spawns, and headroom is judged on measurement alone.
     probe.set(gb);
     let next = AgentId::from("after-fresh-sample");
-    timeout(Duration::from_millis(50), reg.acquire(&next))
-        .await
-        .expect("a fresh under-budget sample admits again");
+    timeout(
+        Duration::from_millis(50),
+        reg.acquire(&next, claim_all, release_none),
+    )
+    .await
+    .expect("a fresh under-budget sample admits again");
 }
 
 #[tokio::test]
@@ -602,9 +623,12 @@ async fn deregister_credits_back_the_provisional_charge() {
     reg.mark_active(&seed);
 
     let first = AgentId::from("first");
-    timeout(Duration::from_millis(50), reg.acquire(&first))
-        .await
-        .expect("the single unit of headroom admits one spawn");
+    timeout(
+        Duration::from_millis(50),
+        reg.acquire(&first, claim_all, release_none),
+    )
+    .await
+    .expect("the single unit of headroom admits one spawn");
     reg.register(first.clone(), recording_kill(first.clone(), log.clone()));
     // Active, so the budget cannot reclaim it — the credit path is under test.
     reg.mark_active(&first);
@@ -612,18 +636,24 @@ async fn deregister_credits_back_the_provisional_charge() {
     // Headroom is now spent against the same sample.
     let second = AgentId::from("second");
     assert!(
-        timeout(Duration::from_millis(50), reg.acquire(&second))
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(50),
+            reg.acquire(&second, claim_all, release_none),
+        )
+        .await
+        .is_err(),
         "no headroom left against this sample"
     );
 
     // The dead process is still inside that sample, so its cost is credited
     // back rather than waiting a full sampling period for the truth.
     reg.deregister(&first);
-    timeout(Duration::from_millis(50), reg.acquire(&second))
-        .await
-        .expect("the credited charge frees the headroom immediately");
+    timeout(
+        Duration::from_millis(50),
+        reg.acquire(&second, claim_all, release_none),
+    )
+    .await
+    .expect("the credited charge frees the headroom immediately");
 }
 
 /// `budget_status` (monorepo#2063 A3): the `system.status` visibility read —
@@ -652,7 +682,7 @@ async fn budget_status_reports_budget_charged_and_queued() {
     assert!(reg.set_memory_budget(4 * gb, probe.clone()));
     let log = Arc::new(Mutex::new(Vec::new()));
     let active = AgentId::from("active");
-    reg.acquire(&active).await;
+    reg.acquire(&active, claim_all, release_none).await;
     reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
     reg.mark_active(&active);
     let (budget, charged, queued) = reg.budget_status().expect("budget installed");
@@ -680,7 +710,7 @@ async fn budget_status_reports_budget_charged_and_queued() {
     // read recorded the new seq while keeping the stale correction, this
     // would report 3 GB + 2 × provisional.
     let second = AgentId::from("second");
-    reg.acquire(&second).await;
+    reg.acquire(&second, claim_all, release_none).await;
     reg.register(second.clone(), recording_kill(second.clone(), log.clone()));
     reg.mark_active(&second);
     let (_, charged, _) = reg.budget_status().expect("budget installed");
@@ -691,7 +721,10 @@ async fn budget_status_reports_budget_charged_and_queued() {
     // reset, nothing yet admitted against it).
     probe.set(10 * gb);
     let reg2 = reg.clone();
-    let handle = tokio::spawn(async move { reg2.acquire(&AgentId::from("spawning")).await });
+    let handle = tokio::spawn(async move {
+        reg2.acquire(&AgentId::from("spawning"), claim_all, release_none)
+            .await;
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let (_, charged, queued) = reg.budget_status().expect("budget installed");
     assert_eq!(charged, Some(10 * gb), "charged is what admission compares");
@@ -876,7 +909,10 @@ async fn turn_start_gates_idle_agent_and_reclaims_other_idle_first() {
 
     let reg2 = reg.clone();
     let warm2 = warm.clone();
-    let handle = tokio::spawn(async move { reg2.acquire_turn_start(&warm2).await });
+    let handle = tokio::spawn(async move {
+        reg2.acquire_turn_start(&warm2, claim_all, release_none)
+            .await;
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         *log.lock().unwrap(),
@@ -917,13 +953,16 @@ async fn turn_start_never_gates_active_or_unregistered_agents() {
     reg.register(busy.clone(), recording_kill(busy.clone(), log.clone()));
     reg.mark_active(&busy);
 
-    timeout(Duration::from_millis(200), reg.acquire_turn_start(&busy))
-        .await
-        .expect("an active process is never gated mid-turn");
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire_turn_start(&busy, claim_all, release_none),
+    )
+    .await
+    .expect("an active process is never gated mid-turn");
 
     timeout(
         Duration::from_millis(200),
-        reg.acquire_turn_start(&AgentId::from("unregistered")),
+        reg.acquire_turn_start(&AgentId::from("unregistered"), claim_all, release_none),
     )
     .await
     .expect("an unregistered agent admits immediately (spawn path gates it)");
@@ -959,7 +998,10 @@ async fn turn_start_gate_events_carry_memory_budget_reason_without_charge() {
 
     let reg2 = reg.clone();
     let warm2 = warm.clone();
-    let handle = tokio::spawn(async move { reg2.acquire_turn_start(&warm2).await });
+    let handle = tokio::spawn(async move {
+        reg2.acquire_turn_start(&warm2, claim_all, release_none)
+            .await;
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     {
         let events = events.lock().unwrap();
@@ -990,7 +1032,7 @@ async fn lifecycle_active_processes_are_not_reaped() {
     reg.mark_active(&a);
     assert!(reg.is_active(&a));
 
-    let evicted = reg.evict_idle(None).await;
+    let evicted = reg.evict_idle(None, claim_all, release_none).await;
     assert_eq!(evicted, 1);
     assert_eq!(
         *log.lock().unwrap(),
@@ -1229,7 +1271,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         .await
         .unwrap();
 
-    mgr.registry.acquire(&c).await;
+    mgr.registry.acquire(&c, claim_all, release_none).await;
     // After acquiring, register C.
     mgr.registry
         .register(c.clone(), recording_kill(c.clone(), log.clone()));
@@ -1322,7 +1364,8 @@ async fn process_cap_events_queued_resumed_evicted() {
 
     let reg2 = mgr.registry.clone();
     let d_clone = d.clone();
-    let queued_acquire = tokio::spawn(async move { reg2.acquire(&d_clone).await });
+    let queued_acquire =
+        tokio::spawn(async move { reg2.acquire(&d_clone, claim_all, release_none).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !queued_acquire.is_finished(),
@@ -1567,6 +1610,7 @@ async fn shutdown_flushes_partial_live_turn_as_interrupted_assistant_row() {
 #[tokio::test]
 async fn reap_idle_evicts_handles_and_deregisters() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
     track(&mgr, &a);
     track(&mgr, &b);
@@ -2198,6 +2242,581 @@ async fn overlapping_sweep_does_not_double_claim() {
     mgr.reap_claims.lock().unwrap().remove(&id);
     assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
     assert!(!mgr.registry().is_registered(&id));
+}
+
+/// A kill that signals entry on a channel and then blocks until the test
+/// releases it, exposing the mid-kill window (the monorepo#2118/#2247 races).
+fn blocking_kill() -> (
+    KillFn,
+    mpsc::UnboundedReceiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let kill: KillFn = Arc::new(move || {
+        let entered_tx = entered_tx.clone();
+        let release_rx = release_rx.clone();
+        Box::pin(async move {
+            let _ = entered_tx.send(());
+            let rx = release_rx.lock().unwrap().take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+        })
+    });
+    (kill, entered_rx, release_tx)
+}
+
+/// Fill the registry's remaining slots with ACTIVE processes so the eviction
+/// paths under test have exactly the candidates the test registered.
+fn fill_active(mgr: &AgentManager, n: usize, log: &Arc<Mutex<Vec<AgentId>>>) {
+    for i in 0..n {
+        let id = AgentId::from(format!("filler-{i}").as_str());
+        mgr.registry
+            .register(id.clone(), recording_kill(id.clone(), log.clone()));
+        mgr.registry.mark_active(&id);
+    }
+}
+
+/// monorepo#2247 — the slot-cap eviction TOCTOU. `acquire`'s evict arm must
+/// CLAIM its victim atomically against `try_begin` before killing it, exactly
+/// like the TTL sweep (monorepo#2118): with the old bare LRU pick, a turn
+/// starting between candidate selection and the `kill().await` had its
+/// freshly-spawned child tree killed mid-turn. Mid-kill a `try_begin` must
+/// LOSE (the message parks on the queue); after the eviction the claim is
+/// gone and `try_begin` wins again.
+#[tokio::test]
+async fn acquire_evict_claim_blocks_try_begin_during_kill_window() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-acquire-claim");
+    let victim = AgentId::from("a-acquire-claim");
+    seed_agent(&mgr, &ws, &victim).await;
+
+    let (kill, mut entered_rx, release_tx) = blocking_kill();
+    mgr.registry.register(victim.clone(), kill);
+    mgr.registry.set_last_active(&victim, 1);
+    // At cap (8) with the victim as the only idle candidate.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    fill_active(&mgr, 7, &log);
+
+    let acquire = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            let (try_claim, release, _released) = mgr.reap_claim_fns();
+            mgr.registry
+                .acquire(&AgentId::from("spawning"), try_claim, release)
+                .await;
+        })
+    };
+    entered_rx.recv().await.expect("kill entered");
+
+    // Mid-kill: the claim must make this turn LOSE, exactly like busy.
+    assert!(
+        !mgr.try_begin(&victim, &ws).await,
+        "try_begin must lose against a held eviction claim (the TOCTOU)"
+    );
+
+    release_tx.send(()).unwrap();
+    acquire.await.unwrap();
+    assert!(
+        !mgr.registry.is_registered(&victim),
+        "the victim was evicted"
+    );
+    assert!(
+        mgr.try_begin(&victim, &ws).await,
+        "claim is released after the kill; the next turn starts normally"
+    );
+    assert!(log.lock().unwrap().is_empty(), "no filler was killed");
+}
+
+/// monorepo#2247 — an eviction candidate whose id is ALREADY in `reap_claims`
+/// (a sweep holds it mid-kill) is skipped for the next-LRU idle candidate,
+/// and the holder's claim is left untouched.
+#[tokio::test]
+async fn acquire_evict_skips_candidate_claimed_by_a_sweep() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (held, next) = (AgentId::from("held"), AgentId::from("next"));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(held.clone(), recording_kill(held.clone(), log.clone()));
+    mgr.registry.set_last_active(&held, 1);
+    mgr.registry
+        .register(next.clone(), recording_kill(next.clone(), log.clone()));
+    mgr.registry.set_last_active(&next, 2);
+    fill_active(&mgr, 6, &log);
+
+    // Another sweep holds the LRU candidate's claim (mid-kill).
+    mgr.reap_claims.lock().unwrap().insert(held.clone());
+
+    let (try_claim, release, _released) = mgr.reap_claim_fns();
+    timeout(
+        Duration::from_secs(2),
+        mgr.registry
+            .acquire(&AgentId::from("spawning"), try_claim, release),
+    )
+    .await
+    .expect("acquire proceeds via the next-LRU candidate");
+
+    assert_eq!(*log.lock().unwrap(), vec![next.clone()], "next-LRU killed");
+    assert!(mgr.registry.is_registered(&held), "held candidate kept");
+    assert!(
+        mgr.reap_claims.lock().unwrap().contains(&held),
+        "the holder's claim is untouched (a lost try_claim never releases)"
+    );
+}
+
+/// monorepo#2247 — aborting the acquire future mid-kill (the abortable
+/// worker case) must release the claim via the drop guard, or the victim's
+/// queue is wedged until daemon restart.
+#[tokio::test]
+async fn acquire_abort_at_kill_releases_claim() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-abort-claim");
+    let victim = AgentId::from("a-abort-claim");
+    seed_agent(&mgr, &ws, &victim).await;
+
+    let (kill, mut entered_rx, _release_tx) = blocking_kill();
+    mgr.registry.register(victim.clone(), kill);
+    mgr.registry.set_last_active(&victim, 1);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    fill_active(&mgr, 7, &log);
+
+    let acquire = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            let (try_claim, release, _released) = mgr.reap_claim_fns();
+            mgr.registry
+                .acquire(&AgentId::from("spawning"), try_claim, release)
+                .await;
+        })
+    };
+    entered_rx.recv().await.expect("kill entered");
+    assert!(mgr.reap_claims.lock().unwrap().contains(&victim));
+
+    acquire.abort();
+    let _ = acquire.await;
+    assert!(
+        !mgr.reap_claims.lock().unwrap().contains(&victim),
+        "claim released by the drop guard on abort"
+    );
+    assert!(
+        mgr.try_begin(&victim, &ws).await,
+        "try_begin wins after abort"
+    );
+}
+
+/// monorepo#2247 — when EVERY candidate is claimed by a concurrent sweep,
+/// `acquire` queues as a (timed) waiter instead of spinning on the same
+/// unclaimable snapshot, and proceeds once the holder releases.
+#[tokio::test]
+async fn acquire_waits_when_every_candidate_is_claimed() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let held = AgentId::from("held");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(held.clone(), recording_kill(held.clone(), log.clone()));
+    mgr.registry.set_last_active(&held, 1);
+    fill_active(&mgr, 7, &log);
+
+    mgr.reap_claims.lock().unwrap().insert(held.clone());
+
+    let acquire = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            let (try_claim, release, _released) = mgr.reap_claim_fns();
+            mgr.registry
+                .acquire(&AgentId::from("spawning"), try_claim, release)
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !acquire.is_finished(),
+        "acquire waits while the only candidate is claimed"
+    );
+    assert!(mgr.registry.is_registered(&held), "no kill under a claim");
+
+    // Holder releases (no deregister fires): the waiter's timed re-check
+    // claims and evicts normally.
+    mgr.reap_claims.lock().unwrap().remove(&held);
+    timeout(Duration::from_secs(30), acquire)
+        .await
+        .expect("the waiter re-checks on its own timer")
+        .expect("task ok");
+    assert!(!mgr.registry.is_registered(&held));
+}
+
+/// monorepo#2247 — the spawning agent's OWN stale entry is evicted without a
+/// claim: the busy slot held by the worker driving the spawn already makes
+/// `try_begin` lose for it, and a claim attempt against that busy slot would
+/// deadlock the spawn forever.
+#[tokio::test]
+async fn acquire_evicts_own_stale_entry_without_claim() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-own-entry");
+    let id = AgentId::from("a-own-entry");
+    seed_agent(&mgr, &ws, &id).await;
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(id.clone(), recording_kill(id.clone(), log.clone()));
+    mgr.registry.set_last_active(&id, 1);
+    fill_active(&mgr, 7, &log);
+
+    // The agent holds its own busy slot (the worker driving this spawn).
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let (try_claim, release, _released) = mgr.reap_claim_fns();
+    timeout(
+        Duration::from_secs(2),
+        mgr.registry.acquire(&id, try_claim, release),
+    )
+    .await
+    .expect("own stale entry evicts without deadlocking against the own busy slot");
+    assert_eq!(*log.lock().unwrap(), vec![id.clone()], "own entry killed");
+    assert!(!mgr.registry.is_registered(&id));
+}
+
+/// monorepo#2247 — after a claim wins, the candidate is re-validated under
+/// the registry lock before its kill: one that went active in the window is
+/// released and skipped, and the next-LRU candidate is evicted instead.
+#[tokio::test]
+async fn acquire_revalidates_candidate_after_claim() {
+    let reg = Arc::new(ProcessRegistry::new(2));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (a, b) = (AgentId::from("a"), AgentId::from("b"));
+    reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
+    reg.set_last_active(&a, 1);
+    reg.register(b.clone(), recording_kill(b.clone(), log.clone()));
+    reg.set_last_active(&b, 2);
+
+    // A turn races the claim: the moment `a` is claimed it goes active, so
+    // the re-validation must reject and release it.
+    let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
+    let try_claim = {
+        let reg = reg.clone();
+        let a = a.clone();
+        move |id: &AgentId| {
+            if *id == a {
+                reg.mark_active(&a);
+            }
+            true
+        }
+    };
+    let release = {
+        let released = released.clone();
+        move |id: &AgentId| released.lock().unwrap().push(id.clone())
+    };
+    reg.acquire(&AgentId::from("c"), try_claim, release).await;
+
+    assert_eq!(*log.lock().unwrap(), vec![b.clone()], "only `b` is killed");
+    assert!(reg.is_registered(&a), "`a` re-validated active and kept");
+    assert!(
+        released.lock().unwrap().contains(&a),
+        "`a`'s claim was released on the re-validation reject"
+    );
+}
+
+/// monorepo#2247 (PR review) — the admission paths run inside ABORTABLE
+/// worker futures: when the future is dropped at the `kill().await`, the
+/// `ClaimGuard` releases the claim, and that release itself must kick the
+/// drain — otherwise a message that parked behind the claim (`try_begin`
+/// lost `ReapClaimed` mid-kill) strands until an unrelated queue event.
+#[tokio::test]
+async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-abort-kick");
+    let victim = AgentId::from("a-abort-kick");
+    seed_agent(&mgr, &ws, &victim).await;
+    let mut session = mgr.services.store.get_agent_session(&victim).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    // Keep `release_tx` alive: dropping it would complete the blocked kill
+    // and defeat the mid-kill abort below.
+    let (kill, mut entered_rx, _release_tx) = blocking_kill();
+    mgr.registry.register(victim.clone(), kill);
+    mgr.registry.set_last_active(&victim, 1);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    fill_active(&mgr, 7, &log);
+
+    let acquire = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            let (try_claim, release) = mgr.admission_claim_fns();
+            mgr.registry
+                .acquire(&AgentId::from("spawning"), try_claim, release)
+                .await;
+        })
+    };
+    entered_rx.recv().await.expect("kill entered");
+
+    // Mid-kill, a send parks behind the claim (its inline drain kick loses
+    // `try_begin` against the held claim).
+    mgr.services
+        .agent_queue_message_op(victim.clone(), "parked behind claim".into(), None, None)
+        .await
+        .expect("queue message");
+    assert_eq!(services.queue_snapshot(&victim).len(), 1, "message parked");
+
+    // Abort the admission future at the `kill().await`: the `ClaimGuard`
+    // releases the claim, and the release's own drain kick delivers the
+    // parked message — no tail call after the await ever runs here.
+    acquire.abort();
+    let _ = acquire.await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if services.queue_snapshot(&victim).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the aborted admission's claim release kicks the parked drain");
+}
+
+/// monorepo#2247 — the turn-start budget gate's eviction claims its victim
+/// against `try_begin` on the same terms as `acquire`'s evict arm.
+#[tokio::test]
+async fn turn_start_evict_claim_blocks_try_begin_during_kill_window() {
+    let gb = super::GB;
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-turn-start-claim");
+    let victim = AgentId::from("a-turn-start-claim");
+    seed_agent(&mgr, &ws, &victim).await;
+
+    let probe = FakeProbe::new(10 * gb);
+    assert!(mgr.registry.set_memory_budget(4 * gb, probe.clone()));
+
+    let (kill, mut entered_rx, release_tx) = blocking_kill();
+    mgr.registry.register(victim.clone(), kill);
+    mgr.registry.set_last_active(&victim, 1);
+    // The gated warm agent (never its own gate's victim).
+    let warm = AgentId::from("warm");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+    mgr.registry.set_last_active(&warm, 1000);
+
+    let gate = {
+        let mgr = mgr.clone();
+        let warm = warm.clone();
+        tokio::spawn(async move {
+            let (try_claim, release, _released) = mgr.reap_claim_fns();
+            mgr.registry
+                .acquire_turn_start(&warm, try_claim, release)
+                .await;
+        })
+    };
+    entered_rx.recv().await.expect("kill entered");
+
+    assert!(
+        !mgr.try_begin(&victim, &ws).await,
+        "try_begin must lose against the turn-start gate's held claim"
+    );
+
+    release_tx.send(()).unwrap();
+    // Under budget again → the gate admits.
+    probe.set(gb);
+    timeout(Duration::from_secs(30), gate)
+        .await
+        .expect("gate admits once the tree drains")
+        .expect("task ok");
+    assert!(!mgr.registry.is_registered(&victim), "victim evicted");
+    assert!(
+        mgr.try_begin(&victim, &ws).await,
+        "claim is released after the kill"
+    );
+    assert!(log.lock().unwrap().is_empty(), "the warm agent survives");
+}
+
+/// monorepo#2247 (PR review) — `acquire_turn_start` duplicates `acquire`'s
+/// candidate-walk machinery, so its skip-claimed behavior is pinned on its
+/// own copy: a candidate held by another sweep is skipped for the next-LRU
+/// one, and the holder's claim is left untouched.
+#[tokio::test]
+async fn turn_start_evict_skips_candidate_claimed_by_a_sweep() {
+    let gb = super::GB;
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+
+    let probe = FakeProbe::new(10 * gb);
+    assert!(mgr.registry.set_memory_budget(4 * gb, probe.clone()));
+
+    let (held, next) = (AgentId::from("held"), AgentId::from("next"));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(held.clone(), recording_kill(held.clone(), log.clone()));
+    mgr.registry.set_last_active(&held, 1);
+    mgr.registry
+        .register(next.clone(), recording_kill(next.clone(), log.clone()));
+    mgr.registry.set_last_active(&next, 2);
+    let warm = AgentId::from("warm");
+    mgr.registry
+        .register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+    mgr.registry.set_last_active(&warm, 1000);
+
+    // Another sweep holds the LRU candidate's claim (mid-kill).
+    mgr.reap_claims.lock().unwrap().insert(held.clone());
+
+    let (try_claim, release, _released) = mgr.reap_claim_fns();
+    let gate = mgr.registry.acquire_turn_start(&warm, try_claim, release);
+    tokio::pin!(gate);
+    // The eviction of `next` drains the tree below budget mid-walk.
+    let advance = async {
+        loop {
+            if log.lock().unwrap().contains(&next) {
+                probe.set(gb);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(30), async {
+        tokio::join!(&mut gate, advance)
+    })
+    .await
+    .expect("gate proceeds via the next-LRU candidate");
+
+    assert_eq!(*log.lock().unwrap(), vec![next.clone()], "next-LRU killed");
+    assert!(mgr.registry.is_registered(&held), "held candidate kept");
+    assert!(
+        mgr.reap_claims.lock().unwrap().contains(&held),
+        "the holder's claim is untouched (a lost try_claim never releases)"
+    );
+}
+
+/// monorepo#2247 (PR review) — `acquire_turn_start`'s copy of the
+/// all-candidates-claimed fallback: the gate queues as a (timed) waiter
+/// instead of spinning, and proceeds once the holder releases.
+#[tokio::test]
+async fn turn_start_waits_when_every_candidate_is_claimed() {
+    let gb = super::GB;
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+
+    let probe = FakeProbe::new(10 * gb);
+    assert!(mgr.registry.set_memory_budget(4 * gb, probe.clone()));
+
+    let held = AgentId::from("held");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(held.clone(), recording_kill(held.clone(), log.clone()));
+    mgr.registry.set_last_active(&held, 1);
+    let warm = AgentId::from("warm");
+    mgr.registry
+        .register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+    mgr.registry.set_last_active(&warm, 1000);
+
+    mgr.reap_claims.lock().unwrap().insert(held.clone());
+
+    let gate = {
+        let mgr = mgr.clone();
+        let warm = warm.clone();
+        tokio::spawn(async move {
+            let (try_claim, release, _released) = mgr.reap_claim_fns();
+            mgr.registry
+                .acquire_turn_start(&warm, try_claim, release)
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !gate.is_finished(),
+        "the gate waits while the only candidate is claimed"
+    );
+    assert!(mgr.registry.is_registered(&held), "no kill under a claim");
+
+    // Holder releases and the tree drains (no deregister fires): the
+    // waiter's timed re-check admits.
+    mgr.reap_claims.lock().unwrap().remove(&held);
+    probe.set(gb);
+    timeout(Duration::from_secs(30), gate)
+        .await
+        .expect("the waiter re-checks on its own timer")
+        .expect("task ok");
+    assert!(mgr.registry.is_registered(&held), "under budget: no evict");
+    assert!(log.lock().unwrap().is_empty(), "nothing was killed");
+}
+
+/// monorepo#2247 — the count-based LRU reap (`reap_idle` / `evict_idle`)
+/// claims each candidate before its kill: mid-kill a `try_begin` must LOSE,
+/// and a candidate claimed by another sweep is skipped, not killed.
+#[tokio::test]
+async fn reap_idle_claim_blocks_try_begin_during_kill_window() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-max-claim");
+    let id = AgentId::from("a-reap-max-claim");
+    seed_agent(&mgr, &ws, &id).await;
+
+    let (kill, mut entered_rx, release_tx) = blocking_kill();
+    mgr.registry.register(id.clone(), kill);
+
+    let sweep = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move { mgr.reap_idle(None).await })
+    };
+    entered_rx.recv().await.expect("kill entered");
+
+    assert!(
+        !mgr.try_begin(&id, &ws).await,
+        "try_begin must lose against the count-based reap's held claim"
+    );
+
+    release_tx.send(()).unwrap();
+    assert_eq!(sweep.await.unwrap(), 1);
+    assert!(!mgr.registry.is_registered(&id), "candidate was reaped");
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "claim is released after the kill; the next turn starts normally"
+    );
+}
+
+/// monorepo#2247 — `reap_idle` honors a claim another sweep already holds:
+/// the candidate is skipped (not killed), the holder's claim untouched.
+#[tokio::test]
+async fn reap_idle_skips_candidate_claimed_by_a_sweep() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let id = AgentId::from("a-reap-max-held");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry
+        .register(id.clone(), recording_kill(id.clone(), log.clone()));
+
+    mgr.reap_claims.lock().unwrap().insert(id.clone());
+    assert_eq!(mgr.reap_idle(None).await, 0);
+    assert!(log.lock().unwrap().is_empty(), "no kill under a held claim");
+    assert!(mgr.registry.is_registered(&id), "candidate kept");
+    assert!(
+        mgr.reap_claims.lock().unwrap().contains(&id),
+        "the holder's claim is untouched"
+    );
+
+    mgr.reap_claims.lock().unwrap().remove(&id);
+    assert_eq!(mgr.reap_idle(None).await, 1);
+    assert!(!mgr.registry.is_registered(&id));
 }
 
 /// monorepo#2063 B7 — the manager's over-budget reap drains idle agents with
