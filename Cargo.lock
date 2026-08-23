@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "intentd-sitter"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "directories",
  "flate2",
