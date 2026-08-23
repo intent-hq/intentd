@@ -19325,6 +19325,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -19365,6 +19366,7 @@ mod rules {
             false,
             false,
             &intent_core::settings_file::AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -19464,6 +19466,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -19509,6 +19512,7 @@ mod rules {
             false,
             false,
             &intent_core::settings_file::AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -19561,6 +19565,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -19588,6 +19593,7 @@ mod rules {
             false,
             false,
             &intent_core::settings_file::AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -19641,6 +19647,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             None,
             None,
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -19671,6 +19678,7 @@ mod rules {
             true,
             false,
             &intent_core::settings_file::AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -19740,6 +19748,7 @@ mod rules {
             false,
             false,
             &intent_core::settings_file::AgentFeaturesSettings::default(),
+            None,
             None,
             None,
         )
@@ -19872,6 +19881,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -20015,6 +20025,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -20148,6 +20159,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -20277,6 +20289,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -20406,6 +20419,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
+            None,
         )
         .await
         .expect("assembled prompt");
@@ -20539,6 +20553,7 @@ mod rules {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
             Some(&workspace),
             Some(&agent_session),
+            None,
         )
         .await
         .expect("assembled prompt");

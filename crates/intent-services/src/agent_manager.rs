@@ -2552,9 +2552,13 @@ impl AgentManager {
                     self.services
                         .specialist_model_options_for_workspace(&workspace_id)
                         .await,
-                ),
+                )
+                // Truncating providers (claude-code cuts tool descriptions
+                // at ~2k chars) get the compact `workspace_api` description;
+                // the full reference rides the system prompt below.
+                .with_compact_tool_descriptions(opts.provider.truncates_tool_descriptions),
         );
-        let bridge = serve_workspace_mcp_tcp(server)
+        let bridge = serve_workspace_mcp_tcp(Arc::clone(&server))
             .await
             .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;
 
@@ -2645,6 +2649,18 @@ impl AgentManager {
             // directive, matching the reference `isSubAgent` derivation.
             // Fetch workspace for mode-dependent prompt hints (Task 6).
             let workspace = self.services.store.get_workspace(&workspace_id).await.ok();
+            // Truncating providers get the full `workspace_api` reference in
+            // the prompt (this bridge's exact per-agent assembly — gating,
+            // chief-ness, and model options identical to what a non-flagged
+            // provider's tools/list would serve). Invariant: truncating
+            // providers must go through this `rules_file.is_none()` branch —
+            // the bridge serves the compact description unconditionally, so a
+            // caller-supplied rules file would leave its "Workspace API
+            // Reference" pointer dangling (ws.help() as the only fallback).
+            let workspace_api_docs = opts
+                .provider
+                .truncates_tool_descriptions
+                .then(|| server.full_workspace_api_description());
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
@@ -2656,6 +2672,7 @@ impl AgentManager {
                 &agent_features,
                 workspace.as_ref(),
                 Some(&session),
+                workspace_api_docs.as_deref(),
             )
             .await
             {
