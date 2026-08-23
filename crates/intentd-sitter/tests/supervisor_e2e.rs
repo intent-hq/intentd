@@ -26,7 +26,7 @@ use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::{
     BACKOFF_CAP_ENV, BACKOFF_INITIAL_ENV, BACKOFF_RESET_ENV, CHECK_MAX_ENV, CHECK_MIN_ENV,
-    GIVE_UP_AFTER_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
+    GIVE_UP_AFTER_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV, UPDATE_RESTART_ENV,
 };
 
 const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
@@ -222,6 +222,31 @@ fn long_running_script(version: &str) -> String {
 /// Fake daemon: log one line and crash with `code`.
 fn crash_script(code: i32) -> String {
     format!("#!/bin/sh\necho run >> \"${FAKE_DAEMON_LOG}\"\nexit {code}\n")
+}
+
+/// Like [`long_running_script`] but the start line records whether the
+/// sitter injected the update-restart marker into the environment.
+fn long_running_env_script(version: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         printf 'start {version} update_restart=%s\\n' \
+         \"${{{UPDATE_RESTART_ENV}:-unset}}\" >> \"${FAKE_DAEMON_LOG}\"\n\
+         trap 'exit 0' TERM INT\n\
+         sleep 60 &\n\
+         wait $!\n\
+         exit 0\n"
+    )
+}
+
+/// Like [`crash_script`] but the run line records whether the sitter
+/// injected the update-restart marker into the environment.
+fn crash_env_script(code: i32) -> String {
+    format!(
+        "#!/bin/sh\n\
+         printf 'run update_restart=%s\\n' \
+         \"${{{UPDATE_RESTART_ENV}:-unset}}\" >> \"${FAKE_DAEMON_LOG}\"\n\
+         exit {code}\n"
+    )
 }
 
 /// Fake daemon: log one line, stay up `secs`, then crash with `code` — a
@@ -458,6 +483,272 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
     assert_eq!(
         state::load(&paths.state_path).current_version.as_deref(),
         Some("0.2.0")
+    );
+}
+
+/// A mid-run periodic-check update respawns a different version than the
+/// one that just ran: that respawn (and only it) must carry
+/// `INTENTD_UPDATE_RESTART=1`; the first spawn must not.
+#[test]
+fn update_mid_run_respawn_sets_update_restart_env() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(CHECK_MIN_ENV, "300")
+        .env(CHECK_MAX_ENV, "301")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0; the next periodic check installs it and restarts.
+    let archive = make_tar_xz(long_running_env_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(20), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset".to_string(),
+            "start 0.2.0 update_restart=1".to_string(),
+        ],
+        "only the update-triggered respawn may carry the env var"
+    );
+}
+
+/// A SIGHUP restart that re-resolves to the same version (plain
+/// `intentd restart`, no update) must not mark the respawn as
+/// update-triggered.
+#[test]
+fn sighup_same_version_respawn_does_not_set_update_restart_env() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGHUP may restart the child.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    send_signal(&sitter, "HUP");
+    wait_until("daemon 0.1.0 to restart", Duration::from_secs(15), || {
+        read_or_empty(&log_path).lines().count() >= 2
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset".to_string(),
+            "start 0.1.0 update_restart=unset".to_string(),
+        ],
+        "a same-version SIGHUP respawn must not carry the env var"
+    );
+}
+
+/// A sitter launched with the update-restart marker already in its own
+/// environment (e.g. respawned by a wrapper that set it) must not leak it
+/// to children: first spawns and same-version respawns clear it rather
+/// than inherit it.
+#[test]
+fn inherited_update_restart_env_is_cleared_on_plain_spawns() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGHUP may restart the child.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(UPDATE_RESTART_ENV, "1")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    send_signal(&sitter, "HUP");
+    wait_until("daemon 0.1.0 to restart", Duration::from_secs(15), || {
+        read_or_empty(&log_path).lines().count() >= 2
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset".to_string(),
+            "start 0.1.0 update_restart=unset".to_string(),
+        ],
+        "plain spawns must clear an inherited marker, not pass it through"
+    );
+}
+
+/// Crash respawns of the same version are plain restarts: none of them
+/// may carry the update-restart marker.
+#[test]
+fn crash_respawn_does_not_set_update_restart_env() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_env_script(7));
+    // "Already current" on every failed-start re-check: the loop keeps
+    // respawning the same crashing 0.1.0.
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .env(BACKOFF_CAP_ENV, "100")
+        .env(GIVE_UP_AFTER_ENV, "10000")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("two crash respawns", Duration::from_secs(15), || {
+        read_or_empty(&log_path).lines().count() >= 3
+    });
+
+    send_signal(&sitter, "TERM");
+    wait_exit(&mut sitter, Duration::from_secs(10));
+
+    let contents = read_or_empty(&log_path);
+    let lines: Vec<&str> = contents.lines().collect();
+    assert!(lines.len() >= 3, "expected at least 3 runs: {lines:?}");
+    for line in &lines {
+        assert_eq!(
+            *line, "run update_restart=unset",
+            "crash respawns must not carry the env var: {lines:?}"
+        );
+    }
+}
+
+/// The CLI update path: an update installed out-of-band (new version in
+/// `state.json`) followed by SIGHUP respawns a different version than the
+/// one that just ran, so that respawn must carry the update-restart
+/// marker.
+#[test]
+fn sighup_respawn_with_version_change_sets_update_restart_env() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGHUP may restart the child.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Simulate `intentd update`: install 0.2.0 and point state.json at it
+    // while the sitter keeps running, then SIGHUP.
+    preinstall(&paths, "0.2.0", &long_running_env_script("0.2.0"));
+    send_signal(&sitter, "HUP");
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset".to_string(),
+            "start 0.2.0 update_restart=1".to_string(),
+        ],
+        "a SIGHUP respawn onto a new version must carry the env var"
     );
 }
 
@@ -890,6 +1181,10 @@ fn install_log_contract_spawn_failure_line_is_emitted_verbatim() {
 /// out the periodic schedule (12–24h in production, disabled here) and
 /// without any give-up in play. Before the fix the sitter only re-ran the
 /// startup check's version forever, so this test wedges until timeout.
+/// Uses the env-recording scripts to also cover the third update path's
+/// marker behavior: a fix adopted during failed-start backoff
+/// (`FailedStartCheck::Respawn`) differs from the version that last ran,
+/// so that respawn (and only it) must carry the update-restart marker.
 #[test]
 fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     let _serial = SERVE_LOOP_SERIAL
@@ -897,7 +1192,7 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
-    preinstall(&paths, "0.1.0", &crash_script(7));
+    preinstall(&paths, "0.1.0", &crash_env_script(7));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
         MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
@@ -907,6 +1202,7 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     // Periodic checks disabled (hour-long interval) and give-up out of
     // reach: only the failed-start re-check can find the fix.
     let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
         .env(BACKOFF_INITIAL_ENV, "50")
         .env(BACKOFF_CAP_ENV, "200")
         .env(BACKOFF_RESET_ENV, "60000")
@@ -929,7 +1225,7 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     );
 
     // Publish fixed 0.2.0; the crash loop's next re-check must install it.
-    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let archive = make_tar_xz(long_running_env_script("0.2.0").as_bytes());
     let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
     let sha = sha256_hex(&archive);
     {
@@ -946,6 +1242,24 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     assert!(
         sitter.try_wait().unwrap().is_none(),
         "the sitter must still be supervising after self-healing"
+    );
+    // Per-cause marker matrix: the crash respawns of broken 0.1.0 are plain
+    // restarts (unmarked), while the fix adopted by a failed-start re-check
+    // respawns a different version than the one that last ran — that spawn
+    // (and only it) must carry the update-restart marker.
+    let contents = read_or_empty(&log_path);
+    let lines: Vec<&str> = contents.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("run"))
+            .all(|l| *l == "run update_restart=unset"),
+        "crash respawns must not carry the env var: {lines:?}"
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&"start 0.2.0 update_restart=1"),
+        "the adopted-fix respawn must carry the env var: {lines:?}"
     );
     assert_eq!(
         state::load(&paths.state_path).current_version.as_deref(),

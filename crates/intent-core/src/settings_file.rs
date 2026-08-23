@@ -569,7 +569,9 @@ impl Default for AgentsSettings {
 }
 
 /// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
-/// (`"auto"`, `"on"`, `"off"`).
+/// (`"auto"`, `"on"`, `"off"`). Governs plain starts only: update-triggered
+/// restarts (the sitter respawning a freshly installed version, signaled via
+/// `INTENTD_UPDATE_RESTART=1`) always resume, regardless of this setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResumeInterruptedOnStart {
@@ -578,7 +580,8 @@ pub enum ResumeInterruptedOnStart {
     Auto,
     /// Always resume interrupted agents at startup.
     On,
-    /// Never resume interrupted agents at startup.
+    /// Never resume interrupted agents at startup (except update-triggered
+    /// restarts, which always resume).
     Off,
 }
 

@@ -1365,7 +1365,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Resume interrupted agents on start",
             "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
              auto resumes only on headless hosts (no display detected), on always resumes, \
-             off never resumes (changes apply on daemon restart)",
+             off never resumes; update-triggered restarts always resume regardless of this \
+             setting (changes apply on daemon restart)",
             "agents",
             &["auto", "on", "off"],
             "auto",

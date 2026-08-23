@@ -212,8 +212,23 @@ enum Command {
     },
 }
 
+fn main() -> ExitCode {
+    // Capture-and-scrub the sitter's update-restart marker before the tokio
+    // runtime starts (still single-threaded here, where `env::remove_var` is
+    // sound): the daemon's environment is inherited by every subprocess it
+    // spawns (agent tool shells, etc.), so a leaked marker would make a
+    // nested `intentd serve` launched from such a subprocess falsely force
+    // the resume sweep.
+    UPDATE_RESTART.store(
+        env_flag(UPDATE_RESTART_ENV),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    std::env::remove_var(UPDATE_RESTART_ENV);
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn async_main() -> ExitCode {
     init_tracing();
     install_panic_hook();
     let cli = Cli::parse();
@@ -886,6 +901,17 @@ fn init_tracing() {
 /// downgrades a stdio broken-pipe panic to a quiet exit for one-shot CLI
 /// invocations only (monorepo#1827).
 static ONE_SHOT_CLI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Env var the sitter sets on the child when a respawn is update-triggered
+/// (see `intentd_sitter::supervisor::UPDATE_RESTART_ENV`). Captured into
+/// [`UPDATE_RESTART`] and scrubbed from the environment in `main()` so it
+/// never leaks into subprocesses the daemon spawns.
+const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
+
+/// Whether this start is an update-triggered respawn: the value of
+/// [`UPDATE_RESTART_ENV`] captured in `main()` before the env var is
+/// scrubbed. Read by `cmd_serve` for the startup resume decision.
+static UPDATE_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
 /// code shells report for standard Unix tools whose output pipe closes early.
@@ -1680,8 +1706,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     );
 
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
-    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
-    // (`auto` = headless hosts only, `on` = always, `off` = never). Awaited to
+    // sweep, as does an update-triggered restart (the sitter sets
+    // `INTENTD_UPDATE_RESTART=1` when it respawns a different version than
+    // the one that just ran; captured into [`UPDATE_RESTART`] and scrubbed
+    // from the environment in `main()` so it never leaks to subprocesses);
+    // otherwise the `agents.resumeInterruptedOnStart`
+    // setting decides (`auto` = headless hosts only, `on` = always, `off` =
+    // never). Awaited to
     // completion BEFORE any listener starts (WS/WSS below, UDS further down)
     // so the first `agent.listInterrupted` a client issues on connect never
     // sees rows the sweep is about to claim (no interrupted-agents modal
@@ -1690,9 +1721,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // sweep only logs, so a bad sweep never wedges startup.
     let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
     let has_display = detect_has_display();
-    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    // Captured in `main()` before the env var was scrubbed from the
+    // environment (so it never leaks into daemon-spawned subprocesses).
+    let update_restart = UPDATE_RESTART.load(std::sync::atomic::Ordering::Relaxed);
+    let resume_on_start =
+        should_resume_on_start(resume_all, update_restart, resume_setting, has_display);
     tracing::info!(
         resume_all,
+        update_restart,
         setting = resume_setting.as_str(),
         has_display,
         resume = resume_on_start,
@@ -4695,17 +4731,20 @@ async fn report_context_engine() {
 }
 
 /// Whether the startup interrupted-agent resume sweep should run. The
-/// `--resume-all` flag forces the sweep; otherwise the
+/// `--resume-all` flag forces the sweep, as does `update_restart` (the
+/// sitter set `INTENTD_UPDATE_RESTART=1` because this start is an
+/// update-triggered respawn); otherwise the
 /// `agents.resumeInterruptedOnStart` setting decides: `on` always resumes,
 /// `off` never resumes, and `auto` (the default) resumes only on headless
 /// hosts (no display detected).
 fn should_resume_on_start(
     resume_all: bool,
+    update_restart: bool,
     setting: intent_core::settings_file::ResumeInterruptedOnStart,
     has_display: bool,
 ) -> bool {
     use intent_core::settings_file::ResumeInterruptedOnStart;
-    if resume_all {
+    if resume_all || update_restart {
         return true;
     }
     match setting {
@@ -5489,10 +5528,29 @@ mod tests {
     #[test]
     fn resume_on_start_flag_forces_resume() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
-        // --resume-all wins regardless of setting or display.
+        // --resume-all wins regardless of update-restart, setting, or display.
+        for update_restart in [true, false] {
+            for setting in [R::Auto, R::On, R::Off] {
+                for has_display in [true, false] {
+                    assert!(should_resume_on_start(
+                        true,
+                        update_restart,
+                        setting,
+                        has_display
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resume_on_start_update_restart_forces_resume() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        // An update-triggered restart wins regardless of setting or display,
+        // same as --resume-all.
         for setting in [R::Auto, R::On, R::Off] {
             for has_display in [true, false] {
-                assert!(should_resume_on_start(true, setting, has_display));
+                assert!(should_resume_on_start(false, true, setting, has_display));
             }
         }
     }
@@ -5501,16 +5559,16 @@ mod tests {
     fn resume_on_start_setting_on_and_off_ignore_display() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
         for has_display in [true, false] {
-            assert!(should_resume_on_start(false, R::On, has_display));
-            assert!(!should_resume_on_start(false, R::Off, has_display));
+            assert!(should_resume_on_start(false, false, R::On, has_display));
+            assert!(!should_resume_on_start(false, false, R::Off, has_display));
         }
     }
 
     #[test]
     fn resume_on_start_auto_resumes_only_headless() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
-        assert!(should_resume_on_start(false, R::Auto, false));
-        assert!(!should_resume_on_start(false, R::Auto, true));
+        assert!(should_resume_on_start(false, false, R::Auto, false));
+        assert!(!should_resume_on_start(false, false, R::Auto, true));
     }
 
     #[test]
