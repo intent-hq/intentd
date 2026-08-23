@@ -6486,7 +6486,11 @@ impl AgentManager {
         match self.try_begin_outcome(agent_id, workspace_id, true).await {
             TryBeginOutcome::Started => {}
             TryBeginOutcome::Busy => {
-                self.services
+                // Outcome deliberately ignored: the prompt turn that won the
+                // slot is itself the recovery — an empty zero-settle drive
+                // here needs no redrive/attention (monorepo#3262).
+                let _ = self
+                    .services
                     .run_harness_wake_turn(
                         &mut guard,
                         first,
@@ -6518,7 +6522,8 @@ impl AgentManager {
         let mgr = self.clone();
         let (id, ws) = (agent_id.clone(), workspace_id.clone());
         let drive = tokio::spawn(async move {
-            mgr.services
+            let outcome = mgr
+                .services
                 .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
                 .await;
             mgr.registry.mark_idle(&id);
@@ -6528,10 +6533,23 @@ impl AgentManager {
             // so this provably removes only this task's own entry.
             mgr.clear_worker(&id);
             mgr.end_turn(&id).await;
-            mgr.services.publish_harness_wake_idle(&id, &ws).await;
-            // A user send that raced in queued behind this turn's slot; with
-            // the slot released, kick the self-drain so it streams now
-            // (handoff: the drained prompt turn locks the receiver next).
+            // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
+            // that finalized with no meaningful content must not be
+            // accepted as a successful completion. Runs AFTER the slot
+            // release (an enqueued nudge drains as a normal prompt turn via
+            // the kick below) and BEFORE the idle emit (the nudge's
+            // ready-to-send entry suppresses the idle; the attention arm's
+            // session fields land before subscribers see the idle).
+            if outcome.empty_response {
+                mgr.services.recover_empty_harness_wake(&id, &ws).await;
+            }
+            mgr.services
+                .publish_harness_wake_idle(&id, &ws, outcome.empty_response)
+                .await;
+            // A user send that raced in queued behind this turn's slot (or
+            // the recovery nudge above); with the slot released, kick the
+            // self-drain so it streams now (handoff: the drained prompt
+            // turn locks the receiver next).
             if mgr.services.has_ready_to_send(&id) {
                 mgr.clone().try_drain_queue(id, ws).await;
             }

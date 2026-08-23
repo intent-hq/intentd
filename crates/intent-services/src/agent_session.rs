@@ -824,6 +824,44 @@ fn last_response_summary(blocks: &[Value]) -> Option<String> {
     }
 }
 
+/// Whether a finalized harness-wake transcript carries no meaningful content
+/// (intent-hq/monorepo#3262): every block is a `text`/`thinking` block whose
+/// text is whitespace-only, or the transcript is empty. Tool blocks and
+/// question/resource blocks always count as meaningful. Only wake turns that
+/// actually OPENED consult this — status-only bursts never open a turn (the
+/// wake tick drops unmappable variants), so they can never classify as an
+/// empty response.
+pub(crate) fn harness_wake_response_is_empty(blocks: &[Value]) -> bool {
+    blocks.iter().all(|b| {
+        matches!(
+            b.get("type").and_then(Value::as_str),
+            Some("text" | "thinking")
+        ) && b
+            .get("text")
+            .and_then(Value::as_str)
+            .is_none_or(|t| t.trim().is_empty())
+    })
+}
+
+/// The outcome of a finished harness-wake turn (monorepo#855 /
+/// intent-hq/monorepo#3262): the persisted assistant `message_id` (when the
+/// burst persisted a row) plus the empty-response classification the caller
+/// uses to decide whether the wake was a silent no-op needing recovery.
+pub(crate) struct HarnessWakeOutcome {
+    /// The persisted assistant row id, or `None` when the burst persisted
+    /// nothing. The production drive task keys only off `empty_response`
+    /// (the persisted-row event pair already carries the id); exercised by
+    /// the wake-turn unit tests (hence the allow — the lib build has no
+    /// reader).
+    #[allow(dead_code)]
+    pub message_id: Option<String>,
+    /// `true` when the turn's finalized transcript carried no meaningful
+    /// content (see [`harness_wake_response_is_empty`]) — the incident
+    /// signature of a failed post-interrupt recovery wake (a single bare
+    /// newline accepted as `harness_wake_complete`).
+    pub empty_response: bool,
+}
+
 /// Extract the `type: "text"` block strings from content blocks — the input
 /// shape [`last_response_and_digest_from_blocks`] expects.
 pub(crate) fn text_block_strings(blocks: &[Value]) -> Vec<String> {
@@ -3047,8 +3085,12 @@ impl Services {
     /// was persisted). The `agent:idle` lifecycle emit stays with the caller,
     /// which owns the single-flight slot.
     ///
-    /// Returns the persisted assistant `messageId`, or `None` when the burst
-    /// persisted nothing.
+    /// Returns a [`HarnessWakeOutcome`]: the persisted assistant `messageId`
+    /// (`None` when the burst persisted nothing) plus the empty-response
+    /// classification (intent-hq/monorepo#3262) — `true` when the turn
+    /// OPENED but its finalized transcript carried no meaningful content
+    /// (whitespace-only text/thinking blocks), the signature of a failed
+    /// recovery wake the caller must not accept as a successful completion.
     pub(crate) async fn run_harness_wake_turn(
         &self,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
@@ -3056,7 +3098,7 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         settle: std::time::Duration,
-    ) -> Option<String> {
+    ) -> HarnessWakeOutcome {
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone());
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
@@ -3116,6 +3158,13 @@ impl Services {
         let blocks = transcript.into_blocks();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Empty-response classification (intent-hq/monorepo#3262): the wake
+        // turn OPENED (a chunk/tool-call materialized content) but finalized
+        // with nothing meaningful — whitespace-only text/thinking blocks, the
+        // incident's single bare "\n". Computed on the finalized blocks
+        // BEFORE the append consumes them; the row (when any) still persists
+        // as the durable record of the no-op wake.
+        let empty_response = harness_wake_response_is_empty(&blocks);
         let mut message_persisted = false;
         if !blocks.is_empty() {
             match self
@@ -3170,17 +3219,118 @@ impl Services {
         stamp_preview_fields(&mut end_data, &preview_text_blocks);
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
-        message_persisted.then_some(message_id)
+        HarnessWakeOutcome {
+            message_id: message_persisted.then_some(message_id),
+            empty_response,
+        }
+    }
+
+    /// Recover from an empty harness-wake response (intent-hq/monorepo#3262):
+    /// the wake turn opened but finalized with no meaningful content — the
+    /// post-interrupt incident signature where a bare newline was accepted as
+    /// `harness_wake_complete` and the agent stalled silently. Runs after the
+    /// wake turn's slot is released and BEFORE the wake idle emit:
+    ///
+    /// 1. **Skip** when a ready-to-send queue entry exists (the imminent
+    ///    drain is itself the nudge; the wake idle is suppressed on the same
+    ///    condition) or when an attention request is already pending (the
+    ///    stall is already surfaced — do not stack).
+    /// 2. **Redrive** when the agent is redrive-eligible (delegated, in-task,
+    ///    no report — [`Self::truncation_redrive_eligible`]) and the
+    ///    consecutive counter (shared with the #2863 stall-episode streak) is
+    ///    within [`MAX_CONSECUTIVE_TRUNCATION_REDRIVES`]: the harness's
+    ///    empty-wake nudge is enqueued as a system-origin message tagged
+    ///    `{"type": "empty_wake_redrive"}`; the caller's ready-to-send kick
+    ///    drains it as a normal prompt turn. The streak clears on the next
+    ///    clean completion, same as the prompt-turn redrive.
+    /// 3. **Raise attention** otherwise (root/user-facing or taskless agents,
+    ///    or the cap is spent): a `"blocker"` attention request with the
+    ///    harness's turn-ended-unexpectedly reason, via the standard
+    ///    [`Self::agent_request_attention_op`] surfaces (session fields,
+    ///    transcript notice, `agent:attention-requested`, `needs_attention`
+    ///    display status, parent wake for delegated callers) — the workspace
+    ///    visibly needs input instead of looking healthy.
+    ///
+    /// Returns `true` when a nudge was enqueued (the caller's queue kick
+    /// delivers it), `false` otherwise. Best-effort throughout: store
+    /// failures fall through to the attention arm's own error handling and
+    /// never fail the wake path.
+    pub(crate) async fn recover_empty_harness_wake(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        if self.has_ready_to_send(agent_id) {
+            return false;
+        }
+        if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+            if session.attention_request_kind.is_some() {
+                return false;
+            }
+        }
+        if self.truncation_redrive_eligible(agent_id).await {
+            let streak = self.bump_truncation_redrives(agent_id);
+            if streak <= MAX_CONSECUTIVE_TRUNCATION_REDRIVES {
+                tracing::warn!(
+                    agent = %agent_id,
+                    streak,
+                    "empty harness-wake response on a delegated in-task agent — enqueueing recovery nudge (monorepo#3262)"
+                );
+                let nudge = crate::harness::latest().empty_wake_redrive_nudge();
+                self.enqueue_message_with_origin(
+                    agent_id,
+                    nudge,
+                    None,
+                    None,
+                    Some(json!({ "type": "empty_wake_redrive" })),
+                    None,
+                    false,
+                    false,
+                );
+                self.publish_queue_updated(agent_id).await;
+                return true;
+            }
+            tracing::warn!(
+                agent = %agent_id,
+                streak,
+                "empty harness-wake response — consecutive-redrive cap spent, raising attention (monorepo#3262)"
+            );
+        }
+        // Attention arm: not redrive-eligible (root/user-facing, taskless)
+        // or the cap is spent — surface the stall instead of idling
+        // silently. The op's attention fields are cleared when the agent
+        // next receives a message, so a fresh user prompt retires it.
+        let reason = crate::harness::latest().empty_wake_attention_reason();
+        if let Err(e) = self
+            .agent_request_attention_op(
+                workspace_id.clone(),
+                "blocker".to_string(),
+                reason,
+                Some(agent_id.clone()),
+            )
+            .await
+        {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "empty harness-wake recovery: attention request failed (monorepo#3262)"
+            );
+        }
+        false
     }
 
     /// Emit the `agent:idle` lifecycle signal for a finished harness-wake turn
     /// (monorepo#855), honoring the same ready-to-send suppression as a prompt
     /// turn's idle emit. `reason: "harness_wake_complete"` distinguishes it
-    /// from `stream_complete` for subscribers.
+    /// from `stream_complete` for subscribers. `empty_wake_response` stamps
+    /// the advisory `emptyWakeResponse: true` (intent-hq/monorepo#3262) so
+    /// subscribers can tell a no-op recovery wake from a healthy one; omitted
+    /// otherwise (absent ≠ present-false, additive field).
     pub(crate) async fn publish_harness_wake_idle(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
+        empty_wake_response: bool,
     ) {
         if self.has_ready_to_send(agent_id) {
             tracing::debug!(
@@ -3194,6 +3344,9 @@ impl Services {
             "reason": "harness_wake_complete",
             "status": "idle",
         });
+        if empty_wake_response {
+            data["emptyWakeResponse"] = Value::Bool(true);
+        }
         if let Ok(session) = self.store.get_agent_session(agent_id).await {
             data["agentName"] = Value::String(session.name);
             data["isBackground"] = Value::Bool(session.is_background);
