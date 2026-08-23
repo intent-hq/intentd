@@ -198,7 +198,7 @@ fn resolve_provider_id_empty_configured_default_yields_none() {
 }
 
 #[test]
-fn claude_code_meta_appends_system_prompt() {
+fn claude_code_meta_replaces_system_prompt() {
     let meta = build_session_meta("claude-code", Some("Test prompt"), Some("Builder"));
     assert!(meta.is_some(), "claude-code gets _meta");
     let meta_map = meta.unwrap();
@@ -224,38 +224,17 @@ fn claude_code_meta_appends_system_prompt() {
     assert_eq!(disallowed.len(), 1);
     assert_eq!(disallowed[0].as_str(), Some("Task"));
 
-    // Check systemPrompt.append
+    // Check systemPrompt is a plain string (full replacement of the
+    // claude_code preset prompt — not the { append, ... } object shape).
     let system_prompt_value = meta_map.get("systemPrompt");
     assert!(
         system_prompt_value.is_some(),
         "claude-code _meta contains systemPrompt"
     );
-    let system_prompt_obj = system_prompt_value.unwrap().as_object();
-    assert!(
-        system_prompt_obj.is_some(),
-        "claude-code _meta.systemPrompt is an object"
-    );
-    let obj = system_prompt_obj.unwrap();
     assert_eq!(
-        obj.len(),
-        2,
-        "claude-code _meta.systemPrompt has exactly two keys (append + excludeDynamicSections)"
-    );
-    let append_value = obj.get("append");
-    assert!(
-        append_value.is_some(),
-        "claude-code _meta.systemPrompt contains append"
-    );
-    assert_eq!(
-        append_value.unwrap().as_str(),
+        system_prompt_value.unwrap().as_str(),
         Some("Test prompt"),
-        "claude-code _meta.systemPrompt.append is the prompt text"
-    );
-    assert_eq!(
-        obj.get("excludeDynamicSections")
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "claude-code _meta.systemPrompt.excludeDynamicSections is true"
+        "claude-code _meta.systemPrompt is the prompt text as a plain string (full replacement)"
     );
 }
 
