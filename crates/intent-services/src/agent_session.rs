@@ -1104,8 +1104,14 @@ fn select_entry<'a>(
 /// `None` for providers that do not use `_meta` injection (auggie, droid,
 /// opencode, cortex, pi, grok, mock use other mechanisms).
 /// Provider-specific shapes:
-/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
-///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>", "excludeDynamicSections": true }? }`
+///   (disallowedTools always present; systemPrompt present only when non-blank
+///   prompt). `excludeDynamicSections: true` slims the preset system prompt so
+///   the appended instructions carry more weight: at adapter 0.66.0 / SDK
+///   0.3.220 it strips the per-user dynamic sections (working directory,
+///   auto-memory path, git status) from the system prompt and re-injects the
+///   stripped content as the first user message — nothing is lost, only
+///   relocated.
 /// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
 ///   `session_title` is supplied — monorepo#3151; older adapters ignore the
 ///   unknown field). The system prompt stays on the first-turn prepend fallback
@@ -1132,13 +1138,17 @@ fn build_session_meta(
                 }),
             );
 
-            // Add systemPrompt.append if non-blank prompt exists
+            // Add systemPrompt.append if non-blank prompt exists, with
+            // excludeDynamicSections so the preset prompt stays slim (the
+            // stripped sections come back as the first user message).
             if let Some(prompt) = system_prompt {
                 let prompt = prompt.trim();
                 if !prompt.is_empty() {
                     let mut system_prompt_obj = serde_json::Map::new();
                     system_prompt_obj
                         .insert("append".to_string(), Value::String(prompt.to_string()));
+                    system_prompt_obj
+                        .insert("excludeDynamicSections".to_string(), Value::Bool(true));
                     meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
                 }
             }

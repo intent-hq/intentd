@@ -238,8 +238,8 @@ fn claude_code_meta_appends_system_prompt() {
     let obj = system_prompt_obj.unwrap();
     assert_eq!(
         obj.len(),
-        1,
-        "claude-code _meta.systemPrompt has exactly one key"
+        2,
+        "claude-code _meta.systemPrompt has exactly two keys (append + excludeDynamicSections)"
     );
     let append_value = obj.get("append");
     assert!(
@@ -250,6 +250,12 @@ fn claude_code_meta_appends_system_prompt() {
         append_value.unwrap().as_str(),
         Some("Test prompt"),
         "claude-code _meta.systemPrompt.append is the prompt text"
+    );
+    assert_eq!(
+        obj.get("excludeDynamicSections")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "claude-code _meta.systemPrompt.excludeDynamicSections is true"
     );
 }
 

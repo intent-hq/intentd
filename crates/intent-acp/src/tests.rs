@@ -464,7 +464,10 @@ mod session_tests {
                 }
             }),
         );
-        meta.insert("systemPrompt".to_string(), json!({"append": "test prompt"}));
+        meta.insert(
+            "systemPrompt".to_string(),
+            json!({"append": "test prompt", "excludeDynamicSections": true}),
+        );
 
         let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
             .await
@@ -487,6 +490,11 @@ mod session_tests {
             meta_payload["systemPrompt"]["append"],
             json!("test prompt"),
             "session/new systemPrompt.append preserved"
+        );
+        assert_eq!(
+            meta_payload["systemPrompt"]["excludeDynamicSections"],
+            json!(true),
+            "session/new systemPrompt.excludeDynamicSections preserved"
         );
     }
 
