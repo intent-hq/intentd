@@ -941,6 +941,13 @@ impl SourceControl for GitHubSourceControl {
         }
     }
 
+    async fn rate_limit_reset_at(&self) -> Result<Option<u64>> {
+        // `GET /rate_limit` is quota-free, so it stays usable while the core
+        // quota is exhausted (monorepo#2961).
+        let v: Value = self.client.get("/rate_limit", None::<&()>).await?;
+        Ok(v.pointer("/resources/core/reset").and_then(Value::as_u64))
+    }
+
     async fn get_user(&self) -> Result<UserIdentity> {
         let v: Value = self.client.get("/user", None::<&()>).await?;
         map_user_identity(v)

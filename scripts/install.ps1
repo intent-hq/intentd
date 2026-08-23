@@ -25,6 +25,11 @@
 # $env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off' (or -AutoResume <value>, on
 # direct runs) forces an answer.
 #
+# Task setup is refused up front when a daemon is already running and owns the
+# data dir the task would serve: a daemon locks its data dir for its whole
+# lifetime, so a second one on the same dir can only crash-loop. Nothing is
+# registered in that case.
+#
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
     [switch]$Service,
@@ -63,6 +68,24 @@ if ($env:INTENTD_AUTO_RESUME) {
         throw "install.ps1: invalid INTENTD_AUTO_RESUME value '$env:INTENTD_AUTO_RESUME' (expected auto, on, or off)"
     }
 }
+
+# >>> BEGIN resolve-data-dir (extracted verbatim and executed by
+# crates/intentd-sitter/tests/install_ps1_owner.rs — keep these markers).
+#
+# Anchor a relative INTENTD_DATA_DIR to the directory the installer runs in,
+# once, before anything reads it — the same normalization install.sh's
+# resolve_data_dir does. The override is carried verbatim into the Scheduled
+# Task action, and a task has no working directory of its own, so a bare
+# `.\data` would otherwise name one dir here — where the ownership check below
+# looks, and where this run's `intentd` calls read — and a different one once
+# the task starts. GetUnresolvedProviderPathFromPSPath resolves against the
+# current location without requiring the dir to exist yet, and leaves an
+# already-absolute path unchanged.
+if ($env:INTENTD_DATA_DIR) {
+    $env:INTENTD_DATA_DIR =
+        $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:INTENTD_DATA_DIR)
+}
+# <<< END resolve-data-dir
 
 $installDir = if ($env:INTENTD_INSTALL_DIR) {
     $env:INTENTD_INSTALL_DIR
@@ -153,6 +176,62 @@ if (-not $serviceMode) {
 }
 
 if ($serviceMode -eq 'yes') {
+    # >>> BEGIN data-dir-owner-check (extracted verbatim and executed by
+    # crates/intentd-sitter/tests/install_ps1_owner.rs — keep these markers,
+    # and keep the block self-contained: its only inputs are the environment).
+    #
+    # Before anything is asked or registered: refuse a data dir a live daemon
+    # already owns (install.sh's check_data_dir_not_owned). The daemon holds an
+    # exclusive lock on its data dir for as long as it runs, so a second task on
+    # the same dir never serves anything - it crash-loops until the sitter gives
+    # up, while the daemon it is fighting is usually the one the user wants to
+    # keep. `<data_dir>\intentd.pid` names the owner and only a live owner
+    # counts: a missing, unreadable or malformed pidfile - and the stale one a
+    # crash or a hard reboot leaves behind - all mean "not owned". The default
+    # data dir mirrors
+    # intent_core::Config::resolve (the `directories` crate's roaming data dir).
+    #
+    # "Malformed" is read exactly as the daemon's read_pid
+    # (crates/intentd/src/main.rs) reads it: the *whole* file, trimmed, parsed
+    # as a u32 - so `123\nnot-a-pid` and `1 23` are malformed, not pid 123.
+    # Taking only the first line would find an owner where the daemon finds
+    # none, and an unrelated live pid would then abort a legitimate install
+    # with nothing the user could do about it. [uint32]::TryParse accepts the
+    # same leading `+`, leading zeros and surrounding whitespace u32::from_str
+    # does, and rejects the same negatives and overflows.
+    $dataDir = if ($env:INTENTD_DATA_DIR) { $env:INTENTD_DATA_DIR } else { Join-Path $env:APPDATA 'intentd\data' }
+    $ownerPid = 0
+    $pidFile = Join-Path $dataDir 'intentd.pid'
+    try {
+        if (Test-Path $pidFile) {
+            $pidText = [string](Get-Content $pidFile -Raw -ErrorAction Stop)
+            $parsed = [uint32]0
+            if ([uint32]::TryParse($pidText.Trim(), [ref]$parsed) -and
+                $parsed -gt 0 -and $parsed -le [int]::MaxValue) {
+                if (Get-Process -Id ([int]$parsed) -ErrorAction SilentlyContinue) { $ownerPid = [int]$parsed }
+            }
+        }
+    } catch {
+        # An unreadable pidfile proves nothing; treat it as unowned.
+        $ownerPid = 0
+    }
+    if ($ownerPid -gt 0) {
+        # Best-effort image path, so the refusal names the program instead of a
+        # bare number (Get-Process cannot read Path for some processes).
+        $ownerPath = ''
+        try { $ownerPath = (Get-Process -Id $ownerPid -ErrorAction Stop).Path } catch { $ownerPath = '' }
+        $ownerDesc = if ($ownerPath) { "pid $ownerPid ($ownerPath)" } else { "pid $ownerPid" }
+        throw ("install.ps1: an intentd daemon is already running and owns the data dir this task would use:`n" +
+            "  data dir: $dataDir`n" +
+            "  owner:    $ownerDesc`n" +
+            "A daemon locks its data dir for as long as it runs, so a second task on the same dir cannot start - it would only crash-loop. Nothing has been registered.`n" +
+            "Pick one:`n" +
+            "  * keep the daemon that is already running - it serves this data dir now: intentd status`n" +
+            "  * stop it first (quit the app that started it, or stop its task), then re-run this installer`n" +
+            "  * give this task its own data dir: `$env:INTENTD_DATA_DIR = `"`$env:LOCALAPPDATA\intentd\service-data`"`n" +
+            "  * install just the binary, with no task: re-run with `$env:INTENTD_INSTALL_SERVICE = '0'")
+    }
+    # <<< END data-dir-owner-check
     # Auto-resume choice: parameter beats the env var beats the prompt (both
     # validated up front); 'auto' — or a non-interactive run — is the daemon
     # default and writes nothing. Applied via `intentd settings` after the
@@ -229,55 +308,25 @@ if ($serviceMode -eq 'yes') {
     Start-ScheduledTask -TaskName $taskName
     Write-Host "install.ps1: scheduled task '$taskName' registered (runs at logon) and started"
 
-    # First service start can be slow: the sitter downloads the real daemon
-    # before serving.
-    Write-Host 'install.ps1: waiting for the daemon to respond (first start downloads the daemon binary)...'
-    $up = $false
-    for ($waited = 0; $waited -lt 60; $waited += 2) {
-        & $dest status *> $null
-        if ($LASTEXITCODE -eq 0) { $up = $true; break }
-        Start-Sleep -Seconds 2
-    }
-    if ($up) {
-        Write-Host "install.ps1: daemon is up - 'intentd status' responds"
-    } else {
-        # Timing out is three different things. The sitter reports a daemon
-        # that starts and dies on the service log, so this run's slice says
-        # whether it has already given up (service stopped for good), is still
-        # respawning a daemon that cannot start (it only gives up minutes
-        # after this 60s wait, so this is the common case), or nothing crashed
-        # at all and the first download is merely slow. Only the last of the
-        # three is a warning. The substrings matched below are the sitter's
-        # own log lines - a detection contract with
-        # crates/intentd-sitter/src/supervisor.rs and install.sh, pinned by
-        # the install_log_contract_* tests in
-        # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in
-        # lockstep.
-        # An explicit on/off auto-resume answer is applied only after this
-        # check passes, so a failure here drops it - say so instead of
-        # dropping it silently.
-        $autoResumeNote = ''
-        if (@('on', 'off') -contains $autoResume) {
-            $autoResumeNote = "`nYour auto-resume choice ('$autoResume') was not applied; once the daemon is up, apply it with:`n  intentd settings agents.resumeInterruptedOnStart $autoResume"
-        }
-        # This run's slice of the service log, bounded to 40 lines. Empty when
-        # there is nothing to read; a file shorter than the noted offset was
-        # rotated or replaced, so read it whole. The offset is a byte count
-        # taken before decoding, so the first line can start mid-word; the
-        # lines that matter come after it. The log is append-only and never
-        # rotated, so seek with [long] offsets (it can exceed 2 GiB) and read
-        # at most a 256 KiB tail instead of loading the whole file — only the
-        # last 40 lines are quoted anyway. A failed read is reported as its
-        # own warning below, never passed off as an empty log.
-        $logOut = ''
-        $logReadFailed = $false
+    # This run's slice of the service log, bounded to 40 lines. Empty when
+    # there is nothing to read; a file shorter than the noted offset was
+    # rotated or replaced, so read it whole. The offset is a byte count taken
+    # before decoding, so the first line can start mid-word; the lines that
+    # matter come after it. The log is append-only and never rotated, so seek
+    # with [long] offsets (it can exceed 2 GiB) and read at most a 256 KiB tail
+    # instead of loading the whole file — only the last 40 lines are quoted
+    # anyway. A failed read is reported as its own warning below, never passed
+    # off as an empty log.
+    function Get-ServiceLogSlice {
+        param([string]$Path, [long]$Offset)
+        $text = ''
         try {
-            if (Test-Path $logFile) {
-                $stream = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Open,
+            if (Test-Path $Path) {
+                $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
                     [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                 try {
                     $length = [long]$stream.Length
-                    $sliceFrom = if ($length -lt [long]$logOffset) { [long]0 } else { [long]$logOffset }
+                    $sliceFrom = if ($length -lt $Offset) { [long]0 } else { $Offset }
                     $maxTailBytes = [long]262144
                     if (($length - $sliceFrom) -gt $maxTailBytes) { $sliceFrom = $length - $maxTailBytes }
                     $null = $stream.Seek($sliceFrom, [System.IO.SeekOrigin]::Begin)
@@ -292,38 +341,103 @@ if ($serviceMode -eq 'yes') {
                     if ($slice) {
                         $lines = @($slice -split "`r?`n")
                         if ($lines.Count -gt 40) { $lines = $lines[($lines.Count - 40)..($lines.Count - 1)] }
-                        $logOut = $lines -join "`n"
+                        $text = $lines -join "`n"
                     }
                 } finally {
                     $stream.Dispose()
                 }
             }
         } catch {
-            $logOut = ''
-            $logReadFailed = $true
+            return [pscustomobject]@{ Text = ''; Failed = $true }
+        }
+        return [pscustomobject]@{ Text = $text; Failed = $false }
+    }
+
+    # Wait for the first start to resolve into an outcome - up, failed, or (only
+    # once the deadline runs out with nothing decided) unknown - rather than
+    # classifying the log once at a fixed 60s mark. A sitter still resolving a
+    # channel or downloading at that mark has not crashed yet, so the old window
+    # reported "may still be downloading" seconds before the daemon proved it
+    # could never start. Mirrors install.sh's verify_daemon, including its
+    # knobs: $deadline bounds the whole wait, $settle is the grace after crash
+    # evidence appears (the sitter respawns, so a daemon that died once and then
+    # came up is a working install). Success still returns the moment the daemon
+    # answers.
+    $deadline = 300
+    $poll = 2
+    $settle = 10
+    $progressAt = 60
+    # The substrings matched below are the sitter's own log lines - a detection
+    # contract with crates/intentd-sitter/src/supervisor.rs and install.sh,
+    # pinned by the install_log_contract_* tests in
+    # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in lockstep.
+    Write-Host 'install.ps1: waiting for the daemon to respond (first start downloads the daemon binary)...'
+    $verdict = ''
+    $crashText = ''
+    $crashAt = -1
+    $logReadFailed = $false
+    $progressShown = $false
+    $waited = 0
+    while ($true) {
+        & $dest status *> $null
+        if ($LASTEXITCODE -eq 0) { $verdict = 'up'; break }
+        $slice = Get-ServiceLogSlice -Path $logFile -Offset ([long]$logOffset)
+        $logReadFailed = $slice.Failed
+        $logOut = $slice.Text
+        if ($logOut.Contains('times in a row without ever staying up')) {
+            # Terminal: the sitter has stopped trying, so nothing can change.
+            $crashText = $logOut
+            $verdict = 'gaveup'
+            break
+        } elseif ($logOut.Contains('exited unexpectedly') -or $logOut.Contains('failed to spawn') -or $logOut.Contains('failed waiting on intentd')) {
+            $crashText = $logOut
+            if ($crashAt -lt 0) { $crashAt = $waited }
+            if (($waited - $crashAt) -ge $settle) { $verdict = 'crashing'; break }
+        }
+        if ($waited -ge $deadline) {
+            $verdict = if ($crashText) { 'crashing' } else { 'undecided' }
+            break
+        }
+        if (-not $progressShown -and $waited -ge $progressAt) {
+            Write-Host "install.ps1: still waiting (${waited}s) - nothing has failed yet; a first download over a slow link can take a few minutes"
+            $progressShown = $true
+        }
+        Start-Sleep -Seconds $poll
+        $waited += $poll
+    }
+    if ($verdict -eq 'up') {
+        Write-Host "install.ps1: daemon is up - 'intentd status' responds"
+    } else {
+        # An explicit on/off auto-resume answer is applied only once the daemon
+        # is reachable, so any other outcome drops it - say so instead of
+        # dropping it silently.
+        $autoResumeNote = ''
+        if (@('on', 'off') -contains $autoResume) {
+            $autoResumeNote = "`nYour auto-resume choice ('$autoResume') was not applied; once the daemon is up, apply it with:`n  intentd settings agents.resumeInterruptedOnStart $autoResume"
         }
         $restartHint = "Start-ScheduledTask -TaskName $taskName"
-        if ($logOut.Contains('times in a row without ever staying up')) {
+        if ($verdict -eq 'gaveup') {
             Write-Host "install.ps1: the service's output for this start (from ${logFile}):"
-            foreach ($line in ($logOut -split "`n")) { Write-Host "  | $line" }
+            foreach ($line in ($crashText -split "`n")) { Write-Host "  | $line" }
             throw ("install.ps1: the daemon could not start and the sitter has given up - the service is stopped.`nFix the cause reported above, then start it again with:`n  $restartHint$autoResumeNote")
-        } elseif ($logOut.Contains('exited unexpectedly') -or $logOut.Contains('failed to spawn') -or $logOut.Contains('failed waiting on intentd')) {
+        } elseif ($verdict -eq 'crashing') {
             Write-Host "install.ps1: the service's output for this start (from ${logFile}):"
-            foreach ($line in ($logOut -split "`n")) { Write-Host "  | $line" }
+            foreach ($line in ($crashText -split "`n")) { Write-Host "  | $line" }
             throw ("install.ps1: the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.`nFix the cause reported above, then start it again with:`n  $restartHint$autoResumeNote")
         } elseif ($logReadFailed) {
-            # A read failure is not an empty log: without the slice the three
-            # cases above are indistinguishable, so say so instead of guessing
-            # "still downloading".
-            Write-Warning "install.ps1: daemon did not respond within 60s and the service log could not be read ($logFile) - cannot tell whether it is still downloading or crashing; check later with: intentd status"
+            # A read failure is not an empty log: without the slice a crash and
+            # a slow download are indistinguishable, so say so instead of
+            # guessing "still downloading".
+            Write-Warning "install.ps1: the daemon has not responded in ${waited}s and the service log could not be read ($logFile) - cannot tell whether it is still downloading or crashing; check later with: intentd status$autoResumeNote"
         } else {
-            Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
+            Write-Warning "install.ps1: the daemon has not responded in ${waited}s and nothing in this run's service log reports a failure - this install could not tell whether the daemon binary is still downloading or the task is stuck.`nThe task is registered and started; its output is in $logFile.`nCheck on it with: intentd status`nIf it is still not responding in a few minutes, restart it and re-read that log:`n  $restartHint$autoResumeNote"
         }
     }
     # 'auto' is the daemon default — nothing to write. A failure is a warning,
     # not a fatal install error: the setting can be changed later with the
-    # same command.
-    if (@('on', 'off') -contains $autoResume) {
+    # same command. Only attempted once the daemon actually answered: an
+    # undecided wait already told the user how to apply the setting themselves.
+    if ($verdict -eq 'up' -and @('on', 'off') -contains $autoResume) {
         & $dest settings agents.resumeInterruptedOnStart $autoResume *> $null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "install.ps1: auto-resume on service start set to '$autoResume' (agents.resumeInterruptedOnStart)"

@@ -104,6 +104,7 @@ mod primitive_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
+mod rate_limit;
 pub mod repo_config;
 mod rtk;
 mod sandbox_ops;
@@ -772,6 +773,17 @@ pub struct Services {
     /// it via the `#[cfg(test)]`-only `with_pr_refresh_fetch_timeout` so
     /// hung-fetch coverage completes in milliseconds.
     pr_refresh_fetch_timeout: std::time::Duration,
+    /// Global forge rate-limit pause gate for the background sweeps
+    /// (monorepo#2961): after a sweep forge call fails with
+    /// [`Error::RateLimited`], every forge-touching sweep — PR refresh and
+    /// git-root refresh alike, across all workspaces — is skipped until the
+    /// quota window resets (honoring the forge-reported reset timestamp,
+    /// else a fixed fallback), and the condition is logged once per pause
+    /// window instead of once per root/workspace per tick. Shared across
+    /// clones so the sweep loop and every other handle observe one pause.
+    /// In-memory only — a daemon restart re-learns the limit on the first
+    /// rate-limited call.
+    sweep_rate_limit: Arc<rate_limit::RateLimitGate>,
     /// In-memory pending workspace deletions for the delete grace window
     /// (§5.1): `workspace.delete` with `undoDelayMs > 0` registers the timer
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
@@ -952,6 +964,7 @@ impl Services {
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
+            sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -3218,8 +3231,10 @@ impl Services {
                 }
             }
             // Step 4 (PR refresh) needs a forge; without one the sweep's
-            // local steps above have already done their work.
-            let Some(sc) = sc else {
+            // local steps above have already done their work. A forge whose
+            // quota is exhausted is treated the same for the remaining roots
+            // — the local steps 1–3 above still ran (monorepo#2961).
+            let Some(sc) = sc.filter(|_| !self.sweeps_rate_limited()) else {
                 continue;
             };
             let root_id = root.id.clone();
@@ -3235,14 +3250,55 @@ impl Services {
                     self.pr_refresh_fetch_timeout
                 ))),
             };
-            if let Err(e) = refreshed {
-                tracing::warn!(
-                    workspace = %ws.id.as_str(),
-                    git_root = %root_id.as_str(),
-                    error = %e,
-                    "git root sweep: root refresh failed"
-                );
+            match refreshed {
+                Err(Error::RateLimited(detail)) => {
+                    self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %ws.id.as_str(),
+                        git_root = %root_id.as_str(),
+                        error = %e,
+                        "git root sweep: root refresh failed"
+                    );
+                }
+                Ok(_) => {}
             }
+        }
+    }
+
+    /// True while the global sweep rate-limit pause window is active
+    /// (monorepo#2961): forge-touching sweep work is skipped, silently —
+    /// the one WARN for the window was logged when the pause opened.
+    fn sweeps_rate_limited(&self) -> bool {
+        self.sweep_rate_limit.paused_remaining().is_some()
+    }
+
+    /// A sweep forge call failed with [`Error::RateLimited`]: pause all
+    /// forge-touching sweep work globally until the quota window resets.
+    /// The pause honors the forge-reported reset timestamp (GitHub's free
+    /// `rate_limit` probe) plus a margin, clamped, else a fixed fallback —
+    /// see [`rate_limit::pause_duration`]. Exactly one WARN is logged per
+    /// pause window (the opening trigger); repeat triggers while paused
+    /// extend the deadline silently, coalescing what used to be one WARN
+    /// per root/workspace per tick.
+    async fn pause_sweeps_for_rate_limit(
+        &self,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+        detail: &str,
+    ) {
+        let reset_unix = sc.rate_limit_reset_at().await.ok().flatten();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let pause = rate_limit::pause_duration(reset_unix, now_unix);
+        if self.sweep_rate_limit.pause_for(pause) {
+            tracing::warn!(
+                pause_secs = pause.as_secs(),
+                reset_unix,
+                detail,
+                "forge rate limit hit: pausing pr refresh + git root sweeps globally"
+            );
         }
     }
 
@@ -3293,6 +3349,10 @@ impl Services {
         // PR numbers fetched fresh this pass (linked / just-discovered);
         // the stale-pool heal below skips them.
         let mut fetched_fresh: Vec<u64> = Vec::new();
+        // A rate-limited relink discovery is captured here (not swallowed
+        // as a generic discovery failure) so it surfaces AFTER the status
+        // delta persist below and the sweep pauses globally (monorepo#2961).
+        let mut discovery_rate_limited: Option<String> = None;
         let mut outcome = if let Some(number) = root.pr_number {
             let pr = sc
                 .get_pr(&repo_ref, number)
@@ -3343,6 +3403,15 @@ impl Services {
                     .await
                     {
                         Ok(found) => found,
+                        // A rate-limited discovery still degrades to the
+                        // plain update path (the status delta persists),
+                        // but the class surfaces after the persist below
+                        // so the sweep pauses globally instead of burning
+                        // the remaining roots (monorepo#2961).
+                        Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
+                            discovery_rate_limited = Some(detail);
+                            None
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 git_root = %root.id.as_str(),
@@ -3401,30 +3470,42 @@ impl Services {
         // capped entries can consume at most half of it, so a hung pool
         // fetch (monorepo#1988 lineage) can never starve the linked-PR
         // delta persist below out of the caller's PR_REFRESH_FETCH_TIMEOUT.
-        changed |= pr_ops::refresh_stale_pool_entries(
-            sc.as_ref(),
-            &repo_ref,
-            &mut root.pull_requests,
-            &fetched_fresh,
-            self.pr_refresh_fetch_timeout / 10,
-        )
-        .await;
-        if !changed {
-            return Ok(outcome);
+        // A rate-limited relink discovery skips the heal entirely — its
+        // re-fetches would only burn into the same exhausted quota.
+        let mut rate_limited = discovery_rate_limited;
+        if rate_limited.is_none() {
+            let (heal_changed, heal_rate_limited) = pr_ops::refresh_stale_pool_entries(
+                sc.as_ref(),
+                &repo_ref,
+                &mut root.pull_requests,
+                &fetched_fresh,
+                self.pr_refresh_fetch_timeout / 10,
+            )
+            .await;
+            changed |= heal_changed;
+            rate_limited = heal_rate_limited;
         }
-        if matches!(
-            outcome,
-            PrRefreshOutcome::Unchanged | PrRefreshOutcome::Skipped
-        ) {
-            outcome = PrRefreshOutcome::Updated;
+        if changed {
+            if matches!(
+                outcome,
+                PrRefreshOutcome::Unchanged | PrRefreshOutcome::Skipped
+            ) {
+                outcome = PrRefreshOutcome::Updated;
+            }
+            root.updated_at = now_iso();
+            self.store.update_workspace_git_root_pr(&root).await?;
+            publish_event(
+                self.event_bus.as_ref(),
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
         }
-        root.updated_at = now_iso();
-        self.store.update_workspace_git_root_pr(&root).await?;
-        publish_event(
-            self.event_bus.as_ref(),
-            git_root_changed_event(GIT_ROOT_UPDATED, &root),
-        )
-        .await;
+        // A relink discovery or heal re-fetch that hit the forge quota
+        // surfaces AFTER the delta persist (the paid-for snapshots land)
+        // so the sweep caller pauses globally (monorepo#2961).
+        if let Some(detail) = rate_limited {
+            return Err(Error::RateLimited(detail));
+        }
         Ok(outcome)
     }
 
@@ -3524,6 +3605,11 @@ impl Services {
             let info = pr_ops::build_pr_info(&pr);
             // Keep the daemon-owned PR list current on every linked refresh.
             let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // A rate-limited relink discovery is captured here (not
+            // swallowed as a generic discovery failure) so it surfaces
+            // AFTER the status delta persist below and the sweep pauses
+            // globally (monorepo#2961).
+            let mut discovery_rate_limited: Option<String> = None;
             // A merged/closed linked PR stays recorded in `pull_requests`
             // but no longer blocks discovery: relink to a newer open PR
             // matching the branch (or, failing that, the baseRef), so the
@@ -3547,6 +3633,15 @@ impl Services {
                 .await
                 {
                     Ok(found) => found,
+                    // A rate-limited discovery still degrades to the plain
+                    // update path (the status delta persists), but the
+                    // class surfaces after the persist below so the sweep
+                    // pauses globally instead of burning the remaining
+                    // workspaces (monorepo#2961).
+                    Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
+                        discovery_rate_limited = Some(detail);
+                        None
+                    }
                     Err(e) => {
                         tracing::warn!(
                             workspace_id = %ws.id.as_str(),
@@ -3574,17 +3669,26 @@ impl Services {
                 || ws.pr_status != Some(info.status)
                 || ws.active_pull_request.as_ref() != Some(&info)
                 || ws.pr_url.as_deref() != Some(pr.url.as_str());
-            if !changed {
-                return Ok(PrRefreshOutcome::Unchanged);
+            if changed {
+                ws.pr_status = Some(info.status);
+                ws.pr_url = Some(pr.url.clone());
+                ws.active_pull_request = Some(info);
+                ws.updated_at = now_iso();
+                self.store.update_workspace_pr_linkage(&ws).await?;
+                publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
+                self.maybe_emit_display_status_changed(&ws.id).await;
             }
-            ws.pr_status = Some(info.status);
-            ws.pr_url = Some(pr.url.clone());
-            ws.active_pull_request = Some(info);
-            ws.updated_at = now_iso();
-            self.store.update_workspace_pr_linkage(&ws).await?;
-            publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
-            self.maybe_emit_display_status_changed(&ws.id).await;
-            Ok(PrRefreshOutcome::Updated)
+            // A rate-limited relink discovery surfaces AFTER the delta
+            // persist (the paid-for status lands) so the sweep caller
+            // pauses globally (monorepo#2961).
+            if let Some(detail) = discovery_rate_limited {
+                return Err(Error::RateLimited(detail));
+            }
+            if changed {
+                Ok(PrRefreshOutcome::Updated)
+            } else {
+                Ok(PrRefreshOutcome::Unchanged)
+            }
         } else {
             // Discovery: link an open PR matching the branch, or —
             // failing that — the workspace's baseRef (§7.6).
@@ -3682,7 +3786,12 @@ impl Services {
             // timeouts: a refresh that pends indefinitely maps to the same
             // log-and-continue path as any other per-workspace error instead
             // of wedging the sweep for every other workspace.
-            if let Some(sc) = &sc {
+            //
+            // The rate-limit gate is re-checked per workspace (not once per
+            // sweep) so a limit hit mid-sweep stops the remaining forge
+            // calls immediately instead of burning them into the exhausted
+            // quota (monorepo#2961).
+            if let Some(sc) = sc.as_ref().filter(|_| !self.sweeps_rate_limited()) {
                 let refreshed = match tokio::time::timeout(
                     self.pr_refresh_fetch_timeout,
                     self.refresh_workspace_pr_with_sc(ws.clone(), sc),
@@ -3695,12 +3804,18 @@ impl Services {
                         self.pr_refresh_fetch_timeout
                     ))),
                 };
-                if let Err(e) = refreshed {
-                    tracing::warn!(
-                        workspace = %ws_id.as_str(),
-                        error = %e,
-                        "pr refresh: workspace refresh failed"
-                    );
+                match refreshed {
+                    Err(Error::RateLimited(detail)) => {
+                        self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws_id.as_str(),
+                            error = %e,
+                            "pr refresh: workspace refresh failed"
+                        );
+                    }
+                    Ok(_) => {}
                 }
             }
             // After the workspace's own refresh, sweep its tracked git roots
