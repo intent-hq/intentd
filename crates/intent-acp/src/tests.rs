@@ -5867,6 +5867,52 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
+    async fn tools_list_compact_flag_serves_compact_description() {
+        // A bridge flagged for a truncating provider serves the compact
+        // `workspace_api` description (whole text under the ~2k cutoff, no
+        // API sections), while `full_workspace_api_description()` returns
+        // exactly what the unflagged bridge's tools/list serves — the text
+        // the spawn path appends to the system prompt.
+        let compact_srv = server("amber-forest", None)
+            .with_agent_features(no_hooks_features())
+            .with_compact_tool_descriptions(true);
+        let resp = compact_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let compact = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            compact.len() <= 2000,
+            "compact description is {} bytes, over the ~2k truncation cutoff",
+            compact.len()
+        );
+        assert!(
+            !compact.contains("\nAPI:"),
+            "compact description must not carry the API sections"
+        );
+        assert!(
+            !compact.contains("ws.hook."),
+            "feature pruning must still apply to the compact description"
+        );
+        assert!(
+            compact.contains("system prompt"),
+            "compact description must point at the system-prompt reference"
+        );
+
+        let full_srv = server("amber-forest", None).with_agent_features(no_hooks_features());
+        let resp = full_srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let full = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            compact_srv.full_workspace_api_description(),
+            full,
+            "full_workspace_api_description must match the unflagged tools/list text"
+        );
+    }
+
+    #[tokio::test]
     async fn disabled_namespace_is_absent_from_prelude() {
         // Layer (b): with the toggle off, `ws.hook` is not installed, so
         // touching it fails with the clear namespace-missing TypeError.
