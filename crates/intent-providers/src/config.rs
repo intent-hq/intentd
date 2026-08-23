@@ -392,6 +392,15 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         short_name: "Cortex",
+        // Cortex defers ALL MCP tools by default (`settings.toolSearch !==
+        // false` — default ON): a names-only reminder ("Schemas are NOT
+        // loaded in your context") replaces description text unless the
+        // model calls `tool_search`. However, this entry has NO MCP delivery
+        // channel yet (no `supports_mcp_config` / `supports_session_mcp_servers`
+        // / env config / pi extension), so the workspace bridge never reaches
+        // cortex sessions — flipping `truncates_tool_descriptions` here would
+        // inject the full ws.* reference for tools cortex cannot call. Flip it
+        // together with bridge delivery: intent-hq/monorepo#3303.
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {
@@ -460,6 +469,14 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_session_mcp_servers: true,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
         short_name: "Droid",
+        // Defensive: droid's remote Statsig feature `mcp_tool_search` defers
+        // every non-github MCP server's tools behind a "Deferred tools:"
+        // reminder whose per-tool summary is the description's first line
+        // truncated to 200 chars — and the flag can flip server-side without
+        // a CLI update. Serve the compact `workspace_api` description and
+        // carry the full ws.* reference in the system prompt
+        // (`--append-system-prompt-file`).
+        truncates_tool_descriptions: true,
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -481,6 +498,13 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // in both auth states); the daemon parses that output instead of
         // using ACP `authenticate` (see `models::parse_grok_models_command_output`).
         auth_check_args: Some(&["models"]),
+        // Grok never puts MCP tools in the model's tool list
+        // (`tool_definitions_builtins_only()` filters MCP-qualified names);
+        // discovery rides its `search_tool` meta-tool, which truncates every
+        // description at 2,048 chars (`MAX_MCP_DESCRIPTION_LENGTH`). Serve
+        // the compact `workspace_api` description and carry the full ws.*
+        // reference in the system prompt (first-turn prepend).
+        truncates_tool_descriptions: true,
         login_docs_url: Some("https://docs.x.ai/build/enterprise#authentication"),
         short_name: "Grok",
         // Grok's ACP terminal adapter packs `/bin/bash -lc '…'` into `command`
