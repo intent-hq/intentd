@@ -88,6 +88,18 @@ fn registry_field_parity() {
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
     assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
     assert_eq!(cc.fallback_npx_package, None);
+    // Claude Code truncates MCP tool descriptions at ~2k chars
+    // (anthropics/claude-code#53933): it gets the compact `workspace_api`
+    // description + system-prompt API reference. Every other provider keeps
+    // the full tool description byte-identical to before.
+    assert!(cc.truncates_tool_descriptions);
+    for p in ACP_PROVIDERS.iter().filter(|p| p.id != "claude-code") {
+        assert!(
+            !p.truncates_tool_descriptions,
+            "{} must keep the full workspace_api tool description",
+            p.id
+        );
+    }
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));

@@ -1412,6 +1412,7 @@ async fn golden_assembled_prompt_static_layers() {
         &intent_core::settings_file::AgentFeaturesSettings::default(),
         None,
         None,
+        None,
     )
     .await
     .expect("assembled prompt");
@@ -1490,6 +1491,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         &features,
         None,
         None,
+        None,
     )
     .await
     .expect("prompt");
@@ -1521,6 +1523,7 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
         false,
         false,
         &features,
+        None,
         None,
         None,
     )
@@ -1570,6 +1573,7 @@ async fn golden_v1_session_assembles_identical_to_latest() {
                 &features,
                 None,
                 session.as_ref(),
+                None,
             )
             .await
             .expect("assembled prompt")
