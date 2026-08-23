@@ -573,6 +573,7 @@ mod session_tests {
         );
         let mut system_prompt_obj = serde_json::Map::new();
         system_prompt_obj.insert("append".to_string(), json!("Resumed prompt"));
+        system_prompt_obj.insert("excludeDynamicSections".to_string(), json!(true));
         meta.insert(
             "systemPrompt".to_string(),
             serde_json::Value::Object(system_prompt_obj),
@@ -597,6 +598,11 @@ mod session_tests {
             meta_payload["systemPrompt"]["append"],
             json!("Resumed prompt"),
             "session/load for claude-code must inject systemPrompt.append when provided"
+        );
+        assert_eq!(
+            meta_payload["systemPrompt"]["excludeDynamicSections"],
+            json!(true),
+            "session/load systemPrompt.excludeDynamicSections preserved"
         );
     }
 
