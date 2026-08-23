@@ -1260,7 +1260,13 @@ impl ProcessRegistry {
     /// released by a drop guard rather than a tail call — a drop at the
     /// `kill().await` frees the claim, and the admission `release` spawns the
     /// drain kick itself ([`AgentManager::admission_claim_fns`]), so a message
-    /// that parked behind the claim drains even on that path.
+    /// that parked behind the claim drains even on that path. A drop at (or
+    /// just after) the `kill().await` also skips the `deregister`: the victim
+    /// stays registered with a dead/half-killed child, holding its slot and
+    /// provisional budget charge. That self-heals on the victim's next turn —
+    /// `ensure_started`'s not-tracked gate routes it into `create_agent`,
+    /// whose `acquire` evicts the stale own entry — but until then the slot
+    /// reads as occupied.
     ///
     /// # Panics
     ///
@@ -1300,18 +1306,16 @@ impl ProcessRegistry {
                 } else {
                     REASON_SLOTS
                 };
-                let candidates = if forced_wait {
-                    Vec::new()
-                } else {
-                    lru_idle_ordered(&inner, None)
-                };
                 if inner.entries.len() < self.cap && over_budget.is_none() {
                     // Charge the spawn now: it will not appear in a tree sample
                     // for up to a sampling period, and a burst of spawns must not
                     // all clear the gate against the same stale reading.
                     self.budget_adjust(&mut inner, 1);
                     Action::Slot
-                } else if !candidates.is_empty() {
+                } else if let Some(candidates) = (!forced_wait)
+                    .then(|| lru_idle_ordered(&inner, None))
+                    .filter(|c| !c.is_empty())
+                {
                     Action::Evict(candidates, reason)
                 } else {
                     let (tx, rx) = tokio::sync::oneshot::channel();
