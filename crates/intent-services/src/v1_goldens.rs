@@ -207,6 +207,27 @@ fn golden_idle_timeout_warning() {
     );
 }
 
+#[test]
+fn golden_empty_wake_redrive_nudge() {
+    assert_eq!(
+        crate::harness::latest().empty_wake_redrive_nudge(),
+        "[SYSTEM NOTE] Automatic recovery (monorepo#3262): your previous turn ended \
+         unexpectedly mid-response, and the follow-up wake produced no output. Assess where \
+         you left off and continue the work; if the work is already complete, say so \
+         explicitly."
+    );
+}
+
+#[test]
+fn golden_empty_wake_attention_reason() {
+    assert_eq!(
+        crate::harness::latest().empty_wake_attention_reason(),
+        "Turn ended unexpectedly: the last turn stopped mid-response and the automatic \
+         recovery wake produced no output. The agent is idle and needs a fresh message to \
+         continue."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Turn-envelope literal fragments
 // ---------------------------------------------------------------------------

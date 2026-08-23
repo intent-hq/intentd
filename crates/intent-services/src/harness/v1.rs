@@ -421,6 +421,21 @@ impl Harness for V1 {
             .to_string()
     }
 
+    fn empty_wake_redrive_nudge(&self) -> String {
+        "[SYSTEM NOTE] Automatic recovery (monorepo#3262): your previous turn ended \
+         unexpectedly mid-response, and the follow-up wake produced no output. Assess where \
+         you left off and continue the work; if the work is already complete, say so \
+         explicitly."
+            .to_string()
+    }
+
+    fn empty_wake_attention_reason(&self) -> String {
+        "Turn ended unexpectedly: the last turn stopped mid-response and the automatic \
+         recovery wake produced no output. The agent is idle and needs a fresh message to \
+         continue."
+            .to_string()
+    }
+
     fn note_images_notice(&self, n: usize) -> String {
         format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
     }

@@ -14097,6 +14097,89 @@ mod harness_wake_tests {
         );
     }
 
+    /// The intent-hq/monorepo#3262 incident shape at the tick level: a wake
+    /// burst whose whole output is one whitespace-only chunk (the bare "\n")
+    /// must NOT be accepted as a successful recovery. The seeded agent is
+    /// root/taskless (not redrive-eligible), so the recovery raises a
+    /// `"blocker"` attention request and the wake idle carries the advisory
+    /// `emptyWakeResponse: true` — the workspace visibly needs input instead
+    /// of looking healthy.
+    #[tokio::test]
+    async fn empty_wake_burst_raises_attention_and_annotates_idle() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(chunk_note("\n")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        let idle = events
+            .iter()
+            .find(|e| e.event_type == "agent:idle")
+            .expect("wake idle still fires (attention arm enqueues nothing)");
+        assert_eq!(idle.data["reason"], json!("harness_wake_complete"));
+        assert_eq!(
+            idle.data["emptyWakeResponse"],
+            json!(true),
+            "no-op recovery wake carries the advisory flag: {idle:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "agent:attention-requested"),
+            "empty wake surfaces agent:attention-requested"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(
+            session.attention_request_kind.as_deref(),
+            Some("blocker"),
+            "attention request persisted on the session"
+        );
+        assert!(!mgr.is_busy(&id), "slot released after finalize");
+    }
+
+    /// Healthy wake turns keep today's behavior end-to-end: meaningful chunk
+    /// output finalizes with a plain `harness_wake_complete` idle — no
+    /// `emptyWakeResponse` stamp, no attention request (no false positive on
+    /// the recovery path).
+    #[tokio::test]
+    async fn meaningful_wake_burst_idles_without_recovery() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx
+            .send(chunk_note("[compaction] context compacted"))
+            .unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        let idle = events
+            .iter()
+            .find(|e| e.event_type == "agent:idle")
+            .expect("agent:idle after finalize");
+        assert!(
+            idle.data.get("emptyWakeResponse").is_none(),
+            "healthy wake omits the advisory flag: {idle:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == "agent:attention-requested"),
+            "no attention raised for a meaningful wake"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert!(
+            session.attention_request_kind.is_none(),
+            "no attention request persisted"
+        );
+    }
+
     /// A burst with no mappable update opens no turn: no events, no rows,
     /// slot untouched.
     #[tokio::test]
@@ -14574,7 +14657,7 @@ mod harness_wake_tests {
         let persisted_id = {
             let mut guard = notes.lock().await;
             let first = guard.try_recv().expect("first buffered note");
-            let persisted_id = mgr
+            let outcome = mgr
                 .services
                 .run_harness_wake_turn(&mut guard, first, &id, &ws, Duration::ZERO)
                 .await;
@@ -14582,7 +14665,11 @@ mod harness_wake_tests {
                 guard.try_recv().is_ok(),
                 "zero-settle turn leaves the later note buffered for the slot owner"
             );
-            persisted_id.expect("assistant row persisted")
+            assert!(
+                !outcome.empty_response,
+                "meaningful chunk output is not an empty wake response"
+            );
+            outcome.message_id.expect("assistant row persisted")
         };
 
         let events = collect_until(&mut sub, |seen| {

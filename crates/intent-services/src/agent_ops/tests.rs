@@ -24398,6 +24398,190 @@ async fn truncation_redrive_counter_and_handoff_semantics() {
 }
 
 // ---------------------------------------------------------------------------
+// Empty harness-wake recovery (intent-hq/monorepo#3262)
+// ---------------------------------------------------------------------------
+
+/// The empty-response classifier: whitespace-only text/thinking blocks (the
+/// incident's single bare newline) classify as empty; any meaningful text,
+/// tool block, or resource block does not.
+#[test]
+fn harness_wake_empty_response_classifier() {
+    use crate::agent_session::harness_wake_response_is_empty;
+    // The incident shape: one text block containing "\n".
+    assert!(harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "\n" })
+    ]));
+    assert!(harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "  \n\t" }),
+        json!({ "type": "thinking", "id": "b1", "text": "" }),
+    ]));
+    // Meaningful text is not empty.
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "resuming the plan" })
+    ]));
+    // Tool blocks always count as meaningful (no `text` field is NOT
+    // whitespace-only-text).
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "tool_use", "id": "t0", "name": "view", "input": {} })
+    ]));
+    // Question/resource blocks count as meaningful.
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "resource", "resource": { "uri": "intent-question://q-1" } })
+    ]));
+    // Mixed: one meaningful block rescues the burst.
+    assert!(!harness_wake_response_is_empty(&[
+        json!({ "type": "text", "id": "b0", "text": "\n" }),
+        json!({ "type": "tool_use", "id": "t0", "name": "view", "input": {} }),
+    ]));
+}
+
+/// The recovery's attention arm: a ROOT (non-delegated) agent whose wake
+/// produced nothing gets a `"blocker"` attention request with the harness's
+/// turn-ended-unexpectedly reason — the workspace shows `needs_attention`
+/// instead of looking healthy.
+#[tokio::test]
+async fn empty_wake_recovery_raises_attention_for_root_agent() {
+    let (_t, svc, ws) = setup().await;
+    let root = create_agent(&svc, &ws, "Coordinator").await;
+
+    let nudged = svc.recover_empty_harness_wake(&root, &ws).await;
+    assert!(!nudged, "root agents are not redrive-eligible — no nudge");
+
+    let session = svc.store().get_agent_session(&root).await.expect("session");
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "attention request persisted"
+    );
+    assert_eq!(
+        session.attention_request_reason.as_deref(),
+        Some(
+            crate::harness::latest()
+                .empty_wake_attention_reason()
+                .as_str()
+        ),
+        "reason is the harness's turn-ended-unexpectedly text"
+    );
+    assert!(
+        !svc.has_ready_to_send(&root),
+        "no recovery nudge enqueued for the attention arm"
+    );
+}
+
+/// The recovery's redrive arm: a delegated in-task agent gets the harness's
+/// empty-wake nudge enqueued (tagged `{"type": "empty_wake_redrive"}`)
+/// instead of an attention request — bounded by the shared consecutive
+/// counter, past which the attention arm takes over.
+#[tokio::test]
+async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
+    use crate::agent_session::MAX_CONSECUTIVE_TRUNCATION_REDRIVES;
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
+    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    s.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("link parent");
+
+    assert!(
+        svc.recover_empty_harness_wake(&child, &ws).await,
+        "eligible child gets the recovery nudge"
+    );
+    let entry = svc
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&child)
+        .and_then(|q| q.first().cloned())
+        .expect("nudge enqueued");
+    assert_eq!(
+        entry.content,
+        crate::harness::latest().empty_wake_redrive_nudge(),
+        "nudge text comes from the harness surface"
+    );
+    assert_eq!(
+        entry.message_metadata,
+        Some(json!({ "type": "empty_wake_redrive" })),
+        "nudge row is attributable"
+    );
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(
+        session.attention_request_kind.is_none(),
+        "redrive arm raises no attention"
+    );
+
+    // Drain the queue between calls (a ready-to-send entry short-circuits
+    // the recovery) and spend the shared consecutive counter.
+    svc.agent_queues.lock().unwrap().remove(&child);
+    for _ in 1..MAX_CONSECUTIVE_TRUNCATION_REDRIVES {
+        assert!(
+            svc.recover_empty_harness_wake(&child, &ws).await,
+            "still within the consecutive cap"
+        );
+        svc.agent_queues.lock().unwrap().remove(&child);
+    }
+    // Cap spent: the next empty wake falls through to the attention arm.
+    assert!(
+        !svc.recover_empty_harness_wake(&child, &ws).await,
+        "cap spent — no further nudges"
+    );
+    assert!(
+        !svc.has_ready_to_send(&child),
+        "no nudge enqueued past the cap"
+    );
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "cap exhaustion surfaces the attention request"
+    );
+}
+
+/// The recovery's skip guards: a ready-to-send queue entry (the imminent
+/// drain is itself the nudge) and an already-pending attention request both
+/// short-circuit — no nudge, no stacked attention.
+#[tokio::test]
+async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
+    let (_t, svc, ws) = setup().await;
+
+    // Ready-to-send entry → skip entirely.
+    let queued = create_agent(&svc, &ws, "Queued").await;
+    svc.enqueue_message(
+        &queued,
+        "pending user prompt".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    assert!(!svc.recover_empty_harness_wake(&queued, &ws).await);
+    let session = svc.store().get_agent_session(&queued).await.expect("s");
+    assert!(
+        session.attention_request_kind.is_none(),
+        "imminent drain suppresses the recovery"
+    );
+
+    // Pending attention request → skip (do not stack a second request).
+    let raised = create_agent(&svc, &ws, "Raised").await;
+    svc.store()
+        .set_attention_request(&ws, &raised, "discussion", "waiting on input", &now_iso())
+        .await
+        .expect("seed attention");
+    assert!(!svc.recover_empty_harness_wake(&raised, &ws).await);
+    let session = svc.store().get_agent_session(&raised).await.expect("s");
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("discussion"),
+        "existing request left untouched"
+    );
+    assert!(!svc.has_ready_to_send(&raised), "no nudge enqueued");
+}
+
+// ---------------------------------------------------------------------------
 // Question hold: `question_hold_active` derivation + `agent.dismissQuestions`
 // ---------------------------------------------------------------------------
 

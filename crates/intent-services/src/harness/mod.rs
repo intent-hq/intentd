@@ -148,6 +148,14 @@ pub(crate) trait Harness: Send + Sync {
     /// `[SYSTEM NOTE]` auto-redrive nudge injected after a suspected-truncated
     /// turn on a delegated in-task agent (intent-hq/monorepo#2863).
     fn truncation_redrive_nudge(&self) -> String;
+    /// `[SYSTEM NOTE]` auto-recovery nudge injected after a harness-wake turn
+    /// that produced no meaningful output on a delegated in-task agent
+    /// (intent-hq/monorepo#3262).
+    fn empty_wake_redrive_nudge(&self) -> String;
+    /// Attention-request reason recorded when an empty harness-wake recovery
+    /// cannot be redriven — root/user-facing or taskless agent, or the
+    /// consecutive-redrive cap is spent (intent-hq/monorepo#3262).
+    fn empty_wake_attention_reason(&self) -> String;
 
     // --- Prompt notices (`agent_manager.rs`) ---
 
