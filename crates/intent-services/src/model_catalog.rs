@@ -613,11 +613,44 @@ impl ModelCatalogCache {
 }
 
 /// Read the persisted snapshot, discarding unreadable or version-mismatched
-/// files.
+/// files. Loaded entries are sanitized: an adapter's `default` pseudo-row is
+/// dropped when real rows exist next to it — a snapshot persisted by a daemon
+/// predating the parse-time pseudo-row resolution stays valid under the same
+/// version key (the adapter pin, not the daemon version), so without this the
+/// stale row would be served indefinitely.
 fn load_persisted(path: &Path) -> Option<HashMap<String, CacheEntry>> {
     let bytes = std::fs::read(path).ok()?;
     let persisted: PersistedCache = serde_json::from_slice(&bytes).ok()?;
-    (persisted.version == PERSIST_VERSION).then_some(persisted.entries)
+    (persisted.version == PERSIST_VERSION)
+        .then_some(persisted.entries)
+        .map(|mut entries| {
+            for (provider_id, entry) in &mut entries {
+                if PSEUDO_ROW_RESOLVING_PROVIDERS.contains(&provider_id.as_str()) {
+                    drop_stale_pseudo_row(&mut entry.models);
+                }
+            }
+            entries
+        })
+}
+
+/// Providers whose catalogs go through the shared ACP row parser and its
+/// `default` pseudo-row resolution (`parse_acp_models`). Only their persisted
+/// entries are sanitized on load — for any other provider a row with id
+/// `default` would be a legitimate model the parse path serves as-is.
+const PSEUDO_ROW_RESOLVING_PROVIDERS: [&str; 3] = ["claude-code", "pi", "droid"];
+
+/// Drop the `default` pseudo-row(s) from a persisted row list when at least
+/// one real (non-pseudo) row exists (mirrors the parse-time rule in
+/// [`crate::provider_models::is_default_pseudo_row`]'s caller): a list with
+/// no real rows is left untouched so a catalog never loads empty because of
+/// this.
+fn drop_stale_pseudo_row(models: &mut Vec<Value>) {
+    if models
+        .iter()
+        .any(|row| !crate::provider_models::is_default_pseudo_row(row))
+    {
+        models.retain(|row| !crate::provider_models::is_default_pseudo_row(row));
+    }
 }
 
 /// Outcome of [`resolve_with_cache`]: the rows to serve (or `None` when the

@@ -206,10 +206,40 @@ fn parse_acp_models_resolves_default_pseudo_row_via_family_match() {
 }
 
 #[test]
-fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
-    // Fail-soft: a pseudo-row whose name/description carry no version-bearing
-    // family (or whose family matches zero or several siblings) is kept as-is
-    // and nothing is marked isDefault.
+fn parse_acp_models_drops_pseudo_row_for_live_opus_5_payload() {
+    // Repro of the live claude-agent-acp payload observed on intentd v0.7.42
+    // (2026-08, monorepo model-picker screenshot): the pseudo-row and the
+    // "Opus (1M context)" sibling share the same description, the model
+    // select's currentValue is "default". The pseudo-row must never reach the
+    // wire catalog while real rows exist.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "name": "Model", "category": "model", "type": "select",
+              "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)",
+                  "description": "Opus 5 with 1M context · Best for everyday, complex tasks" },
+                { "value": "opus[1m]", "name": "Opus (1M context)",
+                  "description": "Opus 5 with 1M context · Best for everyday, complex tasks" },
+                { "value": "claude-fable-5", "name": "Fable",
+                  "description": "Fable 5 · Most capable for your hardest and longest tasks" },
+                { "value": "sonnet", "name": "Sonnet",
+                  "description": "Sonnet 5 · Efficient for routine tasks" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["opus[1m]", "claude-fable-5", "sonnet"]);
+    assert_eq!(rows[0]["isDefault"], json!(true));
+}
+
+#[test]
+fn parse_acp_models_drops_unresolvable_default_pseudo_row() {
+    // An unresolvable pseudo-row — no version-bearing family in its
+    // name/description, or a family matching zero or several siblings — is
+    // still dropped when real rows exist; nothing is marked isDefault (no
+    // guessing).
     let no_family = json!({
         "configOptions": [
             { "id": "model", "currentValue": "default",
@@ -232,15 +262,15 @@ fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
     });
     for payload in [no_family, ambiguous] {
         let rows = parse_acp_models(&payload, "claude-code");
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["id"], "default");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r["id"] != "default"));
         assert!(rows
             .iter()
             .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
     }
 
-    // A lone pseudo-row can never resolve — the catalog must not come back
-    // empty.
+    // A catalog whose ONLY row is the pseudo-row keeps it — the catalog must
+    // not come back empty (D1).
     let only_default = json!({
         "configOptions": [
             { "id": "model", "currentValue": "default",
@@ -250,6 +280,45 @@ fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
     let rows = parse_acp_models(&only_default, "claude-code");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "default");
+
+    // The drop requires a real (non-pseudo) row: a pathological catalog of
+    // only duplicate pseudo-rows is served unchanged and nothing is marked
+    // isDefault.
+    let all_pseudo = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "DEFAULT", "name": "Default (dup)" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&all_pseudo, "claude-code");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
+}
+
+#[test]
+fn parse_acp_models_drops_every_pseudo_row_when_a_real_row_exists() {
+    // EVERY pseudo-row is dropped once a real row exists — not just the
+    // first — matching the cache-load sanitization: a `default` id must
+    // never ship next to a real model row.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "sonnet",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "DEFAULT", "name": "Default (dup)" },
+                { "value": "sonnet", "name": "Sonnet" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "sonnet");
+    assert_eq!(rows[0]["isDefault"], json!(true));
 }
 
 #[test]
@@ -294,13 +363,13 @@ fn parse_acp_models_current_value_wins_over_unresolvable_pseudo_row() {
 }
 
 #[test]
-fn parse_acp_models_family_less_default_row_stays_without_config_options() {
+fn parse_acp_models_family_less_default_row_drops_without_config_options() {
     // Catalogs from the models.availableModels shapes have no model select to
     // read a currentValue from, so only the family-match fallback applies.
-    // This family-less "default" row cannot resolve — it stays and no row is
-    // marked, matching the pre-resolution behavior. (A legacy default row
-    // whose name/description DOES carry a version-bearing family shared with
-    // exactly one sibling would still resolve via the fallback.)
+    // This family-less "default" row cannot resolve — it is still dropped
+    // (a real sibling exists) and no row is marked isDefault. (A legacy
+    // default row whose name/description DOES carry a version-bearing family
+    // shared with exactly one sibling would still resolve via the fallback.)
     let payload = json!({
         "models": {
             "availableModels": [
@@ -311,7 +380,8 @@ fn parse_acp_models_family_less_default_row_stays_without_config_options() {
         }
     });
     let rows = parse_acp_models(&payload, "claude-code");
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "opus");
     assert!(rows
         .iter()
         .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
