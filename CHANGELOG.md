@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.45] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- *(services)* Always drop the ACP default pseudo-row when real rows exist ([#1419](https://github.com/intent-hq/intentd/pull/1419))
+
+
 ## [0.7.44] - 2026-08-23
 
 ### 🚀 Features
