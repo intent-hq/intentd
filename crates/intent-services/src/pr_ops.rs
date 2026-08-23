@@ -29,11 +29,15 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// the graceful "not configured" path (§8.3) surfaces the same way.
 /// `Unsupported` (§7.2/§7.4 capability gating) maps onto a stable wire message
 /// with the `unsupported by provider:` prefix so clients can match on it.
+/// `RateLimited` keeps its class ([`Error::RateLimited`], same `-32603` wire
+/// code) so the background sweeps can detect quota exhaustion and pause
+/// instead of misreporting it as an auth/internal error (monorepo#2961).
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
     match e {
         intent_sourcecontrol::Error::Unsupported(msg) => {
             Error::Internal(format!("unsupported by provider: {msg}"))
         }
+        intent_sourcecontrol::Error::RateLimited(msg) => Error::RateLimited(msg),
         other => Error::Internal(other.to_string()),
     }
 }
@@ -358,16 +362,20 @@ pub(crate) const MAX_STALE_POOL_REFETCHES: usize = 5;
 /// snapshot, and each re-fetch is bounded by `per_entry_timeout` so one
 /// hung connection (monorepo#1988 lineage) can never eat the caller's whole
 /// per-root budget and starve the linked-PR delta persist that follows the
-/// heal. Returns whether the list changed.
+/// heal. Returns whether the list changed, plus the rate-limit detail when a
+/// re-fetch hit the forge's quota (monorepo#2961) — the one non-fail-soft
+/// class: the remaining candidates are skipped (they would burn the
+/// exhausted quota for the same answer) and the caller pauses the sweeps
+/// instead of this loop WARN-ing per entry.
 pub(crate) async fn refresh_stale_pool_entries(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     list: &mut Option<Vec<PullRequestInfo>>,
     exclude: &[u64],
     per_entry_timeout: std::time::Duration,
-) -> bool {
+) -> (bool, Option<String>) {
     let Some(items) = list.as_deref() else {
-        return false;
+        return (false, None);
     };
     let mut candidates: Vec<(Option<OffsetDateTime>, u64)> = items
         .iter()
@@ -381,6 +389,9 @@ pub(crate) async fn refresh_stale_pool_entries(
         match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
             Ok(Ok(pr)) => {
                 changed |= upsert_pr_info(list, &build_pr_info(&pr));
+            }
+            Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
+                return (changed, Some(detail));
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -398,7 +409,7 @@ pub(crate) async fn refresh_stale_pool_entries(
             }
         }
     }
-    changed
+    (changed, None)
 }
 
 /// Derive the persisted [`PullRequestStatus`] from a forge PR (draft wins over

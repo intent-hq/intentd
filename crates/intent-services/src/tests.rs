@@ -10350,6 +10350,15 @@ mod pr {
         /// PR numbers `get_pr` was called with, in call order (sweep
         /// stale-pool heal tests assert cap + ordering).
         seen_get_pr: std::sync::Mutex<Vec<u64>>,
+        /// When true, `get_pr` and `list_prs` fail with `RateLimited`
+        /// (exhausted GitHub core quota, monorepo#2961), exercising the
+        /// global sweep pause.
+        rate_limited: bool,
+        /// What `rate_limit_reset_at` reports (`None` mirrors a host
+        /// without the signal → fallback pause).
+        rate_limit_reset: Option<u64>,
+        /// How many times `rate_limit_reset_at` was probed.
+        seen_reset_probes: std::sync::Mutex<u64>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -10509,8 +10518,17 @@ mod pr {
                 updated_at: String::new(),
             })
         }
+        async fn rate_limit_reset_at(&self) -> ScResult<Option<u64>> {
+            *self.seen_reset_probes.lock().unwrap() += 1;
+            Ok(self.rate_limit_reset)
+        }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
             self.seen_get_pr.lock().unwrap().push(number);
+            if self.rate_limited {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
             if self.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
                 std::future::pending::<()>().await;
@@ -10535,6 +10553,11 @@ mod pr {
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
+            if self.rate_limited {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
             if self.fail_list_prs {
                 return Err(intent_sourcecontrol::Error::Api("list_prs down".into()));
             }
@@ -13417,6 +13440,135 @@ mod pr {
         assert_eq!(list.len(), 1, "in-place only — no append");
         assert_eq!(list[0].number, 42);
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
+    }
+
+    // ---- forge rate-limit backoff (monorepo#2961) -------------------------
+
+    /// A rate-limited forge call during the git-root sweep pauses ALL
+    /// remaining forge work in the same sweep: the first root's refresh
+    /// trips the gate (probing the forge's reset timestamp once), the
+    /// second root's refresh is skipped, and a follow-up sweep while paused
+    /// performs no forge calls and no further reset probes (coalescing).
+    #[tokio::test]
+    async fn sweep_rate_limit_pauses_remaining_roots_globally() {
+        let primary = SweepRepo::init("main", None);
+        let a = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let b = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        for (dir, n) in [(&a.dir, 42u64), (&b.dir, 43)] {
+            let mut root = sweep_root(&ws.id, dir, Some(("o", "r")));
+            root.pr_number = Some(n);
+            root.pr_url = Some(format!("https://github.com/o/r/pull/{n}"));
+            root.pr_status = Some(intent_core::PullRequestStatus::Open);
+            svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        }
+
+        let sc = Arc::new(StubForge {
+            rate_limited: true,
+            rate_limit_reset: Some(u64::MAX / 2),
+            ..Default::default()
+        });
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+
+        assert_eq!(
+            sc.seen_get_pr.lock().unwrap().len(),
+            1,
+            "first rate-limited fetch pauses the sweep; the second root is skipped"
+        );
+        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
+
+        // A whole follow-up sweep while paused performs no forge calls and
+        // no further reset probes — the condition was reported once.
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
+        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
+    }
+
+    /// The PR-refresh sweep shares the same global gate: a rate-limited
+    /// workspace refresh pauses the forge work for every subsequent
+    /// workspace in this and later sweeps (until the window resets), while
+    /// the sweep itself keeps running its local, forge-free steps.
+    #[tokio::test]
+    async fn pr_refresh_sweep_rate_limit_pauses_all_workspaces() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        for _ in 0..2 {
+            let ws_id = WorkspaceId::new();
+            let mut ws = workspace(&ws_id);
+            ws.branch = "feature".into();
+            ws.repository_owner = Some("o".into());
+            ws.repository_name = Some("r".into());
+            ws.pr_number = Some(42);
+            ws.updated_at = now_iso();
+            store.insert_workspace(&ws).await.expect("ws");
+        }
+        let sc = Arc::new(StubForge {
+            rate_limited: true,
+            rate_limit_reset: Some(u64::MAX / 2),
+            ..Default::default()
+        });
+        let svc = Services::new(store).with_source_control(sc.clone());
+
+        svc.refresh_all_workspace_prs(0).await;
+        assert_eq!(
+            sc.seen_get_pr.lock().unwrap().len(),
+            1,
+            "the first workspace's rate-limited refresh pauses the rest"
+        );
+        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
+
+        // The next tick is still inside the pause window: zero forge calls.
+        svc.refresh_all_workspace_prs(1).await;
+        assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
+        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
+    }
+
+    /// The stale-pool heal stops at the FIRST rate-limited re-fetch instead
+    /// of burning the exhausted quota on the remaining candidates, and
+    /// surfaces the limit to its caller rather than WARN-ing per entry.
+    #[tokio::test]
+    async fn pool_heal_stops_early_and_surfaces_rate_limit() {
+        let sc = StubForge {
+            rate_limited: true,
+            ..Default::default()
+        };
+        let repo = RepoRef::new("o", "r");
+        let mut list = Some(vec![
+            pool_entry(
+                1,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-01T00:00:00Z",
+            ),
+            pool_entry(
+                2,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-02T00:00:00Z",
+            ),
+            pool_entry(
+                3,
+                intent_core::PullRequestStatus::Closed,
+                "2026-01-03T00:00:00Z",
+            ),
+        ]);
+        let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
+            &sc,
+            &repo,
+            &mut list,
+            &[],
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(!changed);
+        assert!(
+            rate_limited.is_some_and(|d| d.contains("rate limit")),
+            "the limit surfaces to the caller"
+        );
+        assert_eq!(
+            sc.seen_get_pr.lock().unwrap().len(),
+            1,
+            "remaining candidates are not fetched into the exhausted quota"
+        );
     }
 }
 

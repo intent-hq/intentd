@@ -116,6 +116,14 @@ pub enum Error {
         waited_ms: u64,
         limit: u32,
     },
+
+    /// The source-control forge rate-limited a request (REST 403/429 with an
+    /// exhausted quota). Distinct from `Internal` so background sweeps can
+    /// detect the class and pause globally until the quota window resets, and
+    /// so logs stop misreporting quota exhaustion as
+    /// "source control auth error" (monorepo#2961). Surfaces as `-32603`.
+    #[error("source control rate limited: {0}")]
+    RateLimited(String),
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -190,6 +198,7 @@ impl Error {
             | Error::ListenerDown
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
+            | Error::RateLimited(_)
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,
