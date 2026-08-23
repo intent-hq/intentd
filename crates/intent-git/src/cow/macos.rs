@@ -64,13 +64,14 @@ fn get_volume_id(path: &Path) -> Option<u64> {
     if ret != 0 {
         return None;
     }
-    // Combine the two i32 fsid values bitwise into a u64: each half is
-    // reinterpreted as its raw 32 bits so a negative component cannot
-    // sign-extend across the other half of the key.
-    Some(
-        (u64::from(stat.f_fsid[0].cast_unsigned()) << 32)
-            | u64::from(stat.f_fsid[1].cast_unsigned()),
-    )
+    Some(combine_fsid(stat.f_fsid))
+}
+
+/// Combine the two i32 fsid values bitwise into a u64 cache key: each half
+/// is reinterpreted as its raw 32 bits so a negative component cannot
+/// sign-extend across the other half of the key.
+fn combine_fsid(fsid: [i32; 2]) -> u64 {
+    (u64::from(fsid[0].cast_unsigned()) << 32) | u64::from(fsid[1].cast_unsigned())
 }
 
 pub fn probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
@@ -212,6 +213,27 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
+
+    /// Regression test for the fsid cache-key composition: a negative
+    /// `f_fsid` half must be zero-extended into its own 32 bits, never
+    /// sign-extended across the other half. The pre-fix `as u64` cast
+    /// sign-extended a negative low half across bits 32-63, flooding
+    /// (and destroying) the high half's contribution — so volumes with
+    /// negative `f_fsid[1]` and different `f_fsid[0]` collided.
+    #[test]
+    fn combine_fsid_zero_extends_negative_halves() {
+        assert_eq!(combine_fsid([0, 0]), 0);
+        assert_eq!(combine_fsid([1, 2]), (1u64 << 32) | 2);
+        // Negative low half stays confined to bits 0-31.
+        assert_eq!(combine_fsid([0, -1]), 0xFFFF_FFFF);
+        assert_eq!(combine_fsid([1, -1]), (1u64 << 32) | 0xFFFF_FFFF);
+        // Negative high half stays confined to bits 32-63.
+        assert_eq!(combine_fsid([-1, 0]), 0xFFFF_FFFF_0000_0000);
+        // The old sign-extending composition collapsed these two keys.
+        assert_ne!(combine_fsid([1, -1]), combine_fsid([2, -1]));
+        // Bijectivity spot-check: distinct pairs yield distinct keys.
+        assert_ne!(combine_fsid([i32::MIN, 7]), combine_fsid([7, i32::MIN]));
+    }
 
     /// Regression test for the whole-tree fast path on socket-bearing trees
     /// (intent-hq/monorepo#1125): a source tree containing a live Unix socket
