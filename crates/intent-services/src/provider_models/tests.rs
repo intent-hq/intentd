@@ -280,6 +280,24 @@ fn parse_acp_models_drops_unresolvable_default_pseudo_row() {
     let rows = parse_acp_models(&only_default, "claude-code");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], "default");
+
+    // The drop requires a real (non-pseudo) row: a pathological catalog of
+    // only duplicate pseudo-rows is served unchanged and nothing is marked
+    // isDefault.
+    let all_pseudo = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "DEFAULT", "name": "Default (dup)" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&all_pseudo, "claude-code");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
 }
 
 #[test]

@@ -372,10 +372,10 @@ fn resolve_pseudo_default_sibling(rows: &[Value], pseudo: usize) -> Option<usize
 /// select's `currentValue` when it names a real (non-`default`) row; else the
 /// pseudo-row is resolved to the unique sibling sharing its version-bearing
 /// model family ([`resolve_pseudo_default_sibling`]). The pseudo-row is
-/// dropped **unconditionally** whenever at least one real row exists —
-/// resolved or not; when the resolution fails nothing is marked `isDefault`
-/// (no guessing). The single exception: a catalog whose only row is the
-/// pseudo-row keeps it, so this logic never empties a catalog.
+/// dropped **unconditionally** whenever at least one real (non-pseudo) row
+/// exists — resolved or not; when the resolution fails nothing is marked
+/// `isDefault` (no guessing). A catalog with no real rows keeps its
+/// pseudo-row(s), so this logic never empties a catalog.
 fn resolve_default_row(rows: &mut Vec<Value>, current_value: Option<&str>) {
     let pseudo = rows.iter().position(is_default_pseudo_row);
     let target = current_value
@@ -390,7 +390,7 @@ fn resolve_default_row(rows: &mut Vec<Value>, current_value: Option<&str>) {
             row.insert("isDefault".to_string(), json!(true));
         }
     }
-    if let Some(pseudo) = pseudo.filter(|_| rows.len() > 1) {
+    if let Some(pseudo) = pseudo.filter(|_| rows.iter().any(|row| !is_default_pseudo_row(row))) {
         rows.remove(pseudo);
     }
 }

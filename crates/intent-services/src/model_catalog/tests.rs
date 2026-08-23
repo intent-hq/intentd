@@ -240,11 +240,33 @@ fn persistence_load_drops_stale_default_pseudo_row() {
         json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code" }),
     ];
     cache.store("claude-code", "pin@1", only_default.clone(), 2_000);
-    let reloaded = ModelCatalogCache::new(Some(path));
+    let reloaded = ModelCatalogCache::new(Some(path.clone()));
     assert_eq!(
         reloaded.last_good("claude-code", "pin@1"),
         Some(only_default)
     );
+
+    // A list with no real rows (even several pseudo-rows) is left untouched —
+    // retain never produces a stored-empty entry.
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let all_pseudo = vec![
+        json!({ "id": "default", "name": "Default", "provider": "claude-code" }),
+        json!({ "id": "DEFAULT", "name": "Default (dup)", "provider": "claude-code" }),
+    ];
+    cache.store("claude-code", "pin@1", all_pseudo.clone(), 3_000);
+    let reloaded = ModelCatalogCache::new(Some(path.clone()));
+    assert_eq!(reloaded.last_good("claude-code", "pin@1"), Some(all_pseudo));
+
+    // Sanitization is scoped to the pseudo-row-resolving providers: for any
+    // other provider a `default` id is a legitimate model and survives load.
+    let cache = ModelCatalogCache::new(Some(path.clone()));
+    let opencode = vec![
+        json!({ "id": "default", "name": "Default", "provider": "opencode" }),
+        json!({ "id": "gpt-6", "name": "GPT-6", "provider": "opencode" }),
+    ];
+    cache.store("opencode", "pin@1", opencode.clone(), 4_000);
+    let reloaded = ModelCatalogCache::new(Some(path));
+    assert_eq!(reloaded.last_good("opencode", "pin@1"), Some(opencode));
 }
 
 /// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
