@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.41] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- Rate-limit backoff for pr refresh + git root sweeps ([#1412](https://github.com/intent-hq/intentd/pull/1412))
+
+
 ## [0.7.40] - 2026-08-22
 
 ### 🐛 Bug Fixes
