@@ -2410,6 +2410,18 @@ pub fn last_tool_use_preview(content: &serde_json::Value) -> Option<serde_json::
     Some(Value::Object(preview))
 }
 
+/// Per-field byte budget for `agent.list` row previews (list-payload cost
+/// contract, extending monorepo#2932): the preview fields exist to render a
+/// one-line summary in list contexts (sidebar rows, HUD cells), so each is
+/// bounded to this render-sized budget on the LIST path only — `agent.get` /
+/// `agent.getSession` keep serving full values. See
+/// [`AgentLite::cap_list_previews`]. Sized against the dogfooding workspace
+/// that motivated the cap (253 sessions, ~1.1 MB `agent.list` frames): at
+/// 400 bytes/field the same response serializes to ~630 KB — well under the
+/// transport's 1 MiB large-frame warn — while keeping each preview long
+/// enough for its one-line render.
+pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
+
 /// Metadata key under which the client-supplied `userAppMessageId` is
 /// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
 /// the router (which folds the top-level param into `messageMetadata`) and
@@ -3143,6 +3155,41 @@ impl AgentLite {
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
+        }
+    }
+
+    /// List-path preview capping (list-payload cost contract, extending
+    /// monorepo#2932): bound every render-preview field to
+    /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — `lastAgentResponse`,
+    /// `lastUserMessage`, `digest`, and `metadata.completionReport` are
+    /// truncated char-boundary safe, and an over-budget `lastToolUse` is
+    /// replaced by [`cap_json_value`]'s structure-preserving preview (the
+    /// small `name` key survives smallest-value-first admission, so the FE's
+    /// tool classification keeps working). These fields exist to render a
+    /// one-line summary in list contexts, so `agent.list` applies this to
+    /// every row; the detail reads (`agent.get` / `agent.getSession`) never
+    /// call it and keep serving full values.
+    pub fn cap_list_previews(&mut self) {
+        fn cap_string(field: &mut Option<String>) {
+            if let Some(s) = field {
+                if s.len() > AGENT_LIST_PREVIEW_BUDGET_BYTES {
+                    let mut end = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    s.truncate(end);
+                }
+            }
+        }
+        cap_string(&mut self.last_agent_response);
+        cap_string(&mut self.last_user_message);
+        cap_string(&mut self.digest);
+        cap_string(&mut self.metadata.completion_report);
+        if let Some(tool_use) = self.last_tool_use.as_ref() {
+            if slim_body_size(tool_use) > AGENT_LIST_PREVIEW_BUDGET_BYTES {
+                let mut budget = AGENT_LIST_PREVIEW_BUDGET_BYTES;
+                self.last_tool_use = Some(cap_json_value(tool_use, &mut budget));
+            }
         }
     }
 }
@@ -5007,6 +5054,108 @@ mod tests {
         assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastMessageId"], "msg-last");
         assert_eq!(v["lastActivity"], "t1");
+    }
+
+    /// [`AgentLite::cap_list_previews`] (list-payload cost contract): each
+    /// preview string is truncated to [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
+    /// char-boundary safe, an over-budget `lastToolUse` collapses to the
+    /// bounded [`cap_json_value`] preview with the small `name` key
+    /// surviving, and under-budget values pass through untouched.
+    #[test]
+    fn agent_lite_cap_list_previews_bounds_preview_fields() {
+        let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            // Multi-byte tail: truncation must land on a char boundary.
+            completion_report: Some(format!(
+                "{}{}",
+                "r".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES - 1),
+                "é".repeat(8)
+            )),
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let mut lite = AgentLite::from_session(
+            session,
+            2,
+            Some("a".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 4)),
+            Some("short user ask".to_string()),
+            Some("d".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES + 1)),
+            Some("assistant".to_string()),
+            Some("msg-1".to_string()),
+        );
+        lite.last_tool_use = Some(json!({
+            "name": "write_file",
+            "input": {
+                "path": "/tmp/a.txt",
+                "content": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 8),
+            },
+        }));
+
+        lite.cap_list_previews();
+
+        assert_eq!(
+            lite.last_agent_response.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        );
+        assert_eq!(
+            lite.digest.as_deref().map(str::len),
+            Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
+        );
+        // Under-budget values pass through untouched.
+        assert_eq!(lite.last_user_message.as_deref(), Some("short user ask"));
+        // The multi-byte report truncates on a char boundary at or under the
+        // budget (never mid-`é`).
+        let report = lite.metadata.completion_report.as_deref().unwrap();
+        assert!(report.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        assert!(report.is_char_boundary(report.len()));
+        // The over-budget tool preview collapses to the bounded shape with
+        // the small `name` key surviving admission.
+        let tool_use = lite.last_tool_use.as_ref().unwrap();
+        assert_eq!(tool_use["name"], "write_file");
+        let served = serde_json::to_string(tool_use).unwrap();
+        assert!(
+            served.len() <= AGENT_LIST_PREVIEW_BUDGET_BYTES * 2,
+            "capped lastToolUse stays near the budget, got {} bytes",
+            served.len()
+        );
     }
 
     /// Presence-sensitive `AgentLite` metadata fields preserve their distinct

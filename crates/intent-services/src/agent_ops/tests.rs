@@ -4147,9 +4147,11 @@ async fn list_derives_last_response_and_digest() {
 }
 
 /// P1b: multi-MB messages never regress the `AgentLite` previews — the
-/// SQL-capped projection still yields the correct digest, final response
-/// line, and a bounded `lastUserMessage` (the message's head, capped at the
-/// store's per-block limit instead of the full multi-MB text).
+/// SQL-capped projection still yields the correct digest and final response
+/// line, and a bounded `lastUserMessage` (the message's head). The list path
+/// additionally caps the preview at the render-sized list budget
+/// ([`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`]); `agent.get` serves the
+/// store's projection cap ([`intent_store::PROJECTION_TEXT_BLOCK_CAP`]).
 #[tokio::test]
 async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
     let (_t, svc, ws) = setup().await;
@@ -4167,7 +4169,7 @@ async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
             .expect("append");
     }
 
-    let agents = svc.agent_list_op(ws).await.expect("list");
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
     assert_eq!(agents[0].message_count, 2);
     assert_eq!(agents[0].digest.as_deref(), Some("big digest"));
     assert_eq!(
@@ -4177,9 +4179,19 @@ async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
     let last_user = agents[0].last_user_message.as_deref().expect("last user");
     assert!(last_user.starts_with("start of the big ask"));
     assert_eq!(
+        last_user.len(),
+        intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        "list-row lastUserMessage bounded at the render budget"
+    );
+
+    // The detail read keeps the projection-cap-sized head.
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    let last_user = got.last_user_message.as_deref().expect("get last user");
+    assert!(last_user.starts_with("start of the big ask"));
+    assert_eq!(
         last_user.chars().count(),
         intent_store::PROJECTION_TEXT_BLOCK_CAP as usize,
-        "lastUserMessage bounded at the projection cap"
+        "agent.get lastUserMessage bounded at the projection cap"
     );
 }
 
@@ -6617,6 +6629,105 @@ async fn create_persists_and_reserves_gap_fields() {
         agents[0].metadata.initial_message, None,
         "initialMessage must stay off agent.list rows (monorepo#2932)"
     );
+}
+
+/// List-payload cost contract (extending monorepo#2932): `agent.list` rows
+/// bound every render-preview field — `lastAgentResponse`, `lastUserMessage`,
+/// `digest`, `lastToolUse`, `metadata.completionReport` — to
+/// [`intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES`], while `agent.get` keeps
+/// serving the full values for the same session.
+#[tokio::test]
+async fn list_caps_previews_get_serves_full_values() {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Verbose").await;
+
+    let long_user = format!("user ask starts {}", "u".repeat(BUDGET * 3));
+    let long_line = format!("final answer {}", "a".repeat(BUDGET * 3));
+    let long_digest = format!("digest {}", "d".repeat(BUDGET * 3));
+    let long_report = format!("report {}", "r".repeat(BUDGET * 3));
+    let user = json!([{ "type": "text", "text": long_user }]);
+    svc.store()
+        .append_agent_message(&id, "user", &user, &now_iso())
+        .await
+        .expect("append user");
+    // A tool_use whose input is over the list budget but under the persisted
+    // preview budget (2048), so the 0098 column keeps it whole and only the
+    // list path caps it.
+    let assistant = json!([
+        {
+            "type": "tool_use", "id": "m:0", "name": "write_file",
+            "input": { "path": "/tmp/a.txt", "content": "x".repeat(BUDGET * 3) },
+            "toolCallId": "t1",
+        },
+        {
+            "type": "text",
+            "text": format!("{long_line}\n<agent_digest>{long_digest}</agent_digest>"),
+        },
+    ]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &assistant, &now_iso())
+        .await
+        .expect("append assistant");
+    svc.agent_update_op(id.clone(), json!({ "completionReport": long_report }))
+        .await
+        .expect("set report");
+
+    // `agent.get` serves the full values.
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_agent_response.as_deref(), Some(long_line.as_str()));
+    assert_eq!(got.digest.as_deref(), Some(long_digest.as_str()));
+    assert_eq!(got.last_user_message.as_deref(), Some(long_user.as_str()));
+    assert_eq!(
+        got.metadata.completion_report.as_deref(),
+        Some(long_report.as_str())
+    );
+    let got_tool = got.last_tool_use.as_ref().expect("get lastToolUse");
+    assert_eq!(
+        got_tool["input"]["content"].as_str().map(str::len),
+        Some(BUDGET * 3)
+    );
+
+    // `agent.list` rows cap every preview field to the render budget.
+    let agents = svc.agent_list_op(ws).await.expect("list");
+    assert_eq!(agents.len(), 1);
+    let row = &agents[0];
+    assert_eq!(
+        row.last_agent_response.as_deref().map(str::len),
+        Some(BUDGET),
+        "lastAgentResponse capped on list rows"
+    );
+    assert_eq!(
+        row.digest.as_deref().map(str::len),
+        Some(BUDGET),
+        "digest capped on list rows"
+    );
+    assert_eq!(
+        row.last_user_message.as_deref().map(str::len),
+        Some(BUDGET),
+        "lastUserMessage capped on list rows"
+    );
+    assert_eq!(
+        row.metadata.completion_report.as_deref().map(str::len),
+        Some(BUDGET),
+        "metadata.completionReport capped (not omitted) on list rows"
+    );
+    let tool_use = row.last_tool_use.as_ref().expect("list lastToolUse");
+    assert_eq!(
+        tool_use["name"], "write_file",
+        "tool name survives the capped preview"
+    );
+    let served = serde_json::to_string(tool_use).unwrap();
+    assert!(
+        served.len() <= BUDGET * 2,
+        "capped lastToolUse stays near the budget, got {} bytes",
+        served.len()
+    );
+    // The capped fields keep the original heads (truncation, not
+    // replacement).
+    assert!(long_line.starts_with(row.last_agent_response.as_deref().unwrap()));
+    assert!(long_user.starts_with(row.last_user_message.as_deref().unwrap()));
+    assert!(long_report.starts_with(row.metadata.completion_report.as_deref().unwrap()));
 }
 
 /// The top-level `isBackground` param wins over the `metadata` fallback, and
