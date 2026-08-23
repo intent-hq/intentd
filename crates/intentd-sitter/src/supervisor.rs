@@ -468,6 +468,11 @@ impl Supervisor {
                 .is_some_and(|last| *last != current_version)
             {
                 command.env(UPDATE_RESTART_ENV, "1");
+            } else {
+                // Clear rather than inherit: if the sitter itself was
+                // launched with the marker set, a first spawn, crash
+                // respawn, or same-version restart must not carry it.
+                command.env_remove(UPDATE_RESTART_ENV);
             }
             let mut child = match command.spawn() {
                 Ok(child) => child,

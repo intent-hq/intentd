@@ -598,6 +598,58 @@ fn sighup_same_version_respawn_does_not_set_update_restart_env() {
     );
 }
 
+/// A sitter launched with the update-restart marker already in its own
+/// environment (e.g. respawned by a wrapper that set it) must not leak it
+/// to children: first spawns and same-version respawns clear it rather
+/// than inherit it.
+#[test]
+fn inherited_update_restart_env_is_cleared_on_plain_spawns() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGHUP may restart the child.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(UPDATE_RESTART_ENV, "1")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    send_signal(&sitter, "HUP");
+    wait_until("daemon 0.1.0 to restart", Duration::from_secs(15), || {
+        read_or_empty(&log_path).lines().count() >= 2
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset".to_string(),
+            "start 0.1.0 update_restart=unset".to_string(),
+        ],
+        "plain spawns must clear an inherited marker, not pass it through"
+    );
+}
+
 /// Crash respawns of the same version are plain restarts: none of them
 /// may carry the update-restart marker.
 #[test]
