@@ -675,30 +675,48 @@ fn pop_waiter(
     None
 }
 
-fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
-    inner
+/// Idle entries ordered least-recently-used first — the eviction candidate
+/// list for the slot-cap/budget admission paths (monorepo#2247: a WALK, not a
+/// single pick, so a candidate whose claim fails is skipped instead of ending
+/// the eviction attempt). `exclude` is the turn-start budget gate's own agent
+/// (monorepo#2063 B8): the gated agent's own process is never its own gate's
+/// victim (evicting it would only trade this gate for the spawn gate). Other
+/// admission paths — a concurrent spawn `acquire`, or another turn-start
+/// gate — select via their own candidate lists and may still evict a process
+/// parked here; its waiter then wakes via `deregister`, re-classifies as
+/// unregistered, admits, and respawns through the spawn gate (queued, never
+/// refused, message intact — the warm session is lost, not the turn).
+fn lru_idle_ordered(inner: &RegistryInner, exclude: Option<&AgentId>) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
         .entries
         .iter()
-        .filter(|(_, e)| !e.is_active)
-        .min_by_key(|(_, e)| e.last_active_ms)
-        .map(|(id, e)| (id.clone(), e.kill.clone()))
+        .filter(|(id, e)| !e.is_active && exclude.is_none_or(|x| *id != x))
+        .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
+        .collect();
+    candidates.sort_by_key(|(_, ms, _)| *ms);
+    candidates
+        .into_iter()
+        .map(|(id, _, kill)| (id, kill))
+        .collect()
 }
 
-/// LRU idle entry excluding `exclude` — the turn-start budget gate's eviction
-/// candidate list (monorepo#2063 B8): the gated agent's own process is never
-/// its own gate's victim (evicting it would only trade this gate for the spawn
-/// gate). Other admission paths — a concurrent spawn `acquire`, or another
-/// turn-start gate — select via their own candidate lists and may still evict
-/// a process parked here; its waiter then wakes via `deregister`, re-classifies
-/// as unregistered, admits, and respawns through the spawn gate (queued, never
-/// refused, message intact — the warm session is lost, not the turn).
-fn lru_idle_excluding(inner: &RegistryInner, exclude: &AgentId) -> Option<(AgentId, KillFn)> {
-    inner
-        .entries
-        .iter()
-        .filter(|(id, e)| !e.is_active && *id != exclude)
-        .min_by_key(|(_, e)| e.last_active_ms)
-        .map(|(id, e)| (id.clone(), e.kill.clone()))
+/// Releases a held eviction claim when dropped (monorepo#2247). The admission
+/// paths ([`ProcessRegistry::acquire`] / [`ProcessRegistry::acquire_turn_start`])
+/// run inside abortable futures — the spawn worker can be aborted at the
+/// `kill().await` — and a leaked claim makes `try_begin` permanently lose for
+/// that agent until daemon restart. `None` marks the no-claim self-eviction
+/// case (nothing to release).
+struct ClaimGuard<'a, R: Fn(&AgentId)> {
+    release: &'a R,
+    id: Option<&'a AgentId>,
+}
+
+impl<R: Fn(&AgentId)> Drop for ClaimGuard<'_, R> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            (self.release)(id);
+        }
+    }
 }
 
 /// Idle entries whose `last_active_ms` is at/older than `cutoff_ms`, ordered
@@ -1225,20 +1243,50 @@ impl ProcessRegistry {
     /// agents exist to do. Admission is the only lever that is cheap, reversible,
     /// and never wrong about which agent to punish.
     ///
+    /// Claim-before-kill (monorepo#2247): same `try_claim` / `release`
+    /// contract as [`Self::evict_idle_older_than`] (monorepo#2118) — each
+    /// eviction candidate is claimed against whatever can start work on it
+    /// before its kill, re-validated under the registry lock after the claim,
+    /// and released after the kill. A candidate whose claim fails (an
+    /// overlapping sweep holds it mid-kill) is skipped for the next-LRU one;
+    /// when no candidate can be claimed the spawn queues on a timed re-check
+    /// instead of spinning. The one exception is the spawning agent's OWN
+    /// stale entry: it is evicted without a claim, because the busy slot held
+    /// by the worker driving this spawn already makes `try_begin` lose for
+    /// it — and a claim attempt would deadlock against that same busy slot.
+    ///
+    /// Unlike the reap sweeps this future IS dropped in production (the
+    /// worker task that spawns through it is abortable), so the held claim is
+    /// released by a drop guard rather than a tail call — a drop at the
+    /// `kill().await` frees the claim; only the post-release drain kick is
+    /// skipped on that path.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
-    pub async fn acquire(&self, agent_id: &AgentId) {
+    pub async fn acquire<C, R>(&self, agent_id: &AgentId, try_claim: C, release: R)
+    where
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
+    {
+        // Set when an eviction pass found candidates but could claim none of
+        // them: the next iteration queues as a waiter (timed) instead of
+        // re-snapshotting the same unclaimable candidates in a hot loop.
+        let mut wait_pass = false;
         loop {
             enum Action {
                 Slot,
-                /// The `&'static str` is the reason the eviction was needed
-                /// ([`REASON_SLOTS`] / [`REASON_MEMORY_BUDGET`]).
-                Evict(AgentId, KillFn, &'static str),
-                /// The `bool` is true when the wait is on memory rather than a
-                /// slot, which needs a timed re-check rather than only a wakeup.
+                /// LRU-ordered idle candidates; the `&'static str` is the
+                /// reason the eviction was needed ([`REASON_SLOTS`] /
+                /// [`REASON_MEMORY_BUDGET`]).
+                Evict(Vec<(AgentId, KillFn)>, &'static str),
+                /// The `bool` is true when the wait needs a timed re-check
+                /// rather than only a wakeup: a memory wait (the tree can
+                /// drain with no registry event) or a claim-contention wait
+                /// (the contending sweep may release without deregistering).
                 Wait(tokio::sync::oneshot::Receiver<()>, bool),
             }
+            let forced_wait = std::mem::take(&mut wait_pass);
             let action = {
                 let mut inner = self.inner.lock().unwrap();
                 let over_budget = self.budget_denies(&mut inner);
@@ -1251,14 +1299,19 @@ impl ProcessRegistry {
                 } else {
                     REASON_SLOTS
                 };
+                let candidates = if forced_wait {
+                    Vec::new()
+                } else {
+                    lru_idle_ordered(&inner, None)
+                };
                 if inner.entries.len() < self.cap && over_budget.is_none() {
                     // Charge the spawn now: it will not appear in a tree sample
                     // for up to a sampling period, and a burst of spawns must not
                     // all clear the gate against the same stale reading.
                     self.budget_adjust(&mut inner, 1);
                     Action::Slot
-                } else if let Some((id, kill)) = lru_idle(&inner) {
-                    Action::Evict(id, kill, reason)
+                } else if !candidates.is_empty() {
+                    Action::Evict(candidates, reason)
                 } else {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     // Drop waiters whose receiver is gone before adding ours, so
@@ -1287,26 +1340,66 @@ impl ProcessRegistry {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
                         tokio::spawn(fut);
                     }
-                    Action::Wait(rx, over_budget.is_some())
+                    // A claim-contention wait re-checks on a timer too: the
+                    // contending sweep may release its claim (re-validation
+                    // reject) without any deregister to wake this waiter.
+                    Action::Wait(rx, over_budget.is_some() || forced_wait)
                 }
             };
             match action {
                 Action::Slot => return,
-                Action::Evict(id, kill, reason) => {
-                    let used = self.size();
-                    tracing::info!(
-                        evicted = %id,
-                        used = used,
-                        cap = self.cap,
-                        reason = reason,
-                        "process registry: LRU idle process evicted"
-                    );
-                    if let Some(ref f) = self.event_fn {
-                        let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
-                        tokio::spawn(fut);
+                Action::Evict(candidates, reason) => {
+                    let mut evicted_one = false;
+                    for (id, kill) in candidates {
+                        // The spawning agent's own stale entry needs no claim:
+                        // the busy slot held by the worker driving this spawn
+                        // already makes `try_begin` lose for it, and a claim
+                        // attempt would always fail against that busy slot.
+                        let own_entry = id == *agent_id;
+                        if !own_entry && !try_claim(&id) {
+                            continue;
+                        }
+                        let guard = ClaimGuard {
+                            release: &release,
+                            id: (!own_entry).then_some(&id),
+                        };
+                        // Re-validate under the registry lock (the
+                        // monorepo#2247 TOCTOU): earlier iterations of this
+                        // loop awaited kills, so the entry may be actively
+                        // streaming again or gone. With the claim held nothing
+                        // can start new work on it after this check.
+                        let still_idle = {
+                            let inner = self.inner.lock().unwrap();
+                            inner.entries.get(&id).is_some_and(|e| !e.is_active)
+                        };
+                        if !still_idle {
+                            drop(guard);
+                            continue;
+                        }
+                        let used = self.size();
+                        tracing::info!(
+                            evicted = %id,
+                            used = used,
+                            cap = self.cap,
+                            reason = reason,
+                            "process registry: LRU idle process evicted"
+                        );
+                        if let Some(ref f) = self.event_fn {
+                            let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
+                            tokio::spawn(fut);
+                        }
+                        kill().await;
+                        self.deregister(&id);
+                        drop(guard);
+                        evicted_one = true;
+                        break;
                     }
-                    kill().await;
-                    self.deregister(&id);
+                    // Every candidate was claimed by a concurrent sweep or
+                    // re-validated non-idle: queue as a waiter (timed — the
+                    // contending sweep may release its claim without any
+                    // deregister to wake us) instead of re-snapshotting the
+                    // same candidates in a hot loop.
+                    wait_pass = !evicted_one;
                 }
                 Action::Wait(rx, true) => {
                     // Memory can fall with no registry event to wake us — an
@@ -1332,20 +1425,38 @@ impl ProcessRegistry {
     /// - Its own idle process is never *this gate's* eviction victim: that
     ///   would only trade this gate for the spawn gate and lose the warm
     ///   session. Other admission paths may still reclaim it while it waits
-    ///   (see [`lru_idle_excluding`]); the turn then degrades to the spawn
+    ///   (see [`lru_idle_ordered`]); the turn then degrades to the spawn
     ///   gate — still queued, never refused.
     /// - A process marked ACTIVE admits immediately: busy agents are never
     ///   gated mid-turn (regression-pinned).
     ///
     /// An unregistered agent admits immediately too — its child must spawn,
     /// and `create_agent`'s [`Self::acquire`] is that path's gate.
-    pub(crate) async fn acquire_turn_start(&self, agent_id: &AgentId) {
+    ///
+    /// Claim-before-kill (monorepo#2247): same `try_claim` / `release`
+    /// contract, candidate walk, re-validation, drop-guard release, and
+    /// claim-contention timed wait as [`Self::acquire`]. No self-eviction
+    /// exemption is needed — the gated agent's own process is excluded from
+    /// the candidate list outright.
+    pub(crate) async fn acquire_turn_start<C, R>(
+        &self,
+        agent_id: &AgentId,
+        try_claim: C,
+        release: R,
+    ) where
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
+    {
+        // Same forced-wait handoff as `acquire`: an eviction pass that could
+        // claim nothing queues (timed) instead of re-snapshotting hot.
+        let mut wait_pass = false;
         loop {
             enum Action {
                 Admit,
-                Evict(AgentId, KillFn),
+                Evict(Vec<(AgentId, KillFn)>),
                 Wait(tokio::sync::oneshot::Receiver<()>),
             }
+            let forced_wait = std::mem::take(&mut wait_pass);
             let action = {
                 let mut inner = self.inner.lock().unwrap();
                 let idle_here = matches!(inner.entries.get(agent_id), Some(e) if !e.is_active);
@@ -1355,9 +1466,12 @@ impl ProcessRegistry {
                     None
                 };
                 if let Some(charged) = over_budget {
-                    if let Some((id, kill)) = lru_idle_excluding(&inner, agent_id) {
-                        Action::Evict(id, kill)
+                    let candidates = if forced_wait {
+                        Vec::new()
                     } else {
+                        lru_idle_ordered(&inner, Some(agent_id))
+                    };
+                    if candidates.is_empty() {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         // Same waiter hygiene as `acquire`: drop dead receivers
                         // before re-queueing on the timed budget re-check.
@@ -1385,6 +1499,8 @@ impl ProcessRegistry {
                             tokio::spawn(fut);
                         }
                         Action::Wait(rx)
+                    } else {
+                        Action::Evict(candidates)
                     }
                 } else {
                     Action::Admit
@@ -1392,27 +1508,51 @@ impl ProcessRegistry {
             };
             match action {
                 Action::Admit => return,
-                Action::Evict(id, kill) => {
-                    let used = self.size();
-                    tracing::info!(
-                        evicted = %id,
-                        used = used,
-                        cap = self.cap,
-                        reason = REASON_MEMORY_BUDGET,
-                        "process registry: LRU idle process evicted"
-                    );
-                    if let Some(ref f) = self.event_fn {
-                        let fut = f(
-                            &id,
-                            "agent:process:evicted",
-                            used,
-                            self.cap,
-                            REASON_MEMORY_BUDGET,
+                Action::Evict(candidates) => {
+                    let mut evicted_one = false;
+                    for (id, kill) in candidates {
+                        if !try_claim(&id) {
+                            continue;
+                        }
+                        let guard = ClaimGuard {
+                            release: &release,
+                            id: Some(&id),
+                        };
+                        // Re-validate under the registry lock (monorepo#2247),
+                        // exactly as in `acquire`.
+                        let still_idle = {
+                            let inner = self.inner.lock().unwrap();
+                            inner.entries.get(&id).is_some_and(|e| !e.is_active)
+                        };
+                        if !still_idle {
+                            drop(guard);
+                            continue;
+                        }
+                        let used = self.size();
+                        tracing::info!(
+                            evicted = %id,
+                            used = used,
+                            cap = self.cap,
+                            reason = REASON_MEMORY_BUDGET,
+                            "process registry: LRU idle process evicted"
                         );
-                        tokio::spawn(fut);
+                        if let Some(ref f) = self.event_fn {
+                            let fut = f(
+                                &id,
+                                "agent:process:evicted",
+                                used,
+                                self.cap,
+                                REASON_MEMORY_BUDGET,
+                            );
+                            tokio::spawn(fut);
+                        }
+                        kill().await;
+                        self.deregister(&id);
+                        drop(guard);
+                        evicted_one = true;
+                        break;
                     }
-                    kill().await;
-                    self.deregister(&id);
+                    wait_pass = !evicted_one;
                 }
                 Action::Wait(rx) => {
                     // Memory can fall with no registry event to wake us (same
@@ -1450,18 +1590,50 @@ impl ProcessRegistry {
     /// production; add the emit (with an appropriate reason) before wiring a
     /// production caller, or its evictions are invisible to clients
     /// (the monorepo#3040 gap).
-    pub(crate) async fn evict_idle(&self, max: Option<usize>) -> usize {
+    ///
+    /// Claim-before-kill (monorepo#2247): same `try_claim` / `release`
+    /// contract as [`Self::evict_idle_older_than`] (monorepo#2118), including
+    /// the re-validation before each kill and the NOT-cancellation-safe
+    /// caveat — dropping this future at the `kill().await` leaks the held
+    /// claim.
+    pub(crate) async fn evict_idle<C, R>(
+        &self,
+        max: Option<usize>,
+        try_claim: C,
+        release: R,
+    ) -> usize
+    where
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
+    {
         let max = max.unwrap_or(usize::MAX);
+        let candidates = {
+            let inner = self.inner.lock().unwrap();
+            lru_idle_ordered(&inner, None)
+        };
         let mut evicted = 0;
-        while evicted < max {
-            let Some((id, kill)) = ({
-                let inner = self.inner.lock().unwrap();
-                lru_idle(&inner)
-            }) else {
+        for (id, kill) in candidates {
+            if evicted >= max {
                 break;
+            }
+            if !try_claim(&id) {
+                continue;
+            }
+            // Re-validate under the registry lock (the monorepo#2247 TOCTOU):
+            // earlier kills in this sweep awaited, so the entry may be
+            // actively streaming again or gone. With the claim held nothing
+            // can start new work on it after this check.
+            let still_idle = {
+                let inner = self.inner.lock().unwrap();
+                inner.entries.get(&id).is_some_and(|e| !e.is_active)
             };
+            if !still_idle {
+                release(&id);
+                continue;
+            }
             kill().await;
             self.deregister(&id);
+            release(&id);
             evicted += 1;
         }
         evicted
@@ -2316,7 +2488,14 @@ impl AgentManager {
         cwd: PathBuf,
         opts: &SpawnOptions<'_>,
     ) -> Result<()> {
-        self.registry.acquire(&agent_id).await;
+        // Claim-before-kill (monorepo#2247): the slot-cap/budget eviction
+        // inside `acquire` claims its victim against `try_begin` exactly like
+        // the reap sweeps, so a turn cannot start on the victim mid-kill.
+        {
+            let (try_claim, release, released) = self.reap_claim_fns();
+            self.registry.acquire(&agent_id, try_claim, release).await;
+            self.kick_released_via_attached(released).await;
+        }
 
         // Session row for the sub-agent derivation below and the prompt
         // assembly further down (one read, shared). The session was inserted
@@ -7032,9 +7211,14 @@ impl AgentManager {
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
-    /// the LRU `acquire`-eviction companion).
-    pub async fn reap_idle(&self, max: Option<usize>) -> usize {
-        self.registry.evict_idle(max).await
+    /// the LRU `acquire`-eviction companion). Same claim-before-kill semantics
+    /// (monorepo#2247) and post-sweep drain kick as
+    /// [`Self::reap_idle_older_than`].
+    pub async fn reap_idle(self: &Arc<Self>, max: Option<usize>) -> usize {
+        let (try_claim, release, released) = self.reap_claim_fns();
+        let reaped = self.registry.evict_idle(max, try_claim, release).await;
+        self.kick_released(released).await;
+        reaped
     }
 
     /// TTL idle-reap sweep (§5.6/§6.7): evict every idle agent whose last
@@ -7132,6 +7316,22 @@ impl AgentManager {
                     .try_drain_queue(id, session.workspace_id)
                     .await;
             }
+        }
+    }
+
+    /// [`Self::kick_released`] for `&self` callers (monorepo#2247): the
+    /// admission paths (`create_agent`'s `acquire`, the worker's
+    /// `acquire_turn_start`) run on `&self`, so the kick's `Arc<Self>` comes
+    /// from the manager attached to the services surface — production always
+    /// attaches it. When unattached (bare test wiring) or nothing was
+    /// released, this is a no-op; a parked message then drains on the next
+    /// external queue event instead of immediately.
+    async fn kick_released_via_attached(&self, released: Arc<Mutex<Vec<AgentId>>>) {
+        if released.lock().unwrap().is_empty() {
+            return;
+        }
+        if let Some(mgr) = self.services.agent_manager() {
+            mgr.kick_released(released).await;
         }
     }
 
@@ -8240,7 +8440,16 @@ async fn run_message_worker(
         // marked active and `acquire_turn_start` admits immediately. An
         // unregistered agent also admits immediately: its spawn below goes
         // through `create_agent`'s `acquire`, the existing gate.
-        mgr.registry.acquire_turn_start(&agent_id).await;
+        {
+            // Claim-before-kill (monorepo#2247): the turn-start gate's budget
+            // eviction claims its victim against `try_begin` exactly like the
+            // reap sweeps, so a turn cannot start on the victim mid-kill.
+            let (try_claim, release, released) = mgr.reap_claim_fns();
+            mgr.registry
+                .acquire_turn_start(&agent_id, try_claim, release)
+                .await;
+            mgr.kick_released(released).await;
+        }
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
                 // Clear any persisted completion report at the start of this turn
