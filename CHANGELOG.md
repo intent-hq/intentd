@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.47] - 2026-08-23
+
+### 🚀 Features
+
+- *(providers)* Flag grok and droid as truncating tool descriptions ([#1429](https://github.com/intent-hq/intentd/pull/1429))
+- Always run startup resume sweep on update-triggered restarts ([#1428](https://github.com/intent-hq/intentd/pull/1428))
+
+
 ## [0.7.46] - 2026-08-23
 
 ### 🐛 Bug Fixes
