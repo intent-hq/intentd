@@ -557,6 +557,85 @@ async fn harness_wake_burst_streams_as_agent_initiated_turn_over_wss() {
     }
 }
 
+/// WAKE-3 (intent-hq/monorepo#3262): a harness-wake burst whose entire
+/// output is one whitespace-only chunk (the incident's bare "\n") is a
+/// FAILED recovery, not a successful completion. The agent here is
+/// root/user-facing (not redrive-eligible), so over the wire the daemon
+/// must: emit `agent:attention-requested` `{ kind: "blocker" }`, stamp the
+/// wake `agent:idle` with `emptyWakeResponse: true`, and leave the
+/// persisted session carrying `attentionRequest*` fields — the workspace
+/// shows "turn ended unexpectedly" instead of idling silently.
+#[tokio::test]
+async fn empty_wake_response_surfaces_attention_over_wss() {
+    let Some(script) = gate("WSS empty-wake attention E2E") else {
+        return;
+    };
+    let behavior = json!({ "response": "warmup done" }).to_string();
+    let mut setup = wake_setup(&script, &behavior).await;
+    let agent_id = setup.agent_id.clone();
+
+    // Fire the incident-shaped burst: ONE chunk containing a bare newline.
+    std::fs::write(&setup.trigger_file, "<NEWLINE_ONLY>\n").expect("write wake trigger");
+
+    let mut saw_attention = false;
+    let mut saw_idle = false;
+    let mut idle_frame = Value::Null;
+    for _ in 0..300 {
+        let frame = wss_event(&mut setup.sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:attention-requested") => {
+                assert_eq!(
+                    event["data"]["kind"], "blocker",
+                    "empty-wake attention is a blocker: {frame}"
+                );
+                let reason = event["data"]["reason"].as_str().unwrap_or_default();
+                assert!(
+                    reason.contains("Turn ended unexpectedly"),
+                    "reason names the unexpected turn end: {frame}"
+                );
+                saw_attention = true;
+            }
+            Some("agent:idle") => {
+                assert_eq!(
+                    event["data"]["reason"], "harness_wake_complete",
+                    "wake idle reason: {frame}"
+                );
+                saw_idle = true;
+                idle_frame = frame.clone();
+            }
+            Some("agent:failed") => panic!("agent:failed during empty-wake scenario: {frame}"),
+            _ => {}
+        }
+        if saw_attention && saw_idle {
+            break;
+        }
+    }
+    assert!(saw_attention, "agent:attention-requested observed");
+    assert!(saw_idle, "wake agent:idle observed");
+    assert_eq!(
+        idle_frame["params"]["event"]["data"]["emptyWakeResponse"],
+        json!(true),
+        "wake idle carries the advisory emptyWakeResponse flag: {idle_frame}"
+    );
+
+    // The attention request is durable on the session (agent.getSession).
+    let got = wss_rpc(
+        &mut setup.rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": setup.ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        got["session"]["attentionRequestKind"], "blocker",
+        "session carries the persisted attention request: {got}"
+    );
+}
+
 /// WAKE-2 (monorepo#855): a user `agent.sendMessage` racing in mid-wake
 /// queues behind the wake turn's single-flight slot (never interleaves),
 /// preempts the settle window, suppresses the wake `agent:idle`, and

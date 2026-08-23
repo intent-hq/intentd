@@ -1027,6 +1027,9 @@ if (treePidFile) {
 // waking the child on its own (compaction notice, background task output):
 // the daemon must stream the burst as an implicit agent-initiated turn.
 // One-shot per process; the test controls timing by creating the file.
+// The literal token `<NEWLINE_ONLY>` on a line emits one chunk whose text is
+// a bare "\n" (the monorepo#3262 incident shape — a whitespace-only wake
+// response); plain whitespace-only lines stay filtered as before.
 const wakeTriggerFile = process.env.MOCK_AGENT_WAKE_TRIGGER_FILE;
 if (wakeTriggerFile) {
   const poll = setInterval(() => {
@@ -1041,7 +1044,8 @@ if (wakeTriggerFile) {
     }
     clearInterval(poll);
     log(`wake trigger fired: emitting ${lines.length} unsolicited chunk(s)`);
-    for (const text of lines) {
+    for (const line of lines) {
+      const text = line === '<NEWLINE_ONLY>' ? '\n' : line;
       note('session/update', {
         sessionId: SESSION_ID,
         update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },

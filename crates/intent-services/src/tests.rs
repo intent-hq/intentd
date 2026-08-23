@@ -29344,7 +29344,7 @@ mod idle_workspace_archived_stamp {
             .expect("insert archived-ws session");
         let mut sub = subscribe_idle(&h, &archived_ws);
         h.services
-            .publish_harness_wake_idle(&archived_agent, &archived_ws)
+            .publish_harness_wake_idle(&archived_agent, &archived_ws, false)
             .await;
         let ev = recv_idle(&mut sub).await;
         assert_eq!(ev["type"], AGENT_IDLE);
@@ -29362,7 +29362,7 @@ mod idle_workspace_archived_stamp {
             .expect("insert active-ws session");
         let mut sub = subscribe_idle(&h, &active_ws);
         h.services
-            .publish_harness_wake_idle(&active_agent, &active_ws)
+            .publish_harness_wake_idle(&active_agent, &active_ws, false)
             .await;
         let ev = recv_idle(&mut sub).await;
         assert!(
