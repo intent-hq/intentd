@@ -1000,6 +1000,165 @@ async fn wss_agent_list_omits_initial_message() {
     srv.ws.stop().await;
 }
 
+/// List-payload cost contract (extending monorepo#2932): `agent.list` rows
+/// bound every render-preview field — `lastAgentResponse`, `lastUserMessage`,
+/// `digest`, `lastToolUse`, `metadata.completionReport` — to the render-sized
+/// per-field budget, while `agent.get` keeps serving the full values for the
+/// same session. Asserts the wire shape over the real WSS transport.
+#[tokio::test]
+async fn wss_agent_list_caps_previews_get_serves_full() {
+    const BUDGET: usize = intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES;
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"List Cap"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Capped"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Persist a long user message, a long assistant response + digest with an
+    // over-budget tool_use, and a long completionReport.
+    let long_user = format!("user ask starts {}", "u".repeat(BUDGET * 3));
+    let long_line = format!("final answer {}", "a".repeat(BUDGET * 3));
+    let long_digest = format!("digest {}", "d".repeat(BUDGET * 3));
+    let long_report = format!("report {}", "r".repeat(BUDGET * 3));
+    let user_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "agent.appendMessage",
+        "params": {
+            "agentId": agent_id, "role": "user",
+            "contentBlocks": [{ "type": "text", "text": long_user }],
+        },
+    });
+    wss_call(srv.port, srv.cfg.clone(), &user_frame.to_string()).await;
+    let assistant_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "agent.appendMessage",
+        "params": {
+            "agentId": agent_id, "role": "assistant",
+            "contentBlocks": [
+                {
+                    "type": "tool_use", "id": "m:0", "name": "write_file",
+                    "input": { "path": "/tmp/a.txt", "content": "x".repeat(BUDGET * 3) },
+                    "toolCallId": "t1",
+                },
+                {
+                    "type": "text",
+                    "text": format!("{long_line}\n<agent_digest>{long_digest}</agent_digest>"),
+                },
+            ],
+        },
+    });
+    wss_call(srv.port, srv.cfg.clone(), &assistant_frame.to_string()).await;
+    let update_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "agent.update",
+        "params": { "agentId": agent_id, "changes": { "completionReport": long_report } },
+    });
+    wss_call(srv.port, srv.cfg.clone(), &update_frame.to_string()).await;
+
+    // The detail read serves the full values.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let agent = &got["result"]["agent"];
+    assert_eq!(
+        agent["lastAgentResponse"].as_str(),
+        Some(long_line.as_str()),
+        "agent.get keeps the full lastAgentResponse"
+    );
+    assert_eq!(
+        agent["lastUserMessage"].as_str(),
+        Some(long_user.as_str()),
+        "agent.get keeps the full lastUserMessage"
+    );
+    assert_eq!(
+        agent["digest"].as_str(),
+        Some(long_digest.as_str()),
+        "agent.get keeps the full digest"
+    );
+    assert_eq!(
+        agent["metadata"]["completionReport"].as_str(),
+        Some(long_report.as_str()),
+        "agent.get keeps the full metadata.completionReport"
+    );
+    assert_eq!(
+        agent["lastToolUse"]["input"]["content"]
+            .as_str()
+            .map(str::len),
+        Some(BUDGET * 3),
+        "agent.get keeps the full lastToolUse input"
+    );
+
+    // The list row caps every preview field to the render budget.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let row = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("created agent in list");
+    assert_eq!(
+        row["lastAgentResponse"].as_str().map(str::len),
+        Some(BUDGET),
+        "agent.list caps lastAgentResponse: {row}"
+    );
+    assert_eq!(
+        row["lastUserMessage"].as_str().map(str::len),
+        Some(BUDGET),
+        "agent.list caps lastUserMessage: {row}"
+    );
+    assert_eq!(
+        row["digest"].as_str().map(str::len),
+        Some(BUDGET),
+        "agent.list caps digest: {row}"
+    );
+    assert_eq!(
+        row["metadata"]["completionReport"].as_str().map(str::len),
+        Some(BUDGET),
+        "agent.list caps metadata.completionReport (capped, not omitted): {row}"
+    );
+    assert_eq!(
+        row["lastToolUse"]["name"].as_str(),
+        Some("write_file"),
+        "the tool name survives the capped list preview: {row}"
+    );
+    // The list re-cap keeps the §5.5 preview contract: the over-budget input
+    // carries `inputTruncated: true` + `inputBytes` (original size).
+    assert_eq!(
+        row["lastToolUse"]["inputTruncated"].as_bool(),
+        Some(true),
+        "agent.list stamps inputTruncated on the capped preview: {row}"
+    );
+    assert!(
+        row["lastToolUse"]["inputBytes"].as_u64().unwrap() > BUDGET as u64,
+        "inputBytes names the original input's serialized size: {row}"
+    );
+    let served_tool = row["lastToolUse"]["input"].to_string();
+    assert!(
+        served_tool.len() <= BUDGET * 2,
+        "agent.list caps lastToolUse input near the budget, got {} bytes: {row}",
+        served_tool.len()
+    );
+
+    srv.ws.stop().await;
+}
+
 /// monorepo#3041 over the real WSS wire (§5.1): `workspace.list` rows omit
 /// `tokenUsage` entirely (absent, never null) and archived rows additionally
 /// omit `agentSummary`, while active rows keep it; the `workspace.subscribe`
