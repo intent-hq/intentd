@@ -47,9 +47,16 @@
 # and updates. A default run writes no pin, leaving any channel you pinned
 # earlier by hand untouched.
 #
+# Service setup is refused up front when a daemon is already running and owns
+# the data dir the service would serve: a daemon locks its data dir for its
+# whole lifetime, so a second one on the same dir can only crash-loop. Nothing
+# is registered in that case — see check_data_dir_not_owned.
+#
 # INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
-# serves the same data dir the install-time CLI used.
+# serves the same data dir the install-time CLI used. A relative value is
+# anchored to the directory this installer runs in, since the service has no
+# working directory of its own — see resolve_data_dir.
 #
 # Idempotent: re-running replaces the installed binary atomically, and
 # service setup restarts an already-registered service instead of
@@ -80,6 +87,26 @@ cleanup() {
 # the daemon's own error (it inherits the sitter's stdio, so its message sits
 # directly above the sitter's respawn lines) without dumping an unbounded log.
 log_tail_lines=40
+
+# How the wait for the first daemon start is bounded (all seconds). The wait
+# ends the moment the outcome is decided — the daemon answers, or the sitter's
+# own failure lines appear — so these only cap the undecided case:
+#
+#   verify_deadline  hard bound on the whole wait. Generous on purpose: the
+#                    first start downloads the daemon, and the crash that
+#                    proves an install broken can land well after a 60s
+#                    window (a slow channel resolve/download delays the very
+#                    first spawn, so the first crash line does too).
+#   verify_poll      gap between `intentd status` probes and log reads.
+#   verify_settle    grace after crash evidence first appears: the sitter
+#                    respawns, so a daemon that died once and then came up is
+#                    a working install, not a failure.
+#   verify_progress  when to say the wait is still open, so a long download
+#                    does not look like a hang.
+verify_deadline=300
+verify_poll=2
+verify_settle=10
+verify_progress=60
 
 # Where this run's service output lands, plus how to bound it to this run so a
 # diagnosis never quotes a previous run's crash. Set by note_log_start.
@@ -155,55 +182,98 @@ report_daemon_log() {
   printf '%s\n' "$1" | sed 's/^/  | /' >&2
 }
 
-# Poll `intentd status` until the daemon answers. First service start can be
-# slow: the sitter downloads the real daemon before serving. The caller must
-# have called note_log_start before starting the service, so the log window
-# quoted on failure covers the whole start.
+# An explicit on/off auto-resume answer is applied only once the daemon is
+# reachable (apply_auto_resume runs after verify_daemon), so any outcome short
+# of "up" drops it — say so instead of dropping it silently.
+auto_resume_pending_note() {
+  case "${auto_resume:-}" in
+    on | off) printf '%s' "
+Your auto-resume choice ('$auto_resume') was not applied; once the daemon is up, apply it with:
+  intentd settings agents.resumeInterruptedOnStart $auto_resume" ;;
+  esac
+}
+
+# Wait for the first daemon start to resolve into an outcome: up, failed, or —
+# only when the deadline runs out with nothing decided — unknown. Returns 0
+# when the daemon answers, exits non-zero when the service log proves it is
+# failing, and returns 1 when the deadline is reached undecided.
+#
+# The caller must have called note_log_start before starting the service, so
+# the log window read here covers the whole start.
+#
+# Polling both signals — `intentd status` and this run's service log — is what
+# keeps the wait from racing the outcome. The old fixed 60s window classified
+# the log once, at the end: a sitter still resolving a channel or downloading
+# at that point had not crashed yet, so the install exited 0 with "may still be
+# downloading" while the daemon that could never start crashed seconds later.
+# Success still returns the moment the daemon answers, so a working install is
+# no slower to report.
 verify_daemon() {
   info "waiting for the daemon to respond (first start downloads the daemon binary)..."
   waited=0
-  while [ "$waited" -lt 60 ]; do
+  crash_out=""
+  crash_at=-1
+  progress_shown=0
+  while :; do
     if "$install_dir/intentd" status >/dev/null 2>&1; then
       info "daemon is up — 'intentd status' responds"
       return 0
     fi
-    sleep 2
-    waited=$((waited + 2))
+
+    # The substrings matched below are the sitter's own log lines — a detection
+    # contract with crates/intentd-sitter/src/supervisor.rs and install.ps1,
+    # pinned by the install_log_contract_* tests in
+    # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in lockstep.
+    log_out=$(service_log_tail)
+    case "$log_out" in
+      *"times in a row without ever staying up"*)
+        # Terminal: the sitter has stopped trying, so nothing more can happen.
+        report_daemon_log "$log_out"
+        fail "the daemon could not start and the sitter has given up — the service is stopped.
+Fix the cause reported above, then start it again with:
+  $restart_hint$(auto_resume_pending_note)" ;;
+      *"exited unexpectedly"* | *"failed to spawn"* | *"failed waiting on intentd"*)
+        # A crash is not yet a verdict: the sitter respawns, and a daemon that
+        # died once can still come up. Keep polling for verify_settle seconds —
+        # the loop returns 0 above if it does — and only then call it a failure.
+        crash_out="$log_out"
+        if [ "$crash_at" -lt 0 ]; then
+          crash_at="$waited"
+        fi
+        if [ $((waited - crash_at)) -ge "$verify_settle" ]; then
+          break
+        fi ;;
+    esac
+
+    if [ "$waited" -ge "$verify_deadline" ]; then
+      break
+    fi
+    if [ "$progress_shown" -eq 0 ] && [ "$waited" -ge "$verify_progress" ]; then
+      info "still waiting (${waited}s) — nothing has failed yet; a first download over a slow link can take a few minutes"
+      progress_shown=1
+    fi
+    sleep "$verify_poll"
+    waited=$((waited + verify_poll))
   done
 
-  # Timing out is three different things. The sitter reports a daemon that
-  # starts and dies on the service's stderr, so this run's log says whether it
-  # has already given up (service stopped for good), is still respawning a
-  # daemon that cannot start (it only gives up minutes after this 60s wait, so
-  # this is the common case), or nothing crashed at all and the first download
-  # is merely slow. Only the last of the three is a warning.
-  # An explicit on/off auto-resume answer is applied only after this check
-  # passes (apply_auto_resume runs after verify_daemon), so a failure here
-  # drops it — say so instead of dropping it silently.
-  auto_resume_note=""
-  case "${auto_resume:-}" in
-    on | off) auto_resume_note="
-Your auto-resume choice ('$auto_resume') was not applied; once the daemon is up, apply it with:
-  intentd settings agents.resumeInterruptedOnStart $auto_resume" ;;
-  esac
-  # The substrings matched below are the sitter's own log lines — a detection
-  # contract with crates/intentd-sitter/src/supervisor.rs and install.ps1,
-  # pinned by the install_log_contract_* tests in
-  # crates/intentd-sitter/tests/supervisor_e2e.rs. Change only in lockstep.
-  log_out=$(service_log_tail)
-  case "$log_out" in
-    *"times in a row without ever staying up"*)
-      report_daemon_log "$log_out"
-      fail "the daemon could not start and the sitter has given up — the service is stopped.
+  # Crash evidence anywhere in this run's window is a failure, whether the
+  # settle grace expired or the deadline cut it short.
+  if [ -n "$crash_out" ]; then
+    report_daemon_log "$crash_out"
+    fail "the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.
 Fix the cause reported above, then start it again with:
-  $restart_hint$auto_resume_note" ;;
-    *"exited unexpectedly"* | *"failed to spawn"* | *"failed waiting on intentd"*)
-      report_daemon_log "$log_out"
-      fail "the daemon is failing to start and the sitter is still respawning it; it gives up in a few minutes and leaves the service stopped.
-Fix the cause reported above, then start it again with:
-  $restart_hint$auto_resume_note" ;;
-  esac
-  warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
+  $restart_hint$(auto_resume_pending_note)"
+  fi
+
+  # Undecided: no answer, and nothing in the log says anything failed. Say
+  # exactly that rather than asserting a slow download.
+  warn "the daemon has not responded in ${waited}s and nothing in this run's service log reports a failure — this install could not tell whether the daemon binary is still downloading or the service is stuck.
+The service is registered and started; its output is in $log_desc.
+Check on it with:
+  intentd status
+If it is still not responding in a few minutes, restart it and re-read that log:
+  $restart_hint$(auto_resume_pending_note)"
+  return 1
 }
 
 # Normalize an auto-resume value from the flag, the env var, or the prompt:
@@ -303,6 +373,141 @@ report_installed_version() {
   fi
 }
 
+# The absolute data dir the service registered below would serve: the explicit
+# override, else the daemon's own platform default. Kept in step with
+# intent_core::Config::resolve (crates/intent-core/src/config.rs), which reads
+# INTENTD_DATA_DIR first and otherwise takes the `directories` crate's per-app
+# data dir — `~/Library/Application Support/intentd` on macOS,
+# `$XDG_DATA_HOME/intentd` (default `~/.local/share/intentd`) elsewhere.
+#
+# A relative override is anchored to the directory the installer runs in. The
+# override is carried into the unit/plist, and neither a systemd user unit nor
+# a LaunchAgent inherits this shell's working directory, so a bare `./data`
+# would otherwise name one dir here — where the ownership check looks — and a
+# different one once the service starts. Anchoring it leaves a single dir that
+# this check, the unit/plist and the `intentd` calls below all agree on.
+# Idempotent, so it stays the same dir however many times it is resolved.
+resolve_data_dir() {
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    case "$INTENTD_DATA_DIR" in
+      /*) printf '%s' "$INTENTD_DATA_DIR" ;;
+      *) printf '%s' "$(pwd)/${INTENTD_DATA_DIR#./}" ;;
+    esac
+  elif [ "$os" = "Darwin" ]; then
+    printf '%s' "$HOME/Library/Application Support/intentd"
+  else
+    printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}/intentd"
+  fi
+}
+
+# Is this pid a live process? `kill -0` sends no signal and only asks whether
+# the pid can be signalled; it fails with EPERM on another user's process,
+# which still proves the process exists, so fall back to `ps -p` (POSIX, and
+# owner-blind). Mirrors the daemon's own pid_is_alive, which counts EPERM as
+# alive.
+pid_is_alive() {
+  kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1
+}
+
+# Print the pid of the live daemon that owns <data_dir>, or nothing at all.
+#
+# `<data_dir>/intentd.pid` names the owner, and only a live owner counts: a
+# missing, unreadable or malformed pidfile — and the stale pidfile a crash or a
+# hard reboot leaves behind — all mean "not owned", exactly as the daemon
+# itself reads them (it deletes a stale pidfile and starts).
+#
+# "Malformed" has to mean the same thing on both sides, so this mirrors the
+# daemon's read_pid (crates/intentd/src/main.rs) literally: the *whole* file,
+# trimmed of surrounding whitespace, parsed as a u32. Reading just the first
+# line, or deleting whitespace from anywhere in the file, would find an owner
+# where the daemon finds none — `123\nnot-a-pid` and `1 23` are both malformed
+# to it, not pid 123 — and an unrelated live pid would then abort a legitimate
+# install with nothing the user could do about it. A false "not owned" only
+# costs the crash-loop this check is a shortcut around, so where the two
+# cannot agree, err that way:
+#
+#   * leading `+` is accepted, as u32::from_str accepts it;
+#   * leading zeros are stripped, so the pid probed here is the number the
+#     daemon read and never what a `kill` reading octal would make of it;
+#   * pid 0 is refused outright — `kill -0 0` probes our own process group, so
+#     it would look alive whatever wrote it, and no daemon ever writes it;
+#   * `.trim()` also strips non-ASCII whitespace, which `[:space:]` in the C
+#     locale does not; such a pidfile reads as unowned here.
+data_dir_owner_pid() {
+  pid_file="$1/intentd.pid"
+  [ -r "$pid_file" ] || return 0
+  owner=$(cat "$pid_file" 2>/dev/null) || owner=""
+  # Trim surrounding whitespace only: any left inside is what makes the file
+  # unparseable for the daemon, and must stay visible to the digit check.
+  owner=${owner#"${owner%%[![:space:]]*}"}
+  owner=${owner%"${owner##*[![:space:]]}"}
+  case "$owner" in
+    +*) owner=${owner#+} ;;
+  esac
+  case "$owner" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  while :; do
+    case "$owner" in
+      0?*) owner=${owner#0} ;;
+      *) break ;;
+    esac
+  done
+  # Past u32 the daemon's own parse fails; the length guard keeps the numeric
+  # comparison itself inside what a shell can represent.
+  [ "${#owner}" -le 10 ] || return 0
+  [ "$owner" -le 4294967295 ] || return 0
+  [ "$owner" != 0 ] || return 0
+  pid_is_alive "$owner" || return 0
+  printf '%s' "$owner"
+}
+
+# Best-effort executable path for a pid, so a refusal names the program holding
+# the data dir (a desktop app's bundled daemon, a brew service, a stray
+# `intentd serve` in another terminal) instead of a bare number — which is also
+# what makes the rare recycled-pid case visible to the reader. Empty when it
+# cannot be determined; never fatal.
+process_path() {
+  if [ -r "/proc/$1/exe" ]; then
+    # Linux: `ps -o comm=` reports the command name, sometimes truncated; the
+    # exe link is the real path.
+    readlink "/proc/$1/exe" 2>/dev/null || true
+  else
+    ps -o comm= -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true
+  fi
+}
+
+# Refuse to register a service against a data dir a live daemon already owns.
+#
+# The daemon holds an exclusive lock on its data dir for as long as it runs and
+# refuses to start when it cannot take it ("intentd data dir ... is locked by
+# another running instance"), so a second service on the same dir never serves
+# anything — it crash-loops until the sitter gives up, while the daemon it is
+# fighting is usually the one the user wants to keep.
+#
+# Decidable instantly and without guessing: either a live process holds the dir
+# or it does not. Callers run this before anything about a service is written,
+# so a refusal leaves no unit, plist or enabled service behind.
+check_data_dir_not_owned() {
+  data_dir=$(resolve_data_dir)
+  owner_pid=$(data_dir_owner_pid "$data_dir")
+  [ -n "$owner_pid" ] || return 0
+  owner_path=$(process_path "$owner_pid")
+  owner_desc="pid $owner_pid"
+  [ -z "$owner_path" ] || owner_desc="pid $owner_pid ($owner_path)"
+  fail "an intentd daemon is already running and owns the data dir this service would use:
+  data dir: $data_dir
+  owner:    $owner_desc
+A daemon locks its data dir for as long as it runs, so a second service on the same dir cannot start — it would only crash-loop. Nothing has been registered.
+Pick one:
+  * keep the daemon that is already running — it serves this data dir now:
+      $install_dir/intentd status
+  * stop it first (quit the app that started it, or stop its service), then re-run this installer
+  * give this service its own data dir, separate from the running daemon's:
+      INTENTD_DATA_DIR=\"\$HOME/.intentd-service\" INTENTD_INSTALL_SERVICE=1 <re-run this installer>
+  * install just the binary, with no service: re-run with INTENTD_INSTALL_SERVICE=0"
+}
+
 setup_service_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
@@ -314,10 +519,12 @@ setup_service_linux() {
   unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir" || fail "cannot create $unit_dir"
   # Carry a custom data dir into the service so it serves the same data dir
-  # the install-time CLI used.
+  # the install-time CLI used — resolved, so a relative override names the same
+  # dir the ownership check tested and not whatever the unit's own working
+  # directory happens to be.
   env_line=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
-    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$INTENTD_DATA_DIR")\""
+    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$(resolve_data_dir)")\""
   fi
   # Same unit the .deb ships (packaging/deb/intentd.service), pointed at the
   # installed binary. ExecStart/ExecStop are quoted: install dirs can contain
@@ -374,8 +581,11 @@ EOF
     fi
   fi
 
-  verify_daemon
-  apply_auto_resume
+  # apply_auto_resume only when the daemon actually answered: an undecided
+  # wait already told the user how to apply the setting themselves.
+  if verify_daemon; then
+    apply_auto_resume
+  fi
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
   info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
@@ -389,13 +599,15 @@ setup_service_macos() {
   xml_bin=$(xml_escape "$install_dir/intentd")
   xml_home=$(xml_escape "$HOME")
   # Carry a custom data dir into the service so it serves the same data dir
-  # the install-time CLI used.
+  # the install-time CLI used — resolved, so a relative override names the same
+  # dir the ownership check tested and not whatever working directory launchd
+  # gives the agent.
   env_block=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
     env_block="	<key>EnvironmentVariables</key>
 	<dict>
 		<key>INTENTD_DATA_DIR</key>
-		<string>$(xml_escape "$INTENTD_DATA_DIR")</string>
+		<string>$(xml_escape "$(resolve_data_dir)")</string>
 	</dict>
 "
   fi
@@ -453,8 +665,11 @@ EOF
     || fail "launchctl bootstrap failed for $plist"
   info "LaunchAgent installed and started: $plist"
 
-  verify_daemon
-  apply_auto_resume
+  # apply_auto_resume only when the daemon actually answered: an undecided
+  # wait already told the user how to apply the setting themselves.
+  if verify_daemon; then
+    apply_auto_resume
+  fi
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
   info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
@@ -514,6 +729,15 @@ main() {
   powershell -c \"irm $BASE_URL/install.ps1 | iex\"" ;;
     *) fail "unsupported operating system '$os' (supported: Linux, Darwin/macOS)" ;;
   esac
+
+  # Anchor a relative override once, here, so every `intentd` invoked below
+  # inherits the same absolute dir the ownership check tests and the
+  # unit/plist carries. resolve_data_dir is idempotent, so this only ever
+  # rewrites the relative case.
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    INTENTD_DATA_DIR=$(resolve_data_dir)
+    export INTENTD_DATA_DIR
+  fi
 
   arch=$(uname -m)
   case "$arch" in
@@ -642,6 +866,10 @@ main() {
   fi
 
   if [ "$service_mode" = "yes" ]; then
+    # Before anything is asked or written: a data dir a live daemon already
+    # owns cannot host a second service, so refuse now rather than register a
+    # service that can only crash-loop.
+    check_data_dir_not_owned
     # Auto-resume choice: flag beats the env var beats the prompt (both were
     # lowercased + validated above). Same /dev/tty pattern as the service
     # prompt; `auto` — or no terminal — is the daemon default and writes
