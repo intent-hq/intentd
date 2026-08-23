@@ -1181,6 +1181,10 @@ fn install_log_contract_spawn_failure_line_is_emitted_verbatim() {
 /// out the periodic schedule (12–24h in production, disabled here) and
 /// without any give-up in play. Before the fix the sitter only re-ran the
 /// startup check's version forever, so this test wedges until timeout.
+/// Uses the env-recording scripts to also cover the third update path's
+/// marker behavior: a fix adopted during failed-start backoff
+/// (`FailedStartCheck::Respawn`) differs from the version that last ran,
+/// so that respawn (and only it) must carry the update-restart marker.
 #[test]
 fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     let _serial = SERVE_LOOP_SERIAL
@@ -1188,7 +1192,7 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
-    preinstall(&paths, "0.1.0", &crash_script(7));
+    preinstall(&paths, "0.1.0", &crash_env_script(7));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
         MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
@@ -1198,6 +1202,7 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     // Periodic checks disabled (hour-long interval) and give-up out of
     // reach: only the failed-start re-check can find the fix.
     let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(UPDATE_RESTART_ENV)
         .env(BACKOFF_INITIAL_ENV, "50")
         .env(BACKOFF_CAP_ENV, "200")
         .env(BACKOFF_RESET_ENV, "60000")
@@ -1220,7 +1225,7 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     );
 
     // Publish fixed 0.2.0; the crash loop's next re-check must install it.
-    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let archive = make_tar_xz(long_running_env_script("0.2.0").as_bytes());
     let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
     let sha = sha256_hex(&archive);
     {
@@ -1237,6 +1242,24 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
     assert!(
         sitter.try_wait().unwrap().is_none(),
         "the sitter must still be supervising after self-healing"
+    );
+    // Per-cause marker matrix: the crash respawns of broken 0.1.0 are plain
+    // restarts (unmarked), while the fix adopted by a failed-start re-check
+    // respawns a different version than the one that last ran — that spawn
+    // (and only it) must carry the update-restart marker.
+    let contents = read_or_empty(&log_path);
+    let lines: Vec<&str> = contents.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("run"))
+            .all(|l| *l == "run update_restart=unset"),
+        "crash respawns must not carry the env var: {lines:?}"
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&"start 0.2.0 update_restart=1"),
+        "the adopted-fix respawn must carry the env var: {lines:?}"
     );
     assert_eq!(
         state::load(&paths.state_path).current_version.as_deref(),

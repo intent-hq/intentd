@@ -457,6 +457,11 @@ impl Supervisor {
         // which the child is told via UPDATE_RESTART_ENV. Failed spawns
         // don't count — retrying an updated version that couldn't spawn is
         // still update-triggered relative to the version that last ran.
+        // Accepted trade-off: recorded at spawn, so if the freshly updated
+        // version crashes before its startup resume sweep completes, the
+        // subsequent respawn is same-version and unmarked — with
+        // `agents.resumeInterruptedOnStart=off`, agents interrupted by the
+        // update then stay unresumed (a crash respawn is a plain restart).
         let mut last_ran_version: Option<String> = None;
 
         loop {

@@ -212,8 +212,23 @@ enum Command {
     },
 }
 
+fn main() -> ExitCode {
+    // Capture-and-scrub the sitter's update-restart marker before the tokio
+    // runtime starts (still single-threaded here, where `env::remove_var` is
+    // sound): the daemon's environment is inherited by every subprocess it
+    // spawns (agent tool shells, etc.), so a leaked marker would make a
+    // nested `intentd serve` launched from such a subprocess falsely force
+    // the resume sweep.
+    UPDATE_RESTART.store(
+        env_flag(UPDATE_RESTART_ENV),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    std::env::remove_var(UPDATE_RESTART_ENV);
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn async_main() -> ExitCode {
     init_tracing();
     install_panic_hook();
     let cli = Cli::parse();
@@ -886,6 +901,17 @@ fn init_tracing() {
 /// downgrades a stdio broken-pipe panic to a quiet exit for one-shot CLI
 /// invocations only (monorepo#1827).
 static ONE_SHOT_CLI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Env var the sitter sets on the child when a respawn is update-triggered
+/// (see `intentd_sitter::supervisor::UPDATE_RESTART_ENV`). Captured into
+/// [`UPDATE_RESTART`] and scrubbed from the environment in `main()` so it
+/// never leaks into subprocesses the daemon spawns.
+const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
+
+/// Whether this start is an update-triggered respawn: the value of
+/// [`UPDATE_RESTART_ENV`] captured in `main()` before the env var is
+/// scrubbed. Read by `cmd_serve` for the startup resume decision.
+static UPDATE_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
 /// code shells report for standard Unix tools whose output pipe closes early.
@@ -1682,7 +1708,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Auto-resume interrupted agents at startup. `--resume-all` forces the
     // sweep, as does an update-triggered restart (the sitter sets
     // `INTENTD_UPDATE_RESTART=1` when it respawns a different version than
-    // the one that just ran); otherwise the `agents.resumeInterruptedOnStart`
+    // the one that just ran; captured into [`UPDATE_RESTART`] and scrubbed
+    // from the environment in `main()` so it never leaks to subprocesses);
+    // otherwise the `agents.resumeInterruptedOnStart`
     // setting decides (`auto` = headless hosts only, `on` = always, `off` =
     // never). Awaited to
     // completion BEFORE any listener starts (WS/WSS below, UDS further down)
@@ -1693,7 +1721,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // sweep only logs, so a bad sweep never wedges startup.
     let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
     let has_display = detect_has_display();
-    let update_restart = env_flag("INTENTD_UPDATE_RESTART");
+    // Captured in `main()` before the env var was scrubbed from the
+    // environment (so it never leaks into daemon-spawned subprocesses).
+    let update_restart = UPDATE_RESTART.load(std::sync::atomic::Ordering::Relaxed);
     let resume_on_start =
         should_resume_on_start(resume_all, update_restart, resume_setting, has_display);
     tracing::info!(
