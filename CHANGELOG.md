@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.46] - 2026-08-23
+
+### 🐛 Bug Fixes
+
+- Lint macOS-gated code in CI and fix pedantic clippy warnings ([#1425](https://github.com/intent-hq/intentd/pull/1425))
+
+
 ## [0.7.45] - 2026-08-23
 
 ### 🐛 Bug Fixes
