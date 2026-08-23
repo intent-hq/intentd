@@ -40,9 +40,10 @@ pub(crate) const RATE_LIMIT_MAX_PAUSE: Duration = Duration::from_secs(2 * 60 * 6
 /// reported reset, [`RATE_LIMIT_FALLBACK_PAUSE`].
 pub(crate) fn pause_duration(reset_unix: Option<u64>, now_unix: u64) -> Duration {
     let base = match reset_unix {
-        Some(reset) => {
-            Duration::from_secs(reset.saturating_sub(now_unix)) + RATE_LIMIT_RESET_MARGIN
-        }
+        // Saturating: a nonsense reset near `u64::MAX` must clamp to
+        // [`RATE_LIMIT_MAX_PAUSE`], not overflow `Duration` and panic.
+        Some(reset) => Duration::from_secs(reset.saturating_sub(now_unix))
+            .saturating_add(RATE_LIMIT_RESET_MARGIN),
         None => RATE_LIMIT_FALLBACK_PAUSE,
     };
     base.clamp(RATE_LIMIT_MIN_PAUSE, RATE_LIMIT_MAX_PAUSE)
@@ -113,6 +114,19 @@ mod tests {
     #[test]
     fn pause_duration_falls_back_without_a_reset() {
         assert_eq!(pause_duration(None, 1_000), RATE_LIMIT_FALLBACK_PAUSE);
+    }
+
+    #[test]
+    fn pause_duration_saturates_on_a_near_max_reset() {
+        // A forge-supplied reset near `u64::MAX` must clamp to the cap,
+        // not overflow the margin addition and panic.
+        assert_eq!(pause_duration(Some(u64::MAX), 0), RATE_LIMIT_MAX_PAUSE);
+        // The margin addition itself must not overflow either: a reset one
+        // second out near the top of the range clamps to the minimum.
+        assert_eq!(
+            pause_duration(Some(u64::MAX), u64::MAX - 1),
+            RATE_LIMIT_MIN_PAUSE
+        );
     }
 
     #[test]

@@ -10354,6 +10354,10 @@ mod pr {
         /// (exhausted GitHub core quota, monorepo#2961), exercising the
         /// global sweep pause.
         rate_limited: bool,
+        /// When true, only `list_prs` fails with `RateLimited` (the linked
+        /// `get_pr` still succeeds), exercising the merged/closed relink
+        /// discovery hitting the quota mid-refresh (monorepo#2961).
+        rate_limited_list_prs: bool,
         /// What `rate_limit_reset_at` reports (`None` mirrors a host
         /// without the signal → fallback pause).
         rate_limit_reset: Option<u64>,
@@ -10553,7 +10557,7 @@ mod pr {
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
-            if self.rate_limited {
+            if self.rate_limited || self.rate_limited_list_prs {
                 return Err(ScError::RateLimited(
                     "API rate limit exceeded for user ID 526899.".into(),
                 ));
@@ -13569,6 +13573,88 @@ mod pr {
             1,
             "remaining candidates are not fetched into the exhausted quota"
         );
+    }
+
+    /// A rate limit hit by the merged-PR *relink discovery* (`list_prs`)
+    /// — not the linked `get_pr` — still pauses the sweep globally: the
+    /// merged status delta persists first (paid for), then the class
+    /// surfaces instead of being swallowed as a generic discovery failure.
+    #[tokio::test]
+    async fn pr_refresh_relink_discovery_rate_limit_pauses_and_persists_delta() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let ws_id = WorkspaceId::new();
+            let mut ws = workspace(&ws_id);
+            ws.branch = "feature".into();
+            ws.repository_owner = Some("o".into());
+            ws.repository_name = Some("r".into());
+            ws.pr_number = Some(42);
+            ws.updated_at = now_iso();
+            store.insert_workspace(&ws).await.expect("ws");
+            ids.push(ws_id);
+        }
+        let sc = Arc::new(StubForge {
+            merged_linked: true,
+            rate_limited_list_prs: true,
+            rate_limit_reset: Some(u64::MAX / 2),
+            ..Default::default()
+        });
+        let svc = Services::new(store).with_source_control(sc.clone());
+
+        svc.refresh_all_workspace_prs(0).await;
+        assert_eq!(
+            sc.seen_get_pr.lock().unwrap().len(),
+            1,
+            "the first workspace's rate-limited relink discovery pauses the rest"
+        );
+        // The merged status delta from the paid-for `get_pr` persisted.
+        let ws = svc.store().get_workspace(&ids[0]).await.unwrap();
+        assert_eq!(ws.pr_status, Some(intent_core::PullRequestStatus::Merged));
+
+        // The next tick is still inside the pause window: zero forge calls.
+        svc.refresh_all_workspace_prs(1).await;
+        assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
+    }
+
+    /// Same for the git-root sweep: a rate limit hit by a root's relink
+    /// discovery persists the merged delta, skips the heal, and pauses
+    /// the remaining roots' forge work.
+    #[tokio::test]
+    async fn sweep_relink_discovery_rate_limit_pauses_remaining_roots() {
+        let primary = SweepRepo::init("main", None);
+        let a = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let b = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        for (dir, n) in [(&a.dir, 42u64), (&b.dir, 43)] {
+            let mut root = sweep_root(&ws.id, dir, Some(("o", "r")));
+            root.pr_number = Some(n);
+            root.pr_url = Some(format!("https://github.com/o/r/pull/{n}"));
+            root.pr_status = Some(intent_core::PullRequestStatus::Open);
+            svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        }
+
+        let sc = Arc::new(StubForge {
+            merged_linked: true,
+            rate_limited_list_prs: true,
+            rate_limit_reset: Some(u64::MAX / 2),
+            ..Default::default()
+        });
+        let sc_dyn: Arc<dyn SourceControl> = sc.clone();
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+
+        assert_eq!(
+            sc.seen_get_pr.lock().unwrap().len(),
+            1,
+            "the first root's rate-limited relink discovery pauses the sweep"
+        );
+        // The merged delta from the paid-for `get_pr` persisted.
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let merged = roots
+            .iter()
+            .find(|r| r.pr_status == Some(intent_core::PullRequestStatus::Merged));
+        assert!(merged.is_some(), "merged status delta persists");
     }
 }
 

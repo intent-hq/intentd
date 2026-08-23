@@ -3349,6 +3349,10 @@ impl Services {
         // PR numbers fetched fresh this pass (linked / just-discovered);
         // the stale-pool heal below skips them.
         let mut fetched_fresh: Vec<u64> = Vec::new();
+        // A rate-limited relink discovery is captured here (not swallowed
+        // as a generic discovery failure) so it surfaces AFTER the status
+        // delta persist below and the sweep pauses globally (monorepo#2961).
+        let mut discovery_rate_limited: Option<String> = None;
         let mut outcome = if let Some(number) = root.pr_number {
             let pr = sc
                 .get_pr(&repo_ref, number)
@@ -3399,6 +3403,15 @@ impl Services {
                     .await
                     {
                         Ok(found) => found,
+                        // A rate-limited discovery still degrades to the
+                        // plain update path (the status delta persists),
+                        // but the class surfaces after the persist below
+                        // so the sweep pauses globally instead of burning
+                        // the remaining roots (monorepo#2961).
+                        Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
+                            discovery_rate_limited = Some(detail);
+                            None
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 git_root = %root.id.as_str(),
@@ -3457,15 +3470,21 @@ impl Services {
         // capped entries can consume at most half of it, so a hung pool
         // fetch (monorepo#1988 lineage) can never starve the linked-PR
         // delta persist below out of the caller's PR_REFRESH_FETCH_TIMEOUT.
-        let (heal_changed, rate_limited) = pr_ops::refresh_stale_pool_entries(
-            sc.as_ref(),
-            &repo_ref,
-            &mut root.pull_requests,
-            &fetched_fresh,
-            self.pr_refresh_fetch_timeout / 10,
-        )
-        .await;
-        changed |= heal_changed;
+        // A rate-limited relink discovery skips the heal entirely — its
+        // re-fetches would only burn into the same exhausted quota.
+        let mut rate_limited = discovery_rate_limited;
+        if rate_limited.is_none() {
+            let (heal_changed, heal_rate_limited) = pr_ops::refresh_stale_pool_entries(
+                sc.as_ref(),
+                &repo_ref,
+                &mut root.pull_requests,
+                &fetched_fresh,
+                self.pr_refresh_fetch_timeout / 10,
+            )
+            .await;
+            changed |= heal_changed;
+            rate_limited = heal_rate_limited;
+        }
         if changed {
             if matches!(
                 outcome,
@@ -3481,9 +3500,9 @@ impl Services {
             )
             .await;
         }
-        // A heal re-fetch that hit the forge quota surfaces AFTER the delta
-        // persist (the paid-for snapshots land) so the sweep caller pauses
-        // globally (monorepo#2961).
+        // A relink discovery or heal re-fetch that hit the forge quota
+        // surfaces AFTER the delta persist (the paid-for snapshots land)
+        // so the sweep caller pauses globally (monorepo#2961).
         if let Some(detail) = rate_limited {
             return Err(Error::RateLimited(detail));
         }
@@ -3586,6 +3605,11 @@ impl Services {
             let info = pr_ops::build_pr_info(&pr);
             // Keep the daemon-owned PR list current on every linked refresh.
             let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+            // A rate-limited relink discovery is captured here (not
+            // swallowed as a generic discovery failure) so it surfaces
+            // AFTER the status delta persist below and the sweep pauses
+            // globally (monorepo#2961).
+            let mut discovery_rate_limited: Option<String> = None;
             // A merged/closed linked PR stays recorded in `pull_requests`
             // but no longer blocks discovery: relink to a newer open PR
             // matching the branch (or, failing that, the baseRef), so the
@@ -3609,6 +3633,15 @@ impl Services {
                 .await
                 {
                     Ok(found) => found,
+                    // A rate-limited discovery still degrades to the plain
+                    // update path (the status delta persists), but the
+                    // class surfaces after the persist below so the sweep
+                    // pauses globally instead of burning the remaining
+                    // workspaces (monorepo#2961).
+                    Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
+                        discovery_rate_limited = Some(detail);
+                        None
+                    }
                     Err(e) => {
                         tracing::warn!(
                             workspace_id = %ws.id.as_str(),
@@ -3636,17 +3669,26 @@ impl Services {
                 || ws.pr_status != Some(info.status)
                 || ws.active_pull_request.as_ref() != Some(&info)
                 || ws.pr_url.as_deref() != Some(pr.url.as_str());
-            if !changed {
-                return Ok(PrRefreshOutcome::Unchanged);
+            if changed {
+                ws.pr_status = Some(info.status);
+                ws.pr_url = Some(pr.url.clone());
+                ws.active_pull_request = Some(info);
+                ws.updated_at = now_iso();
+                self.store.update_workspace_pr_linkage(&ws).await?;
+                publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
+                self.maybe_emit_display_status_changed(&ws.id).await;
             }
-            ws.pr_status = Some(info.status);
-            ws.pr_url = Some(pr.url.clone());
-            ws.active_pull_request = Some(info);
-            ws.updated_at = now_iso();
-            self.store.update_workspace_pr_linkage(&ws).await?;
-            publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
-            self.maybe_emit_display_status_changed(&ws.id).await;
-            Ok(PrRefreshOutcome::Updated)
+            // A rate-limited relink discovery surfaces AFTER the delta
+            // persist (the paid-for status lands) so the sweep caller
+            // pauses globally (monorepo#2961).
+            if let Some(detail) = discovery_rate_limited {
+                return Err(Error::RateLimited(detail));
+            }
+            if changed {
+                Ok(PrRefreshOutcome::Updated)
+            } else {
+                Ok(PrRefreshOutcome::Unchanged)
+            }
         } else {
             // Discovery: link an open PR matching the branch, or —
             // failing that — the workspace's baseRef (§7.6).
