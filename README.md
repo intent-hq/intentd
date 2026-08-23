@@ -255,6 +255,14 @@ intentd settings agents.resumeInterruptedOnStart on|off|auto
 `intentd serve --resume-all` force-enables the sweep for that single run,
 regardless of the setting.
 
+**Update-triggered restarts always resume**, regardless of the setting: when the
+sitter installs an update and respawns the daemon (periodic mid-run check,
+`intentd update` followed by a restart, or an update adopted during failed-start
+backoff), it marks the respawn with `INTENTD_UPDATE_RESTART=1` and the daemon
+runs the resume sweep so agents interrupted by the update pick up where they
+left off. The setting governs all other starts: `intentd restart` with an
+unchanged version, crash respawns, service restarts, and fresh boots.
+
 ### Channels
 
 The sitter follows the **stable** channel by default. To durably switch a machine to
