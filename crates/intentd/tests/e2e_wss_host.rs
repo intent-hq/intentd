@@ -697,6 +697,28 @@ async fn host_exec_over_wss() {
         canonical
     );
 
+    // 2b) workspaceId with cwd OMITTED defaults to the workspace root
+    // (monorepo#3231) — previously the child inherited the daemon's own cwd.
+    let defaulted = wss_rpc(
+        &mut ws,
+        205,
+        "host.exec",
+        json!({
+            "command": "pwd",
+            "workspaceId": ws_id,
+            "timeoutMs": 5000,
+        }),
+    )
+    .await;
+    assert_eq!(defaulted["exitCode"], 0, "default cwd ⇒ ok: {defaulted}");
+    let printed = defaulted["stdout"].as_str().unwrap().trim();
+    assert!(
+        printed == root.to_string_lossy() || printed == canonical,
+        "omitted cwd defaults to the workspace root ({} or {}): {printed}",
+        root.display(),
+        canonical
+    );
+
     // 3) cwd OUTSIDE the workspace ⇒ -32603 with a clear containment message.
     let frame = json!({
         "jsonrpc": "2.0", "id": 202, "method": "host.exec",
