@@ -22817,6 +22817,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_delete_op(agent_id, workspace_id).await })
     }
 
+    fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+        // Cheap single-column point read; missing rows and store errors
+        // report `false` per the trait contract (absence is handled by the
+        // per-method guards, and a transient read failure must not
+        // blanket-deny every workspace_api call).
+        Box::pin(async move {
+            matches!(
+                self.store.get_agent_session_retired_at(&agent_id).await,
+                Ok(Some(_))
+            )
+        })
+    }
+
     fn agent_retire(
         &self,
         agent_id: AgentId,

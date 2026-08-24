@@ -1878,10 +1878,20 @@ impl Store {
         id: &AgentId,
         retired_at: Option<&str>,
         updated_at: &str,
-    ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET retired_at=?, updated_at=? WHERE id=? AND workspace_id=?",
-        )
+    ) -> Result<bool> {
+        // Compare-and-set: the write only lands when it is a real state
+        // transition (set requires currently-NULL, clear requires
+        // currently-set), so two concurrent retire/restore requests cannot
+        // both observe the transition and double-emit the lifecycle event.
+        let guard = if retired_at.is_some() {
+            "retired_at IS NULL"
+        } else {
+            "retired_at IS NOT NULL"
+        };
+        let rows = sqlx::query(&format!(
+            "UPDATE agent_session SET retired_at=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND {guard}"
+        ))
         .bind(retired_at)
         .bind(updated_at)
         .bind(&id.0)
@@ -1890,10 +1900,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("set agent session retired_at failed: {e}")))?
         .rows_affected();
-        if rows == 0 {
-            return Err(Error::NotFound(format!("agent session {id}")));
-        }
-        Ok(())
+        Ok(rows > 0)
     }
 
     /// Clear `completion_report` + `completion_report_timestamp` when a new turn

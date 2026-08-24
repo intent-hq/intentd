@@ -8247,6 +8247,9 @@ mod wsapi4_bindings_tests {
         request_attention_calls: Mutex<Vec<AttentionCall>>,
         agent_delete_calls: Mutex<Vec<(String, Option<String>)>>,
         agent_retire_calls: Mutex<Vec<RetireCall>>,
+        /// Agent ids `agent_is_retired` reports as retired (same-turn
+        /// dispatch-guard tests).
+        retired_agent_ids: Mutex<Vec<String>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
         /// When set, `agent_get` fails with this error (name-lookup failure path).
         agent_get_error: Mutex<Option<String>>,
@@ -8669,6 +8672,15 @@ mod wsapi4_bindings_tests {
             Box::pin(
                 async move { Ok(json!({ "success": true, "retiredAt": "2026-01-01T00:00:00Z" })) },
             )
+        }
+
+        fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+            let retired = self
+                .retired_agent_ids
+                .lock()
+                .unwrap()
+                .contains(&agent_id.as_str().to_string());
+            Box::pin(async move { retired })
         }
 
         fn event_query(
@@ -9908,6 +9920,35 @@ mod wsapi4_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("retire requires an agent caller identity"));
         assert!(api.agent_retire_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_caller_is_rejected_at_dispatch() {
+        // Same-turn inertness: once the caller's session is marked retired,
+        // every subsequent workspace_api host frame from it fails closed —
+        // the retiring turn cannot keep acting after the mark lands.
+        let api = Arc::new(FakeApi::default());
+        api.retired_agent_ids
+            .lock()
+            .unwrap()
+            .push("agent-self-3".to_string());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from("agent-self-3")));
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("retired"));
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn non_retired_caller_passes_dispatch_guard() {
+        // Control: a caller whose session is not retired dispatches normally.
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from("agent-self-4")));
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 1);
     }
 
     // ================================================================

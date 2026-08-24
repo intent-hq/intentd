@@ -2161,6 +2161,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Whether `agent_id`'s session is soft-retired (`retiredAt` set) — the
+    /// cheap point read backing the MCP dispatch guard that keeps a caller
+    /// inert for the remainder of the turn that retired it (retirement lands
+    /// mid-turn; the ACP stream only stops at the turn boundary). Missing
+    /// sessions and read errors report `false`: absence is handled by the
+    /// per-method `require_*` guards, and a transient store error must not
+    /// blanket-deny every `workspace_api` call. Default `false` so non-agent
+    /// `WorkspaceApi` impls need not implement it.
+    fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+        let _ = agent_id;
+        Box::pin(async { false })
+    }
+
     /// Soft retire (`ws.agent.retire`): set `retiredAt` on the session,
     /// keeping the row and its full conversation intact. The retired session
     /// is inert until `agent.restore` clears the mark. Emits `agent:retired`;

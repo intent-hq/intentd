@@ -3788,9 +3788,18 @@ impl Services {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
         let now = now_iso();
-        self.store
+        // CAS write: only the request that actually flips NULL → set emits
+        // the event; a concurrent retire that lost the race re-reads the
+        // winner's timestamp and reports `alreadyRetired`.
+        let transitioned = self
+            .store
             .set_agent_session_retired_at(&session.workspace_id, &agent_id, Some(&now), &now)
             .await?;
+        if !transitioned {
+            let session = self.store.get_agent_session_summary(&agent_id).await?;
+            let existing = session.retired_at.unwrap_or(now);
+            return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
+        }
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Drop the retired agent's event subscriptions: the wake target is
         // inert, so matching/batching for it is pure leak (same rationale
@@ -3849,9 +3858,16 @@ impl Services {
             return Ok(json!({ "success": true, "restored": false }));
         }
         let now = now_iso();
-        self.store
+        // CAS write: only the request that actually clears the mark emits
+        // the event; a concurrent restore that lost the race reports the
+        // documented no-op shape.
+        let transitioned = self
+            .store
             .set_agent_session_retired_at(&session.workspace_id, &agent_id, None, &now)
             .await?;
+        if !transitioned {
+            return Ok(json!({ "success": true, "restored": false }));
+        }
         self.invalidate_agent_list_cache(&session.workspace_id);
         crate::publish_event(
             self.event_bus.as_ref(),
