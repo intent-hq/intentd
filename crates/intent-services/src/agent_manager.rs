@@ -551,6 +551,23 @@ fn origin_from_user_flag(user_origin: bool) -> intent_core::MessageOrigin {
     }
 }
 
+fn usage_message_origin(
+    origin: intent_core::MessageOrigin,
+    metadata: Option<&serde_json::Value>,
+) -> intent_store::UsageMessageOrigin {
+    if origin.is_user() {
+        intent_store::UsageMessageOrigin::Human
+    } else if metadata
+        .and_then(|m| m.get("fromAgentId"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        intent_store::UsageMessageOrigin::Agent
+    } else {
+        intent_store::UsageMessageOrigin::Excluded
+    }
+}
+
 /// Rebuild the single-entry drain [`TurnOptions`] for one queue entry — the
 /// exact shape the non-flush drain arms construct inline. Used by the
 /// batch-flush persist-failure path so the failed entry is parked/requeued
@@ -5884,13 +5901,14 @@ impl AgentManager {
         let message = match self
             .services
             .store
-            .append_agent_message_with_id(
+            .append_agent_message_with_provenance(
                 &agent_id,
                 &message_id,
                 "user",
                 &blocks,
                 options.message_metadata.as_ref(),
                 &now_iso(),
+                usage_message_origin(options.origin, options.message_metadata.as_ref()),
             )
             .await
         {
@@ -6416,13 +6434,14 @@ impl AgentManager {
             let message = match self
                 .services
                 .store
-                .append_agent_message_with_id(
+                .append_agent_message_with_provenance(
                     &agent_id,
                     &entry.id,
                     "user",
                     &blocks,
                     entry.message_metadata.as_ref(),
                     &now_iso(),
+                    usage_message_origin(options.origin, options.message_metadata.as_ref()),
                 )
                 .await
             {
@@ -10506,19 +10525,23 @@ async fn persist_user(
             text_block.insert("messageMetadata".into(), md);
         }
     }
+    let usage_origin = usage_message_origin(origin_from_user_flag(user_origin), message_metadata);
     // Bounded retry (#547): initial attempt + one retry per backoff delay.
     let backoff = persist_retry_backoff_ms();
     let mut attempt = 0usize;
+    let message_id = new_message_id();
     let message = loop {
         match mgr
             .services
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_provenance(
                 agent_id,
+                &message_id,
                 "user",
                 &blocks,
                 message_metadata,
                 &created_at,
+                usage_origin,
             )
             .await
         {

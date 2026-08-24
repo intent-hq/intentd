@@ -57,8 +57,9 @@ pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    ChildAgentCounts, MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage,
-    SessionMessageProjection, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    AgentUsageCellRow, ChildAgentCounts, MessageFtsMatch, PrunedToolField, PrunedToolPayload,
+    ReplaceMessage, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
+    PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::AttachmentRecord;
 pub use completion_watch_repo::PersistedCompletionWatch;
