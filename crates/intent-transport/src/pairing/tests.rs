@@ -39,7 +39,7 @@ impl TokenStore for MemoryStore {
 /// Mock pairing info provider for tests.
 struct MockPairingInfo {
     port: Option<u16>,
-    bind_address: Option<std::net::IpAddr>,
+    bind_addresses: Option<Vec<std::net::IpAddr>>,
     data_dir: PathBuf,
     token_store: crate::AsyncTokenStore,
 }
@@ -47,8 +47,13 @@ struct MockPairingInfo {
 impl ServerPairingInfo for MockPairingInfo {
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>> {
         let port = self.port;
-        let bind_address = self.bind_address;
-        Box::pin(async move { PairingSnapshot { port, bind_address } })
+        let bind_addresses = self.bind_addresses.clone();
+        Box::pin(async move {
+            PairingSnapshot {
+                port,
+                bind_addresses,
+            }
+        })
     }
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
@@ -64,7 +69,7 @@ fn provider(port: Option<u16>, dir: &str, token: &str) -> (Arc<dyn ServerPairing
 
 fn provider_with_bind(
     port: Option<u16>,
-    bind_address: Option<std::net::IpAddr>,
+    bind_addresses: Option<Vec<std::net::IpAddr>>,
     dir: &str,
     token: &str,
 ) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
@@ -78,7 +83,7 @@ fn provider_with_bind(
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with(token)));
     let p: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port,
-        bind_address,
+        bind_addresses,
         data_dir: tmpdir.clone(),
         token_store: store,
     });
@@ -207,7 +212,7 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
     let token = "abababababababababababababababababababababababababababababababab";
     let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     let (provider, tmpdir) =
-        provider_with_bind(Some(5181), Some(bind), "pairing_bind_loopback", token);
+        provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_loopback", token);
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),

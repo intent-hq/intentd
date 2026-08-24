@@ -33,10 +33,10 @@ pub trait ServerPairingInfo: Send + Sync {
 pub struct PairingSnapshot {
     /// The bound WSS port, when the TCP listener is running.
     pub port: Option<u16>,
-    /// The address the running listener is bound to (`server.bindAddress`),
-    /// when known — drives which hosts the pairing payload advertises
-    /// (`pairing_hosts`).
-    pub bind_address: Option<std::net::IpAddr>,
+    /// The address set the running listener is bound to
+    /// (`server.bindAddress`; one listener per address), when known — drives
+    /// which hosts the pairing payload advertises (`pairing_hosts`).
+    pub bind_addresses: Option<Vec<std::net::IpAddr>>,
 }
 
 /// The two server methods, once classified.
@@ -148,16 +148,23 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 }
 
 /// Hosts the pairing payload should advertise for `snapshot`: a listener
-/// bound to a specific address (loopback included) is reachable only there,
-/// so advertise exactly that address; an unspecified bind (`0.0.0.0` / `::`)
-/// or an unknown one falls back to enumerating the machine's local IPs.
+/// bound to specific addresses (loopback included) is reachable only there,
+/// so advertise exactly those addresses; an unspecified bind (`0.0.0.0` /
+/// `::` — always the sole entry per the settings validation) or an unknown
+/// set falls back to enumerating the machine's local IPs.
 /// An IPv6-unspecified bind (`::`) also accepts native IPv6 connections
 /// (v4-mapped sockets cover the IPv4 side), so its enumeration additionally
 /// carries the machine's global IPv6 addresses.
 pub(crate) fn pairing_hosts(snapshot: &PairingSnapshot) -> Vec<String> {
-    match snapshot.bind_address {
-        Some(addr) if !addr.is_unspecified() => vec![addr.to_string()],
-        Some(std::net::IpAddr::V6(_)) => {
+    match snapshot.bind_addresses.as_deref() {
+        Some(addrs) if !addrs.is_empty() && !addrs.iter().any(std::net::IpAddr::is_unspecified) => {
+            addrs.iter().map(std::string::ToString::to_string).collect()
+        }
+        Some(addrs)
+            if addrs
+                .iter()
+                .any(|a| a.is_unspecified() && matches!(a, std::net::IpAddr::V6(_))) =>
+        {
             let mut hosts = collect_local_ips();
             hosts.extend(collect_local_ipv6s());
             hosts

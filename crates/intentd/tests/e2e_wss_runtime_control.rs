@@ -1076,3 +1076,124 @@ async fn runtime_bind_address_change_restarts_listener() {
         "listener must survive a rejected bindAddress write: {sub3}"
     );
 }
+
+/// Runtime `server.bindAddress` list form (monorepo#3314): a list of IPs is
+/// accepted end to end over the settings surface — the restart hook applies
+/// it, the listener stays connectable, and `pairing.getInfo` advertises
+/// exactly the configured set. Invalid sets (duplicates, unspecified mixed
+/// with specific) are rejected at write time with the running listener
+/// untouched.
+#[tokio::test]
+async fn runtime_bind_address_list_applies_and_validates() {
+    // The two-address set is loopback-family (127.0.0.1 + ::1) so CI needs no
+    // real interfaces; skip only when the sandbox lacks IPv6 entirely.
+    if std::net::TcpListener::bind(("::1", 0)).is_err() {
+        eprintln!("skipping: IPv6 loopback unavailable");
+        return;
+    }
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Switch to the list form while the listener runs: the hook restarts it
+    // bound to both loopback addresses on the same port.
+    let widen = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.bindAddress", "value": ["127.0.0.1", "::1"] }] }),
+    )
+    .await;
+    assert!(
+        widen.get("error").is_none(),
+        "settings.update bindAddress → list should succeed: {widen}"
+    );
+
+    // Listener is back up on the same port and the persisted value reads back
+    // in its array shape.
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let sub = wss_rpc(
+        &mut ws,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub.get("error").is_none(),
+        "events.subscribe after bindAddress list should work: {sub}"
+    );
+    let get = uds_rpc(
+        &socket,
+        3,
+        "settings.get",
+        json!({ "path": "server.bindAddress" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!(["127.0.0.1", "::1"]),
+        "list form persists and reads back as an array: {get}"
+    );
+
+    // Pairing advertises exactly the configured set (specific addresses).
+    let info = uds_rpc(&socket, 4, "pairing.getInfo", json!({})).await;
+    assert_eq!(
+        info["result"]["hosts"],
+        json!(["127.0.0.1", "::1"]),
+        "list bind advertises exactly its entries: {info}"
+    );
+
+    // Invalid sets are rejected at write time; the listener stays up.
+    for (id, bad_value) in [
+        (5, json!(["127.0.0.1", "127.0.0.1"])),
+        (6, json!(["0.0.0.0", "127.0.0.1"])),
+        (7, json!([])),
+        (8, json!(["not-an-ip"])),
+    ] {
+        let bad = uds_rpc(
+            &socket,
+            id,
+            "settings.update",
+            json!({ "changes": [{ "path": "server.bindAddress", "value": bad_value }] }),
+        )
+        .await;
+        let err = bad
+            .get("error")
+            .unwrap_or_else(|| panic!("invalid bindAddress set {id} must be rejected: {bad}"))
+            .to_string();
+        assert!(err.contains("server.bindAddress"), "{bad}");
+    }
+    let mut ws2 = connect_ws(port, cfg).await;
+    let sub2 = wss_rpc(
+        &mut ws2,
+        20,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub2.get("error").is_none(),
+        "listener must survive rejected bindAddress writes: {sub2}"
+    );
+}

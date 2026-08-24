@@ -35,11 +35,13 @@ pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Clone` for the `Shared` combinator).
 type StartFuture = Shared<BoxFuture<'static, Result<u16, Arc<io::Error>>>>;
 
-/// Handles for a running listener, taken by `stop()` to tear it down in order.
+/// Handles for a running listener, taken by `stop()` to tear it down in
+/// order. One accept task + shutdown signal per bound address
+/// (`server.bindAddress` may list several; monorepo#3314).
 pub(crate) struct RunningHandles {
-    pub accept_task: JoinHandle<()>,
+    pub accept_tasks: Vec<JoinHandle<()>>,
     pub heartbeat_task: JoinHandle<()>,
-    pub shutdown_tx: Option<oneshot::Sender<()>>,
+    pub shutdown_txs: Vec<oneshot::Sender<()>>,
 }
 
 /// Lifecycle state guarded by a single async mutex (the TS instance fields).
@@ -80,46 +82,79 @@ impl WsInner {
             .map_err(|e| io::Error::new(e.kind(), e.to_string()))
     }
 
-    /// Bind once, then spawn the accept + heartbeat loops and record their
-    /// handles. Re-checks the stop generation before binding.
+    /// Bind every configured address, then spawn one accept loop per
+    /// listener plus the heartbeat loop and record their handles. Re-checks
+    /// the stop generation before binding.
     async fn do_start(self: Arc<Self>, generation: u64) -> Result<u16, Arc<io::Error>> {
-        let (listener, port) = self.bind_once(generation).await?;
-        tracing::info!(port, "intentd WSS listening");
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let accept_task = tokio::spawn(self.clone().accept_loop(listener, shutdown_rx));
+        let (listeners, port) = self.bind_once(generation).await?;
+        for listener in &listeners {
+            if let Ok(addr) = listener.local_addr() {
+                tracing::info!(address = %addr.ip(), port, "intentd WSS listening");
+            }
+        }
+        let mut accept_tasks = Vec::with_capacity(listeners.len());
+        let mut shutdown_txs = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            accept_tasks.push(tokio::spawn(
+                self.clone().accept_loop(listener, shutdown_rx),
+            ));
+            shutdown_txs.push(shutdown_tx);
+        }
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
         let mut st = self.state.lock().await;
         st.started = true;
         st.port = Some(port);
         st.start_task = None;
         st.running = Some(RunningHandles {
-            accept_task,
+            accept_tasks,
             heartbeat_task,
-            shutdown_tx: Some(shutdown_tx),
+            shutdown_txs,
         });
         Ok(port)
     }
 
-    /// One TCP bind attempt on the configured port; any failure (including
-    /// `EADDRINUSE`) is returned to the caller as-is. Re-checks the stop
-    /// generation so a concurrent `stop()` unwinds instead of binding.
+    /// One TCP bind attempt per configured address on the configured port —
+    /// all-or-nothing: any failure (including `EADDRINUSE`) drops the
+    /// already-bound listeners and is returned as-is, so the daemon never
+    /// silently serves fewer interfaces than configured (monorepo#3314). A
+    /// `base_port` of 0 (the E2E ephemeral seam) binds the first address on
+    /// an OS-assigned port and the remaining addresses on that same port.
+    /// Re-checks the stop generation so a concurrent `stop()` unwinds
+    /// instead of binding.
     async fn bind_once(
         self: &Arc<Self>,
         generation: u64,
-    ) -> Result<(TcpListener, u16), Arc<io::Error>> {
+    ) -> Result<(Vec<TcpListener>, u16), Arc<io::Error>> {
         if self.external_stop_generation.load(Ordering::SeqCst) != generation {
             return Err(Arc::new(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "ws start aborted by concurrent stop",
             )));
         }
-        match TcpListener::bind((self.bind_address, self.base_port)).await {
-            Ok(listener) => {
-                let port = listener.local_addr().map_err(Arc::new)?.port();
-                Ok((listener, port))
+        debug_assert!(
+            !self.bind_addresses.is_empty(),
+            "WsOptions.bind_addresses must be non-empty"
+        );
+        let mut listeners = Vec::with_capacity(self.bind_addresses.len());
+        let mut port = self.base_port;
+        for addr in &self.bind_addresses {
+            match TcpListener::bind((*addr, port)).await {
+                Ok(listener) => {
+                    // First bind resolves an ephemeral port 0; the rest of
+                    // the set joins it on the same resolved port.
+                    port = listener.local_addr().map_err(Arc::new)?.port();
+                    listeners.push(listener);
+                }
+                Err(e) => {
+                    return Err(Arc::new(io::Error::new(
+                        e.kind(),
+                        format!("bind {addr}:{port}: {e}"),
+                    )))
+                }
             }
-            Err(e) => Err(Arc::new(e)),
         }
+        Ok((listeners, port))
     }
 
     /// Graceful shutdown in the canonical order (port of `stop()`): bump the
@@ -155,16 +190,18 @@ impl WsInner {
             if !handles.is_empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            // (4)+(6) remove the upgrade handler / close the listener.
-            if let Some(tx) = running.shutdown_tx.take() {
+            // (4)+(6) remove the upgrade handlers / close every listener.
+            for tx in running.shutdown_txs.drain(..) {
                 let _ = tx.send(());
             }
             // (5) terminate any lingering client connections.
             for client in &handles {
                 client.abort.abort();
             }
-            // (7) await the listener closure so the port is fully released.
-            let _ = running.accept_task.await;
+            // (7) await every listener closure so the port is fully released.
+            for task in running.accept_tasks.drain(..) {
+                let _ = task.await;
+            }
             let _ = running.heartbeat_task.await;
         }
         let mut st = self.state.lock().await;

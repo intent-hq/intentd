@@ -216,6 +216,121 @@ pub struct RtkSettings {
     pub enabled: bool,
 }
 
+/// `server.bindAddress` — a single IP string (back-compat) or a list of IP
+/// strings, so selected interfaces (e.g. LAN + Tailscale) can be bound
+/// without resorting to `0.0.0.0` (monorepo#3314). Serializes back to the
+/// shape it was written in (`One` → string, `Many` → array).
+///
+/// Shape-only at the type level: [`BindAddress::resolve`] performs the
+/// semantic validation (every entry a valid IP; no duplicates; an
+/// unspecified `0.0.0.0`/`::` only allowed alone), which
+/// [`SettingsFile::validate`] enforces at parse/write time.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum BindAddress {
+    /// The historical single-string form (`bindAddress = "127.0.0.1"`).
+    One(String),
+    /// The list form (`bindAddress = ["192.168.1.7", "100.64.0.3"]`).
+    Many(Vec<String>),
+}
+
+impl Default for BindAddress {
+    fn default() -> Self {
+        BindAddress::One("127.0.0.1".to_string())
+    }
+}
+
+// Manual visitor instead of `#[serde(untagged)]` deserialize so a wrong type
+// still yields a precise "expected …" message (untagged buffering reports
+// only "data did not match any variant").
+impl<'de> Deserialize<'de> for BindAddress {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BindAddressVisitor;
+        impl<'de> serde::de::Visitor<'de> for BindAddressVisitor {
+            type Value = BindAddress;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an IP address string or an array of IP address strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(BindAddress::One(v.to_string()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = seq.next_element::<String>()? {
+                    entries.push(entry);
+                }
+                Ok(BindAddress::Many(entries))
+            }
+        }
+        deserializer.deserialize_any(BindAddressVisitor)
+    }
+}
+
+impl BindAddress {
+    /// The raw configured entries, list-shaped regardless of the input form.
+    #[must_use]
+    pub fn entries(&self) -> &[String] {
+        match self {
+            BindAddress::One(s) => std::slice::from_ref(s),
+            BindAddress::Many(v) => v.as_slice(),
+        }
+    }
+
+    /// Parse + semantically validate the configured entries into the bind
+    /// set: every entry must be a valid IP, duplicates are rejected, an
+    /// unspecified address (`0.0.0.0` / `::`) is only allowed as the sole
+    /// entry, and the list form must not be empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message (no key prefix — callers name the
+    /// key) describing the first violation.
+    pub fn resolve(&self) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+        let entries = self.entries();
+        if entries.is_empty() {
+            return Err("must list at least one IP address".to_string());
+        }
+        let mut addrs: Vec<std::net::IpAddr> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let addr: std::net::IpAddr = entry.parse().map_err(|_| {
+                format!("must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {entry:?}")
+            })?;
+            if addrs.contains(&addr) {
+                return Err(format!("duplicate address {addr}"));
+            }
+            addrs.push(addr);
+        }
+        if addrs.len() > 1 {
+            if let Some(wide) = addrs.iter().find(|a| a.is_unspecified()) {
+                return Err(format!(
+                    "unspecified address {wide} binds every interface and must be the only entry"
+                ));
+            }
+        }
+        Ok(addrs)
+    }
+}
+
+impl std::fmt::Display for BindAddress {
+    /// Comma-separated entries (`"127.0.0.1"` / `"192.168.1.7, 100.64.0.3"`)
+    /// for log and warning messages.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.entries().join(", "))
+    }
+}
+
 /// `[server]` — transport/listener config (`server.*`). The bearer token
 /// (`server.auth.token`) is a secret and lives in `secrets.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,10 +338,11 @@ pub struct RtkSettings {
 pub struct ServerSettings {
     /// `server.socketPath` — Unix socket path for the UDS listener.
     pub socket_path: Option<String>,
-    /// `server.bindAddress` — address the TCP listener binds. Defaults to
-    /// loopback (`127.0.0.1`); set `0.0.0.0` to expose the listener on every
-    /// interface, including untrusted networks.
-    pub bind_address: String,
+    /// `server.bindAddress` — address(es) the TCP listener binds: a single IP
+    /// string or a list of IP strings (one listener per address, same port).
+    /// Defaults to loopback (`127.0.0.1`); set `0.0.0.0` to expose the
+    /// listener on every interface, including untrusted networks.
+    pub bind_address: BindAddress,
     /// `server.port` — TCP port for the WSS listener (1024–65535).
     pub port: u16,
     /// `server.originAllowList` — permitted WS origins.
@@ -246,7 +362,7 @@ impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             socket_path: None,
-            bind_address: "127.0.0.1".to_string(),
+            bind_address: BindAddress::default(),
             port: 5181,
             origin_allow_list: None,
             max_outstanding_rpcs: DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
@@ -985,22 +1101,12 @@ impl SettingsFile {
                 ),
             ));
         }
-        // Reject non-IP bind addresses at write time (settings.update
+        // Reject invalid bind sets at write time (settings.update
         // re-validates through here) instead of deferring the failure to the
-        // next listener start (monorepo#2900 review).
-        if self
-            .server
-            .bind_address
-            .parse::<std::net::IpAddr>()
-            .is_err()
-        {
-            return Err(bad(
-                "server.bindAddress",
-                &format!(
-                    "must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {:?}",
-                    self.server.bind_address
-                ),
-            ));
+        // next listener start (monorepo#2900 review): every entry a valid IP,
+        // no duplicates, unspecified (0.0.0.0/::) only alone (monorepo#3314).
+        if let Err(msg) = self.server.bind_address.resolve() {
+            return Err(bad("server.bindAddress", &msg));
         }
         // Mirrors the catalog bound so a hand-edited config.toml cannot boot a
         // cap the `settings.update` RPC would have rejected (`0` = unlimited).
@@ -1209,8 +1315,9 @@ enabled = false
 [server]
 # Socket path -- Unix socket path for the UDS listener.
 # socketPath = "/path/to/intentd.sock"
-# Bind address -- address the TCP listener binds; 0.0.0.0 exposes it on every
-# interface, including untrusted networks.
+# Bind address -- address(es) the TCP listener binds: a single IP or a list of
+# IPs (e.g. ["192.168.1.7", "100.64.0.3"] -- one listener per address, same
+# port); 0.0.0.0 exposes it on every interface, including untrusted networks.
 bindAddress = "127.0.0.1"
 # WS port -- TCP port for the WSS listener (1024-65535).
 port = 5181
@@ -1472,7 +1579,10 @@ mod tests {
         assert!(d.notifications.sound_only_when_unfocused);
         assert_eq!(d.notifications.volume, 0.5);
         assert!(!d.rtk.enabled);
-        assert_eq!(d.server.bind_address, "127.0.0.1");
+        assert_eq!(
+            d.server.bind_address,
+            BindAddress::One("127.0.0.1".to_string())
+        );
         assert_eq!(d.server.port, 5181);
         assert_eq!(d.server.origin_allow_list, None);
         assert!(!d.server.ws_api.enabled);
@@ -1755,8 +1865,94 @@ mod tests {
         for addr in ["127.0.0.1", "0.0.0.0", "192.168.1.7", "::", "::1"] {
             let body = format!("[server]\nbindAddress = \"{addr}\"\n");
             let parsed = SettingsFile::parse_str(&body).unwrap();
-            assert_eq!(parsed.server.bind_address, addr);
+            assert_eq!(
+                parsed.server.bind_address,
+                BindAddress::One(addr.to_string())
+            );
         }
+    }
+
+    #[test]
+    fn bind_address_accepts_a_list_of_ips() {
+        // monorepo#3314: the array form binds selected interfaces.
+        let parsed = SettingsFile::parse_str(
+            "[server]\nbindAddress = [\"192.168.1.7\", \"100.64.0.3\", \"::1\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.server.bind_address,
+            BindAddress::Many(vec![
+                "192.168.1.7".to_string(),
+                "100.64.0.3".to_string(),
+                "::1".to_string(),
+            ])
+        );
+        assert_eq!(
+            parsed.server.bind_address.resolve().unwrap(),
+            vec![
+                "192.168.1.7".parse::<std::net::IpAddr>().unwrap(),
+                "100.64.0.3".parse().unwrap(),
+                "::1".parse().unwrap(),
+            ]
+        );
+        // A single-entry list is equivalent to the string form.
+        let parsed = SettingsFile::parse_str("[server]\nbindAddress = [\"127.0.0.1\"]\n").unwrap();
+        assert_eq!(
+            parsed.server.bind_address.resolve().unwrap(),
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn bind_address_list_rejects_invalid_sets() {
+        // Every entry an IP, no duplicates, unspecified only alone, non-empty.
+        for body in [
+            "[server]\nbindAddress = []\n",
+            "[server]\nbindAddress = [\"not-an-ip\"]\n",
+            "[server]\nbindAddress = [\"127.0.0.1\", \"not-an-ip\"]\n",
+            "[server]\nbindAddress = [\"127.0.0.1\", \"127.0.0.1\"]\n",
+            "[server]\nbindAddress = [\"0.0.0.0\", \"192.168.1.7\"]\n",
+            "[server]\nbindAddress = [\"::\", \"::1\"]\n",
+            "[server]\nbindAddress = [\"192.168.1.7\", \"0.0.0.0\"]\n",
+            "[server]\nbindAddress = 5181\n",
+        ] {
+            let err = SettingsFile::parse_str(body).unwrap_err();
+            assert!(
+                err.to_string().contains("server.bindAddress"),
+                "{body:?} should fail naming `server.bindAddress`: {err}"
+            );
+        }
+        // A sole unspecified entry stays valid in both shapes.
+        for body in [
+            "[server]\nbindAddress = \"0.0.0.0\"\n",
+            "[server]\nbindAddress = [\"0.0.0.0\"]\n",
+            "[server]\nbindAddress = [\"::\"]\n",
+        ] {
+            SettingsFile::parse_str(body).unwrap_or_else(|e| panic!("{body:?} should parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn bind_address_display_joins_entries() {
+        assert_eq!(
+            BindAddress::One("127.0.0.1".into()).to_string(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            BindAddress::Many(vec!["192.168.1.7".into(), "100.64.0.3".into()]).to_string(),
+            "192.168.1.7, 100.64.0.3"
+        );
+    }
+
+    #[test]
+    fn bind_address_serializes_in_its_written_shape() {
+        // String stays a string; list stays a list — round-trip through the
+        // JSON tree the settings registry uses for path-keyed access.
+        let one = serde_json::to_value(BindAddress::One("127.0.0.1".into())).unwrap();
+        assert_eq!(one, serde_json::json!("127.0.0.1"));
+        let many = serde_json::to_value(BindAddress::Many(vec!["::1".into(), "127.0.0.1".into()]))
+            .unwrap();
+        assert_eq!(many, serde_json::json!(["::1", "127.0.0.1"]));
     }
 
     #[test]

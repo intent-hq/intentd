@@ -255,7 +255,7 @@ async fn start_with_auggie_and_models_cache(
     if opts.base_port == WsOptions::default().base_port {
         opts.base_port = 0;
     }
-    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    opts.bind_addresses = vec![Ipv4Addr::LOCALHOST.into()];
     let ws =
         WsApiServer::new(api.clone(), bus.clone(), &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
@@ -1663,7 +1663,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
         base_port: 0,
         ..WsOptions::default()
     };
-    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    opts.bind_addresses = vec![Ipv4Addr::LOCALHOST.into()];
     let server = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
@@ -1794,7 +1794,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
         base_port: 0,
         ..WsOptions::default()
     };
-    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    opts.bind_addresses = vec![Ipv4Addr::LOCALHOST.into()];
     let server = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = server.start().await.expect("start");
@@ -3784,6 +3784,130 @@ async fn health_reports_ok_and_client_count() {
     srv.ws.stop().await;
 }
 
+/// Open a pinned TLS stream to `addr:port` (the fixed-target variant of
+/// [`tls_connect`] for multi-bind tests).
+async fn tls_connect_to(
+    addr: std::net::IpAddr,
+    port: u16,
+    cfg: Arc<ClientConfig>,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let tcp = TcpStream::connect((addr, port)).await.expect("tcp connect");
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    tokio_rustls::TlsConnector::from(cfg)
+        .connect(name, tcp)
+        .await
+        .expect("tls connect")
+}
+
+/// Whether this machine can bind the IPv6 loopback (rare CI sandboxes lack
+/// IPv6; multi-bind tests use `127.0.0.1` + `::1` as the two-address set).
+fn ipv6_loopback_available() -> bool {
+    StdTcpListener::bind(("::1", 0)).is_ok()
+}
+
+/// monorepo#3314: a `server.bindAddress` list binds one listener per address
+/// on the same port — both addresses accept and serve the same instance.
+#[tokio::test]
+async fn multi_bind_serves_every_configured_address() {
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: IPv6 loopback unavailable");
+        return;
+    }
+    let (api, bus, _store, _registry, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let opts = WsOptions {
+        base_port: 0,
+        bind_addresses: vec![
+            Ipv4Addr::LOCALHOST.into(),
+            std::net::Ipv6Addr::LOCALHOST.into(),
+        ],
+        ..WsOptions::default()
+    };
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = ws.start().await.expect("start binds both addresses");
+
+    for addr in [
+        std::net::IpAddr::from(Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        let mut tls_stream = tls_connect_to(addr, port, cfg.clone()).await;
+        tls_stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        tls_stream.flush().await.expect("flush");
+        let mut buf = Vec::new();
+        let _ = tls_stream.read_to_end(&mut buf).await;
+        let resp = String::from_utf8_lossy(&buf);
+        assert_eq!(status_code(&resp), 200, "health on {addr}: {resp}");
+        assert!(
+            resp.contains("\"status\":\"ok\""),
+            "health body on {addr}: {resp}"
+        );
+    }
+    ws.stop().await;
+
+    // stop() releases every listener: both addresses refuse new connections.
+    for addr in [
+        std::net::IpAddr::from(Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        assert!(
+            TcpStream::connect((addr, port)).await.is_err(),
+            "{addr}:{port} still accepting after stop"
+        );
+    }
+}
+
+/// monorepo#3314: partial bind failure is a hard error — when any address in
+/// the set cannot bind, `start()` fails and the addresses that DID bind are
+/// released (never silently serve fewer interfaces than configured).
+#[tokio::test]
+async fn multi_bind_partial_failure_is_all_or_nothing() {
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: IPv6 loopback unavailable");
+        return;
+    }
+    // Occupy a port on ::1 only, then ask for [127.0.0.1, ::1] on it.
+    let blocker = StdTcpListener::bind(("::1", 0)).expect("blocker bind");
+    let port = blocker.local_addr().expect("blocker addr").port();
+
+    let (api, bus, _store, _registry, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let opts = WsOptions {
+        base_port: port,
+        bind_addresses: vec![
+            Ipv4Addr::LOCALHOST.into(),
+            std::net::Ipv6Addr::LOCALHOST.into(),
+        ],
+        ..WsOptions::default()
+    };
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
+    let err = ws
+        .start()
+        .await
+        .expect_err("start must fail when ::1 is occupied");
+    assert!(
+        err.to_string().contains("::1"),
+        "bind error names the failing address: {err}"
+    );
+
+    // All-or-nothing: the successfully-bound 127.0.0.1 listener was released.
+    assert!(
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .is_err(),
+        "127.0.0.1:{port} must not accept after a partial bind failure"
+    );
+}
+
 #[tokio::test]
 async fn upgrade_rejected_without_or_with_bad_token() {
     let srv = start(WsOptions::default()).await;
@@ -5470,7 +5594,7 @@ async fn bind_fails_fast_on_occupied_port() {
         base_port: base,
         ..WsOptions::default()
     };
-    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    opts.bind_addresses = vec![Ipv4Addr::LOCALHOST.into()];
     let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
     let err = ws
         .start()
@@ -5498,7 +5622,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     let (api, bus, _store, _registry, _dir) = make_services(None, None).await;
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws = WsApiServer::new_insecure(api, bus, opts, None);
@@ -5555,7 +5679,7 @@ async fn graceful_shutdown_allows_immediate_restart() {
         let fixed_port = free_port();
         let opts = WsOptions {
             base_port: fixed_port,
-            bind_address: Ipv4Addr::LOCALHOST.into(),
+            bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
             ..WsOptions::default()
         };
         let ws = WsApiServer::new(
