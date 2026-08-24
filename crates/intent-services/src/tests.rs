@@ -29362,6 +29362,10 @@ mod idle_workspace_archived_stamp {
     #[tokio::test]
     async fn harness_wake_idle_carries_stamp() {
         let h = harness().await;
+        let lifecycle = crate::agent_session::HarnessWakeLifecycle {
+            correlation_id: "harness-wake-idle-stamp-test".to_string(),
+            block_count: 1,
+        };
 
         let archived_ws = seed_workspace(&h, true).await;
         let archived_agent = AgentId::new();
@@ -29371,7 +29375,7 @@ mod idle_workspace_archived_stamp {
             .expect("insert archived-ws session");
         let mut sub = subscribe_idle(&h, &archived_ws);
         h.services
-            .publish_harness_wake_idle(&archived_agent, &archived_ws, false)
+            .publish_harness_wake_idle(&archived_agent, &archived_ws, &lifecycle, false)
             .await;
         let ev = recv_idle(&mut sub).await;
         assert_eq!(ev["type"], AGENT_IDLE);
@@ -29389,7 +29393,7 @@ mod idle_workspace_archived_stamp {
             .expect("insert active-ws session");
         let mut sub = subscribe_idle(&h, &active_ws);
         h.services
-            .publish_harness_wake_idle(&active_agent, &active_ws, false)
+            .publish_harness_wake_idle(&active_agent, &active_ws, &lifecycle, false)
             .await;
         let ev = recv_idle(&mut sub).await;
         assert!(
