@@ -657,12 +657,17 @@ pub(crate) struct SpecialistsService {
 impl SpecialistsService {
     /// Build the service, resolving any unset directory from the environment
     /// (`~/.intent/specialists/` for user, [`BUNDLED_DIR_ENV`]/exe-relative for
-    /// bundled). When [`REPLACEMENT_DIR_ENV`] is set to a non-empty path the
-    /// base tier is wholesale-replaced instead ([`Self::with_base_replacement`]).
-    /// Tests inject explicit roots for hermetic 3-tier coverage.
+    /// bundled). When no bundled root is injected and [`REPLACEMENT_DIR_ENV`]
+    /// is set to a non-empty path the base tier is wholesale-replaced instead
+    /// ([`Self::with_base_replacement`]) — an explicitly injected
+    /// `bundled_dir` wins over the env var (matching [`BUNDLED_DIR_ENV`],
+    /// consulted only inside `default_bundled_dir`), so tests that inject
+    /// explicit roots stay hermetic even when the var is exported.
     pub(crate) fn new(user_dir: Option<PathBuf>, bundled_dir: Option<PathBuf>) -> Self {
-        if let Some(dir) = replacement_dir(std::env::var_os(REPLACEMENT_DIR_ENV)) {
-            return Self::with_base_replacement(user_dir, dir);
+        if bundled_dir.is_none() {
+            if let Some(dir) = replacement_dir(std::env::var_os(REPLACEMENT_DIR_ENV)) {
+                return Self::with_base_replacement(user_dir, dir);
+            }
         }
         Self {
             user_dir: user_dir.or_else(default_user_dir),
@@ -673,13 +678,14 @@ impl SpecialistsService {
     }
 
     /// Build the service with the base tier wholesale-replaced by `dir`
-    /// ([`REPLACEMENT_DIR_ENV`]): the embedded bundle and the bundled
+    /// (the effective `specialists.dir` setting — [`REPLACEMENT_DIR_ENV`]
+    /// startup pin or config.toml): the embedded bundle and the bundled
     /// directory are excluded, and `dir` is the sole base (`bundled`,
     /// read-only) tier — a missing/empty `dir` yields an empty base tier.
     /// The user/project tiers fold on top unchanged. Split out of
     /// [`Self::new`] so tests cover replacement hermetically, without
     /// mutating process-global env.
-    fn with_base_replacement(user_dir: Option<PathBuf>, dir: PathBuf) -> Self {
+    pub(crate) fn with_base_replacement(user_dir: Option<PathBuf>, dir: PathBuf) -> Self {
         Self {
             user_dir: user_dir.or_else(default_user_dir),
             bundled_dir: Some(dir),

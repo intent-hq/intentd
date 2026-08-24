@@ -417,6 +417,103 @@ async fn embedded_bundled_catalog_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for the base-tier replacement (`INTENTD_SPECIALISTS_DIR`): with the
+/// startup pin set, `specialist.list` over the real WSS transport returns only
+/// the replacement directory's specialists (as `bundled`) plus user-tier
+/// folds — none of the eight embedded ids survive — and the pin surfaces as
+/// the read-only `specialists.dir` setting.
+#[tokio::test]
+async fn specialists_replacement_dir_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // The replacement base tier: a single specialist, nothing else survives.
+    let replacement_dir = data_dir.join("replacement-specialists");
+    std::fs::create_dir_all(&replacement_dir).expect("mkdir replacement dir");
+    std::fs::write(
+        replacement_dir.join("solo.md"),
+        "---\nname: \"Solo\"\ndescription: \"Replacement base\"\n---\n\nSolo body.",
+    )
+    .expect("write replacement solo");
+
+    // A user-tier specialist still folds on top of the replacement.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("extra.md"),
+        "---\nname: \"Extra\"\ndescription: \"User tier\"\n---\n\nExtra body.",
+    )
+    .expect("write user extra");
+
+    let replacement_dir_str = replacement_dir
+        .to_str()
+        .expect("replacement dir to str")
+        .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_SPECIALISTS_DIR", &replacement_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // list — exactly the replacement base + the user fold; no embedded ids.
+    let list = wss_rpc(&mut ws, 2, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let mut ids: Vec<&str> = specs
+        .iter()
+        .map(|s| s["id"].as_str().expect("specialist id"))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["extra", "solo"],
+        "replacement dir excludes every embedded specialist over WSS"
+    );
+    let solo = specs.iter().find(|s| s["id"] == "solo").expect("solo");
+    assert_eq!(solo["source"], "bundled", "replacement is the base tier");
+    let extra = specs.iter().find(|s| s["id"] == "extra").expect("extra");
+    assert_eq!(extra["source"], "user", "user tier folds on top");
+
+    // get — a shipped id not restated in the replacement does not resolve.
+    let missing = wss_rpc_raw(&mut ws, 3, "specialist.get", json!({ "id": "developer" })).await;
+    assert!(
+        missing.get("error").is_some(),
+        "shipped id is gone under replacement: {missing}"
+    );
+
+    // The pin surfaces as the read-only specialists.dir setting.
+    let got = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({ "path": "specialists.dir" }),
+    )
+    .await;
+    assert_eq!(
+        got["value"],
+        json!(replacement_dir_str),
+        "specialists.dir reports the startup pin over WSS"
+    );
+
+    drop(daemon);
+}
+
 /// WSS e2e for config-scalar inheritance across tiers (PROTOCOL §5.11,
 /// monorepo#718): a user-tier override that omits `model`/`agentType`
 /// inherits the bundled tier's values on `specialist.get` and

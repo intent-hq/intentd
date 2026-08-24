@@ -863,7 +863,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
     let mut specialists_dir = string(
         "specialists.dir",
         "Specialists directory",
-        "Base specialist directory replacing the built-in set (set via the INTENTD_SPECIALISTS_DIR startup pin)",
+        "Base specialist directory replacing the built-in set (INTENTD_SPECIALISTS_DIR startup pin or config.toml; read-only on the wire)",
         "providers",
         None,
     );

@@ -128,8 +128,9 @@ pub struct SpecialistsSettings {
     /// `specialists.default` — specialist applied when none is chosen.
     pub default: Option<String>,
     /// `specialists.dir` — base specialist directory replacing the built-in
-    /// set. Read-only on the wire: it only takes a value via the
-    /// `INTENTD_SPECIALISTS_DIR` startup pin.
+    /// set. Read-only on the wire: it takes a value via the
+    /// `INTENTD_SPECIALISTS_DIR` startup pin (or `--specialists-dir`), else a
+    /// file-written `[specialists] dir` in config.toml.
     pub dir: Option<String>,
 }
 
