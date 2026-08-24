@@ -127,6 +127,10 @@ pub struct QuickActionsSettings {
 pub struct SpecialistsSettings {
     /// `specialists.default` — specialist applied when none is chosen.
     pub default: Option<String>,
+    /// `specialists.dir` — base specialist directory replacing the built-in
+    /// set. Read-only on the wire: it only takes a value via the
+    /// `INTENTD_SPECIALISTS_DIR` startup pin.
+    pub dir: Option<String>,
 }
 
 /// `[workspace]` — workspace/git-adjacent knobs (`workspace.*`).

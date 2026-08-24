@@ -74,6 +74,14 @@ enum Command {
         /// startup instead of waiting for `agent.resolveInterrupted` RPC.
         #[arg(long)]
         resume_all: bool,
+        /// Replace the base specialist tier with this directory: the embedded
+        /// bundle and the bundled `resources/specialists/` directory are
+        /// excluded and only specialists present here (plus user/project
+        /// overrides) exist. Also enabled by `INTENTD_SPECIALISTS_DIR`; the
+        /// flag wins. Pins the `specialists.dir` setting for the process
+        /// lifetime.
+        #[arg(long)]
+        specialists_dir: Option<std::path::PathBuf>,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -253,7 +261,8 @@ async fn async_main() -> ExitCode {
             mode,
             insecure,
             resume_all,
-        } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all).await),
+            specialists_dir,
+        } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all, specialists_dir).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
@@ -975,11 +984,24 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
+async fn cmd_serve(
+    mode: Option<&str>,
+    insecure: bool,
+    resume_all: bool,
+    specialists_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
     let insecure = insecure || env_flag("INTENTD_INSECURE");
+    // `--specialists-dir` and INTENTD_SPECIALISTS_DIR both replace the base
+    // specialist tier; the flag wins by overwriting the env var, which is the
+    // single seam `SpecialistsService::new` (and `apply_startup_pins` below)
+    // reads. Set before any service construction so every per-call service
+    // sees the replacement.
+    if let Some(dir) = specialists_dir {
+        std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
+    }
     // Resolve the optional locality override (§5.14): `--mode local|remote`
     // forces the value reported over `host.status` regardless of transport;
     // absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
@@ -3110,6 +3132,19 @@ fn apply_startup_pins(
             "INTENTD_WORKSPACES_DIR",
         )?;
     }
+    // The base-tier replacement directory (also settable via
+    // `--specialists-dir`, which `cmd_serve` folds into the env var before
+    // this runs). The empty string counts as unset, matching the specialists
+    // service's own read of the var.
+    if let Some(dir) =
+        std::env::var_os("INTENTD_SPECIALISTS_DIR").filter(|d| !d.as_os_str().is_empty())
+    {
+        pin(
+            "specialists.dir",
+            json!(dir.to_string_lossy()),
+            "INTENTD_SPECIALISTS_DIR",
+        )?;
+    }
     Ok(())
 }
 
@@ -5033,7 +5068,8 @@ fn report_config_status(config: &Config) {
     println!("[ok] config.toml parsed: {}", config.config_path.display());
     // Mirror `apply_startup_pins` exactly: a numeric env var only pins when
     // it parses (and `INTENTD_TCP_PORT=0` is the ephemeral-port seam, never a
-    // pin); the two path overrides pin whenever set.
+    // pin); the data/workspaces path overrides pin whenever set, and the
+    // specialists replacement dir only when non-empty.
     let tcp_port_pins = std::env::var("INTENTD_TCP_PORT")
         .ok()
         .and_then(|v| v.trim().parse::<u16>().ok())
@@ -5065,6 +5101,11 @@ fn report_config_status(config: &Config) {
             "INTENTD_WORKSPACES_DIR",
             "workspaces.root",
             std::env::var_os("INTENTD_WORKSPACES_DIR").is_some(),
+        ),
+        (
+            "INTENTD_SPECIALISTS_DIR",
+            "specialists.dir",
+            std::env::var_os("INTENTD_SPECIALISTS_DIR").is_some_and(|d| !d.is_empty()),
         ),
     ];
     let mut any = false;
