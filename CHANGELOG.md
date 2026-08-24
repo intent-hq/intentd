@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.54] - 2026-08-24
+
+### 🚀 Features
+
+- Add privacy-safe stream lifecycle telemetry ([#1352](https://github.com/intent-hq/intentd/pull/1352))
+
+
 ## [0.7.53] - 2026-08-24
 
 ### 📚 Documentation
