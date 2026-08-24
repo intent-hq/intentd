@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.50] - 2026-08-24
+
+### 🚀 Features
+
+- Specialist replacement directory at startup ([#1435](https://github.com/intent-hq/intentd/pull/1435))
+
+
 ## [0.7.49] - 2026-08-24
 
 ### 🚀 Features
