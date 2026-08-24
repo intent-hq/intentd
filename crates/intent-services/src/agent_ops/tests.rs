@@ -22092,6 +22092,41 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
     assert_eq!(persisted_queue(&svc, &target).await.len(), 2);
 }
 
+/// Soft-retire inertness: a session interrupted mid-turn and then retired
+/// must not be redriven via `resume_interrupted_agent` — the retired probe
+/// after the atomic claim rejects with the agent.restore hint, and the row
+/// resets to pending so the interruption stays resolvable after restore.
+#[tokio::test]
+async fn resume_interrupted_rejects_retired_session_and_resets_to_pending() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "RetiredInterrupted").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    let err = svc
+        .resume_interrupted_agent(&id)
+        .await
+        .expect_err("retired session must not be redriven");
+    assert!(
+        err.to_string().contains("retired"),
+        "error names the retired state: {err}"
+    );
+
+    // The claim was rolled back: the row is pending again, so a restore
+    // followed by a resume completes normally.
+    svc.agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    svc.resume_interrupted_agent(&id)
+        .await
+        .expect("resume after restore");
+}
+
 /// Resume appends the system interruption marker before the continuation, and
 /// the append is idempotent on retry: when a prior resume attempt already left
 /// the marker as the transcript tail (continuation delivery failed, row reset

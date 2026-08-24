@@ -8605,6 +8605,67 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     .expect("re-check drain delivers the raced wake without an organic kick");
 }
 
+/// Soft-retire wake gate: `deliver_wake_message` must not start a turn on a
+/// retired session — hook dispatches, PR-monitor wakes, and batch-delegate
+/// advisory wakes can all still target one (retiring cancels neither hooks
+/// nor monitors). An idle retired agent parks the wake in the queue
+/// (`retiredParked`), and `agent.restore`'s own drain kick delivers it.
+#[tokio::test]
+async fn retired_session_parks_wake_deliveries_until_restore() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-retired-wake");
+    let id = AgentId::from("a-retired-wake");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    services
+        .agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    // Idle agent + retired session: the wake queues instead of spawning a
+    // turn.
+    let out = services
+        .deliver_wake_message(&ws, &id, "[Background hook \"w\"] fired", None)
+        .await
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parks while retired");
+    assert_eq!(
+        out["retiredParked"],
+        json!(true),
+        "retired park is distinguishable from a plain busy-queue fallback"
+    );
+    assert!(!mgr.is_busy(&id), "no turn spawned while retired");
+    assert_eq!(
+        services.queue_snapshot(&id).len(),
+        1,
+        "wake queued behind the retired gate"
+    );
+
+    // Restore itself kicks the drain and delivers the parked wake.
+    services
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if services.queue_snapshot(&id).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restore's drain kick delivers the parked wake");
+}
+
 /// Regression (intent-hq/monorepo#2732): an AUTOMATIC `send_message` into an
 /// archived workspace must park in the queue — NOT claim the slot (whose
 /// `try_begin` would auto-unarchive the workspace). The workspace stays

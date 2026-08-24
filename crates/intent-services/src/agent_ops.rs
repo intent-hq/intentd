@@ -3886,6 +3886,20 @@ impl Services {
         .await;
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // Re-engage the queue parked by the retired gates (`try_drain_queue`
+        // / `deliver_wake_message`): nothing kicks the restored agent's drain
+        // organically, so without this a wake parked during retirement would
+        // stay stranded until someone happened to message the agent (mirrors
+        // `unarchive_workspace`'s kick). Best-effort: `try_drain_queue`
+        // re-checks its own gates (busy, question hold, Error park).
+        if let Some(manager) = self.agent_manager() {
+            if self.has_ready_to_send(&agent_id) {
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
+                    .await;
+            }
+        }
         Ok(json!({ "success": true, "restored": true }))
     }
 
@@ -10351,6 +10365,54 @@ impl Services {
                 }
             }
         }
+        // Soft-retire gate (mirrors the archived-workspace gate above): a
+        // wake must not start a turn on a retired session — hook dispatches,
+        // PR-monitor wakes, and batch-delegate advisory wakes can all still
+        // target one, since retiring does not cancel those sources. Park the
+        // wake in the queue; `agent.restore` returns the session to service
+        // and its drain kick delivers it. Fail open on a lookup error — the
+        // gate only parks affirmatively-retired sessions.
+        match self.store.get_agent_session_retired_at(agent_id).await {
+            Ok(Some(_)) => {
+                let (queued, position) = self.enqueue_message(
+                    agent_id,
+                    content.to_string(),
+                    None,
+                    None,
+                    message_metadata.cloned(),
+                    None,
+                    false,
+                );
+                let result = json!({
+                    "success": true,
+                    "queued": true,
+                    "retiredParked": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.publish_queue_updated(agent_id).await;
+                // Race close (retired-check → enqueue vs a concurrent
+                // `agent.restore`): the restore's drain kick may have fired
+                // against a still-empty queue before this enqueue landed,
+                // stranding the wake. Re-check and kick the drain if the
+                // session is no longer retired; the retired gate in
+                // `try_drain_queue` makes this a no-op while still retired.
+                if let Ok(None) = self.store.get_agent_session_retired_at(agent_id).await {
+                    manager
+                        .clone()
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+                return Ok(result);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "wake delivery: retired-state lookup failed; proceeding"
+                );
+            }
+        }
         // Runtime path (DELIV-1): two-step claim/persist/spawn so the
         // user-message row is on disk BEFORE the turn worker starts, and no
         // worker is ever spawned for a row that failed to persist:
@@ -12010,6 +12072,30 @@ impl Services {
                 );
             }
         };
+
+        // Soft-retire gate: a session interrupted mid-turn and then retired
+        // must not be redriven — retiring means nothing may start a turn on
+        // it. Probed AFTER the atomic claim so the check inherits its race
+        // protection; the row resets to pending so the interruption stays
+        // resolvable once `agent.restore` returns the session to service.
+        match self.store.get_agent_session_retired_at(agent_id).await {
+            Ok(Some(_)) => {
+                reset_to_pending().await;
+                return Err(Error::InvalidParams(format!(
+                    "agent {agent_id} is retired; restore it with agent.restore before resuming"
+                )));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Fail open, matching the drain/wake gates: the gate only
+                // parks affirmatively-retired sessions.
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "resume: retired-state lookup failed; proceeding"
+                );
+            }
+        }
 
         // Rehydrate delegation groups for this workspace (idempotent, best-effort).
         // Groups are sealed on rehydration since the original parent turn is gone.
