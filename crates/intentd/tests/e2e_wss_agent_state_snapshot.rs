@@ -726,3 +726,182 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         "gated session's tool still reports its subscription: {v2}"
     );
 }
+
+/// monorepo#3384: `runningSubAgents` through the production WSS/MCP path —
+/// the parent's `ws.agent.snapshot()` counts a delegated child only while it
+/// is genuinely in flight, and once the child's turn ends (status settles to
+/// idle) the field disappears. Pre-fix the count was backed by an
+/// unsettled-children blocklist, so the settled-idle poll below never
+/// converged: an idle child was reported as running forever.
+#[tokio::test]
+async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
+    const SPAWN_MARKER: &str = "SNAP3384_SPAWN_GO";
+    const CHILD_MARKER: &str = "SNAP3384_CHILD_GO";
+    let Some(script) = gate("runningSubAgents idle-child E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // The child's rule holds its turn open for a few seconds so the
+    // parent-bridge poll below observes the in-flight child deterministically.
+    let spawn_js = format!(
+        "const r = await ws.agent.create('SnapChild', '{CHILD_MARKER} do the work', \
+         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+    );
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            {
+                "ifPromptContains": SPAWN_MARKER,
+                "toolCalls": [{
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the child" },
+                }],
+                "response": "child spawned",
+            },
+            { "ifPromptContains": CHILD_MARKER, "delayMs": 3000, "response": "child done" },
+        ],
+        "response": "done",
+    })
+    .to_string();
+
+    let mut _daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("INTENTD_TCP_PORT", "0"),
+                ("MOCK_AGENT_SCRIPT_PATH", &script),
+                ("MOCK_AGENT_BEHAVIOR", &behavior),
+            ],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().expect("fp");
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(fp);
+
+    let mut sub = wss_connect(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        sub_resp["result"]["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = wss_connect(port, cfg.clone()).await;
+
+    // Plain-JSON tool bodies so the snapshot polls below parse as JSON.
+    let toon_off = wss_rpc(
+        &mut rpc,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspaceApi.toonOutput", "value": false }] }),
+    )
+    .await;
+    assert_eq!(
+        toon_off["result"]["applied"][0]["value"],
+        json!(false),
+        "toonOutput off: {toon_off}"
+    );
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "runningSubAgents WS",
+            "branch": "feat/running-sub-agents-e2e",
+            "idempotencyKey": "running-sub-agents-e2e-1",
+            "initialAgent": {
+                "prompt": "plain first turn",
+                "name": "SnapParent",
+                "model": "mock:default",
+            },
+        }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let parent = created["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
+    await_stream_end(&mut sub, &parent).await;
+
+    // The parent's bridge config, captured while it is the only agent.
+    let parent_configs = mcp_config_files(&data_dir);
+    assert_eq!(
+        parent_configs.len(),
+        1,
+        "one agent → one mcp config: {parent_configs:?}"
+    );
+    let mut bridge = BridgeClient::connect(&bridge_addr_from_config(&parent_configs[0])).await;
+
+    // Baseline: no children → the field is absent (omitted when zero).
+    let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!err, "snapshot baseline: {text}");
+    let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+    assert!(v.get("runningSubAgents").is_none(), "no children yet: {v}");
+
+    // Spawn the child; its held turn keeps it in flight for the poll below.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": parent,
+            "content": format!("go {SPAWN_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
+
+    // In flight: the parent's snapshot must count exactly the running child.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+        assert!(!err, "snapshot poll (in flight): {text}");
+        let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+        if v["runningSubAgents"] == json!(1) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "child never observed in flight: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Settled: once the child's turn ends it persists idle and must drop out
+    // of the count. Pre-fix this poll never converged — the idle child is
+    // non-terminal, so the unsettled blocklist kept reporting it as running.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
+        assert!(!err, "snapshot poll (settled): {text}");
+        let v: Value = serde_json::from_str(&text).expect("snapshot tool returns JSON");
+        if v.get("runningSubAgents").is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle child still counted as running: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
