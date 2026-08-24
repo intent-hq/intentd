@@ -475,8 +475,11 @@ async fn current_bind_address_value(socket: &Path) -> Option<serde_json::Value> 
 
 /// The effective `server.bindAddress` as a parsed address set: a string
 /// value yields one entry, the list form (monorepo#3314) all of them, in
-/// stored order. Empty when the RPC fails or nothing parses (callers treat
-/// that as "default: loopback").
+/// stored order. Entries are canonicalized (v4-mapped IPv6 → IPv4) to match
+/// the daemon-side `BindAddress::resolve`, so a persisted `::ffff:x.y.z.w`
+/// compares equal to its enumerated IPv4 twin instead of showing up as a
+/// duplicate picker entry. Empty when the RPC fails or nothing parses
+/// (callers treat that as "default: loopback").
 async fn current_bind_addresses(socket: &Path) -> Vec<std::net::IpAddr> {
     let Some(value) = current_bind_address_value(socket).await else {
         return Vec::new();
@@ -489,6 +492,7 @@ async fn current_bind_addresses(socket: &Path) -> Vec<std::net::IpAddr> {
     raw_entries
         .iter()
         .filter_map(|raw| raw.parse::<std::net::IpAddr>().ok())
+        .map(|addr| addr.to_canonical())
         .collect()
 }
 
@@ -629,10 +633,12 @@ fn resolve_bind_selection(
     indices: &[usize],
 ) -> Result<Vec<std::net::IpAddr>, String> {
     let addrs: Vec<std::net::IpAddr> = indices.iter().map(|&i| choices[i].addr).collect();
-    if addrs.len() > 1 && addrs.iter().any(std::net::IpAddr::is_unspecified) {
-        return Err(
-            "0.0.0.0 (all interfaces) already covers every address — select it alone".to_string(),
-        );
+    if addrs.len() > 1 {
+        if let Some(wide) = addrs.iter().find(|a| a.is_unspecified()) {
+            return Err(format!(
+                "{wide} (all interfaces) already covers every address — select it alone"
+            ));
+        }
     }
     Ok(addrs)
 }
@@ -671,7 +677,10 @@ fn prompt_bind_addresses(current: &[std::net::IpAddr]) -> anyhow::Result<Vec<std
         let mark = if default_set.contains(&i) { "x" } else { " " };
         eprintln!("  {}) [{mark}] {}", i + 1, choice.label);
     }
-    eprintln!("Enter numbers separated by commas (e.g. 1,3); 0.0.0.0 must be selected alone.");
+    eprintln!(
+        "Enter numbers separated by commas (e.g. 1,3), or press Enter to keep the current \
+         selection; an all-interfaces address (0.0.0.0 / ::) must be selected alone."
+    );
     let default_display = default_set
         .iter()
         .map(|i| (i + 1).to_string())
@@ -5599,9 +5608,46 @@ mod tests {
             resolve_bind_selection(&choices, &[2]).unwrap(),
             vec!["0.0.0.0".parse::<std::net::IpAddr>().unwrap()]
         );
-        // …but cannot be mixed with specific IPs (either order).
-        assert!(resolve_bind_selection(&choices, &[0, 2]).is_err());
+        // …but cannot be mixed with specific IPs (either order), and the
+        // re-prompt names the offending entry.
+        let err = resolve_bind_selection(&choices, &[0, 2]).unwrap_err();
+        assert!(err.contains("0.0.0.0"), "should name the wide entry: {err}");
         assert!(resolve_bind_selection(&choices, &[2, 1]).is_err());
+
+        // A merged IPv6 unspecified entry (persisted `::`, accepted by the
+        // daemon schema) is equally exclusive, and the message names it
+        // rather than hardcoding 0.0.0.0.
+        let with_v6_wide = merge_current_into_bind_choices(
+            build_bind_choices(&[("lo".to_string(), std::net::Ipv4Addr::LOCALHOST)]),
+            &["::".parse::<std::net::IpAddr>().unwrap()],
+        );
+        let v6_wide_idx = with_v6_wide
+            .iter()
+            .position(|c| c.addr.is_unspecified() && c.addr.is_ipv6())
+            .expect("merged :: entry");
+        let err = resolve_bind_selection(&with_v6_wide, &[0, v6_wide_idx]).unwrap_err();
+        assert!(err.contains("::"), "should name the v6 wide entry: {err}");
+    }
+
+    #[test]
+    fn canonicalized_v4_mapped_entry_equals_its_ipv4_twin() {
+        // `current_bind_addresses` canonicalizes parsed entries the way the
+        // daemon-side BindAddress::resolve does: a persisted
+        // `::ffff:192.168.1.5` must compare equal to the enumerated IPv4
+        // twin, so the picker neither duplicates the entry nor treats
+        // re-selecting the twin as a change.
+        let mapped: std::net::IpAddr = "::ffff:192.168.1.5".parse().unwrap();
+        let v4: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+        assert_ne!(mapped, v4);
+        assert_eq!(mapped.to_canonical(), v4);
+        assert!(same_addr_set(&[mapped.to_canonical()], &[v4]));
+        // Merging the canonicalized set into choices that already list the
+        // IPv4 twin adds nothing.
+        let base =
+            build_bind_choices(&[("eth0".to_string(), std::net::Ipv4Addr::new(192, 168, 1, 5))]);
+        let base_len = base.len();
+        let merged = merge_current_into_bind_choices(base, &[mapped.to_canonical()]);
+        assert_eq!(merged.len(), base_len);
     }
 
     #[test]

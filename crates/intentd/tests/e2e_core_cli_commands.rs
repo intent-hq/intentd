@@ -729,6 +729,11 @@ async fn pair_select_endpoints_rebinds_without_repairing() {
 
     // Selecting entry 1 (loopback) replaces the wide bind: persisted as a
     // plain string (single entry) and the listener re-binds immediately.
+    // The e2e matrix deliberately never persists a multi-IP selection: the
+    // only universally bindable addresses are loopback and 0.0.0.0, which
+    // cannot combine (exclusive), so an array-shape e2e would be
+    // machine-dependent. The persisted array shape is unit-covered
+    // (bind_addresses_value) and the daemon's array handling by #1431.
     let output = run_select_endpoints(&data_dir, "1\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
