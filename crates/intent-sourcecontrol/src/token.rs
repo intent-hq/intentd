@@ -350,17 +350,48 @@ fn interpret_gh_output(gh: &Path, output: std::io::Result<std::process::Output>)
     }
 }
 
-/// Locate the `gh` binary: inherited PATH plus common install locations
-/// (`/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `~/.local/bin`,
-/// login-shell PATH dirs, …) via [`intent_core::path_utils::enhanced_path_dirs`].
-/// A daemon launched by launchd/systemd inherits a minimal PATH that often
-/// lacks `gh` even though interactive shells find it (monorepo#3321). Shared
-/// with [`crate::gh_sync`] so every `gh` lookup in this crate agrees.
+/// Locate the `gh` binary. A daemon launched by launchd/systemd inherits a
+/// minimal PATH that often lacks `gh` even though interactive shells find it
+/// (monorepo#3321). Two phases, cheapest first:
+///
+/// 1. Inherited PATH plus well-known install directories ([`fast_gh_dirs`]) —
+///    never blocks, and covers virtually every real install.
+/// 2. The full [`intent_core::path_utils::enhanced_path_dirs`] list — this
+///    can pay the one-time cold login-shell PATH capture (up to ~5s per shell
+///    attempt when the startup prewarm has not finished), so it only runs
+///    when phase 1 misses; a cold daemon still resolves `/usr/bin`-style
+///    installs instantly, inside [`GH_CLI_TIMEOUT`].
+///
+/// Shared with [`crate::gh_sync`] so every `gh` lookup in this crate agrees.
 pub(crate) fn find_gh_binary() -> Option<PathBuf> {
-    find_gh_in_dirs_for(
-        &intent_core::path_utils::enhanced_path_dirs(),
-        cfg!(windows),
-    )
+    let is_windows = cfg!(windows);
+    find_gh_in_dirs_for(&fast_gh_dirs(), is_windows)
+        .or_else(|| find_gh_in_dirs_for(&intent_core::path_utils::enhanced_path_dirs(), is_windows))
+}
+
+/// Phase-1 directory list: inherited PATH entries, then the well-known unix
+/// install locations from monorepo#3321 (`/usr/local/bin`, `/opt/homebrew/bin`,
+/// `/usr/bin`, `~/.local/bin`), deduplicated. Pure env/filesystem — never
+/// spawns the login-shell probe.
+fn fast_gh_dirs() -> Vec<PathBuf> {
+    use intent_core::path_utils::push_dir;
+    use std::collections::HashSet;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            push_dir(&mut dirs, &mut seen, dir);
+        }
+    }
+    if !cfg!(windows) {
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin"] {
+            push_dir(&mut dirs, &mut seen, PathBuf::from(dir));
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            push_dir(&mut dirs, &mut seen, PathBuf::from(home).join(".local/bin"));
+        }
+    }
+    dirs
 }
 
 /// [`find_gh_binary`] parametrized on the directory list and platform (test
