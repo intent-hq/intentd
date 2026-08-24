@@ -148,7 +148,7 @@ async fn start_server() -> (WsApiServer, u16, Arc<ClientConfig>, tempfile::TempD
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");

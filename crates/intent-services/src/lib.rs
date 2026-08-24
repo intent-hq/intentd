@@ -11219,7 +11219,20 @@ impl Services {
                         }
                     }
                     "server.bindAddress" => {
-                        if let Some(addr) = change.get("value").and_then(|v| v.as_str()) {
+                        // String or array of strings (monorepo#3314); render
+                        // one comma-joined form for the log lines.
+                        let addr = match change.get("value") {
+                            Some(serde_json::Value::String(s)) => Some(s.clone()),
+                            Some(serde_json::Value::Array(items)) => Some(
+                                items
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(addr) = addr {
                             // Check if listener is running
                             if control.ws_listener_port().await.is_some() {
                                 // Listener is running: restart it on the new

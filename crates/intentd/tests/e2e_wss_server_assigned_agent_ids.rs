@@ -57,7 +57,7 @@ async fn boot() -> Fixture {
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         ..Default::default()
     };
     let ws = WsApiServer::new_insecure(api, bus, opts, None);

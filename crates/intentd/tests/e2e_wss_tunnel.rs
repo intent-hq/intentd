@@ -157,7 +157,7 @@ async fn start_with(limits: TunnelLimits) -> Server {
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
-        bind_address: Ipv4Addr::LOCALHOST.into(),
+        bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         tunnel_limits: limits,
         ..WsOptions::default()
     };

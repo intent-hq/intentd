@@ -402,13 +402,14 @@ async fn enable_wss_listener(
             rpc_error_text(error)
         );
     }
-    // Name the address the listener now binds so an unattended run still
+    // Name the address(es) the listener now binds so an unattended run still
     // reports the effective posture (default: loopback) and how to widen it.
+    // The list form (monorepo#3314) is reported in full, comma-separated.
     let effective = match bind_address {
         Some(addr) => addr.to_string(),
-        None => current_bind_address(socket)
+        None => current_bind_addresses_display(socket)
             .await
-            .map_or_else(|| "127.0.0.1".to_string(), |a| a.to_string()),
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
     };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
@@ -419,9 +420,9 @@ async fn enable_wss_listener(
     Ok(())
 }
 
-/// Read the effective `server.bindAddress` over UDS; `None` when the RPC
-/// fails or the value is not a parseable IP (callers fall back to loopback).
-async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
+/// Read the raw effective `server.bindAddress` value over UDS; `None` when
+/// the RPC fails (callers fall back to loopback).
+async fn current_bind_address_value(socket: &Path) -> Option<serde_json::Value> {
     let response = rpc_call(
         socket,
         "settings.get",
@@ -429,7 +430,27 @@ async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
     )
     .await
     .ok()?;
-    response["result"]["value"].as_str()?.parse().ok()
+    let value = response["result"]["value"].clone();
+    (!value.is_null()).then_some(value)
+}
+
+/// Display form of the effective `server.bindAddress` for user-facing
+/// output: a single IP as-is, the list form (monorepo#3314) joined with
+/// ", " so every bound address is reported, not just the first.
+async fn current_bind_addresses_display(socket: &Path) -> Option<String> {
+    let value = current_bind_address_value(socket).await?;
+    if let Some(raw) = value.as_str() {
+        return Some(raw.to_string());
+    }
+    let entries: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(entries.join(", "))
 }
 
 /// One selectable entry in the `intentd pair` bind-address picker.
@@ -580,8 +601,38 @@ async fn cmd_pair(
                      config.toml"
                 );
             }
-            let current = current_bind_address(&config.socket_path).await;
-            Some(prompt_bind_address(current)?)
+            // The picker is single-select; a configured list (monorepo#3314)
+            // pre-selects its first entry. Guard against silent data loss:
+            // confirming that default keeps the list untouched (no write),
+            // and choosing anything else warns that it replaces the set.
+            let current_value = current_bind_address_value(&config.socket_path).await;
+            let current_list: Vec<String> = current_value
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|e| e.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let current = current_value
+                .as_ref()
+                .and_then(|v| v.as_str().or_else(|| v.get(0)?.as_str()))
+                .and_then(|raw| raw.parse::<std::net::IpAddr>().ok());
+            if current_list.len() > 1 {
+                eprintln!(
+                    "note: server.bindAddress is a list ([{}]); picking an address here \
+                     replaces the whole list, while confirming the default keeps it.",
+                    current_list.join(", ")
+                );
+            }
+            let choice = prompt_bind_address(current)?;
+            if current_list.len() > 1 && Some(choice) == current {
+                None
+            } else {
+                Some(choice)
+            }
         };
         enable_wss_listener(&config.socket_path, bind_address).await?;
         response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
@@ -1570,22 +1621,27 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
     // Apply the effective server.bindAddress (default 127.0.0.1 — loopback;
-    // monorepo#2900). An unparseable persisted value falls back to loopback
-    // with a warning rather than silently widening the bind (defense in
-    // depth — SettingsFile::validate rejects non-IP values at load time).
-    if let Ok(addr) = boot_settings.effective.server.bind_address.parse() {
-        ws_options.bind_address = addr;
-    } else {
-        tracing::warn!(
+    // monorepo#2900). A single IP or a list of IPs (one listener per address,
+    // same port; monorepo#3314). An invalid persisted set falls back to
+    // loopback with a warning rather than silently widening the bind (defense
+    // in depth — SettingsFile::validate rejects invalid sets at load time).
+    match boot_settings.effective.server.bind_address.resolve() {
+        Ok(addrs) => ws_options.bind_addresses = addrs,
+        Err(msg) => tracing::warn!(
             value = %boot_settings.effective.server.bind_address,
-            "server.bindAddress is not a valid IP address; binding loopback (127.0.0.1)"
-        );
+            "server.bindAddress is invalid ({msg}); binding loopback (127.0.0.1)"
+        ),
     }
     // Loud upgrade-path warning (monorepo#2900): the old config template wrote
     // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
     // file-origin wide bind that predates the loopback default. When that wide
     // bind will actually be served (listener enabled), say so prominently.
-    if ws_options.bind_address.is_unspecified()
+    // Fires only when the effective set contains an unspecified address —
+    // which the settings validation constrains to being the sole entry.
+    if ws_options
+        .bind_addresses
+        .iter()
+        .any(std::net::IpAddr::is_unspecified)
         && boot_settings.effective.server.ws_api.enabled
         && !insecure
     {
@@ -1616,7 +1672,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let (tls_cert, token_store) = if insecure {
         tracing::warn!(
             "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
-            ws_options.bind_address,
+            ws_options
+                .bind_addresses
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
             ws_options.base_port
         );
         (None, None)
@@ -1642,7 +1703,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         state: tokio::sync::Mutex::new(WsRuntimeState {
             ws_server: None,
             port: None,
-            bind_address: None,
+            bind_addresses: None,
         }),
         control: std::sync::OnceLock::new(),
     });
@@ -1765,7 +1826,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             let mut state = runtime.state.lock().await;
             state.ws_server = Some(server);
             state.port = Some(port);
-            state.bind_address = Some(ws_options.bind_address);
+            state.bind_addresses = Some(ws_options.bind_addresses.clone());
         }
     }
 
@@ -2626,9 +2687,10 @@ struct WsRuntimeState {
     ws_server: Option<WsApiServer>,
     /// Cached port for sync system.status access
     port: Option<u16>,
-    /// Address the running listener is bound to (`server.bindAddress`) so
-    /// pairing surfaces advertise the reachable host(s), not all local IPs.
-    bind_address: Option<std::net::IpAddr>,
+    /// Address set the running listener is bound to (`server.bindAddress`;
+    /// one listener per address) so pairing surfaces advertise the reachable
+    /// host(s), not all local IPs.
+    bind_addresses: Option<Vec<std::net::IpAddr>>,
 }
 
 /// Pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
@@ -2653,7 +2715,7 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
             let state = self.ws_runtime.state.lock().await;
             intent_transport::PairingSnapshot {
                 port: state.port,
-                bind_address: state.bind_address,
+                bind_addresses: state.bind_addresses.clone(),
             }
         })
     }
@@ -2878,32 +2940,43 @@ impl intent_core::ServerControl for DaemonControl {
                 runtime.ws_options.base_port,
             );
 
-            // Read the persisted bind address (server.bindAddress) so a value
-            // changed since boot applies on the next listener start. An invalid
-            // value is a hard error naming the setting — never silently bind a
-            // different address than the user configured.
-            let bind_address = match runtime
+            // Read the persisted bind address set (server.bindAddress — a
+            // single IP string or a list of IP strings; monorepo#3314) so a
+            // value changed since boot applies on the next listener start. An
+            // invalid value is a hard error naming the setting — never
+            // silently bind a different address set than the user configured.
+            let bind_addresses = match runtime
                 .api
                 .settings_get("server.bindAddress".to_string())
                 .await
             {
-                Ok(result) => match result.get("value").and_then(|v| v.as_str()) {
-                    Some(raw) => Some(raw.parse::<std::net::IpAddr>().map_err(|_| {
-                        intent_core::Error::InvalidParams(format!(
-                            "server.bindAddress {raw:?} is not a valid IP address — fix it in \
-                             config.toml ([server] bindAddress) or via settings"
-                        ))
-                    })?),
-                    None => None,
+                Ok(result) => match result.get("value") {
+                    Some(raw @ (serde_json::Value::String(_) | serde_json::Value::Array(_))) => {
+                        let parsed: intent_core::settings_file::BindAddress =
+                            serde_json::from_value(raw.clone()).map_err(|_| {
+                                intent_core::Error::InvalidParams(format!(
+                                    "server.bindAddress {raw} is not an IP string or an array of \
+                                     IP strings — fix it in config.toml ([server] bindAddress) \
+                                     or via settings"
+                                ))
+                            })?;
+                        Some(parsed.resolve().map_err(|msg| {
+                            intent_core::Error::InvalidParams(format!(
+                                "server.bindAddress {raw}: {msg} — fix it in config.toml \
+                                 ([server] bindAddress) or via settings"
+                            ))
+                        })?)
+                    }
+                    _ => None,
                 },
                 Err(_) => None,
             }
-            .unwrap_or(runtime.ws_options.bind_address);
+            .unwrap_or_else(|| runtime.ws_options.bind_addresses.clone());
 
-            // Clone ws_options and override the port + bind address
+            // Clone ws_options and override the port + bind address set
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
-            ws_options.bind_address = bind_address;
+            ws_options.bind_addresses = bind_addresses.clone();
 
             // Build a fresh WsApiServer and start it. The control is populated via
             // OnceLock after DaemonControl construction (breaking the circular Arc).
@@ -2952,18 +3025,20 @@ impl intent_core::ServerControl for DaemonControl {
             }
 
             let port = server.start().await.map_err(|e| {
-                // Map bind failures to friendly, actionable error messages
-                let error_kind = e.kind();
-                let error_msg = if error_kind == std::io::ErrorKind::AddrInUse {
+                // Map bind failures to friendly, actionable error messages.
+                // The bind is all-or-nothing across the configured set, and
+                // the transport error names the failing address:port — keep
+                // it so a partial multi-bind failure (or a port-0 run) stays
+                // diagnosable, and add the actionable guidance.
+                let error_msg = if e.kind() == std::io::ErrorKind::AddrInUse {
                     format!(
-                        "Port {desired_port} is already in use — choose a different port or stop the process using it"
+                        "Address already in use ({e}) — choose a different port or stop the process using it"
                     )
                 } else {
-                    // Other bind errors: name the address (server.bindAddress)
-                    // + port and include the OS error text
-                    format!(
-                        "failed to bind {bind_address}:{desired_port} (server.bindAddress): {e}"
-                    )
+                    // Other bind errors: name the setting (server.bindAddress)
+                    // and include the OS error text (which carries the
+                    // failing address:port).
+                    format!("failed to bind (server.bindAddress): {e}")
                 };
                 intent_core::Error::Internal(error_msg)
             })?;
@@ -2973,7 +3048,7 @@ impl intent_core::ServerControl for DaemonControl {
                 let mut state = runtime.state.lock().await;
                 state.ws_server = Some(server);
                 state.port = Some(port);
-                state.bind_address = Some(bind_address);
+                state.bind_addresses = Some(bind_addresses);
             }
 
             Ok(port)
@@ -2989,7 +3064,7 @@ impl intent_core::ServerControl for DaemonControl {
             let server = {
                 let mut state = runtime.state.lock().await;
                 state.port = None;
-                state.bind_address = None;
+                state.bind_addresses = None;
                 state.ws_server.take()
             };
 

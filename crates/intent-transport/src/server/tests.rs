@@ -48,7 +48,7 @@ impl ServerPairingInfo for MockPairingInfo {
         Box::pin(async move {
             PairingSnapshot {
                 port,
-                bind_address: None,
+                bind_addresses: None,
             }
         })
     }
@@ -214,10 +214,26 @@ fn pairing_hosts_specific_bind_advertises_only_that_address() {
     for addr in ["127.0.0.1", "192.168.1.23"] {
         let snapshot = PairingSnapshot {
             port: Some(5181),
-            bind_address: Some(addr.parse().unwrap()),
+            bind_addresses: Some(vec![addr.parse().unwrap()]),
         };
         assert_eq!(pairing_hosts(&snapshot), vec![addr.to_string()]);
     }
+}
+
+#[test]
+fn pairing_hosts_multi_bind_advertises_every_address() {
+    // A list bind (monorepo#3314) is reachable on exactly its entries.
+    let snapshot = PairingSnapshot {
+        port: Some(5181),
+        bind_addresses: Some(vec![
+            "192.168.1.23".parse().unwrap(),
+            "100.64.0.3".parse().unwrap(),
+        ]),
+    };
+    assert_eq!(
+        pairing_hosts(&snapshot),
+        vec!["192.168.1.23".to_string(), "100.64.0.3".to_string()]
+    );
 }
 
 #[test]
@@ -228,11 +244,11 @@ fn pairing_hosts_unspecified_or_unknown_bind_enumerates_local_ips() {
     // machine's interfaces vary.
     let unspecified = PairingSnapshot {
         port: Some(5181),
-        bind_address: Some("0.0.0.0".parse().unwrap()),
+        bind_addresses: Some(vec!["0.0.0.0".parse().unwrap()]),
     };
     let unknown = PairingSnapshot {
         port: Some(5181),
-        bind_address: None,
+        bind_addresses: None,
     };
     assert_eq!(pairing_hosts(&unspecified), collect_local_ips());
     assert_eq!(pairing_hosts(&unknown), collect_local_ips());
@@ -245,7 +261,7 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
     // prefix). A SPECIFIC v6 bind still advertises exactly that address.
     let v6_unspecified = PairingSnapshot {
         port: Some(5181),
-        bind_address: Some("::".parse().unwrap()),
+        bind_addresses: Some(vec!["::".parse().unwrap()]),
     };
     let hosts = pairing_hosts(&v6_unspecified);
     let v4 = collect_local_ips();
@@ -260,7 +276,7 @@ fn pairing_hosts_v6_unspecified_bind_includes_v4_and_specific_v6_stays_exact() {
 
     let v6_specific = PairingSnapshot {
         port: Some(5181),
-        bind_address: Some("2001:db8::7".parse().unwrap()),
+        bind_addresses: Some(vec!["2001:db8::7".parse().unwrap()]),
     };
     assert_eq!(pairing_hosts(&v6_specific), vec!["2001:db8::7".to_string()]);
 }
