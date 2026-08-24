@@ -32,10 +32,14 @@ pub(crate) const PRELUDE: &str = r"
         create: (name, message, opts) =>
             host({ method: 'agent.create', args: { name, message, ...(opts || {}) } }),
         delegate: (opts) => host({ method: 'agent.delegate', args: { ...(opts || {}) } }),
-        send: (agentId, message, priority, messageMetadata) =>
-            host({ method: 'agent.send', args: { agentId, message, priority, messageMetadata } }),
-        sendToTask: (taskNoteId, message, priority, messageMetadata) =>
-            host({ method: 'agent.sendToTask', args: { taskNoteId, message, priority, messageMetadata } }),
+        send: (agentId, message, priority, messageMetadata) => {
+            const opts = priority !== null && typeof priority === 'object' ? priority : { priority };
+            return host({ method: 'agent.send', args: { agentId, message, messageMetadata, ...opts } });
+        },
+        sendToTask: (taskNoteId, message, priority, messageMetadata) => {
+            const opts = priority !== null && typeof priority === 'object' ? priority : { priority };
+            return host({ method: 'agent.sendToTask', args: { taskNoteId, message, messageMetadata, ...opts } });
+        },
         subscribe: (eventTypes, opts) =>
             host({ method: 'agent.subscribe', args: { eventTypes, ...(opts || {}) } }),
         unsubscribe: (subscriptionId) =>
@@ -330,7 +334,10 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// `ws.agent.send`. Guarded by the single-pending-message rule: when the
 /// caller (an agent) already has a pending entry in the target's queue, the
 /// send is refused with an `ok: false` result echoing the target's queue —
-/// see [`pending_send_refusal`]. Success results carry a top-level
+/// see [`pending_send_refusal`]. `replacePending: true` (options-object third
+/// argument) turns the refusal into a replace: the pending entry is retracted
+/// ([`replace_pending_entry`]) and the send proceeds, reporting the replace
+/// outcome on the result. Success results carry a top-level
 /// `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
 /// silently-queued is unambiguous even to a sender that only glances at
 /// the result.
@@ -343,8 +350,17 @@ async fn send(
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
+    let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
+    let mut replace_report: Option<Value> = None;
     if let Some(refusal) = pending_send_refusal(api, ws, caller, &agent_id).await {
-        return Ok(refusal);
+        if !replace_pending {
+            return Ok(refusal);
+        }
+        if let Some(caller) = caller {
+            replace_report = Some(replace_pending_entry(api, caller, &agent_id, &refusal).await);
+        }
+    } else if replace_pending && caller.is_some() {
+        replace_report = Some(json!({ "replaced": false, "replaceOutcome": "none" }));
     }
     let mut result = api
         .agent_send_message(
@@ -373,6 +389,7 @@ async fn send(
         if let Some(delivery) = delivery_outcome(obj) {
             obj.insert("delivery".to_string(), json!(delivery));
         }
+        merge_replace_report(obj, replace_report);
     }
     Ok(out)
 }
@@ -380,7 +397,8 @@ async fn send(
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
 /// applied against the task's assigned agent (resolution failures fall
 /// through so the unguarded call surfaces its existing error/`ok: false`
-/// shapes — e.g. "No agent assigned to task"), and the same top-level
+/// shapes — e.g. "No agent assigned to task"), the same `replacePending`
+/// replace path, and the same top-level
 /// `delivery` outcome on success ([`delivery_outcome`] — the op nests its
 /// flags under `result`). The guard's target resolution
 /// (`task.assigned_agents.first()`) deliberately mirrors
@@ -396,17 +414,25 @@ async fn send_to_task(
     let task_note_id =
         req_str(args, "taskNoteId").map_err(|_| "taskNoteId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
-    if caller.is_some() {
+    let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
+    let mut replace_report: Option<Value> = None;
+    if let Some(caller_id) = caller {
         if let Ok(task) = api
             .get_my_task(ws.clone(), NoteId::from_string(&task_note_id))
             .await
         {
             if let Some(target) = task.assigned_agents.first() {
                 if let Some(mut refusal) = pending_send_refusal(api, ws, caller, target).await {
-                    if let Some(obj) = refusal.as_object_mut() {
-                        obj.insert("taskNoteId".to_string(), json!(task_note_id));
+                    if !replace_pending {
+                        if let Some(obj) = refusal.as_object_mut() {
+                            obj.insert("taskNoteId".to_string(), json!(task_note_id));
+                        }
+                        return Ok(refusal);
                     }
-                    return Ok(refusal);
+                    replace_report =
+                        Some(replace_pending_entry(api, caller_id, target, &refusal).await);
+                } else if replace_pending {
+                    replace_report = Some(json!({ "replaced": false, "replaceOutcome": "none" }));
                 }
             }
         }
@@ -437,6 +463,7 @@ async fn send_to_task(
         if let Some(delivery) = delivery_outcome(obj) {
             obj.insert("delivery".to_string(), json!(delivery));
         }
+        merge_replace_report(obj, replace_report);
     }
     Ok(out)
 }
@@ -890,8 +917,8 @@ async fn fetch_presented_queue(
 /// unmissable `refused: true` discriminator, an `error` naming the rule,
 /// target's presented queue (drain order, [`truncate_entry_content`]'d), the
 /// caller's pending entry id, and the instruction to either keep the existing
-/// entry or remove it and re-send one combined message (which lands at the
-/// end of the queue). Returns `None` when the guard does not apply: no agent
+/// entry or re-send one combined message with `replacePending: true` (which
+/// lands at the end of the queue). Returns `None` when the guard does not apply: no agent
 /// caller identity (user/FE-origin sends are never guarded), the queue could
 /// not be fetched (fall through so the unguarded send surfaces its existing
 /// error shapes — e.g. the monorepo#564 unknown-id `-32602`), or the caller
@@ -923,8 +950,49 @@ async fn pending_send_refusal(
         "pendingMessageId": pending_id,
         "queueLength": queue_length,
         "queue": queue,
-        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or remove it with ws.agent.removeQueuedMessage(agentId, messageId) and re-send ONE message combining everything you want to say. Notes: remove + re-send is NOT atomic — the pending entry may deliver in between, so re-check ws.agent.getQueue if the removal fails — and a re-sent message lands at the END of the queue.",
+        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or re-send ONE message combining everything you want to say with `replacePending: true` in the options-object third argument — it atomically retracts your pending entry and sends the new message in a single call (degrading gracefully to a plain send when the entry drains in between; the result reports `replaced`/`replaceOutcome`). Manual removeQueuedMessage + re-send still works but is NOT atomic. Either way the re-sent message lands at the END of the queue.",
     }))
+}
+
+/// Execute the `replacePending` retraction against the pending entry named
+/// by a [`pending_send_refusal`] result, returning the replace-report
+/// fragment merged into the send result by [`merge_replace_report`].
+/// Retraction success → `replaced: true` + `replacedMessageId`; retraction
+/// failure (entry already drained/delivered between the guard check and the
+/// removal, or any other removal error) degrades gracefully to a plain send
+/// with `replaced: false` + `replaceOutcome: "drained"` — the new message is
+/// sent either way, so the caller never has to re-drive the sequence.
+async fn replace_pending_entry(
+    api: &Arc<dyn WorkspaceApi>,
+    caller: &AgentId,
+    target: &AgentId,
+    refusal: &Value,
+) -> Value {
+    let pending_id = refusal
+        .get("pendingMessageId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match api
+        .agent_remove_queued_message_owned(target.clone(), pending_id.clone(), caller.clone())
+        .await
+    {
+        Ok(_) => json!({ "replaced": true, "replacedMessageId": pending_id }),
+        Err(_) => json!({ "replaced": false, "replaceOutcome": "drained" }),
+    }
+}
+
+/// Merge a [`replace_pending_entry`] report (or the no-pending-entry
+/// `replaceOutcome: "none"` fragment) into a send result. `replaced: true`
+/// carries `replacedMessageId`; `replaced: false` carries `replaceOutcome`
+/// (`"drained"` — the entry delivered before it could be retracted — or
+/// `"none"` — there was nothing to replace).
+fn merge_replace_report(obj: &mut serde_json::Map<String, Value>, report: Option<Value>) {
+    if let Some(Value::Object(report)) = report {
+        for (k, v) in report {
+            obj.insert(k, v);
+        }
+    }
 }
 
 /// Classify a successful send result into the top-level `delivery` outcome:

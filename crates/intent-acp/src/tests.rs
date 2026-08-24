@@ -8145,8 +8145,8 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result, WorkspaceApi,
-        WorkspaceId,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result,
+        TaskGetMyTaskResult, TaskMetadata, TaskStatus, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -8180,6 +8180,13 @@ mod wsapi4_bindings_tests {
         /// Raw `agent.getQueue` entries served by `agent_get_queue`.
         queue_entries: Mutex<Vec<Value>>,
         remove_queued_owned_calls: Mutex<Vec<(String, String, String)>>,
+        /// When set, `agent_remove_queued_message_owned` fails with this
+        /// error (replacePending drained-race path).
+        remove_queued_error: Mutex<Option<String>>,
+        /// When set, `get_my_task` reports this agent as the task's assignee
+        /// (sendToTask guard-path tests). Unset → `get_my_task` errors, so
+        /// the guard falls through as on a resolution failure.
+        task_assignee: Mutex<Option<String>>,
         /// When set, overrides the `agent_send_message` result (delivery-shape tests).
         agent_send_result: Mutex<Option<Value>>,
         /// When set, overrides the `agent_send_to_task` result (delivery-shape tests).
@@ -8311,7 +8318,41 @@ mod wsapi4_bindings_tests {
                 message_id.clone(),
                 caller_agent_id.as_str().to_string(),
             ));
-            Box::pin(async move { Ok(json!({ "success": true, "messageId": message_id })) })
+            let error = self.remove_queued_error.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(Error::NotFound(e));
+                }
+                Ok(json!({ "success": true, "messageId": message_id }))
+            })
+        }
+
+        fn get_my_task(
+            &self,
+            _workspace_id: WorkspaceId,
+            task_note_id: intent_core::NoteId,
+        ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
+            let assignee = self.task_assignee.lock().unwrap().clone();
+            Box::pin(async move {
+                let Some(assignee) = assignee else {
+                    return Err(Error::NotFound("no task".to_string()));
+                };
+                Ok(TaskGetMyTaskResult {
+                    note_id: task_note_id,
+                    title: "task title".to_string(),
+                    content: "body".to_string(),
+                    status: TaskStatus::InProgress,
+                    task_metadata: TaskMetadata {
+                        status: TaskStatus::InProgress,
+                        ..Default::default()
+                    },
+                    parent_id: None,
+                    subtasks: Vec::new(),
+                    assigned_agents: vec![AgentId::from(assignee.as_str())],
+                    rev: 1,
+                    unmet_depends_on: Vec::new(),
+                })
+            })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -8825,7 +8866,9 @@ mod wsapi4_bindings_tests {
     }
 
     /// Single-pending-message refusal: `refused: true` discriminator, an
-    /// `error` naming the rule, and the atomicity warning in `instruction`.
+    /// `error` naming the rule, and an `instruction` pointing at the atomic
+    /// `replacePending` option (with manual removeQueuedMessage as the
+    /// non-atomic fallback).
     #[tokio::test]
     async fn agent_send_refusal_is_self_describing() {
         let (srv, api) = server_with_caller("caller-1");
@@ -8848,15 +8891,202 @@ mod wsapi4_bindings_tests {
             "error names the rule: {error}"
         );
         let instruction = v["instruction"].as_str().unwrap();
+        assert!(
+            instruction.contains("replacePending"),
+            "instruction recommends the atomic replace: {instruction}"
+        );
         assert!(instruction.contains("removeQueuedMessage"), "{instruction}");
         assert!(
             instruction.contains("NOT atomic"),
-            "instruction warns remove + re-send is not atomic: {instruction}"
+            "instruction warns manual remove + re-send is not atomic: {instruction}"
         );
         assert!(
             api.agent_send_calls.lock().unwrap().is_empty(),
             "refused send never reaches the service layer"
         );
+    }
+
+    /// `replacePending: true` with a pending entry present: the entry is
+    /// retracted (ownership-guarded removal with the caller's identity), the
+    /// send proceeds, and the result reports `replaced: true` +
+    /// `replacedMessageId`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_retracts_and_sends() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(true), "{v}");
+        assert_eq!(v["replacedMessageId"], json!("qmsg-pending"), "{v}");
+        assert!(v.get("refused").is_none(), "{v}");
+        let removals = api.remove_queued_owned_calls.lock().unwrap();
+        assert_eq!(
+            removals[0],
+            (
+                "a-1".to_string(),
+                "qmsg-pending".to_string(),
+                "caller-1".to_string()
+            )
+        );
+        let sends = api.agent_send_calls.lock().unwrap();
+        assert_eq!(sends[0].1, "hi");
+        // Options-object third argument without `priority` keeps the
+        // interrupt default.
+        assert_eq!(sends[0].2.as_deref(), Some("interrupt"));
+    }
+
+    /// `replacePending: true` when the pending entry drains between the guard
+    /// check and the retraction (removal fails): the send still proceeds —
+    /// graceful degradation — and the result reports `replaced: false` +
+    /// `replaceOutcome: "drained"`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_drained_entry_degrades_to_plain_send() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        *api.remove_queued_error.lock().unwrap() = Some("message not found".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("drained"), "{v}");
+        assert!(v.get("replacedMessageId").is_none(), "{v}");
+        assert_eq!(api.agent_send_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `replacePending: true` with no pending entry at all: nothing to
+    /// retract, the send proceeds, and the result reports `replaced: false`
+    /// + `replaceOutcome: "none"`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_without_entry_reports_none() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("none"), "{v}");
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
+        assert_eq!(api.agent_send_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `replacePending` from a caller-less (user/FE) context is a no-op: the
+    /// guard never applies, no replace report is attached.
+    #[tokio::test]
+    async fn agent_send_replace_pending_without_caller_is_noop() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert!(v.get("replaced").is_none(), "{v}");
+        assert!(v.get("replaceOutcome").is_none(), "{v}");
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
+    }
+
+    /// Options-object third argument carries `priority` alongside
+    /// `replacePending` — the `"queue"` opt-out still maps to `"normal"`.
+    #[tokio::test]
+    async fn agent_send_options_object_priority_queue_opts_out() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { priority: 'queue' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// `sendToTask` with `replacePending: true` against an assigned target
+    /// holding the caller's pending entry: same retract-and-send as `send`,
+    /// tagged with the task note id.
+    #[tokio::test]
+    async fn agent_send_to_task_replace_pending_retracts_and_sends() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.task_assignee.lock().unwrap() = Some("agent-assignee".to_string());
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["taskNoteId"], json!("tn-1"), "{v}");
+        assert_eq!(v["replaced"], json!(true), "{v}");
+        assert_eq!(v["replacedMessageId"], json!("qmsg-pending"), "{v}");
+        let removals = api.remove_queued_owned_calls.lock().unwrap();
+        assert_eq!(
+            removals[0],
+            (
+                "agent-assignee".to_string(),
+                "qmsg-pending".to_string(),
+                "caller-1".to_string()
+            )
+        );
+        assert_eq!(api.agent_send_to_task_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `sendToTask` still refuses without `replacePending` when the caller
+    /// has a pending entry in the assignee's queue, and the refusal carries
+    /// the task tag.
+    #[tokio::test]
+    async fn agent_send_to_task_refusal_without_replace_pending() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.task_assignee.lock().unwrap() = Some("agent-assignee".to_string());
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false), "{v}");
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert_eq!(v["taskNoteId"], json!("tn-1"), "{v}");
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
     }
 
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
