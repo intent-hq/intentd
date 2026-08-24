@@ -2272,6 +2272,12 @@ impl Services {
                         )
                         .await;
                     }
+                    if let Err(error) = self
+                        .recompute_workspace_token_usage(&session.workspace_id, false)
+                        .await
+                    {
+                        tracing::warn!(agent_id = %agent_id.0, %error, "interruption usage recompute failed");
+                    }
                 }
                 if owns_slot {
                     self.clear_live_turn(agent_id);
@@ -4401,6 +4407,12 @@ impl Services {
                     // (§6.5); wake turns carry no turn correlation id.
                     self.publish_agent_message_events(workspace_id, agent_id, &message, None)
                         .await;
+                    if let Err(error) = self
+                        .recompute_workspace_token_usage(workspace_id, false)
+                        .await
+                    {
+                        tracing::warn!(agent_id = %agent_id.0, %error, "wake turn usage recompute failed");
+                    }
                     message_persisted = true;
                 }
                 Err(e) => {
