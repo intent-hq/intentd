@@ -10239,6 +10239,169 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
     );
 }
 
+/// monorepo#3338: an image block carrying an attachment-registry
+/// `attachmentId` reference (no inline base64) is resolved daemon-side at
+/// prompt assembly — the ACP receives an `image` content block exactly as if
+/// the bytes had been sent inline, while the persisted transcript row keeps
+/// only the reference. Asserted via the fixture's `MOCK_AGENT_PROMPT_LOG`
+/// seam (`blockTypes`).
+#[tokio::test]
+async fn image_reference_block_resolves_to_acp_image_over_wss() {
+    use base64::Engine as _;
+
+    let Some(script) = gate("image-reference block resolution E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    // The workspace needs a real filesystem root: `file.placeAttachment`
+    // lands bytes under `.intent/attachments/` and the reference resolution
+    // reads them back from the same root.
+    let ws_id = {
+        use intent_store::Store;
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let ws = intent_core::WorkspaceId::new();
+        let root = data_dir.join("ws-root");
+        std::fs::create_dir_all(&root).expect("mkdir ws root");
+        let mut seed = workspace_seed(&ws);
+        seed.worktree_path = Some(root.to_string_lossy().into_owned());
+        store.insert_workspace(&seed).await.expect("insert ws");
+        ws.0
+    };
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "seen" }).to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Register the attachment (1x1 transparent PNG).
+    let png_b64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let placed = wss_rpc(
+        &mut rpc,
+        10,
+        "file.placeAttachment",
+        json!({
+            "workspaceId": &ws_id,
+            "fileName": "pixel.png",
+            "data": png_b64,
+            "mimeType": "image/png",
+        }),
+    )
+    .await;
+    let attachment_id = placed["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_string();
+
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "ImgRef", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "describe the referenced image",
+            "imageBlocks": [
+                { "type": "image", "attachmentId": &attachment_id }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Outbound-prompt contract: the turn's prompt reaches the mock carrying
+    // an `image` content block — the daemon resolved the reference to bytes.
+    let mut prompt = None;
+    for _ in 0..50 {
+        if let Ok(log) = std::fs::read_to_string(&prompt_log) {
+            if let Some(p) = log
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|p| {
+                    p["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("describe the referenced image")
+                })
+            {
+                prompt = Some(p);
+                break;
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    let prompt = prompt.expect("turn's prompt reached the mock");
+    let block_types: Vec<&str> = prompt["blockTypes"]
+        .as_array()
+        .expect("prompt log carries blockTypes")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        block_types.contains(&"image"),
+        "reference resolved to an ACP image block: {block_types:?}"
+    );
+
+    // Persisted transcript: the user row keeps the REFERENCE (no bytes).
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let image = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .flat_map(|m| m["contentBlocks"].as_array().cloned().unwrap_or_default())
+        .find(|b| b["type"] == "image")
+        .expect("image block on the user row");
+    assert_eq!(image["attachmentId"], json!(attachment_id), "{image}");
+    assert!(
+        image.get("data").is_none(),
+        "no bytes on the transcript row: {image}"
+    );
+    // Sanity: the placed bytes decode (the mock does not echo block payloads,
+    // so byte-equality is covered by the services-layer resolution unit test).
+    base64::engine::general_purpose::STANDARD
+        .decode(png_b64)
+        .expect("valid fixture png");
+}
+
 /// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an
 /// anonymous `tool_use` block (`name: ""`). The mock parks after emitting a
 /// `tool_call` (`in_progress`); on `session/cancel` it echoes a title-less

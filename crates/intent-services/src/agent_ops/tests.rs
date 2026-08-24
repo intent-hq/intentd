@@ -19035,6 +19035,30 @@ async fn agent_update_name_only_emits_agent_renamed() {
     assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
 }
 
+/// `agent.update` runs the same registry validation on the `imageBlocks`
+/// reference arm as the other ingress seams (monorepo#3338): an unknown
+/// `attachmentId` is `-32602` naming the id and nothing is persisted.
+#[tokio::test]
+async fn agent_update_rejects_unknown_image_reference() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "ImgRef").await;
+    let err = svc
+        .agent_update_op(
+            id.clone(),
+            json!({ "imageBlocks": [{ "type": "image", "attachmentId": "att-nope" }] }),
+        )
+        .await
+        .expect_err("unknown reference");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    assert!(format!("{err}").contains("att-nope"), "{err}");
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert!(
+        session.image_blocks.is_none(),
+        "rejected update must not persist: {:?}",
+        session.image_blocks
+    );
+}
+
 /// `reasoningEffort` lifecycle (PROTOCOL §5.5, Option B): settable at
 /// `agent.create` (stored as-is — no vocabulary validation, unknown levels
 /// pass), patchable and clearable via `agent.update`, and served on both the

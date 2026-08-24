@@ -1526,15 +1526,78 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
     Ok(())
 }
 
+/// Validate an FE-supplied `imageBlocks` array (PROTOCOL §5.5,
+/// monorepo#3338): every entry must carry EXACTLY one of inline `data`
+/// (base64 payload) or an attachment-registry `attachmentId` reference.
+/// Both-or-neither is `Error::InvalidParams` (→ `-32602`) naming the
+/// offending index. A non-array payload and non-object entries are tolerated
+/// (skipped downstream like every other malformed attachment entry) so
+/// legacy callers keep their fail-soft behavior — mirrors
+/// [`validate_file_blocks`].
+pub(crate) fn validate_image_blocks(method: &str, image_blocks: Option<&Value>) -> Result<()> {
+    let Some(imgs) = image_blocks.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, img) in imgs.iter().enumerate() {
+        let Some(obj) = img.as_object() else {
+            continue;
+        };
+        let has_data = obj.get("data").and_then(Value::as_str).is_some();
+        let has_ref = obj
+            .get("attachmentId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_data == has_ref {
+            return Err(Error::InvalidParams(format!(
+                "{method}: imageBlocks[{i}] must carry exactly one of `data` or `attachmentId`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Byte cap for attachment-registry image references resolved into a turn
+/// (monorepo#3338). 30 MiB of raw bytes base64-encode to exactly 40 MiB —
+/// the transport's inbound frame cap that already bounds INLINE image
+/// blocks — so a reference can never carry a larger image than the inline
+/// arm could.
+pub(crate) const IMAGE_REF_MAX_BYTES: u64 = 30 * 1024 * 1024;
+
+/// The non-blank `attachmentId` values of reference-arm image entries
+/// (entries WITHOUT inline `data`) — the same either-or reading as
+/// [`validate_image_blocks`] / [`user_message_blocks`]: inline `data` wins,
+/// and a blank reference counts as absent.
+pub(crate) fn image_block_ref_ids(image_blocks: Option<&Value>) -> Vec<String> {
+    image_blocks
+        .and_then(Value::as_array)
+        .map(|imgs| {
+            imgs.iter()
+                .filter_map(|img| {
+                    let obj = img.as_object()?;
+                    if obj.get("data").and_then(Value::as_str).is_some() {
+                        return None;
+                    }
+                    obj.get("attachmentId")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The persisted content-block array for a user message: one `text` block
 /// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
 /// attachments must reach the transcript so the conversation view can render
-/// them). Image entries require `data` + `mimeType` and file entries require
-/// `fileName` plus EITHER inline `data` + `mimeType` OR an
-/// attachment-registry `attachmentId` reference (PROTOCOL §5.5) — the same
-/// attachment contract prompt assembly (`append_attachment_blocks`) enforces;
-/// malformed entries are silently skipped so a partial attachment array never
-/// breaks the persist.
+/// them). Image entries require EITHER inline `data` + `mimeType` OR an
+/// attachment-registry `attachmentId` reference (monorepo#3338) and file
+/// entries require `fileName` plus the same either-or (PROTOCOL §5.5) — the
+/// same attachment contract prompt assembly (`append_attachment_blocks`)
+/// enforces; malformed entries are silently skipped so a partial attachment
+/// array never breaks the persist. Reference blocks persist AS references —
+/// the bytes never ride the transcript row, keeping `agent.getConversation`
+/// payloads constant-size.
 pub(crate) fn user_message_blocks(
     content: &str,
     image_blocks: Option<&Value>,
@@ -1545,6 +1608,23 @@ pub(crate) fn user_message_blocks(
         for img in imgs {
             let data = img.get("data").and_then(Value::as_str);
             let mime = img.get("mimeType").and_then(Value::as_str);
+            // Same non-blank filter as `validate_image_blocks` and prompt
+            // assembly — a whitespace attachmentId must not shadow inline
+            // data into a dangling blank reference.
+            let attachment_id = img
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if data.is_none() {
+                if let Some(id) = attachment_id {
+                    let mut block = json!({ "type": "image", "attachmentId": id });
+                    if let Some(mime) = mime {
+                        block["mimeType"] = json!(mime);
+                    }
+                    blocks.push(block);
+                    continue;
+                }
+            }
             if let (Some(data), Some(mime)) = (data, mime) {
                 blocks.push(json!({ "type": "image", "data": data, "mimeType": mime }));
             }
@@ -2923,10 +3003,15 @@ impl Services {
         let file_blocks = file_blocks
             .or_else(|| meta_get("fileBlocks"))
             .filter(|v| !v.is_null());
-        // Attachment-reference validation (PROTOCOL §5.5): every file block
-        // must carry exactly one of `data` / `attachmentId`. Runs before any
-        // side effect so a `-32602` rejection persists nothing.
+        // Attachment-reference validation (PROTOCOL §5.5): every file and
+        // image block must carry exactly one of `data` / `attachmentId`, and
+        // image references must name registered attachments in this
+        // workspace (monorepo#3338). Runs before any side effect so a
+        // `-32602` rejection persists nothing.
         validate_file_blocks("agent.create", file_blocks.as_ref())?;
+        validate_image_blocks("agent.create", image_blocks.as_ref())?;
+        self.validate_image_block_refs("agent.create", image_blocks.as_ref())
+            .await?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
@@ -3819,6 +3904,9 @@ impl Services {
                     session.image_blocks = if value.is_null() {
                         None
                     } else {
+                        validate_image_blocks("agent.update", Some(value))?;
+                        self.validate_image_block_refs("agent.update", Some(value))
+                            .await?;
                         Some(value.clone())
                     };
                 }
@@ -4356,10 +4444,13 @@ impl Services {
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
         validate_file_blocks("agent.queueMessage", file_blocks.as_ref())?;
+        validate_image_blocks("agent.queueMessage", image_blocks.as_ref())?;
         // monorepo#568: reject nonexistent targets BEFORE enqueueing — a
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
+        self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
+            .await?;
         let (queued, position) = self.enqueue_message(
             &agent_id,
             content,
@@ -4561,6 +4652,132 @@ impl Services {
             })
     }
 
+    /// Validate the reference arm of an `imageBlocks` array against the
+    /// attachment registry (PROTOCOL §5.5, monorepo#3338): every
+    /// `attachmentId` must name a registered attachment, and the recorded
+    /// sizes must fit [`IMAGE_REF_MAX_BYTES`] **in aggregate** across all
+    /// references in the array (a per-reference cap alone would let a small
+    /// request name many attachments whose resolved bytes expand one ACP
+    /// prompt far past the transport bound the cap mirrors). Rejections are
+    /// `-32602` naming the id, raised at the RPC seam BEFORE any state
+    /// change; inline-data entries are untouched. Callers run the shape
+    /// check ([`validate_image_blocks`]) first. The lookup is registry-wide
+    /// rather than workspace-scoped by design: `workspace.create`'s
+    /// `initialAgent` references attachments placed BEFORE the new workspace
+    /// exists, so they necessarily live in another workspace's registry;
+    /// resolution reads from the record's own workspace root either way.
+    pub(crate) async fn validate_image_block_refs(
+        &self,
+        method: &str,
+        image_blocks: Option<&Value>,
+    ) -> Result<()> {
+        let mut total: u64 = 0;
+        for id in image_block_ref_ids(image_blocks) {
+            let record = self.store.get_attachment(&id).await.map_err(|e| match e {
+                Error::NotFound(_) => {
+                    Error::InvalidParams(format!("{method}: unknown attachment id: {id}"))
+                }
+                other => other,
+            })?;
+            let size = u64::try_from(record.size).unwrap_or(0);
+            if size > IMAGE_REF_MAX_BYTES {
+                return Err(Error::InvalidParams(format!(
+                    "{method}: attachment {id} is {} bytes — exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references",
+                    record.size
+                )));
+            }
+            total = total.saturating_add(size);
+            if total > IMAGE_REF_MAX_BYTES {
+                return Err(Error::InvalidParams(format!(
+                    "{method}: image references total {total} bytes at attachment {id} — exceeds the {IMAGE_REF_MAX_BYTES} byte aggregate cap for image references"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve reference-arm image entries into inline `{ data, mimeType }`
+    /// form for prompt assembly (monorepo#3338): the attachment's bytes are
+    /// read from the record's own canonical workspace root (with the same
+    /// within-root containment guard as `file.getAttachment`) and
+    /// base64-encoded so the ACP receives the image exactly as an inline
+    /// block. MIME resolves block `mimeType` > registry `mime_type` >
+    /// extension inference. Fail-soft by design — ingress already rejected
+    /// bad references, so a row/file that vanished since is skipped with a
+    /// warning rather than breaking the turn (same convention as note-image
+    /// resolution); the same skip re-enforces the [`IMAGE_REF_MAX_BYTES`]
+    /// aggregate cap over the bytes actually read, in case files grew after
+    /// ingress validated the recorded sizes. Inline entries pass through
+    /// untouched; inputs without references return unchanged.
+    pub(crate) async fn resolve_image_block_refs(
+        &self,
+        image_blocks: Option<Value>,
+    ) -> Option<Value> {
+        use base64::Engine as _;
+        if image_block_ref_ids(image_blocks.as_ref()).is_empty() {
+            return image_blocks;
+        }
+        let arr = match image_blocks {
+            Some(Value::Array(arr)) => arr,
+            other => return other,
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        let mut total: u64 = 0;
+        for img in arr {
+            let Some(obj) = img.as_object() else {
+                out.push(img);
+                continue;
+            };
+            let attachment_id = obj
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            let (Some(id), None) = (attachment_id, obj.get("data").and_then(Value::as_str)) else {
+                out.push(img);
+                continue;
+            };
+            let Ok(record) = self.store.get_attachment(id).await else {
+                tracing::warn!(attachment = %id, "image reference: attachment row vanished; skipping");
+                continue;
+            };
+            let root = crate::file_ops::resolve_root(&self.store, &record.workspace_id, None).await;
+            if root.is_empty() {
+                tracing::warn!(attachment = %id, "image reference: attachment workspace has no resolved root; skipping");
+                continue;
+            }
+            let Ok(path) = crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
+            else {
+                tracing::warn!(attachment = %id, "image reference: stored path escapes the workspace; skipping");
+                continue;
+            };
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(attachment = %id, error = %e, "image reference: read failed; skipping");
+                    continue;
+                }
+            };
+            if bytes.len() as u64 > IMAGE_REF_MAX_BYTES {
+                tracing::warn!(attachment = %id, size = bytes.len(), "image reference: over the byte cap; skipping");
+                continue;
+            }
+            if total.saturating_add(bytes.len() as u64) > IMAGE_REF_MAX_BYTES {
+                tracing::warn!(attachment = %id, size = bytes.len(), total, "image reference: over the aggregate byte cap; skipping");
+                continue;
+            }
+            total += bytes.len() as u64;
+            let mime = obj
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| record.mime_type.clone())
+                .unwrap_or_else(|| crate::note_ops::mime_from_extension(&record.file_name));
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            out.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+        }
+        Some(Value::Array(out))
+    }
+
     /// `agent.sendMessage`: persist the user message; on failure auto-queue
     /// (PROTOCOL §5.5). Fails closed on a nonexistent target (monorepo#564).
     pub(crate) async fn agent_send_message_op(
@@ -4580,14 +4797,19 @@ impl Services {
                 )));
             }
         }
-        // Attachment-reference validation (PROTOCOL §5.5): every file block
-        // must carry exactly one of `data` / `attachmentId`, rejected before
-        // any state change.
+        // Attachment-reference validation (PROTOCOL §5.5): every file and
+        // image block must carry exactly one of `data` / `attachmentId`,
+        // rejected before any state change.
         validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
+        validate_image_blocks("agent.sendMessage", image_blocks.as_ref())?;
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
+        // Image references must name registered attachments
+        // (monorepo#3338) — rejected before any state change.
+        self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
+            .await?;
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());

@@ -3800,7 +3800,30 @@ impl AgentManager {
                 body: &body,
             });
         let mut blocks = text_prompt(&prompt_text);
-        append_attachment_blocks(&mut blocks, options);
+        // Image-reference resolution (monorepo#3338): attachment-registry
+        // references in this turn's (and any preempted prepend's) image
+        // blocks are resolved to inline bytes HERE — the single prompt
+        // assembly choke point — so the ACP receives them exactly as inline
+        // blocks, whatever ingress path carried the reference. No-op when no
+        // references are present.
+        let has_image_refs = !crate::agent_ops::image_block_ref_ids(options.image_blocks.as_ref())
+            .is_empty()
+            || !crate::agent_ops::image_block_ref_ids(options.prepend_image_blocks.as_ref())
+                .is_empty();
+        if has_image_refs {
+            let mut resolved = options.clone();
+            resolved.image_blocks = self
+                .services
+                .resolve_image_block_refs(resolved.image_blocks.take())
+                .await;
+            resolved.prepend_image_blocks = self
+                .services
+                .resolve_image_block_refs(resolved.prepend_image_blocks.take())
+                .await;
+            append_attachment_blocks(&mut blocks, &resolved);
+        } else {
+            append_attachment_blocks(&mut blocks, options);
+        }
         // Resolve `noteIds` to `workspace-asset://` image content blocks
         // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
         // image references whose URL is a workspace-asset in the current
