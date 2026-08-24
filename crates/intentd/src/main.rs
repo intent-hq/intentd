@@ -722,9 +722,12 @@ async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
 /// persist the new set via `settings.update`, without re-pairing (no token
 /// mint or rotation, no QR). Also persists `server.wsApi.enabled = true`
 /// (idempotent when already enabled; [`enable_wss_listener`] batch), so the
-/// listener re-binds onto the chosen set immediately. An unchanged selection
-/// writes nothing and says so. Requires a running daemon; reads the
-/// selection from stdin (one line), so a piped run works without a TTY.
+/// listener (re-)binds onto the chosen set immediately — an unchanged
+/// selection with the listener already enabled writes nothing and says so,
+/// while an unchanged selection with it disabled still enables (keeping the
+/// stored `server.bindAddress` shape untouched). Requires a running daemon;
+/// reads the selection from stdin (one line), so a piped run works without
+/// a TTY.
 async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
     let config = resolve_config()?;
     // Fail early (daemon down / socket missing) before showing the picker.
@@ -732,10 +735,25 @@ async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
     if let Some(error) = response.get("error") {
         anyhow::bail!("cannot reach the daemon: {}", rpc_error_text(error));
     }
+    let enabled_response = rpc_call(
+        &config.socket_path,
+        "settings.get",
+        json!({ "path": "server.wsApi.enabled" }),
+    )
+    .await?;
+    let listener_enabled = enabled_response["result"]["value"]
+        .as_bool()
+        .unwrap_or(false);
     let current = current_bind_addresses(&config.socket_path).await;
     let selection = prompt_bind_addresses(&current)?;
     if same_addr_set(&selection, &current) {
-        eprintln!("Selection unchanged — server.bindAddress not modified.");
+        if listener_enabled {
+            eprintln!("Selection unchanged — server.bindAddress not modified.");
+            return Ok(());
+        }
+        // Unchanged set but external connections are disabled: enable the
+        // listener without rewriting the stored bindAddress shape.
+        enable_wss_listener(&config.socket_path, None).await?;
         return Ok(());
     }
     enable_wss_listener(&config.socket_path, Some(&selection)).await?;

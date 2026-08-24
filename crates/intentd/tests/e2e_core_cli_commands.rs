@@ -802,6 +802,57 @@ async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
 }
 
 #[tokio::test]
+async fn pair_select_endpoints_unchanged_selection_still_enables_listener() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // UDS-only daemon (WSS listener disabled) with the default loopback bind
+    // persisted: keeping the pre-checked set unchanged must still enable and
+    // start the listener — the documented rebind/enable behavior — instead of
+    // returning early with "unchanged" while external connections stay off.
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"127.0.0.1\"\n",
+    )
+    .expect("seed config.toml");
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_select_endpoints(&data_dir, "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "unchanged selection with listener down should succeed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Selection unchanged"),
+        "must not claim an unchanged no-op while the listener is down: {stderr}"
+    );
+    assert!(
+        stderr.contains("listening on 127.0.0.1"),
+        "should enable the listener on the kept set: {stderr}"
+    );
+
+    // The enable must be persisted, and the stored bindAddress shape kept.
+    let config = std::fs::read_to_string(data_dir.join("config.toml")).expect("read config.toml");
+    assert!(
+        has_uncommented_enabled_true(&config),
+        "server.wsApi.enabled = true should be persisted: {config}"
+    );
+    let line = bind_address_line(&config).expect("bindAddress still persisted");
+    assert!(
+        line.contains("127.0.0.1"),
+        "stored bindAddress must be untouched: {line}"
+    );
+}
+
+#[tokio::test]
 async fn pair_select_endpoints_reprompts_on_invalid_input() {
     let id = Uuid::new_v4().simple().to_string();
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
