@@ -702,10 +702,16 @@ impl Services {
         group_id
     }
 
-    /// Whether `parent_id` currently has an open (unsealed && undelivered)
-    /// delegation group — i.e. a future `after_all` settlement wake is still
-    /// owed to it. Used by the batch-delegate zero-started advisory
-    /// (monorepo#3334) to decide whether silence would otherwise be permanent.
+    /// Whether `parent_id` currently has an ENROLLMENT-OPEN (unsealed &&
+    /// undelivered) delegation group — one still accepting children in the
+    /// parent's current delegating turn. Used by the batch-delegate
+    /// zero-started advisory (monorepo#3334) to decide whether to deliver the
+    /// immediate advisory wake. Note this is deliberately NARROWER than
+    /// "a settlement wake is still owed": a sealed-but-undelivered group from
+    /// an earlier turn also owes a wake, but it does not suppress the
+    /// advisory — that errs on the side of an extra (redundant) advisory
+    /// rather than risking a permanent stall if the sealed group's delivery
+    /// never fires. Fail-noisy over fail-silent.
     pub(crate) fn has_open_delegation_group(&self, parent_id: &AgentId) -> bool {
         self.agent_subscriptions
             .lock()
