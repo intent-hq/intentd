@@ -112,3 +112,5 @@ flowchart LR
 ```
 
 Mermaid renders live and invalid source shows a parse error inline — keep node/edge labels plain (no backticks or quotes).
+
+You can also embed workspace image files inline with standard markdown: `![alt](intent://local/file/<workspace-relative-path>)`. Images only (png, jpg/jpeg, gif, webp — no SVG, no video); the path is relative to the workspace root, with special characters percent-encoded. Inline images render in the chat and click to zoom in a lightbox; an `intent://local/file/...` link to a non-image file opens it in the workspace file viewer.
