@@ -32544,3 +32544,428 @@ mod agent_summary_excludes_deleted {
         );
     }
 }
+
+/// Daemon-side derived workspace `unread` (§5.1): unread = any top-level
+/// (non-background, non-deleted) session whose newest user/assistant message
+/// is an assistant message the per-agent seen marker (`agent.markSeen`,
+/// §5.5) has not caught up with. Read paths serve the derivation (stored
+/// `review_required` still wins), `agent.markSeen` settles the workspace
+/// flag when the last unread session is read, and `workspace.markSeen`
+/// advances every top-level marker.
+mod derived_workspace_unread {
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+        }
+    }
+
+    /// Insert a top-level session and append `roles` in order, returning the
+    /// LAST appended message id.
+    async fn seed_session(h: &Harness, id: &str, roles: &[&str]) -> String {
+        seed_session_with(h, mk_session(&h.ws, id), roles).await
+    }
+
+    async fn seed_session_with(h: &Harness, session: AgentSession, roles: &[&str]) -> String {
+        let agent_id = session.id.clone();
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let mut last = String::new();
+        for role in roles {
+            let msg = h
+                .store
+                .append_agent_message(
+                    &agent_id,
+                    role,
+                    &json!([{ "type": "text", "text": "m" }]),
+                    &now_iso(),
+                )
+                .await
+                .expect("append message");
+            last = msg.id;
+        }
+        last
+    }
+
+    fn subscribe_attention(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_silent(sub: &mut Subscription) {
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(res.is_err(), "expected no attention event: {res:?}");
+    }
+
+    /// Served attention over `workspace.get` (the enrichment path).
+    async fn served_attention(h: &Harness) -> WorkspaceAttention {
+        h.services
+            .get_workspace(h.ws.clone())
+            .await
+            .expect("get workspace")
+            .attention
+    }
+
+    /// Store-level derivation truth table: no agents / unseen-assistant /
+    /// seen / user-last / background / child / deleted sessions.
+    #[tokio::test]
+    async fn derivation_truth_table() {
+        let h = harness().await;
+        let probe = || h.store.workspace_has_unread_top_level_session(&h.ws);
+
+        // No agents: not unread.
+        assert!(!probe().await.expect("probe"));
+
+        // Top-level session with no messages: not unread.
+        h.store
+            .insert_agent_session(&mk_session(&h.ws, "agent-empty"))
+            .await
+            .expect("insert");
+        assert!(!probe().await.expect("probe"));
+
+        // User-last session: not unread.
+        seed_session(&h, "agent-user-last", &["assistant", "user"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Background session with an unseen assistant last: never unread.
+        let mut background = mk_session(&h.ws, "agent-background");
+        background.is_background = true;
+        seed_session_with(&h, background, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Child session with an unseen assistant last: never unread.
+        let mut child = mk_session(&h.ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-empty"));
+        seed_session_with(&h, child, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Deleted session with an unseen assistant last: never unread.
+        let mut deleted = mk_session(&h.ws, "agent-deleted");
+        deleted.status = AgentStatus::Deleted;
+        seed_session_with(&h, deleted, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Top-level unseen assistant last: unread.
+        let last = seed_session(&h, "agent-unread", &["user", "assistant"]).await;
+        assert!(probe().await.expect("probe"));
+
+        // Marker caught up: not unread again.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-unread"), last)
+            .await
+            .expect("mark seen");
+        assert!(!probe().await.expect("probe"));
+    }
+
+    /// Read paths serve the derivation: an unseen assistant last message
+    /// reads `unread` even when the stored flag is `none`, and a stale
+    /// stored `unread` reads `none` once every marker is caught up.
+    #[tokio::test]
+    async fn reads_serve_derived_attention_over_stored_flag() {
+        let h = harness().await;
+        // Derived unread, stored none.
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Stale stored unread + marker caught up: derived none wins.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed stale");
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // list_workspaces serves the same derivation.
+        let listed = h
+            .services
+            .list_workspaces(false)
+            .await
+            .expect("list workspaces");
+        let row = listed.iter().find(|w| w.id == h.ws).expect("row");
+        assert_eq!(row.attention, WorkspaceAttention::None);
+    }
+
+    /// Stored `review_required` always wins over the derivation — in both
+    /// directions (derived unread and derived none).
+    #[tokio::test]
+    async fn review_required_wins_over_derivation() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::ReviewRequired;
+        h.store.update_workspace(&ws).await.expect("seed review");
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+
+        // markSeen advances the marker but leaves review_required in place
+        // (and never emits attention-changed { none } while it holds).
+        let mut sub = subscribe_attention(&h);
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+    }
+
+    /// `agent.markSeen` partial vs final clear: reading one of two unread
+    /// agents stays silent; reading the last one clears the stored flag and
+    /// emits exactly one `workspace:attention-changed { none }`.
+    #[tokio::test]
+    async fn agent_mark_seen_partial_then_final_clear() {
+        let h = harness().await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let last_b = seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        // Partial: agent-b still unread — no workspace-level emission.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last_a)
+            .await
+            .expect("mark a seen");
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Final: last unread agent read — stored flag cleared + one emit.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-b"), last_b)
+            .await
+            .expect("mark b seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Idempotent re-mark: no duplicate emission.
+        h.services
+            .agent_mark_seen_op(
+                h.ws.clone(),
+                AgentId::from("agent-b"),
+                h.store
+                    .get_agent_session_summary(&AgentId::from("agent-b"))
+                    .await
+                    .expect("summary")
+                    .last_seen_message_id()
+                    .expect("marker")
+                    .to_string(),
+            )
+            .await
+            .expect("re-mark");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The final `agent.markSeen` clears the derived state even when the
+    /// stored flag was never raised (e.g. the turn-end raise was skipped):
+    /// clients tracking the derived value still get the clear.
+    #[tokio::test]
+    async fn agent_mark_seen_emits_clear_without_stored_flag() {
+        let h = harness().await;
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+    }
+
+    /// `workspace.markSeen` advances every top-level session's marker to its
+    /// `last_message_id` (background/child sessions untouched), clears the
+    /// derived + stored unread, and emits exactly one attention-changed.
+    #[tokio::test]
+    async fn workspace_mark_seen_marks_all_top_level_sessions() {
+        let h = harness().await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let last_b = seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        let mut background = mk_session(&h.ws, "agent-background");
+        background.is_background = true;
+        seed_session_with(&h, background, &["user", "assistant"]).await;
+        let mut child = mk_session(&h.ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-a"));
+        seed_session_with(&h, child, &["user", "assistant"]).await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        // Exactly one workspace-level clear.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut sub).await;
+
+        // Top-level markers advanced to each session's last message.
+        for (id, last) in [("agent-a", &last_a), ("agent-b", &last_b)] {
+            let s = h
+                .store
+                .get_agent_session_summary(&AgentId::from(id))
+                .await
+                .expect("summary");
+            assert_eq!(s.last_seen_message_id(), Some(last.as_str()));
+        }
+        // Child/background markers untouched.
+        for id in ["agent-background", "agent-child"] {
+            let s = h
+                .store
+                .get_agent_session_summary(&AgentId::from(id))
+                .await
+                .expect("summary");
+            assert_eq!(s.last_seen_message_id(), None, "{id} marker untouched");
+        }
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Idempotent: a second markSeen is silent.
+        h.services.mark_seen(h.ws.clone()).await.expect("again");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The turn-end raise still only emits on the none→unread transition
+    /// (guarded write), and the derivation agrees with the raise.
+    #[tokio::test]
+    async fn turn_end_raise_transition_only() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut sub = subscribe_attention(&h);
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "unread" })
+        );
+
+        // Re-raise while already unread: guarded no-op, no spam.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("re-raise");
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+}

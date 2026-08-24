@@ -1043,6 +1043,80 @@ impl Store {
         Ok(count.cast_unsigned())
     }
 
+    /// Whether the workspace has any **unread top-level session**: a
+    /// non-deleted, non-background session with no parent whose newest
+    /// user/assistant message is an assistant message the user has not seen
+    /// (`last_message_id` set, `last_message_role = 'assistant'`, and the
+    /// session-metadata seen marker `lastSeenMessageId` absent or different).
+    /// The daemon-side workspace `unread` derivation (§5.1) — one bounded
+    /// EXISTS over the persisted `agent_session` columns (0070/0088 previews
+    /// plus the v4.5 seen marker); message bodies are never touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn workspace_has_unread_top_level_session(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
+        let sql = "SELECT EXISTS(\
+            SELECT 1 FROM agent_session \
+            WHERE workspace_id = ? \
+              AND parent_agent_id IS NULL \
+              AND is_background = 0 \
+              AND status <> 'deleted' \
+              AND last_message_id IS NOT NULL \
+              AND last_message_role = 'assistant' \
+              AND (json_extract(metadata, '$.lastSeenMessageId') IS NULL \
+                   OR json_extract(metadata, '$.lastSeenMessageId') <> last_message_id)\
+        ) AS unread";
+        let row = sqlx::query(sql)
+            .bind(&workspace_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("workspace unread probe failed: {e}")))?;
+        Ok(col::<i64>(&row, "unread")? != 0)
+    }
+
+    /// The workspace's top-level (no parent, non-background, non-deleted)
+    /// sessions whose seen marker trails their newest user/assistant message:
+    /// `(agent_id, last_message_id)` pairs where `last_message_id` is set and
+    /// the session-metadata `lastSeenMessageId` is absent or different — any
+    /// role, so `workspace.markSeen` advances markers on user-last sessions
+    /// too (harmless for the unread derivation, which only counts
+    /// assistant-last). Bounded: persisted columns only, no message bodies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_top_level_sessions_with_unseen_last_message(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, String)>> {
+        let sql = "SELECT id, last_message_id FROM agent_session \
+            WHERE workspace_id = ? \
+              AND parent_agent_id IS NULL \
+              AND is_background = 0 \
+              AND status <> 'deleted' \
+              AND last_message_id IS NOT NULL \
+              AND (json_extract(metadata, '$.lastSeenMessageId') IS NULL \
+                   OR json_extract(metadata, '$.lastSeenMessageId') <> last_message_id) \
+            ORDER BY created_at";
+        let rows = sqlx::query(sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list unseen top-level sessions failed: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    col::<String>(r, "id")?,
+                    col::<String>(r, "last_message_id")?,
+                ))
+            })
+            .collect()
+    }
+
     /// Upsert one session's cumulative end-of-turn token-usage snapshot
     /// (§5.23): the JSON-encoded [`TokenUsageTotals`] REPLACES any previous
     /// snapshot (ACP end-of-turn counts are cumulative per session, never

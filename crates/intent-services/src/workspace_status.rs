@@ -174,6 +174,35 @@ impl Services {
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
     ) {
+        // Served `attention` is DERIVED on this same emit path (§5.1):
+        // `unread` = any top-level (non-background, non-deleted) session
+        // whose newest user/assistant message is an unseen assistant message
+        // (per-agent seen marker, `agent.markSeen` §5.5). A stored
+        // `review_required` still wins (it is the persistent review flag,
+        // retired only by `workspace.dismissAttention`); the stored `unread`
+        // flag is no longer the read-path source of truth — the turn-end
+        // raise still writes it (back-compat + the transition emit), but a
+        // stale stored value can neither show nor hide the blue dot.
+        // Archived rows keep the stored value: the turn-end raise skips
+        // archived workspaces (no blue dot until unarchive, intentd#1075)
+        // and the derivation honors the same rule. One bounded EXISTS over
+        // persisted session columns; a probe failure keeps the stored value
+        // (degrade, never fail the read).
+        if ws.attention != WorkspaceAttention::ReviewRequired
+            && ws.status != intent_core::WorkspaceStatus::Archived
+        {
+            if let Ok(unread) = self
+                .store
+                .workspace_has_unread_top_level_session(&ws.id)
+                .await
+            {
+                ws.attention = if unread {
+                    WorkspaceAttention::Unread
+                } else {
+                    WorkspaceAttention::None
+                };
+            }
+        }
         // The orthogonal `waiting` flag rides the same emit path but is
         // independent of the `taskStats` gate below: it is populated even
         // when a transient notes-read failure leaves `displayStatus` absent.

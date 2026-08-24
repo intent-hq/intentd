@@ -2560,6 +2560,78 @@ impl Services {
         }
     }
 
+    /// Post-seen-marker settlement of the workspace-level `unread` state
+    /// (§5.1): when advancing a per-agent seen marker (`agent.markSeen`, or
+    /// the `workspace.markSeen` mark-all loop) leaves the workspace with no
+    /// unread top-level session, clear the stored legacy flag (guarded on
+    /// `unread`, so `review_required` is never touched) and emit ONE
+    /// self-sufficient `workspace:attention-changed { none }` — clients
+    /// clear the blue dot together whether they track the derived or the
+    /// stored flag. `was_unread` is the derivation observed before the
+    /// marker write; a still-unread workspace (other sessions pending) is a
+    /// silent no-op, so partial reads never emit. Best-effort: a probe
+    /// failure fails closed (no emit we cannot confirm) and a write failure
+    /// skips the settle — the marker write is the contract; reads re-derive.
+    pub(crate) async fn settle_workspace_unread_after_seen(
+        &self,
+        workspace_id: &WorkspaceId,
+        was_unread: bool,
+    ) {
+        if workspace_id.is_chief() {
+            return;
+        }
+        let still_unread = self
+            .store
+            .workspace_has_unread_top_level_session(workspace_id)
+            .await
+            .unwrap_or(true);
+        if still_unread {
+            return;
+        }
+        self.park_attention_write().await;
+        // Scoped, guarded clear of the stored legacy flag (monorepo#1481
+        // pattern): only an `unread` value is cleared, so a persistent
+        // `review_required` survives, and `updated_at` stays untouched —
+        // acknowledging is not "activity" (monorepo#1466).
+        let cleared = self
+            .store
+            .set_workspace_attention(
+                workspace_id,
+                WorkspaceAttention::None,
+                None,
+                Some(WorkspaceAttention::Unread),
+            )
+            .await
+            .unwrap_or(false);
+        if cleared {
+            publish_event(
+                self.event_bus.as_ref(),
+                attention_changed_event(workspace_id, WorkspaceAttention::None),
+            )
+            .await;
+            return;
+        }
+        if was_unread {
+            // The derivation transitioned while the stored flag was already
+            // clear (e.g. a turn-end raise was skipped, or a store error
+            // dropped it): the read paths were serving derived `unread`, so
+            // clients still need the clear — unless `review_required` holds
+            // the dot (it wins on reads; emitting `none` would wrongly
+            // retire it).
+            match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.attention == WorkspaceAttention::ReviewRequired => {}
+                Ok(_) => {
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        attention_changed_event(workspace_id, WorkspaceAttention::None),
+                    )
+                    .await;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     /// Raise the server-owned `attention` flag (§9.9) — the BE side of the
     /// blue dot. Persists `attention = level` and emits a self-sufficient
     /// `workspace:attention-changed` only when the value actually changes
@@ -17154,11 +17226,42 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
+            // Workspace-seen = every conversation seen (§5.1): advance each
+            // top-level session's seen marker to its `last_message_id`
+            // through the `agent.markSeen` op (§5.5) — same monotonic CAS,
+            // same per-agent `agent:updated` marker event, so per-agent
+            // clients converge — which also settles the derived workspace
+            // `unread`: the last unread session's advance clears the stored
+            // legacy flag and emits ONE
+            // `workspace:attention-changed { none }`. Best-effort per
+            // session (a racing delete/edit never fails the whole call);
+            // background/child sessions are untouched (their markers are
+            // conversation-entry state, and they never feed the derivation).
+            if let Ok(pending) = store
+                .list_top_level_sessions_with_unseen_last_message(&id)
+                .await
+            {
+                for (agent_id, last_message_id) in pending {
+                    if let Err(e) = this
+                        .agent_mark_seen_op(id.clone(), AgentId(agent_id.clone()), last_message_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            workspace = %id.as_str(),
+                            agent = %agent_id,
+                            error = %e,
+                            "workspace.markSeen: per-agent seen-marker advance failed"
+                        );
+                    }
+                }
+            }
             this.park_attention_write().await;
-            // "Seen" clears the unread flag; review-required attention persists.
-            // Merely looking at a workspace is not "activity", so `updated_at`
-            // (which feeds the derived `lastActivity`) stays untouched
-            // (intent-hq/monorepo#1466). Scoped, conditional write
+            // Legacy stored-flag clear (kept for the no-sessions/stale-flag
+            // case; after the mark-all above it is normally a no-op — the
+            // settle already cleared and emitted). Review-required attention
+            // persists. Merely looking at a workspace is not "activity", so
+            // `updated_at` (which feeds the derived `lastActivity`) stays
+            // untouched (intent-hq/monorepo#1466). Scoped, conditional write
             // (monorepo#1481): one UPDATE guarded on `attention = unread`
             // touching only the attention column — a concurrent mutation of
             // any other column is never clobbered — whose row count decides
