@@ -13674,6 +13674,11 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage1["totals"]["cost"]["currency"], "USD");
     assert_eq!(usage1["byAgentId"][&agent_id]["cost"]["amount"], 0.5);
     assert_eq!(usage1["byModel"]["default"]["cost"]["amount"], 0.5);
+    assert_eq!(usage1["byAgentModel"][0]["agentId"], agent_id);
+    assert_eq!(usage1["byAgentModel"][0]["model"], "default");
+    assert_eq!(usage1["byAgentModel"][0]["humanMessages"], 1);
+    assert_eq!(usage1["byAgentModel"][0]["agentMessages"], 1);
+    assert_eq!(usage1["byAgentModel"][0]["totals"]["cost"]["amount"], 0.5);
 
     // Turn 2 — cumulative per ACP session, so 1.25 REPLACES 0.5 (not 1.75).
     let sent2 = wss_rpc(
@@ -13701,6 +13706,11 @@ async fn usage_update_cost_captured_over_wss() {
     assert_eq!(usage["totals"]["cost"]["amount"], 1.25, "read: {read}");
     assert_eq!(usage["totals"]["cost"]["currency"], "USD");
     assert_eq!(usage["totals"]["inputTokens"], 100);
+    assert_eq!(usage["byAgentModel"][0]["agentId"], agent_id);
+    assert_eq!(usage["byAgentModel"][0]["model"], "default");
+    assert_eq!(usage["byAgentModel"][0]["humanMessages"], 2);
+    assert_eq!(usage["byAgentModel"][0]["agentMessages"], 2);
+    assert_eq!(usage["byAgentModel"][0]["totals"]["inputTokens"], 100);
 
     // The same usage_update's required used/size fields surface as the
     // additive AgentLite.contextUsage occupancy overlay (§5.5,

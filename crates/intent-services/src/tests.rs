@@ -481,6 +481,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
             cost: None,
         },
         by_model: BTreeMap::new(),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     };
 
@@ -719,6 +720,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
                 ("claude-opus-4-1".to_string(), totals(2)),
                 ("gpt-5".to_string(), totals(3)),
             ]),
+            by_agent_model: None,
             last_scan_at: Some(now_iso()),
         });
         if i >= ACTIVE {
@@ -32395,7 +32397,92 @@ mod turn_token_usage {
         assert_eq!(usage.totals.cache_creation_tokens, 6);
         assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
         assert_eq!(usage.by_model["opus-4.8"].input_tokens, 100);
+        let cells = usage
+            .by_agent_model
+            .expect("new snapshots carry cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].agent_id, agent.0);
+        assert_eq!(cells[0].model, "opus-4.8");
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (0, 0));
         assert!(usage.last_scan_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn model_switch_assigns_only_the_new_snapshot_delta_to_the_new_cell() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 0, 0, 0)), None)
+            .await;
+        h.store
+            .set_agent_session_model(&h.ws, &agent, "model-b", None, &now_iso())
+            .await
+            .expect("switch model");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(150, 0, 0, 0)), None)
+            .await;
+
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage");
+        assert_eq!(usage.totals.input_tokens, 150);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 150);
+        assert_eq!(usage.by_model["model-a"].input_tokens, 100);
+        assert_eq!(usage.by_model["model-b"].input_tokens, 50);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells[0].model, "model-a");
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!(cells[1].model, "model-b");
+        assert_eq!(cells[1].totals.input_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_fallback_merges_with_new_materialized_message_counts() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 0, 0, 0)), None)
+            .await;
+        sqlx::query("DELETE FROM agent_usage_cell WHERE agent_id=?")
+            .bind(&agent.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("simulate archive without cells");
+        h.store
+            .append_agent_message(&agent, "user", &serde_json::json!([]), &now_iso())
+            .await
+            .expect("append message");
+
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage");
+        assert_eq!(usage.totals.input_tokens, 70);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].totals.input_tokens, 70);
+        assert_eq!(cells[0].human_messages, 1);
     }
 
     /// An identical snapshot re-report leaves the tally unchanged and emits no
