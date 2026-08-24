@@ -2835,28 +2835,35 @@ async fn wss_agent_mark_seen_round_trip() {
         "subscribe: {sub}"
     );
 
-    // Mark the second (newest) message seen: `{ success, lastSeenMessageId }`.
-    let marked = send_and_wait(
-        &mut ws,
+    // Mark the second (newest) message seen: `{ success, lastSeenMessageId }`
+    // plus the `agent:updated` marker event (self-sufficient, §6.5). The
+    // response and the notification race on the wire (the op keeps working —
+    // workspace-unread settlement — after the publish), so collect both in
+    // arrival order.
+    ws.send(Message::Text(
         format!(
             r#"{{"jsonrpc":"2.0","id":6,"method":"agent.markSeen","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","messageId":"{second_id}"}}}}"#
-        ),
-        6,
-    )
-    .await;
-    assert_eq!(marked["result"]["success"], true, "markSeen: {marked}");
-    assert_eq!(marked["result"]["lastSeenMessageId"], second_id.as_str());
-
-    // The `agent:updated` event carries the marker (self-sufficient, §6.5).
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        )
+        .into(),
+    ))
+    .await
+    .expect("send markSeen");
+    let (marked, evt) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut marked: Option<Value> = None;
+        let mut evt: Option<Value> = None;
         loop {
+            if let (Some(m), Some(e)) = (&marked, &evt) {
+                return (m.clone(), e.clone());
+            }
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
+                    if v.get("id") == Some(&serde_json::json!(6)) {
+                        marked = Some(v);
+                    } else if v["method"] == "events.event"
                         && v["params"]["event"]["type"] == "agent:updated"
                     {
-                        return v["params"]["event"].clone();
+                        evt = Some(v["params"]["event"].clone());
                     }
                 }
                 Some(Ok(Message::Ping(p))) => {
@@ -2868,7 +2875,9 @@ async fn wss_agent_mark_seen_round_trip() {
         }
     })
     .await
-    .expect("timed out waiting for agent:updated");
+    .expect("timed out waiting for markSeen response + agent:updated");
+    assert_eq!(marked["result"]["success"], true, "markSeen: {marked}");
+    assert_eq!(marked["result"]["lastSeenMessageId"], second_id.as_str());
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert_eq!(evt["data"]["agentId"], agent_id.as_str());
     assert_eq!(evt["data"]["lastSeenMessageId"], second_id.as_str());

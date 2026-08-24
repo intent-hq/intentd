@@ -5790,6 +5790,16 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
+        // Pre-write unread derivation (§5.1): whether the workspace read as
+        // unread BEFORE this marker advance, so the settle below only emits
+        // the workspace-level clear on an actual unread→none transition. A
+        // probe failure reads `false` — fail closed on emission (no spurious
+        // clear), the marker write is unaffected.
+        let was_unread = self
+            .store
+            .workspace_has_unread_top_level_session(&workspace_id)
+            .await
+            .unwrap_or(false);
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -5860,6 +5870,14 @@ impl Services {
                 }),
             )
             .await;
+            // Reading the last unread agent clears the derived workspace
+            // `unread` (§5.1): re-derive and, on the unread→none transition,
+            // clear the stored legacy flag + emit ONE
+            // `workspace:attention-changed { none }`. A workspace with other
+            // unread sessions — or one that was not unread to begin with —
+            // stays silent.
+            self.settle_workspace_unread_after_seen(&workspace_id, was_unread)
+                .await;
             return Ok(json!({
                 "success": true,
                 "lastSeenMessageId": message_id,

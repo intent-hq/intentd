@@ -910,10 +910,13 @@ async fn blocked_transition_over_wss() {
 /// Attention flags over the wire: the `unread` flag is not a displayStatus
 /// axis — `workspace.update { attention: "unread" }` and `workspace.markSeen`
 /// leave `displayStatus: "idle"` and emit no
-/// `workspace:displayStatus-changed`. A `review_required` flag reads as
-/// `needs_attention` and `workspace.dismissAttention` retires it; the ordered
-/// event stream (first event observed is the `review_required` promotion)
-/// proves the unread mutations stayed silent.
+/// `workspace:displayStatus-changed`. Served `attention` is DERIVED from
+/// per-agent seen markers (§5.1): with no agent sessions a stored `unread`
+/// reads back as `none` — the stale stored flag cannot show the blue dot. A
+/// `review_required` flag reads as `needs_attention` and
+/// `workspace.dismissAttention` retires it; the ordered event stream (first
+/// event observed is the `review_required` promotion) proves the unread
+/// mutations stayed silent.
 #[tokio::test]
 async fn attention_flag_transitions_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
@@ -958,7 +961,9 @@ async fn attention_flag_transitions_over_wss() {
     )
     .await;
     assert_eq!(got["workspace"]["displayStatus"], "idle");
-    assert_eq!(got["workspace"]["attention"], "unread");
+    // Derived unread (§5.1): no agent session has an unseen assistant last
+    // message, so the served value is `none` despite the stored flag.
+    assert_eq!(got["workspace"]["attention"], "none");
 
     // markSeen retires the flag; the rollup never moved.
     wss_rpc(
