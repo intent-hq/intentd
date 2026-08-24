@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.49] - 2026-08-24
+
+### 🚀 Features
+
+- Multi-select endpoint picker for intentd pair + --select-endpoints ([#1433](https://github.com/intent-hq/intentd/pull/1433))
+
+### 🐛 Bug Fixes
+
+- *(voice)* Sanitize keyterms sent to ElevenLabs ([#1434](https://github.com/intent-hq/intentd/pull/1434))
+
+
 ## [0.7.48] - 2026-08-24
 
 ### 🚀 Features
