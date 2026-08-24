@@ -215,7 +215,16 @@ pub async fn logout_gh_after_revoke(revoked: Option<String>) {
     let revoked = revoked
         .filter(|t| !t.trim().is_empty())
         .map(SecretString::from);
-    let handle = tokio::task::spawn_blocking(move || logout_with(&SystemGhCli, revoked));
+    let handle = tokio::task::spawn_blocking(move || {
+        let outcome = logout_with(&SystemGhCli, revoked);
+        if outcome == GhLogoutOutcome::LoggedOut {
+            // The gh-CLI token cache may still hold the token gh just lost;
+            // drop it so the next resolution re-probes. Inside the closure so
+            // a logout that outlives the timed-out wait still invalidates.
+            crate::token::invalidate_gh_cli_cache();
+        }
+        outcome
+    });
     match timeout(GH_SYNC_TIMEOUT, handle).await {
         Ok(Ok(GhLogoutOutcome::LoggedOut)) => {
             tracing::info!("logged the gh CLI out of github.com after token revoke");
@@ -246,7 +255,7 @@ struct SystemGhCli;
 
 impl GhCli for SystemGhCli {
     fn locate(&self) -> Option<PathBuf> {
-        find_on_path("gh")
+        crate::token::find_gh_binary()
     }
 
     fn is_authenticated(&self, gh: &Path) -> bool {
@@ -358,42 +367,6 @@ fn parse_active_login(status: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// `which`-style lookup: first executable `name` (plus `.exe` on Windows)
-/// across the `PATH` entries. `intent-transport`'s resolver cannot be reused
-/// here (transport depends on services, never the reverse), so this crate
-/// carries its own minimal lookup.
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-        if cfg!(windows) {
-            let candidate = dir.join(format!("{name}.exe"));
-            if is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 #[cfg(test)]
