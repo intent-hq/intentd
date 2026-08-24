@@ -124,13 +124,16 @@ pub(crate) trait Harness: Send + Sync {
     /// Provider-correct spelling of the workspace-MCP rename tool for the
     /// naming nudge.
     fn naming_tool_reference(&self, provider_id: &str) -> &'static str;
+    /// Provider-correct spelling of the workspace API MCP tool used for agent
+    /// self-naming.
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str;
     /// Fire-once `<system>` agent/workspace naming instruction. The caller
-    /// independently gates each instruction; `workspace_tool_reference` is
-    /// present only when the workspace still needs a title.
+    /// independently gates each instruction; each tool reference is present
+    /// only when its corresponding name still needs attention.
     fn naming_nudge(
         &self,
+        agent_tool_reference: Option<&str>,
         workspace_tool_reference: Option<&str>,
-        agent_needs_name: bool,
     ) -> String;
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;

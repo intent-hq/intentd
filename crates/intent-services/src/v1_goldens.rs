@@ -235,6 +235,22 @@ fn golden_empty_wake_attention_reason() {
 #[test]
 fn golden_naming_tool_references() {
     assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("auggie"),
+        "the `workspace_api_workspace-mcp` tool"
+    );
+    assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("opencode"),
+        "the `workspace-mcp_workspace_api` tool"
+    );
+    assert_eq!(
+        crate::agent_manager::agent_naming_tool_reference("codex"),
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE
+    );
+    assert_eq!(
+        crate::agent_manager::GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        "the `workspace_api` tool from the workspace MCP server"
+    );
+    assert_eq!(
         crate::agent_manager::workspace_naming_tool_reference("auggie"),
         "the `set_workspace_title_workspace-mcp` tool"
     );
@@ -256,16 +272,16 @@ fn golden_naming_tool_references() {
 fn golden_first_turn_naming_nudges() {
     let harness = crate::harness::latest();
     assert_eq!(
-        harness.naming_nudge(None, true),
+        harness.naming_nudge(Some("the `workspace_api_workspace-mcp` tool"), None),
         "<system>\nThis agent still has a generated name. Early in your first turn, call \
-         `ws.workspace.setAgentName` through the `workspace_api` tool with a short 1–5 word \
+         `ws.workspace.setAgentName` through the `workspace_api_workspace-mcp` tool with a short 1–5 word \
          task-specific name. Do this independently of workspace title naming and in parallel \
          with information-gathering.\n</system>"
     );
     assert_eq!(
         harness.naming_nudge(
+            None,
             Some("the `set_workspace_title_workspace-mcp` tool"),
-            false,
         ),
         "<system>\nThis workspace needs a title. As your first action, call the \
          `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case title \

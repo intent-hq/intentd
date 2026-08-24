@@ -202,6 +202,8 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
 /// landed yet).
 pub(crate) const GENERIC_NAMING_TOOL_REFERENCE: &str =
     "the `set_workspace_title` tool from the workspace MCP server";
+pub(crate) const GENERIC_AGENT_NAMING_TOOL_REFERENCE: &str =
+    "the `workspace_api` tool from the workspace MCP server";
 
 impl Harness for V1 {
     fn join_prompt_layers(&self, parts: &[String]) -> String {
@@ -343,20 +345,27 @@ impl Harness for V1 {
         }
     }
 
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str {
+        match provider_id {
+            "auggie" => "the `workspace_api_workspace-mcp` tool",
+            "opencode" => "the `workspace-mcp_workspace_api` tool",
+            _ => GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        }
+    }
+
     fn naming_nudge(
         &self,
+        agent_tool_reference: Option<&str>,
         workspace_tool_reference: Option<&str>,
-        agent_needs_name: bool,
     ) -> String {
         let mut instructions = Vec::new();
-        if agent_needs_name {
-            instructions.push(
+        if let Some(tool_reference) = agent_tool_reference {
+            instructions.push(format!(
                 "This agent still has a generated name. Early in your first turn, call \
-                 `ws.workspace.setAgentName` through the `workspace_api` tool with a short \
-                 1–5 word task-specific name. Do this independently of workspace title naming \
-                 and in parallel with information-gathering."
-                    .to_string(),
-            );
+                 `ws.workspace.setAgentName` through {tool_reference} with a short 1–5 word \
+                 task-specific name. Do this independently of workspace title naming and in \
+                 parallel with information-gathering."
+            ));
         }
         if let Some(tool_reference) = workspace_tool_reference {
             instructions.push(format!(
