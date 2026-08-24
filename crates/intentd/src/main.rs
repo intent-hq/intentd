@@ -434,16 +434,6 @@ async fn current_bind_address_value(socket: &Path) -> Option<serde_json::Value> 
     (!value.is_null()).then_some(value)
 }
 
-/// Read the effective `server.bindAddress` over UDS; `None` when the RPC
-/// fails or the value is not a parseable IP (callers fall back to loopback).
-/// The list form (monorepo#3314) yields its first entry — the single-select
-/// picker uses this only to pre-select a default.
-async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
-    let value = current_bind_address_value(socket).await?;
-    let raw = value.as_str().or_else(|| value.get(0)?.as_str())?;
-    raw.parse().ok()
-}
-
 /// Display form of the effective `server.bindAddress` for user-facing
 /// output: a single IP as-is, the list form (monorepo#3314) joined with
 /// ", " so every bound address is reported, not just the first.
@@ -611,8 +601,38 @@ async fn cmd_pair(
                      config.toml"
                 );
             }
-            let current = current_bind_address(&config.socket_path).await;
-            Some(prompt_bind_address(current)?)
+            // The picker is single-select; a configured list (monorepo#3314)
+            // pre-selects its first entry. Guard against silent data loss:
+            // confirming that default keeps the list untouched (no write),
+            // and choosing anything else warns that it replaces the set.
+            let current_value = current_bind_address_value(&config.socket_path).await;
+            let current_list: Vec<String> = current_value
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|e| e.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let current = current_value
+                .as_ref()
+                .and_then(|v| v.as_str().or_else(|| v.get(0)?.as_str()))
+                .and_then(|raw| raw.parse::<std::net::IpAddr>().ok());
+            if current_list.len() > 1 {
+                eprintln!(
+                    "note: server.bindAddress is a list ([{}]); picking an address here \
+                     replaces the whole list, while confirming the default keeps it.",
+                    current_list.join(", ")
+                );
+            }
+            let choice = prompt_bind_address(current)?;
+            if current_list.len() > 1 && Some(choice) == current {
+                None
+            } else {
+                Some(choice)
+            }
         };
         enable_wss_listener(&config.socket_path, bind_address).await?;
         response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;

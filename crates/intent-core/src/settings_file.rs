@@ -291,7 +291,9 @@ impl BindAddress {
     /// Parse + semantically validate the configured entries into the bind
     /// set: every entry must be a valid IP, duplicates are rejected, an
     /// unspecified address (`0.0.0.0` / `::`) is only allowed as the sole
-    /// entry, and the list form must not be empty.
+    /// entry, and the list form must not be empty. Entries are canonicalized
+    /// (v4-mapped IPv6 → IPv4), so `::ffff:127.0.0.1` duplicates `127.0.0.1`
+    /// instead of colliding at bind time on dual-stack hosts.
     ///
     /// # Errors
     ///
@@ -307,6 +309,7 @@ impl BindAddress {
             let addr: std::net::IpAddr = entry.parse().map_err(|_| {
                 format!("must be an IP address (e.g. 127.0.0.1 or 0.0.0.0), got {entry:?}")
             })?;
+            let addr = addr.to_canonical();
             if addrs.contains(&addr) {
                 return Err(format!("duplicate address {addr}"));
             }
@@ -1911,6 +1914,9 @@ mod tests {
             "[server]\nbindAddress = [\"not-an-ip\"]\n",
             "[server]\nbindAddress = [\"127.0.0.1\", \"not-an-ip\"]\n",
             "[server]\nbindAddress = [\"127.0.0.1\", \"127.0.0.1\"]\n",
+            // v4-mapped IPv6 canonicalizes to the IPv4 it would collide with
+            // at bind time on dual-stack hosts.
+            "[server]\nbindAddress = [\"127.0.0.1\", \"::ffff:127.0.0.1\"]\n",
             "[server]\nbindAddress = [\"0.0.0.0\", \"192.168.1.7\"]\n",
             "[server]\nbindAddress = [\"::\", \"::1\"]\n",
             "[server]\nbindAddress = [\"192.168.1.7\", \"0.0.0.0\"]\n",
