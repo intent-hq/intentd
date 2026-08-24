@@ -672,6 +672,281 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     );
 }
 
+/// Run `intentd pair --select-endpoints` with `input` piped to stdin (the
+/// picker reads one selection line, so a piped run works without a TTY).
+fn run_select_endpoints(data_dir: &Path, input: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .arg("--select-endpoints")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn intentd pair --select-endpoints");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write selection stdin");
+    child
+        .wait_with_output()
+        .expect("wait pair --select-endpoints")
+}
+
+/// The uncommented `bindAddress` assignment line from config.toml, if any.
+fn bind_address_line(config: &str) -> Option<&str> {
+    config
+        .lines()
+        .map(str::trim_start)
+        .find(|l| !l.starts_with('#') && l.replace(' ', "").starts_with("bindAddress="))
+}
+
+#[tokio::test]
+async fn pair_select_endpoints_rebinds_without_repairing() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // Seed a wide bind so the picker's pre-checked set ({0.0.0.0}) differs
+    // from the selection below — the only two universally bindable addresses
+    // (loopback is always entry 1, so the selection is deterministic).
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"0.0.0.0\"\n",
+    )
+    .expect("seed config.toml with wide bindAddress");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+    let before = await_stored_token(&data_dir).await;
+
+    // Selecting entry 1 (loopback) replaces the wide bind: persisted as a
+    // plain string (single entry) and the listener re-binds immediately.
+    // The e2e matrix deliberately never persists a multi-IP selection: the
+    // only universally bindable addresses are loopback and 0.0.0.0, which
+    // cannot combine (exclusive), so an array-shape e2e would be
+    // machine-dependent. The persisted array shape is unit-covered
+    // (bind_addresses_value) and the daemon's array handling by #1431.
+    let output = run_select_endpoints(&data_dir, "1\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pair --select-endpoints should succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("Which address(es)"),
+        "should show the multi-select picker: {stderr}"
+    );
+    assert!(
+        stderr.contains("listening on 127.0.0.1"),
+        "should report the new effective bind: {stderr}"
+    );
+    // No re-pairing: no QR/credentials on stdout, and the token is unchanged.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("intent://pair?"),
+        "must not print a pairing payload: {stdout}"
+    );
+    let after = stored_token(&data_dir).expect("stored token after select-endpoints");
+    assert_eq!(before, after, "select-endpoints must not rotate the token");
+
+    let config = std::fs::read_to_string(data_dir.join("config.toml")).expect("read config.toml");
+    let line = bind_address_line(&config).expect("bindAddress persisted");
+    assert!(
+        line.contains("127.0.0.1") && !line.contains("0.0.0.0"),
+        "bindAddress should now be loopback only: {line}"
+    );
+}
+
+#[tokio::test]
+async fn pair_select_endpoints_unchanged_selection_writes_nothing() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"127.0.0.1\"\n",
+    )
+    .expect("seed config.toml");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+    let config_before =
+        std::fs::read_to_string(data_dir.join("config.toml")).expect("read config.toml");
+
+    // Plain Enter keeps the pre-checked set (= the persisted set): nothing
+    // is written and the command says so.
+    let output = run_select_endpoints(&data_dir, "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "unchanged selection should succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("Selection unchanged"),
+        "should report the unchanged selection: {stderr}"
+    );
+    let config_after =
+        std::fs::read_to_string(data_dir.join("config.toml")).expect("read config.toml");
+    assert_eq!(
+        config_before, config_after,
+        "unchanged selection must not touch config.toml"
+    );
+}
+
+#[tokio::test]
+async fn pair_select_endpoints_unchanged_selection_still_enables_listener() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // UDS-only daemon (WSS listener disabled) with the default loopback bind
+    // persisted: keeping the pre-checked set unchanged must still enable and
+    // start the listener — the documented rebind/enable behavior — instead of
+    // returning early with "unchanged" while external connections stay off.
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"127.0.0.1\"\n",
+    )
+    .expect("seed config.toml");
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_select_endpoints(&data_dir, "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "unchanged selection with listener down should succeed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Selection unchanged"),
+        "must not claim an unchanged no-op while the listener is down: {stderr}"
+    );
+    assert!(
+        stderr.contains("listening on 127.0.0.1"),
+        "should enable the listener on the kept set: {stderr}"
+    );
+
+    // The enable must be persisted, and the stored bindAddress shape kept.
+    let config = std::fs::read_to_string(data_dir.join("config.toml")).expect("read config.toml");
+    assert!(
+        has_uncommented_enabled_true(&config),
+        "server.wsApi.enabled = true should be persisted: {config}"
+    );
+    let line = bind_address_line(&config).expect("bindAddress still persisted");
+    assert!(
+        line.contains("127.0.0.1"),
+        "stored bindAddress must be untouched: {line}"
+    );
+}
+
+#[tokio::test]
+async fn pair_select_endpoints_reprompts_on_invalid_input() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[server]\nbindAddress = \"127.0.0.1\"\n",
+    )
+    .expect("seed config.toml");
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    // An out-of-range token re-prompts; the follow-up plain Enter keeps the
+    // persisted set. EOF right after a bad token (no second line) fails.
+    let output = run_select_endpoints(&data_dir, "999\n\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "re-prompt then Enter should succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("enter numbers between"),
+        "should explain the invalid token: {stderr}"
+    );
+    assert!(
+        stderr.contains("Selection unchanged"),
+        "second read keeps the persisted set: {stderr}"
+    );
+
+    let output = run_select_endpoints(&data_dir, "999\n");
+    assert!(
+        !output.status.success(),
+        "EOF before a valid selection must fail"
+    );
+}
+
+#[tokio::test]
+async fn pair_select_endpoints_fails_when_daemon_down() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    // No daemon: the command must fail before showing the picker.
+    let output = run_select_endpoints(&data_dir, "1\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "select-endpoints requires a running daemon: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Which address(es)"),
+        "must not show the picker without a daemon: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn pair_select_endpoints_conflicts_with_pairing_flags() {
+    // clap-level: --select-endpoints re-runs ONLY the selection, so the
+    // pairing-output flags are rejected up front.
+    for conflicting in ["--yes", "--rotate", "--png", "--svg"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+        cmd.arg("pair").arg("--select-endpoints").arg(conflicting);
+        if matches!(conflicting, "--png" | "--svg") {
+            cmd.arg("/tmp/out.img");
+        }
+        let output = cmd
+            .stdin(Stdio::null())
+            .output()
+            .expect("run conflicting pair flags");
+        assert!(
+            !output.status.success(),
+            "--select-endpoints must conflict with {conflicting}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot be used with"),
+            "clap should name the conflict for {conflicting}: {stderr}"
+        );
+    }
+}
+
 /// Regression test for intent-hq/monorepo#1827: piping one-shot CLI output
 /// into a consumer that closes the pipe early (`intentd status | head`) must
 /// not panic with a broken-pipe backtrace. The read end of the pipe is closed
