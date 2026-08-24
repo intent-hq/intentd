@@ -372,6 +372,16 @@ async fn batch_delegate_request_response_shape_over_wss() {
     let agent_id = r1["agentId"].as_str().expect("agentId").to_string();
     assert_eq!(r1["title"], json!("T1"));
     assert_eq!(resp["startedTaskIds"], json!([t1]));
+    // Top-level summary (monorepo#3334); one task started, so no warning.
+    assert_eq!(
+        resp["summary"],
+        json!({ "started": 1, "held": 2, "skipped": 0, "errors": 0 }),
+        "{resp}"
+    );
+    assert!(
+        resp.as_object().unwrap().get("warning").is_none(),
+        "no warning when tasks started: {resp}"
+    );
     // Every requested task is covered by the graph (t2 depends on t1, t3
     // conflicts with t1), so no row carries `relationsUnknown`.
     for row in resp["tasks"].as_array().unwrap() {
@@ -453,6 +463,18 @@ async fn batch_delegate_request_response_shape_over_wss() {
     );
     assert_eq!(row_for(&again, &t3)["disposition"], json!("held:conflict"));
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
+    // Zero started on the re-call: summary reflects it and the top-level
+    // warning names the breakdown (monorepo#3334).
+    assert_eq!(
+        again["summary"],
+        json!({ "started": 0, "held": 2, "skipped": 1, "errors": 0 }),
+        "{again}"
+    );
+    let warning = again["warning"].as_str().expect("warning present");
+    assert!(warning.contains("NO TASKS STARTED"), "{warning}");
+    assert!(warning.contains("held on unmet dependencies"), "{warning}");
+    assert!(warning.contains("held on conflicts"), "{warning}");
+    assert!(warning.contains("re-call agent.delegate"), "{warning}");
 
     // The removed greedy param is rejected with -32602 pointing at
     // individual delegation — any supplied value (true / false / explicit

@@ -702,6 +702,19 @@ impl Services {
         group_id
     }
 
+    /// Whether `parent_id` currently has an open (unsealed && undelivered)
+    /// delegation group — i.e. a future `after_all` settlement wake is still
+    /// owed to it. Used by the batch-delegate zero-started advisory
+    /// (monorepo#3334) to decide whether silence would otherwise be permanent.
+    pub(crate) fn has_open_delegation_group(&self, parent_id: &AgentId) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .delegation_groups
+            .iter()
+            .any(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)
+    }
+
     /// Add `child_id` to a group's expected set (idempotent).
     pub(crate) fn enroll_child_in_group(&self, group_id: &str, child_id: &AgentId) {
         let mut guard = self
