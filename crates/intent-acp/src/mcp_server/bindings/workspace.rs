@@ -162,6 +162,7 @@ async fn propose_sibling(
         "The current workspace has no usable Git repository; a sibling workspace cannot be proposed"
             .to_string()
     })?;
+    let resolved_base_ref = base_ref.as_deref().unwrap_or(&default_branch);
 
     let mut warnings = Vec::new();
     if let Some(named_ref) = base_ref.as_deref() {
@@ -194,9 +195,7 @@ async fn propose_sibling(
     if let Some(name) = workspace.repository_name.as_deref() {
         create_params.insert("repositoryName".to_string(), json!(name));
     }
-    if let Some(named_ref) = base_ref.as_deref() {
-        create_params.insert("baseRef".to_string(), json!(named_ref));
-    }
+    create_params.insert("baseRef".to_string(), json!(resolved_base_ref));
     let mut initial_agent = serde_json::Map::new();
     initial_agent.insert("name".to_string(), json!("Coordinator"));
     initial_agent.insert("prompt".to_string(), json!(initial_prompt));
@@ -224,10 +223,7 @@ async fn propose_sibling(
     workspace_create.insert("initialPrompt".to_string(), json!(initial_prompt));
     workspace_create.insert("repoPath".to_string(), json!(repository_path));
     workspace_create.insert("repoType".to_string(), json!("local"));
-    workspace_create.insert(
-        "branch".to_string(),
-        json!(base_ref.as_deref().unwrap_or(&default_branch)),
-    );
+    workspace_create.insert("branch".to_string(), json!(resolved_base_ref));
     workspace_create.insert("isNewRepo".to_string(), json!(false));
     if let Some(url) = github_url {
         workspace_create.insert("githubUrl".to_string(), json!(url));

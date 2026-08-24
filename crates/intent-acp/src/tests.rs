@@ -5530,7 +5530,14 @@ mod workspace_api_tool_tests {
         let commit = repo.find_commit(commit_id).unwrap();
         repo.branch("main", &commit, true).unwrap();
         repo.branch("feature/ready", &commit, false).unwrap();
-        repo.set_head("refs/heads/main").unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            false,
+            "test default branch",
+        )
+        .unwrap();
+        repo.set_head("refs/heads/feature/ready").unwrap();
         drop(commit);
         drop(tree);
         drop(repo);
@@ -5602,10 +5609,8 @@ mod workspace_api_tool_tests {
         );
         assert_eq!(params["repositoryOwner"], "intent-hq");
         assert_eq!(params["repositoryName"], "intentd");
-        assert!(
-            params.get("baseRef").is_none(),
-            "omitted baseRef must stay omitted"
-        );
+        assert_eq!(params["baseRef"], "main");
+        assert_eq!(params["baseRef"], create["branch"]);
         assert_eq!(params["initialAgent"]["prompt"], create["initialPrompt"]);
         assert_eq!(params["initialAgent"]["specialist"], "implementor");
         assert_eq!(params["initialAgent"]["metadata"]["isInitialAgent"], true);
