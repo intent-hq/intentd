@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.53] - 2026-08-24
+
+### 📚 Documentation
+
+- Teach agents inline workspace image embedding in chat ([#1448](https://github.com/intent-hq/intentd/pull/1448))
+
+
 ## [0.7.52] - 2026-08-24
 
 ### 🚀 Features
