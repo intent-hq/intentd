@@ -5,8 +5,11 @@
 //! plus a short style hint for prompt-based providers. Request-supplied
 //! context (`prompt`, `keyterms`) is merged on top: `OpenAI` receives one
 //! composed `prompt` string; `ElevenLabs` receives the merged `keyterms` array
-//! (deduped case-insensitively, capped at [`MAX_KEYTERMS`], each term ≤
-//! [`MAX_KEYTERM_CHARS`] chars — the Scribe v2 limits).
+//! sanitized to the Scribe v2 limits: the unsupported characters
+//! `<` `>` `{` `}` `[` `]` `\` are stripped and whitespace runs collapsed,
+//! then terms that are blank, longer than [`MAX_KEYTERM_CHARS`] chars, or more
+//! than [`MAX_KEYTERM_WORDS`] words are dropped; the result is deduped
+//! case-insensitively and capped at [`MAX_KEYTERMS`].
 
 /// Style hint prefixed to the composed `OpenAI` `prompt`.
 pub(crate) const OPENAI_STYLE_HINT: &str = "Technical dictation in a software-engineering app; \
@@ -18,23 +21,46 @@ pub(crate) const MAX_KEYTERMS: usize = 100;
 /// `ElevenLabs` Scribe v2 per-keyterm length cap.
 pub(crate) const MAX_KEYTERM_CHARS: usize = 50;
 
+/// `ElevenLabs` Scribe v2 per-keyterm word cap.
+pub(crate) const MAX_KEYTERM_WORDS: usize = 5;
+
+/// Characters `ElevenLabs` Scribe v2 rejects in keyterms.
+const REJECTED_CHARS: [char; 7] = ['<', '>', '{', '}', '[', ']', '\\'];
+
+/// Sanitize one candidate keyterm to the `ElevenLabs` Scribe v2 rules:
+/// strip [`REJECTED_CHARS`], collapse whitespace runs to single spaces, and
+/// trim. Returns the sanitized spelling.
+fn sanitize_keyterm(term: &str) -> String {
+    term.chars()
+        .filter(|c| !REJECTED_CHARS.contains(c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Merge the configured `vocabulary` with request `keyterms`: vocabulary
-/// terms first, then request terms; duplicates dropped case-insensitively
-/// (first spelling wins); terms longer than [`MAX_KEYTERM_CHARS`] chars or
-/// blank are skipped; capped at [`MAX_KEYTERMS`].
+/// terms first, then request terms; each term sanitized via
+/// [`sanitize_keyterm`]; duplicates dropped case-insensitively on the
+/// sanitized spelling (first spelling wins); terms that are blank, longer
+/// than [`MAX_KEYTERM_CHARS`] chars, or more than [`MAX_KEYTERM_WORDS`]
+/// words after sanitization are skipped; capped at [`MAX_KEYTERMS`].
 #[must_use]
 pub fn merge_keyterms(vocabulary: &[String], request_keyterms: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for term in vocabulary.iter().chain(request_keyterms.iter()) {
-        let trimmed = term.trim();
-        if trimmed.is_empty() || trimmed.chars().count() > MAX_KEYTERM_CHARS {
+        let sanitized = sanitize_keyterm(term);
+        if sanitized.is_empty()
+            || sanitized.chars().count() > MAX_KEYTERM_CHARS
+            || sanitized.split_whitespace().count() > MAX_KEYTERM_WORDS
+        {
             continue;
         }
-        if !seen.insert(trimmed.to_lowercase()) {
+        if !seen.insert(sanitized.to_lowercase()) {
             continue;
         }
-        out.push(trimmed.to_string());
+        out.push(sanitized);
         if out.len() >= MAX_KEYTERMS {
             break;
         }
@@ -115,6 +141,46 @@ mod tests {
         let many: Vec<String> = (0..200).map(|i| format!("term{i}")).collect();
         let merged = merge_keyterms(&[], &many);
         assert_eq!(merged.len(), MAX_KEYTERMS);
+    }
+
+    #[test]
+    fn strips_each_rejected_character() {
+        let cases = [
+            ("[fix] task", "fix task"),
+            ("<intentd>", "intentd"),
+            ("{brace}", "brace"),
+            ("back\\slash", "backslash"),
+        ];
+        for (input, expected) in cases {
+            let merged = merge_keyterms(&[], &[input.to_string()]);
+            assert_eq!(merged, vec![expected.to_string()], "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn collapses_whitespace_runs() {
+        let merged = merge_keyterms(&[], &["foo \t bar   baz".to_string()]);
+        assert_eq!(merged, vec!["foo bar baz".to_string()]);
+    }
+
+    #[test]
+    fn drops_terms_blank_after_stripping() {
+        let merged = merge_keyterms(&[], &["[] {} <> \\".to_string()]);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn drops_terms_with_more_than_five_words() {
+        let six = "one two three four five six".to_string();
+        let five = "one two three four five".to_string();
+        let merged = merge_keyterms(&[], &[six, five.clone()]);
+        assert_eq!(merged, vec![five]);
+    }
+
+    #[test]
+    fn dedupes_on_sanitized_spelling() {
+        let merged = merge_keyterms(&[], &["[fix] task".to_string(), "fix task".to_string()]);
+        assert_eq!(merged, vec!["fix task".to_string()]);
     }
 
     #[test]
