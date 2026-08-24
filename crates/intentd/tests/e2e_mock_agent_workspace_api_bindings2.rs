@@ -1159,8 +1159,9 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .as_str()
         .expect("resend parked entry id");
 
-    // Atomic replace: `replacePending: true` retracts the caller's pending
-    // entry (the re-send) and parks the replacement in one call, reporting
+    // Atomic replace: `replacePending: true` parks the replacement and then
+    // retracts the caller's pending entry (the re-send) in one call —
+    // send-first, so a failed send would leave the entry intact — reporting
     // the retracted id.
     let replace = &out["replace"];
     assert_eq!(replace["ok"], true, "{out}");

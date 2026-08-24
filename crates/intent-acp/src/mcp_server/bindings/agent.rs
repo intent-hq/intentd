@@ -14,7 +14,7 @@ use std::sync::Arc;
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     model::{AgentDelegateInput, BatchTaskEntry},
-    AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin, NoteId, WorkspaceApi,
+    AgentCreateExtra, AgentId, AgentWakeOrCreateInput, Error, MessageOrigin, NoteId, WorkspaceApi,
     WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
@@ -335,10 +335,11 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// caller (an agent) already has a pending entry in the target's queue, the
 /// send is refused with an `ok: false` result echoing the target's queue —
 /// see [`pending_send_refusal`]. `replacePending: true` (options-object third
-/// argument) turns the refusal into a replace: the pending entry is retracted
-/// ([`replace_pending_entry`]) and the send proceeds, reporting the replace
-/// outcome on the result. Success results carry a top-level
-/// `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
+/// argument) turns the refusal into a replace: the new message is sent FIRST
+/// and the pending entry retracted after ([`replace_pending_entry`]), so a
+/// failed send never discards the pending entry — the replace is lossless,
+/// with the replace outcome reported on the result. Success results carry a
+/// top-level `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
 /// silently-queued is unambiguous even to a sender that only glances at
 /// the result.
 async fn send(
@@ -351,16 +352,15 @@ async fn send(
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
     let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
-    let mut replace_report: Option<Value> = None;
+    let mut pending_to_replace: Option<String> = None;
     if let Some(refusal) = pending_send_refusal(api, ws, caller, &agent_id).await {
         if !replace_pending {
             return Ok(refusal);
         }
-        if let Some(caller) = caller {
-            replace_report = Some(replace_pending_entry(api, caller, &agent_id, &refusal).await);
-        }
-    } else if replace_pending && caller.is_some() {
-        replace_report = Some(json!({ "replaced": false, "replaceOutcome": "none" }));
+        pending_to_replace = refusal
+            .get("pendingMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
     let mut result = api
         .agent_send_message(
@@ -379,6 +379,15 @@ async fn send(
         )
         .await
         .map_err(map_err)?;
+    let mut replace_report: Option<Value> = None;
+    if replace_pending {
+        if let Some(caller) = caller {
+            replace_report = Some(match &pending_to_replace {
+                Some(pid) => replace_pending_entry(api, caller, &agent_id, pid).await,
+                None => json!({ "replaced": false, "replaceOutcome": "none" }),
+            });
+        }
+    }
     if let Some(sub) = watch_sender(api, ws, caller, &agent_id).await {
         result["subscriptionId"] = json!(sub);
         result["message"] = json!(SENDER_WATCH_NOTIFICATION);
@@ -397,14 +406,20 @@ async fn send(
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
 /// applied against the task's assigned agent (resolution failures fall
 /// through so the unguarded call surfaces its existing error/`ok: false`
-/// shapes — e.g. "No agent assigned to task"), the same `replacePending`
-/// replace path, and the same top-level
+/// shapes — e.g. "No agent assigned to task"), the same send-first
+/// `replacePending` replace path, and the same top-level
 /// `delivery` outcome on success ([`delivery_outcome`] — the op nests its
 /// flags under `result`). The guard's target resolution
 /// (`task.assigned_agents.first()`) deliberately mirrors
 /// `agent_send_to_task_op` in `intent-services` — if the op's resolution
 /// ever changes, this site must change with it or the guard checks the
-/// wrong agent.
+/// wrong agent. The op re-resolves the assignee itself, so the retraction
+/// only runs when the op's resolved `agentId` matches the guard's target;
+/// a mid-call reassignment retracts nothing and reports
+/// `replaceOutcome: "reassigned"`. An agent caller passing
+/// `replacePending: true` always gets a replace report — the fall-through
+/// paths report `replaceOutcome: "none"` rather than silently ignoring the
+/// option.
 async fn send_to_task(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -415,8 +430,9 @@ async fn send_to_task(
         req_str(args, "taskNoteId").map_err(|_| "taskNoteId is required".to_string())?;
     let message = req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let replace_pending = opt_bool(args, "replacePending").unwrap_or(false);
-    let mut replace_report: Option<Value> = None;
-    if let Some(caller_id) = caller {
+    let mut guard_target: Option<AgentId> = None;
+    let mut pending_to_replace: Option<String> = None;
+    if caller.is_some() {
         if let Ok(task) = api
             .get_my_task(ws.clone(), NoteId::from_string(&task_note_id))
             .await
@@ -429,10 +445,11 @@ async fn send_to_task(
                         }
                         return Ok(refusal);
                     }
-                    replace_report =
-                        Some(replace_pending_entry(api, caller_id, target, &refusal).await);
-                } else if replace_pending {
-                    replace_report = Some(json!({ "replaced": false, "replaceOutcome": "none" }));
+                    pending_to_replace = refusal
+                        .get("pendingMessageId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    guard_target = Some(target.clone());
                 }
             }
         }
@@ -451,6 +468,24 @@ async fn send_to_task(
         .get("agentId")
         .and_then(Value::as_str)
         .map(AgentId::from);
+    let mut replace_report: Option<Value> = None;
+    if replace_pending {
+        if let Some(caller_id) = caller {
+            replace_report = Some(match (&pending_to_replace, &guard_target) {
+                (Some(pid), Some(gt)) if target.as_ref() == Some(gt) => {
+                    replace_pending_entry(api, caller_id, gt, pid).await
+                }
+                (Some(_), Some(_)) => {
+                    // The op resolved a different assignee (or none) than the
+                    // guard did — the pending entry sits in the old assignee's
+                    // queue while the new message went elsewhere. Retract
+                    // nothing and say so instead of reporting a false replace.
+                    json!({ "replaced": false, "replaceOutcome": "reassigned" })
+                }
+                _ => json!({ "replaced": false, "replaceOutcome": "none" }),
+            });
+        }
+    }
     if let Some(target) = target {
         if let Some(sub) = watch_sender(api, ws, caller, &target).await {
             result["subscriptionId"] = json!(sub);
@@ -950,43 +985,49 @@ async fn pending_send_refusal(
         "pendingMessageId": pending_id,
         "queueLength": queue_length,
         "queue": queue,
-        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or re-send ONE message combining everything you want to say with `replacePending: true` in the options-object third argument — it atomically retracts your pending entry and sends the new message in a single call (degrading gracefully to a plain send when the entry drains in between; the result reports `replaced`/`replaceOutcome`). Manual removeQueuedMessage + re-send still works but is NOT atomic. Either way the re-sent message lands at the END of the queue.",
+        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or re-send ONE message combining everything you want to say with `replacePending: true` in the options-object third argument — it sends the new message and retracts your pending entry in a single call (the entry is only removed after the new message is accepted, so nothing is lost if the send fails; the result reports `replaced`/`replaceOutcome`). Manual removeQueuedMessage + re-send still works but is NOT atomic (the pending entry is gone even if the re-send then fails). Either way the re-sent message lands at the END of the queue.",
     }))
 }
 
-/// Execute the `replacePending` retraction against the pending entry named
-/// by a [`pending_send_refusal`] result, returning the replace-report
-/// fragment merged into the send result by [`merge_replace_report`].
-/// Retraction success → `replaced: true` + `replacedMessageId`; retraction
-/// failure (entry already drained/delivered between the guard check and the
-/// removal, or any other removal error) degrades gracefully to a plain send
-/// with `replaced: false` + `replaceOutcome: "drained"` — the new message is
-/// sent either way, so the caller never has to re-drive the sequence.
+/// Execute the `replacePending` retraction against the pending entry id
+/// captured from a [`pending_send_refusal`] result, returning the
+/// replace-report fragment merged into the send result by
+/// [`merge_replace_report`]. Runs AFTER the new message was sent, so a
+/// failed send never discards the pending entry. Retraction success →
+/// `replaced: true` + `replacedMessageId`; `NotFound` (entry drained /
+/// delivered between the guard check and the removal) → `replaced: false` +
+/// `replaceOutcome: "drained"`; any other removal error (unexpected here —
+/// the refusal already established the caller's ownership) is logged and
+/// reported as `replaceOutcome: "error"` so an infrastructure failure never
+/// masquerades as a drained race. The new message was sent either way, so
+/// the caller never has to re-drive the sequence.
 async fn replace_pending_entry(
     api: &Arc<dyn WorkspaceApi>,
     caller: &AgentId,
     target: &AgentId,
-    refusal: &Value,
+    pending_id: &str,
 ) -> Value {
-    let pending_id = refusal
-        .get("pendingMessageId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     match api
-        .agent_remove_queued_message_owned(target.clone(), pending_id.clone(), caller.clone())
+        .agent_remove_queued_message_owned(target.clone(), pending_id.to_string(), caller.clone())
         .await
     {
         Ok(_) => json!({ "replaced": true, "replacedMessageId": pending_id }),
-        Err(_) => json!({ "replaced": false, "replaceOutcome": "drained" }),
+        Err(Error::NotFound(_)) => json!({ "replaced": false, "replaceOutcome": "drained" }),
+        Err(e) => {
+            tracing::warn!(target_agent = %target.0, message_id = %pending_id, error = %e, "agent.send: replacePending retraction failed");
+            json!({ "replaced": false, "replaceOutcome": "error" })
+        }
     }
 }
 
-/// Merge a [`replace_pending_entry`] report (or the no-pending-entry
-/// `replaceOutcome: "none"` fragment) into a send result. `replaced: true`
-/// carries `replacedMessageId`; `replaced: false` carries `replaceOutcome`
-/// (`"drained"` — the entry delivered before it could be retracted — or
-/// `"none"` — there was nothing to replace).
+/// Merge a [`replace_pending_entry`] report (or a fall-through
+/// `replaceOutcome` fragment) into a send result. `replaced: true` carries
+/// `replacedMessageId`; `replaced: false` carries `replaceOutcome`
+/// (`"drained"` — the entry delivered before it could be retracted,
+/// `"none"` — there was nothing to replace, `"reassigned"` — sendToTask
+/// only: the task's assignee changed mid-call so the entry was left in the
+/// old assignee's queue, or `"error"` — the retraction failed for a reason
+/// other than the entry draining).
 fn merge_replace_report(obj: &mut serde_json::Map<String, Value>, report: Option<Value>) {
     if let Some(Value::Object(report)) = report {
         for (k, v) in report {
