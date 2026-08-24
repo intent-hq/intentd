@@ -24,7 +24,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -54,18 +54,75 @@ const GH_CLI_TIMEOUT: Duration = Duration::from_secs(5);
 const GH_TOKEN_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Positive-only cache for the `gh` CLI token. 🔒 In-memory only — the value
-/// must never reach logs, errors, or argv.
-fn gh_token_cache() -> &'static Mutex<Option<(Instant, String)>> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+/// must never reach logs, errors, or argv (no `Debug` derive on the state).
+///
+/// The generation counter closes the invalidate-during-lookup race: a lookup
+/// snapshots the generation before spawning `gh`, and its result is stored
+/// only when the generation is unchanged — an [`invalidate`](Self::invalidate)
+/// that lands mid-lookup (e.g. the post-revoke `gh` logout) bumps it, so the
+/// now-revoked token is discarded instead of re-populating the cache.
+struct GhTokenCache {
+    state: Mutex<GhTokenCacheState>,
 }
+
+#[derive(Default)]
+struct GhTokenCacheState {
+    generation: u64,
+    entry: Option<(Instant, String)>,
+}
+
+impl GhTokenCache {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(GhTokenCacheState {
+                generation: 0,
+                entry: None,
+            }),
+        }
+    }
+
+    /// The cached token when it is younger than `ttl`, else `None`.
+    fn fresh(&self, ttl: Duration) -> Option<String> {
+        let guard = self.state.lock().ok()?;
+        let (at, token) = guard.entry.as_ref()?;
+        (at.elapsed() < ttl).then(|| token.clone())
+    }
+
+    /// Snapshot the generation before starting a lookup (see
+    /// [`store_if_current`](Self::store_if_current)).
+    fn generation(&self) -> u64 {
+        self.state.lock().map_or(0, |g| g.generation)
+    }
+
+    /// Store a lookup's token unless an invalidation raced it: a no-op when
+    /// `generation` no longer matches (the looked-up token may be the very
+    /// one that was just revoked).
+    fn store_if_current(&self, generation: u64, token: &str) {
+        if let Ok(mut guard) = self.state.lock() {
+            if guard.generation == generation {
+                guard.entry = Some((Instant::now(), token.to_string()));
+            }
+        }
+    }
+
+    /// Drop the cached token and bump the generation so any in-flight lookup
+    /// discards its (possibly stale) result.
+    fn invalidate(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.entry = None;
+        }
+    }
+}
+
+/// Process-wide [`GhTokenCache`] used by [`gh_cli_token`].
+static GH_TOKEN_CACHE: GhTokenCache = GhTokenCache::new();
 
 /// Drop the cached `gh` CLI token (e.g. after the daemon logs `gh` out on
 /// revoke) so the next resolution re-probes instead of serving a stale token.
+/// Also discards the result of any lookup already in flight.
 pub(crate) fn invalidate_gh_cli_cache() {
-    if let Ok(mut guard) = gh_token_cache().lock() {
-        *guard = None;
-    }
+    GH_TOKEN_CACHE.invalidate();
 }
 
 /// Strategy used to resolve the GitHub token.
@@ -87,13 +144,23 @@ pub enum TokenSource {
 /// produced one) plus a human-readable skip reason for every source that was
 /// tried and yielded nothing, in attempt order. Reasons never carry token
 /// material.
-#[derive(Debug)]
 pub struct TokenResolution {
     /// The first token the attempted sources produced, if any.
     pub token: Option<String>,
     /// Why each attempted source yielded nothing (empty when `token` is
     /// `Some` and the first source hit).
     pub skipped: Vec<String>,
+}
+
+/// 🔒 Manual impl: the token is redacted so a stray `{:?}` (logs, `expect`
+/// messages) can never leak credential material.
+impl std::fmt::Debug for TokenResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResolution")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("skipped", &self.skipped)
+            .finish()
+    }
 }
 
 /// One source's attempt: the token, or a reason it yielded nothing.
@@ -207,13 +274,10 @@ pub(crate) fn pick_env_token(github: Option<&str>, gh: Option<&str>) -> Option<S
 /// with a bounded timeout so a wedged child can't block a tokio worker. A
 /// success is cached for [`GH_TOKEN_CACHE_TTL`].
 async fn gh_cli_token() -> SourceResult {
-    if let Ok(guard) = gh_token_cache().lock() {
-        if let Some((at, token)) = guard.as_ref() {
-            if at.elapsed() < GH_TOKEN_CACHE_TTL {
-                return Ok(token.clone());
-            }
-        }
+    if let Some(token) = GH_TOKEN_CACHE.fresh(GH_TOKEN_CACHE_TTL) {
+        return Ok(token);
     }
+    let generation = GH_TOKEN_CACHE.generation();
     let handle = tokio::task::spawn_blocking(|| {
         let Some(gh) = find_gh_binary() else {
             return Err(
@@ -228,9 +292,7 @@ async fn gh_cli_token() -> SourceResult {
     });
     match timeout(GH_CLI_TIMEOUT, handle).await {
         Ok(Ok(Ok(v))) => {
-            if let Ok(mut guard) = gh_token_cache().lock() {
-                *guard = Some((Instant::now(), v.clone()));
-            }
+            GH_TOKEN_CACHE.store_if_current(generation, &v);
             Ok(v)
         }
         Ok(Ok(Err(reason))) => Err(reason),
@@ -500,5 +562,58 @@ mod tests {
             find_gh_in_dirs_for(&[dir.path().to_path_buf()], true),
             Some(exe)
         );
+    }
+
+    #[test]
+    fn cache_serves_fresh_token_within_ttl() {
+        let cache = GhTokenCache::new();
+        assert_eq!(cache.fresh(GH_TOKEN_CACHE_TTL), None);
+        let generation = cache.generation();
+        cache.store_if_current(generation, "gho_cached");
+        assert_eq!(
+            cache.fresh(GH_TOKEN_CACHE_TTL).as_deref(),
+            Some("gho_cached")
+        );
+    }
+
+    #[test]
+    fn cache_expires_after_ttl() {
+        let cache = GhTokenCache::new();
+        cache.store_if_current(cache.generation(), "gho_cached");
+        assert_eq!(cache.fresh(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn cache_invalidate_drops_entry() {
+        let cache = GhTokenCache::new();
+        cache.store_if_current(cache.generation(), "gho_cached");
+        cache.invalidate();
+        assert_eq!(cache.fresh(GH_TOKEN_CACHE_TTL), None);
+    }
+
+    #[test]
+    fn cache_rejects_store_from_a_lookup_that_raced_an_invalidation() {
+        let cache = GhTokenCache::new();
+        let generation = cache.generation();
+        cache.invalidate();
+        cache.store_if_current(generation, "gho_revoked");
+        assert_eq!(cache.fresh(GH_TOKEN_CACHE_TTL), None);
+        cache.store_if_current(cache.generation(), "gho_fresh");
+        assert_eq!(
+            cache.fresh(GH_TOKEN_CACHE_TTL).as_deref(),
+            Some("gho_fresh")
+        );
+    }
+
+    #[test]
+    fn token_resolution_debug_redacts_the_token() {
+        let res = TokenResolution {
+            token: Some("gho_secret_material".to_string()),
+            skipped: vec!["env: unset".to_string()],
+        };
+        let debug = format!("{res:?}");
+        assert!(!debug.contains("gho_secret_material"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(debug.contains("env: unset"), "{debug}");
     }
 }

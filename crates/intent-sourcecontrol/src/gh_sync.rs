@@ -215,12 +215,18 @@ pub async fn logout_gh_after_revoke(revoked: Option<String>) {
     let revoked = revoked
         .filter(|t| !t.trim().is_empty())
         .map(SecretString::from);
-    let handle = tokio::task::spawn_blocking(move || logout_with(&SystemGhCli, revoked));
+    let handle = tokio::task::spawn_blocking(move || {
+        let outcome = logout_with(&SystemGhCli, revoked);
+        if outcome == GhLogoutOutcome::LoggedOut {
+            // The gh-CLI token cache may still hold the token gh just lost;
+            // drop it so the next resolution re-probes. Inside the closure so
+            // a logout that outlives the timed-out wait still invalidates.
+            crate::token::invalidate_gh_cli_cache();
+        }
+        outcome
+    });
     match timeout(GH_SYNC_TIMEOUT, handle).await {
         Ok(Ok(GhLogoutOutcome::LoggedOut)) => {
-            // The gh-CLI token cache may still hold the token gh just lost;
-            // drop it so the next resolution re-probes.
-            crate::token::invalidate_gh_cli_cache();
             tracing::info!("logged the gh CLI out of github.com after token revoke");
         }
         Ok(Ok(GhLogoutOutcome::LogoutFailed)) => {
