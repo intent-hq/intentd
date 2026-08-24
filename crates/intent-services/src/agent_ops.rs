@@ -6925,9 +6925,14 @@ impl Services {
     /// defaults. No scheduler state is written: held tasks are simply not
     /// started, and re-calling with the same list is idempotent
     /// (running/terminal tasks classify as `skipped`). The result enumerates
-    /// EVERY supplied task with its disposition + reason and projects the
+    /// EVERY supplied task with its disposition + reason, carries a top-level
+    /// `summary` (started/held/skipped/errors counts) plus a top-level
+    /// `warning` when zero tasks started (monorepo#3334), and projects the
     /// unlock plan; the existing group settlement wake is the resume signal —
-    /// the caller re-calls delegate then, which recomputes everything.
+    /// the caller re-calls delegate then, which recomputes everything. A
+    /// zero-started `after_all` call with no open delegation group owes no
+    /// future wake, so it additionally delivers an immediate advisory wake to
+    /// the parent (best-effort) instead of silence.
     async fn agent_delegate_batch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -7236,12 +7241,92 @@ impl Services {
                 .unwrap()
                 .insert("criticalPathMinutes".into(), json!(minutes));
         }
-        Ok(json!({
+        // Top-level disposition summary (monorepo#3334): a lazy `.ok` read
+        // must still surface "started nothing" without parsing the rows.
+        let count_disposition = |d: &str| {
+            rows.iter()
+                .filter(|r| r["disposition"].as_str() == Some(d))
+                .count()
+        };
+        let held_deps = count_disposition("held:blocked-on-deps");
+        let held_conflict = count_disposition("held:conflict");
+        let skipped_count = count_disposition("skipped");
+        let error_count = count_disposition("error");
+        let started_count = started_ids.len();
+        let mut result = json!({
             "ok": true,
             "tasks": rows,
             "startedTaskIds": started_ids,
+            "summary": {
+                "started": started_count,
+                "held": held_count,
+                "skipped": skipped_count,
+                "errors": error_count,
+            },
             "unlockPlan": unlock_plan,
-        }))
+        });
+        if started_count == 0 {
+            // Prominent top-level warning: a zero-started batch is the
+            // silent-stall footgun (monorepo#3334) — name the hold reasons so
+            // even a summary read explains what happened and what to do.
+            let mut reasons: Vec<String> = Vec::new();
+            if held_deps > 0 {
+                reasons.push(format!("{held_deps} held on unmet dependencies"));
+            }
+            if held_conflict > 0 {
+                reasons.push(format!("{held_conflict} held on conflicts"));
+            }
+            if skipped_count > 0 {
+                reasons.push(format!(
+                    "{skipped_count} skipped (already running or complete/cancelled)"
+                ));
+            }
+            if error_count > 0 {
+                reasons.push(format!("{error_count} failed to start"));
+            }
+            let breakdown = if reasons.is_empty() {
+                "nothing was startable".to_string()
+            } else {
+                reasons.join(", ")
+            };
+            let warning = format!(
+                "NO TASKS STARTED — {breakdown}. Nothing starts on its own and no completion wake will arrive from this call; resolve the holds, then re-call agent.delegate."
+            );
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("warning".into(), json!(warning));
+            // A zero-started `after_all` batch owes the caller a future
+            // settlement wake it will never get: no child enrolled, so no
+            // group formed (or extended). Unless an open group from earlier
+            // delegations still guarantees a wake, deliver an immediate
+            // advisory wake so the silence cannot become a permanent stall.
+            // Best-effort: an advisory delivery failure never fails the call.
+            if input.wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                if let Some(parent) = &parent_agent_id {
+                    if !self.has_open_delegation_group(parent) {
+                        let parent_home_ws = self
+                            .store
+                            .get_agent_session(parent)
+                            .await
+                            .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                        let advisory = format!(
+                            "Advisory: your batch agent.delegate (waitMode: \"after_all\") started ZERO tasks — {breakdown}. No delegation group was formed, so NO settlement wake will ever arrive from that call. Re-call agent.delegate once the holds clear, or delegate a held task individually to force it."
+                        );
+                        if let Err(e) = self
+                            .deliver_wake_message(&parent_home_ws, parent, &advisory, None)
+                            .await
+                        {
+                            tracing::warn!(
+                                "zero-started batch delegate advisory wake failed for {}: {e}",
+                                parent.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run
