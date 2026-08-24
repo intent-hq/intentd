@@ -615,6 +615,7 @@ mod tests {
         let common = gated_common(&V1, &features);
         assert!(!common.contains("## Rich Chat Rendering"));
         assert!(!common.contains("mermaid"));
+        assert!(!common.contains("intent://local/file/"));
         // The section is last in common.md: the body ends cleanly after the
         // previous section, and composition keeps the layer separator intact.
         assert!(common.ends_with("work as closing tags."));
