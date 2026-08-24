@@ -809,11 +809,27 @@ mod tests {
         );
     }
 
+    /// A `git` command reading config with `params` as the command-line scope
+    /// and every host config scope excluded, so assertions see only the
+    /// entries under test — e.g. `gh auth setup-git` installs a github.com
+    /// credential helper in the global config that would otherwise leak into
+    /// `--get-all` reads (monorepo#3343). `-C /` runs outside any repository
+    /// (the same no-repo trick `discover_github_helpers` uses), excluding the
+    /// enclosing checkout's local config too.
+    fn hermetic_config_git(params: &str) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg("/")
+            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd
+    }
+
     /// Read back the ordered `credential.https://github.com.helper` values a
     /// `GIT_CONFIG_PARAMETERS` value produces, using real git as the parser.
     fn helper_values_via_git(params: &str) -> Vec<String> {
-        let out = Command::new("git")
-            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+        let out = hermetic_config_git(params)
             .args(["config", "--get-all", GITHUB_HELPER_KEY])
             .output()
             .expect("git must be runnable");
@@ -839,8 +855,7 @@ mod tests {
             params.starts_with("'foo.bar=baz' '"),
             "inherited entry must come first: {params}"
         );
-        let out = std::process::Command::new("git")
-            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+        let out = hermetic_config_git(params)
             .args(["config", "--get", "foo.bar"])
             .output()
             .expect("git must be runnable");
@@ -908,8 +923,7 @@ mod tests {
             params.starts_with("'foo.bar=baz' '"),
             "inherited entry must come first: {params}"
         );
-        let out = std::process::Command::new("git")
-            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+        let out = hermetic_config_git(params)
             .args(["config", "--get", "foo.bar"])
             .output()
             .expect("git must be runnable");
