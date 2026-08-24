@@ -4223,10 +4223,11 @@ impl AgentManager {
         // as it really ended (monorepo#2110) — including the zero-output
         // completion that persists no row of its own and must therefore still
         // produce the marker row and arm the redelivery below.
-        let (interrupted_message_id, interrupted_text_blocks, had_output) = match flushed {
-            Some(f) => (f.message_id, f.text_blocks, f.had_output),
-            None => (None, Vec::new(), false),
-        };
+        let (interrupted_message_id, interrupted_text_blocks, interrupted_block_count, had_output) =
+            match flushed {
+                Some(f) => (f.message_id, f.text_blocks, f.block_count, f.had_output),
+                None => (None, Vec::new(), 0, false),
+            };
         // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
         // provider turn dropped the stopped message before producing any
         // output, so arm the prompt-only redelivery payload for the NEXT
@@ -4328,6 +4329,15 @@ impl AgentManager {
         // blocks for the event to mirror; carrying undrained entries would
         // break the byte-identical persisted↔event invariant.
         if let Some(workspace_id) = workspace_id {
+            let diagnostic_id = interrupted_message_id.as_deref();
+            crate::agent_session::trace_stream_lifecycle(
+                diagnostic_id,
+                "message",
+                "agent_stream_end",
+                None,
+                interrupted_block_count,
+                "interrupted",
+            );
             // `interruptReason`/`interruptedBy` mirror the persisted row's
             // metadata so clients can render the reason-specific Stopped
             // indicator live, without refetching the transcript.
@@ -4371,6 +4381,14 @@ impl AgentManager {
             // content has not been queued yet at this point, so the
             // ready-to-send check alone cannot see the imminent interrupt turn).
             if !suppress_idle_emit && !self.services.has_ready_to_send(agent_id) {
+                crate::agent_session::trace_stream_lifecycle(
+                    diagnostic_id,
+                    "message",
+                    "agent_idle",
+                    None,
+                    interrupted_block_count,
+                    "interrupted",
+                );
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "interrupted",
@@ -6574,7 +6592,7 @@ impl AgentManager {
             mgr.clear_worker(&id);
             mgr.end_turn(&id).await;
             mgr.services
-                .publish_harness_wake_idle(&id, &ws, outcome.empty_response)
+                .publish_harness_wake_idle(&id, &ws, &outcome.lifecycle, outcome.empty_response)
                 .await;
             // A user send that raced in queued behind this turn's slot (or
             // the recovery nudge above); with the slot released, kick the
@@ -8859,6 +8877,7 @@ async fn run_message_worker(
                             .await;
                             mgr.services
                                 .stash_pending_terminal_error(&agent_id, persist);
+                            trace_idle_timeout_cap(options.turn_id.as_deref());
                             let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                             if let Some(tid) = options.turn_id.as_deref() {
                                 data["turnId"] = json!(tid);
@@ -10101,18 +10120,61 @@ async fn publish_terminal_failure_events(
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "terminal_failure",
+        None,
+        0,
+        "failed",
+    );
     let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
     let mut end_data = json!({ "agentId": agent_id.0 });
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
         end_data["turnId"] = json!(tid);
     }
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "agent_failed",
+        None,
+        0,
+        "failed",
+    );
     mgr.services
         .publish_agent_event(workspace_id, agent_id, AGENT_FAILED, failed_data)
         .await;
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "agent_stream_end",
+        None,
+        0,
+        "failed",
+    );
     mgr.services
         .publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
         .await;
+}
+
+pub(crate) fn trace_idle_timeout_cap(turn_id: Option<&str>) {
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "terminal_failure",
+        None,
+        0,
+        "idle_timeout_cap",
+    );
+    crate::agent_session::trace_stream_lifecycle(
+        turn_id,
+        "turn_only",
+        "agent_failed",
+        None,
+        0,
+        "idle_timeout_cap",
+    );
 }
 
 /// Durable slice of the terminal-failure path (monorepo#2009): record the
