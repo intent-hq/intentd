@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.48] - 2026-08-24
+
+### 🚀 Features
+
+- Support a list of IPs for server.bindAddress ([#1431](https://github.com/intent-hq/intentd/pull/1431))
+
+
 ## [0.7.47] - 2026-08-23
 
 ### 🚀 Features
