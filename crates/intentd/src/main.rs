@@ -74,6 +74,14 @@ enum Command {
         /// startup instead of waiting for `agent.resolveInterrupted` RPC.
         #[arg(long)]
         resume_all: bool,
+        /// Replace the base specialist tier with this directory: the embedded
+        /// bundle and the bundled `resources/specialists/` directory are
+        /// excluded and only specialists present here (plus user/project
+        /// overrides) exist. Also enabled by `INTENTD_SPECIALISTS_DIR`; the
+        /// flag wins. Pins the `specialists.dir` setting for the process
+        /// lifetime.
+        #[arg(long)]
+        specialists_dir: Option<std::path::PathBuf>,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -233,14 +241,26 @@ fn main() -> ExitCode {
         std::sync::atomic::Ordering::Relaxed,
     );
     std::env::remove_var(UPDATE_RESTART_ENV);
-    async_main()
+    // Parse the CLI here too — before the tokio runtime — so `serve
+    // --specialists-dir` can fold into INTENTD_SPECIALISTS_DIR while
+    // `env::set_var` is still sound (the flag wins over an inherited env
+    // value). The env var is the single seam `apply_startup_pins` and the
+    // specialists service read.
+    let cli = Cli::parse();
+    if let Command::Serve {
+        specialists_dir: Some(dir),
+        ..
+    } = &cli.command
+    {
+        std::env::set_var("INTENTD_SPECIALISTS_DIR", dir);
+    }
+    async_main(cli)
 }
 
 #[tokio::main]
-async fn async_main() -> ExitCode {
+async fn async_main(cli: Cli) -> ExitCode {
     init_tracing();
     install_panic_hook();
-    let cli = Cli::parse();
     // Rust starts with SIGPIPE ignored, so `println!` to a pipe whose reader
     // closed early (`intentd status | head`) gets EPIPE and panics — and the
     // panic hook logs an ERROR backtrace, making a routine shell pipeline
@@ -262,6 +282,8 @@ async fn async_main() -> ExitCode {
             mode,
             insecure,
             resume_all,
+            // Folded into INTENTD_SPECIALISTS_DIR in `main()`, pre-runtime.
+            specialists_dir: _,
         } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
@@ -3370,6 +3392,19 @@ fn apply_startup_pins(
             "INTENTD_WORKSPACES_DIR",
         )?;
     }
+    // The base-tier replacement directory (also settable via
+    // `--specialists-dir`, which `main()` folds into the env var pre-runtime).
+    // The empty string counts as unset, matching the specialists service's
+    // own read of the var.
+    if let Some(dir) =
+        std::env::var_os("INTENTD_SPECIALISTS_DIR").filter(|d| !d.as_os_str().is_empty())
+    {
+        pin(
+            "specialists.dir",
+            json!(dir.to_string_lossy()),
+            "INTENTD_SPECIALISTS_DIR",
+        )?;
+    }
     Ok(())
 }
 
@@ -5293,7 +5328,8 @@ fn report_config_status(config: &Config) {
     println!("[ok] config.toml parsed: {}", config.config_path.display());
     // Mirror `apply_startup_pins` exactly: a numeric env var only pins when
     // it parses (and `INTENTD_TCP_PORT=0` is the ephemeral-port seam, never a
-    // pin); the two path overrides pin whenever set.
+    // pin); the data/workspaces path overrides pin whenever set, and the
+    // specialists replacement dir only when non-empty.
     let tcp_port_pins = std::env::var("INTENTD_TCP_PORT")
         .ok()
         .and_then(|v| v.trim().parse::<u16>().ok())
@@ -5325,6 +5361,11 @@ fn report_config_status(config: &Config) {
             "INTENTD_WORKSPACES_DIR",
             "workspaces.root",
             std::env::var_os("INTENTD_WORKSPACES_DIR").is_some(),
+        ),
+        (
+            "INTENTD_SPECIALISTS_DIR",
+            "specialists.dir",
+            std::env::var_os("INTENTD_SPECIALISTS_DIR").is_some_and(|d| !d.is_empty()),
         ),
     ];
     let mut any = false;

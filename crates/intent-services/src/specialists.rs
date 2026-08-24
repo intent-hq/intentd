@@ -5,6 +5,9 @@
 //! read-only). Ports `specialist-file-loader.ts` + `specialists.ipc.ts`'s
 //! combined load. Nothing is persisted in `SQLite`; `create`/`edit`/`delete`
 //! write user/project files only and `bundled` definitions are read-only.
+//! [`REPLACEMENT_DIR_ENV`] (startup-pinned) wholesale-replaces the base tier
+//! with an operator-supplied directory, excluding the embedded bundle and the
+//! bundled directory entirely.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +19,15 @@ const SPECIALISTS_FOLDER: &str = "specialists";
 /// Env override for the bundled (read-only) specialists directory; lets the
 /// daemon and tests point at app-shipped resources hermetically.
 const BUNDLED_DIR_ENV: &str = "INTENTD_BUNDLED_SPECIALISTS_DIR";
+/// Startup-pinned env var that wholesale-REPLACES the base specialist tier:
+/// when set to a non-empty path, the embedded bundle and the bundled
+/// directory ([`BUNDLED_DIR_ENV`]/exe-relative) are both excluded and this
+/// directory becomes the sole base (`bundled`, read-only) tier — shipped ids
+/// resolve only if present here or in the user/project tiers, which fold on
+/// top unchanged. A missing or empty directory yields an empty base tier.
+/// Reported as a settings pin (`specialists.dir`) like the other `INTENTD_*`
+/// env pins; the empty string counts as unset (no replacement).
+const REPLACEMENT_DIR_ENV: &str = "INTENTD_SPECIALISTS_DIR";
 
 /// The reference specialist definitions embedded at compile time (PP-2,
 /// byte-identical to the reference bundle, kept under the versioned
@@ -64,6 +76,16 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
 const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1;
+
+/// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
+/// base tier: no shipped specialist survives the replacement.
+const EMPTY_BUNDLE: &[(&str, &str)] = &[];
+
+/// Parse a raw [`REPLACEMENT_DIR_ENV`] value: a non-empty path is the
+/// replacement base-tier directory; unset/empty means no replacement.
+fn replacement_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
 
 /// Resolve an embedded bundled specialist by id from `bundle` (the lowest
 /// tier).
@@ -625,17 +647,50 @@ pub(crate) struct SpecialistsService {
     /// bundle via [`Self::with_embedded`]. The file tiers above it are
     /// user-owned and unversioned.
     embedded: &'static [(&'static str, &'static str)],
+    /// Whether [`REPLACEMENT_DIR_ENV`] replaced the base tier at construction:
+    /// `bundled_dir` is the replacement directory, `embedded` is empty, and
+    /// [`Self::with_embedded`] keeps it that way (session pins never restore
+    /// the shipped bundle behind a startup-pinned replacement).
+    base_replaced: bool,
 }
 
 impl SpecialistsService {
     /// Build the service, resolving any unset directory from the environment
     /// (`~/.intent/specialists/` for user, [`BUNDLED_DIR_ENV`]/exe-relative for
-    /// bundled). Tests inject explicit roots for hermetic 3-tier coverage.
+    /// bundled). When no bundled root is injected and [`REPLACEMENT_DIR_ENV`]
+    /// is set to a non-empty path the base tier is wholesale-replaced instead
+    /// ([`Self::with_base_replacement`]) — an explicitly injected
+    /// `bundled_dir` wins over the env var (matching [`BUNDLED_DIR_ENV`],
+    /// consulted only inside `default_bundled_dir`), so tests that inject
+    /// explicit roots stay hermetic even when the var is exported.
     pub(crate) fn new(user_dir: Option<PathBuf>, bundled_dir: Option<PathBuf>) -> Self {
+        if bundled_dir.is_none() {
+            if let Some(dir) = replacement_dir(std::env::var_os(REPLACEMENT_DIR_ENV)) {
+                return Self::with_base_replacement(user_dir, dir);
+            }
+        }
         Self {
             user_dir: user_dir.or_else(default_user_dir),
             bundled_dir: bundled_dir.or_else(default_bundled_dir),
             embedded: EMBEDDED_BUNDLED,
+            base_replaced: false,
+        }
+    }
+
+    /// Build the service with the base tier wholesale-replaced by `dir`
+    /// (the effective `specialists.dir` setting — [`REPLACEMENT_DIR_ENV`]
+    /// startup pin or config.toml): the embedded bundle and the bundled
+    /// directory are excluded, and `dir` is the sole base (`bundled`,
+    /// read-only) tier — a missing/empty `dir` yields an empty base tier.
+    /// The user/project tiers fold on top unchanged. Split out of
+    /// [`Self::new`] so tests cover replacement hermetically, without
+    /// mutating process-global env.
+    pub(crate) fn with_base_replacement(user_dir: Option<PathBuf>, dir: PathBuf) -> Self {
+        Self {
+            user_dir: user_dir.or_else(default_user_dir),
+            bundled_dir: Some(dir),
+            embedded: EMPTY_BUNDLE,
+            base_replaced: true,
         }
     }
 
@@ -649,8 +704,14 @@ impl SpecialistsService {
     /// stay latest-bound, so if a future bundle changes a specialist's
     /// scalar, pinned sessions adopt the new behavior while keeping their
     /// pinned prompt text.
+    ///
+    /// No-op when [`REPLACEMENT_DIR_ENV`] replaced the base tier: the
+    /// replacement directory stays the sole base tier, so pinned sessions
+    /// never resurrect shipped bundles the operator excluded at startup.
     pub(crate) fn with_embedded(mut self, bundle: &'static [(&'static str, &'static str)]) -> Self {
-        self.embedded = bundle;
+        if !self.base_replaced {
+            self.embedded = bundle;
+        }
         self
     }
 
@@ -1312,6 +1373,163 @@ mod tests {
         );
         let def = svc.resolve("implementor", None).expect("resolves");
         assert_eq!(def["name"], "File Implementor");
+    }
+
+    /// The base-tier replacement ([`REPLACEMENT_DIR_ENV`]) excludes the
+    /// embedded set wholesale: only ids present in the replacement directory
+    /// exist in the base tier, and shipped ids not restated there are gone.
+    #[test]
+    fn base_replacement_excludes_the_embedded_set() {
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "custom",
+            "---\nname: \"Custom\"\ndescription: \"d\"\n---\n\ncustom body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        );
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["custom"]);
+        let custom = svc.get("custom", None).unwrap();
+        assert_eq!(custom["specialist"]["source"], "bundled");
+        assert_eq!(custom["specialist"]["prompt"], "custom body");
+        // A shipped id absent from the replacement directory does not exist.
+        assert!(matches!(
+            svc.get("implementor", None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A shipped id restated in the replacement directory resolves from there,
+    /// with the replacement's content — never the embedded copy's.
+    #[test]
+    fn base_replacement_restated_shipped_id_uses_replacement_content() {
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "implementor",
+            "---\nname: \"Replaced Implementor\"\ndescription: \"d\"\n---\n\nreplaced body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        );
+        let def = svc.resolve("implementor", None).expect("resolves");
+        assert_eq!(def["name"], "Replaced Implementor");
+        assert_eq!(def["behaviorPrompt"], "replaced body");
+        assert_eq!(def["source"], "bundled");
+    }
+
+    /// The user tier folds on top of the replacement tier unchanged: it
+    /// overrides same-id entries (inheriting omitted config scalars from the
+    /// replacement) and adds new ids alongside it.
+    #[test]
+    fn user_tier_overrides_the_replacement_tier() {
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "custom",
+            "---\nname: \"Custom\"\ndescription: \"d\"\nmodel: \"base-model\"\n---\n\nbase body",
+        );
+        user.write(
+            "custom",
+            "---\nname: \"User Custom\"\ndescription: \"d\"\n---\n\nuser body",
+        );
+        user.write(
+            "extra",
+            "---\nname: \"Extra\"\ndescription: \"d\"\n---\n\nextra body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        );
+        let def = svc.resolve("custom", None).expect("resolves");
+        assert_eq!(def["name"], "User Custom");
+        assert_eq!(def["source"], "user");
+        assert_eq!(
+            def["model"], "base-model",
+            "omitted config scalar inherits from the replacement tier"
+        );
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["custom", "extra"]);
+    }
+
+    /// A missing (or empty) replacement directory yields an EMPTY base tier —
+    /// no fallback to the embedded set — while the user tier stays in play.
+    #[test]
+    fn missing_replacement_dir_yields_empty_base_tier() {
+        let user = TempSpecialistsDir::new();
+        user.write(
+            "mine",
+            "---\nname: \"Mine\"\ndescription: \"d\"\n---\n\nmine body",
+        );
+        let missing =
+            std::env::temp_dir().join(format!("intentd-missing-{}", uuid::Uuid::new_v4()));
+        let svc = SpecialistsService::with_base_replacement(Some(user.path.clone()), missing);
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["mine"], "user tier only; no embedded fallback");
+        assert!(matches!(
+            svc.get("implementor", None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A session's pinned bundle ([`SpecialistsService::with_embedded`]) never
+    /// resurrects shipped specialists behind a startup-pinned replacement.
+    #[test]
+    fn with_embedded_is_a_no_op_under_base_replacement() {
+        static PINNED: &[(&str, &str)] = &[(
+            "implementor",
+            "---\nname: \"Pinned Implementor\"\ndescription: \"d\"\n---\n\npinned body",
+        )];
+        let user = TempSpecialistsDir::new();
+        let replacement = TempSpecialistsDir::new();
+        replacement.write(
+            "custom",
+            "---\nname: \"Custom\"\ndescription: \"d\"\n---\n\ncustom body",
+        );
+        let svc = SpecialistsService::with_base_replacement(
+            Some(user.path.clone()),
+            replacement.path.clone(),
+        )
+        .with_embedded(PINNED);
+        assert!(matches!(
+            svc.get("implementor", None),
+            Err(Error::NotFound(_))
+        ));
+        assert!(svc.resolve("custom", None).is_some());
+    }
+
+    /// [`replacement_dir`] parsing: unset and empty mean no replacement; a
+    /// non-empty value is the replacement path.
+    #[test]
+    fn replacement_dir_parses_unset_empty_and_set() {
+        assert_eq!(replacement_dir(None), None);
+        assert_eq!(replacement_dir(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            replacement_dir(Some(std::ffi::OsString::from("/tmp/specialists"))),
+            Some(PathBuf::from("/tmp/specialists"))
+        );
     }
 
     #[test]

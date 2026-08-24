@@ -860,6 +860,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         "server",
     );
     server_auth_token.read_only = true;
+    let mut specialists_dir = string(
+        "specialists.dir",
+        "Specialists directory",
+        "Base specialist directory replacing the built-in set (INTENTD_SPECIALISTS_DIR startup pin or config.toml; read-only on the wire)",
+        "providers",
+        None,
+    );
+    specialists_dir.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
         string(
@@ -932,6 +940,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             None,
         ),
+        specialists_dir,
         // --- Group A: workspace / git ---------------------------------------
         string(
             "workspace.branchPrefix",

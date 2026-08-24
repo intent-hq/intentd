@@ -1179,7 +1179,26 @@ impl Services {
 
     /// Build a [`SpecialistsService`](specialists::SpecialistsService) view over
     /// the configured directory roots for one `specialist.*` call.
+    ///
+    /// The effective `specialists.dir` setting (the `INTENTD_SPECIALISTS_DIR`
+    /// startup pin, else a file-written `[specialists] dir`) wholesale-replaces
+    /// the base tier. An explicitly injected bundled root (test wiring via
+    /// [`Self::with_specialist_dirs`]) wins over the setting so hermetic
+    /// 3-tier coverage is unaffected.
     fn specialists_service(&self) -> specialists::SpecialistsService {
+        if self.specialists_bundled_dir.is_none() {
+            if let Some(dir) = self
+                .effective_settings()
+                .specialists
+                .dir
+                .filter(|d| !d.is_empty())
+            {
+                return specialists::SpecialistsService::with_base_replacement(
+                    self.specialists_user_dir.clone(),
+                    PathBuf::from(dir),
+                );
+            }
+        }
         specialists::SpecialistsService::new(
             self.specialists_user_dir.clone(),
             self.specialists_bundled_dir.clone(),
