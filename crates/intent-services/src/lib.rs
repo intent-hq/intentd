@@ -22317,6 +22317,11 @@ impl WorkspaceApi for Services {
             // runtime-manager path below never reaches
             // `agent_send_message_op`'s check.
             crate::agent_ops::validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
+            crate::agent_ops::validate_image_blocks("agent.sendMessage", image_blocks.as_ref())?;
+            // Image references must name registered attachments
+            // (monorepo#3338) — rejected before any state change.
+            self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
+                .await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
@@ -22464,6 +22469,12 @@ impl WorkspaceApi for Services {
                 "agent.editAndRegenerate",
                 file_blocks.as_ref(),
             )?;
+            crate::agent_ops::validate_image_blocks(
+                "agent.editAndRegenerate",
+                image_blocks.as_ref(),
+            )?;
+            self.validate_image_block_refs("agent.editAndRegenerate", image_blocks.as_ref())
+                .await?;
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,

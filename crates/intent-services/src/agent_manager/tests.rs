@@ -12115,6 +12115,257 @@ fn validate_file_blocks_rejects_both_or_neither() {
     assert!(validate_file_blocks("m", Some(&json!(["str"]))).is_ok());
 }
 
+/// `validate_image_blocks` (monorepo#3338): exactly one of `data` /
+/// `attachmentId` per image entry — both or neither is `-32602`; valid
+/// arrays, non-arrays, and non-object entries pass.
+#[test]
+fn validate_image_blocks_rejects_both_or_neither() {
+    use crate::agent_ops::validate_image_blocks;
+    // Valid: inline-data entry and attachment-reference entry.
+    let ok = json!([
+        { "type": "image", "data": "iVBOR", "mimeType": "image/png" },
+        { "type": "image", "attachmentId": "att-1", "mimeType": "image/png" },
+    ]);
+    assert!(validate_image_blocks("m", Some(&ok)).is_ok());
+    // Neither.
+    let neither = json!([{ "type": "image", "mimeType": "image/png" }]);
+    let err = validate_image_blocks("agent.sendMessage", Some(&neither)).unwrap_err();
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(msg.contains("imageBlocks[0]"), "{msg}");
+    // Both.
+    let both = json!([{ "type": "image", "data": "d", "attachmentId": "att-1" }]);
+    assert!(validate_image_blocks("m", Some(&both)).is_err());
+    // Blank attachmentId counts as absent → data-only entry still valid.
+    let blank = json!([{ "type": "image", "data": "d", "attachmentId": " " }]);
+    assert!(validate_image_blocks("m", Some(&blank)).is_ok());
+    // Non-array / absent / non-object entries are tolerated.
+    assert!(validate_image_blocks("m", None).is_ok());
+    assert!(validate_image_blocks("m", Some(&json!("nope"))).is_ok());
+    assert!(validate_image_blocks("m", Some(&json!(["str"]))).is_ok());
+}
+
+/// `image_block_ref_ids` (monorepo#3338): only non-blank reference-arm
+/// entries (no inline `data`) contribute ids.
+#[test]
+fn image_block_ref_ids_extracts_reference_arm_only() {
+    use crate::agent_ops::image_block_ref_ids;
+    let blocks = json!([
+        { "type": "image", "data": "d", "mimeType": "image/png" },
+        { "type": "image", "attachmentId": "att-1" },
+        { "type": "image", "attachmentId": "  " },
+        { "type": "image", "data": "d", "attachmentId": "att-2" },
+        "not-an-object",
+    ]);
+    assert_eq!(image_block_ref_ids(Some(&blocks)), vec!["att-1"]);
+    assert!(image_block_ref_ids(None).is_empty());
+}
+
+/// STAB-133 + monorepo#3338: an image-reference block persists on the user
+/// transcript row AS a reference (no bytes), with `mimeType` carried when
+/// present; inline entries keep the data shape.
+#[test]
+fn user_message_blocks_persists_image_reference() {
+    let images = json!([
+        { "type": "image", "attachmentId": "att-7", "mimeType": "image/png" },
+        { "type": "image", "attachmentId": "att-8" },
+        { "type": "image", "data": "imgdata", "mimeType": "image/jpeg" },
+    ]);
+    let blocks = user_message_blocks("msg", Some(&images), None);
+    let arr = blocks.as_array().expect("array");
+    assert_eq!(arr.len(), 4);
+    assert_eq!(arr[1]["attachmentId"], json!("att-7"));
+    assert_eq!(arr[1]["mimeType"], json!("image/png"));
+    assert!(arr[1].get("data").is_none());
+    assert_eq!(arr[2]["attachmentId"], json!("att-8"));
+    assert!(arr[2].get("mimeType").is_none());
+    assert_eq!(arr[3]["data"], json!("imgdata"));
+    assert!(arr[3].get("attachmentId").is_none());
+}
+
+/// `validate_image_block_refs` (monorepo#3338): unknown attachment ids are
+/// `-32602` naming the id; registered ids under the byte cap pass; a
+/// recorded size over the cap is rejected.
+#[tokio::test]
+async fn validate_image_block_refs_checks_registry() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone());
+    let ws_id = WorkspaceId::from("ws-imgref");
+
+    let unknown = json!([{ "type": "image", "attachmentId": "att-missing" }]);
+    let err = services
+        .validate_image_block_refs("agent.sendMessage", Some(&unknown))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
+    assert!(format!("{err}").contains("att-missing"), "{err}");
+
+    store
+        .insert_attachment(&intent_store::AttachmentRecord {
+            id: "att-ok".into(),
+            workspace_id: ws_id.clone(),
+            file_name: "pic.png".into(),
+            mime_type: Some("image/png".into()),
+            size: 5,
+            uploaded_at: now_iso(),
+            stored_path: ".intent/attachments/att-ok_pic.png".into(),
+        })
+        .await
+        .unwrap();
+    let ok = json!([{ "type": "image", "attachmentId": "att-ok" }]);
+    assert!(services
+        .validate_image_block_refs("m", Some(&ok))
+        .await
+        .is_ok());
+
+    store
+        .insert_attachment(&intent_store::AttachmentRecord {
+            id: "att-big".into(),
+            workspace_id: ws_id,
+            file_name: "huge.png".into(),
+            mime_type: Some("image/png".into()),
+            size: i64::try_from(crate::agent_ops::IMAGE_REF_MAX_BYTES + 1).expect("fits in i64"),
+            uploaded_at: now_iso(),
+            stored_path: ".intent/attachments/att-big_huge.png".into(),
+        })
+        .await
+        .unwrap();
+    let big = json!([{ "type": "image", "attachmentId": "att-big" }]);
+    let err = services
+        .validate_image_block_refs("m", Some(&big))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
+}
+
+/// `resolve_image_block_refs` (monorepo#3338): a reference entry resolves to
+/// inline base64 bytes read from the attachment's workspace root (MIME from
+/// the block, else the registry row); inline entries pass through untouched;
+/// a reference whose file vanished is skipped fail-soft.
+#[tokio::test]
+async fn resolve_image_block_refs_inlines_attachment_bytes() {
+    use base64::Engine as _;
+    use intent_core::{Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = tempfile::Builder::new()
+        .prefix("intentd-imgref-root-")
+        .tempdir()
+        .expect("tempdir");
+    let ws_id = WorkspaceId::from("ws-imgres");
+    let ts = now_iso();
+    let ws = Workspace {
+        id: ws_id.clone(),
+        title: "WS".into(),
+        branch: "main".into(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        status_image_asset_id: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: Some(root.path().display().to_string()),
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+        cow_supported: None,
+        display_status: None,
+        waiting: false,
+        checkout_mode: None,
+        disk_usage: None,
+        pending_delete_at: None,
+    };
+    store.insert_workspace(&ws).await.unwrap();
+
+    let stored = ".intent/attachments/att-r_pic.png";
+    let full = root.path().join(stored);
+    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+    std::fs::write(&full, b"png-bytes").unwrap();
+    store
+        .insert_attachment(&intent_store::AttachmentRecord {
+            id: "att-r".into(),
+            workspace_id: ws_id.clone(),
+            file_name: "pic.png".into(),
+            mime_type: Some("image/png".into()),
+            size: 9,
+            uploaded_at: now_iso(),
+            stored_path: stored.into(),
+        })
+        .await
+        .unwrap();
+    // Registered row whose file was deleted out-of-band → skipped fail-soft.
+    store
+        .insert_attachment(&intent_store::AttachmentRecord {
+            id: "att-gone".into(),
+            workspace_id: ws_id,
+            file_name: "gone.png".into(),
+            mime_type: None,
+            size: 1,
+            uploaded_at: now_iso(),
+            stored_path: ".intent/attachments/att-gone_gone.png".into(),
+        })
+        .await
+        .unwrap();
+
+    let services = Services::new(store);
+    let input = json!([
+        { "type": "image", "attachmentId": "att-r" },
+        { "type": "image", "attachmentId": "att-gone" },
+        { "type": "image", "data": "inline", "mimeType": "image/jpeg" },
+    ]);
+    let out = services
+        .resolve_image_block_refs(Some(input))
+        .await
+        .expect("resolved array");
+    let arr = out.as_array().expect("array");
+    assert_eq!(arr.len(), 2, "vanished reference skipped: {arr:?}");
+    let expected = base64::engine::general_purpose::STANDARD.encode(b"png-bytes");
+    assert_eq!(arr[0]["data"], json!(expected));
+    assert_eq!(arr[0]["mimeType"], json!("image/png"));
+    assert!(arr[0].get("attachmentId").is_none());
+    assert_eq!(arr[1]["data"], json!("inline"));
+    assert_eq!(arr[1]["mimeType"], json!("image/jpeg"));
+
+    // No references → input returned unchanged (no clone/rebuild).
+    let inline_only = json!([{ "type": "image", "data": "x", "mimeType": "image/png" }]);
+    let out = services
+        .resolve_image_block_refs(Some(inline_only.clone()))
+        .await;
+    assert_eq!(out, Some(inline_only));
+}
+
 /// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
 /// becomes a `text` attachment notice naming the metadata and directing the
 /// model to `ws.file.getAttachment(attachmentId)`; inline-data file blocks
