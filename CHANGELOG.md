@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.51] - 2026-08-24
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Robust gh discovery + enriched no-token error ([#1438](https://github.com/intent-hq/intentd/pull/1438))
+
+
 ## [0.7.50] - 2026-08-24
 
 ### 🚀 Features
