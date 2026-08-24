@@ -7,7 +7,7 @@ use intent_core::{
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::agent_repo::fetch_agent_usage_rows;
+use crate::agent_repo::{fetch_agent_usage_rows, UNREAD_TOP_LEVEL_SESSION_PREDICATE};
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
@@ -366,6 +366,39 @@ impl Store {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
         Ok(false)
+    }
+
+    /// Atomic settle-clear of the stored `unread` flag (§5.1): set
+    /// `attention = none` ONLY when the current value is `unread` AND the
+    /// workspace has no unread top-level session — the derivation re-checked
+    /// INSIDE the same guarded UPDATE (shared predicate with
+    /// [`Store::workspace_has_unread_top_level_session`]), so a message that
+    /// lands between a caller's probe and this write flips the NOT EXISTS
+    /// and the clear declines instead of retiring a freshly-raised unread.
+    /// Scoped to the attention column, `updated_at` untouched (acknowledging
+    /// is not "activity", monorepo#1466). Returns whether a row was written
+    /// (`true` ⇒ stored `unread` was cleared); a missing workspace reads as
+    /// `false` — settle callers are best-effort and never need `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
+        let sql = format!(
+            "UPDATE workspace SET attention='none' \
+             WHERE id = ? AND attention = 'unread' \
+               AND NOT EXISTS(\
+                   SELECT 1 FROM agent_session \
+                   WHERE workspace_id = workspace.id \
+                     AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
+               )"
+        );
+        let res = sqlx::query(&sql)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("settle unread clear failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Scoped, monotonic `last_activity` write (monorepo#1580): set ONLY the
