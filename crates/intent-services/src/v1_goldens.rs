@@ -253,6 +253,27 @@ fn golden_naming_tool_references() {
 }
 
 #[test]
+fn golden_first_turn_naming_nudges() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.naming_nudge(None, true),
+        "<system>\nThis agent still has a generated name. Early in your first turn, call \
+         `ws.workspace.setAgentName` through the `workspace_api` tool with a short 1–5 word \
+         task-specific name. Do this independently of workspace title naming and in parallel \
+         with information-gathering.\n</system>"
+    );
+    assert_eq!(
+        harness.naming_nudge(
+            Some("the `set_workspace_title_workspace-mcp` tool"),
+            false,
+        ),
+        "<system>\nThis workspace needs a title. As your first action, call the \
+         `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case title \
+         describing the task. This can be called in parallel with information-gathering.\n</system>"
+    );
+}
+
+#[test]
 fn golden_supervisor_history_wrapper() {
     use intent_core::AgentMessage;
     let msg = |role: &str, text: &str| AgentMessage {

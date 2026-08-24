@@ -343,10 +343,27 @@ impl Harness for V1 {
         }
     }
 
-    fn naming_nudge(&self, tool_reference: &str) -> String {
-        format!(
-            "<system>\nThis workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-        )
+    fn naming_nudge(
+        &self,
+        workspace_tool_reference: Option<&str>,
+        agent_needs_name: bool,
+    ) -> String {
+        let mut instructions = Vec::new();
+        if agent_needs_name {
+            instructions.push(
+                "This agent still has a generated name. Early in your first turn, call \
+                 `ws.workspace.setAgentName` through the `workspace_api` tool with a short \
+                 1–5 word task-specific name. Do this independently of workspace title naming \
+                 and in parallel with information-gathering."
+                    .to_string(),
+            );
+        }
+        if let Some(tool_reference) = workspace_tool_reference {
+            instructions.push(format!(
+                "This workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering."
+            ));
+        }
+        format!("<system>\n{}\n</system>", instructions.join("\n"))
     }
 
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String {
