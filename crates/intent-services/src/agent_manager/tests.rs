@@ -12248,6 +12248,52 @@ async fn validate_image_block_refs_checks_registry() {
     );
 }
 
+/// `validate_image_block_refs` (monorepo#3338): the byte cap is enforced in
+/// AGGREGATE across all references in the array — two attachments each under
+/// the cap individually are rejected when their recorded sizes sum past it,
+/// so a small request cannot expand one prompt beyond the transport bound.
+#[tokio::test]
+async fn validate_image_block_refs_enforces_aggregate_cap() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let services = Services::new(store.clone());
+    let ws_id = WorkspaceId::from("ws-imgagg");
+    let over_half =
+        i64::try_from(crate::agent_ops::IMAGE_REF_MAX_BYTES / 2 + 1).expect("fits in i64");
+    for id in ["att-h1", "att-h2"] {
+        store
+            .insert_attachment(&intent_store::AttachmentRecord {
+                id: id.into(),
+                workspace_id: ws_id.clone(),
+                file_name: format!("{id}.png"),
+                mime_type: Some("image/png".into()),
+                size: over_half,
+                uploaded_at: now_iso(),
+                stored_path: format!(".intent/attachments/{id}.png"),
+            })
+            .await
+            .unwrap();
+    }
+    let one = json!([{ "type": "image", "attachmentId": "att-h1" }]);
+    assert!(services
+        .validate_image_block_refs("m", Some(&one))
+        .await
+        .is_ok());
+    let both = json!([
+        { "type": "image", "attachmentId": "att-h1" },
+        { "type": "image", "attachmentId": "att-h2" }
+    ]);
+    let err = services
+        .validate_image_block_refs("m", Some(&both))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
+    assert!(format!("{err}").contains("aggregate"), "{err}");
+}
+
 /// `resolve_image_block_refs` (monorepo#3338): a reference entry resolves to
 /// inline base64 bytes read from the attachment's workspace root (MIME from
 /// the block, else the registry row); inline entries pass through untouched;

@@ -3905,6 +3905,8 @@ impl Services {
                         None
                     } else {
                         validate_image_blocks("agent.update", Some(value))?;
+                        self.validate_image_block_refs("agent.update", Some(value))
+                            .await?;
                         Some(value.clone())
                     };
                 }
@@ -4652,20 +4654,24 @@ impl Services {
 
     /// Validate the reference arm of an `imageBlocks` array against the
     /// attachment registry (PROTOCOL §5.5, monorepo#3338): every
-    /// `attachmentId` must name a registered attachment whose recorded size
-    /// fits [`IMAGE_REF_MAX_BYTES`]. Rejections are `-32602` naming the id,
-    /// raised at the RPC seam BEFORE any state change; inline-data entries
-    /// are untouched. Callers run the shape check
-    /// ([`validate_image_blocks`]) first. The lookup is registry-wide rather
-    /// than workspace-scoped by design: `workspace.create`'s `initialAgent`
-    /// references attachments placed BEFORE the new workspace exists, so
-    /// they necessarily live in another workspace's registry; resolution
-    /// reads from the record's own workspace root either way.
+    /// `attachmentId` must name a registered attachment, and the recorded
+    /// sizes must fit [`IMAGE_REF_MAX_BYTES`] **in aggregate** across all
+    /// references in the array (a per-reference cap alone would let a small
+    /// request name many attachments whose resolved bytes expand one ACP
+    /// prompt far past the transport bound the cap mirrors). Rejections are
+    /// `-32602` naming the id, raised at the RPC seam BEFORE any state
+    /// change; inline-data entries are untouched. Callers run the shape
+    /// check ([`validate_image_blocks`]) first. The lookup is registry-wide
+    /// rather than workspace-scoped by design: `workspace.create`'s
+    /// `initialAgent` references attachments placed BEFORE the new workspace
+    /// exists, so they necessarily live in another workspace's registry;
+    /// resolution reads from the record's own workspace root either way.
     pub(crate) async fn validate_image_block_refs(
         &self,
         method: &str,
         image_blocks: Option<&Value>,
     ) -> Result<()> {
+        let mut total: u64 = 0;
         for id in image_block_ref_ids(image_blocks) {
             let record = self.store.get_attachment(&id).await.map_err(|e| match e {
                 Error::NotFound(_) => {
@@ -4673,10 +4679,17 @@ impl Services {
                 }
                 other => other,
             })?;
-            if u64::try_from(record.size).unwrap_or(0) > IMAGE_REF_MAX_BYTES {
+            let size = u64::try_from(record.size).unwrap_or(0);
+            if size > IMAGE_REF_MAX_BYTES {
                 return Err(Error::InvalidParams(format!(
                     "{method}: attachment {id} is {} bytes — exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references",
                     record.size
+                )));
+            }
+            total = total.saturating_add(size);
+            if total > IMAGE_REF_MAX_BYTES {
+                return Err(Error::InvalidParams(format!(
+                    "{method}: image references total {total} bytes at attachment {id} — exceeds the {IMAGE_REF_MAX_BYTES} byte aggregate cap for image references"
                 )));
             }
         }
@@ -4692,8 +4705,10 @@ impl Services {
     /// extension inference. Fail-soft by design — ingress already rejected
     /// bad references, so a row/file that vanished since is skipped with a
     /// warning rather than breaking the turn (same convention as note-image
-    /// resolution). Inline entries pass through untouched; inputs without
-    /// references return unchanged.
+    /// resolution); the same skip re-enforces the [`IMAGE_REF_MAX_BYTES`]
+    /// aggregate cap over the bytes actually read, in case files grew after
+    /// ingress validated the recorded sizes. Inline entries pass through
+    /// untouched; inputs without references return unchanged.
     pub(crate) async fn resolve_image_block_refs(
         &self,
         image_blocks: Option<Value>,
@@ -4707,6 +4722,7 @@ impl Services {
             other => return other,
         };
         let mut out = Vec::with_capacity(arr.len());
+        let mut total: u64 = 0;
         for img in arr {
             let Some(obj) = img.as_object() else {
                 out.push(img);
@@ -4745,6 +4761,11 @@ impl Services {
                 tracing::warn!(attachment = %id, size = bytes.len(), "image reference: over the byte cap; skipping");
                 continue;
             }
+            if total.saturating_add(bytes.len() as u64) > IMAGE_REF_MAX_BYTES {
+                tracing::warn!(attachment = %id, size = bytes.len(), total, "image reference: over the aggregate byte cap; skipping");
+                continue;
+            }
+            total += bytes.len() as u64;
             let mime = obj
                 .get("mimeType")
                 .and_then(Value::as_str)

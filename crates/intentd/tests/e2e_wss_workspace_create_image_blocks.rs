@@ -408,4 +408,37 @@ async fn image_reference_blocks_accepted_and_validated() {
     )
     .await;
     assert_eq!(err["code"], json!(-32602), "{err}");
+
+    // (6) workspace.create with an unknown initialAgent reference: rejected
+    // -32602 BEFORE any state change — no partially created workspace row is
+    // left behind (the validation is hoisted ahead of the row insert).
+    let before = wss_rpc(&mut rpc, 10, "workspace.list", json!({})).await;
+    let count_before = before["workspaces"].as_array().expect("list").len();
+    let err = wss_rpc_err(
+        &mut rpc,
+        11,
+        "workspace.create",
+        json!({
+            "title": "Bad ref",
+            "path": ".",
+            "initialAgent": {
+                "prompt": "bad image ref",
+                "imageBlocks": [
+                    { "type": "image", "attachmentId": "att-nope" }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(err["code"], json!(-32602), "{err}");
+    assert!(
+        err["message"].as_str().unwrap().contains("att-nope"),
+        "{err}"
+    );
+    let after = wss_rpc(&mut rpc, 12, "workspace.list", json!({})).await;
+    let count_after = after["workspaces"].as_array().expect("list").len();
+    assert_eq!(
+        count_before, count_after,
+        "rejected create must not leave a workspace row behind"
+    );
 }
