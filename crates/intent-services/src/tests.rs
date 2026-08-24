@@ -32578,15 +32578,27 @@ mod derived_workspace_unread {
     }
 
     async fn harness() -> Harness {
+        harness_with_park(None).await
+    }
+
+    /// Harness variant with the monorepo#1481 attention-write park seam
+    /// armed, so settle-race tests can hold the settlement immediately
+    /// before its atomic clear (the probe→write gap).
+    async fn harness_with_park(
+        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+    ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
         let ws_root = WorkspacesRoot::new();
-        let services = Services::new(store.clone())
+        let mut services = Services::new(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
+        if let Some(park) = park {
+            services = services.with_attention_write_park(park);
+        }
         Harness {
             _tmp: tmp,
             _ws_root: ws_root,
@@ -32971,5 +32983,138 @@ mod derived_workspace_unread {
             .expect("re-raise");
         assert_silent(&mut sub).await;
         assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// Settle race: an assistant message landing in the gap between the
+    /// settle's unread probe and its attention write must NOT be retired.
+    /// Parks the settlement immediately before the write, seeds a fresh
+    /// unread session while parked, and asserts the atomic clear declines —
+    /// stored flag still `unread`, no `{ none }` emit — so subscribers never
+    /// believe the workspace is caught up while the derivation reads unread.
+    #[tokio::test]
+    async fn settle_race_new_message_in_gap_never_clears() {
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_park(Some(park.clone())).await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it (seeded
+        // via the store — the armed park would hold the service-path raise).
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed flag");
+
+        let mut sub = subscribe_attention(&h);
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move {
+            services
+                .agent_mark_seen_op(ws_id, AgentId::from("agent-a"), last_a)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("settle reaches the attention write window");
+
+        // New unread session lands while the settle sits parked between its
+        // probe (which saw "all seen") and its write.
+        seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        park.release.notify_one();
+
+        task.await.expect("join").expect("mark seen");
+        // The atomic clear re-checked the derivation inside the write and
+        // declined; the fallback emit re-probed and stayed silent too.
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::Unread,
+            "stored unread must survive a message landing in the settle gap"
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// `workspace.markSeen` propagates marker-advance failures instead of
+    /// swallowing them: a failed per-session advance (here: the message
+    /// table dropped out from under the monotonicity gate) surfaces as the
+    /// call's error, the stored `unread` flag survives, and no `{ none }`
+    /// event is emitted — the caller never sees "seen" while a session
+    /// stays unread.
+    #[tokio::test]
+    async fn workspace_mark_seen_propagates_marker_failures() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Persist a dangling current marker so the monotonicity gate must
+        // resolve transcript positions (and hit the induced store failure).
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), "stale".into())
+            .await
+            .expect("seed marker");
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        // Force the per-session advance to fail hard (not NotFound).
+        sqlx::query("DROP TABLE agent_message")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_message");
+
+        let mut sub = subscribe_attention(&h);
+        let err = h.services.mark_seen(h.ws.clone()).await;
+        assert!(err.is_err(), "marker failure must propagate: {err:?}");
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::Unread,
+            "stored unread must survive a failed mark-all"
+        );
+    }
+
+    /// Batch list-path derivation (`workspaces_with_unread_top_level_sessions`)
+    /// agrees with the per-workspace EXISTS probe: only workspaces with an
+    /// unread top-level session appear in the set, and a marker catch-up
+    /// removes them.
+    #[tokio::test]
+    async fn batch_unread_set_matches_single_probe() {
+        let h = harness().await;
+        // Second workspace, fully seen.
+        let ws_seen = WorkspaceId::new();
+        h.store
+            .insert_workspace(&workspace(&ws_seen))
+            .await
+            .expect("ws2");
+        let seen_session = mk_session(&ws_seen, "agent-seen");
+        let last_seen = seed_session_with(&h, seen_session, &["user", "assistant"]).await;
+        h.services
+            .agent_mark_seen_op(ws_seen.clone(), AgentId::from("agent-seen"), last_seen)
+            .await
+            .expect("catch up ws2");
+        // Primary workspace unread.
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+
+        let set = h
+            .store
+            .workspaces_with_unread_top_level_sessions()
+            .await
+            .expect("batch probe");
+        assert!(set.contains(h.ws.as_str()), "unread workspace in the set");
+        assert!(
+            !set.contains(ws_seen.as_str()),
+            "caught-up workspace absent"
+        );
+
+        // Marker catch-up drains the set.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let set = h
+            .store
+            .workspaces_with_unread_top_level_sessions()
+            .await
+            .expect("batch probe");
+        assert!(!set.contains(h.ws.as_str()), "seen workspace drained");
     }
 }
