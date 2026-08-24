@@ -2967,11 +2967,19 @@ impl Store {
 
     /// Number of RUNNING delegated children of `parent_agent_id`: sessions
     /// carrying this `parent_agent_id` whose status is genuinely in-flight —
-    /// `pending`/`active`/`Processing`/`Waiting`, the same in-flight set the
-    /// archive guardrail and the startup heal sweep use. Idle children (`Idle`
-    /// / `idle`) do NOT count: an idle-but-restorable delegate is unsettled
-    /// lifecycle state, not active work, and counting it made
-    /// `runningSubAgents` stick forever (intent-hq/monorepo#3384). An
+    /// `pending`/`active`/`Processing`/`Waiting`, the same in-flight set as
+    /// the archive guardrail (`is_running_or_queued`); the startup heal
+    /// sweep's `is_stale_in_flight_status` covers the non-queued subset.
+    /// Idle children (`Idle` / `idle`) do NOT count: an idle-but-restorable
+    /// delegate is unsettled lifecycle state, not active work, and counting
+    /// it made `runningSubAgents` stick forever (intent-hq/monorepo#3384).
+    /// Persisted-status-only aggregate: a child sitting `Idle` with
+    /// queued-but-undelivered messages, or a fresh delegate in the window
+    /// before its first turn flips it `Active`, reports as not running — the
+    /// runtime `is_responding` signal the archive guardrail adds on top is
+    /// invisible at the store level, and briefly undercounting is the right
+    /// trade for a field named "running" (do not widen this back toward
+    /// unsettled-counting). An
     /// allowlist (`IN`), not a terminal-status blocklist, so a future status
     /// variant defaults to "not running". Deliberately UNSCOPED by
     /// workspace — a Chief parent can delegate into another workspace
