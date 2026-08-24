@@ -57,7 +57,12 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// uses TLS + bearer auth; [`WsApiServer::new_insecure`] disables both.
 #[derive(Debug, Clone)]
 pub struct WsOptions {
-    pub bind_address: IpAddr,
+    /// The bind set (`server.bindAddress`): one TCP listener per address, all
+    /// on `base_port`. Binding is all-or-nothing — any failed address fails
+    /// `start()`. Must be non-empty and semantically valid (no duplicates,
+    /// unspecified only alone); [`intent_core::settings_file::BindAddress::resolve`]
+    /// produces exactly that shape.
+    pub bind_addresses: Vec<IpAddr>,
     pub base_port: u16,
     pub enabled: bool,
     pub auth_enabled: bool,
@@ -80,7 +85,7 @@ pub struct WsOptions {
 impl Default for WsOptions {
     fn default() -> Self {
         Self {
-            bind_address: IpAddr::from([127, 0, 0, 1]),
+            bind_addresses: vec![IpAddr::from([127, 0, 0, 1])],
             base_port: DEFAULT_PORT,
             enabled: true,
             auth_enabled: true,
@@ -127,7 +132,7 @@ pub(crate) struct WsInner {
     /// `false` = remote. TCP/WSS defaults to remote unless forced via
     /// `WsOptions::locality_override`.
     pub locality_is_local: bool,
-    pub bind_address: IpAddr,
+    pub bind_addresses: Vec<IpAddr>,
     pub base_port: u16,
     /// Pinned SHA-256 cert fingerprint; `None` in insecure mode (no TLS cert).
     pub fingerprint: Option<String>,
@@ -195,7 +200,7 @@ impl WsApiServer {
             // The WSS transport is remote by default; an override forces it
             // local/remote (§5.14).
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
-            bind_address: options.bind_address,
+            bind_addresses: options.bind_addresses.clone(),
             base_port: options.base_port,
             fingerprint: Some(tls.fingerprint256.clone()),
             heartbeat_interval: options.heartbeat_interval,
@@ -233,7 +238,7 @@ impl WsApiServer {
             enabled: options.enabled,
             auth_enabled: false,
             locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
-            bind_address: options.bind_address,
+            bind_addresses: options.bind_addresses.clone(),
             base_port: options.base_port,
             fingerprint: None,
             heartbeat_interval: options.heartbeat_interval,
