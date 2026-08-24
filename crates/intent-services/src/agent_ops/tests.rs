@@ -27733,6 +27733,15 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     assert_eq!(r1["disposition"], "started");
     let agent_id = r1["agentId"].as_str().expect("started row carries agentId");
     assert_eq!(resp["startedTaskIds"], json!([t1.0]));
+    // Top-level summary (monorepo#3334); something started, so no warning.
+    assert_eq!(
+        resp["summary"],
+        json!({ "started": 1, "held": 1, "skipped": 0, "errors": 0 })
+    );
+    assert!(
+        !resp.as_object().unwrap().contains_key("warning"),
+        "no warning when tasks started: {resp}"
+    );
 
     let r2 = row_for(&resp, &t2);
     assert_eq!(r2["disposition"], "held:blocked-on-deps");
@@ -27770,6 +27779,176 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
         "{again}"
     );
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
+    // Zero started on the re-call: summary reflects it and the top-level
+    // warning names the hold/skip breakdown (monorepo#3334).
+    assert_eq!(
+        again["summary"],
+        json!({ "started": 0, "held": 1, "skipped": 1, "errors": 0 })
+    );
+    let warning = again["warning"].as_str().expect("warning present");
+    assert!(warning.contains("NO TASKS STARTED"), "{warning}");
+    assert!(
+        warning.contains("1 held on unmet dependencies"),
+        "{warning}"
+    );
+    assert!(warning.contains("1 skipped"), "{warning}");
+    assert!(warning.contains("re-call agent.delegate"), "{warning}");
+}
+
+/// monorepo#3334 regression: a batch where EVERYTHING holds on dependencies
+/// returns `ok: true` but must carry a zeroed summary and the prominent
+/// warning, so the caller cannot misread the call as "work started".
+#[tokio::test]
+async fn batch_delegate_zero_started_carries_summary_and_warning() {
+    let (_t, svc, ws) = setup().await;
+    let dep = seed_task(&svc, &ws, "Dep").await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    for t in [&t1, &t2] {
+        svc.task_set_relations(ws.clone(), t.clone(), Some(vec![dep.clone()]), None)
+            .await
+            .expect("dependsOn dep");
+    }
+    // The dependency is review_required — incomplete, so both holds (the
+    // exact real-world footgun from the issue).
+    svc.task_update_note_status(
+        ws.clone(),
+        dep.clone(),
+        "review_required".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("dep review_required");
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2]), None)
+        .await
+        .expect("batch delegate");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["startedTaskIds"], json!([] as [String; 0]));
+    assert_eq!(
+        resp["summary"],
+        json!({ "started": 0, "held": 2, "skipped": 0, "errors": 0 })
+    );
+    let warning = resp["warning"].as_str().expect("warning present");
+    assert!(warning.contains("NO TASKS STARTED"), "{warning}");
+    assert!(
+        warning.contains("2 held on unmet dependencies"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("no completion wake will arrive from this call"),
+        "{warning}"
+    );
+}
+
+/// monorepo#3334 regression: an all-started batch carries the summary but no
+/// warning.
+#[tokio::test]
+async fn batch_delegate_all_started_summary_without_warning() {
+    let (_t, svc, ws) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2]), None)
+        .await
+        .expect("batch delegate");
+    assert_eq!(
+        resp["summary"],
+        json!({ "started": 2, "held": 0, "skipped": 0, "errors": 0 })
+    );
+    assert!(
+        !resp.as_object().unwrap().contains_key("warning"),
+        "no warning when all started: {resp}"
+    );
+}
+
+/// monorepo#3334 fix 3: a zero-started `after_all` batch from an agent caller
+/// with NO open delegation group delivers an immediate advisory wake to the
+/// parent — otherwise no settlement wake would ever arrive (silent stall).
+#[tokio::test]
+async fn batch_delegate_zero_started_after_all_delivers_advisory_wake() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let dep = seed_task(&svc, &ws, "Dep").await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    svc.task_set_relations(ws.clone(), t1.clone(), Some(vec![dep.clone()]), None)
+        .await
+        .expect("t1 dependsOn dep");
+
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..batch_input(&[&t1])
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, Some(parent.clone()))
+        .await
+        .expect("batch delegate");
+    assert_eq!(resp["summary"]["started"], json!(0));
+
+    // No group was formed (nothing enrolled) …
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "zero-started batch must not open a group"
+    );
+    // … and the parent received exactly one advisory wake naming the stall.
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("started ZERO tasks"), "{text}");
+    assert!(
+        text.contains("NO settlement wake will ever arrive"),
+        "{text}"
+    );
+
+    // Immediate (default) waitMode: same zero-started outcome, but no
+    // advisory wake — immediate mode never owed a settlement wake.
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1]), Some(parent.clone()))
+        .await
+        .expect("batch delegate immediate");
+    assert_eq!(resp["summary"]["started"], json!(0));
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "no advisory wake in immediate mode"
+    );
+}
+
+/// monorepo#3334 guard: when an OPEN `after_all` group from an earlier
+/// delegation still owes the parent a settlement wake, a zero-started batch
+/// stays silent — the coming settlement wake is the resume signal, and a
+/// redundant advisory would double-wake the parent.
+#[tokio::test]
+async fn batch_delegate_zero_started_after_all_skips_advisory_when_group_open() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Earlier delegation opened a group that is still unsettled.
+    let _child = delegate_after_all(&svc, &ws, &parent).await;
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
+
+    let dep = seed_task(&svc, &ws, "Dep").await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    svc.task_set_relations(ws.clone(), t1.clone(), Some(vec![dep.clone()]), None)
+        .await
+        .expect("t1 dependsOn dep");
+
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..batch_input(&[&t1])
+    };
+    let resp = svc
+        .agent_delegate_op(ws.clone(), input, Some(parent.clone()))
+        .await
+        .expect("batch delegate");
+    assert_eq!(resp["summary"]["started"], json!(0));
+    assert!(resp["warning"].as_str().is_some(), "warning still present");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "open group already owes a settlement wake — no advisory"
+    );
 }
 
 /// Relation-less annotation (monorepo#2457 part 3): a mixed request — a
