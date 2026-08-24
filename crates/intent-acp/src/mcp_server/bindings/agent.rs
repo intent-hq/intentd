@@ -929,20 +929,30 @@ async fn pending_send_refusal(
 
 /// Classify a successful send result into the top-level `delivery` outcome:
 /// `"held"` (parked behind the target's pending Q&A, `heldForQuestions`),
-/// `"queued"` (target busy / non-interrupt send, `queued: true`), or
-/// `"delivered"` (driving a turn now). `sendToTask` nests the underlying
-/// send flags under `result`, so that envelope is consulted when the flags
-/// are not top-level. Returns `None` for non-success shapes (e.g.
+/// `"queued"` (parked in the target's queue: target busy / non-interrupt
+/// send — but ALSO the indefinite parks, `quarantined: true` which drains
+/// only after `agent.retry` and `archivedParked: true` which drains only on
+/// unarchive; both carry `queued: true`, and the underlying flag stays in
+/// the result for callers that need the distinction), or `"delivered"`
+/// (driving a turn now). Returns `None` for non-success shapes (e.g.
 /// sendToTask's `ok: false` "No agent assigned to task") — those keep their
 /// existing fields with no `delivery` claim.
+///
+/// A `result` object, when present, takes PRECEDENCE over top-level flags
+/// (not just a fallback): `sendToTask` nests the underlying send flags
+/// under `result`, and plain `send` results never carry a `result` key.
+/// Nested `result.success` is deliberately not re-checked — sound because
+/// `agent_send_to_task_op` only nests success shapes (inner errors
+/// propagate as `Err`, no-assignee returns a `result`-less `ok: false`).
 ///
 /// `queued: false` alone is NOT proof a turn is being driven: the
 /// no-`AgentManager` store-only fallback (`agent_send_message_op`) returns
 /// `{ success: true, queued: false, messageId }` after only persisting the
-/// row. Every turn-driving success from `AgentManager` carries a `turnId`
-/// (and the interrupt dedup shape — the duplicate of a delivery that
-/// already ran — is flagged `deduplicated: true`), so `"delivered"` is
-/// claimed only on those markers; a persist-only success gets no `delivery`
+/// row. Every turn-driving success from `AgentManager` carries a `turnId`,
+/// so `"delivered"` is claimed only on that marker — plus the interrupt
+/// dedup replay (`deduplicated: true`), which delivered nothing NEW on this
+/// call but whose original delivery did run, so "the message reached the
+/// target's turn" still holds. A persist-only success gets no `delivery`
 /// claim rather than a false "delivered".
 fn delivery_outcome(obj: &serde_json::Map<String, Value>) -> Option<&'static str> {
     let ok = obj.get("ok").and_then(Value::as_bool).unwrap_or(false)
