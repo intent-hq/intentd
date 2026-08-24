@@ -330,7 +330,10 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// `ws.agent.send`. Guarded by the single-pending-message rule: when the
 /// caller (an agent) already has a pending entry in the target's queue, the
 /// send is refused with an `ok: false` result echoing the target's queue —
-/// see [`pending_send_refusal`].
+/// see [`pending_send_refusal`]. Success results carry a top-level
+/// `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
+/// silently-queued is unambiguous even to a sender that only glances at
+/// the result.
 async fn send(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -367,11 +370,16 @@ async fn send(
     let mut out = merge_ok(result);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("agentId".to_string(), json!(agent_id_str));
+        if let Some(delivery) = delivery_outcome(obj) {
+            obj.insert("delivery".to_string(), json!(delivery));
+        }
     }
     Ok(out)
 }
 
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
+/// and the same top-level `delivery` outcome on success
+/// ([`delivery_outcome`] — the op nests its flags under `result`).
 /// applied against the task's assigned agent (resolution failures fall
 /// through so the unguarded call surfaces its existing error/`ok: false`
 /// shapes — e.g. "No agent assigned to task"). The guard's target
@@ -426,6 +434,9 @@ async fn send_to_task(
     let mut out = merge_ok(result);
     if let Some(obj) = out.as_object_mut() {
         obj.insert("taskNoteId".to_string(), json!(task_note_id));
+        if let Some(delivery) = delivery_outcome(obj) {
+            obj.insert("delivery".to_string(), json!(delivery));
+        }
     }
     Ok(out)
 }
@@ -876,6 +887,7 @@ async fn fetch_presented_queue(
 /// when the caller (an agent) already has a pending entry in the target's
 /// queue, refuse the send instead of stacking a second one. Returns
 /// `Some(refusal)` — a **successful** tool result with `ok: false`, the
+/// unmissable `refused: true` discriminator, an `error` naming the rule,
 /// target's presented queue (drain order, [`truncate_entry_content`]'d), the
 /// caller's pending entry id, and the instruction to either keep the existing
 /// entry or remove it and re-send one combined message (which lands at the
@@ -903,15 +915,44 @@ async fn pending_send_refusal(
     let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
     Some(json!({
         "ok": false,
+        "refused": true,
         "agentId": target.as_str(),
         "error": format!(
-            "send refused: you already have a pending message (id: {pending_id}) in this agent's queue"
+            "send refused: only one pending message per target is allowed, and you already have a pending message (id: {pending_id}) in this agent's queue"
         ),
         "pendingMessageId": pending_id,
         "queueLength": queue_length,
         "queue": queue,
-        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or remove it with ws.agent.removeQueuedMessage(agentId, messageId) and re-send ONE message combining everything you want to say. Note: a re-sent message lands at the END of the queue.",
+        "instruction": "Only one pending message per target is allowed. Either keep your existing entry as-is, or remove it with ws.agent.removeQueuedMessage(agentId, messageId) and re-send ONE message combining everything you want to say. Notes: remove + re-send is NOT atomic — the pending entry may deliver in between, so re-check ws.agent.getQueue if the removal fails — and a re-sent message lands at the END of the queue.",
     }))
+}
+
+/// Classify a successful send result into the top-level `delivery` outcome:
+/// `"held"` (parked behind the target's pending Q&A, `heldForQuestions`),
+/// `"queued"` (target busy / non-interrupt send, `queued: true`), or
+/// `"delivered"` (persisted and driving a turn now). `sendToTask` nests the
+/// underlying send flags under `result`, so that envelope is consulted when
+/// the flags are not top-level. Returns `None` for non-success shapes (e.g.
+/// sendToTask's `ok: false` "No agent assigned to task") — those keep their
+/// existing fields with no `delivery` claim.
+fn delivery_outcome(obj: &serde_json::Map<String, Value>) -> Option<&'static str> {
+    let ok = obj.get("ok").and_then(Value::as_bool).unwrap_or(false)
+        || obj.get("success").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let flags = match obj.get("result") {
+        Some(Value::Object(inner)) => inner,
+        _ => obj,
+    };
+    let flag = |k: &str| flags.get(k).and_then(Value::as_bool).unwrap_or(false);
+    if flag("heldForQuestions") {
+        Some("held")
+    } else if flag("queued") {
+        Some("queued")
+    } else {
+        Some("delivered")
+    }
 }
 
 /// The id of the caller's first pending entry in a presented queue
@@ -1158,5 +1199,67 @@ mod tests {
 
         let short = truncate_entry_content(json!({ "id": "e", "content": "short" }));
         assert_eq!(short["content"], json!("short"));
+    }
+
+    fn outcome(v: &Value) -> Option<&'static str> {
+        delivery_outcome(v.as_object().unwrap())
+    }
+
+    #[test]
+    fn delivery_outcome_classifies_send_shapes() {
+        // Plain `send`: flags top-level (post-merge_ok `ok: true`).
+        assert_eq!(
+            outcome(&json!({ "ok": true, "success": true, "queued": false })),
+            Some("delivered")
+        );
+        assert_eq!(
+            outcome(&json!({ "ok": true, "success": true, "queued": true })),
+            Some("queued")
+        );
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "success": true, "queued": true, "heldForQuestions": true
+            })),
+            Some("held")
+        );
+        // Pre-merge `success: true` alone still classifies.
+        assert_eq!(
+            outcome(&json!({ "success": true, "queued": false })),
+            Some("delivered")
+        );
+    }
+
+    #[test]
+    fn delivery_outcome_reads_nested_send_to_task_result() {
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": false }
+            })),
+            Some("delivered")
+        );
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": true }
+            })),
+            Some("queued")
+        );
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": true, "heldForQuestions": true }
+            })),
+            Some("held")
+        );
+    }
+
+    #[test]
+    fn delivery_outcome_skips_non_success_shapes() {
+        assert_eq!(
+            outcome(&json!({ "ok": false, "error": "No agent assigned to task" })),
+            None
+        );
+        assert_eq!(outcome(&json!({ "ok": false, "refused": true })), None);
     }
 }

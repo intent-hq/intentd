@@ -8180,6 +8180,10 @@ mod wsapi4_bindings_tests {
         /// Raw `agent.getQueue` entries served by `agent_get_queue`.
         queue_entries: Mutex<Vec<Value>>,
         remove_queued_owned_calls: Mutex<Vec<(String, String, String)>>,
+        /// When set, overrides the `agent_send_message` result (delivery-shape tests).
+        agent_send_result: Mutex<Option<Value>>,
+        /// When set, overrides the `agent_send_to_task` result (delivery-shape tests).
+        agent_send_to_task_result: Mutex<Option<Value>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -8332,7 +8336,13 @@ mod wsapi4_bindings_tests {
                 priority,
                 message_metadata,
             ));
-            Box::pin(async move { Ok(json!({ "success": true, "queued": false })) })
+            let result = self
+                .agent_send_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| json!({ "success": true, "queued": false }));
+            Box::pin(async move { Ok(result) })
         }
 
         fn agent_send_to_task(
@@ -8349,8 +8359,11 @@ mod wsapi4_bindings_tests {
                 priority,
                 message_metadata,
             ));
+            let result = self.agent_send_to_task_result.lock().unwrap().clone();
             Box::pin(async move {
-                Ok(json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }))
+                Ok(result.unwrap_or_else(
+                    || json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }),
+                ))
             })
         }
 
@@ -8701,6 +8714,125 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["ok"], json!(true));
         let calls = api.agent_send_calls.lock().unwrap();
         assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
+    }
+
+    /// Self-describing success: a delivered-now send carries the top-level
+    /// `delivery: "delivered"` outcome.
+    #[tokio::test]
+    async fn agent_send_delivered_shape_carries_delivery_field() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["delivery"], json!("delivered"));
+    }
+
+    /// Self-describing success: a queued-because-busy send is explicit —
+    /// `delivery: "queued"` — so `ok: true` is not read as "delivered now".
+    #[tokio::test]
+    async fn agent_send_queued_shape_carries_delivery_field() {
+        let (srv, api) = server();
+        *api.agent_send_result.lock().unwrap() = Some(json!({
+            "success": true,
+            "queued": true,
+            "queuedMessage": { "id": "qmsg-1" },
+        }));
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["delivery"], json!("queued"));
+    }
+
+    /// Self-describing success: a held-for-questions park reports
+    /// `delivery: "held"`.
+    #[tokio::test]
+    async fn agent_send_held_shape_carries_delivery_field() {
+        let (srv, api) = server();
+        *api.agent_send_result.lock().unwrap() = Some(json!({
+            "success": true,
+            "queued": true,
+            "heldForQuestions": true,
+            "queuedMessage": { "id": "qmsg-1" },
+        }));
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["delivery"], json!("held"));
+    }
+
+    /// `sendToTask` classifies the nested `result` envelope the op returns.
+    #[tokio::test]
+    async fn agent_send_to_task_delivery_field_reads_nested_result() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["delivery"], json!("delivered"));
+
+        *api.agent_send_to_task_result.lock().unwrap() = Some(json!({
+            "ok": true,
+            "agentId": "agent-assignee",
+            "result": { "success": true, "queued": true, "heldForQuestions": true },
+        }));
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["delivery"], json!("held"));
+    }
+
+    /// A non-success `sendToTask` result (e.g. no assignee) gains no
+    /// `delivery` claim — nothing was sent.
+    #[tokio::test]
+    async fn agent_send_to_task_failure_has_no_delivery_field() {
+        let (srv, api) = server();
+        *api.agent_send_to_task_result.lock().unwrap() = Some(json!({
+            "ok": false,
+            "delivered": false,
+            "error": "No agent assigned to task",
+        }));
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert!(v.get("delivery").is_none(), "{v}");
+    }
+
+    /// Single-pending-message refusal: `refused: true` discriminator, an
+    /// `error` naming the rule, and the atomicity warning in `instruction`.
+    #[tokio::test]
+    async fn agent_send_refusal_is_self_describing() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["refused"], json!(true));
+        assert_eq!(v["pendingMessageId"], json!("qmsg-pending"));
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.contains("only one pending message per target"),
+            "error names the rule: {error}"
+        );
+        let instruction = v["instruction"].as_str().unwrap();
+        assert!(instruction.contains("removeQueuedMessage"), "{instruction}");
+        assert!(
+            instruction.contains("NOT atomic"),
+            "instruction warns remove + re-send is not atomic: {instruction}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "refused send never reaches the service layer"
+        );
     }
 
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
