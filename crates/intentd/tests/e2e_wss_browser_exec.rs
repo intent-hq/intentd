@@ -174,8 +174,15 @@ async fn read_text<S>(ws: &mut WebSocketStream<S>) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    read_text_with_timeout(ws, Duration::from_secs(15)).await
+}
+
+async fn read_text_with_timeout<S>(ws: &mut WebSocketStream<S>, duration: Duration) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(duration, ws.next())
             .await
             .expect("wss read timed out");
         match next {
@@ -375,4 +382,36 @@ async fn browser_exec_fe_json_rpc_error_surfaces_as_internal_error() {
         .as_str()
         .unwrap()
         .contains("CDP not attached"));
+}
+
+#[tokio::test]
+async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss() {
+    let (_daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "browser.exec",
+        "params": { "actions": [{ "action": "screenshot" }] },
+    });
+    let started = tokio::time::Instant::now();
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+
+    let reverse = read_text(&mut ws).await;
+    assert_eq!(reverse["method"], "browser.exec");
+    assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
+    // Do not answer the reverse request. The daemon must settle the caller
+    // before the JavaScript tool's 30-second outer budget expires.
+    let response = read_text_with_timeout(&mut ws, Duration::from_secs(25)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(response["id"], 32);
+    assert_eq!(response["error"]["code"], -32603);
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("reverse request timed out: browser.exec"));
+    assert!(elapsed >= Duration::from_secs(19), "elapsed={elapsed:?}");
+    assert!(elapsed < Duration::from_secs(30), "elapsed={elapsed:?}");
 }
