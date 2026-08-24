@@ -84,9 +84,21 @@ impl WsInner {
 
     /// Bind every configured address, then spawn one accept loop per
     /// listener plus the heartbeat loop and record their handles. Re-checks
-    /// the stop generation before binding.
+    /// the stop generation before binding AND again under the state lock
+    /// before spawning/installing: `stop()` may have taken `start_task` and
+    /// `running` while a later bind in the set was in flight, and installing
+    /// after that would leave live listeners nothing tears down. Dropping
+    /// the bound listeners on that path closes them.
     async fn do_start(self: Arc<Self>, generation: u64) -> Result<u16, Arc<io::Error>> {
         let (listeners, port) = self.bind_once(generation).await?;
+        let mut st = self.state.lock().await;
+        if self.external_stop_generation.load(Ordering::SeqCst) != generation {
+            st.start_task = None;
+            return Err(Arc::new(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "ws start aborted by concurrent stop",
+            )));
+        }
         for listener in &listeners {
             if let Ok(addr) = listener.local_addr() {
                 tracing::info!(address = %addr.ip(), port, "intentd WSS listening");
@@ -102,7 +114,6 @@ impl WsInner {
             shutdown_txs.push(shutdown_tx);
         }
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
-        let mut st = self.state.lock().await;
         st.started = true;
         st.port = Some(port);
         st.start_task = None;
@@ -132,10 +143,15 @@ impl WsInner {
                 "ws start aborted by concurrent stop",
             )));
         }
-        debug_assert!(
-            !self.bind_addresses.is_empty(),
-            "WsOptions.bind_addresses must be non-empty"
-        );
+        // Hard error (not just a debug assertion): `WsOptions` is public, and
+        // an empty set completing "successfully" would start the heartbeat
+        // and report a port with no TCP listener behind it.
+        if self.bind_addresses.is_empty() {
+            return Err(Arc::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WsOptions.bind_addresses must be non-empty",
+            )));
+        }
         let mut listeners = Vec::with_capacity(self.bind_addresses.len());
         let mut port = self.base_port;
         for addr in &self.bind_addresses {

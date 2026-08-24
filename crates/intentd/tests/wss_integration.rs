@@ -3908,6 +3908,32 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     );
 }
 
+/// `WsOptions` is public, so an empty bind set must be a hard `start()`
+/// error in release builds too — never a "successful" start with a
+/// heartbeat and reported port but no TCP listener behind it.
+#[tokio::test]
+async fn empty_bind_set_is_a_start_error() {
+    let (api, bus, _store, _registry, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let opts = WsOptions {
+        base_port: 0,
+        bind_addresses: Vec::new(),
+        ..WsOptions::default()
+    };
+    let ws = WsApiServer::new(api, bus, &tls, &token_store, opts, None).expect("server");
+    let err = ws
+        .start()
+        .await
+        .expect_err("start must fail on an empty bind set");
+    assert!(
+        err.to_string().contains("non-empty"),
+        "error names the invariant: {err}"
+    );
+}
+
 #[tokio::test]
 async fn upgrade_rejected_without_or_with_bad_token() {
     let srv = start(WsOptions::default()).await;

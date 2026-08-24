@@ -402,13 +402,14 @@ async fn enable_wss_listener(
             rpc_error_text(error)
         );
     }
-    // Name the address the listener now binds so an unattended run still
+    // Name the address(es) the listener now binds so an unattended run still
     // reports the effective posture (default: loopback) and how to widen it.
+    // The list form (monorepo#3314) is reported in full, comma-separated.
     let effective = match bind_address {
         Some(addr) => addr.to_string(),
-        None => current_bind_address(socket)
+        None => current_bind_addresses_display(socket)
             .await
-            .map_or_else(|| "127.0.0.1".to_string(), |a| a.to_string()),
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
     };
     eprintln!(
         "External connections enabled — other Intent apps can now pair with this \
@@ -419,11 +420,9 @@ async fn enable_wss_listener(
     Ok(())
 }
 
-/// Read the effective `server.bindAddress` over UDS; `None` when the RPC
-/// fails or the value is not a parseable IP (callers fall back to loopback).
-/// The list form (monorepo#3314) yields its first entry — the single-select
-/// picker uses this only to pre-select a default.
-async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
+/// Read the raw effective `server.bindAddress` value over UDS; `None` when
+/// the RPC fails (callers fall back to loopback).
+async fn current_bind_address_value(socket: &Path) -> Option<serde_json::Value> {
     let response = rpc_call(
         socket,
         "settings.get",
@@ -431,9 +430,37 @@ async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
     )
     .await
     .ok()?;
-    let value = &response["result"]["value"];
+    let value = response["result"]["value"].clone();
+    (!value.is_null()).then_some(value)
+}
+
+/// Read the effective `server.bindAddress` over UDS; `None` when the RPC
+/// fails or the value is not a parseable IP (callers fall back to loopback).
+/// The list form (monorepo#3314) yields its first entry — the single-select
+/// picker uses this only to pre-select a default.
+async fn current_bind_address(socket: &Path) -> Option<std::net::IpAddr> {
+    let value = current_bind_address_value(socket).await?;
     let raw = value.as_str().or_else(|| value.get(0)?.as_str())?;
     raw.parse().ok()
+}
+
+/// Display form of the effective `server.bindAddress` for user-facing
+/// output: a single IP as-is, the list form (monorepo#3314) joined with
+/// ", " so every bound address is reported, not just the first.
+async fn current_bind_addresses_display(socket: &Path) -> Option<String> {
+    let value = current_bind_address_value(socket).await?;
+    if let Some(raw) = value.as_str() {
+        return Some(raw.to_string());
+    }
+    let entries: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(entries.join(", "))
 }
 
 /// One selectable entry in the `intentd pair` bind-address picker.
@@ -2979,12 +3006,13 @@ impl intent_core::ServerControl for DaemonControl {
 
             let port = server.start().await.map_err(|e| {
                 // Map bind failures to friendly, actionable error messages.
-                // The bind is all-or-nothing across the configured set: the
-                // error from the transport already names the failing address.
-                let error_kind = e.kind();
-                let error_msg = if error_kind == std::io::ErrorKind::AddrInUse {
+                // The bind is all-or-nothing across the configured set, and
+                // the transport error names the failing address:port — keep
+                // it so a partial multi-bind failure (or a port-0 run) stays
+                // diagnosable, and add the actionable guidance.
+                let error_msg = if e.kind() == std::io::ErrorKind::AddrInUse {
                     format!(
-                        "Port {desired_port} is already in use — choose a different port or stop the process using it"
+                        "Address already in use ({e}) — choose a different port or stop the process using it"
                     )
                 } else {
                     // Other bind errors: name the setting (server.bindAddress)
