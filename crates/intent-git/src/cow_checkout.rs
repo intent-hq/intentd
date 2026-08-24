@@ -557,9 +557,16 @@ fn checkout_in_clone_impl(
 /// invocation via `-c` (the clone's own config stays untouched): entries
 /// whose mtime+size still match the index are trusted, and only real
 /// differences — files dirty in the source working tree, or paths differing
-/// between the source tip and the base ref — are checked out. Any failure
-/// (no `git` binary, nonzero exit) degrades to the full libgit2 hard reset
-/// with a warning naming the error: the end state is identical either way.
+/// between the source tip and the base ref — are checked out. One residual
+/// case survives this stat trust where the full libgit2 re-hash would not:
+/// a tracked file dirty in the source with an unchanged size and an mtime
+/// not newer than the index's recorded mtime (e.g. backdated by a tool that
+/// restores mtimes) is trusted as clean and left stale in the clone. This is
+/// exactly the trust plain `git status`/`git reset` places in its own stat
+/// cache on the source repo, so the clone is no less trustworthy than normal
+/// git operation there, and the gap is accepted. Any failure (no `git`
+/// binary, nonzero exit) degrades to the full libgit2 hard reset with a
+/// warning naming the error.
 /// Returns whether the fast path engaged (`false` means the fallback ran).
 fn fast_hard_reset(
     checkout_path: &Path,
@@ -594,7 +601,12 @@ fn fast_hard_reset_with(
 
 /// `git reset --hard <sha>` with the stat-trusting config applied via `-c`
 /// for this one invocation. Local-only (no network, no prompt); `sha` is a
-/// hex object id from libgit2, never user input.
+/// hex object id from libgit2, never user input. Hermetic against inherited
+/// context: `submodule.recurse=false` pins the reset to the superproject
+/// even if host config sets `submodule.recurse=true` (libgit2's reset never
+/// recursed), and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` are stripped —
+/// they would override `-C`-based repo discovery, aiming a destructive
+/// command that exits 0 at the wrong repository, bypassing the fallback.
 fn cli_stat_trusting_reset(checkout_path: &Path, sha: &str) -> Result<()> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -604,12 +616,17 @@ fn cli_stat_trusting_reset(checkout_path: &Path, sha: &str) -> Result<()> {
             "core.checkstat=minimal",
             "-c",
             "core.trustctime=false",
+            "-c",
+            "submodule.recurse=false",
             "reset",
             "--hard",
             "--quiet",
             sha,
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
