@@ -7980,7 +7980,11 @@ impl Services {
     /// rehydration) pair the watch with a message/wake that settles one side
     /// or must keep rehydrating persisted pairs, and stay covered by the
     /// settlement-time backstop. Direct pair check only — deeper cycles
-    /// (A→B→C→A) are intentionally not detected here.
+    /// (A→B→C→A) are intentionally not detected here. Best-effort under
+    /// concurrency (TOCTOU): two agents racing explicit registrations on
+    /// each other can both pass this check before either watch lands and
+    /// still form the mutual pair — that race is covered by the same
+    /// settlement-time `mutual_idle` backstop.
     fn check_no_reverse_watch(
         &self,
         caller_agent_id: &AgentId,
