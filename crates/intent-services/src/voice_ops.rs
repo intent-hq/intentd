@@ -241,10 +241,14 @@ pub(crate) fn parse_vocabulary_setting(value: Option<&serde_json::Value>) -> Vec
 /// `voice.vocabulary` terms, the auto-derived workspace vocabulary (empty
 /// when the call carries no `workspaceId` — PROTOCOL §5.41, v4.6), and the
 /// request keyterms — in that fixed order, under the existing dedup/cap
-/// rules — and compose the `OpenAI` prompt (see [`intent_voice::context`]).
-/// Both fields are always populated; each engine consumes the one it
-/// supports. `language` is the resolved value from [`resolve_language`]
-/// (per-call > `voice.language` setting > auto-detect).
+/// rules — and compose the `OpenAI` prompt from the merged terms verbatim
+/// (see [`intent_voice::context`]). The `keyterms` field alone is then
+/// sanitized to the `ElevenLabs` Scribe v2 rules
+/// ([`context::sanitize_keyterms`]) — only `ElevenLabs` consumes it, and
+/// `OpenAI` biasing must keep unsanitized spellings. Both fields are always
+/// populated; each engine consumes the one it supports. `language` is the
+/// resolved value from [`resolve_language`] (per-call > `voice.language`
+/// setting > auto-detect).
 pub(crate) fn build_engine_request(
     parsed: &ParsedRequest,
     vocabulary: &[String],
@@ -257,8 +261,9 @@ pub(crate) fn build_engine_request(
     let mut biased: Vec<String> = Vec::with_capacity(vocabulary.len() + workspace_terms.len());
     biased.extend_from_slice(vocabulary);
     biased.extend_from_slice(workspace_terms);
-    let keyterms = context::merge_keyterms(&biased, &parsed.keyterms);
-    let prompt = context::compose_prompt(&keyterms, parsed.prompt.as_deref());
+    let merged = context::merge_keyterms(&biased, &parsed.keyterms);
+    let prompt = context::compose_prompt(&merged, parsed.prompt.as_deref());
+    let keyterms = context::sanitize_keyterms(&merged);
     TranscribeRequest {
         audio: parsed.audio.clone(),
         mime_type: parsed.mime_type.clone(),
@@ -435,6 +440,27 @@ mod tests {
         .unwrap();
         let req = build_engine_request(&parsed, &[], &[], parsed.language.clone());
         assert_eq!(req.keyterms, vec!["Endara".to_string()]);
+    }
+
+    #[test]
+    fn engine_request_sanitizes_keyterms_but_keeps_prompt_unsanitized() {
+        let parsed = parse_request(&json!({
+            "audio": b64(b"x"),
+            "context": { "keyterms": ["[fix] task"] },
+        }))
+        .unwrap();
+        let vocabulary = vec!["C:\\src".to_string()];
+        let req = build_engine_request(&parsed, &vocabulary, &[], parsed.language.clone());
+        assert_eq!(
+            req.keyterms,
+            vec!["C:src".to_string(), "fix task".to_string()],
+            "keyterms carry the ElevenLabs-sanitized spellings"
+        );
+        let prompt = req.prompt.unwrap();
+        assert!(
+            prompt.contains("C:\\src") && prompt.contains("[fix] task"),
+            "OpenAI prompt keeps unsanitized spellings: {prompt}"
+        );
     }
 
     #[test]

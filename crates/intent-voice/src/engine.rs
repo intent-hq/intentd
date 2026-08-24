@@ -19,12 +19,14 @@ pub struct TranscribeRequest {
     pub mime_type: String,
     /// Optional ISO language hint (e.g. `en`).
     pub language: Option<String>,
-    /// Merged keyterm vocabulary (static base ⊕ request), deduped and capped
-    /// per [`crate::context`]. `ElevenLabs` sends these as `keyterms`; `OpenAI`
-    /// folds them into the composed `prompt`.
+    /// Merged keyterm vocabulary (static base ⊕ request), deduped, capped,
+    /// and sanitized to the `ElevenLabs` Scribe v2 keyterm rules per
+    /// [`crate::context`]. Only `ElevenLabs` consumes these (as `keyterms`);
+    /// `OpenAI` biasing comes from `prompt`, which keeps the unsanitized
+    /// spellings.
     pub keyterms: Vec<String>,
-    /// Composed `OpenAI` `prompt` (style hint + vocabulary + request prompt).
-    /// Ignored by `ElevenLabs`.
+    /// Composed `OpenAI` `prompt` (style hint + unsanitized merged
+    /// vocabulary + request prompt). Ignored by `ElevenLabs`.
     pub prompt: Option<String>,
 }
 
