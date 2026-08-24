@@ -119,7 +119,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// (`workspace.setAgentName` / `git.commit` /
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods — `create`,
 /// `delegate`, `send`, `sendToTask`, `wakeOrCreate`, `reportToParent`,
-/// `requestDiscussion`, `reportBlocker`) can do so.
+/// `requestDiscussion`, `reportBlocker`, `retire`) can do so.
 /// `turn_attachments` threads the §7.1 turn-attachment registry to the
 /// bindings that register attachments mid-dispatch (`ws.app.question.ask`);
 /// `None` keeps those bindings inert (FE front door, tests).
@@ -411,5 +411,44 @@ mod prelude_tests {
         for kept in ["ws.agent = {", "reportToParent:", "wakeOrCreate:"] {
             assert!(js.contains(kept), "`{kept}` was wrongly dropped");
         }
+    }
+
+    // Guard: the retire segment gated by `peerAgents` still matches the
+    // `ws.agent` prelude verbatim, so the `replacen` scrub cannot silently
+    // become a no-op after a prelude edit.
+    #[test]
+    fn retire_prelude_segment_matches_agent_prelude() {
+        assert!(agent::PRELUDE.contains(agent::RETIRE_PRELUDE_SEGMENT));
+    }
+
+    // `peerAgents` defaults OFF (the one opt-in toggle): the default prelude
+    // omits the `retire` installer; opting in installs it, and the two
+    // `ws.agent` scrubs compose independently.
+    #[test]
+    fn peer_agents_gates_retire_installer_in_prelude() {
+        let js = prelude_for(&AgentFeaturesSettings::default());
+        assert!(
+            !js.contains("retire:"),
+            "retire installed with peerAgents off"
+        );
+        assert!(
+            js.contains("reportBlocker:"),
+            "attention installers must survive"
+        );
+
+        let js = prelude_for(&AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        });
+        assert!(js.contains("retire:"), "opting in must install retire");
+
+        let js = prelude_for(&AgentFeaturesSettings {
+            peer_agents: true,
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        });
+        assert!(js.contains("retire:"));
+        assert!(!js.contains("reportBlocker:"));
+        assert!(js.contains("reportToParent:"));
     }
 }

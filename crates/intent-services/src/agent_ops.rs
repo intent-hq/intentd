@@ -2089,11 +2089,38 @@ impl Services {
     /// (capped rows), while per-agent deltas re-read via `agent.get` (full
     /// values) — the bound is a property of list-shaped reads, not a channel
     /// invariant. Delta frames are single-agent, so the size goal holds.
+    ///
+    /// Soft retire: the default read excludes retired sessions (SQL-side
+    /// `retired_at IS NULL` filter — cost stays O(rows returned)); the wire
+    /// `includeRetired: true` variant is
+    /// [`Self::agent_list_including_retired_op`].
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
-        let sessions = self
-            .store
-            .list_agent_session_summaries(&workspace_id)
-            .await?;
+        self.agent_list_impl(workspace_id, false).await
+    }
+
+    /// `agent.list` with `includeRetired: true` (PROTOCOL §5.5): every
+    /// session including soft-retired ones, whose rows carry `retiredAt`.
+    pub(crate) async fn agent_list_including_retired_op(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<AgentLite>> {
+        self.agent_list_impl(workspace_id, true).await
+    }
+
+    async fn agent_list_impl(
+        &self,
+        workspace_id: WorkspaceId,
+        include_retired: bool,
+    ) -> Result<Vec<AgentLite>> {
+        let sessions = if include_retired {
+            self.store
+                .list_agent_session_summaries(&workspace_id)
+                .await?
+        } else {
+            self.store
+                .list_active_agent_session_summaries(&workspace_id)
+                .await?
+        };
         // Message projections are the expensive half (full-workspace COUNT
         // aggregate + preview columns). Cache per workspace; invalidated on
         // transcript writes and session create/delete.
@@ -3311,6 +3338,7 @@ impl Services {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -3734,6 +3762,115 @@ impl Services {
         for session in sessions {
             self.pending_agent_deletes.cancel(session.id.0.as_str());
         }
+    }
+
+    /// Soft retire (`ws.agent.retire`): set `retired_at` on the session,
+    /// keeping the row and its full conversation intact (still searchable).
+    /// The retired session is INERT — `require_agent_session` rejects every
+    /// interaction path and default `agent.list` reads exclude it — until
+    /// the user/FE-initiated `agent.restore` clears the mark. Idempotent on
+    /// an already-retired session (the existing timestamp is preserved, no
+    /// event re-emitted). Emits `agent:retired` with
+    /// `{ agentId, agentName, retiredAt, reason? }`.
+    pub(crate) async fn agent_retire_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        reason: Option<String>,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        if let Some(existing) = session.retired_at {
+            return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
+        }
+        let now = now_iso();
+        self.store
+            .set_agent_session_retired_at(&session.workspace_id, &agent_id, Some(&now), &now)
+            .await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
+        // Drop the retired agent's event subscriptions: the wake target is
+        // inert, so matching/batching for it is pure leak (same rationale
+        // as the delete cascade — monorepo#937). The queue entry is kept:
+        // restore may drain it later.
+        self.remove_event_subscriptions_for_agent(&agent_id).await;
+        let mut data = json!({
+            "agentId": agent_id.0,
+            "agentName": session.name,
+            "retiredAt": now,
+        });
+        if let Some(r) = reason.as_ref() {
+            data["reason"] = json!(r);
+        }
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            intent_store::NewEvent {
+                workspace_id: session.workspace_id.clone(),
+                timestamp: now.clone(),
+                event_type: intent_core::events::AGENT_RETIRED.to_string(),
+                actor: crate::system_actor(),
+                session_id: Some(agent_id.0.clone()),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data,
+            },
+        )
+        .await;
+        // Retiring a session can retire a needs_attention hold too (a
+        // pending attention request or unanswered question goes inert with
+        // the row): recompute-and-compare (§6.5 step 0).
+        self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
+        Ok(json!({ "success": true, "retiredAt": now }))
+    }
+
+    /// `agent.restore` (wire-only; PROTOCOL §5.5): clear `retired_at`,
+    /// returning the session to normal service. Restoring a non-retired
+    /// session is a documented no-op (`{ success: true, restored: false }`)
+    /// — idempotent-friendly for double-clicks/replays. Emits
+    /// `agent:restored` with `{ agentId, agentName }` when a mark was
+    /// actually cleared.
+    pub(crate) async fn agent_restore_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session.workspace_id != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        if session.retired_at.is_none() {
+            return Ok(json!({ "success": true, "restored": false }));
+        }
+        let now = now_iso();
+        self.store
+            .set_agent_session_retired_at(&session.workspace_id, &agent_id, None, &now)
+            .await?;
+        self.invalidate_agent_list_cache(&session.workspace_id);
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            intent_store::NewEvent {
+                workspace_id: session.workspace_id.clone(),
+                timestamp: now,
+                event_type: intent_core::events::AGENT_RESTORED.to_string(),
+                actor: crate::system_actor(),
+                session_id: Some(agent_id.0.clone()),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: json!({ "agentId": agent_id.0, "agentName": session.name }),
+            },
+        )
+        .await;
+        self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
+        Ok(json!({ "success": true, "restored": true }))
     }
 
     /// `agent.getSession` (PROTOCOL §5.5). Full [`AgentSession`] projection —
@@ -4640,8 +4777,17 @@ impl Services {
     /// (auto-queue / phantom watch). Only `NotFound` maps to `InvalidParams`;
     /// internal store failures propagate unchanged — mirrors the
     /// `app_agents_wait_op` target-validation loop.
+    ///
+    /// Soft-retire inertness: a RETIRED session (`retired_at` set) is rejected
+    /// with a clear "agent is retired" `-32602`. Every caller of this helper
+    /// is a mutation/interaction path (sends, queueing, watches, wakes, queue
+    /// migration targets, turn starts via the manager), and none of them may
+    /// touch a retired session — reads that must still serve retired rows
+    /// (`agent.get`, `agent.getSession`, conversation reads) do not come
+    /// through here.
     pub(crate) async fn require_agent_session(&self, agent_id: &AgentId) -> Result<AgentSession> {
-        self.store
+        let session = self
+            .store
             .get_agent_session(agent_id)
             .await
             .map_err(|e| match e {
@@ -4649,7 +4795,14 @@ impl Services {
                     Error::InvalidParams(format!("unknown agent id: {}", agent_id.0))
                 }
                 other => other,
-            })
+            })?;
+        if session.retired_at.is_some() {
+            return Err(Error::InvalidParams(format!(
+                "agent {} is retired; restore it with agent.restore before interacting",
+                agent_id.0
+            )));
+        }
+        Ok(session)
     }
 
     /// Validate the reference arm of an `imageBlocks` array against the
@@ -9513,8 +9666,11 @@ impl Services {
         for candidate in assigned.iter().rev().cloned() {
             if scan.live_session.is_some() {
                 match self.store.get_agent_session(&candidate).await {
+                    // Retired sessions are never GC'd (the poisoned path
+                    // hard-deletes) — leave them untouched here.
                     Ok(session)
-                        if session.status != AgentStatus::Deleted
+                        if session.retired_at.is_none()
+                            && session.status != AgentStatus::Deleted
                             && self.session_poisoned(&session) =>
                     {
                         scan.poisoned.push(candidate.clone());
@@ -9526,6 +9682,17 @@ impl Services {
                 continue;
             }
             match self.store.get_agent_session(&candidate).await {
+                // Soft-retired: inert — never resumable and never GC'd (the
+                // poisoned path below hard-deletes, which must not touch a
+                // retired session). Treated like a stale assignment (cleaned
+                // up) while still serving as the specialist/model
+                // inheritance source, mirroring the Deleted case.
+                Ok(session) if session.retired_at.is_some() => {
+                    if scan.inheritance_source.is_none() {
+                        scan.inheritance_source = Some(session);
+                    }
+                    scan.cleaned_up.push(candidate);
+                }
                 Ok(session)
                     if session.status != AgentStatus::Deleted
                         && !self.session_poisoned(&session) =>

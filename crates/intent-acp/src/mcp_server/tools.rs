@@ -237,6 +237,7 @@ API:
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
+  ws.agent.retire(reason?) → { ok, agentId, retired, retiredAt, reason? }  // Soft-retire YOUR OWN agent session — TERMINAL for you: the call marks you retired immediately (emits `agent:retired`) and nothing after it runs, so say goodbye / hand off first (report to your parent or coordinator, update your task note). Your conversation history is preserved and stays searchable, but you become inert: excluded from agent lists, unable to receive messages or start turns. Only the user can undo this (`agent.restore`). Self-retire only: no target parameter, other agents can never be retired this way. The optional `reason` rides the event and the daemon log.
 
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -465,6 +466,7 @@ API:
   ws.agent.reportToParent(report) → { ok, ... }  // Send a concise report on completed or progressing work to the parent agent — if you are blocked or need input, use `ws.agent.reportBlocker`/`ws.agent.requestDiscussion` instead. Only works for delegated agents; user-created agents will get an error.
   ws.agent.requestDiscussion(reason) → { ok, kind, reason, savedAt }  // Raise a pending attention request when you need user/coordinator input to proceed — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `discussion_needed`.
   ws.agent.reportBlocker(reason) → { ok, kind, reason, savedAt }  // Report an infrastructure/environment problem you cannot resolve (broken sandbox, failing environment, missing credentials) — call it BEFORE ending your turn. `reason` is required. Available to every agent; if you have a linked task it moves to `blocked`.
+  ws.agent.retire(reason?) → { ok, agentId, retired, reason? }  // Delete YOUR OWN agent session — TERMINAL: the call ends you immediately (no undo grace window; emits `agent:deleted`), so say goodbye / hand off first (report to your parent or coordinator, update your task note) — nothing after the call runs. Self-retire only: no target parameter, other agents can never be deleted this way. The optional `reason` is recorded in the daemon log.
 
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
@@ -571,10 +573,11 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
 
 /// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
 /// Namespace-level prefixes end with `.`; method-level prefixes (the
-/// `attentionRequests` pair) name one full method each. Shared by the
-/// description assembler below, the prelude assembler in [`super::bindings`],
-/// and the dispatch deny in [`super::bindings`] (via [`denied_feature`]), so
-/// the three layers cannot drift.
+/// `attentionRequests` pair, the `peerAgents` retire entry) name one full
+/// method each. Shared by the description assembler below, the prelude
+/// assembler in [`super::bindings`], and the dispatch deny in
+/// [`super::bindings`] (via [`denied_feature`]), so the three layers cannot
+/// drift.
 fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
     if !features.background_hooks {
@@ -609,6 +612,11 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
         out.push(("ws.pr.monitors", "agentFeatures.prMonitor"));
         out.push(("ws.pr.monitor", "agentFeatures.prMonitor"));
         out.push(("ws.pr.unmonitor", "agentFeatures.prMonitor"));
+    }
+    if !features.peer_agents {
+        // Method-level: `ws.agent.retire` is the only `ws.agent.*` surface
+        // gated by the opt-in peerAgents toggle (default off).
+        out.push(("ws.agent.retire", "agentFeatures.peerAgents"));
     }
     out
 }
@@ -1416,6 +1424,7 @@ mod tests {
                 state_snapshot: false,
                 pr_monitor: false,
                 task_graph: false,
+                peer_agents: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1739,13 +1748,15 @@ mod tests {
 
     // The gated `ws.` doc prefixes paired with the mutator that flips their
     // `[agentFeatures]` toggle off. Namespace-level toggles gate one
-    // `ws.<ns>.` prefix; method-level toggles (attentionRequests) gate one
-    // full method name per prefix.
+    // `ws.<ns>.` prefix; method-level toggles (attentionRequests, peerAgents)
+    // gate one full method name per prefix.
     type FeatureCase = (&'static [&'static str], fn(&mut AgentFeaturesSettings));
 
     // Each toggle mapped to the `ws.` doc prefixes it prunes and a mutator
     // that flips it off. Iterated by the assembly tests below so a new toggle
-    // cannot ship without joining the sweep.
+    // cannot ship without joining the sweep. Cases mutate from
+    // [`all_gates_open`], not the defaults — `peerAgents` defaults off, so
+    // the defaults are not the fully-open baseline.
     fn feature_cases() -> Vec<FeatureCase> {
         vec![
             (&["ws.hook."], |f| f.background_hooks = false),
@@ -1762,13 +1773,17 @@ mod tests {
                 &["ws.pr.monitors", "ws.pr.monitor", "ws.pr.unmonitor"],
                 |f| f.pr_monitor = false,
             ),
+            (&["ws.agent.retire"], |f| f.peer_agents = false),
         ]
     }
 
-    // Every gate open: the defaults (all toggles on, `taskGraph` included
-    // since the default flip).
+    // Every gate open: the defaults plus the opt-in `peerAgents` toggle (the
+    // one default-off gate).
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings::default()
+        AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        }
     }
 
     // Hard requirement: with every gate open (the defaults), the assembled
@@ -1910,10 +1925,10 @@ mod tests {
     #[test]
     fn disabling_one_feature_prunes_only_its_lines() {
         for is_chief in [false, true] {
-            let full = workspace_api_description(is_chief, &AgentFeaturesSettings::default());
+            let full = workspace_api_description(is_chief, &all_gates_open());
             let full_methods = extract_ws_methods(&full);
             for (prefixes, disable) in feature_cases() {
-                let mut features = AgentFeaturesSettings::default();
+                let mut features = all_gates_open();
                 disable(&mut features);
                 let pruned = workspace_api_description(is_chief, &features);
                 for prefix in prefixes {
@@ -1964,6 +1979,7 @@ mod tests {
             state_snapshot: false,
             pr_monitor: false,
             task_graph: false,
+            peer_agents: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -2170,6 +2186,7 @@ mod tests {
             state_snapshot: false,
             pr_monitor: false,
             task_graph: false,
+            peer_agents: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -2217,12 +2234,24 @@ mod tests {
         // Sibling `ws.agent.*` methods pass even with attentionRequests off.
         assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
         assert_eq!(denied_feature(&all_off, "agent.list"), None);
+        // `peerAgents` gates exactly `agent.retire` — off by DEFAULT (the
+        // one opt-in toggle), so the defaults deny it too.
+        assert_eq!(
+            denied_feature(&all_off, "agent.retire"),
+            Some("agentFeatures.peerAgents")
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "agent.retire"),
+            Some("agentFeatures.peerAgents")
+        );
+        assert_eq!(denied_feature(&all_gates_open(), "agent.retire"), None);
         // Method-level entries match exactly: a longer method sharing the
         // gated method as a prefix is not over-denied.
         assert_eq!(
             denied_feature(&all_off, "agent.requestDiscussionHistory"),
             None
         );
+        assert_eq!(denied_feature(&all_off, "agent.retireOthers"), None);
         // Enabled toggles never deny.
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),

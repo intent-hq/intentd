@@ -19244,6 +19244,17 @@ impl WorkspaceApi for Services {
                 return Err(Error::Internal(format!("Note {note_id} is not a task")));
             };
             let agent = AgentId::from(agent_id.as_str());
+            // Soft-retire inertness: an affirmatively-retired session can
+            // never work the task — reject before any note mutation. Lookup
+            // failures fall through (assignment has never required the
+            // session to exist yet).
+            if let Ok(session) = services.store.get_agent_session_summary(&agent).await {
+                if session.retired_at.is_some() {
+                    return Err(Error::InvalidParams(format!(
+                        "agent {agent} is retired; restore it with agent.restore before assigning"
+                    )));
+                }
+            }
             let already_assigned = task.assigned_agent_ids.contains(&agent);
             let should_update_status = task.status == TaskStatus::NotStarted;
             if already_assigned && !should_update_status {
@@ -22096,6 +22107,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_list_op(workspace_id).await })
     }
 
+    fn agent_list_including_retired(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        Box::pin(async move { self.agent_list_including_retired_op(workspace_id).await })
+    }
+
     fn agent_list_active(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_list_active_op().await })
     }
@@ -22797,6 +22815,23 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.agent_delete_op(agent_id, workspace_id).await })
+    }
+
+    fn agent_retire(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_retire_op(agent_id, workspace_id, reason).await })
+    }
+
+    fn agent_restore(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_restore_op(agent_id, workspace_id).await })
     }
 
     fn agent_schedule_delete(

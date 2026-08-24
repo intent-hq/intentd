@@ -24,7 +24,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features";
+    harness_features, retired_at";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt` and `image_blocks` are intentionally omitted:
@@ -36,7 +36,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     initial_message, context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features";
+    effort_levels, harness_version, harness_features, retired_at";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
@@ -415,7 +415,7 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 39-column `agent_session` insert value list onto `query`, in
+/// Bind the full 40-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -464,7 +464,8 @@ fn bind_session_insert<'q>(
         .bind(effort_levels_to_db(s.effort_levels.as_ref())?)
         .bind(i64::from(task_graph_enabled))
         .bind(&s.harness_version)
-        .bind(json_col_to_db(s.harness_features.as_ref())?))
+        .bind(json_col_to_db(s.harness_features.as_ref())?)
+        .bind(&s.retired_at))
 }
 
 impl Store {
@@ -491,7 +492,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?
             .execute(self.write_pool())
@@ -557,7 +558,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -876,6 +877,32 @@ impl Store {
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list agent session summaries failed: {e}")))?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
+    /// [`Store::list_agent_session_summaries`] restricted to ACTIVE (not
+    /// soft-retired) sessions — the default `agent.list` read. The filter
+    /// runs in SQL (`retired_at IS NULL`), keeping the handler cost
+    /// O(rows returned) per the RPC cost contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_active_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
+             WHERE workspace_id = ? AND retired_at IS NULL ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("list active agent session summaries failed: {e}"))
+            })?;
         rows.iter().map(map_session_summary_row).collect()
     }
 
@@ -1818,6 +1845,57 @@ impl Store {
         Ok(())
     }
 
+    /// Read `agent_session.retired_at` alone — the cheap inertness probe for
+    /// paths that must not start a turn on a retired session (queue drain,
+    /// retry) without hydrating a whole session row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_retired_at(&self, id: &AgentId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT retired_at FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session retired_at failed: {e}")))?
+            .ok_or_else(|| Error::NotFound(format!("agent session {id}")))?;
+        Ok(row.get::<Option<String>, _>("retired_at"))
+    }
+
+    /// Set or clear `agent_session.retired_at` (soft retire / restore).
+    /// `Some(ts)` marks the session retired at `ts`; `None` restores it to
+    /// active. `updated_at` is refreshed to the same instant so the FE card
+    /// timestamp reflects the transition. Scoped to `workspace_id`
+    /// (defense-in-depth guard — matches `refresh_agent_session_timestamp`).
+    /// `NotFound` if the session is absent or the workspace does not match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_session_retired_at(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        retired_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET retired_at=?, updated_at=? WHERE id=? AND workspace_id=?",
+        )
+        .bind(retired_at)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session retired_at failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Clear `completion_report` + `completion_report_timestamp` when a new turn
     /// begins for a delegated agent that previously called `report_to_parent`.
     /// Returns `true` if a report was present and cleared, `false` if no report
@@ -2325,6 +2403,7 @@ fn map_session_row_with_heavy_cols(
         // Derived on emit by the service layer (monorepo#940); never persisted.
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: col(row, "retired_at")?,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -3564,6 +3643,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -3684,6 +3764,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -3845,6 +3926,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -5409,6 +5491,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store
             .insert_agent_session(&session)
@@ -5585,6 +5668,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -5875,6 +5959,7 @@ mod tests {
                 stop_reason_timestamp: None,
                 session_corrupted: false,
                 pending_delete_at: None,
+                retired_at: None,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -9342,6 +9427,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),

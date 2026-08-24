@@ -1159,6 +1159,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -1206,6 +1207,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -1267,6 +1269,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -1358,6 +1361,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .unwrap();
@@ -3897,6 +3901,7 @@ async fn seed_agent_with_task_graph(
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     mgr.services
         .store
@@ -7722,6 +7727,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 
@@ -8117,6 +8123,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     mgr.services
         .store

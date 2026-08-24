@@ -1380,6 +1380,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             f64::from(intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS),
         ),
         number(
+            "agents.maxTopLevelAgents",
+            "Max top-level agents",
+            "Cap on live top-level (parentless) agents per workspace, enforced on the peer-spawn path (ws.agent.spawnPeer) as the runaway-spawn guard; user-created agents are never blocked by it (minimum 1; no unlimited value)",
+            "agents",
+            Some(1.0),
+            None,
+            f64::from(intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS),
+        ),
+        number(
             "agents.idleReapMinutes",
             "Idle reap minutes",
             "Minutes before an idle agent is reaped (0 disables idle reaping)",
@@ -1510,6 +1519,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Teach agents the task-graph workflow (batch delegate, dependsOn/conflictsWith, @@@task fence attributes, unblocked-wake hints); docs/prompt only, APIs always work; applies to new sessions only",
             "agentFeatures",
             true,
+        ),
+        boolean(
+            "agentFeatures.peerAgents",
+            "Peer agents",
+            "Expose independent peer-agent spawning and self-retire (ws.agent.spawnPeer / ws.agent.retire) to agents; applies to new sessions only",
+            "agentFeatures",
+            false,
         ),
         number(
             "prMonitor.debounceSeconds",
@@ -2658,6 +2674,37 @@ mod tests {
         );
     }
 
+    /// `agents.maxTopLevelAgents` is a TOML-backed bounded number (minimum 1,
+    /// no unlimited value, default 20) registered in `KNOWN_PATHS`, and its
+    /// catalog default matches the schema default so the FE never shows a
+    /// default the daemon does not use.
+    #[test]
+    fn max_top_level_agents_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.maxTopLevelAgents")
+            .expect("agents.maxTopLevelAgents missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(1.0),
+                max: None
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(20.0)));
+        assert_eq!(intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS, 20);
+        assert_eq!(
+            SettingsFile::default().agents.max_top_level_agents,
+            intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.maxTopLevelAgents"));
+        def.validate(&json!(1))
+            .expect("the minimum itself is legal");
+        def.validate(&json!(0))
+            .expect_err("0 must be rejected — there is no unlimited value");
+    }
+
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
     /// (0 = unlimited, max 100k, default 256) registered in `KNOWN_PATHS`, and
     /// its description states the restart requirement (the limiter is built
@@ -3004,9 +3051,10 @@ mod tests {
     }
 
     /// The `agentFeatures.*` toggles are TOML-backed booleans — all default
-    /// `true`: each has a catalog entry in the `agentFeatures` category and a
-    /// `KNOWN_PATHS` entry, and each round-trips through the registry-wired
-    /// service (default origin → file override → reset).
+    /// `true` except `peerAgents` (opt-in, default `false`): each has a
+    /// catalog entry in the `agentFeatures` category and a `KNOWN_PATHS`
+    /// entry, and each round-trips through the registry-wired service
+    /// (default origin → file override → reset).
     #[tokio::test]
     async fn agent_features_toggles_round_trip_via_registry() {
         let paths = [
@@ -3021,6 +3069,7 @@ mod tests {
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
+            ("agentFeatures.peerAgents", false),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

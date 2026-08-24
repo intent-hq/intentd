@@ -5585,6 +5585,22 @@ impl AgentManager {
                 return;
             }
         }
+        // Soft-retire gate: a retired session is inert — nothing may start a
+        // turn on it. Queued entries stay parked; `agent.restore` returns the
+        // session to service (a later queue kick drains them). Fail open on a
+        // lookup error, matching the archived-workspace gate above.
+        if let Ok(Some(_)) = self
+            .services
+            .store
+            .get_agent_session_retired_at(&agent_id)
+            .await
+        {
+            tracing::debug!(
+                agent = %agent_id,
+                "skipping queue drain: session is retired (awaiting agent.restore)"
+            );
+            return;
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
@@ -6617,6 +6633,15 @@ impl AgentManager {
     ) -> Result<Value> {
         // Fetch current session status
         let session = self.services.store.get_agent_session(&agent_id).await?;
+
+        // Soft-retire inertness: a retired session must not be redriven —
+        // `agent.restore` is the deliberate return-to-service path.
+        if session.retired_at.is_some() {
+            return Err(Error::InvalidParams(format!(
+                "agent {} is retired; restore it with agent.restore before retrying",
+                agent_id.0
+            )));
+        }
 
         // Only allow retry when the session status is `error`
         if session.status != AgentStatus::Error {
@@ -10909,6 +10934,7 @@ mod role_reminder_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -13691,6 +13717,7 @@ mod agent_retry_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 

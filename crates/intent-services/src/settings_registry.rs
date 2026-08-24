@@ -96,6 +96,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "logging.level",
     "agents.maxConcurrent",
     "agents.maxConcurrentAdapters",
+    "agents.maxTopLevelAgents",
     "agents.memoryBudgetMb",
     "agents.idleReapMinutes",
     "agents.flushQueuedMessages",
@@ -114,6 +115,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
     "agentFeatures.taskGraph",
+    "agentFeatures.peerAgents",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
 ];

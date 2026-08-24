@@ -33,6 +33,12 @@ pub const DEFAULT_MAX_CONCURRENT_ADAPTERS: u32 = 6;
 /// this bound replaced (~610 MB × 64 ≈ 39 GB is already a bad day).
 pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 
+/// Default cap on live top-level (depth-0) agents in a workspace
+/// (`agents.maxTopLevelAgents`), enforced on the peer-spawn path
+/// (`ws.agent.spawnPeer`) as a runaway-spawn guard; user-created agents are
+/// never blocked by it. Minimum 1 — there is no unlimited value.
+pub const DEFAULT_MAX_TOP_LEVEL_AGENTS: u32 = 20;
+
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h
 /// (3 days) so dev/release databases do not grow unboundedly; set to `0` to opt

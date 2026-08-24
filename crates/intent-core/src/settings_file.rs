@@ -36,11 +36,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
-    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
-    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
-    MAX_CONCURRENT_ADAPTERS_LIMIT,
+    DEFAULT_MAX_TOP_LEVEL_AGENTS, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT, MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -662,6 +662,11 @@ pub struct AgentsSettings {
     /// agent slot, so removing the ceiling is exactly the failure being
     /// fixed (monorepo#2062).
     pub max_concurrent_adapters: u32,
+    /// `agents.maxTopLevelAgents` — cap on live top-level (parentless)
+    /// agents per workspace, enforced on the peer-spawn path
+    /// (`ws.agent.spawnPeer`) as the runaway-spawn guard; user/FE-created
+    /// agents are never blocked by it (minimum 1; no unlimited value).
+    pub max_top_level_agents: u32,
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
@@ -685,6 +690,7 @@ impl Default for AgentsSettings {
             max_concurrent: 0,
             memory_budget_mb: None,
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
+            max_top_level_agents: DEFAULT_MAX_TOP_LEVEL_AGENTS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
@@ -821,8 +827,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on**; changes apply to new agent
-/// sessions only.
+/// (`agentFeatures.*`). All default **on** except `peerAgents` (opt-in);
+/// changes apply to new agent sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[allow(clippy::struct_excessive_bools)]
@@ -873,6 +879,10 @@ pub struct AgentFeaturesSettings {
     /// Defaults **on** like the other toggles (originally opt-in —
     /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
+    /// `agentFeatures.peerAgents` — expose peer-agent spawning
+    /// (`ws.agent.spawnPeer`) to agents. Defaults **off** (opt-in), unlike
+    /// the other toggles.
+    pub peer_agents: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -889,6 +899,7 @@ impl Default for AgentFeaturesSettings {
             state_snapshot: true,
             pr_monitor: true,
             task_graph: true,
+            peer_agents: false,
         }
     }
 }
@@ -1152,6 +1163,15 @@ impl SettingsFile {
             return Err(bad(
                 "agents.maxConcurrentAdapters",
                 &format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
+            ));
+        }
+        // Minimum 1, no unlimited value: the cap is the runaway-spawn guard,
+        // so a hand-edited config.toml cannot disable it.
+        let top_level = self.agents.max_top_level_agents;
+        if top_level < 1 {
+            return Err(bad(
+                "agents.maxTopLevelAgents",
+                &format!("must be at least 1, got {top_level}"),
             ));
         }
         let chars = self.workspace_api.max_output_chars;
@@ -1457,6 +1477,10 @@ maxConcurrent = 0
 # peaks at its own size). The over-limit caller has spawned nothing, so its
 # retry is always safe.
 maxConcurrentAdapters = 6
+# Max top-level agents -- cap on live top-level (parentless) agents per
+# workspace, enforced on the peer-spawn path as the runaway-spawn guard;
+# user-created agents are never blocked by it (minimum 1; no unlimited value).
+maxTopLevelAgents = 20
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping). The main lever on resident memory: every agent touched inside the
 # window keeps its whole subtree alive (~0.66 GB each when idle), so a seat
@@ -1626,6 +1650,7 @@ mod tests {
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
         assert_eq!(d.agents.max_concurrent, 0);
+        assert_eq!(d.agents.max_top_level_agents, DEFAULT_MAX_TOP_LEVEL_AGENTS);
         assert_eq!(d.agents.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
         assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
@@ -1650,6 +1675,7 @@ mod tests {
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
+        assert!(!d.agent_features.peer_agents);
         assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
         assert_eq!(
             d.wake_resume.threshold_seconds,
@@ -1687,6 +1713,8 @@ mod tests {
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
         assert!(parsed.agent_features.task_graph);
+        // peerAgents is the one default-off toggle.
+        assert!(!parsed.agent_features.peer_agents);
     }
 
     #[test]
@@ -1837,6 +1865,10 @@ mod tests {
             ("[server]\nport = 80\n", "server.port"),
             ("[server.wsApi]\nport = 80\n", "server.wsApi.port"),
             ("[agents]\nmaxConcurrent = 500\n", "agents.maxConcurrent"),
+            (
+                "[agents]\nmaxTopLevelAgents = 0\n",
+                "agents.maxTopLevelAgents",
+            ),
             (
                 "[workspaceApi]\nmaxOutputChars = 500\n",
                 "workspaceApi.maxOutputChars",
