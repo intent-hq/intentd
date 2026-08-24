@@ -378,12 +378,12 @@ async fn send(
 }
 
 /// `ws.agent.sendToTask`. Same single-pending-message guard as [`send`],
-/// and the same top-level `delivery` outcome on success
-/// ([`delivery_outcome`] — the op nests its flags under `result`).
 /// applied against the task's assigned agent (resolution failures fall
 /// through so the unguarded call surfaces its existing error/`ok: false`
-/// shapes — e.g. "No agent assigned to task"). The guard's target
-/// resolution (`task.assigned_agents.first()`) deliberately mirrors
+/// shapes — e.g. "No agent assigned to task"), and the same top-level
+/// `delivery` outcome on success ([`delivery_outcome`] — the op nests its
+/// flags under `result`). The guard's target resolution
+/// (`task.assigned_agents.first()`) deliberately mirrors
 /// `agent_send_to_task_op` in `intent-services` — if the op's resolution
 /// ever changes, this site must change with it or the guard checks the
 /// wrong agent.
@@ -930,11 +930,20 @@ async fn pending_send_refusal(
 /// Classify a successful send result into the top-level `delivery` outcome:
 /// `"held"` (parked behind the target's pending Q&A, `heldForQuestions`),
 /// `"queued"` (target busy / non-interrupt send, `queued: true`), or
-/// `"delivered"` (persisted and driving a turn now). `sendToTask` nests the
-/// underlying send flags under `result`, so that envelope is consulted when
-/// the flags are not top-level. Returns `None` for non-success shapes (e.g.
+/// `"delivered"` (driving a turn now). `sendToTask` nests the underlying
+/// send flags under `result`, so that envelope is consulted when the flags
+/// are not top-level. Returns `None` for non-success shapes (e.g.
 /// sendToTask's `ok: false` "No agent assigned to task") — those keep their
 /// existing fields with no `delivery` claim.
+///
+/// `queued: false` alone is NOT proof a turn is being driven: the
+/// no-`AgentManager` store-only fallback (`agent_send_message_op`) returns
+/// `{ success: true, queued: false, messageId }` after only persisting the
+/// row. Every turn-driving success from `AgentManager` carries a `turnId`
+/// (and the interrupt dedup shape — the duplicate of a delivery that
+/// already ran — is flagged `deduplicated: true`), so `"delivered"` is
+/// claimed only on those markers; a persist-only success gets no `delivery`
+/// claim rather than a false "delivered".
 fn delivery_outcome(obj: &serde_json::Map<String, Value>) -> Option<&'static str> {
     let ok = obj.get("ok").and_then(Value::as_bool).unwrap_or(false)
         || obj.get("success").and_then(Value::as_bool).unwrap_or(false);
@@ -950,8 +959,10 @@ fn delivery_outcome(obj: &serde_json::Map<String, Value>) -> Option<&'static str
         Some("held")
     } else if flag("queued") {
         Some("queued")
-    } else {
+    } else if flags.get("turnId").is_some() || flag("deduplicated") {
         Some("delivered")
+    } else {
+        None
     }
 }
 
@@ -1207,9 +1218,12 @@ mod tests {
 
     #[test]
     fn delivery_outcome_classifies_send_shapes() {
-        // Plain `send`: flags top-level (post-merge_ok `ok: true`).
+        // Plain `send`: flags top-level (post-merge_ok `ok: true`). A
+        // turn-driving delivery carries `turnId`.
         assert_eq!(
-            outcome(&json!({ "ok": true, "success": true, "queued": false })),
+            outcome(&json!({
+                "ok": true, "success": true, "queued": false, "turnId": "t-1"
+            })),
             Some("delivered")
         );
         assert_eq!(
@@ -1224,7 +1238,15 @@ mod tests {
         );
         // Pre-merge `success: true` alone still classifies.
         assert_eq!(
-            outcome(&json!({ "success": true, "queued": false })),
+            outcome(&json!({ "success": true, "queued": false, "turnId": "t-2" })),
+            Some("delivered")
+        );
+        // The interrupt dedup shape (no turn spawned — the original
+        // delivery already ran) still reads as delivered.
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "success": true, "queued": false, "deduplicated": true
+            })),
             Some("delivered")
         );
     }
@@ -1234,7 +1256,7 @@ mod tests {
         assert_eq!(
             outcome(&json!({
                 "ok": true, "agentId": "a-1",
-                "result": { "success": true, "queued": false }
+                "result": { "success": true, "queued": false, "turnId": "t-1" }
             })),
             Some("delivered")
         );
@@ -1261,5 +1283,22 @@ mod tests {
             None
         );
         assert_eq!(outcome(&json!({ "ok": false, "refused": true })), None);
+    }
+
+    /// The store-only fallback's persist-only success (`queued: false`, no
+    /// `turnId`) drives no turn — it must NOT claim `"delivered"`.
+    #[test]
+    fn delivery_outcome_makes_no_claim_for_persist_only_success() {
+        assert_eq!(
+            outcome(&json!({ "ok": true, "success": true, "queued": false, "messageId": "m-1" })),
+            None
+        );
+        assert_eq!(
+            outcome(&json!({
+                "ok": true, "agentId": "a-1",
+                "result": { "success": true, "queued": false, "messageId": "m-1" }
+            })),
+            None
+        );
     }
 }

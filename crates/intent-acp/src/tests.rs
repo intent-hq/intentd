@@ -8341,7 +8341,9 @@ mod wsapi4_bindings_tests {
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| json!({ "success": true, "queued": false }));
+                .unwrap_or_else(
+                    || json!({ "success": true, "queued": false, "turnId": "turn-fake-1" }),
+                );
             Box::pin(async move { Ok(result) })
         }
 
@@ -8361,9 +8363,13 @@ mod wsapi4_bindings_tests {
             ));
             let result = self.agent_send_to_task_result.lock().unwrap().clone();
             Box::pin(async move {
-                Ok(result.unwrap_or_else(
-                    || json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }),
-                ))
+                Ok(result.unwrap_or_else(|| {
+                    json!({
+                        "ok": true,
+                        "agentId": "agent-assignee",
+                        "result": { "success": true, "queued": false, "turnId": "turn-fake-1" },
+                    })
+                }))
             })
         }
 
@@ -8716,8 +8722,8 @@ mod wsapi4_bindings_tests {
         assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
     }
 
-    /// Self-describing success: a delivered-now send carries the top-level
-    /// `delivery: "delivered"` outcome.
+    /// Self-describing success: a delivered-now send (turn-driving, carries
+    /// `turnId`) reports the top-level `delivery: "delivered"` outcome.
     #[tokio::test]
     async fn agent_send_delivered_shape_carries_delivery_field() {
         let (srv, _api) = server();
@@ -8726,6 +8732,24 @@ mod wsapi4_bindings_tests {
         let v = body(&resp);
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["delivery"], json!("delivered"));
+    }
+
+    /// The store-only fallback's persist-only success (`queued: false`, no
+    /// `turnId`) drives no turn — the binding makes no `delivery` claim
+    /// rather than reporting a false "delivered".
+    #[tokio::test]
+    async fn agent_send_persist_only_shape_makes_no_delivery_claim() {
+        let (srv, api) = server();
+        *api.agent_send_result.lock().unwrap() = Some(json!({
+            "success": true,
+            "queued": false,
+            "messageId": "m-1",
+        }));
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert!(v.get("delivery").is_none(), "{v}");
     }
 
     /// Self-describing success: a queued-because-busy send is explicit —
