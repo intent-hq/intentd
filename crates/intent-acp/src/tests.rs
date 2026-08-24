@@ -3059,7 +3059,7 @@ mod tool_restriction_tests {
 
     #[test]
     fn working_agents_deny_only_subagents() {
-        for ty in ["task-loop", "ralph-loop", "chat"] {
+        for ty in ["task-loop", "chat"] {
             let deny = get_tool_denylist_for_agent_type(ty);
             assert_eq!(deny, SUBAGENT_TOOLS.to_vec(), "{ty}");
         }
@@ -3086,9 +3086,9 @@ mod tool_restriction_tests {
                 "{ty} should not be background"
             );
         }
-        // The list is the closed set of seven names — fix it here so any
+        // The list is the closed set of six names — fix it here so any
         // accidental addition/removal trips a test.
-        assert_eq!(background_agent_types().len(), 7);
+        assert_eq!(background_agent_types().len(), 6);
     }
 
     #[test]
@@ -3170,7 +3170,7 @@ mod tool_registry_tests {
         // Pure-text background agents (commit-message, pr-description,
         // code-review, code-walkthrough) deny the unified `workspace_api`
         // surface, so their available set is empty. The other background
-        // types (task-loop / ralph-loop / chat) only deny auggie subagent
+        // types (task-loop / chat) only deny auggie subagent
         // tools that are intentionally absent from this registry.
         for ty in [
             "commit-message",
@@ -3193,10 +3193,10 @@ mod tool_registry_tests {
 
     #[test]
     fn working_agent_types_keep_the_workspace_api_tool() {
-        // task-loop / ralph-loop / chat only deny auggie subagent tools that
+        // task-loop / chat only deny auggie subagent tools that
         // are not in the workspace-MCP registry, so `workspace_api` stays
         // available.
-        for ty in ["task-loop", "ralph-loop", "chat"] {
+        for ty in ["task-loop", "chat"] {
             let srv = WorkspaceMcpServer::for_agent_type(
                 super::mcp_tests::mock_api(),
                 intent_core::WorkspaceId::from_string("ws-1"),
@@ -3213,11 +3213,11 @@ mod tool_registry_tests {
                 "{ty} must keep workspace_api as the sole registered tool, got {names:?}"
             );
         }
-        // Sanity: background_agent_types() enumerates exactly these seven types
-        // (4 pure-text + 3 working), keeping the two branches of this pair test
+        // Sanity: background_agent_types() enumerates exactly these six types
+        // (4 pure-text + 2 working), keeping the two branches of this pair test
         // exhaustive over the predicate.
         let bg: Vec<&str> = background_agent_types().to_vec();
-        assert_eq!(bg.len(), 7);
+        assert_eq!(bg.len(), 6);
     }
 }
 

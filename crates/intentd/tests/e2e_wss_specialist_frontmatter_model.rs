@@ -358,7 +358,7 @@ async fn specialist_hidden_round_trips_over_wss() {
 }
 
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
-/// bundled-dir override, `specialist.list` over WSS returns exactly the eight
+/// bundled-dir override, `specialist.list` over WSS returns exactly the seven
 /// embedded reference specialists — `pr-shepherd` is gone from the bundled set
 /// (review thread `PRRT_kwDOS9Wxuc6YSV2u`).
 #[tokio::test]
@@ -403,12 +403,11 @@ async fn embedded_bundled_catalog_over_wss() {
             "developer",
             "implementor",
             "pr-reviewer",
-            "ralph",
             "spec-writer",
             "ui-designer",
             "verifier",
         ],
-        "bundled catalog over WSS is exactly the eight embedded ids (no pr-shepherd)"
+        "bundled catalog over WSS is exactly the seven embedded ids (no pr-shepherd)"
     );
     for spec in specs {
         assert_eq!(spec["source"], "bundled", "{}: embedded tier", spec["id"]);

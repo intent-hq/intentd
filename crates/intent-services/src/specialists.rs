@@ -54,10 +54,6 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
         include_str!("../resources/specialists/v1/pr-reviewer.md"),
     ),
     (
-        "ralph",
-        include_str!("../resources/specialists/v1/ralph.md"),
-    ),
-    (
         "spec-writer",
         include_str!("../resources/specialists/v1/spec-writer.md"),
     ),
@@ -1166,20 +1162,20 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_captures_optional_scalars() {
-        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\n---\n\nYou loop.";
         let (fm, body) = parse_frontmatter(content);
         assert_eq!(fm.get("codingAgent").unwrap(), "claude");
         assert_eq!(fm.get("model").unwrap(), "opus4.5");
         // Retired keys are stripped on parse (RETIRED_FRONTMATTER_KEYS).
         assert!(fm.get("modelTier").is_none());
         assert_eq!(fm.get("roleReminder").unwrap(), "Never stop early");
-        assert_eq!(fm.get("agentType").unwrap(), "ralph-loop");
+        assert_eq!(fm.get("agentType").unwrap(), "task-loop");
         assert_eq!(body, "You loop.");
     }
 
     #[test]
     fn build_def_emits_wire_fields() {
-        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\n---\n\nYou loop.";
         let def = build_def("ralph", content, "user", Path::new("/tmp/ralph.md"));
         assert_eq!(def["id"], "ralph");
         assert_eq!(def["name"], "Ralph");
@@ -1189,7 +1185,7 @@ mod tests {
         // A retired `modelTier:` frontmatter line is never echoed on the wire.
         assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
-        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.");
         assert_eq!(def["behaviorPrompt"], "You loop.");
         assert_eq!(def["source"], "user");
@@ -1218,7 +1214,7 @@ mod tests {
             "model": "opus4.5",
             "modelTier": "smart",
             "roleReminder": "Never stop early",
-            "agentType": "ralph-loop",
+            "agentType": "task-loop",
             "prompt": "You loop.\nForever."
         });
         let rendered = render_file("ralph", &spec);
@@ -1229,7 +1225,7 @@ mod tests {
         assert_eq!(def["model"], "opus4.5");
         assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
-        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
         assert_eq!(def["behaviorPrompt"], "You loop.\nForever.");
     }
@@ -1572,22 +1568,21 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    /// The eight reference specialist ids embedded via `include_str!` (PP-2).
-    const EMBEDDED_IDS: [&str; 8] = [
+    /// The seven reference specialist ids embedded via `include_str!` (PP-2).
+    const EMBEDDED_IDS: [&str; 7] = [
         "spec-writer",
         "implementor",
         "verifier",
         "developer",
         "chief-of-staff",
-        "ralph",
         "ui-designer",
         "pr-reviewer",
     ];
 
     #[test]
-    fn embedded_bundled_resolves_all_eight_with_zero_local_files() {
+    fn embedded_bundled_resolves_all_seven_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
-        // get()/list()/resolve_agent_type()/resolve_role_reminder().
+        // get()/list()/resolve_role_reminder().
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
         for id in EMBEDDED_IDS {
@@ -1615,12 +1610,8 @@ mod tests {
                 assert!(spec.get("hidden").is_none(), "{}: not hidden", spec["id"]);
             }
         }
-        // Frontmatter-driven resolution works too: ralph declares an agentType,
-        // implementor an explicit roleReminder.
-        assert_eq!(
-            svc.resolve_agent_type("ralph", None).as_deref(),
-            Some("ralph-loop")
-        );
+        // Frontmatter-driven resolution works too: implementor declares an
+        // explicit roleReminder.
         let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
         assert_eq!(name, "Implementor");
         assert!(reminder.starts_with("Stay within task scope."));
@@ -1955,20 +1946,20 @@ mod tests {
     }
 
     #[test]
-    fn user_override_of_embedded_inherits_scalars_at_spawn() {
-        // The embedded floor participates in the fold: a user ralph.md that
-        // omits agentType keeps the embedded value at spawn time.
+    fn user_file_can_define_task_loop_agent_type() {
+        // An explicit user-file agentType continues to resolve through the
+        // generic specialist infrastructure.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
             "ralph",
-            "---\nname: \"Custom Ralph\"\ndescription: \"d\"\n---\n\nCustom body",
+            "---\nname: \"Custom Ralph\"\ndescription: \"d\"\nagentType: \"task-loop\"\n---\n\nCustom body",
         );
         let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
         assert_eq!(
             svc.resolve_agent_type("ralph", None).as_deref(),
-            Some("ralph-loop"),
-            "agentType inherited from the embedded floor"
+            Some("task-loop"),
+            "explicit user-file agentType resolves"
         );
         let got = svc.get("ralph", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");

@@ -361,7 +361,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
     // Seed a bundled specialist whose frontmatter carries every optional scalar
     // plus the optional `hidden` boolean and a retired `modelTier` line.
-    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\nhidden: true\n---\n\nYou loop.";
+    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\nhidden: true\n---\n\nYou loop.";
     std::fs::write(h.bundled_dir.join("ralph.md"), body).unwrap();
 
     let (read, mut w) = connect_retry(&h.socket).await.into_split();
@@ -384,7 +384,7 @@ async fn specialist_full_frontmatter_wire_parity() {
         "retired modelTier is never echoed"
     );
     assert_eq!(s["roleReminder"], "Never stop early");
-    assert_eq!(s["agentType"], "ralph-loop");
+    assert_eq!(s["agentType"], "task-loop");
     assert_eq!(s["prompt"], "You loop.");
     assert_eq!(
         s["behaviorPrompt"], "You loop.",
@@ -397,7 +397,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     let list = ok(&mut w, &mut r, 2, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().unwrap();
     let ralph = specs.iter().find(|s| s["id"] == "ralph").unwrap();
-    assert_eq!(ralph["agentType"], "ralph-loop");
+    assert_eq!(ralph["agentType"], "task-loop");
     assert_eq!(ralph["roleReminder"], "Never stop early");
     assert_eq!(ralph["isCustomized"], false);
     assert_eq!(ralph["hidden"], true, "hidden surfaces in list");
@@ -414,12 +414,12 @@ async fn specialist_full_frontmatter_wire_parity() {
             "id": "ralph2", "name": "Ralph II",
             "description": "Loops again", "codingAgent": "claude",
             "model": "opus4.5", "modelTier": "smart",
-            "roleReminder": "Keep going", "agentType": "ralph-loop",
+            "roleReminder": "Keep going", "agentType": "task-loop",
             "hidden": true,
             "behaviorPrompt": "Loop body." } }),
     )
     .await;
-    assert_eq!(created["specialist"]["agentType"], "ralph-loop");
+    assert_eq!(created["specialist"]["agentType"], "task-loop");
     assert_eq!(created["specialist"]["isCustomized"], true);
     assert_eq!(created["specialist"]["prompt"], "Loop body.");
     assert_eq!(created["specialist"]["behaviorPrompt"], "Loop body.");
@@ -442,7 +442,7 @@ async fn specialist_full_frontmatter_wire_parity() {
         "retired modelTier is dropped on create"
     );
     assert_eq!(s["roleReminder"], "Keep going");
-    assert_eq!(s["agentType"], "ralph-loop");
+    assert_eq!(s["agentType"], "task-loop");
     assert_eq!(s["prompt"], "Loop body.");
     assert_eq!(s["behaviorPrompt"], "Loop body.");
     assert_eq!(s["isCustomized"], true);

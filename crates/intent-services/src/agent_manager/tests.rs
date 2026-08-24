@@ -7732,23 +7732,20 @@ async fn derive_agent_type_uses_specialist_agent_type_and_engages_denylist() {
     let dir = TempSpecialistsDir::new();
     dir.write(
         "ralph",
-        "---\nname: \"Ralph\"\ndescription: \"Loops\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.",
+        "---\nname: \"Ralph\"\ndescription: \"Loops\"\nagentType: \"task-loop\"\n---\n\nYou loop.",
     );
     let (_tmp, services) = services_with_specialists(&dir).await;
 
     let session = session_with_specialist(Some("ralph"));
     let agent_type = derive_agent_type(&services, &session, None);
-    assert_eq!(agent_type, "ralph-loop");
+    assert_eq!(agent_type, "task-loop");
 
-    // The derived type drives the §18.4 denylist: ralph-loop denies the
+    // The derived type drives the §18.4 denylist: task-loop denies the
     // sub-agent orchestration tools (but not the full text-only denylist).
     let denylist = get_tool_denylist_for_agent_type(&agent_type);
-    assert!(!denylist.is_empty(), "ralph-loop engages a denylist");
+    assert!(!denylist.is_empty(), "task-loop engages a denylist");
     for tool in SUBAGENT_TOOLS {
-        assert!(
-            denylist.contains(tool),
-            "ralph-loop denylist removes {tool}"
-        );
+        assert!(denylist.contains(tool), "task-loop denylist removes {tool}");
     }
 }
 

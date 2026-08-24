@@ -46,7 +46,6 @@ const TASK_BREAKDOWN: &str = instr!("v1", "task-breakdown");
 const TASK_DEBUG: &str = instr!("v1", "task-debug");
 const TASK_FOCUSED: &str = instr!("v1", "task-focused");
 const TASK_LOOP: &str = instr!("v1", "task-loop");
-const RALPH_LOOP: &str = instr!("v1", "ralph-loop");
 const WORKSPACE_AGENT: &str = instr!("v1", "workspace-agent");
 const NOTES_SYSTEM_GUIDE: &str = instr!("v1", "notes-system-guide");
 const CODE_REVIEW: &str = instr!("v1", "code-review");
@@ -78,7 +77,6 @@ pub(crate) struct InstructionSet {
     pub task_debug: &'static str,
     pub task_focused: &'static str,
     pub task_loop: &'static str,
-    pub ralph_loop: &'static str,
     pub workspace_agent: &'static str,
     pub notes_system_guide: &'static str,
     pub code_review: &'static str,
@@ -100,7 +98,6 @@ pub(crate) static V1: InstructionSet = InstructionSet {
     task_debug: TASK_DEBUG,
     task_focused: TASK_FOCUSED,
     task_loop: TASK_LOOP,
-    ralph_loop: RALPH_LOOP,
     workspace_agent: WORKSPACE_AGENT,
     notes_system_guide: NOTES_SYSTEM_GUIDE,
     code_review: CODE_REVIEW,
@@ -146,7 +143,6 @@ fn get_instruction_by_id(
         "task-debug" => set.task_debug,
         "task-focused" => set.task_focused,
         "task-loop" => set.task_loop,
-        "ralph-loop" => set.ralph_loop,
         "workspace-agent" => set.workspace_agent,
         "notes-system-guide" => set.notes_system_guide,
         "code-review" | "review" => set.code_review,
