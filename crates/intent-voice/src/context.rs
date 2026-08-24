@@ -18,8 +18,10 @@ pub(crate) const OPENAI_STYLE_HINT: &str = "Technical dictation in a software-en
 /// `ElevenLabs` Scribe v2 keyterm cap (batch API allows up to 100 terms).
 pub(crate) const MAX_KEYTERMS: usize = 100;
 
-/// `ElevenLabs` Scribe v2 per-keyterm length cap.
-pub(crate) const MAX_KEYTERM_CHARS: usize = 50;
+/// `ElevenLabs` Scribe v2 per-keyterm length cap (inclusive). The API
+/// requires each keyterm to be *less than* 50 characters, so the longest
+/// accepted term is 49 chars.
+pub(crate) const MAX_KEYTERM_CHARS: usize = 49;
 
 /// `ElevenLabs` Scribe v2 per-keyterm word cap.
 pub(crate) const MAX_KEYTERM_WORDS: usize = 5;
@@ -134,6 +136,14 @@ mod tests {
         let merged = merge_keyterms(&[], &["  ".to_string(), long.clone()]);
         assert!(!merged.iter().any(|t| t == &long));
         assert!(!merged.iter().any(|t| t.trim().is_empty()));
+    }
+
+    #[test]
+    fn keeps_49_char_terms_and_drops_50_char_terms() {
+        let ok = "a".repeat(49);
+        let too_long = "b".repeat(50);
+        let merged = merge_keyterms(&[], &[ok.clone(), too_long]);
+        assert_eq!(merged, vec![ok], "ElevenLabs requires terms < 50 chars");
     }
 
     #[test]
