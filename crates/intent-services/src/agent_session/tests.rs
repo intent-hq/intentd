@@ -10,8 +10,8 @@ use std::time::Duration;
 use intent_acp::session::{ContentBlock, InitializeResponse};
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Event, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Event, NoteCreate, Workspace, WorkspaceActivity,
+    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -22,6 +22,46 @@ use tokio::time::timeout;
 
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
+
+/// Captures only the content-free stream lifecycle target so ordering tests do
+/// not depend on the daemon's formatting layer.
+#[derive(Clone, Default)]
+struct LifecycleCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl LifecycleCapture {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl tracing::Subscriber for LifecycleCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "intent_services::stream_lifecycle"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
 
 struct TempDb {
     path: PathBuf,
@@ -3208,6 +3248,8 @@ async fn post_output_transport_death_keeps_terminal_events() {
     .to_string();
     let (conn, mut note_rx, _agent) = connect_dying(vec![chunk]);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let capture = LifecycleCapture::default();
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
 
     let err = services
         .run_prompt_turn(
@@ -3217,7 +3259,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
-            None,
+            Some("turn-terminal-order-1"),
         )
         .await
         .expect_err("transport death fails the turn");
@@ -3254,6 +3296,207 @@ async fn post_output_transport_death_keeps_terminal_events() {
         .await
         .unwrap();
     assert_eq!(messages.len(), 1, "partial output persisted");
+
+    let message_id = &messages[0].id;
+    let expected_correlation = crate::agent_session::opaque_stream_ref(message_id);
+    let lifecycle = capture.lines();
+    assert_eq!(
+        lifecycle.len(),
+        5,
+        "one bounded record per reached terminal stage: {lifecycle:?}"
+    );
+    for (line, stage) in lifecycle.iter().skip(1).zip([
+        "assistant_persisted",
+        "terminal_failure",
+        "agent_stream_end",
+        "agent_failed",
+    ]) {
+        assert!(line.contains(&format!("stage=\"{stage}\"")), "{line}");
+        assert!(
+            line.contains(&format!("turnCorrelation={expected_correlation}")),
+            "{line}"
+        );
+        assert!(line.contains("block_count=1"), "{line}");
+        assert!(
+            !line.contains("turn-terminal-order-1"),
+            "raw turn id: {line}"
+        );
+        assert!(!line.contains("agent-1"), "raw agent id: {line}");
+        assert!(!line.contains(message_id), "raw message id: {line}");
+        assert!(!line.contains("partial"), "transcript content: {line}");
+    }
+    assert!(lifecycle[0].contains("stage=\"correlation_mapping\""));
+    assert!(lifecycle[0].contains("correlationBasis=\"mapping\""));
+}
+
+/// A real clean `end_turn` at the truncation-redrive cap must fall through to
+/// terminal stream:end + idle, with the bounded diagnostic naming cap
+/// exhaustion rather than another redrive.
+#[tokio::test]
+async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
+    let _env = EnvGuard::set_all(&[("INTENTD_SILENT_TAIL_SUSPECT_MS", "0")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+
+    let note = services
+        .create_note(
+            workspace_id.clone(),
+            NoteCreate {
+                title: "In-flight work".into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create task note")
+        .note;
+    WorkspaceApi::mark_as_task(
+        &services,
+        workspace_id.clone(),
+        note.id.clone(),
+        "in_progress".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("mark task in progress");
+    let mut session = bus.store().get_agent_session(&agent_id).await.unwrap();
+    session.parent_agent_id = Some(AgentId::from("parent-agent"));
+    session.task_note_id = Some(note.id);
+    bus.store()
+        .update_agent_session(&workspace_id, &session)
+        .await
+        .expect("make delegated agent eligible");
+    for expected in 1..=crate::agent_session::MAX_CONSECUTIVE_TRUNCATION_REDRIVES {
+        assert_eq!(services.bump_truncation_redrives(&agent_id), expected);
+    }
+
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(Vec::new(), json!({ "stopReason": "end_turn" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let capture = LifecycleCapture::default();
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-cap-exhausted"),
+        )
+        .await
+        .expect("clean capped turn completes");
+
+    let mut events = Vec::new();
+    while !events
+        .iter()
+        .any(|event: &Event| event.event_type == "agent:idle")
+    {
+        events.extend(
+            timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("idle timed out")
+                .expect("subscription open"),
+        );
+    }
+    let idle = events
+        .iter()
+        .find(|event| event.event_type == "agent:idle")
+        .expect("cap exhaustion emits idle");
+    assert_eq!(idle.data["suspectedTruncated"], json!(true));
+    assert!(!services.take_truncation_redrive(&agent_id));
+
+    let lifecycle = capture.lines();
+    assert_eq!(
+        lifecycle.len(),
+        3,
+        "mapping + stream:end + idle: {lifecycle:?}"
+    );
+    assert!(lifecycle[1].contains("stage=\"agent_stream_end\""));
+    assert!(lifecycle[2].contains("stage=\"agent_idle\""));
+    assert!(
+        lifecycle
+            .iter()
+            .skip(1)
+            .all(|line| line.contains("outcome=\"truncation_cap_exhausted\"")),
+        "cap outcome is explicit: {lifecycle:?}"
+    );
+}
+
+#[tokio::test]
+async fn harness_wake_logs_persist_end_and_idle_with_one_private_correlation() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (_tx, mut notifications) = mpsc::unbounded_channel();
+    let capture = LifecycleCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let outcome = services
+        .run_harness_wake_turn(
+            &mut notifications,
+            message_note("private wake response"),
+            &agent_id,
+            &workspace_id,
+            Duration::ZERO,
+        )
+        .await;
+    services
+        .publish_harness_wake_idle(
+            &agent_id,
+            &workspace_id,
+            &outcome.lifecycle,
+            outcome.empty_response,
+        )
+        .await;
+
+    let expected = crate::agent_session::opaque_stream_ref(&outcome.lifecycle.correlation_id);
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 3, "persist + stream:end + idle: {lines:?}");
+    for (line, stage) in lines
+        .iter()
+        .zip(["assistant_persisted", "agent_stream_end", "agent_idle"])
+    {
+        assert!(line.contains(&format!("stage=\"{stage}\"")), "{line}");
+        assert!(
+            line.contains(&format!("turnCorrelation={expected}")),
+            "{line}"
+        );
+        assert!(line.contains("block_count=1"), "{line}");
+        assert!(
+            !line.contains(&outcome.lifecycle.correlation_id),
+            "raw message id: {line}"
+        );
+        assert!(!line.contains("private wake response"), "content: {line}");
+    }
+}
+
+#[test]
+fn turn_mapping_joins_idle_timeout_cap_records_without_raw_ids() {
+    let capture = LifecycleCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    crate::agent_session::trace_stream_correlation_mapping(
+        "assistant-message-fixture",
+        Some("wire-turn-fixture"),
+    );
+    crate::agent_manager::trace_idle_timeout_cap(Some("wire-turn-fixture"));
+    let lines = capture.lines();
+    assert_eq!(
+        lines.len(),
+        3,
+        "mapping + terminal failure + failed: {lines:?}"
+    );
+    assert!(lines[0].contains("correlationBasis=\"mapping\""));
+    assert!(lines[1].contains("correlationBasis=\"turn_only\""));
+    assert!(lines[1].contains("stage=\"terminal_failure\""));
+    assert!(lines[2].contains("stage=\"agent_failed\""));
+    assert!(!lines.join(" ").contains("assistant-message-fixture"));
+    assert!(!lines.join(" ").contains("wire-turn-fixture"));
 }
 
 /// Mock agent whose `session/prompt` streams `updates`, then resolves with a
@@ -4011,6 +4254,8 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     let (conn, mut note_rx, _agent) =
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let capture = LifecycleCapture::default();
+    let _capture_guard = tracing::subscriber::set_default(capture.clone());
 
     let err = services
         .run_prompt_turn(
@@ -4047,6 +4292,31 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
         .expect("interrupted terminal stream:end emitted");
     assert_eq!(end.data["stopReason"], json!("interrupted"));
     assert_eq!(end.data["interruptReason"], json!("system_suspend"));
+
+    let message_id = end.data["messageId"]
+        .as_str()
+        .expect("interrupted partial persisted");
+    let expected = crate::agent_session::opaque_stream_ref(message_id);
+    let lifecycle = capture.lines();
+    assert_eq!(
+        lifecycle.len(),
+        2,
+        "persist + interrupted stream:end: {lifecycle:?}"
+    );
+    for (line, stage) in lifecycle
+        .iter()
+        .zip(["assistant_persisted", "agent_stream_end"])
+    {
+        assert!(line.contains(&format!("stage=\"{stage}\"")), "{line}");
+        assert!(
+            line.contains(&format!("turnCorrelation={expected}")),
+            "{line}"
+        );
+        assert!(line.contains("block_count=1"), "{line}");
+        assert!(line.contains("outcome=\"interrupted\""), "{line}");
+        assert!(!line.contains(message_id), "raw message id: {line}");
+        assert!(!line.contains("partial"), "content: {line}");
+    }
 
     // The partial turn persisted, tagged with the interrupt reason.
     let messages = bus

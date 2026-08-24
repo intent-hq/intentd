@@ -88,17 +88,35 @@ fn registry_field_parity() {
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
     assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
     assert_eq!(cc.fallback_npx_package, None);
-    // Claude Code truncates MCP tool descriptions at ~2k chars
-    // (anthropics/claude-code#53933): it gets the compact `workspace_api`
-    // description + system-prompt API reference. Every other provider keeps
-    // the full tool description byte-identical to before.
-    assert!(cc.truncates_tool_descriptions);
-    for p in ACP_PROVIDERS.iter().filter(|p| p.id != "claude-code") {
-        assert!(
-            !p.truncates_tool_descriptions,
-            "{} must keep the full workspace_api tool description",
+    // Providers whose client truncates, defers, or hides long MCP tool
+    // descriptions get the compact `workspace_api` description +
+    // system-prompt API reference: claude-code cuts at ~2k chars
+    // (anthropics/claude-code#53933), grok's `search_tool` truncates at
+    // 2,048 chars (MCP tools never appear in the tool list), and droid's
+    // remote Statsig `mcp_tool_search` flag gates 200-char deferred summaries
+    // (defensive). Cortex also defers ALL MCP tools to a names-only reminder,
+    // but it has no MCP delivery channel yet, so flagging it is deferred to
+    // intent-hq/monorepo#3303. Evidence per entry lives in config.rs. Every
+    // other provider keeps the full tool description byte-identical to before.
+    let flagged = ["claude-code", "droid", "grok"];
+    for p in ACP_PROVIDERS {
+        assert_eq!(
+            p.truncates_tool_descriptions,
+            flagged.contains(&p.id),
+            "{} truncates_tool_descriptions out of sync with the audited set",
             p.id
         );
+        // The full ws.* reference rides the assembled system prompt, so a
+        // flagged provider must have a prompt-delivery channel.
+        if p.truncates_tool_descriptions {
+            assert_ne!(
+                p.injection_mechanism,
+                InjectionMechanism::None,
+                "{} is flagged but has no system-prompt injection channel \
+                 to carry the full workspace_api reference",
+                p.id
+            );
+        }
     }
 
     let codex = find_provider("codex").unwrap();

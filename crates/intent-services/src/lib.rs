@@ -1179,7 +1179,26 @@ impl Services {
 
     /// Build a [`SpecialistsService`](specialists::SpecialistsService) view over
     /// the configured directory roots for one `specialist.*` call.
+    ///
+    /// The effective `specialists.dir` setting (the `INTENTD_SPECIALISTS_DIR`
+    /// startup pin, else a file-written `[specialists] dir`) wholesale-replaces
+    /// the base tier. An explicitly injected bundled root (test wiring via
+    /// [`Self::with_specialist_dirs`]) wins over the setting so hermetic
+    /// 3-tier coverage is unaffected.
     fn specialists_service(&self) -> specialists::SpecialistsService {
+        if self.specialists_bundled_dir.is_none() {
+            if let Some(dir) = self
+                .effective_settings()
+                .specialists
+                .dir
+                .filter(|d| !d.is_empty())
+            {
+                return specialists::SpecialistsService::with_base_replacement(
+                    self.specialists_user_dir.clone(),
+                    PathBuf::from(dir),
+                );
+            }
+        }
         specialists::SpecialistsService::new(
             self.specialists_user_dir.clone(),
             self.specialists_bundled_dir.clone(),
@@ -11219,7 +11238,20 @@ impl Services {
                         }
                     }
                     "server.bindAddress" => {
-                        if let Some(addr) = change.get("value").and_then(|v| v.as_str()) {
+                        // String or array of strings (monorepo#3314); render
+                        // one comma-joined form for the log lines.
+                        let addr = match change.get("value") {
+                            Some(serde_json::Value::String(s)) => Some(s.clone()),
+                            Some(serde_json::Value::Array(items)) => Some(
+                                items
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(addr) = addr {
                             // Check if listener is running
                             if control.ws_listener_port().await.is_some() {
                                 // Listener is running: restart it on the new
@@ -13535,6 +13567,36 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Attachment-reference validation (PROTOCOL §5.5,
+                    // monorepo#3338), hoisted BEFORE any state change so a
+                    // bad `initialAgent.imageBlocks` reference rejects
+                    // `-32602` without leaving a partially created workspace
+                    // (row/metadata/event/spec note) behind. Same harvest as
+                    // `agent_create_op` (top-level param wins over the
+                    // `metadata.imageBlocks` copy); the create op re-runs
+                    // the same checks harmlessly.
+                    if let Some(agent) = input.initial_agent.as_ref() {
+                        let effective_image_blocks = agent
+                            .image_blocks
+                            .clone()
+                            .or_else(|| {
+                                agent
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("imageBlocks").cloned())
+                            })
+                            .filter(|v| !v.is_null());
+                        crate::agent_ops::validate_image_blocks(
+                            "workspace.create",
+                            effective_image_blocks.as_ref(),
+                        )?;
+                        services
+                            .validate_image_block_refs(
+                                "workspace.create",
+                                effective_image_blocks.as_ref(),
+                            )
+                            .await?;
+                    }
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and
@@ -22285,6 +22347,11 @@ impl WorkspaceApi for Services {
             // runtime-manager path below never reaches
             // `agent_send_message_op`'s check.
             crate::agent_ops::validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
+            crate::agent_ops::validate_image_blocks("agent.sendMessage", image_blocks.as_ref())?;
+            // Image references must name registered attachments
+            // (monorepo#3338) — rejected before any state change.
+            self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
+                .await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
@@ -22432,6 +22499,12 @@ impl WorkspaceApi for Services {
                 "agent.editAndRegenerate",
                 file_blocks.as_ref(),
             )?;
+            crate::agent_ops::validate_image_blocks(
+                "agent.editAndRegenerate",
+                image_blocks.as_ref(),
+            )?;
+            self.validate_image_block_refs("agent.editAndRegenerate", image_blocks.as_ref())
+                .await?;
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,

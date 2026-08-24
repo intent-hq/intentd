@@ -966,6 +966,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
         out.toTask = await ws.agent.sendToTask('{}', 'task: status update please');
         out.removed = await ws.agent.removeQueuedMessage(target, out.first.queuedMessage.id);
         out.resend = await ws.agent.send(target, 'combined: review diff AND check tests');
+        out.replace = await ws.agent.send(target, 'replacement: final combined ask', {{ replacePending: true }});
         return out;
         ",
         target_id.0, task_note.id.0
@@ -1063,6 +1064,10 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(out["first"]["ok"], true, "{out}");
     assert_eq!(out["first"]["queued"], true, "{out}");
     assert_eq!(out["first"]["heldForQuestions"], true, "{out}");
+    assert_eq!(
+        out["first"]["delivery"], "held",
+        "held-for-questions park is self-describing: {out}"
+    );
     let first_id = out["first"]["queuedMessage"]["id"]
         .as_str()
         .expect("first parked entry id");
@@ -1071,6 +1076,11 @@ async fn agent_bindings_send_single_pending_message_guard() {
     // target's full queue in drain order with 200-char truncation.
     let second = &out["second"];
     assert_eq!(second["ok"], false, "{out}");
+    assert_eq!(second["refused"], true, "refusal discriminator: {out}");
+    assert!(
+        second.get("delivery").is_none(),
+        "a refused send makes no delivery claim: {second}"
+    );
     assert_eq!(second["agentId"], target_id.0, "{out}");
     assert_eq!(second["pendingMessageId"], first_id, "{out}");
     assert!(
@@ -1078,11 +1088,32 @@ async fn agent_bindings_send_single_pending_message_guard() {
         "refusal names the pending entry: {second}"
     );
     assert!(
+        second["error"]
+            .as_str()
+            .unwrap()
+            .contains("only one pending message per target"),
+        "refusal error names the rule: {second}"
+    );
+    assert!(
+        second["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("replacePending"),
+        "refusal instruction recommends the atomic replace: {second}"
+    );
+    assert!(
         second["instruction"]
             .as_str()
             .unwrap()
             .contains("removeQueuedMessage"),
-        "refusal instructs retract-and-resend: {second}"
+        "refusal instruction keeps the manual fallback: {second}"
+    );
+    assert!(
+        second["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("NOT atomic"),
+        "refusal instruction warns manual remove + re-send is not atomic: {second}"
     );
     assert_eq!(second["queueLength"], 2, "{out}");
     let echo = second["queue"].as_array().expect("queue echo");
@@ -1107,12 +1138,14 @@ async fn agent_bindings_send_single_pending_message_guard() {
     // interrupts get no exemption from the single-pending-message guard.
     let interrupt = &out["interrupt"];
     assert_eq!(interrupt["ok"], false, "{out}");
+    assert_eq!(interrupt["refused"], true, "{out}");
     assert_eq!(interrupt["agentId"], target_id.0, "{out}");
     assert_eq!(interrupt["pendingMessageId"], first_id, "{out}");
 
     // sendToTask against the same target: same refusal, tagged with the task.
     let to_task = &out["toTask"];
     assert_eq!(to_task["ok"], false, "{out}");
+    assert_eq!(to_task["refused"], true, "{out}");
     assert_eq!(to_task["agentId"], target_id.0, "{out}");
     assert_eq!(to_task["taskNoteId"], task_note.id.0, "{out}");
     assert_eq!(to_task["pendingMessageId"], first_id, "{out}");
@@ -1121,10 +1154,27 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(out["removed"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["ok"], true, "{out}");
     assert_eq!(out["resend"]["queued"], true, "{out}");
+    assert_eq!(out["resend"]["delivery"], "held", "{out}");
+    let resend_id = out["resend"]["queuedMessage"]["id"]
+        .as_str()
+        .expect("resend parked entry id");
+
+    // Atomic replace: `replacePending: true` parks the replacement and then
+    // retracts the caller's pending entry (the re-send) in one call —
+    // send-first, so a failed send would leave the entry intact — reporting
+    // the retracted id.
+    let replace = &out["replace"];
+    assert_eq!(replace["ok"], true, "{out}");
+    assert_eq!(replace["replaced"], true, "{out}");
+    assert_eq!(replace["replacedMessageId"], resend_id, "{out}");
+    assert!(replace.get("refused").is_none(), "{replace}");
+    assert_eq!(replace["queued"], true, "{out}");
+    assert_eq!(replace["delivery"], "held", "{out}");
 
     // Backend state: foreign entry untouched, caller's queue slot holds ONLY
-    // the combined re-send (the refused sends never parked). The re-send is
-    // default-interrupt, so it parks ahead of the foreign normal entry.
+    // the replacement (the refused sends never parked; the combined re-send
+    // was atomically retracted). The replacement is default-interrupt, so it
+    // parks ahead of the foreign normal entry.
     let remaining = services
         .agent_get_queue(target_id.clone(), Some(ws.clone()))
         .await
@@ -1141,8 +1191,8 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .map(|e| e["content"].as_str().unwrap())
         .collect();
     assert!(
-        contents[0].starts_with("combined:"),
-        "only the re-send parked: {contents:?}"
+        contents[0].starts_with("replacement:"),
+        "only the atomic replacement parked: {contents:?}"
     );
 
     manager.shutdown().await;

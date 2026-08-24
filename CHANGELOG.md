@@ -2,6 +2,85 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.54] - 2026-08-24
+
+### 🚀 Features
+
+- Add privacy-safe stream lifecycle telemetry ([#1352](https://github.com/intent-hq/intentd/pull/1352))
+
+
+## [0.7.53] - 2026-08-24
+
+### 📚 Documentation
+
+- Teach agents inline workspace image embedding in chat ([#1448](https://github.com/intent-hq/intentd/pull/1448))
+
+
+## [0.7.52] - 2026-08-24
+
+### 🚀 Features
+
+- *(acp)* Self-describing send outcomes for naive senders ([#1439](https://github.com/intent-hq/intentd/pull/1439))
+- *(acp)* Atomic replacePending option on ws.agent.send / sendToTask
+- *(agents)* Accept image-reference blocks ({type:'image', attachmentId}) in sendMessage/create ([#1446](https://github.com/intent-hq/intentd/pull/1446))
+
+### 🐛 Bug Fixes
+
+- *(services)* Surface zero-started batch delegate with summary, warning, and after_all advisory wake ([#1442](https://github.com/intent-hq/intentd/pull/1442))
+
+### 📚 Documentation
+
+- *(acp)* Clarify A2A send outcome shapes and single-pending-message rule ([#1440](https://github.com/intent-hq/intentd/pull/1440))
+
+### ⚡ Performance
+
+- *(git)* O(diff) hard reset in CoW checkout provisioning ([#1447](https://github.com/intent-hq/intentd/pull/1447))
+
+### 🧪 Testing
+
+- *(intent-git)* Isolate auth config-read tests from host gitconfig ([#1443](https://github.com/intent-hq/intentd/pull/1443))
+
+
+## [0.7.51] - 2026-08-24
+
+### 🐛 Bug Fixes
+
+- *(sourcecontrol)* Robust gh discovery + enriched no-token error ([#1438](https://github.com/intent-hq/intentd/pull/1438))
+
+
+## [0.7.50] - 2026-08-24
+
+### 🚀 Features
+
+- Specialist replacement directory at startup ([#1435](https://github.com/intent-hq/intentd/pull/1435))
+
+
+## [0.7.49] - 2026-08-24
+
+### 🚀 Features
+
+- Multi-select endpoint picker for intentd pair + --select-endpoints ([#1433](https://github.com/intent-hq/intentd/pull/1433))
+
+### 🐛 Bug Fixes
+
+- *(voice)* Sanitize keyterms sent to ElevenLabs ([#1434](https://github.com/intent-hq/intentd/pull/1434))
+
+
+## [0.7.48] - 2026-08-24
+
+### 🚀 Features
+
+- Support a list of IPs for server.bindAddress ([#1431](https://github.com/intent-hq/intentd/pull/1431))
+
+
+## [0.7.47] - 2026-08-23
+
+### 🚀 Features
+
+- *(providers)* Flag grok and droid as truncating tool descriptions ([#1429](https://github.com/intent-hq/intentd/pull/1429))
+- Always run startup resume sweep on update-triggered restarts ([#1428](https://github.com/intent-hq/intentd/pull/1428))
+
+
 ## [0.7.46] - 2026-08-23
 
 ### 🐛 Bug Fixes

@@ -1526,15 +1526,78 @@ pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) ->
     Ok(())
 }
 
+/// Validate an FE-supplied `imageBlocks` array (PROTOCOL §5.5,
+/// monorepo#3338): every entry must carry EXACTLY one of inline `data`
+/// (base64 payload) or an attachment-registry `attachmentId` reference.
+/// Both-or-neither is `Error::InvalidParams` (→ `-32602`) naming the
+/// offending index. A non-array payload and non-object entries are tolerated
+/// (skipped downstream like every other malformed attachment entry) so
+/// legacy callers keep their fail-soft behavior — mirrors
+/// [`validate_file_blocks`].
+pub(crate) fn validate_image_blocks(method: &str, image_blocks: Option<&Value>) -> Result<()> {
+    let Some(imgs) = image_blocks.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, img) in imgs.iter().enumerate() {
+        let Some(obj) = img.as_object() else {
+            continue;
+        };
+        let has_data = obj.get("data").and_then(Value::as_str).is_some();
+        let has_ref = obj
+            .get("attachmentId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_data == has_ref {
+            return Err(Error::InvalidParams(format!(
+                "{method}: imageBlocks[{i}] must carry exactly one of `data` or `attachmentId`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Byte cap for attachment-registry image references resolved into a turn
+/// (monorepo#3338). 30 MiB of raw bytes base64-encode to exactly 40 MiB —
+/// the transport's inbound frame cap that already bounds INLINE image
+/// blocks — so a reference can never carry a larger image than the inline
+/// arm could.
+pub(crate) const IMAGE_REF_MAX_BYTES: u64 = 30 * 1024 * 1024;
+
+/// The non-blank `attachmentId` values of reference-arm image entries
+/// (entries WITHOUT inline `data`) — the same either-or reading as
+/// [`validate_image_blocks`] / [`user_message_blocks`]: inline `data` wins,
+/// and a blank reference counts as absent.
+pub(crate) fn image_block_ref_ids(image_blocks: Option<&Value>) -> Vec<String> {
+    image_blocks
+        .and_then(Value::as_array)
+        .map(|imgs| {
+            imgs.iter()
+                .filter_map(|img| {
+                    let obj = img.as_object()?;
+                    if obj.get("data").and_then(Value::as_str).is_some() {
+                        return None;
+                    }
+                    obj.get("attachmentId")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The persisted content-block array for a user message: one `text` block
 /// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
 /// attachments must reach the transcript so the conversation view can render
-/// them). Image entries require `data` + `mimeType` and file entries require
-/// `fileName` plus EITHER inline `data` + `mimeType` OR an
-/// attachment-registry `attachmentId` reference (PROTOCOL §5.5) — the same
-/// attachment contract prompt assembly (`append_attachment_blocks`) enforces;
-/// malformed entries are silently skipped so a partial attachment array never
-/// breaks the persist.
+/// them). Image entries require EITHER inline `data` + `mimeType` OR an
+/// attachment-registry `attachmentId` reference (monorepo#3338) and file
+/// entries require `fileName` plus the same either-or (PROTOCOL §5.5) — the
+/// same attachment contract prompt assembly (`append_attachment_blocks`)
+/// enforces; malformed entries are silently skipped so a partial attachment
+/// array never breaks the persist. Reference blocks persist AS references —
+/// the bytes never ride the transcript row, keeping `agent.getConversation`
+/// payloads constant-size.
 pub(crate) fn user_message_blocks(
     content: &str,
     image_blocks: Option<&Value>,
@@ -1545,6 +1608,23 @@ pub(crate) fn user_message_blocks(
         for img in imgs {
             let data = img.get("data").and_then(Value::as_str);
             let mime = img.get("mimeType").and_then(Value::as_str);
+            // Same non-blank filter as `validate_image_blocks` and prompt
+            // assembly — a whitespace attachmentId must not shadow inline
+            // data into a dangling blank reference.
+            let attachment_id = img
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if data.is_none() {
+                if let Some(id) = attachment_id {
+                    let mut block = json!({ "type": "image", "attachmentId": id });
+                    if let Some(mime) = mime {
+                        block["mimeType"] = json!(mime);
+                    }
+                    blocks.push(block);
+                    continue;
+                }
+            }
             if let (Some(data), Some(mime)) = (data, mime) {
                 blocks.push(json!({ "type": "image", "data": data, "mimeType": mime }));
             }
@@ -2923,10 +3003,15 @@ impl Services {
         let file_blocks = file_blocks
             .or_else(|| meta_get("fileBlocks"))
             .filter(|v| !v.is_null());
-        // Attachment-reference validation (PROTOCOL §5.5): every file block
-        // must carry exactly one of `data` / `attachmentId`. Runs before any
-        // side effect so a `-32602` rejection persists nothing.
+        // Attachment-reference validation (PROTOCOL §5.5): every file and
+        // image block must carry exactly one of `data` / `attachmentId`, and
+        // image references must name registered attachments in this
+        // workspace (monorepo#3338). Runs before any side effect so a
+        // `-32602` rejection persists nothing.
         validate_file_blocks("agent.create", file_blocks.as_ref())?;
+        validate_image_blocks("agent.create", image_blocks.as_ref())?;
+        self.validate_image_block_refs("agent.create", image_blocks.as_ref())
+            .await?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
@@ -3819,6 +3904,9 @@ impl Services {
                     session.image_blocks = if value.is_null() {
                         None
                     } else {
+                        validate_image_blocks("agent.update", Some(value))?;
+                        self.validate_image_block_refs("agent.update", Some(value))
+                            .await?;
                         Some(value.clone())
                     };
                 }
@@ -4356,10 +4444,13 @@ impl Services {
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
         validate_file_blocks("agent.queueMessage", file_blocks.as_ref())?;
+        validate_image_blocks("agent.queueMessage", image_blocks.as_ref())?;
         // monorepo#568: reject nonexistent targets BEFORE enqueueing — a
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
+        self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
+            .await?;
         let (queued, position) = self.enqueue_message(
             &agent_id,
             content,
@@ -4561,6 +4652,132 @@ impl Services {
             })
     }
 
+    /// Validate the reference arm of an `imageBlocks` array against the
+    /// attachment registry (PROTOCOL §5.5, monorepo#3338): every
+    /// `attachmentId` must name a registered attachment, and the recorded
+    /// sizes must fit [`IMAGE_REF_MAX_BYTES`] **in aggregate** across all
+    /// references in the array (a per-reference cap alone would let a small
+    /// request name many attachments whose resolved bytes expand one ACP
+    /// prompt far past the transport bound the cap mirrors). Rejections are
+    /// `-32602` naming the id, raised at the RPC seam BEFORE any state
+    /// change; inline-data entries are untouched. Callers run the shape
+    /// check ([`validate_image_blocks`]) first. The lookup is registry-wide
+    /// rather than workspace-scoped by design: `workspace.create`'s
+    /// `initialAgent` references attachments placed BEFORE the new workspace
+    /// exists, so they necessarily live in another workspace's registry;
+    /// resolution reads from the record's own workspace root either way.
+    pub(crate) async fn validate_image_block_refs(
+        &self,
+        method: &str,
+        image_blocks: Option<&Value>,
+    ) -> Result<()> {
+        let mut total: u64 = 0;
+        for id in image_block_ref_ids(image_blocks) {
+            let record = self.store.get_attachment(&id).await.map_err(|e| match e {
+                Error::NotFound(_) => {
+                    Error::InvalidParams(format!("{method}: unknown attachment id: {id}"))
+                }
+                other => other,
+            })?;
+            let size = u64::try_from(record.size).unwrap_or(0);
+            if size > IMAGE_REF_MAX_BYTES {
+                return Err(Error::InvalidParams(format!(
+                    "{method}: attachment {id} is {} bytes — exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references",
+                    record.size
+                )));
+            }
+            total = total.saturating_add(size);
+            if total > IMAGE_REF_MAX_BYTES {
+                return Err(Error::InvalidParams(format!(
+                    "{method}: image references total {total} bytes at attachment {id} — exceeds the {IMAGE_REF_MAX_BYTES} byte aggregate cap for image references"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve reference-arm image entries into inline `{ data, mimeType }`
+    /// form for prompt assembly (monorepo#3338): the attachment's bytes are
+    /// read from the record's own canonical workspace root (with the same
+    /// within-root containment guard as `file.getAttachment`) and
+    /// base64-encoded so the ACP receives the image exactly as an inline
+    /// block. MIME resolves block `mimeType` > registry `mime_type` >
+    /// extension inference. Fail-soft by design — ingress already rejected
+    /// bad references, so a row/file that vanished since is skipped with a
+    /// warning rather than breaking the turn (same convention as note-image
+    /// resolution); the same skip re-enforces the [`IMAGE_REF_MAX_BYTES`]
+    /// aggregate cap over the bytes actually read, in case files grew after
+    /// ingress validated the recorded sizes. Inline entries pass through
+    /// untouched; inputs without references return unchanged.
+    pub(crate) async fn resolve_image_block_refs(
+        &self,
+        image_blocks: Option<Value>,
+    ) -> Option<Value> {
+        use base64::Engine as _;
+        if image_block_ref_ids(image_blocks.as_ref()).is_empty() {
+            return image_blocks;
+        }
+        let arr = match image_blocks {
+            Some(Value::Array(arr)) => arr,
+            other => return other,
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        let mut total: u64 = 0;
+        for img in arr {
+            let Some(obj) = img.as_object() else {
+                out.push(img);
+                continue;
+            };
+            let attachment_id = obj
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            let (Some(id), None) = (attachment_id, obj.get("data").and_then(Value::as_str)) else {
+                out.push(img);
+                continue;
+            };
+            let Ok(record) = self.store.get_attachment(id).await else {
+                tracing::warn!(attachment = %id, "image reference: attachment row vanished; skipping");
+                continue;
+            };
+            let root = crate::file_ops::resolve_root(&self.store, &record.workspace_id, None).await;
+            if root.is_empty() {
+                tracing::warn!(attachment = %id, "image reference: attachment workspace has no resolved root; skipping");
+                continue;
+            }
+            let Ok(path) = crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
+            else {
+                tracing::warn!(attachment = %id, "image reference: stored path escapes the workspace; skipping");
+                continue;
+            };
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(attachment = %id, error = %e, "image reference: read failed; skipping");
+                    continue;
+                }
+            };
+            if bytes.len() as u64 > IMAGE_REF_MAX_BYTES {
+                tracing::warn!(attachment = %id, size = bytes.len(), "image reference: over the byte cap; skipping");
+                continue;
+            }
+            if total.saturating_add(bytes.len() as u64) > IMAGE_REF_MAX_BYTES {
+                tracing::warn!(attachment = %id, size = bytes.len(), total, "image reference: over the aggregate byte cap; skipping");
+                continue;
+            }
+            total += bytes.len() as u64;
+            let mime = obj
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| record.mime_type.clone())
+                .unwrap_or_else(|| crate::note_ops::mime_from_extension(&record.file_name));
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            out.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+        }
+        Some(Value::Array(out))
+    }
+
     /// `agent.sendMessage`: persist the user message; on failure auto-queue
     /// (PROTOCOL §5.5). Fails closed on a nonexistent target (monorepo#564).
     pub(crate) async fn agent_send_message_op(
@@ -4580,14 +4797,19 @@ impl Services {
                 )));
             }
         }
-        // Attachment-reference validation (PROTOCOL §5.5): every file block
-        // must carry exactly one of `data` / `attachmentId`, rejected before
-        // any state change.
+        // Attachment-reference validation (PROTOCOL §5.5): every file and
+        // image block must carry exactly one of `data` / `attachmentId`,
+        // rejected before any state change.
         validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
+        validate_image_blocks("agent.sendMessage", image_blocks.as_ref())?;
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
         let session = self.require_agent_session(&agent_id).await?;
+        // Image references must name registered attachments
+        // (monorepo#3338) — rejected before any state change.
+        self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
+            .await?;
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
@@ -6925,9 +7147,14 @@ impl Services {
     /// defaults. No scheduler state is written: held tasks are simply not
     /// started, and re-calling with the same list is idempotent
     /// (running/terminal tasks classify as `skipped`). The result enumerates
-    /// EVERY supplied task with its disposition + reason and projects the
+    /// EVERY supplied task with its disposition + reason, carries a top-level
+    /// `summary` (started/held/skipped/errors counts) plus a top-level
+    /// `warning` when zero tasks started (monorepo#3334), and projects the
     /// unlock plan; the existing group settlement wake is the resume signal —
-    /// the caller re-calls delegate then, which recomputes everything.
+    /// the caller re-calls delegate then, which recomputes everything. A
+    /// zero-started `after_all` call with no open delegation group owes no
+    /// future wake, so it additionally delivers an immediate advisory wake to
+    /// the parent (best-effort) instead of silence.
     async fn agent_delegate_batch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -7236,12 +7463,92 @@ impl Services {
                 .unwrap()
                 .insert("criticalPathMinutes".into(), json!(minutes));
         }
-        Ok(json!({
+        // Top-level disposition summary (monorepo#3334): a lazy `.ok` read
+        // must still surface "started nothing" without parsing the rows.
+        let count_disposition = |d: &str| {
+            rows.iter()
+                .filter(|r| r["disposition"].as_str() == Some(d))
+                .count()
+        };
+        let held_deps = count_disposition("held:blocked-on-deps");
+        let held_conflict = count_disposition("held:conflict");
+        let skipped_count = count_disposition("skipped");
+        let error_count = count_disposition("error");
+        let started_count = started_ids.len();
+        let mut result = json!({
             "ok": true,
             "tasks": rows,
             "startedTaskIds": started_ids,
+            "summary": {
+                "started": started_count,
+                "held": held_count,
+                "skipped": skipped_count,
+                "errors": error_count,
+            },
             "unlockPlan": unlock_plan,
-        }))
+        });
+        if started_count == 0 {
+            // Prominent top-level warning: a zero-started batch is the
+            // silent-stall footgun (monorepo#3334) — name the hold reasons so
+            // even a summary read explains what happened and what to do.
+            let mut reasons: Vec<String> = Vec::new();
+            if held_deps > 0 {
+                reasons.push(format!("{held_deps} held on unmet dependencies"));
+            }
+            if held_conflict > 0 {
+                reasons.push(format!("{held_conflict} held on conflicts"));
+            }
+            if skipped_count > 0 {
+                reasons.push(format!(
+                    "{skipped_count} skipped (already running or complete/cancelled)"
+                ));
+            }
+            if error_count > 0 {
+                reasons.push(format!("{error_count} failed to start"));
+            }
+            let breakdown = if reasons.is_empty() {
+                "nothing was startable".to_string()
+            } else {
+                reasons.join(", ")
+            };
+            let warning = format!(
+                "NO TASKS STARTED — {breakdown}. Nothing starts on its own and no completion wake will arrive from this call; resolve the holds, then re-call agent.delegate."
+            );
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("warning".into(), json!(warning));
+            // A zero-started `after_all` batch owes the caller a future
+            // settlement wake it will never get: no child enrolled, so no
+            // group formed (or extended). Unless an open group from earlier
+            // delegations still guarantees a wake, deliver an immediate
+            // advisory wake so the silence cannot become a permanent stall.
+            // Best-effort: an advisory delivery failure never fails the call.
+            if input.wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                if let Some(parent) = &parent_agent_id {
+                    if !self.has_open_delegation_group(parent) {
+                        let parent_home_ws = self
+                            .store
+                            .get_agent_session(parent)
+                            .await
+                            .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
+                        let advisory = format!(
+                            "Advisory: your batch agent.delegate (waitMode: \"after_all\") started ZERO tasks — {breakdown}. No delegation group was formed, so NO settlement wake will ever arrive from that call. Re-call agent.delegate once the holds clear, or delegate a held task individually to force it."
+                        );
+                        if let Err(e) = self
+                            .deliver_wake_message(&parent_home_ws, parent, &advisory, None)
+                            .await
+                        {
+                            tracing::warn!(
+                                "zero-started batch delegate advisory wake failed for {}: {e}",
+                                parent.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run

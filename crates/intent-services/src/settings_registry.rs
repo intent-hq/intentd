@@ -55,6 +55,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "quickActions.typeOverrides",
     "quickActions.providerSettings",
     "specialists.default",
+    "specialists.dir",
     "workspace.branchPrefix",
     "workspace.worktreesLocation",
     "workspace.sshKeyPath",

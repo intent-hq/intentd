@@ -13,7 +13,12 @@
 //!    on failure fall back to `state.current_version`; nothing installed AND
 //!    check failed → exit non-zero with a clear message
 //! 2. spawn `versions/<current>/intentd` with all forwarded args verbatim,
-//!    inheriting stdio and environment (the sitter injects nothing)
+//!    inheriting stdio and environment. The sitter's one injection:
+//!    respawning a version different from the one that just ran in this
+//!    sitter's lifetime sets [`UPDATE_RESTART_ENV`]`=1` on the child, so
+//!    the daemon can tell an update-triggered restart apart from a first
+//!    spawn, a crash respawn, or a same-version SIGHUP restart (none of
+//!    which set it)
 //! 3. after every check, pick the next check uniformly at random in
 //!    [`SupervisorConfig::check_min`], [`SupervisorConfig::check_max`]) and
 //!    persist it to `state.json`
@@ -91,6 +96,15 @@ use crate::updater::{UpdateError, UpdateOutcome, Updater};
 /// fallback (tests point this at a local fixture server; production never
 /// sets it).
 pub const MANIFEST_BASE_URL_ENV: &str = "INTENTD_SITTER_MANIFEST_BASE_URL";
+
+/// Set to `1` in the child's environment when a respawn is
+/// update-triggered: the version being spawned differs from the one that
+/// just ran in this sitter's lifetime (periodic mid-run install, SIGHUP
+/// after a CLI update, or a fix adopted after a failed start). First
+/// spawns, crash respawns, and same-version SIGHUP restarts never set it.
+/// The daemon reads it to force the startup interrupted-agent resume
+/// sweep after updates.
+pub const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
 
 /// Test-only env overrides (integer milliseconds) for the timing knobs in
 /// [`SupervisorConfig`], so integration tests run at millisecond scale.
@@ -438,11 +452,33 @@ impl Supervisor {
         // Failed starts since the last one that stayed up (see
         // `give_up_after_failures`); reset wherever the backoff resets.
         let mut failures: u32 = 0;
+        // Version of the child that last ran (successfully spawned):
+        // spawning a different one means the respawn is update-triggered,
+        // which the child is told via UPDATE_RESTART_ENV. Failed spawns
+        // don't count — retrying an updated version that couldn't spawn is
+        // still update-triggered relative to the version that last ran.
+        // Accepted trade-off: recorded at spawn, so if the freshly updated
+        // version crashes before its startup resume sweep completes, the
+        // subsequent respawn is same-version and unmarked — with
+        // `agents.resumeInterruptedOnStart=off`, agents interrupted by the
+        // update then stay unresumed (a crash respawn is a plain restart).
+        let mut last_ran_version: Option<String> = None;
 
         loop {
             let binary = self.paths.daemon_binary(&current_version);
             let mut command = tokio::process::Command::new(&binary);
             command.args(&self.passthrough).kill_on_drop(true);
+            if last_ran_version
+                .as_ref()
+                .is_some_and(|last| *last != current_version)
+            {
+                command.env(UPDATE_RESTART_ENV, "1");
+            } else {
+                // Clear rather than inherit: if the sitter itself was
+                // launched with the marker set, a first spawn, crash
+                // respawn, or same-version restart must not carry it.
+                command.env_remove(UPDATE_RESTART_ENV);
+            }
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(e) => {
@@ -502,6 +538,7 @@ impl Supervisor {
                     }
                 }
             };
+            last_ran_version = Some(current_version.clone());
             let spawned_at = Instant::now();
 
             // Supervise this child until it exits or the sitter stops it.

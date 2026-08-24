@@ -8145,8 +8145,8 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result, WorkspaceApi,
-        WorkspaceId,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result,
+        TaskGetMyTaskResult, TaskMetadata, TaskStatus, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -8180,6 +8180,26 @@ mod wsapi4_bindings_tests {
         /// Raw `agent.getQueue` entries served by `agent_get_queue`.
         queue_entries: Mutex<Vec<Value>>,
         remove_queued_owned_calls: Mutex<Vec<(String, String, String)>>,
+        /// Interleaved order of send/removal calls, for asserting the
+        /// send-first replacePending sequence.
+        call_order: Mutex<Vec<&'static str>>,
+        /// When set, `agent_remove_queued_message_owned` fails with
+        /// `Error::NotFound` (replacePending drained-race path).
+        remove_queued_error: Mutex<Option<String>>,
+        /// When set, `agent_remove_queued_message_owned` fails with
+        /// `Error::Internal` (replacePending "error" outcome path).
+        remove_queued_internal_error: Mutex<Option<String>>,
+        /// When set, `agent_send_message` fails with `Error::Internal`
+        /// (lossless replacePending path: a failed send retracts nothing).
+        agent_send_error: Mutex<Option<String>>,
+        /// When set, `get_my_task` reports this agent as the task's assignee
+        /// (sendToTask guard-path tests). Unset → `get_my_task` errors, so
+        /// the guard falls through as on a resolution failure.
+        task_assignee: Mutex<Option<String>>,
+        /// When set, overrides the `agent_send_message` result (delivery-shape tests).
+        agent_send_result: Mutex<Option<Value>>,
+        /// When set, overrides the `agent_send_to_task` result (delivery-shape tests).
+        agent_send_to_task_result: Mutex<Option<Value>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -8307,7 +8327,46 @@ mod wsapi4_bindings_tests {
                 message_id.clone(),
                 caller_agent_id.as_str().to_string(),
             ));
-            Box::pin(async move { Ok(json!({ "success": true, "messageId": message_id })) })
+            self.call_order.lock().unwrap().push("remove");
+            let error = self.remove_queued_error.lock().unwrap().clone();
+            let internal = self.remove_queued_internal_error.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(Error::NotFound(e));
+                }
+                if let Some(e) = internal {
+                    return Err(Error::Internal(e));
+                }
+                Ok(json!({ "success": true, "messageId": message_id }))
+            })
+        }
+
+        fn get_my_task(
+            &self,
+            _workspace_id: WorkspaceId,
+            task_note_id: intent_core::NoteId,
+        ) -> BoxFuture<'_, Result<TaskGetMyTaskResult>> {
+            let assignee = self.task_assignee.lock().unwrap().clone();
+            Box::pin(async move {
+                let Some(assignee) = assignee else {
+                    return Err(Error::NotFound("no task".to_string()));
+                };
+                Ok(TaskGetMyTaskResult {
+                    note_id: task_note_id,
+                    title: "task title".to_string(),
+                    content: "body".to_string(),
+                    status: TaskStatus::InProgress,
+                    task_metadata: TaskMetadata {
+                        status: TaskStatus::InProgress,
+                        ..Default::default()
+                    },
+                    parent_id: None,
+                    subtasks: Vec::new(),
+                    assigned_agents: vec![AgentId::from(assignee.as_str())],
+                    rev: 1,
+                    unmet_depends_on: Vec::new(),
+                })
+            })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -8332,7 +8391,22 @@ mod wsapi4_bindings_tests {
                 priority,
                 message_metadata,
             ));
-            Box::pin(async move { Ok(json!({ "success": true, "queued": false })) })
+            self.call_order.lock().unwrap().push("send");
+            let error = self.agent_send_error.lock().unwrap().clone();
+            let result = self
+                .agent_send_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(
+                    || json!({ "success": true, "queued": false, "turnId": "turn-fake-1" }),
+                );
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(Error::Internal(e));
+                }
+                Ok(result)
+            })
         }
 
         fn agent_send_to_task(
@@ -8349,8 +8423,16 @@ mod wsapi4_bindings_tests {
                 priority,
                 message_metadata,
             ));
+            self.call_order.lock().unwrap().push("send");
+            let result = self.agent_send_to_task_result.lock().unwrap().clone();
             Box::pin(async move {
-                Ok(json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }))
+                Ok(result.unwrap_or_else(|| {
+                    json!({
+                        "ok": true,
+                        "agentId": "agent-assignee",
+                        "result": { "success": true, "queued": false, "turnId": "turn-fake-1" },
+                    })
+                }))
             })
         }
 
@@ -8701,6 +8783,447 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["ok"], json!(true));
         let calls = api.agent_send_calls.lock().unwrap();
         assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
+    }
+
+    /// Self-describing success: a delivered-now send (turn-driving, carries
+    /// `turnId`) reports the top-level `delivery: "delivered"` outcome.
+    #[tokio::test]
+    async fn agent_send_delivered_shape_carries_delivery_field() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["delivery"], json!("delivered"));
+    }
+
+    /// The store-only fallback's persist-only success (`queued: false`, no
+    /// `turnId`) drives no turn — the binding makes no `delivery` claim
+    /// rather than reporting a false "delivered".
+    #[tokio::test]
+    async fn agent_send_persist_only_shape_makes_no_delivery_claim() {
+        let (srv, api) = server();
+        *api.agent_send_result.lock().unwrap() = Some(json!({
+            "success": true,
+            "queued": false,
+            "messageId": "m-1",
+        }));
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert!(v.get("delivery").is_none(), "{v}");
+    }
+
+    /// Self-describing success: a queued-because-busy send is explicit —
+    /// `delivery: "queued"` — so `ok: true` is not read as "delivered now".
+    #[tokio::test]
+    async fn agent_send_queued_shape_carries_delivery_field() {
+        let (srv, api) = server();
+        *api.agent_send_result.lock().unwrap() = Some(json!({
+            "success": true,
+            "queued": true,
+            "queuedMessage": { "id": "qmsg-1" },
+        }));
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["delivery"], json!("queued"));
+    }
+
+    /// Self-describing success: a held-for-questions park reports
+    /// `delivery: "held"`.
+    #[tokio::test]
+    async fn agent_send_held_shape_carries_delivery_field() {
+        let (srv, api) = server();
+        *api.agent_send_result.lock().unwrap() = Some(json!({
+            "success": true,
+            "queued": true,
+            "heldForQuestions": true,
+            "queuedMessage": { "id": "qmsg-1" },
+        }));
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["delivery"], json!("held"));
+    }
+
+    /// `sendToTask` classifies the nested `result` envelope the op returns.
+    #[tokio::test]
+    async fn agent_send_to_task_delivery_field_reads_nested_result() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["delivery"], json!("delivered"));
+
+        *api.agent_send_to_task_result.lock().unwrap() = Some(json!({
+            "ok": true,
+            "agentId": "agent-assignee",
+            "result": { "success": true, "queued": true, "heldForQuestions": true },
+        }));
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["delivery"], json!("held"));
+    }
+
+    /// A non-success `sendToTask` result (e.g. no assignee) gains no
+    /// `delivery` claim — nothing was sent.
+    #[tokio::test]
+    async fn agent_send_to_task_failure_has_no_delivery_field() {
+        let (srv, api) = server();
+        *api.agent_send_to_task_result.lock().unwrap() = Some(json!({
+            "ok": false,
+            "delivered": false,
+            "error": "No agent assigned to task",
+        }));
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert!(v.get("delivery").is_none(), "{v}");
+    }
+
+    /// Single-pending-message refusal: `refused: true` discriminator, an
+    /// `error` naming the rule, and an `instruction` pointing at the atomic
+    /// `replacePending` option (with manual removeQueuedMessage as the
+    /// non-atomic fallback).
+    #[tokio::test]
+    async fn agent_send_refusal_is_self_describing() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["refused"], json!(true));
+        assert_eq!(v["pendingMessageId"], json!("qmsg-pending"));
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.contains("only one pending message per target"),
+            "error names the rule: {error}"
+        );
+        let instruction = v["instruction"].as_str().unwrap();
+        assert!(
+            instruction.contains("replacePending"),
+            "instruction recommends the atomic replace: {instruction}"
+        );
+        assert!(instruction.contains("removeQueuedMessage"), "{instruction}");
+        assert!(
+            instruction.contains("NOT atomic"),
+            "instruction warns manual remove + re-send is not atomic: {instruction}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "refused send never reaches the service layer"
+        );
+    }
+
+    /// `replacePending: true` with a pending entry present: the entry is
+    /// retracted (ownership-guarded removal with the caller's identity), the
+    /// send proceeds, and the result reports `replaced: true` +
+    /// `replacedMessageId`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_retracts_and_sends() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(true), "{v}");
+        assert_eq!(v["replacedMessageId"], json!("qmsg-pending"), "{v}");
+        assert!(v.get("refused").is_none(), "{v}");
+        let removals = api.remove_queued_owned_calls.lock().unwrap();
+        assert_eq!(
+            removals[0],
+            (
+                "a-1".to_string(),
+                "qmsg-pending".to_string(),
+                "caller-1".to_string()
+            )
+        );
+        let sends = api.agent_send_calls.lock().unwrap();
+        assert_eq!(sends[0].1, "hi");
+        // Options-object third argument without `priority` keeps the
+        // interrupt default.
+        assert_eq!(sends[0].2.as_deref(), Some("interrupt"));
+        // Lossless ordering: the new message is sent BEFORE the pending
+        // entry is retracted, so a failed send never discards the entry.
+        assert_eq!(*api.call_order.lock().unwrap(), vec!["send", "remove"]);
+    }
+
+    /// Lossless replace: when the send itself fails, the pending entry is
+    /// never retracted — the caller gets the send error and the original
+    /// message stays in the target's queue.
+    #[tokio::test]
+    async fn agent_send_replace_pending_failed_send_retracts_nothing() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        *api.agent_send_error.lock().unwrap() = Some("service failure".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(
+            api.remove_queued_owned_calls.lock().unwrap().is_empty(),
+            "a failed send must not retract the pending entry"
+        );
+    }
+
+    /// `replacePending: true` when the pending entry drains between the guard
+    /// check and the retraction (removal fails with NotFound): the new
+    /// message was already sent — graceful degradation — and the result
+    /// reports `replaced: false` + `replaceOutcome: "drained"`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_drained_entry_degrades_to_plain_send() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        *api.remove_queued_error.lock().unwrap() = Some("message not found".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("drained"), "{v}");
+        assert!(v.get("replacedMessageId").is_none(), "{v}");
+        assert_eq!(api.agent_send_calls.lock().unwrap().len(), 1);
+    }
+
+    /// A non-NotFound removal failure (infrastructure error) does not
+    /// masquerade as a drained race: the send already succeeded and the
+    /// result reports `replaceOutcome: "error"`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_removal_error_reports_error_outcome() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        *api.remove_queued_internal_error.lock().unwrap() = Some("db unavailable".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("error"), "{v}");
+        assert_eq!(api.agent_send_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `replacePending: true` with no pending entry at all: nothing to
+    /// retract, the send proceeds, and the result reports `replaced: false`
+    /// + `replaceOutcome: "none"`.
+    #[tokio::test]
+    async fn agent_send_replace_pending_without_entry_reports_none() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("none"), "{v}");
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
+        assert_eq!(api.agent_send_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `replacePending` from a caller-less (user/FE) context is a no-op: the
+    /// guard never applies, no replace report is attached.
+    #[tokio::test]
+    async fn agent_send_replace_pending_without_caller_is_noop() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert!(v.get("replaced").is_none(), "{v}");
+        assert!(v.get("replaceOutcome").is_none(), "{v}");
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
+    }
+
+    /// Options-object third argument carries `priority` alongside
+    /// `replacePending` — the `"queue"` opt-out still maps to `"normal"`.
+    #[tokio::test]
+    async fn agent_send_options_object_priority_queue_opts_out() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', { priority: 'queue' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// `sendToTask` with `replacePending: true` against an assigned target
+    /// holding the caller's pending entry: same send-then-retract as `send`,
+    /// tagged with the task note id.
+    #[tokio::test]
+    async fn agent_send_to_task_replace_pending_retracts_and_sends() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.task_assignee.lock().unwrap() = Some("agent-assignee".to_string());
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["taskNoteId"], json!("tn-1"), "{v}");
+        assert_eq!(v["replaced"], json!(true), "{v}");
+        assert_eq!(v["replacedMessageId"], json!("qmsg-pending"), "{v}");
+        let removals = api.remove_queued_owned_calls.lock().unwrap();
+        assert_eq!(
+            removals[0],
+            (
+                "agent-assignee".to_string(),
+                "qmsg-pending".to_string(),
+                "caller-1".to_string()
+            )
+        );
+        assert_eq!(api.agent_send_to_task_calls.lock().unwrap().len(), 1);
+        // Lossless ordering: send before retract.
+        assert_eq!(*api.call_order.lock().unwrap(), vec!["send", "remove"]);
+    }
+
+    /// `sendToTask` with `replacePending: true` when the op resolves a
+    /// different assignee than the guard did (mid-call reassignment): the
+    /// pending entry in the old assignee's queue is NOT retracted and the
+    /// result reports `replaceOutcome: "reassigned"`.
+    #[tokio::test]
+    async fn agent_send_to_task_replace_pending_reassigned_retracts_nothing() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.task_assignee.lock().unwrap() = Some("agent-old-assignee".to_string());
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        // The op resolves "agent-assignee" (fixture default) — a different
+        // agent than the guard's "agent-old-assignee".
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("reassigned"), "{v}");
+        assert!(v.get("replacedMessageId").is_none(), "{v}");
+        assert!(
+            api.remove_queued_owned_calls.lock().unwrap().is_empty(),
+            "a reassigned target must not have the old assignee's entry retracted"
+        );
+        assert_eq!(api.agent_send_to_task_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `sendToTask` with `replacePending: true` when the guard's target
+    /// resolution falls through (no task assignee): the op still runs and an
+    /// agent caller gets an explicit `replaceOutcome: "none"` rather than a
+    /// silently ignored option.
+    #[tokio::test]
+    async fn agent_send_to_task_replace_pending_guard_fallthrough_reports_none() {
+        let (srv, api) = server_with_caller("caller-1");
+        // task_assignee unset → get_my_task errors → guard falls through.
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', { replacePending: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["replaced"], json!(false), "{v}");
+        assert_eq!(v["replaceOutcome"], json!("none"), "{v}");
+        assert!(api.remove_queued_owned_calls.lock().unwrap().is_empty());
+        assert_eq!(api.agent_send_to_task_calls.lock().unwrap().len(), 1);
+    }
+
+    /// `sendToTask` still refuses without `replacePending` when the caller
+    /// has a pending entry in the assignee's queue, and the refusal carries
+    /// the task tag.
+    #[tokio::test]
+    async fn agent_send_to_task_refusal_without_replace_pending() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.task_assignee.lock().unwrap() = Some("agent-assignee".to_string());
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "qmsg-pending",
+            "content": "earlier send",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(false), "{v}");
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert_eq!(v["taskNoteId"], json!("tn-1"), "{v}");
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
     }
 
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding

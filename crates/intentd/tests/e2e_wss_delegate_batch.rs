@@ -16,7 +16,11 @@
 //! - the removed `greedy` param is rejected with `-32602` for any supplied
 //!   value (`true`/`false`/explicit `null`), on the batch AND single-task
 //!   forms;
-//! - mixing `tasks` with `taskNoteId` is rejected with `-32602`.
+//! - mixing `tasks` with `taskNoteId` is rejected with `-32602`;
+//! - a zero-started `after_all` batch issued BY AN AGENT (MCP front door,
+//!   monorepo#3334) delivers the immediate advisory wake: the parent gets a
+//!   real wake turn (observed via `agent:*` events) whose message names the
+//!   zero-started breakdown, and no delegation group is left waiting.
 //!
 //! Gated on `node` + the mock ACP agent fixture (same gate as the other
 //! delegate e2e suites).
@@ -227,6 +231,31 @@ where
     v["result"].clone()
 }
 
+/// Next `events.event` notification frame on a subscriber connection.
+async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_secs(secs), ws.next())
+            .await
+            .expect("wss event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
 fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -372,6 +401,16 @@ async fn batch_delegate_request_response_shape_over_wss() {
     let agent_id = r1["agentId"].as_str().expect("agentId").to_string();
     assert_eq!(r1["title"], json!("T1"));
     assert_eq!(resp["startedTaskIds"], json!([t1]));
+    // Top-level summary (monorepo#3334); one task started, so no warning.
+    assert_eq!(
+        resp["summary"],
+        json!({ "started": 1, "held": 2, "skipped": 0, "errors": 0 }),
+        "{resp}"
+    );
+    assert!(
+        resp.as_object().unwrap().get("warning").is_none(),
+        "no warning when tasks started: {resp}"
+    );
     // Every requested task is covered by the graph (t2 depends on t1, t3
     // conflicts with t1), so no row carries `relationsUnknown`.
     for row in resp["tasks"].as_array().unwrap() {
@@ -453,6 +492,18 @@ async fn batch_delegate_request_response_shape_over_wss() {
     );
     assert_eq!(row_for(&again, &t3)["disposition"], json!("held:conflict"));
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
+    // Zero started on the re-call: summary reflects it and the top-level
+    // warning names the breakdown (monorepo#3334).
+    assert_eq!(
+        again["summary"],
+        json!({ "started": 0, "held": 2, "skipped": 1, "errors": 0 }),
+        "{again}"
+    );
+    let warning = again["warning"].as_str().expect("warning present");
+    assert!(warning.contains("NO TASKS STARTED"), "{warning}");
+    assert!(warning.contains("held on unmet dependencies"), "{warning}");
+    assert!(warning.contains("held on conflicts"), "{warning}");
+    assert!(warning.contains("re-call agent.delegate"), "{warning}");
 
     // The removed greedy param is rejected with -32602 pointing at
     // individual delegation — any supplied value (true / false / explicit
@@ -624,5 +675,185 @@ async fn batch_delegate_request_response_shape_over_wss() {
             .unwrap()
             .contains("~30 min of serial work remains on the critical path"),
         "{shadowed}"
+    );
+}
+
+/// Zero-started `after_all` advisory wake (monorepo#3334), end to end over
+/// WSS: a real parent agent (mock ACP provider) issues a batch
+/// `agent.delegate` through the MCP front door whose only task is held on an
+/// unmet dependency, with `waitMode: "after_all"`. No child enrolls, so no
+/// delegation group forms — the daemon must deliver the immediate advisory
+/// wake to the parent instead of leaving it waiting forever. Asserted via
+/// `agent:*` events (the wake runs a second parent turn) plus the parent's
+/// transcript (exactly one advisory naming the breakdown) and `agent.get`
+/// (parent is NOT left waiting on other agents).
+#[tokio::test]
+async fn zero_started_after_all_batch_delivers_advisory_wake_over_wss() {
+    const PARENT_GO: &str = "ZSTART_PARENT_GO";
+    let Some(script) = gate() else {
+        return;
+    };
+
+    // The parent's delegating turn seeds the graph itself (task ids are not
+    // knowable before the daemon boots): a blocker task, a held task
+    // depending on it, then the zero-started after_all batch.
+    let delegate_js = "const b = await ws.note.create('ZB', 'blocker body'); \
+         await ws.task.markAsTask(b.id, 'not_started', {}); \
+         const h = await ws.note.create('ZH', 'held body'); \
+         await ws.task.markAsTask(h.id, 'not_started', { dependsOn: [b.id] }); \
+         return await ws.agent.delegate({ tasks: [h.id], waitMode: 'after_all', model: 'mock:default' });";
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "zero-start after_all batch" }
+                },
+                "response": "parent issued the zero-started after_all batch",
+            },
+            {
+                "ifPromptContains": "started ZERO tasks",
+                "response": "parent acknowledged the advisory wake",
+            },
+        ],
+    })
+    .to_string();
+
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({ "title": "Zero-start advisory E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Subscribe BEFORE the parent's turn so no agent:* event is missed.
+    let mut sub = connect_ws(port, cfg).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        11,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let parent = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], json!(true), "sendMessage ok: {sent}");
+
+    // Two parent turns must complete: the delegating turn, then the advisory
+    // wake turn. The advisory is enqueued mid-turn (the delegating turn is
+    // still active when the batch call delivers it), so the queue drains it
+    // straight into a second turn and the parent idles ONCE at the end —
+    // observe two parent `agent:stream:end` events then the idle over WSS.
+    let mut parent_stream_ends = 0u32;
+    let mut parent_idle = false;
+    for _ in 0..300 {
+        let frame = wss_event(&mut sub, 90).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(parent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:stream:end") => parent_stream_ends += 1,
+            Some("agent:idle") => {
+                parent_idle = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(parent_idle, "parent idled after the advisory wake turn");
+    assert_eq!(
+        parent_stream_ends, 2,
+        "parent streamed the delegating turn AND the advisory wake turn"
+    );
+
+    // The advisory wake landed exactly once in the parent's transcript,
+    // naming the zero-started breakdown and the no-group consequence.
+    let conv = wss_rpc(
+        &mut rpc,
+        30,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    let advisories: Vec<String> = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .filter(|t| t.contains("started ZERO tasks"))
+        .collect();
+    assert_eq!(advisories.len(), 1, "exactly one advisory wake: {conv}");
+    let advisory = &advisories[0];
+    assert!(
+        advisory.contains("1 held on unmet dependencies"),
+        "advisory names the breakdown: {advisory}"
+    );
+    assert!(
+        advisory.contains("No delegation group was formed"),
+        "advisory names the no-group consequence: {advisory}"
+    );
+    assert!(
+        advisory.contains("re-call agent.delegate") || advisory.contains("Re-call agent.delegate"),
+        "advisory names the recovery path: {advisory}"
+    );
+
+    // No group, no waiting: the parent is NOT left waiting on other agents.
+    let lite = wss_rpc(&mut rpc, 31, "agent.get", json!({ "agentId": parent_id })).await;
+    assert_ne!(
+        lite["agent"]["isWaitingForOtherAgents"],
+        json!(true),
+        "zero-started after_all leaves no waiting group: {lite}"
     );
 }

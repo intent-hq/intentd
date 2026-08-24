@@ -508,6 +508,11 @@ pub(crate) enum SettingType {
         max: Option<f64>,
     },
     String,
+    /// A single string or an array of strings (`server.bindAddress`,
+    /// monorepo#3314). Advertised as `string` on the wire so the FE keeps
+    /// rendering the common single-value form; the array shape is accepted
+    /// on write and echoed as-is on read.
+    StringOrStringArray,
     Enum(&'static [&'static str]),
     /// Structured JSON (objects or arrays), e.g. `string[]` / `mcp.servers`.
     Object,
@@ -518,7 +523,7 @@ impl SettingType {
         match self {
             SettingType::Boolean => "boolean",
             SettingType::Number { .. } => "number",
-            SettingType::String => "string",
+            SettingType::String | SettingType::StringOrStringArray => "string",
             SettingType::Enum(_) => "enum",
             SettingType::Object => "object",
         }
@@ -587,6 +592,17 @@ impl SettingDefinition {
             SettingType::String => {
                 if !value.is_string() {
                     return invalid(format!("{}: expected a string", self.path));
+                }
+            }
+            SettingType::StringOrStringArray => {
+                let array_of_strings = value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string));
+                if !value.is_string() && !array_of_strings {
+                    return invalid(format!(
+                        "{}: expected a string or an array of strings",
+                        self.path
+                    ));
                 }
             }
             SettingType::Object => {
@@ -662,6 +678,25 @@ fn string(
         category,
         ty: SettingType::String,
         default_value: default.map(|s| json!(s)),
+        sensitive: false,
+        read_only: false,
+    }
+}
+
+/// `server.bindAddress` (monorepo#3314): a single IP string (back-compat) or
+/// an array of IP strings — one listener per address, same port. Semantic
+/// validation (IP syntax, duplicates, unspecified-only-alone) happens in the
+/// typed registry schema ([`intent_core::settings_file::BindAddress`]).
+fn bind_address_definition() -> SettingDefinition {
+    SettingDefinition {
+        path: "server.bindAddress",
+        label: "Bind address",
+        description: "Address(es) the TCP listener binds: a single IP or a list of IPs \
+                      (one listener per address, same port); 0.0.0.0 exposes it on every \
+                      interface, including untrusted networks",
+        category: "server",
+        ty: SettingType::StringOrStringArray,
+        default_value: Some(json!("127.0.0.1")),
         sensitive: false,
         read_only: false,
     }
@@ -825,6 +860,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         "server",
     );
     server_auth_token.read_only = true;
+    let mut specialists_dir = string(
+        "specialists.dir",
+        "Specialists directory",
+        "Base specialist directory replacing the built-in set (INTENTD_SPECIALISTS_DIR startup pin or config.toml; read-only on the wire)",
+        "providers",
+        None,
+    );
+    specialists_dir.read_only = true;
     vec![
         // --- Group A: providers / agents -----------------------------------
         string(
@@ -897,6 +940,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             None,
         ),
+        specialists_dir,
         // --- Group A: workspace / git ---------------------------------------
         string(
             "workspace.branchPrefix",
@@ -1011,13 +1055,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             None,
         ),
-        string(
-            "server.bindAddress",
-            "Bind address",
-            "Address the TCP listener binds; 0.0.0.0 exposes it on every interface, including untrusted networks",
-            "server",
-            Some("127.0.0.1"),
-        ),
+        bind_address_definition(),
         number(
             "server.port",
             "WS port",
@@ -1365,7 +1403,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Resume interrupted agents on start",
             "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
              auto resumes only on headless hosts (no display detected), on always resumes, \
-             off never resumes (changes apply on daemon restart)",
+             off never resumes; update-triggered restarts always resume regardless of this \
+             setting (changes apply on daemon restart)",
             "agents",
             &["auto", "on", "off"],
             "auto",
