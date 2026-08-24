@@ -455,6 +455,7 @@ mod tests {
                 task_debug: "v2",
                 task_focused: "v2",
                 task_loop: "v2",
+                ralph_loop: "v2",
                 workspace_agent: "v2",
                 notes_system_guide: "v2",
                 code_review: "v2",

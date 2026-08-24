@@ -220,15 +220,19 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     let mut r = BufReader::new(read);
     let wp = h.work_dir.to_string_lossy().to_string();
 
-    // list — bundled tier visible (no workspaceId required). The eight embedded
-    // reference specialists (PP-2) are always present; the two dir-seeded files
-    // override the embedded copies for the same ids.
+    // list — bundled tier visible (no workspaceId required). Seven of the eight
+    // embedded reference specialists are catalog-visible; retired Ralph remains
+    // directly resolvable. The two dir-seeded files override embedded copies.
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().expect("specialists array");
     assert_eq!(
         specs.len(),
-        8,
-        "eight embedded ids, two overridden from dir"
+        7,
+        "seven catalog-visible embedded ids, two overridden from dir"
+    );
+    assert!(
+        specs.iter().all(|s| s["id"] != "ralph"),
+        "retired Ralph is absent from specialist.list"
     );
     let imp = specs.iter().find(|s| s["id"] == "implementor").unwrap();
     assert_eq!(imp["source"], "bundled");
@@ -256,6 +260,23 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     .await;
     assert_eq!(got["specialist"]["source"], "bundled");
     assert_eq!(got["specialist"]["prompt"], "You verify.");
+
+    // get — the retired v1 Ralph definition remains resolvable for respawns.
+    let ralph = ok(
+        &mut w,
+        &mut r,
+        20,
+        "specialist.get",
+        json!({ "id": "ralph" }),
+    )
+    .await;
+    assert_eq!(ralph["specialist"]["source"], "bundled");
+    assert_eq!(ralph["specialist"]["hidden"], true);
+    assert_eq!(ralph["specialist"]["agentType"], "ralph-loop");
+    assert!(ralph["specialist"]["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("Iterative Work/Test Loop"));
 
     // create — user scope (default) authors a new specialist file. A retired
     // `modelTier` in the spec is tolerated-and-ignored (never echoed).
@@ -361,7 +382,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
     // Seed a bundled specialist whose frontmatter carries every optional scalar
     // plus the optional `hidden` boolean and a retired `modelTier` line.
-    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\nhidden: true\n---\n\nYou loop.";
+    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\nhidden: true\n---\n\nYou loop.";
     std::fs::write(h.bundled_dir.join("ralph.md"), body).unwrap();
 
     let (read, mut w) = connect_retry(&h.socket).await.into_split();
@@ -384,7 +405,7 @@ async fn specialist_full_frontmatter_wire_parity() {
         "retired modelTier is never echoed"
     );
     assert_eq!(s["roleReminder"], "Never stop early");
-    assert_eq!(s["agentType"], "task-loop");
+    assert_eq!(s["agentType"], "ralph-loop");
     assert_eq!(s["prompt"], "You loop.");
     assert_eq!(
         s["behaviorPrompt"], "You loop.",
@@ -396,11 +417,10 @@ async fn specialist_full_frontmatter_wire_parity() {
     // list — same fields visible in the list projection.
     let list = ok(&mut w, &mut r, 2, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().unwrap();
-    let ralph = specs.iter().find(|s| s["id"] == "ralph").unwrap();
-    assert_eq!(ralph["agentType"], "task-loop");
-    assert_eq!(ralph["roleReminder"], "Never stop early");
-    assert_eq!(ralph["isCustomized"], false);
-    assert_eq!(ralph["hidden"], true, "hidden surfaces in list");
+    assert!(
+        specs.iter().all(|s| s["id"] != "ralph"),
+        "Ralph is omitted from catalogs even when overridden on disk"
+    );
 
     // create→get round-trip: a user specialist persists every live field
     // losslessly (the retired `modelTier` is dropped), and the body may be
@@ -414,12 +434,12 @@ async fn specialist_full_frontmatter_wire_parity() {
             "id": "ralph2", "name": "Ralph II",
             "description": "Loops again", "codingAgent": "claude",
             "model": "opus4.5", "modelTier": "smart",
-            "roleReminder": "Keep going", "agentType": "task-loop",
+            "roleReminder": "Keep going", "agentType": "ralph-loop",
             "hidden": true,
             "behaviorPrompt": "Loop body." } }),
     )
     .await;
-    assert_eq!(created["specialist"]["agentType"], "task-loop");
+    assert_eq!(created["specialist"]["agentType"], "ralph-loop");
     assert_eq!(created["specialist"]["isCustomized"], true);
     assert_eq!(created["specialist"]["prompt"], "Loop body.");
     assert_eq!(created["specialist"]["behaviorPrompt"], "Loop body.");
@@ -442,7 +462,7 @@ async fn specialist_full_frontmatter_wire_parity() {
         "retired modelTier is dropped on create"
     );
     assert_eq!(s["roleReminder"], "Keep going");
-    assert_eq!(s["agentType"], "task-loop");
+    assert_eq!(s["agentType"], "ralph-loop");
     assert_eq!(s["prompt"], "Loop body.");
     assert_eq!(s["behaviorPrompt"], "Loop body.");
     assert_eq!(s["isCustomized"], true);

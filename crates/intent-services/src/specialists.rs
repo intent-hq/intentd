@@ -54,6 +54,10 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
         include_str!("../resources/specialists/v1/pr-reviewer.md"),
     ),
     (
+        "ralph",
+        include_str!("../resources/specialists/v1/ralph.md"),
+    ),
+    (
         "spec-writer",
         include_str!("../resources/specialists/v1/spec-writer.md"),
     ),
@@ -947,6 +951,9 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
+        // Ralph remains in the pinned v1 doctrine for existing sessions, but
+        // is retired from new-session catalogs (including Settings).
+        acc.remove("ralph");
         let specialists: Vec<Value> = acc.into_values().collect();
         Ok(json!({ "specialists": specialists }))
     }
@@ -1568,21 +1575,23 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    /// The seven reference specialist ids embedded via `include_str!` (PP-2).
-    const EMBEDDED_IDS: [&str; 7] = [
+    /// The eight reference specialist ids embedded via `include_str!` (PP-2).
+    const EMBEDDED_IDS: [&str; 8] = [
         "spec-writer",
         "implementor",
         "verifier",
         "developer",
         "chief-of-staff",
+        "ralph",
         "ui-designer",
         "pr-reviewer",
     ];
 
     #[test]
-    fn embedded_bundled_resolves_all_seven_with_zero_local_files() {
+    fn embedded_bundled_resolves_all_eight_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
-        // get()/list()/resolve_role_reminder().
+        // get()/resolve_agent_type()/resolve_role_reminder(). Ralph is the one
+        // retired id intentionally omitted from list().
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
         for id in EMBEDDED_IDS {
@@ -1598,9 +1607,11 @@ mod tests {
         }
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
-        for id in EMBEDDED_IDS {
+        assert_eq!(specs.len(), 7, "Ralph is excluded from the catalog");
+        for id in EMBEDDED_IDS.into_iter().filter(|id| *id != "ralph") {
             assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
         }
+        assert!(!specs.iter().any(|s| s["id"] == "ralph"));
         // The bundled chief-of-staff is flagged hidden; every other embedded
         // definition omits the field (absent ⇒ not hidden).
         for spec in specs {
@@ -1610,8 +1621,19 @@ mod tests {
                 assert!(spec.get("hidden").is_none(), "{}: not hidden", spec["id"]);
             }
         }
-        // Frontmatter-driven resolution works too: implementor declares an
-        // explicit roleReminder.
+        // Ralph remains fully resolvable for pinned v1 sessions even though it
+        // is absent from the catalog.
+        let ralph = svc.get("ralph", None).unwrap();
+        assert_eq!(ralph["specialist"]["hidden"], true);
+        assert_eq!(
+            svc.resolve_agent_type("ralph", None).as_deref(),
+            Some("ralph-loop")
+        );
+        let (name, reminder) = svc.resolve_role_reminder("ralph", None).unwrap();
+        assert_eq!(name, "Ralph");
+        assert!(reminder.starts_with("You are Ralph."));
+
+        // Implementor also declares an explicit roleReminder.
         let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
         assert_eq!(name, "Implementor");
         assert!(reminder.starts_with("Stay within task scope."));
@@ -1946,23 +1968,30 @@ mod tests {
     }
 
     #[test]
-    fn user_file_can_define_task_loop_agent_type() {
-        // An explicit user-file agentType continues to resolve through the
-        // generic specialist infrastructure.
+    fn user_override_of_embedded_inherits_scalars_at_spawn() {
+        // The embedded floor participates in the fold: a user ralph.md that
+        // omits agentType keeps the embedded value at spawn time, but remains
+        // absent from list() as a retired catalog id.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
             "ralph",
-            "---\nname: \"Custom Ralph\"\ndescription: \"d\"\nagentType: \"task-loop\"\n---\n\nCustom body",
+            "---\nname: \"Custom Ralph\"\ndescription: \"d\"\n---\n\nCustom body",
         );
         let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
         assert_eq!(
             svc.resolve_agent_type("ralph", None).as_deref(),
-            Some("task-loop"),
-            "explicit user-file agentType resolves"
+            Some("ralph-loop"),
+            "agentType inherited from the embedded floor"
         );
         let got = svc.get("ralph", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");
+        assert_eq!(got["specialist"]["hidden"], true);
+        assert!(svc.list(None).unwrap()["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|spec| spec["id"] != "ralph"));
         assert!(
             got["specialist"].get("modelTier").is_none(),
             "modelTier is retired and never emitted"

@@ -147,7 +147,7 @@ pub fn get_tool_denylist_for_agent_type(agent_type: &str) -> Vec<&'static str> {
         // Pure text-generation / analysis agents: no side effects.
         "commit-message" | "pr-description" | "code-review" | "code-walkthrough" => full_denylist(),
         // Full working agents, but no nested sub-agent spawning.
-        "task-loop" | "chat" => SUBAGENT_TOOLS.to_vec(),
+        "task-loop" | "ralph-loop" | "chat" => SUBAGENT_TOOLS.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -163,6 +163,7 @@ pub(crate) fn is_background_agent_type(agent_type: &str) -> bool {
             | "code-review"
             | "code-walkthrough"
             | "task-loop"
+            | "ralph-loop"
             | "chat"
     )
 }
@@ -176,6 +177,7 @@ pub(crate) fn background_agent_types() -> &'static [&'static str] {
         "code-review",
         "code-walkthrough",
         "task-loop",
+        "ralph-loop",
         "chat",
     ]
 }
