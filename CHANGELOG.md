@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.52] - 2026-08-24
+
+### 🚀 Features
+
+- *(acp)* Self-describing send outcomes for naive senders ([#1439](https://github.com/intent-hq/intentd/pull/1439))
+- *(acp)* Atomic replacePending option on ws.agent.send / sendToTask
+- *(agents)* Accept image-reference blocks ({type:'image', attachmentId}) in sendMessage/create ([#1446](https://github.com/intent-hq/intentd/pull/1446))
+
+### 🐛 Bug Fixes
+
+- *(services)* Surface zero-started batch delegate with summary, warning, and after_all advisory wake ([#1442](https://github.com/intent-hq/intentd/pull/1442))
+
+### 📚 Documentation
+
+- *(acp)* Clarify A2A send outcome shapes and single-pending-message rule ([#1440](https://github.com/intent-hq/intentd/pull/1440))
+
+### ⚡ Performance
+
+- *(git)* O(diff) hard reset in CoW checkout provisioning ([#1447](https://github.com/intent-hq/intentd/pull/1447))
+
+### 🧪 Testing
+
+- *(intent-git)* Isolate auth config-read tests from host gitconfig ([#1443](https://github.com/intent-hq/intentd/pull/1443))
+
+
 ## [0.7.51] - 2026-08-24
 
 ### 🐛 Bug Fixes
