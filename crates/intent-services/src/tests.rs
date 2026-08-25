@@ -5975,6 +5975,156 @@ async fn query_opt_in_pagination_envelope_and_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
+/// Insert an event whose `data` payload is roughly `data_bytes` bytes.
+async fn insert_big_event(svc: &Services, ws: &WorkspaceId, i: usize, data_bytes: usize) {
+    svc.store()
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60),
+            event_type: "note:updated".to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some("a1".to_string()),
+                name: Some("name-a1".to_string()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({ "blob": "x".repeat(data_bytes) }),
+        })
+        .await
+        .expect("insert event");
+}
+
+/// Regression (monorepo#3347): a busy workspace's `event.query` no longer
+/// serializes past the transport's 1 MiB large-frame advisory. Both response
+/// shapes (legacy bare array and paginated envelope) are bounded by
+/// per-row payload trimming with observable `truncated` / `originalBytes`
+/// markers, row count is preserved, and the caller-supplied legacy `limit`
+/// is clamped (a negative value previously meant "no limit" in SQL).
+#[tokio::test]
+async fn query_response_size_is_bounded_below_frame_advisory() {
+    const ONE_MIB: usize = 1024 * 1024;
+    let (_tmp, svc, ws) = event_setup().await;
+    // 60 rows × ~30 KiB ≈ 1.8 MiB serialized — past the advisory before the fix.
+    for i in 0..60 {
+        insert_big_event(&svc, &ws, i, 30 * 1024).await;
+    }
+
+    // Legacy bare array: all 60 rows survive, total stays under 1 MiB, and
+    // trimmed rows carry the additive markers.
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("legacy query");
+    let arr = rows.as_array().expect("bare array (non-paginated)");
+    assert_eq!(arr.len(), 60, "no rows may be dropped");
+    let size = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "legacy response must stay under 1 MiB: {size}"
+    );
+    assert!(
+        arr.iter()
+            .any(|r| r["truncated"] == serde_json::json!(true)),
+        "trimming must be observable via row markers"
+    );
+    for row in arr {
+        assert!(row["id"].as_str().is_some(), "identity survives: {row}");
+        assert_eq!(row["type"], serde_json::json!("note:updated"));
+        assert_eq!(row["actor"]["type"], serde_json::json!("agent"));
+        if row["truncated"] == serde_json::json!(true) {
+            assert!(row["originalBytes"].as_u64().is_some(), "marker: {row}");
+        }
+    }
+
+    // Paginated envelope: same bound on a full page.
+    let page = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(200),
+                paginate: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("paginated query");
+    assert_eq!(page["items"].as_array().expect("items").len(), 60);
+    let size = serde_json::to_string(&page).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "paginated response must stay under 1 MiB: {size}"
+    );
+
+    // Legacy limit clamp: a negative limit no longer means "no limit" — it
+    // clamps to 1 row instead of returning the whole table.
+    let neg = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(-1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("negative-limit query");
+    assert_eq!(neg.as_array().expect("bare array").len(), 1);
+
+    // A small query on the same store is returned untouched: no markers.
+    // (The clamp's UPPER bound is pinned by query_legacy_limit_upper_clamp.)
+    let small = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("small query");
+    let small_arr = small.as_array().expect("bare array");
+    assert_eq!(small_arr.len(), 3);
+    assert!(
+        small_arr.iter().all(|r| r.get("truncated").is_none()),
+        "under-budget responses stay byte-identical: {small}"
+    );
+}
+
+/// The legacy `event.query` limit's UPPER bound (monorepo#3347): a limit past
+/// 500 is clamped to exactly 500 rows — the second half of the [1, 500]
+/// contract (the lower bound is covered by the regression test above).
+#[tokio::test]
+async fn query_legacy_limit_upper_clamp() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for i in 0..510 {
+        insert_big_event(&svc, &ws, i, 16).await;
+    }
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("over-limit query");
+    assert_eq!(
+        rows.as_array().expect("bare array").len(),
+        500,
+        "limit > 500 clamps to EVENT_QUERY_MAX_LEGACY_LIMIT rows"
+    );
+}
+
 #[tokio::test]
 async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     let (_tmp, svc, ws) = event_setup().await;

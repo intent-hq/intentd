@@ -248,6 +248,7 @@ API:
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
+    Responses are size-bounded: oversized rows get their `data`/`metadata` replaced by bounded previews plus `truncated: true` + `originalBytes` markers, and `limit` is clamped (default 50, max 500).
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
@@ -476,6 +477,7 @@ API:
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
+    Responses are size-bounded: oversized rows get their `data`/`metadata` replaced by bounded previews plus `truncated: true` + `originalBytes` markers, and `limit` is clamped (default 50, max 500).
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
