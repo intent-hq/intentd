@@ -456,6 +456,7 @@ async fn agent_features_token_impact_over_wss() {
     let mut ws = connect_ws(port, cfg).await;
 
     let resp = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&resp, 1);
     let settings = resp["result"]["settings"]
         .as_array()
         .expect("settings array");
