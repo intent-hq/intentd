@@ -1791,28 +1791,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `chat.unread`: compact digest of the calling agent's own conversation
-    /// messages the user has not seen yet (after the per-conversation seen
-    /// marker persisted by `agent.markSeen`). Scans forward from the marker;
-    /// each HUMAN-authored user message resets the collection (proof of
-    /// presence), so the digest covers only non-human messages after the
-    /// newest human user message: assistant messages and machine-attributed
-    /// user-role deliveries (A2A messages, hook wakes, PR-monitor wakes).
-    /// Read-only — never moves the seen marker. Arms the caller's same-turn
-    /// summarize gate over exactly the returned range.
-    fn agent_chat_unread(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: AgentId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::agent_chat_unread not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `agent.editAndRegenerate`: edit a past user message and regenerate from
     /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
     /// transcript to just before `message_id` (which must reference an existing
