@@ -702,14 +702,25 @@ async fn tunnel_connect_timeout_answers_open_err() {
     srv.ws.stop().await;
 }
 
-/// A `DATA` payload over the 1 MiB per-frame cap closes the connection: the
-/// WebSocket-level message cap rejects it with `1009 Message Too Big`.
+/// A `DATA` message over the 1 MiB inbound cap closes the connection with
+/// `1009 Message Too Big`, and an over-limit single frame still terminates
+/// the connection.
 #[tokio::test]
 async fn tunnel_oversize_data_closes_with_1009() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame as WsFrame;
+
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
-    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
+    // Over-limit fragmented `DATA` on a live stream: the first fragment sits
+    // exactly at the cap (legal on its own), the continuation pushes the
+    // accumulated size past it, surfacing tungstenite's message-capacity
+    // error only after the client has finished writing — so the 1009 close
+    // frame the server sends is reliably delivered even under parallel suite
+    // load: no bytes are left in flight to reset the socket (monorepo#3469,
+    // mirroring the `/ws` oversize coverage in `wss_integration`).
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
     send_frame(
         &mut ws,
         Frame::Open {
@@ -719,14 +730,32 @@ async fn tunnel_oversize_data_closes_with_1009() {
     )
     .await;
     assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 1 });
-    send_frame(
-        &mut ws,
-        Frame::Data {
-            stream_id: 1,
-            payload: vec![0u8; MAX_TUNNEL_MESSAGE_BYTES + 1],
-        },
-    )
-    .await;
+    let header_len = Frame::Data {
+        stream_id: 1,
+        payload: Vec::new(),
+    }
+    .encode()
+    .len();
+    let at_cap = Frame::Data {
+        stream_id: 1,
+        payload: vec![0u8; MAX_TUNNEL_MESSAGE_BYTES - header_len],
+    }
+    .encode();
+    assert_eq!(at_cap.len(), MAX_TUNNEL_MESSAGE_BYTES);
+    ws.send(Message::Frame(WsFrame::message(
+        at_cap,
+        OpCode::Data(Data::Binary),
+        false,
+    )))
+    .await
+    .expect("send first fragment");
+    ws.send(Message::Frame(WsFrame::message(
+        vec![0u8; 1024],
+        OpCode::Data(Data::Continue),
+        true,
+    )))
+    .await
+    .expect("send continuation");
     loop {
         let next = tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), ws.next())
             .await
@@ -742,6 +771,42 @@ async fn tunnel_oversize_data_closes_with_1009() {
             other => panic!("expected 1009 close, got {other:?}"),
         }
     }
+
+    // Over-limit single frame: rejected fast on the frame header, without
+    // buffering the payload — so the teardown can reset the socket while the
+    // client is still mid-write, and the 1009 close frame may be lost to the
+    // reset. Only termination is asserted (the close code is still checked
+    // opportunistically when a close frame does arrive).
+    let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
+    let _ = ws
+        .send(Message::Binary(
+            Frame::Data {
+                stream_id: 1,
+                payload: vec![0u8; MAX_TUNNEL_MESSAGE_BYTES + 1],
+            }
+            .encode()
+            .into(),
+        ))
+        .await;
+    let closed = tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) => break,
+                Some(Ok(Message::Close(frame))) => {
+                    if let Some(frame) = frame {
+                        assert_eq!(u16::from(frame.code), 1009, "close frame: {frame:?}");
+                    }
+                    break;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "oversized frame must terminate the connection"
+    );
     srv.ws.stop().await;
 }
 
