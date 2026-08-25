@@ -636,6 +636,21 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
     );
     assert_eq!(subs[0]["actorIds"], json!([child_id]));
     assert_eq!(subs[0]["workspaceId"], json!(ws_id));
+
+    // monorepo#3442: the created child is a delegated child of the caller on
+    // the wire — `agent.getSession` carries `parentAgentId` == callerAgentId.
+    let session_res = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": child_id }),
+    )
+    .await;
+    assert_eq!(
+        session_res["session"]["parentAgentId"],
+        json!(caller_id),
+        "wakeOrCreate-created child carries parentAgentId over WSS: {session_res}"
+    );
 }
 
 /// TASK-C2 (follow-up to #104): `agent.delegate` with `taskNoteId` APPENDS

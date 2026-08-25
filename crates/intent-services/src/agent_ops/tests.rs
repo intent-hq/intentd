@@ -12776,6 +12776,37 @@ async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
     );
 }
 
+/// monorepo#3442: an unknown `callerAgentId` (no session resolves for it) must
+/// not be persisted as the child's parent — a dangling parent would enable
+/// `reportToParent` against a nonexistent recipient and emit an unresolvable
+/// `parentAgentId`. Parentage derives from the resolved `caller_session`, not
+/// the raw client-supplied ID.
+#[tokio::test]
+async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Unknown caller parent").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(AgentId::from("agent-00000000-dead-beef-0000-000000000000")),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(
+        session.parent_agent_id.is_none(),
+        "unknown caller must not become a dangling parent"
+    );
+}
+
 /// monorepo#994: the queued-to-active branch shares the wake-branch SUB-1
 /// block, so a Deleted caller gets no caller→assignee watch.
 #[tokio::test]

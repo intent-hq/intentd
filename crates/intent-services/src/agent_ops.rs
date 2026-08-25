@@ -9848,6 +9848,16 @@ impl Services {
         {
             crate::agent_subscriptions::check_watch_scope(&session.workspace_id, &workspace_id)?;
         }
+        // monorepo#3442: the caller becomes the created agent's parent ONLY
+        // when its session actually resolved and is not Deleted. Derived from
+        // `caller_session` (not the raw wire `callerAgentId`) so an unknown
+        // client-supplied ID can never be persisted as a dangling parent —
+        // a dangling parent would enable `agent.reportToParent` against a
+        // nonexistent recipient and emit an unresolvable `parentAgentId`.
+        let caller_parent = caller_session
+            .as_ref()
+            .filter(|s| s.status != AgentStatus::Deleted)
+            .map(|s| s.id.clone());
 
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
@@ -10138,12 +10148,14 @@ impl Services {
             is_background: None,
             name_explicitly_set: None,
         };
-        // monorepo#3442: the live caller becomes the created agent's
-        // `parent_agent_id`, so a wakeOrCreate-created agent is a delegated
-        // child (`agent.reportToParent` works, attention/failure events carry
-        // the parent). A Deleted caller is filtered out — it can never receive
-        // the report wake — mirroring `agent_delegate_op`'s deleted-parent
-        // guard (same `caller_deleted` pre-gate as the SUB-1 blocks). The
+        // monorepo#3442: the resolved live caller (`caller_parent`, derived
+        // from the single `caller_session` lookup — never the raw wire
+        // `callerAgentId`) becomes the created agent's `parent_agent_id`, so
+        // a wakeOrCreate-created agent is a delegated child
+        // (`agent.reportToParent` works, attention/failure events carry the
+        // parent). A Deleted caller and an unknown/unresolvable `callerAgentId`
+        // both stay parentless — mirroring `agent_delegate_op`'s deleted-parent
+        // guard and preventing a dangling parent from a client-supplied ID. The
         // depth guard inside `agent_create_op` reads the parent's persisted
         // `delegation_depth` against the same `MAX_DELEGATION_DEPTH` the B3
         // pre-check above already enforced, so a pass there cannot regress
@@ -10155,7 +10167,7 @@ impl Services {
                 name,
                 model,
                 specialist,
-                input.caller_agent_id.clone().filter(|_| !caller_deleted),
+                caller_parent,
                 Some(task_note_id.clone()),
                 skip_auto_commit,
                 extra,
