@@ -8147,6 +8147,51 @@ impl Services {
         )))
     }
 
+    /// The registration-time mutual-wait guard: rejects an explicit watch
+    /// registration when the target already holds a live completion watch —
+    /// grouped or ungrouped — on the caller, i.e. the target is itself
+    /// waiting on the caller to settle. Accepting the registration would arm
+    /// an A⇄B pair where each side's settlement is deferred by the other's
+    /// watch; the settlement-time `mutual_idle` break in
+    /// [`Services::classify_agent_waiting`] eventually declassifies such a
+    /// deadlocked 2-cycle, but only once both sides sit idle — refusing to
+    /// create the pair up front is strictly better. "Live" means
+    /// non-`report_delivered` ([`Services::waiting_watches_for_parent`]): a
+    /// `report_delivered` reverse watch has already delivered its
+    /// report-time wake and is not something the target is waiting FOR, so
+    /// it does not trigger the rejection. Enforced ONLY by the explicit
+    /// registration ops (`agent.watch` / `app.agents.waitFor`): the auto-arm
+    /// paths (delegate, the send SUB-1 auto-watch, `wakeOrCreate`, startup
+    /// rehydration) pair the watch with a message/wake that settles one side
+    /// or must keep rehydrating persisted pairs, and stay covered by the
+    /// settlement-time backstop. Direct pair check only — deeper cycles
+    /// (A→B→C→A) are intentionally not detected here. Best-effort under
+    /// concurrency (TOCTOU): two agents racing explicit registrations on
+    /// each other can both pass this check before either watch lands and
+    /// still form the mutual pair — that race is covered by the same
+    /// settlement-time `mutual_idle` backstop.
+    fn check_no_reverse_watch(
+        &self,
+        caller_agent_id: &AgentId,
+        target_agent_id: &AgentId,
+    ) -> Result<()> {
+        if self
+            .waiting_watches_for_parent(target_agent_id)
+            .iter()
+            .any(|w| &w.child_agent_id == caller_agent_id)
+        {
+            return Err(Error::InvalidParams(format!(
+                "agent {} is already waiting on you ({}): it holds a live completion \
+                 watch on your completion, so watching it back would create a mutual \
+                 wait where each agent waits for the other to settle. Finish your \
+                 work and settle instead — agent.reportToParent (if it delegated \
+                 you) or agent.send delivers your result and wakes it",
+                target_agent_id.0, caller_agent_id.0
+            )));
+        }
+        Ok(())
+    }
+
     /// `agent.watch` (monorepo#1229): explicit caller→target subscription to
     /// the target's harness-curated completion set — idle/completed, failed,
     /// deleted, blocker raised, discussion requested. Unlike the
@@ -8155,9 +8200,11 @@ impl Services {
     /// `agent_request_attention_op` wakes it). The registration is durably
     /// persisted before returning. Fails closed on a nonexistent target and
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
-    /// cross-workspace targets for non-chief callers, and the idle-target
+    /// cross-workspace targets for non-chief callers, the idle-target
     /// guard (monorepo#2972, [`Services::check_idle_target_watchable`])
-    /// rejects a `RuntimeIdle` target with no waiting reason.
+    /// rejects a `RuntimeIdle` target with no waiting reason, and the
+    /// mutual-wait guard ([`Services::check_no_reverse_watch`]) rejects a
+    /// target that already holds a live watch on the caller.
     pub(crate) async fn agent_watch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -8190,6 +8237,9 @@ impl Services {
             &target_session.workspace_id,
         )?;
         self.check_idle_target_watchable(&target_session).await?;
+        // Mutual-wait guard: a target already waiting on the caller must not
+        // be watched back — reject before any side-effectful registration.
+        self.check_no_reverse_watch(&caller_agent_id, &target_agent_id)?;
         let target_ws = target_session.workspace_id;
         let id = self
             .register_agent_watch_durable(
@@ -8297,6 +8347,9 @@ impl Services {
     /// `-32602` naming the target — run in the same up-front validation loop,
     /// so the rejection is side-effect free. (Auto-subscribe paths silently
     /// adopt the existing watch instead; see `register_completion_watch`.)
+    /// The mutual-wait guard ([`Services::check_no_reverse_watch`]) runs in
+    /// the same loop for both modes: a target already holding a live watch
+    /// on the caller is rejected, naming the offending target.
     ///
     /// After registration every target is reconciled against current agent
     /// state (same [`Services::reconcile_watch_child_on_rehydration`] path the
@@ -8389,6 +8442,10 @@ impl Services {
             // Idle-target guard (monorepo#2972): same up-front validation
             // loop as the scope gate, so a rejection is side-effect free.
             self.check_idle_target_watchable(&session).await?;
+            // Mutual-wait guard: a target already waiting on the caller must
+            // not be waited on back — same up-front loop, so a rejection
+            // leaves no group or watches behind.
+            self.check_no_reverse_watch(&caller_agent_id, &target)?;
             // Pair uniqueness: an explicit registration on a child the caller
             // ALREADY watches (ungrouped or grouped) is rejected
             // up front — before any side-effectful registration — instead of
