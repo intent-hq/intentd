@@ -401,6 +401,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         let contents: Vec<serde_json::Value> = (0..60)
             .map(|m| {
