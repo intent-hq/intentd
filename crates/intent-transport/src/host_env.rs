@@ -59,6 +59,19 @@ pub fn local_hostname() -> String {
         .unwrap_or_else(|| "intent".to_string())
 }
 
+/// OS "pretty" device name (macOS Computer Name, e.g. "Clement's Mac Studio";
+/// `PrettyHostname` on Linux, computer name on Windows), or [`local_hostname`]
+/// when no pretty name is available. Public so the composition root can
+/// include it in the `system.status` snapshot alongside `host.status` and
+/// `server.pairingInfo`.
+#[must_use]
+pub fn pretty_hostname() -> String {
+    whoami::devicename()
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(local_hostname)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +86,14 @@ mod tests {
         assert!(!has_display(false, false, true, true));
         // Headless Unix without a display server has none.
         assert!(!has_display(false, false, false, false));
+    }
+
+    #[test]
+    fn hostnames_are_never_empty() {
+        // Both helpers fall back rather than returning an empty string:
+        // `local_hostname` to `intent`, `pretty_hostname` to `local_hostname`.
+        assert!(!local_hostname().is_empty());
+        assert!(!pretty_hostname().is_empty());
     }
 
     #[test]

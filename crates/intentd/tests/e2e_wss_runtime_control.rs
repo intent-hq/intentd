@@ -695,7 +695,8 @@ async fn wss_system_status_includes_capacity_version_uptime() {
         "memoryBytes > 0: {r}"
     );
     // Routing fields (additive): localIps is a string array (may be empty on
-    // hosts with no routable interface), hostname is a non-empty string.
+    // hosts with no routable interface), hostname and prettyHostname are
+    // non-empty strings.
     let local_ips = r["localIps"].as_array().expect("localIps is array");
     assert!(
         local_ips.iter().all(Value::is_string),
@@ -707,6 +708,13 @@ async fn wss_system_status_includes_capacity_version_uptime() {
             .expect("hostname is string")
             .is_empty(),
         "hostname non-empty: {r}"
+    );
+    assert!(
+        !r["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty: {r}"
     );
     // Aggregate-budget fields (monorepo#2063): the budget is ON by default
     // (auto resolves to recommended), so agentMemoryBudgetBytes and queuedSpawns
