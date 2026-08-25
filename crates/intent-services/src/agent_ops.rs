@@ -117,7 +117,9 @@ pub(crate) struct AgentSnapshot {
     /// Active workspace event subscriptions owned by this agent.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) event_subscriptions: usize,
-    /// Delegated child agents not yet settled (non-terminal status).
+    /// Delegated child agents genuinely in flight (pending/active/
+    /// Processing/Waiting status) — idle/restorable children do not count
+    /// (monorepo#3384).
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) running_sub_agents: usize,
     /// Structured questions still pending presentation/answer.
@@ -8574,13 +8576,15 @@ impl Services {
             .get(agent_id)
             .map_or(0, std::vec::Vec::len);
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
-        // Delegated children not yet settled: one aggregate statement over
-        // the `parent_agent_id` index, unscoped by workspace so a Chief
+        // Delegated children genuinely in flight (pending/active/Processing/
+        // Waiting) — idle/restorable children are NOT "running"
+        // (monorepo#3384). One aggregate statement over the
+        // `parent_agent_id` index, unscoped by workspace so a Chief
         // parent's cross-workspace delegates count too — O(this agent's
         // children), never O(workspace sessions). Fails open to 0.
         let running_sub_agents = usize::try_from(
             self.store
-                .count_unsettled_child_agents(agent_id)
+                .count_running_child_agents(agent_id)
                 .await
                 .unwrap_or(0),
         )
