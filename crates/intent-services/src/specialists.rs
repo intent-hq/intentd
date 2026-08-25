@@ -72,8 +72,9 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
 ];
 
 /// The v1.1 embedded specialist bundle (`resources/specialists/v1.1/`):
-/// byte-identical copies of the v1 files (the v1→v1.1 doctrine diff is
-/// instruction-only — the feature-section rewrites in `common.md`), kept as
+/// the v1 files with body-identical prompts (the v1→v1.1 doctrine diff is
+/// instruction-only — the feature-section rewrites in `common.md`) plus the
+/// picker-metadata frontmatter keys (`role`/`teamAgents`/`icon`), kept as
 /// a separate directory so each version's resources stay self-contained.
 /// The v1.1 harness doctrine (`crate::harness::v1_1::ENTRY`) points here.
 pub(crate) const EMBEDDED_BUNDLED_V1_1: &[(&str, &str)] = &[
@@ -214,21 +215,39 @@ fn escape_yaml(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
-/// Reverse [`escape_yaml`] for a double-quoted scalar (port of
-/// `unescapeYamlValue`).
+/// Reverse [`escape_yaml`] for a double-quoted scalar. Decoded in a single
+/// left-to-right pass so an escaped backslash never re-combines with the
+/// following character (sequential `replace` calls corrupted `foo\nbar` —
+/// literal backslash + `n` — into backslash + real newline); an unrecognized
+/// escape is carried verbatim (lenient, like the rest of the parser).
 fn unescape_yaml(value: &str) -> String {
-    value
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            // A trailing lone backslash is carried verbatim, like `\\`.
+            Some('\\') | None => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 /// Split optional leading `---`-delimited YAML frontmatter from the markdown
 /// body (port of `parseFrontmatter`). Returns `(frontmatter, body)`; when there
 /// is no valid frontmatter block the whole content is the body.
-fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
+pub(crate) fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
     let norm = content.replace("\r\n", "\n");
     let mut lines = norm.split('\n');
     if lines.next().map(str::trim) != Some("---") {
@@ -277,14 +296,21 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// Optional frontmatter scalar keys carried through `build_def`/`render_file`
 /// verbatim so parse→write→parse round-trips losslessly (port of
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
-/// `roleReminder`, `agentType`, plus `reasoningEffort`).
+/// `roleReminder`, `agentType`, plus `reasoningEffort`, `role` and `icon`).
 ///
 /// NOTE: the config scalars `codingAgent`/`model`/`agentType`/
-/// `reasoningEffort` ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit
-/// semantics across tiers, like `hidden` (PROTOCOL §5.11,
+/// `reasoningEffort`/`role`/`icon` ([`INHERITED_CONFIG_KEYS`]) resolve with
+/// inherit-on-omit semantics across tiers, like `hidden` (PROTOCOL §5.11,
 /// intent-hq/monorepo#718): an omitted key keeps the lower tiers' effective
 /// value, an explicit empty value (`model: ""`) clears it, and an explicit
 /// non-empty value overrides it.
+/// `role` is the picker-orchestration enum (`orchestrator` | `internal`;
+/// absent = standard) and `icon` names a client-side avatar design; both are
+/// render-only metadata for pickers (never consulted at delegation time).
+/// `role` is validated on `specialist.create`/`edit` ([`validate_role_spec`])
+/// but read leniently — an out-of-enum on-disk value is normalized to
+/// omitted (which inherits), so `list`/`get` never serve a value the strict
+/// write validation would reject when a client echoes the def back.
 /// `roleReminder` stays winner-takes-all — it is carried through only when
 /// present in the winning file (an omitted key falls back to auto-derivation
 /// from the winning body, so inheriting a lower tier's reminder would pin a
@@ -295,11 +321,60 @@ const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
     "reasoningEffort",
     "roleReminder",
     "agentType",
+    "role",
+    "icon",
 ];
 
 /// The subset of [`OPTIONAL_FRONTMATTER_KEYS`] with inherit-on-omit semantics
 /// across tiers; each key inherits independently.
-const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "reasoningEffort", "agentType"];
+const INHERITED_CONFIG_KEYS: &[&str] = &[
+    "codingAgent",
+    "model",
+    "reasoningEffort",
+    "agentType",
+    "role",
+    "icon",
+];
+
+/// Wire/frontmatter values accepted for the `role` enum on write (PROTOCOL
+/// §5.11): `orchestrator` (powers the team-mode card), `internal` (excluded
+/// from the New Workspace modal's single-agent picker only), or the
+/// explicit-clear empty string.
+const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
+
+/// The picker-metadata frontmatter keys (PROTOCOL §5.11) — the only
+/// frontmatter allowed to diverge between the v1 and v1.1 bundled specialist
+/// copies. Consumed only by the cross-version goldens (`v1_1_goldens`,
+/// `harness::tests`), which compare frontmatter modulo this set — hence the
+/// allow: the lib build has no reader.
+#[allow(dead_code)]
+pub(crate) const PICKER_METADATA_KEYS: &[&str] = &["role", "icon", TEAM_AGENTS_KEY];
+
+/// Strictly validate a wire `role` value (`specialist.create`/`edit` specs):
+/// when present it must be a string in [`ROLE_VALUES`] (`""` is the
+/// explicit clear); anything else → `-32602`. Files are read leniently — an
+/// out-of-enum on-disk value is normalized to omitted by
+/// [`build_def_inheriting`] (like an unparseable `teamAgents`), never served.
+fn validate_role_spec(value: Option<&Value>) -> Result<()> {
+    let Some(value) = value else { return Ok(()) };
+    match value.as_str() {
+        Some(s) if ROLE_VALUES.contains(&s) => Ok(()),
+        _ => Err(Error::InvalidParams(
+            "role must be \"orchestrator\", \"internal\", or \"\"".to_string(),
+        )),
+    }
+}
+
+/// Strictly validate a wire `icon` value (`specialist.create`/`edit` specs):
+/// when present it must be a string (`""` is the explicit clear); any other
+/// JSON type → `-32602`. Icon names are free-form (they name client-side
+/// avatar designs), so no enum is enforced.
+fn validate_icon_spec(value: Option<&Value>) -> Result<()> {
+    match value {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(_) => Err(Error::InvalidParams("icon must be a string".to_string())),
+    }
+}
 
 /// Frontmatter/wire key for the ordered list of delegation model options —
 /// `{ model, hint, reasoningEffort? }` entries a delegating agent can pick
@@ -401,6 +476,71 @@ fn parse_model_options_frontmatter(raw: &str) -> Option<Vec<Value>> {
     Some(normalized)
 }
 
+/// A lenient frontmatter parser for a single-line JSON-array scalar key
+/// ([`parse_model_options_frontmatter`] / [`parse_team_agents_frontmatter`]).
+type FrontmatterListParser = fn(&str) -> Option<Vec<Value>>;
+
+/// Frontmatter/wire key for the orchestrator's advisory team roster — the
+/// specialist ids it delegates to (PROTOCOL §5.11), used by clients to render
+/// the team-mode card; never enforced at delegation time.
+/// Encoded in frontmatter as a **single-line JSON-array scalar** (e.g.
+/// `teamAgents: ["implementor","verifier"]`) so it fits the line-based
+/// parser and round-trips losslessly. Resolution follows the same
+/// inherit-on-omit fold as [`MODEL_OPTIONS_KEY`]: an omitted key inherits the
+/// lower tiers' effective list, an explicit `[]` clears it, and a non-empty
+/// list overrides it wholesale (entries never merge across tiers).
+const TEAM_AGENTS_KEY: &str = "teamAgents";
+
+/// Strictly validate a wire `teamAgents` value (`specialist.create`/`edit`
+/// specs): must be a JSON array of non-empty (non-whitespace) strings.
+/// Returns the entries in input order (`None` when the key is absent — the
+/// inherit-on-omit case); any invalid shape → `-32602`.
+fn validate_team_agents_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(arr) = value.as_array() else {
+        return Err(Error::InvalidParams(
+            "teamAgents must be an array of specialist-id strings".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() => out.push(json!(s)),
+            _ => {
+                return Err(Error::InvalidParams(
+                    "teamAgents entries must be non-empty strings".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Leniently parse a frontmatter `teamAgents` scalar (the single-line
+/// JSON-array string), mirroring [`parse_model_options_frontmatter`]: an
+/// unparseable value or a non-array yields `None` (treated like an omitted
+/// key, which inherits), and unusable entries (non-strings, empty strings)
+/// are skipped individually. Only a literal `[]` is the explicit clear
+/// (`Some(vec![])`); a non-empty array whose entries are all unusable also
+/// yields `None`, so a bad hand-authored entry does not silently drop an
+/// inherited list.
+fn parse_team_agents_frontmatter(raw: &str) -> Option<Vec<Value>> {
+    let parsed: Value = serde_json::from_str(raw.trim()).ok()?;
+    let arr = parsed.as_array()?;
+    let normalized: Vec<Value> = arr
+        .iter()
+        .filter_map(|e| {
+            e.as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| json!(s))
+        })
+        .collect();
+    if normalized.is_empty() && !arr.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
 /// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
 /// `model.workspaceOverrides` setting (PROTOCOL §5.11/§5.12): old files and
 /// old-client `specialist.create`/`edit` specs may still carry them, but they
@@ -460,9 +600,10 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
 /// when the effective value is true. The config scalars
 /// ([`INHERITED_CONFIG_KEYS`]) inherit independently per key: an omitted key
 /// keeps the lower tiers' effective value, an explicit empty value clears it,
-/// and an explicit non-empty value overrides it; [`MODEL_OPTIONS_KEY`] follows
-/// the same fold with `[]` as the explicit clear. `roleReminder` does not
-/// inherit — it is emitted only when present in this file.
+/// and an explicit non-empty value overrides it; [`MODEL_OPTIONS_KEY`] and
+/// [`TEAM_AGENTS_KEY`] follow the same fold with `[]` as the explicit clear.
+/// `roleReminder` does not inherit — it is emitted only when present in this
+/// file.
 fn build_def_inheriting(
     id: &str,
     content: &str,
@@ -487,7 +628,15 @@ fn build_def_inheriting(
     def.insert("name".into(), json!(name));
     def.insert("description".into(), json!(description));
     for &key in OPTIONAL_FRONTMATTER_KEYS {
-        match fm.get(key).and_then(Value::as_str) {
+        // Lenient read normalization: an out-of-enum on-disk `role` is
+        // treated like an omitted key (which inherits), mirroring the
+        // unparseable-`teamAgents` case — `list`/`get` must never serve a
+        // value the strict write validation would reject on echo-back.
+        let value = fm
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| key != "role" || ROLE_VALUES.contains(v));
+        match value {
             Some(v) if !v.is_empty() => {
                 def.insert(key.into(), json!(v));
             }
@@ -507,28 +656,30 @@ fn build_def_inheriting(
             Some(_) | None => {}
         }
     }
-    // `modelOptions` (PROTOCOL §5.11): same inherit-on-omit fold as the config
-    // scalars — an omitted key inherits the lower tiers' effective list, an
-    // explicit `[]` clears it, and a non-empty list overrides it wholesale.
-    // Unparseable frontmatter is tolerated like an omitted key (files are
-    // never rejected on read).
-    match fm
-        .get(MODEL_OPTIONS_KEY)
-        .and_then(Value::as_str)
-        .and_then(parse_model_options_frontmatter)
-    {
-        Some(opts) if !opts.is_empty() => {
-            def.insert(MODEL_OPTIONS_KEY.into(), Value::Array(opts));
-        }
-        // Explicit `[]`: clears any inherited list (nothing emitted).
-        Some(_) => {}
-        None => {
-            if let Some(opts) = inherited
-                .and_then(|d| d.get(MODEL_OPTIONS_KEY))
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty())
-            {
-                def.insert(MODEL_OPTIONS_KEY.into(), Value::Array(opts.clone()));
+    // `modelOptions` / `teamAgents` (PROTOCOL §5.11): same inherit-on-omit
+    // fold as the config scalars — an omitted key inherits the lower tiers'
+    // effective list, an explicit `[]` clears it, and a non-empty list
+    // overrides it wholesale. Unparseable frontmatter is tolerated like an
+    // omitted key (files are never rejected on read).
+    let json_array_keys: [(&str, FrontmatterListParser); 2] = [
+        (MODEL_OPTIONS_KEY, parse_model_options_frontmatter),
+        (TEAM_AGENTS_KEY, parse_team_agents_frontmatter),
+    ];
+    for (key, parse) in json_array_keys {
+        match fm.get(key).and_then(Value::as_str).and_then(parse) {
+            Some(entries) if !entries.is_empty() => {
+                def.insert(key.into(), Value::Array(entries));
+            }
+            // Explicit `[]`: clears any inherited list (nothing emitted).
+            Some(_) => {}
+            None => {
+                if let Some(entries) = inherited
+                    .and_then(|d| d.get(key))
+                    .and_then(Value::as_array)
+                    .filter(|a| !a.is_empty())
+                {
+                    def.insert(key.into(), Value::Array(entries.clone()));
+                }
             }
         }
     }
@@ -561,9 +712,10 @@ fn build_def_inheriting(
 /// the prompt body. For the config scalars ([`INHERITED_CONFIG_KEYS`]) an
 /// explicit empty string writes `key: ""` — the explicit-clear that stops
 /// inheritance — while an absent key writes nothing (inherits); an empty
-/// `roleReminder` is skipped like an absent one. A supplied
-/// [`MODEL_OPTIONS_KEY`] list is written as a single-line JSON-array scalar
-/// (an explicit `[]` is the clear; an absent key writes nothing). The body is
+/// `roleReminder` is skipped like an absent one. Supplied
+/// [`MODEL_OPTIONS_KEY`] / [`TEAM_AGENTS_KEY`] lists are written as
+/// single-line JSON-array scalars (an explicit `[]` is the clear; an absent
+/// key writes nothing). The body is
 /// taken from `prompt`, falling back to the `behaviorPrompt` alias (mirroring
 /// `SpecialistProposalPayload`). Only documented fields are written so
 /// parse→write→parse round-trips losslessly.
@@ -584,13 +736,16 @@ fn render_file(id: &str, spec: &Value) -> String {
             }
         }
     }
-    // `modelOptions` is written as a single-line JSON-array scalar; an
-    // explicit empty array writes `modelOptions: []` — the explicit clear
+    // `modelOptions` / `teamAgents` are written as single-line JSON-array
+    // scalars; an explicit empty array writes `key: []` — the explicit clear
     // that stops inheritance — while an absent key writes nothing (inherits).
-    // `create`/`edit` validate the value before rendering (`-32602` on
+    // `create`/`edit` validate the values before rendering (`-32602` on
     // invalid shapes); `render_file` itself silently skips anything invalid.
     if let Ok(Some(opts)) = validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY)) {
         fm.push(format!("{MODEL_OPTIONS_KEY}: {}", Value::Array(opts)));
+    }
+    if let Ok(Some(agents)) = validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY)) {
+        fm.push(format!("{TEAM_AGENTS_KEY}: {}", Value::Array(agents)));
     }
     if let Some(hidden) = hidden_state(spec.get("hidden")) {
         fm.push(format!("hidden: {hidden}"));
@@ -1119,6 +1274,9 @@ impl SpecialistsService {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
+        validate_role_spec(spec.get("role"))?;
+        validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if path.exists() {
@@ -1153,6 +1311,9 @@ impl SpecialistsService {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
+        validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
+        validate_role_spec(spec.get("role"))?;
+        validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if !path.exists() {
@@ -1275,6 +1436,39 @@ mod tests {
         assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
         assert_eq!(def["behaviorPrompt"], "You loop.\nForever.");
+    }
+
+    #[test]
+    fn escape_yaml_round_trips_backslash_sequences() {
+        // Regression: the sequential-replace unescaper corrupted a literal
+        // backslash followed by `n`/`t`/`\` — `foo\nbar` (backslash + n)
+        // escaped to `foo\\nbar` but decoded back as backslash + newline.
+        // The single-pass decoder round-trips every such value.
+        let cases = [
+            "foo\\nbar",
+            "foo\\\\nbar",
+            "tab\\tstop",
+            "trailing\\",
+            "real\nnewline",
+            "mixed \\n and \n and \\\\ and \"quotes\"",
+        ];
+        for value in cases {
+            assert_eq!(
+                unescape_yaml(&escape_yaml(value)),
+                value,
+                "escape→unescape round-trips {value:?}"
+            );
+        }
+        // The full file path round-trips a description carrying the same
+        // hazard (frontmatter scalars are the consumers of the escaper).
+        let spec = json!({
+            "name": "Z",
+            "description": "path C:\\new\\table",
+            "prompt": "body"
+        });
+        let rendered = render_file("z", &spec);
+        let def = build_def("z", &rendered, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["description"], "path C:\\new\\table");
     }
 
     #[test]
@@ -2550,6 +2744,258 @@ mod tests {
             assert!(
                 matches!(err, Error::InvalidParams(_)),
                 "edit rejects {spec} with InvalidParams, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_icon_and_team_agents_round_trip_losslessly() {
+        // The picker-metadata fields write as frontmatter (role/icon as
+        // quoted scalars, teamAgents as a single-line JSON-array scalar) and
+        // parse back byte-identical.
+        let spec = json!({
+            "name": "Zeta",
+            "description": "d",
+            "role": "orchestrator",
+            "icon": "coordinator",
+            "teamAgents": ["implementor", "verifier"],
+            "prompt": "body"
+        });
+        let rendered = render_file("zeta", &spec);
+        assert!(rendered.contains("role: \"orchestrator\""), "{rendered}");
+        assert!(rendered.contains("icon: \"coordinator\""), "{rendered}");
+        assert!(
+            rendered.contains(r#"teamAgents: ["implementor","verifier"]"#),
+            "single-line JSON-array scalar is written: {rendered}"
+        );
+        let def = build_def("zeta", &rendered, "user", Path::new("/tmp/zeta.md"));
+        assert_eq!(def["role"], "orchestrator");
+        assert_eq!(def["icon"], "coordinator");
+        assert_eq!(def["teamAgents"], json!(["implementor", "verifier"]));
+        // A second write of the parsed def is byte-identical (stable order).
+        assert_eq!(render_file("zeta", &def), rendered);
+    }
+
+    #[test]
+    fn role_icon_inherit_across_tiers_with_explicit_clear() {
+        // role/icon fold like the other config scalars: omit → inherit,
+        // explicit empty → clear, non-empty → override.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nrole: \"internal\"\nicon: \"verifier\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["role"], "internal",
+            "omitted role inherits"
+        );
+        assert_eq!(
+            got["specialist"]["icon"], "verifier",
+            "omitted icon inherits"
+        );
+
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nrole: \"\"\nicon: \"ralph\"\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("role").is_none(),
+            "explicit empty clears the inherited role"
+        );
+        assert_eq!(
+            got["specialist"]["icon"], "ralph",
+            "explicit non-empty icon overrides"
+        );
+    }
+
+    #[test]
+    fn team_agents_inherit_across_tiers_with_explicit_clear() {
+        // Inherit-on-omit fold: omit → inherit, explicit `[]` → clear,
+        // non-empty → wholesale override (entries never merge).
+        let bundled_fm = "---\nname: \"Zeta\"\ndescription: \"d\"\nteamAgents: [\"implementor\",\"verifier\"]\n---\n\nbody";
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write("zeta", bundled_fm);
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["teamAgents"],
+            json!(["implementor", "verifier"]),
+            "omitted key inherits the lower tier's list"
+        );
+
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nteamAgents: []\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("teamAgents").is_none(),
+            "explicit [] clears the inherited list"
+        );
+
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nteamAgents: [\"reviewer\"]\n---\n\nbody",
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["teamAgents"],
+            json!(["reviewer"]),
+            "a non-empty list overrides wholesale, never merges"
+        );
+    }
+
+    #[test]
+    fn role_and_team_agents_frontmatter_are_lenient_on_read() {
+        // Files are never rejected on read: an out-of-enum role is
+        // normalized to omitted (so get→modify→edit never echoes a value the
+        // strict write validation rejects), an unparseable teamAgents is
+        // treated as omitted, and unusable entries are skipped individually
+        // (all-unusable ⇒ omitted, not clear).
+        let content =
+            "---\nname: \"Z\"\ndescription: \"d\"\nrole: \"mystery\"\nteamAgents: not-json\n---\n\nbody";
+        let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("role").is_none(),
+            "out-of-enum role is normalized to omitted"
+        );
+        assert!(
+            def.get("teamAgents").is_none(),
+            "unparseable value is treated as omitted"
+        );
+        // An out-of-enum role inherits like an omitted key: the def echoed
+        // by get is always writable back through the strict edit validation.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nrole: \"mystery\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["role"], "internal",
+            "an out-of-enum role inherits the lower tier's value like an omitted key"
+        );
+        let echoed = got["specialist"].clone();
+        svc.edit("zeta", &echoed, "user", None)
+            .expect("a get→edit echo of a def never fails role validation");
+        let mixed = "---\nname: \"Z\"\ndescription: \"d\"\nteamAgents: [\"implementor\", 42, \"\", \"verifier\"]\n---\n\nbody";
+        let def = build_def("z", mixed, "user", Path::new("/tmp/z.md"));
+        assert_eq!(
+            def["teamAgents"],
+            json!(["implementor", "verifier"]),
+            "unusable entries are skipped individually"
+        );
+        let all_bad = "---\nname: \"Z\"\ndescription: \"d\"\nteamAgents: [42, \"\"]\n---\n\nbody";
+        let def = build_def("z", all_bad, "user", Path::new("/tmp/z.md"));
+        assert!(
+            def.get("teamAgents").is_none(),
+            "a non-empty array with only unusable entries is treated as omitted, not a clear"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_reject_invalid_role_and_team_agents() {
+        // Invalid wire shapes → InvalidParams (-32602) for both create and
+        // edit; the valid enum values (and explicit clears) are accepted.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let invalid_specs = [
+            json!({ "name": "Z", "description": "d", "role": "manager" }),
+            json!({ "name": "Z", "description": "d", "role": 42 }),
+            json!({ "name": "Z", "description": "d", "icon": 42 }),
+            json!({ "name": "Z", "description": "d", "icon": ["coordinator"] }),
+            json!({ "name": "Z", "description": "d", "teamAgents": "not-an-array" }),
+            json!({ "name": "Z", "description": "d", "teamAgents": [42] }),
+            json!({ "name": "Z", "description": "d", "teamAgents": [""] }),
+            json!({ "name": "Z", "description": "d", "teamAgents": ["   "] }),
+        ];
+        for spec in &invalid_specs {
+            let err = svc.create("zeta", spec, Some("user"), None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "create rejects {spec} with InvalidParams, got {err:?}"
+            );
+            assert!(
+                !user.path.join("zeta.md").exists(),
+                "nothing is written on a rejected create"
+            );
+        }
+        let valid = json!({
+            "name": "Z",
+            "description": "d",
+            "role": "internal",
+            "teamAgents": ["implementor"],
+            "prompt": "body"
+        });
+        let created = svc.create("zeta", &valid, Some("user"), None).unwrap();
+        assert_eq!(created["specialist"]["role"], "internal");
+        assert_eq!(created["specialist"]["teamAgents"], json!(["implementor"]));
+        for spec in &invalid_specs {
+            let err = svc.edit("zeta", spec, "user", None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParams(_)),
+                "edit rejects {spec} with InvalidParams, got {err:?}"
+            );
+        }
+        // Explicit clears are valid wire values.
+        let cleared = json!({
+            "name": "Z",
+            "description": "d",
+            "role": "",
+            "teamAgents": [],
+            "prompt": "body"
+        });
+        let edited = svc.edit("zeta", &cleared, "user", None).unwrap();
+        assert!(edited["specialist"].get("role").is_none());
+        assert!(edited["specialist"].get("teamAgents").is_none());
+    }
+
+    #[test]
+    fn embedded_bundle_carries_picker_metadata() {
+        // The v1.1 embedded bundle resolves the new picker-metadata fields:
+        // spec-writer is the orchestrator with its advisory roster,
+        // implementor/verifier are internal, and every def carries an icon.
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let sw = svc.get("spec-writer", None).unwrap();
+        assert_eq!(sw["specialist"]["role"], "orchestrator");
+        assert_eq!(
+            sw["specialist"]["teamAgents"],
+            json!(["implementor", "verifier"])
+        );
+        assert_eq!(sw["specialist"]["icon"], "coordinator");
+        for id in ["implementor", "verifier"] {
+            let got = svc.get(id, None).unwrap();
+            assert_eq!(got["specialist"]["role"], "internal", "{id}");
+            assert_eq!(got["specialist"]["icon"], id, "{id}");
+        }
+        for id in EMBEDDED_IDS {
+            let got = svc.get(id, None).unwrap();
+            assert!(
+                got["specialist"]["icon"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "{id}: carries an icon"
             );
         }
     }
