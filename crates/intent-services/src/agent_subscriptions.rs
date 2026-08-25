@@ -223,11 +223,13 @@ impl Services {
     }
 
     /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
-    /// watch that also wakes on the child's attention requests, with an
-    /// AWAITED persist (the registration is the caller's durable contract).
+    /// watch with an AWAITED persist (the registration is the caller's
+    /// durable contract). Attention wakes reach every active watch
+    /// regardless of the `wake_on_attention` flag (monorepo#3443); the flag
+    /// is kept as the persisted record of an explicit registration.
     /// Adoption strengthens an existing watch for the pair
     /// (`wake_on_attention` set) — grouped watches keep their group but gain
-    /// the attention flag.
+    /// the flag.
     pub(crate) async fn register_agent_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
