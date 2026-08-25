@@ -1564,22 +1564,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             false,
         ),
-        boolean(
-            "agentFeatures.unreadSummaries",
-            "Unread summaries",
-            "Expose the unread-digest surface (ws.chat.unread) to top-level agents; applies to new sessions only",
-            "agentFeatures",
-            false,
-        ),
-        number(
-            "agentFeatures.unreadSummarizeThreshold",
-            "Unread summarize threshold",
-            "Unread-message count at which ws.chat.unread guidance suggests summarizing instead of reading in full; applies to new sessions only",
-            "agentFeatures",
-            Some(1.0),
-            Some(1_000.0),
-            f64::from(intent_core::config::DEFAULT_UNREAD_SUMMARIZE_THRESHOLD),
-        ),
         number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
@@ -3123,7 +3107,6 @@ mod tests {
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
             ("agentFeatures.peerAgents", false),
-            ("agentFeatures.unreadSummaries", false),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -3138,20 +3121,6 @@ mod tests {
             );
             assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
         }
-
-        // The one non-boolean in the category: the summarize-threshold number
-        // pins its default to the shared const so the catalog cannot drift
-        // from the struct default and the doc needle.
-        let threshold = find_definition("agentFeatures.unreadSummarizeThreshold")
-            .expect("agentFeatures.unreadSummarizeThreshold missing");
-        assert!(matches!(threshold.ty, SettingType::Number { .. }));
-        assert_eq!(
-            threshold.default_value,
-            Some(json!(f64::from(
-                intent_core::config::DEFAULT_UNREAD_SUMMARIZE_THRESHOLD
-            ))),
-            "threshold default must derive from DEFAULT_UNREAD_SUMMARIZE_THRESHOLD"
-        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-agentfeat-{tag}.db"));
