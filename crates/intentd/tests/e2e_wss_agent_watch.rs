@@ -2156,16 +2156,13 @@ async fn wake_rows_serialized(
 #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2528: the immediate `agent.reportToParent` wake over the real
 /// transport says "reported" (a report is not necessarily a completion) and
-/// discloses the watch disarm exactly when the call flips the parent's
-/// ungrouped watch to `report_delivered`:
-///  - the FIRST report in a turn carries the retirement NOTE with the
-///    `ws.agent.watch` re-arm pointer (#2051 parity) plus
-///    `watchStillArmed: false` on the wake metadata (#2060 parity);
-///  - a REPEAT report in the same turn (watch already flipped) and a
-///    post-retirement report (no watch left at all) still wake the parent but
-///    carry neither the NOTE nor the `watchStillArmed` key;
-///  - the child's genuine idle after the report delivers NO completion wake —
-///    the flipped watch suppresses `agent:idle` and silently retires.
+/// keeps the parent's ungrouped completion watch armed across progress:
+///  - each report before completion omits the retirement NOTE and carries
+///    `watchStillArmed: true` on the wake metadata;
+///  - the child's genuine idle delivers the distinct terminal wake and retires
+///    the watch with `watchStillArmed: false`;
+///  - a post-retirement report still wakes the parent but omits the
+///    `watchStillArmed` key because no watch remains.
 /// (The disclosed re-arm path itself — `ws.agent.watch` after the report wake
 /// firing at the child's next genuine completion — is covered by the WATCH5
 /// adoption test above.)
@@ -2274,9 +2271,7 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
     )
     .await;
 
-    // Per-row disclosure audit. First report flipped the auto watch: full
-    // disclosure — "reported", retirement NOTE with the re-arm pointer, and
-    // the machine-readable metadata twin.
+    // Per-row disclosure audit. Both progress reports retain the auto watch.
     let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
     req_id += 1;
     let row1 = rows
@@ -2288,20 +2283,14 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
         "first report wake says reported: {row1}"
     );
     assert!(
-        row1.contains("consumed your one-shot watch"),
-        "first report wake carries the disarm NOTE: {row1}"
+        !row1.contains("consumed your one-shot watch"),
+        "first progress wake carries no disarm NOTE: {row1}"
     );
     assert!(
-        row1.contains(&format!("ws.agent.watch(\\\"{child}\\\")")),
-        "disarm NOTE carries the re-arm pointer naming the child: {row1}"
+        row1.contains("\"watchStillArmed\":true"),
+        "first progress wake metadata tags watchStillArmed=true: {row1}"
     );
-    assert!(
-        row1.contains("\"watchStillArmed\":false"),
-        "first report wake metadata tags watchStillArmed=false: {row1}"
-    );
-    // Repeat report in the same turn found the watch already flipped: the
-    // wake still delivers but carries NO disclosure — no NOTE, and the
-    // watchStillArmed key is absent entirely.
+    // A repeat report is also progress and leaves the same watch armed.
     let row2 = rows
         .iter()
         .find(|r| r.contains(REPORT2))
@@ -2315,13 +2304,12 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
         "repeat report wake must not carry the disarm NOTE: {row2}"
     );
     assert!(
-        !row2.contains("watchStillArmed"),
-        "repeat report wake metadata must omit the watchStillArmed key: {row2}"
+        row2.contains("\"watchStillArmed\":true"),
+        "repeat progress wake metadata tags watchStillArmed=true: {row2}"
     );
 
-    // Suppression: the flipped watch skips the child's genuine agent:idle and
-    // silently retires — the parent gets NO completion wake, only the two
-    // report wakes.
+    // Terminal completion retires the still-armed watch and delivers a distinct
+    // completion wake after the two progress wakes.
     await_watch_count(
         &mut setup.rpc,
         &mut req_id,
@@ -2342,8 +2330,18 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
     )
     .await;
     assert!(
-        !text.contains("completed."),
-        "the reported child's idle must not deliver a second wake: {text}"
+        text.contains("completed."),
+        "the reported child's idle delivers the terminal wake: {text}"
+    );
+    let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
+    req_id += 1;
+    let terminal = rows
+        .iter()
+        .find(|row| row.contains("completed."))
+        .unwrap_or_else(|| panic!("terminal wake row present: {rows:?}"));
+    assert!(
+        terminal.contains("\"watchStillArmed\":false"),
+        "terminal wake metadata tags watchStillArmed=false: {terminal}"
     );
     let wakes = wake_row_count(
         &mut setup.rpc,
@@ -2354,7 +2352,7 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
     )
     .await;
     req_id += 1;
-    assert_eq!(wakes, 2, "exactly the two report wakes, nothing else");
+    assert_eq!(wakes, 3, "two progress wakes and one terminal wake");
 
     // Post-retirement report (the watch is gone, nothing to flip): the wake
     // still delivers, again with no disclosure.
@@ -2393,20 +2391,8 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
         !row3.contains("watchStillArmed"),
         "post-retirement report wake metadata must omit the watchStillArmed key: {row3}"
     );
-    // And the watchless idle after this second turn delivers nothing either.
+    // And the watchless idle after this second turn delivers nothing else.
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let text = await_conversation_settled(
-        &mut setup.rpc,
-        &mut req_id,
-        &ws_id,
-        &parent,
-        budget.step(60),
-    )
-    .await;
-    assert!(
-        !text.contains("completed."),
-        "the watchless child's idle must not deliver a completion wake: {text}"
-    );
     let wakes = wake_row_count(
         &mut setup.rpc,
         req_id,
@@ -2415,5 +2401,8 @@ async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss()
         "Child agent DiscloseChild",
     )
     .await;
-    assert_eq!(wakes, 3, "exactly the three report wakes, nothing else");
+    assert_eq!(
+        wakes, 4,
+        "two initial progress wakes, one terminal wake, and one watchless progress wake"
+    );
 }

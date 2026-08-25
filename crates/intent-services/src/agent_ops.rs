@@ -197,7 +197,8 @@ fn assignment_content(content: &str) -> String {
 }
 
 fn scope_overlaps_path(scope: &str, path: &str) -> bool {
-    scope == path
+    scope.is_empty()
+        || scope == path
         || path
             .strip_prefix(scope)
             .is_some_and(|rest| rest.starts_with('/'))
@@ -7019,6 +7020,17 @@ impl Services {
                 .ok(),
             None => None,
         };
+        // The legacy `noteId` + `taskText` form addresses a checkbox inside a
+        // regular containing note. Keep its session linkage, but do not apply
+        // task-assignment fencing when that note has no task metadata. Modern
+        // `taskNoteId` delegations and legacy forms that resolve to real task
+        // notes retain the full task fence.
+        let legacy_checkbox_note = input.task_note_id.is_none()
+            && input.note_id.is_some()
+            && task_text_msg.is_some()
+            && task_note
+                .as_ref()
+                .is_some_and(|note| note.metadata.task.is_none());
         if message.is_none() {
             if let Some(note) = task_note.as_ref() {
                 message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
@@ -7246,11 +7258,13 @@ impl Services {
             ASSIGNMENT_INSTRUCTIONS_KEY.to_string(),
             json!(assignment_instructions),
         );
-        if let Some(task_note_id) = &session_task_note_id {
-            extra_metadata.insert(
-                ASSIGNMENT_TASK_NOTE_ID_KEY.to_string(),
-                json!(task_note_id.0),
-            );
+        if !legacy_checkbox_note {
+            if let Some(task_note_id) = &session_task_note_id {
+                extra_metadata.insert(
+                    ASSIGNMENT_TASK_NOTE_ID_KEY.to_string(),
+                    json!(task_note_id.0),
+                );
+            }
         }
         let extra = AgentCreateExtra {
             provider: delegate_provider,

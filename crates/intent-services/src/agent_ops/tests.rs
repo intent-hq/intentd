@@ -26,11 +26,11 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
-    assignment_repository_path, canonical_assignment_scope, ensure_effort_supported_by_model,
-    fetch_auggie_models, fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows,
-    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
-    parse_model_list_json, parse_model_list_output, parse_session_stats_output,
-    resolve_auggie_bin_with,
+    assignment_fence, assignment_repository_path, canonical_assignment_scope,
+    ensure_effort_supported_by_model, fetch_auggie_models, fetch_auggie_models_rich,
+    fetch_session_stats, finalize_model_rows, last_response_and_digest_from_blocks,
+    live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
+    parse_session_stats_output, resolve_auggie_bin_with, scope_overlaps_path,
 };
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
@@ -7021,6 +7021,27 @@ fn assignment_scope_rejects_multiple_git_repositories() {
     );
 }
 
+#[test]
+fn assignment_scope_equal_to_nested_repository_root_matches_every_path() {
+    let root = tempfile::tempdir().expect("root repo");
+    git2::Repository::init(root.path()).expect("init root repo");
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested dir");
+    git2::Repository::init(&nested).expect("init nested repo");
+
+    let assignment_repo = assignment_repository_path(root.path(), &["nested".into()])
+        .expect("nested repository root scope");
+    let workspace_root = root.path().canonicalize().expect("canonical root");
+    let repo_relative = workspace_root
+        .join("nested")
+        .strip_prefix(&assignment_repo)
+        .expect("scope is inside assignment repository")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(repo_relative.is_empty());
+    assert!(scope_overlaps_path(&repo_relative, "src/lib.rs"));
+}
+
 #[tokio::test]
 async fn delegated_assignment_fence_survives_progress_and_is_projected() {
     let (_t, svc, ws) = setup().await;
@@ -7165,6 +7186,86 @@ async fn report_quarantines_changed_task_meaning_without_side_effects() {
     assert_eq!(
         task.metadata.task.expect("task metadata").status,
         intent_core::TaskStatus::InProgress
+    );
+
+    let attention = svc
+        .agent_request_attention_op(
+            ws,
+            "blocker".into(),
+            "stale blocker".into(),
+            Some(child.clone()),
+        )
+        .await
+        .expect("attention quarantine result");
+    assert_eq!(attention["quarantined"], json!(true));
+    assert_eq!(attention["reason"], json!("task-revision-mismatch"));
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(session.attention_request_kind.is_none());
+}
+
+#[tokio::test]
+async fn legacy_checkbox_delegate_can_report_and_request_attention() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Checklist".into(),
+                content: Some("- [ ] Ship the fix".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create containing note")
+        .note;
+    assert!(note.metadata.task.is_none());
+    let delegated = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                note_id: Some(note.id.clone()),
+                task_text: Some("Ship the fix".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate checkbox task");
+    let child = AgentId::from(delegated["agentId"].as_str().expect("agentId"));
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(session.task_note_id.as_ref(), Some(&note.id));
+    assert!(assignment_fence(&session)
+        .expect("scope fence")
+        .task_note_id
+        .is_none());
+
+    let report = svc
+        .agent_report_to_parent_op(ws.clone(), json!("done"), Some(child.clone()))
+        .await
+        .expect("legacy report");
+    assert_eq!(report["ok"], json!(true));
+    assert!(report.get("quarantined").is_none());
+
+    let attention = svc
+        .agent_request_attention_op(
+            ws,
+            "discussion".into(),
+            "need a decision".into(),
+            Some(child.clone()),
+        )
+        .await
+        .expect("legacy attention request");
+    assert_eq!(attention["ok"], json!(true));
+    assert!(attention.get("quarantined").is_none());
+    let session = svc.store().get_agent_session(&child).await.expect("child");
+    assert_eq!(session.completion_report.as_deref(), Some("done"));
+    assert_eq!(
+        session.attention_request_kind.as_deref(),
+        Some("discussion")
     );
 }
 
@@ -19004,15 +19105,37 @@ async fn wait_for_group_children(
     .expect("delegation group recorded child completions");
 }
 
+async fn wait_for_child_watch_cleanup(svc: &Services, child: &AgentId) {
+    timeout(Duration::from_secs(2), async {
+        while !svc.find_watches_for_child(child).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal child completion retired its watches");
+}
+
+async fn wait_for_group_cleanup(svc: &Services, parent: &AgentId) {
+    timeout(Duration::from_secs(2), async {
+        while svc.delegation_group_for_parent(parent).is_some()
+            || !svc.list_watches_for_parent(parent).is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("terminal group settlement retired the group and watches");
+}
+
 /// One joined service-level integration test that drives the full
 /// auto-subscription loop through the real `spawn_completion_delivery_loop` worker
 /// and the `EventBus` publish path (not `handle_completion_event` directly):
-///   (a) an immediate delegate registers an ungrouped watch; the child's agent:idle
-///       published on the bus wakes the parent exactly once and the watch is
-///       cleared from the registry;
-///   (b) an `after_all` group of two children yields no wake until the parent
-///       seals on its own agent:idle and both children complete -- a deleted
-///       child still counts -- then exactly one aggregated partial wake;
+///   (a) an immediate delegate registers an ungrouped watch; progress leaves it
+///       armed, then the child's terminal agent:idle wakes the parent and clears
+///       the watch from the registry;
+///   (b) progress leaves an `after_all` group and both watches live; terminal
+///       child events plus the parent's sealing agent:idle then produce exactly
+///       one aggregated partial wake (a deleted child still counts);
 ///   (c) agent.getSubscriptions / agent.cancelSubscriptions reflect the live
 ///       registry across the loop (populated mid-flight, empty after the group
 ///       settles and after an explicit cancel).
@@ -19026,7 +19149,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
 
     let parent = create_agent(&svc, &ws, "Parent").await;
 
-    // ---- (a) immediate delegate -> single completion wake + watch cleanup ----
+    // ---- (a) progress retains the watch; terminal idle retires it ----
     let resp = svc
         .agent_delegate_op(
             ws.clone(),
@@ -19049,16 +19172,35 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
     );
     assert_eq!(list[0]["actorIds"], json!([child1.0]));
 
+    svc.agent_report_to_parent_op(
+        ws.clone(),
+        json!("progress before completion"),
+        Some(child1.clone()),
+    )
+    .await
+    .expect("progress report");
+    wait_for_message_count(&svc, &parent, 1).await;
+    assert_eq!(
+        svc.find_watches_for_child(&child1).len(),
+        1,
+        "nonterminal progress keeps the completion watch armed"
+    );
+
     publish_completion(
         &bus,
         &ws,
         AGENT_IDLE,
         &child1,
-        json!({ "agentId": child1.0, "lastResponseSummary": "shipped" }),
+        json!({
+            "agentId": child1.0,
+            "lastResponseSummary": "shipped",
+            "completionReport": "progress before completion",
+        }),
     )
     .await;
-    wait_for_message_count(&svc, &parent, 1).await;
+    wait_for_message_count(&svc, &parent, 2).await;
 
+    wait_for_child_watch_cleanup(&svc, &child1).await;
     assert!(svc.find_watches_for_child(&child1).is_empty());
     let subs = svc
         .agent_get_subscriptions(ws.clone(), parent.clone())
@@ -19086,11 +19228,31 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         2
     );
 
-    // c1 idle then c2 deleted: both recorded, but no wake while unsealed.
-    publish_completion(&bus, &ws, AGENT_IDLE, &c1, json!({ "agentId": c1.0 })).await;
+    // Grouped reports are progress too: no immediate wake, and the group plus
+    // both watches stay live until terminal child events settle them.
+    svc.agent_report_to_parent_op(ws.clone(), json!("c1 progress"), Some(c1.clone()))
+        .await
+        .expect("c1 progress report");
+    svc.agent_report_to_parent_op(ws.clone(), json!("c2 progress"), Some(c2.clone()))
+        .await
+        .expect("c2 progress report");
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
+    assert_eq!(svc.list_watches_for_parent(&parent).len(), 2);
+
+    // c1 idle then c2 deleted: both terminal events are recorded, but no wake
+    // occurs while the group remains unsealed.
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0, "completionReport": "c1 progress" }),
+    )
+    .await;
     publish_completion(&bus, &ws, AGENT_DELETED, &c2, json!({ "agentId": c2.0 })).await;
     wait_for_group_children(&svc, &ws, &parent, 2).await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
 
     // The parent's own idle seals the group; now complete -> ONE partial wake.
     publish_completion(
@@ -19101,8 +19263,8 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         json!({ "agentId": parent.0 }),
     )
     .await;
-    wait_for_message_count(&svc, &parent, 2).await;
-    assert_eq!(parent_message_count(&svc, &parent).await, 2);
+    wait_for_message_count(&svc, &parent, 3).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 3);
     assert!(
         parent_messages_text(&svc, &parent)
             .await
@@ -19110,6 +19272,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         "a deleted child should yield a partial aggregated wake"
     );
 
+    wait_for_group_cleanup(&svc, &parent).await;
     assert!(svc.delegation_group_for_parent(&parent).is_none());
     assert!(svc.list_watches_for_parent(&parent).is_empty());
     let subs = svc
