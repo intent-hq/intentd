@@ -1556,6 +1556,7 @@ mod tests {
                 pr_monitor: false,
                 task_graph: false,
                 peer_agents: false,
+                mcp_tools: false,
             },
         ));
         for is_chief in [false, true] {
@@ -2397,6 +2398,7 @@ mod tests {
             pr_monitor: false,
             task_graph: false,
             peer_agents: false,
+            mcp_tools: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -2604,6 +2606,7 @@ mod tests {
             pr_monitor: false,
             task_graph: false,
             peer_agents: false,
+            mcp_tools: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),

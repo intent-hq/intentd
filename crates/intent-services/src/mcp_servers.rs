@@ -1421,6 +1421,119 @@ impl<'a> McpServersService<'a> {
             .unwrap_or(false)
             .then_some(config)
     }
+
+    // -- agent surface (`ws.mcp.*` — bridge/hooks, no wire method) -----------
+
+    /// Gate shared by every agent-facing entry point: the
+    /// `agentFeatures.mcpTools` toggle and the `mcp.enableUserServers`
+    /// master switch, both read live per call.
+    fn require_agent_mcp(&self) -> Result<SettingsFile> {
+        let settings = self.effective();
+        if !settings.agent_features.mcp_tools {
+            return Err(Error::InvalidParams(
+                "mcp: disabled in settings (agentFeatures.mcpTools = false)".to_string(),
+            ));
+        }
+        if !enable_user_servers(&settings) {
+            return Err(Error::InvalidParams(
+                "mcp: user servers disabled in settings (mcp.enableUserServers = false)"
+                    .to_string(),
+            ));
+        }
+        Ok(settings)
+    }
+
+    /// Preconditions for forwarding one tool request on behalf of an agent:
+    /// the settings gates, the server is defined, and it is neither
+    /// `enabled: false` nor listed in `mcp.disabledServers`.
+    async fn require_agent_server(&self, server_id: &str) -> Result<()> {
+        let settings = self.require_agent_mcp()?;
+        let config = self.require_config(server_id).await?;
+        let enabled = config
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !enabled || disabled_servers(&settings).iter().any(|d| d == server_id) {
+            return Err(Error::InvalidParams(format!(
+                "mcp server {server_id} is disabled"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `ws.mcp.listServers`: every configured server projected to a
+    /// non-sensitive allowlist — id, name, transport, enabled, live state
+    /// and toolCount — sorted by id. The shape is built fresh (never a
+    /// redacted config copy) so `env`/`headers`/`command` cannot leak.
+    pub(crate) async fn agent_list_servers(&self) -> Result<Value> {
+        self.require_agent_mcp()?;
+        let configs = read_configs(self.secrets).await;
+        let mut servers: Vec<Value> = configs
+            .values()
+            .map(|config| {
+                let id = config_id(config);
+                let status = self.hub.status(&id);
+                let mut m = Map::new();
+                m.insert("id".into(), json!(id));
+                m.insert(
+                    "name".into(),
+                    json!(config.get("name").and_then(Value::as_str).unwrap_or(&id)),
+                );
+                m.insert(
+                    "transport".into(),
+                    json!(config
+                        .get("transport")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stdio")),
+                );
+                m.insert(
+                    "enabled".into(),
+                    json!(config
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)),
+                );
+                m.insert(
+                    "state".into(),
+                    status.get("state").cloned().unwrap_or(json!("stopped")),
+                );
+                if let Some(tc) = status.get("toolCount") {
+                    m.insert("toolCount".into(), tc.clone());
+                }
+                Value::Object(m)
+            })
+            .collect();
+        servers.sort_by_key(config_id);
+        Ok(json!({ "servers": servers }))
+    }
+
+    /// `ws.mcp.listTools`: forward `tools/list` to one enabled server after
+    /// the settings gates; the raw MCP result (`{ tools: [...] }`).
+    pub(crate) async fn agent_list_tools(&self, server_id: &str) -> Result<Value> {
+        self.require_agent_server(server_id).await?;
+        self.hub.list_tools(server_id).await
+    }
+
+    /// `ws.mcp.callTool`: forward `tools/call` to one enabled server after
+    /// the settings gates; the raw MCP result. `timeout_ms` is the caller
+    /// override the hub caps at its own bound.
+    pub(crate) async fn agent_call_tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value> {
+        self.require_agent_server(server_id).await?;
+        self.hub
+            .call_tool(
+                server_id,
+                tool_name,
+                args,
+                timeout_ms.map(Duration::from_millis),
+            )
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -2249,6 +2362,139 @@ mod tests {
         svc(None, &secrets, &h).start_enabled().await;
         // Spawn failed → no live entry → status stays stopped.
         assert_eq!(h.status("go"), status_stopped("go"));
+    }
+
+    // -- agent surface (ws.mcp.*) -------------------------------------------
+
+    #[tokio::test]
+    async fn agent_list_servers_projects_allowlist_never_secrets() {
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        m.insert(
+            "b".into(),
+            json!({"id":"b","name":"Beta","transport":"http","url":"http://x",
+                   "enabled":true,"headers":{"Authorization":"Bearer hidden"}}),
+        );
+        m.insert(
+            "a".into(),
+            json!({"id":"a","command":"secret-cmd","args":["--token","hush"],
+                   "enabled":false,"env":{"KEY":"VAL"}}),
+        );
+        write_configs(&secrets, &m).await.unwrap();
+
+        let r = svc(None, &secrets, &h).agent_list_servers().await.unwrap();
+        let arr = r["servers"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Sorted by id; only allowlisted keys appear.
+        assert_eq!(arr[0]["id"], json!("a"));
+        assert_eq!(arr[1]["id"], json!("b"));
+        assert_eq!(arr[0]["name"], json!("a")); // name falls back to id
+        assert_eq!(arr[1]["name"], json!("Beta"));
+        assert_eq!(arr[0]["transport"], json!("stdio"));
+        assert_eq!(arr[1]["transport"], json!("http"));
+        assert_eq!(arr[0]["enabled"], json!(false));
+        assert_eq!(arr[1]["enabled"], json!(true));
+        assert_eq!(arr[0]["state"], json!("stopped"));
+        for server in arr {
+            let keys: Vec<&str> = server
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            for key in keys {
+                assert!(
+                    ["id", "name", "transport", "enabled", "state", "toolCount"].contains(&key),
+                    "unexpected key leaked: {key}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_surface_rejected_when_mcp_tools_toggle_off() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        reg.apply(&[("agentFeatures.mcpTools".to_string(), json!(false))])
+            .unwrap();
+        let s = svc(Some(&reg), &secrets, &h);
+
+        for err in [
+            s.agent_list_servers().await.unwrap_err(),
+            s.agent_list_tools("any").await.unwrap_err(),
+            s.agent_call_tool("any", "t", json!({}), None)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::InvalidParams(_)));
+            assert!(format!("{err}").contains("agentFeatures.mcpTools"));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_surface_rejected_when_user_servers_gate_off() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
+            .unwrap();
+        let s = svc(Some(&reg), &secrets, &h);
+
+        for err in [
+            s.agent_list_servers().await.unwrap_err(),
+            s.agent_list_tools("any").await.unwrap_err(),
+            s.agent_call_tool("any", "t", json!({}), None)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::InvalidParams(_)));
+            assert!(format!("{err}").contains("mcp.enableUserServers"));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_list_tools_unknown_server_is_not_found() {
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let err = svc(None, &secrets, &h)
+            .agent_list_tools("ghost")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_forwarding_rejects_disabled_servers() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        // enabled:false in the config.
+        m.insert(
+            "off".into(),
+            json!({"id":"off","command":"x","enabled":false}),
+        );
+        // enabled:true but listed in mcp.disabledServers.
+        m.insert(
+            "blocked".into(),
+            json!({"id":"blocked","command":"x","enabled":true}),
+        );
+        write_configs(&secrets, &m).await.unwrap();
+        set_disabled_servers(Some(&reg), &["blocked".to_string()]).unwrap();
+        let s = svc(Some(&reg), &secrets, &h);
+
+        for id in ["off", "blocked"] {
+            let err = s.agent_list_tools(id).await.unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{id}");
+            assert!(format!("{err}").contains("disabled"), "{id}");
+            let err = s
+                .agent_call_tool(id, "t", json!({}), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{id}");
+        }
     }
 
     // -- remote (http/sse) probing ------------------------------------------
