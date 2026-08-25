@@ -51,21 +51,6 @@ use crate::Services;
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Capitalize the leading ASCII byte of `s` (leaves the rest of the string
-/// untouched). Used to normalize OAuth `token_type` values into the
-/// conventional `Bearer` header form when a bag stores the RFC 6749 lower-case
-/// spelling.
-fn title_case_ascii(s: &str) -> String {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let mut out = String::with_capacity(s.len());
-    out.push(first.to_ascii_uppercase());
-    out.push_str(chars.as_str());
-    out
-}
-
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
 /// blindly re-report the same content (duplicate parent wake). Wording owned
@@ -2649,18 +2634,20 @@ impl AgentManager {
             // directive, matching the reference `isSubAgent` derivation.
             // Fetch workspace for mode-dependent prompt hints (Task 6).
             let workspace = self.services.store.get_workspace(&workspace_id).await.ok();
-            // Truncating providers get the full `workspace_api` reference in
-            // the prompt (this bridge's exact per-agent assembly — gating,
-            // chief-ness, and model options identical to what a non-flagged
-            // provider's tools/list would serve). Invariant: truncating
-            // providers must go through this `rules_file.is_none()` branch —
-            // the bridge serves the compact description unconditionally, so a
-            // caller-supplied rules file would leave its "Workspace API
-            // Reference" pointer dangling (ws.help() as the only fallback).
+            // Truncating providers get the condensed `workspace_api`
+            // reference in the prompt (this bridge's exact per-agent assembly
+            // — gating, chief-ness, and model options as a non-flagged
+            // provider's tools/list — with method summaries cut at the first
+            // sentence; full docs stay reachable via ws.help()). Invariant:
+            // truncating providers must go through this `rules_file.is_none()`
+            // branch — the bridge serves the compact description
+            // unconditionally, so a caller-supplied rules file would leave
+            // its "Workspace API Reference" pointer dangling (ws.help() as
+            // the only fallback).
             let workspace_api_docs = opts
                 .provider
                 .truncates_tool_descriptions
-                .then(|| server.full_workspace_api_description());
+                .then(|| server.condensed_workspace_api_description());
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
@@ -2971,10 +2958,10 @@ impl AgentManager {
 
     /// Reshape one `mcp.servers` entry into the shape [`normalize_mcp_servers`]
     /// expects — stdio entries stay untouched (`command`/`args`/`env`), remote
-    /// entries get a `type` tag plus an `Authorization` header sourced from the
-    /// persisted OAuth bag when the config does not already set one. Returns
-    /// `None` for malformed entries (missing `command`/`url`) so they drop out
-    /// of the merge silently.
+    /// entries get a `type` tag plus an `Authorization` header built by the
+    /// refresh-aware [`crate::mcp_oauth::McpOauthService::authorization_header`]
+    /// when the config does not already set one. Returns `None` for malformed
+    /// entries (missing `command`/`url`) so they drop out of the merge silently.
     async fn reshape_user_mcp_config(
         &self,
         id: &str,
@@ -3005,7 +2992,10 @@ impl AgentManager {
                     .keys()
                     .any(|k| k.eq_ignore_ascii_case("authorization"));
                 if !has_auth {
-                    if let Some(auth) = self.oauth_authorization_header(id).await? {
+                    let auth = crate::mcp_oauth::McpOauthService::new(&self.services.store)
+                        .authorization_header(id)
+                        .await?;
+                    if let Some(auth) = auth {
                         headers.insert("Authorization".to_string(), Value::String(auth));
                     }
                 }
@@ -3031,33 +3021,6 @@ impl AgentManager {
             }
         }
         Ok(Some(Value::Object(out)))
-    }
-
-    /// Build the `Authorization: <token_type> <access_token>` header value from
-    /// the persisted OAuth bag for `server_id`, or `None` when no bag is
-    /// stored / the bag is malformed / `access_token` is missing. `token_type`
-    /// defaults to `Bearer` and is title-cased so a bag storing the RFC 6749
-    /// lower-case `bearer` still produces the conventional header form.
-    async fn oauth_authorization_header(&self, server_id: &str) -> Result<Option<String>> {
-        let Some(raw) = self.services.store.get_mcp_oauth_token(server_id).await? else {
-            return Ok(None);
-        };
-        let Ok(bag) = serde_json::from_str::<Value>(&raw) else {
-            return Ok(None);
-        };
-        let Some(access) = bag
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        let token_type = bag
-            .get("token_type")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Bearer");
-        Ok(Some(format!("{} {}", title_case_ascii(token_type), access)))
     }
 
     /// Complete the connection handshake and establish an ACP session for a

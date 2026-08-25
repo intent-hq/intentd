@@ -217,10 +217,19 @@ fn classify_matches_host_status_and_host_services() {
 
 #[test]
 fn status_json_local_includes_all_fields() {
-    let v = host_status_json("linux", "x86_64", "build-01", true, Some("wayland"), true);
+    let v = host_status_json(
+        "linux",
+        "x86_64",
+        "build-01",
+        "Build Server 01",
+        true,
+        Some("wayland"),
+        true,
+    );
     assert_eq!(v["os"], "linux");
     assert_eq!(v["arch"], "x86_64");
     assert_eq!(v["hostname"], "build-01");
+    assert_eq!(v["prettyHostname"], "Build Server 01");
     assert_eq!(v["hasDisplay"], true);
     assert_eq!(v["locality"], "local");
     assert_eq!(v["displayServer"], "wayland");
@@ -228,9 +237,15 @@ fn status_json_local_includes_all_fields() {
 
 #[test]
 fn status_json_remote_omits_absent_display_server() {
-    let v = host_status_json("linux", "x86_64", "build-01", false, None, false);
+    let v = host_status_json(
+        "linux", "x86_64", "build-01", "build-01", false, None, false,
+    );
     assert_eq!(v["locality"], "remote");
     assert_eq!(v["hasDisplay"], false);
+    assert_eq!(
+        v["prettyHostname"], "build-01",
+        "falls back to hostname when no pretty name exists"
+    );
     assert_eq!(v.get("displayServer"), None, "omitted when not detected");
 }
 
@@ -246,6 +261,13 @@ async fn handle_status_returns_a_response_frame() {
     assert!(parsed["result"]["os"].is_string());
     assert!(parsed["result"]["arch"].is_string());
     assert!(parsed["result"]["hostname"].is_string());
+    assert!(
+        !parsed["result"]["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
     assert!(parsed["result"]["hasDisplay"].is_boolean());
 }
 
