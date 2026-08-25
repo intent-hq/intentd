@@ -1556,14 +1556,15 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
-/// H2 regression: a session stamped `harnessVersion: "1.0"` (every session
-/// H1 has created) resolves the v1 doctrine set and assembles the exact
-/// bytes the pre-versioned layout produced — pinned here as equality with
-/// the session-less (latest) assembly, whose layers are themselves
-/// byte-pinned by the goldens above and the doctrine hashes below. An
-/// unknown/corrupt stamp falls back to the latest instead of failing.
+/// H2 regression: a session stamped `harnessVersion: "1.0"` (every pre-1.1
+/// session) resolves the v1 doctrine set and assembles the exact bytes the
+/// v1 layout produced — its common layer is the v1 body, not the v1.1
+/// rewrite (the v1 composition stays byte-pinned by the doctrine hashes
+/// below). A current-stamp session ("1.1") assembles byte-identical to the
+/// session-less (latest) assembly, and an unknown/corrupt stamp falls back
+/// to the latest instead of failing.
 #[tokio::test]
-async fn golden_v1_session_assembles_identical_to_latest() {
+async fn golden_v1_session_assembles_v1_doctrine() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-h2-pin");
     seed_agent(&svc, &ws, &owner).await;
@@ -1572,7 +1573,11 @@ async fn golden_v1_session_assembles_identical_to_latest() {
         .get_agent_session(&owner)
         .await
         .expect("session");
-    assert_eq!(session.harness_version, "1.0", "H1 stamps 1.0");
+    assert_eq!(
+        session.harness_version,
+        intent_core::CURRENT_HARNESS_VERSION,
+        "H1 stamps the current version"
+    );
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: Some("Implement the task.".to_string()),
@@ -1602,8 +1607,37 @@ async fn golden_v1_session_assembles_identical_to_latest() {
         }
     };
     let latest = assemble(None).await;
+    let current = assemble(Some(session.clone())).await;
+    assert_eq!(current, latest, "current stamp == latest assembly");
+    // A "1.0"-stamped session (every pre-1.1 session) keeps assembling the
+    // v1 doctrine: its specialization-rules layer is the v1 composition.
+    session.harness_version = "1.0".to_string();
     let pinned_v1 = assemble(Some(session.clone())).await;
-    assert_eq!(pinned_v1, latest, "1.0 session == pre-change assembly");
+    let v1_rules = crate::instructions::get_instruction_with_common_for(
+        &crate::instructions::V1,
+        "task-loop",
+        &features,
+    );
+    assert!(
+        pinned_v1.starts_with(&format!("{v1_rules}\n\n---\n\n")),
+        "1.0 session leads with the v1 specialization rules"
+    );
+    assert_ne!(
+        pinned_v1, latest,
+        "v1 doctrine differs from v1.1 (common.md)"
+    );
+    // Only the doctrine layer differs: the static layers after the
+    // specialization rules are byte-identical.
+    let latest_rules = crate::instructions::get_instruction_with_common_for(
+        crate::harness::latest_entry().doctrine.instructions,
+        "task-loop",
+        &features,
+    );
+    assert_eq!(
+        pinned_v1.strip_prefix(&v1_rules).expect("v1 prefix"),
+        latest.strip_prefix(&latest_rules).expect("latest prefix"),
+        "static layers identical across versions"
+    );
     // A stale/corrupt stamp falls back to the latest (never fails a spawn).
     session.harness_version = "9.9".to_string();
     let unknown = assemble(Some(session)).await;
@@ -1611,9 +1645,11 @@ async fn golden_v1_session_assembles_identical_to_latest() {
 }
 
 /// The bundled doctrine layers are large; pin them by SHA-256 so any change
-/// to the shipped instruction markdown (or the feature-gating composition)
-/// fails here and forces a harness-version decision. The hashes are of
-/// `get_instruction_with_common` output with all-default agent features.
+/// to the shipped v1 instruction markdown (or the feature-gating
+/// composition) fails here and forces a harness-version decision. The
+/// hashes are of the v1-set composition with all-default agent features —
+/// pinned to `instructions::V1` explicitly (NOT the latest set) so the v1
+/// bytes stay frozen across later versions; `v1_1_goldens` pins the latest.
 #[test]
 fn golden_bundled_doctrine_hashes() {
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
@@ -1631,8 +1667,10 @@ fn golden_bundled_doctrine_hashes() {
             format!(
                 "{}: {}",
                 agent_type,
-                sha256_hex(&crate::instructions::get_instruction_with_common(
-                    agent_type, &features
+                sha256_hex(&crate::instructions::get_instruction_with_common_for(
+                    &crate::instructions::V1,
+                    agent_type,
+                    &features
                 ))
             )
         })

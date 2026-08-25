@@ -61,6 +61,11 @@ const SETUP_SCRIPT_GENERATOR: &str = instr!("v1", "setup-script-generator.powers
 #[cfg(not(windows))]
 const SETUP_SCRIPT_GENERATOR: &str = instr!("v1", "setup-script-generator.bash");
 
+#[cfg(windows)]
+const SETUP_SCRIPT_GENERATOR_V1_1: &str = instr!("v1.1", "setup-script-generator.powershell");
+#[cfg(not(windows))]
+const SETUP_SCRIPT_GENERATOR_V1_1: &str = instr!("v1.1", "setup-script-generator.bash");
+
 /// One harness version's bundled instruction set: every body the
 /// [`get_instruction_with_common_for`] composition can resolve. Each version
 /// keeps its markdown under `resources/agent-instructions/<ver>/` and exposes
@@ -107,6 +112,31 @@ pub(crate) static V1: InstructionSet = InstructionSet {
     code_walkthrough: CODE_WALKTHROUGH,
     commit_message: COMMIT_MESSAGE,
     pr_description: PR_DESCRIPTION,
+};
+
+/// The v1.1 instruction set (`resources/agent-instructions/v1.1/`): a
+/// copy-then-edit of v1 carrying the feature-section rewrites in `common.md`
+/// (the "Task relations during delegation", "Waiting on External Conditions",
+/// and "Rich Chat Rendering" sections were compressed to doctrine-only text —
+/// mechanics live in the ws.* docs). Every other body is a byte-identical
+/// copy of its v1 counterpart (pinned by `v1_1_goldens`).
+pub(crate) static V1_1: InstructionSet = InstructionSet {
+    chat: instr!("v1.1", "chat"),
+    common: instr!("v1.1", "common"),
+    debug: instr!("v1.1", "debug"),
+    workspace: instr!("v1.1", "workspace"),
+    setup_script_generator: SETUP_SCRIPT_GENERATOR_V1_1,
+    task_breakdown: instr!("v1.1", "task-breakdown"),
+    task_debug: instr!("v1.1", "task-debug"),
+    task_focused: instr!("v1.1", "task-focused"),
+    task_loop: instr!("v1.1", "task-loop"),
+    ralph_loop: instr!("v1.1", "ralph-loop"),
+    workspace_agent: instr!("v1.1", "workspace-agent"),
+    notes_system_guide: instr!("v1.1", "notes-system-guide"),
+    code_review: instr!("v1.1", "code-review"),
+    code_walkthrough: instr!("v1.1", "code-walkthrough"),
+    commit_message: instr!("v1.1", "commit-message"),
+    pr_description: instr!("v1.1", "pr-description"),
 };
 
 /// Utility agents that don't get the workspace instruction layer (port of
@@ -190,12 +220,20 @@ fn remove_section(text: &str, heading: &str) -> String {
 }
 
 /// The `ws.host.exec` fallback sentence of the "Cross-repo PRs" bullet in
-/// common.md's "Waiting on External Conditions" section: its `gh api` recipe
-/// only works when `agentFeatures.hostExec` is on, so it is scrubbed when the
-/// toggle is off — the bullet itself survives, since its primary
+/// the v1 common.md's "Waiting on External Conditions" section: its `gh api`
+/// recipe only works when `agentFeatures.hostExec` is on, so it is scrubbed
+/// when the toggle is off — the bullet itself survives, since its primary
 /// `ws.pr.snapshot({ repo })` path needs no host exec (a unit test guards
-/// that this text still matches the bundled body verbatim).
+/// that this text still matches the v1 bundled body verbatim). The v1.1
+/// rewrite dropped this sentence from the body entirely, so the scrub is an
+/// inherent no-op there (guarded by a unit test).
 const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.";
+
+/// The `ws.pr.monitor` clause of the v1.1 "prefer existing primitives"
+/// bullet in "Waiting on External Conditions", scrubbed when
+/// `agentFeatures.prMonitor` is off (the v1 body never mentioned the
+/// monitor, so this marker is v1.1-pinned; a unit test guards it verbatim).
+const WAITING_PR_MONITOR_CLAUSE_V1_1: &str = ", `ws.pr.monitor` (PRs)";
 
 /// Start/end markers of common.md's "Task relations during delegation"
 /// subsection — the advisory task-graph teaching (intent-hq/monorepo#2457,
@@ -204,7 +242,9 @@ const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carr
 /// H3 inside "## Delegating Tasks" followed by plain section text, so
 /// [`remove_section`]'s H2 scan cannot express it; instead the text from the
 /// heading through the blank line before the "Keep delegated tasks visible"
-/// paragraph is cut by marker (unit tests guard both markers verbatim).
+/// paragraph is cut by marker. The v1.1 rewrite kept both marker lines
+/// verbatim, so one pair serves both sets (unit tests guard the markers
+/// against each bundled body).
 const COMMON_TASK_RELATIONS_START: &str = "### Task relations during delegation";
 const COMMON_TASK_RELATIONS_END: &str = "Keep delegated tasks visible in the note";
 
@@ -225,12 +265,14 @@ fn remove_between(text: &str, start: &str, end: &str) -> String {
 /// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
 /// "Raising Attention", and `taskGraph` gates the "Task relations during
 /// delegation" subsection (dispositions, `unlockPlan`, unblocked-wake
-/// guidance). When `hostExec` is off but the Waiting section survives, the
-/// `ws.host.exec` fallback sentence of its "Cross-repo PRs" bullet is
-/// scrubbed. With every gate open (the defaults) this borrows the
-/// bundled body untouched (byte-identical prompts). The markers are pinned to
-/// the v1 text by unit tests; on a future set where one is absent the gate is
-/// a no-op (that version's gating adds its own markers).
+/// guidance). When the Waiting section survives, `hostExec` off scrubs the
+/// v1 `ws.host.exec` fallback sentence and `prMonitor` off scrubs the v1.1
+/// `ws.pr.monitor` clause — each marker exists in exactly one bundled body,
+/// so the other replace is an inherent no-op (unit tests pin both facts).
+/// With every gate open (the defaults) this borrows the bundled body
+/// untouched (byte-identical prompts). The markers are pinned to their
+/// version's text by unit tests; on a future set where one is absent the
+/// gate is a no-op (that version's gating adds its own markers).
 fn gated_common(
     set: &'static InstructionSet,
     features: &AgentFeaturesSettings,
@@ -246,10 +288,15 @@ fn gated_common(
     if !features.attention_requests {
         body = Cow::Owned(remove_section(&body, "Raising Attention"));
     }
-    if !features.background_hooks {
+    if features.background_hooks {
+        if !features.host_exec && body.contains(WAITING_HOST_EXEC_SENTENCE) {
+            body = Cow::Owned(body.replacen(WAITING_HOST_EXEC_SENTENCE, "", 1));
+        }
+        if !features.pr_monitor && body.contains(WAITING_PR_MONITOR_CLAUSE_V1_1) {
+            body = Cow::Owned(body.replacen(WAITING_PR_MONITOR_CLAUSE_V1_1, "", 1));
+        }
+    } else {
         body = Cow::Owned(remove_section(&body, "Waiting on External Conditions"));
-    } else if !features.host_exec {
-        body = Cow::Owned(body.replacen(WAITING_HOST_EXEC_SENTENCE, "", 1));
     }
     if !features.rich_chat_blocks {
         body = Cow::Owned(remove_section(&body, "Rich Chat Rendering"));
@@ -398,15 +445,24 @@ mod tests {
         defaults()
     }
 
+    /// The LATEST set's common body ([`get_instruction_with_common`] composes
+    /// over the latest set, currently v1.1 — the one body the v1→v1.1
+    /// rewrite changed; every other latest body is a byte-identical v1 copy,
+    /// so the v1 constants still serve those assertions).
+    const COMMON_LATEST: &str = V1_1.common;
+
     #[test]
     fn common_only_is_not_self_wrapped() {
-        assert_eq!(get_instruction_with_common("common", &all_on()), COMMON);
+        assert_eq!(
+            get_instruction_with_common("common", &all_on()),
+            COMMON_LATEST
+        );
     }
 
     #[test]
     fn workspace_gets_common_prepended_once() {
         let out = get_instruction_with_common("workspace", &all_on());
-        assert_eq!(out, format!("{COMMON}\n\n---\n\n{WORKSPACE}"));
+        assert_eq!(out, format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}"));
     }
 
     #[test]
@@ -446,7 +502,7 @@ mod tests {
         let out = get_instruction_with_common("task-loop", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{TASK_LOOP}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{TASK_LOOP}")
         );
     }
 
@@ -455,7 +511,7 @@ mod tests {
         let out = get_instruction_with_common("ralph-loop", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{RALPH_LOOP}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{RALPH_LOOP}")
         );
     }
 
@@ -465,7 +521,7 @@ mod tests {
         let out = get_instruction_with_common("interactive", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{WORKSPACE}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{WORKSPACE}")
         );
     }
 
@@ -474,7 +530,7 @@ mod tests {
         let out = get_instruction_with_common("fix", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{DEBUG}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{DEBUG}")
         );
     }
 
@@ -485,11 +541,11 @@ mod tests {
         // in those sets — so they take the full common+workspace+specific path.
         assert_eq!(
             get_instruction_with_common("review", &all_on()),
-            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_REVIEW}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_REVIEW}")
         );
         assert_eq!(
             get_instruction_with_common("walkthrough", &all_on()),
-            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_WALKTHROUGH}")
+            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_WALKTHROUGH}")
         );
     }
 
@@ -504,6 +560,30 @@ mod tests {
         assert_eq!(gated_common(&V1, &a).as_ref(), COMMON);
         assert_eq!(gated_workspace_agent(&V1, &a).as_ref(), WORKSPACE_AGENT);
         assert_eq!(gated_task_breakdown(&V1, &a).as_ref(), TASK_BREAKDOWN);
+        assert!(matches!(gated_common(&V1_1, &a), Cow::Borrowed(_)));
+        assert_eq!(gated_common(&V1_1, &a).as_ref(), V1_1.common);
+    }
+
+    #[test]
+    fn v1_1_bodies_match_v1_except_common() {
+        // The v1→v1.1 doctrine diff is exactly the common.md feature-section
+        // rewrites; every other body is a byte-identical copy.
+        assert_ne!(V1_1.common, V1.common);
+        assert_eq!(V1_1.chat, V1.chat);
+        assert_eq!(V1_1.debug, V1.debug);
+        assert_eq!(V1_1.workspace, V1.workspace);
+        assert_eq!(V1_1.setup_script_generator, V1.setup_script_generator);
+        assert_eq!(V1_1.task_breakdown, V1.task_breakdown);
+        assert_eq!(V1_1.task_debug, V1.task_debug);
+        assert_eq!(V1_1.task_focused, V1.task_focused);
+        assert_eq!(V1_1.task_loop, V1.task_loop);
+        assert_eq!(V1_1.ralph_loop, V1.ralph_loop);
+        assert_eq!(V1_1.workspace_agent, V1.workspace_agent);
+        assert_eq!(V1_1.notes_system_guide, V1.notes_system_guide);
+        assert_eq!(V1_1.code_review, V1.code_review);
+        assert_eq!(V1_1.code_walkthrough, V1.code_walkthrough);
+        assert_eq!(V1_1.commit_message, V1.commit_message);
+        assert_eq!(V1_1.pr_description, V1.pr_description);
     }
 
     #[test]
@@ -613,6 +693,88 @@ mod tests {
         assert!(common.contains("ws.pr.snapshot(prNumber, { repo: \"owner/name\" })"));
         // …and the scrub leaves a clean sentence boundary before the next bullet.
         assert!(common.contains("diff that snapshot against `hookState`.\n- **Hygiene**"));
+    }
+
+    #[test]
+    fn host_exec_off_is_a_noop_on_v1_1_common() {
+        // The v1.1 rewrite dropped the `gh api … via ws.host.exec` fallback
+        // sentence, so the hostExec scrub has nothing to cut there.
+        assert!(!V1_1.common.contains(WAITING_HOST_EXEC_SENTENCE));
+        assert!(!V1_1.common.contains("ws.host.exec"));
+        let features = AgentFeaturesSettings {
+            host_exec: false,
+            ..defaults()
+        };
+        assert_eq!(gated_common(&V1_1, &features).as_ref(), V1_1.common);
+    }
+
+    #[test]
+    fn pr_monitor_off_scrubs_monitor_clause_from_v1_1_waiting_section() {
+        // Guards: the clause matches the v1.1 body verbatim and is absent
+        // from v1 (whose Waiting section predates the monitor mention).
+        assert!(V1_1.common.contains(WAITING_PR_MONITOR_CLAUSE_V1_1));
+        assert!(!COMMON.contains(WAITING_PR_MONITOR_CLAUSE_V1_1));
+        let features = AgentFeaturesSettings {
+            pr_monitor: false,
+            ..defaults()
+        };
+        let common = gated_common(&V1_1, &features);
+        assert!(common.contains("## Waiting on External Conditions"));
+        assert!(!common.contains("ws.pr.monitor"));
+        // The bullet survives with a clean seam, and the cross-repo snapshot
+        // guidance is untouched.
+        assert!(common.contains("`ws.agent.watch` (sibling agents) over hooks."));
+        assert!(common.contains("ws.pr.snapshot(prNumber, { repo: \"owner/name\" })"));
+        // v1 is untouched by the prMonitor gate (no clause to scrub).
+        assert_eq!(gated_common(&V1, &features).as_ref(), COMMON);
+    }
+
+    #[test]
+    fn task_graph_off_removes_task_relations_from_v1_1_common() {
+        // The v1.1 rewrite kept both marker lines verbatim.
+        assert!(V1_1.common.contains(COMMON_TASK_RELATIONS_START));
+        assert!(V1_1.common.contains(COMMON_TASK_RELATIONS_END));
+        let features = AgentFeaturesSettings {
+            task_graph: false,
+            ..defaults()
+        };
+        let common = gated_common(&V1_1, &features);
+        assert!(!common.contains("### Task relations during delegation"));
+        assert!(!common.contains("unlockPlan"));
+        assert!(common.contains("## Delegating Tasks"));
+        assert!(common.contains(
+            "waitMode: \"after_all\" })\n```\n\nKeep delegated tasks visible in the note"
+        ));
+    }
+
+    #[test]
+    fn background_hooks_off_removes_v1_1_waiting_section() {
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            ..defaults()
+        };
+        let common = gated_common(&V1_1, &features);
+        assert!(!common.contains("## Waiting on External Conditions"));
+        assert!(!common.contains("ws.hook."));
+        assert!(!common.contains("ws.pr.monitor"));
+        // Neighboring sections survive intact, with clean separation.
+        assert!(common.contains("## Raising Attention"));
+        assert!(common.contains("progressing work.\n\n## Response Organization"));
+        assert!(common.contains("## Rich Chat Rendering"));
+    }
+
+    #[test]
+    fn rich_chat_blocks_off_removes_v1_1_trailing_rendering_section() {
+        let features = AgentFeaturesSettings {
+            rich_chat_blocks: false,
+            ..defaults()
+        };
+        let common = gated_common(&V1_1, &features);
+        assert!(!common.contains("## Rich Chat Rendering"));
+        assert!(!common.contains("mermaid"));
+        assert!(!common.contains("intent://local/file/"));
+        // Still the last section: the body ends cleanly after the previous one.
+        assert!(common.ends_with("work as closing tags."));
     }
 
     #[test]
