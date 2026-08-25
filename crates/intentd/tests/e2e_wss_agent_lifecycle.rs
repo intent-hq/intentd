@@ -5657,6 +5657,82 @@ async fn event_query_event_type_glob_over_wss() {
     );
 }
 
+/// Regression (monorepo#3347): a busy workspace's `event.query` response no
+/// longer serializes past the transport's 1 MiB large-frame advisory over the
+/// real WSS wire. Seeds 50 `note:created` events with ~30 KiB caller-supplied
+/// titles (~1.5 MiB of raw event data), then asserts the queried row set is
+/// bounded with additive `truncated` / `originalBytes` markers, row identity
+/// preserved, and no rows dropped.
+#[tokio::test]
+async fn event_query_response_bounded_over_wss() {
+    const ONE_MIB: usize = 1024 * 1024;
+    const SEEDED: usize = 50;
+    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Seed notes whose ~30 KiB titles land verbatim in the `note:created`
+    // event payload — ~1.5 MiB of event data total.
+    let big_title = "t".repeat(30 * 1024);
+    for i in 0..SEEDED {
+        let created = wss_rpc(
+            &mut rpc,
+            i64::try_from(i).expect("value fits in i64") + 1,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": big_title, "content": format!("n{i}") }),
+        )
+        .await;
+        assert!(created["note"]["id"].as_str().is_some(), "note {i} created");
+    }
+
+    // Event writes commit asynchronously relative to the RPC responses; poll
+    // until all seeded `note:created` events are visible.
+    let mut id = i64::try_from(SEEDED).expect("value fits in i64") + 1;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let rows = loop {
+        let rows = wss_rpc(
+            &mut rpc,
+            id,
+            "event.query",
+            json!({ "workspaceId": ws_id, "eventType": "note:created", "limit": 100 }),
+        )
+        .await;
+        id += 1;
+        if rows.as_array().expect("rows array").len() >= SEEDED {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "seeded note:created events never all appeared: {} rows",
+            rows.as_array().expect("rows array").len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let arr = rows.as_array().expect("rows array");
+    assert_eq!(arr.len(), SEEDED, "no rows may be dropped");
+    let size = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "event.query response must stay under the 1 MiB frame advisory: {size}"
+    );
+    assert!(
+        arr.iter().any(|r| r["truncated"] == json!(true)),
+        "trimming must be observable via row markers: {size} bytes"
+    );
+    for row in arr {
+        assert!(row["id"].as_str().is_some(), "row identity survives: {row}");
+        assert_eq!(row["type"], json!("note:created"));
+        assert!(row["timestamp"].as_str().is_some());
+        if row["truncated"] == json!(true) {
+            assert!(
+                row["originalBytes"].as_u64().is_some(),
+                "trimmed rows carry originalBytes: {row}"
+            );
+        }
+    }
+}
+
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching
 /// events to a subscriber. Two pinned WSS subscribers — one scoped to
 /// `["note:*"]`, one to `["agent:*"]` — observe a single mock agent turn and

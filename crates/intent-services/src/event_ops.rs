@@ -179,5 +179,97 @@ pub(crate) fn build_workspace_summary(
     }
 }
 
+/// Serialized-size ceiling for one `event.query` response (monorepo#3347).
+/// Sized comfortably below the transport's 1 MiB large-frame advisory
+/// (`LARGE_MESSAGE_WARN_BYTES`): [`bound_event_rows`] charges each row its
+/// ACTUAL post-cap serialized size against this budget, so the response
+/// total stays within `budget + Σ(per-row identity fields + marker)` — the
+/// identity fields are small bounded scalars, keeping the worst case under
+/// the advisory even at [`EVENT_QUERY_MAX_LEGACY_LIMIT`] rows.
+pub(crate) const EVENT_QUERY_RESPONSE_BUDGET_BYTES: usize = 700 * 1024;
+
+/// Row-count cap for the legacy (non-paginated) `event.query` path
+/// (monorepo#3347). Previously the caller-supplied limit was passed to SQL
+/// unclamped (a negative value even meant "no limit"), so the byte ceiling
+/// above could be defeated by sheer row count — the identity fields of an
+/// unbounded row set are themselves unbounded. 500 keeps the FE's 300-row
+/// boot snapshot intact; the paginated path keeps its own [1, 200] clamp.
+pub(crate) const EVENT_QUERY_MAX_LEGACY_LIMIT: i64 = 500;
+
+/// The bulky per-row fields eligible for trimming: the type-specific payload
+/// and the free-form metadata. Identity fields (id, type, timestamp, actor,
+/// session/correlation ids) always survive intact.
+const EVENT_ROW_BULK_FIELDS: [&str; 2] = ["data", "metadata"];
+
+/// Serialize an `event.query` row set to wire-shape JSON values, ready for
+/// [`bound_event_rows`]. Pure so the service layer maps the error itself.
+pub(crate) fn serialize_event_rows(
+    events: Vec<Event>,
+) -> std::result::Result<Vec<Value>, serde_json::Error> {
+    events.into_iter().map(serde_json::to_value).collect()
+}
+
+/// Bound the serialized size of an `event.query` row set (monorepo#3347).
+///
+/// A row set whose total serialized size fits [`EVENT_QUERY_RESPONSE_BUDGET_BYTES`]
+/// is returned untouched (byte-identical wire behavior for the common case).
+/// Over budget, rows are walked in wire order (newest→oldest) with a running
+/// budget: each row gets a fair share of what remains (`remaining / rows_left`,
+/// so small rows donate their unused share to the rows after them), and a row
+/// over its share has its `data` / `metadata` replaced by
+/// [`intent_core::cap_json_value`] bounded previews plus additive row-level
+/// markers `truncated: true` and `originalBytes` (the row's full serialized
+/// size), so the trimming is observable rather than silent. Row count and the
+/// per-row identity shape are preserved — no rows are dropped.
+///
+/// Returns the number of trimmed rows (`0` = response untouched).
+pub(crate) fn bound_event_rows(rows: &mut [Value]) -> usize {
+    let total: usize = rows.iter().map(intent_core::slim_body_size).sum();
+    if total <= EVENT_QUERY_RESPONSE_BUDGET_BYTES {
+        return 0;
+    }
+    let n = rows.len();
+    let mut remaining = EVENT_QUERY_RESPONSE_BUDGET_BYTES;
+    let mut trimmed = 0usize;
+    for (i, row) in rows.iter_mut().enumerate() {
+        let size = intent_core::slim_body_size(row);
+        let share = remaining / (n - i);
+        if size <= share {
+            remaining -= size;
+            continue;
+        }
+        let Some(obj) = row.as_object_mut() else {
+            // Rows are always serialized `Event` objects; charge anything
+            // else defensively and move on.
+            remaining = remaining.saturating_sub(size);
+            continue;
+        };
+        let bulk: usize = EVENT_ROW_BULK_FIELDS
+            .iter()
+            .filter_map(|k| obj.get(*k))
+            .map(intent_core::slim_body_size)
+            .sum();
+        let base = size.saturating_sub(bulk);
+        // `data` and `metadata` split the row's remaining allowance; the
+        // budget is shared sequentially, `data` (the primary payload) first.
+        let mut bulk_budget = share.saturating_sub(base);
+        for key in EVENT_ROW_BULK_FIELDS {
+            if let Some(v) = obj.get_mut(key) {
+                let capped = intent_core::cap_json_value(v, &mut bulk_budget);
+                *v = capped;
+            }
+        }
+        obj.insert("truncated".to_string(), Value::Bool(true));
+        obj.insert("originalBytes".to_string(), Value::from(size));
+        trimmed += 1;
+        // Charge the ACTUAL post-cap size: `cap_json_value` may overshoot its
+        // budget by a small constant factor, and charging reality keeps the
+        // aggregate bound tight regardless.
+        let actual = intent_core::slim_body_size(row);
+        remaining = remaining.saturating_sub(actual);
+    }
+    trimmed
+}
+
 #[cfg(test)]
 mod tests;
