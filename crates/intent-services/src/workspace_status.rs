@@ -168,12 +168,57 @@ impl Services {
     /// fetched them (the aggregate enrichment path does, for `agentSummary` /
     /// `lastActivity`); passed through to the attention probe so the hot
     /// list/get emit never re-issues the same per-workspace session query
-    /// (monorepo#3058). `None` lets the probe fetch its own.
+    /// (monorepo#3058). `None` lets the probe fetch its own. The summaries
+    /// cannot answer the unread derivation — `SESSION_SUMMARY_COLUMNS`
+    /// deliberately omits the `last_message_id`/`last_message_role` preview
+    /// columns — which is what `unread` is for.
+    ///
+    /// `unread` — the workspace's unread derivation when the caller already
+    /// computed it (the list-shaped paths batch it in ONE statement for the
+    /// whole list via `workspaces_with_unread_top_level_sessions`, so the
+    /// hot RPC's statement count stays independent of the workspace count —
+    /// AGENTS.md RPC cost contract). `None` (single-row paths: get, mutation
+    /// responses, event emits) runs the bounded per-workspace EXISTS probe.
     pub(crate) async fn enrich_display_status(
         &self,
         ws: &mut Workspace,
         sessions: Option<&[intent_core::AgentSession]>,
+        unread: Option<bool>,
     ) {
+        // Served `attention` is DERIVED on this same emit path (§5.1):
+        // `unread` = any top-level (non-background, non-deleted) session
+        // whose newest user/assistant message is an unseen assistant message
+        // (per-agent seen marker, `agent.markSeen` §5.5). A stored
+        // `review_required` still wins (it is the persistent review flag,
+        // retired only by `workspace.dismissAttention`); the stored `unread`
+        // flag is no longer the read-path source of truth — the turn-end
+        // raise still writes it (back-compat + the transition emit), but a
+        // stale stored value can neither show nor hide the blue dot.
+        // Archived rows keep the stored value: the turn-end raise skips
+        // archived workspaces (no blue dot until unarchive, intentd#1075)
+        // and the derivation honors the same rule. One bounded EXISTS over
+        // persisted session columns — or the caller's batch-derived value —
+        // a probe failure keeps the stored value (degrade, never fail the
+        // read).
+        if ws.attention != WorkspaceAttention::ReviewRequired
+            && ws.status != intent_core::WorkspaceStatus::Archived
+        {
+            let derived = match unread {
+                Some(unread) => Some(unread),
+                None => self
+                    .store
+                    .workspace_has_unread_top_level_session(&ws.id)
+                    .await
+                    .ok(),
+            };
+            if let Some(unread) = derived {
+                ws.attention = if unread {
+                    WorkspaceAttention::Unread
+                } else {
+                    WorkspaceAttention::None
+                };
+            }
+        }
         // The orthogonal `waiting` flag rides the same emit path but is
         // independent of the `taskStats` gate below: it is populated even
         // when a transient notes-read failure leaves `displayStatus` absent.
@@ -2985,7 +3030,7 @@ mod display_status_events {
         assert_silent(&mut sub).await;
         let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
         ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
-        h.services.enrich_display_status(&mut ws, None).await;
+        h.services.enrich_display_status(&mut ws, None, None).await;
         assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");

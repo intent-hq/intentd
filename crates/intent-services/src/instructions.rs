@@ -451,6 +451,15 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ralph_loop_gets_its_pinned_specific_instructions() {
+        let out = get_instruction_with_common("ralph-loop", &all_on());
+        assert_eq!(
+            out,
+            format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{RALPH_LOOP}")
+        );
+    }
+
+    #[test]
     fn unknown_type_falls_back_to_workspace_specific() {
         // The spawn default agent type is unknown → fallbackToWorkspace.
         let out = get_instruction_with_common("interactive", &all_on());
