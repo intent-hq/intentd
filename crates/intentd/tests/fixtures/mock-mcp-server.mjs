@@ -6,6 +6,8 @@
 //   - `initialize`               → capability/serverInfo result
 //   - `notifications/initialized`→ ignored (notification, no id)
 //   - `tools/list`               → two tools (so toolCount == 2)
+//   - `tools/call`               → text content `<name>:<args.input>` (echoes
+//                                  the requested tool + input deterministically)
 //   - `ping`                     → empty result (health check)
 // Any other request id gets an empty result. Notifications are never answered.
 //
@@ -48,6 +50,15 @@ function respond(msg) {
       };
     case 'tools/list':
       return { jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } };
+    case 'tools/call': {
+      const name = msg.params?.name ?? 'unknown';
+      const input = msg.params?.arguments?.input ?? '';
+      return {
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { content: [{ type: 'text', text: `${name}:${input}` }] },
+      };
+    }
     case 'ping':
       return { jsonrpc: '2.0', id: msg.id, result: {} };
     default:
