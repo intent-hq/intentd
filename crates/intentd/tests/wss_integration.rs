@@ -1000,6 +1000,209 @@ async fn wss_agent_list_omits_initial_message() {
     srv.ws.stop().await;
 }
 
+/// Soft retire round-trip over the real WSS transport: `agent.retire` (via
+/// the service seam the MCP binding calls) marks the session inert —
+/// excluded from default `agent.list`, served by `includeRetired: true` with
+/// `retiredAt`, still readable via `agent.get`, rejecting `agent.sendMessage`
+/// — and the wire `agent.restore` method returns it to service. Both
+/// transitions emit their events (`agent:retired` / `agent:restored`) to an
+/// `events.subscribe` subscriber.
+#[tokio::test]
+async fn wss_agent_soft_retire_and_restore_round_trip() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    async fn next_event(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        event_type: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == event_type
+                        {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Soft Retire"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Elder"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Subscribe to both lifecycle events on a persistent connection.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    let sub = send_and_wait(
+        &mut ws,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{{"eventTypes":["agent:retired","agent:restored"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        3,
+    )
+    .await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding
+    // routes here; there is deliberately no wire agent.retire method).
+    let retired = srv
+        .api
+        .agent_retire(
+            intent_core::AgentId::from(agent_id.as_str()),
+            Some(WorkspaceId(ws_id.clone())),
+            Some("handing off".to_string()),
+        )
+        .await
+        .expect("retire");
+    assert_eq!(retired["success"], serde_json::json!(true));
+    let retired_at = retired["retiredAt"]
+        .as_str()
+        .expect("retiredAt")
+        .to_string();
+    let retired_at = retired_at.as_str();
+
+    // agent:retired reaches the subscriber with name + reason.
+    let evt = next_event(&mut ws, "agent:retired").await;
+    assert_eq!(evt["data"]["agentId"], agent_id.as_str());
+    assert_eq!(evt["data"]["agentName"], "Elder");
+    assert_eq!(evt["data"]["reason"], "handing off");
+
+    // Default agent.list excludes the retired row…
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert!(
+        listed["result"]["agents"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .all(|a| a["id"].as_str() != Some(agent_id.as_str())),
+        "retired row must be excluded from the default list: {listed}"
+    );
+    // …includeRetired serves it, carrying retiredAt…
+    let list_all_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}","includeRetired":true}}}}"#
+    );
+    let listed_all = wss_call(srv.port, srv.cfg.clone(), &list_all_frame).await;
+    let row = listed_all["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("retired row under includeRetired");
+    assert_eq!(
+        row["retiredAt"].as_str(),
+        Some(retired_at),
+        "includeRetired rows carry retiredAt: {row}"
+    );
+    // …agent.get still serves the retired row (FE renders it read-only)…
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["retiredAt"].as_str(),
+        Some(retired_at),
+        "agent.get keeps serving the retired row: {got}"
+    );
+    // …and sends fail closed with the retired error.
+    let send_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hello?"}}}}"#
+    );
+    let send = wss_call(srv.port, srv.cfg.clone(), &send_frame).await;
+    assert_eq!(send["error"]["code"], -32602, "send to retired: {send}");
+    assert!(
+        send["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("retired"),
+        "error names the retired state: {send}"
+    );
+
+    // agent.restore returns it to service and emits agent:restored.
+    let restore_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.restore","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}"}}}}"#
+    );
+    let restored = wss_call(srv.port, srv.cfg.clone(), &restore_frame).await;
+    assert_eq!(restored["result"]["restored"], serde_json::json!(true));
+    let evt = next_event(&mut ws, "agent:restored").await;
+    assert_eq!(evt["data"]["agentId"], agent_id.as_str());
+
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let row = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("restored row back in the default list");
+    assert!(
+        row.get("retiredAt").is_none(),
+        "restored rows omit retiredAt: {row}"
+    );
+    // Idempotent-friendly no-op on a second restore.
+    let restored_again = wss_call(srv.port, srv.cfg.clone(), &restore_frame).await;
+    assert_eq!(
+        restored_again["result"]["restored"],
+        serde_json::json!(false),
+        "second restore is the documented no-op: {restored_again}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// List-payload cost contract (extending monorepo#2932): `agent.list` rows
 /// bound every render-preview field — `lastAgentResponse`, `lastUserMessage`,
 /// `digest`, `lastToolUse`, `metadata.completionReport` — to the render-sized
@@ -1259,6 +1462,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     srv.store
         .insert_agent_session(&mk_session("agent-slim-a", &ws_active))
@@ -9651,6 +9855,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),

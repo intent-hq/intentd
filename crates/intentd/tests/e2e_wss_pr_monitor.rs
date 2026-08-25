@@ -512,6 +512,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     }
 }
 

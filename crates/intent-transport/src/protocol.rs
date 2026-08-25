@@ -217,13 +217,23 @@
 //! passed through verbatim when present; non-user rows are never included,
 //! roles are filtered in SQL and the transcript is never hydrated (unknown
 //! agent or workspace mismatch is not-found) — 296 router methods,
-//! 335 total.
+//! 335 total. Version 7.5 adds soft agent retirement (additive; §5.5): the
+//! `agent.restore` router method clears a session's `retiredAt` mark
+//! (`{ success, restored }`; restoring a non-retired session is the no-op
+//! `restored: false`), `agent.list` gains the optional `includeRetired`
+//! boolean param (default `false` — retired rows are excluded; `true` serves
+//! them carrying the additive presence-detected `retiredAt` field, also on
+//! `agent.get` / `agent.getSession`), the `agent:retired` event joins the
+//! agent family alongside the now-emitted `agent:restored`, and retirement
+//! itself stays MCP-only (`ws.agent.retire`, self-scoped, gated by
+//! `agentFeatures.peerAgents`) per the §6.8 principle — 297 router methods,
+//! 336 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.4";
+pub const PROTOCOL_VERSION: &str = "7.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -47,6 +47,11 @@ pub const AGENT_DELETED: &str = "agent:deleted";
 // flip the pending state without a follow-up read.
 pub const AGENT_DELETE_SCHEDULED: &str = "agent:delete-scheduled";
 pub const AGENT_DELETE_CANCELLED: &str = "agent:delete-cancelled";
+// Soft retire (PROTOCOL §5.5): `agent:retired` marks a session inert
+// (`retired_at` set — `ws.agent.retire`); `agent:restored` clears it
+// (`agent.restore`). Both carry `{ agentId, agentName }`, and the session
+// row survives with its full conversation on both sides.
+pub const AGENT_RETIRED: &str = "agent:retired";
 pub const AGENT_RESTORED: &str = "agent:restored";
 pub const AGENT_RENAMED: &str = "agent:renamed";
 pub const AGENT_UPDATED: &str = "agent:updated";
@@ -466,6 +471,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_DELETED,
     AGENT_DELETE_SCHEDULED,
     AGENT_DELETE_CANCELLED,
+    AGENT_RETIRED,
     AGENT_RESTORED,
     AGENT_RENAMED,
     AGENT_UPDATED,
