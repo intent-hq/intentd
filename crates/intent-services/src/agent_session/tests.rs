@@ -4770,6 +4770,277 @@ async fn idle_timeout_after_unmapped_update_marks_streamed() {
     );
 }
 
+/// Mock agent for the mid-turn stall tests (intent-hq/monorepo#3402):
+/// `session/prompt` first goes SILENT (no updates, response held) until
+/// `release_stream` fires, then streams `updates`, then goes silent again
+/// until `release_end` fires, then resolves `end_turn`. The two silent
+/// windows in one turn let a test drive stall → resume → re-armed stall
+/// deterministically (each release is sent only after the corresponding
+/// status event was observed on the bus).
+fn spawn_two_silence_mock_agent<R, W>(
+    read: R,
+    write: W,
+    updates: Vec<String>,
+    release_stream: tokio::sync::oneshot::Receiver<()>,
+    release_end: tokio::sync::oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        let mut releases = Some((release_stream, release_end));
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                if let Some((release_stream, release_end)) = releases.take() {
+                    let _ = release_stream.await;
+                    for note in &updates {
+                        write
+                            .write_all(format!("{note}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    write.flush().await.unwrap();
+                    let _ = release_end.await;
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against the two-silence mock above, returning both release
+/// senders alongside the usual harness.
+fn connect_two_silence(
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (release_stream_tx, release_stream_rx) = tokio::sync::oneshot::channel();
+    let (release_end_tx, release_end_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_two_silence_mock_agent(
+        c2a_agent,
+        a2c_agent,
+        updates,
+        release_stream_rx,
+        release_end_rx,
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, release_stream_tx, release_end_tx)
+}
+
+/// Drain the subscription until an `agent:stream:status` event with `phase`
+/// appears at or past `*cursor`, appending every received batch to `events`
+/// and advancing the cursor past the match.
+async fn wait_for_status_phase(
+    sub: &mut crate::events::Subscription,
+    events: &mut Vec<Event>,
+    cursor: &mut usize,
+    phase: &str,
+) {
+    loop {
+        while *cursor < events.len() {
+            let event = &events[*cursor];
+            *cursor += 1;
+            if event.event_type == "agent:stream:status" && event.data["phase"] == json!(phase) {
+                return;
+            }
+        }
+        events.extend(
+            timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for status phase {phase:?}"))
+                .expect("subscription open"),
+        );
+    }
+}
+
+/// Mid-turn stall detection (intent-hq/monorepo#3402): a silence past the
+/// (lowered) threshold emits exactly ONE advisory `stalled` status carrying
+/// `silentMs`, the next `session/update` emits `resumed` and re-arms the
+/// detector, and a second silence in the SAME turn reports again — all while
+/// the turn still resolves normally with `end_turn`.
+#[tokio::test]
+async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
+    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "50")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "back to work" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent, release_stream, release_end) = connect_two_silence(vec![chunk]);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-stall-1"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    // First silent window crosses the 50ms threshold → one stalled status.
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    // Release the update burst: the next notification emits resumed.
+    release_stream.send(()).expect("mock alive");
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "resumed").await;
+    // The detector re-armed: the second silent window stalls again.
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    // Release the held response: the turn still resolves normally.
+    release_end.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("stalls never fail the turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+
+    let statuses: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .collect();
+    let phases: Vec<&str> = statuses
+        .iter()
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt", "stalled", "resumed", "stalled"],
+        "one stalled per silent window, one resumed between, no duplicates"
+    );
+    let first_stall = statuses[1];
+    assert_eq!(first_stall.data["level"], json!("warn"));
+    assert_eq!(first_stall.data["agentId"], json!(agent_id.0));
+    let silent_ms = first_stall.data["silentMs"].as_u64().expect("silentMs");
+    assert!(silent_ms >= 50, "measured silence at emission: {silent_ms}");
+    assert_eq!(
+        first_stall.data["message"],
+        json!(format!("No model activity for {}s", silent_ms / 1000))
+    );
+    assert_eq!(statuses[2].data["level"], json!("info"));
+    assert_eq!(
+        statuses[2].data["message"],
+        json!("Stream activity resumed")
+    );
+    assert!(
+        statuses[2].data.get("silentMs").is_none(),
+        "resumed carries no silentMs"
+    );
+    // The stream:end still closes the turn normally after two stalls.
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:stream:end"),
+        "normal terminal stream:end"
+    );
+}
+
+/// A turn whose silences never reach the stall threshold emits NO
+/// stalled/resumed statuses — the only `agent:stream:status` is the
+/// turn-startup "prompt" hint.
+#[tokio::test]
+async fn sub_threshold_turn_emits_no_stall_status() {
+    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "60000")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect();
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn ok");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(phases, vec!["prompt"], "no stall statuses under threshold");
+}
+
+/// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
+/// unparseable) it falls back to the 90s default.
+#[test]
+fn stream_stall_ms_env_override_and_default() {
+    {
+        let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "1234")]);
+        assert_eq!(crate::agent_session::stream_stall_ms(), 1234);
+    }
+    {
+        let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "not-a-number")]);
+        assert_eq!(crate::agent_session::stream_stall_ms(), 90_000);
+    }
+    let _env = EnvGuard::apply(&[("INTENTD_STREAM_STALL_MS", None)]);
+    assert_eq!(crate::agent_session::stream_stall_ms(), 90_000);
+}
+
 /// Turn correlation (monorepo#1022): the failure-arm `agent:failed` emitted by
 /// `run_prompt_turn` carries the caller-supplied `turnId`; when the caller
 /// passes `None` (bare wiring) the field is omitted, never `null`.

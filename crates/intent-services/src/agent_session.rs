@@ -804,6 +804,24 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
     5 * 60 * 1000
 }
 
+/// Mid-turn stream-stall threshold (intent-hq/monorepo#3402): after this many
+/// ms of zero `session/update` traffic while `session/prompt` is still in
+/// flight, [`run_prompt_turn`](Services::run_prompt_turn) emits ONE advisory
+/// `agent:stream:status` with `phase: "stalled"` so subscribers can surface
+/// the silence live instead of an indefinite spinner. 90s sits well below the
+/// #2669 silent-tail suspicion window and far below the 30-minute prompt idle
+/// timeout, which remains the only terminal mechanism — the stall event never
+/// cancels or fails the turn. Overridable via `INTENTD_STREAM_STALL_MS`
+/// (test seam).
+pub(crate) fn stream_stall_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    90 * 1000
+}
+
 /// Per-agent consecutive suspected-truncation auto-redrive counter
 /// (intent-hq/monorepo#2863): incremented each time `run_prompt_turn` arms an
 /// auto-redrive for a suspected-truncated turn, cleared on any turn that
@@ -2350,6 +2368,17 @@ impl Services {
         // client-served handler may have side-effected on behalf of this
         // turn, so the attempt is no longer provably idempotent.
         let client_request_watermark = conn.client_request_seq();
+        // Mid-turn stall detection (intent-hq/monorepo#3402): a timer arm in
+        // the select loop below samples `activity.idle_ms()` on a fraction of
+        // the stall threshold (~15s at the 90s default) and emits ONE advisory
+        // `stalled` status event once the silence crosses [`stream_stall_ms`].
+        // The next received `session/update` emits `resumed` and re-arms the
+        // detector, so a later second stall in the same turn reports again.
+        // Advisory only: turn resolution is untouched (the 30-minute prompt
+        // idle timeout stays the terminal backstop).
+        let stall_threshold_ms = stream_stall_ms();
+        let stall_check = Duration::from_millis((stall_threshold_ms / 6).clamp(10, 15_000));
+        let mut stall_emitted = false;
         let result = loop {
             let prompt_fut = session::prompt(conn, acp_session_id, prompt.clone(), &activity);
             tokio::pin!(prompt_fut);
@@ -2359,6 +2388,17 @@ impl Services {
                     maybe = notifications.recv(), if !closed => match maybe {
                         Some(note) => {
                             activity.touch();
+                            if stall_emitted {
+                                stall_emitted = false;
+                                self.publish_status_event(
+                                    workspace_id,
+                                    agent_id,
+                                    "resumed",
+                                    "Stream activity resumed",
+                                    "info",
+                                )
+                                .await;
+                            }
                             any_update_received = true;
                             updates_applied |= self
                                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2366,6 +2406,19 @@ impl Services {
                         }
                         None => closed = true,
                     },
+                    () = tokio::time::sleep(stall_check), if !stall_emitted => {
+                        let silent_ms = activity.idle_ms();
+                        if silent_ms >= stall_threshold_ms {
+                            stall_emitted = true;
+                            tracing::warn!(
+                                agent = %agent_id,
+                                silent_ms,
+                                "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
+                            );
+                            self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
+                                .await;
+                        }
+                    }
                 }
             };
             // Drain updates buffered before this attempt settled BEFORE the
@@ -4052,6 +4105,35 @@ impl Services {
                 "phase": phase,
                 "message": message,
                 "level": level,
+                "timestamp": now_epoch_ms(),
+            }),
+        )
+        .await;
+    }
+
+    /// Publish the mid-turn `stalled` `agent:stream:status`
+    /// (intent-hq/monorepo#3402): the [`Self::publish_status_event`] shape
+    /// plus the additive `silentMs` field carrying the measured silence at
+    /// emission, `level: "warn"`. Advisory only — emitted while the turn keeps
+    /// running; the FE clears the presentation on `resumed`, any new stream
+    /// delta, or turn end/failure.
+    async fn publish_stalled_status_event(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        silent_ms: u64,
+    ) {
+        self.publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_STREAM_STATUS,
+            json!({
+                "agentId": agent_id.0,
+                "workspaceId": workspace_id,
+                "phase": "stalled",
+                "message": format!("No model activity for {}s", silent_ms / 1000),
+                "level": "warn",
+                "silentMs": silent_ms,
                 "timestamp": now_epoch_ms(),
             }),
         )
