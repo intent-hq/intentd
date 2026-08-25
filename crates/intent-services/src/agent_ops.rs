@@ -5730,7 +5730,8 @@ impl Services {
     }
 
     /// `chat.unread`: compact digest of the calling agent's own unread
-    /// conversation tail (PROTOCOL §5.5; `ws.chat.unread()`). Scans forward
+    /// conversation tail (MCP-only surface behind `ws.chat.unread()`; not a
+    /// wire RPC). Scans forward
     /// from the message after the persisted seen marker
     /// ([`AgentSession::last_seen_message_id`]; the whole transcript when the
     /// marker is absent or dangling, e.g. truncated by
