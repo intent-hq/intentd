@@ -2,7 +2,8 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      eleven `agentFeatures.*` paths (defaults on).
+//      twelve boolean `agentFeatures.*` paths (defaults on, except the opt-in
+//      `unreadSummaries`).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
@@ -44,9 +45,10 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The eleven `agentFeatures.*` settings paths with their defaults — all on
-/// (`taskGraph` included since the default flip; intent-hq/monorepo#2445).
-const FEATURE_PATHS: [(&str, bool); 11] = [
+/// The twelve boolean `agentFeatures.*` settings paths with their defaults —
+/// all on (`taskGraph` included since the default flip;
+/// intent-hq/monorepo#2445) except the opt-in `unreadSummaries`.
+const FEATURE_PATHS: [(&str, bool); 12] = [
     ("agentFeatures.backgroundHooks", true),
     ("agentFeatures.hostExec", true),
     ("agentFeatures.scripts", true),
@@ -58,6 +60,7 @@ const FEATURE_PATHS: [(&str, bool); 11] = [
     ("agentFeatures.stateSnapshot", true),
     ("agentFeatures.prMonitor", true),
     ("agentFeatures.taskGraph", true),
+    ("agentFeatures.unreadSummaries", false),
 ];
 
 struct Daemon {
@@ -612,6 +615,28 @@ async fn agent_features_gate_new_sessions_only() {
     ] {
         assert!(desc_a.contains(marker), "full description missing {marker}");
     }
+    // `unreadSummaries` is opt-in (defaults OFF): the default session has no
+    // `ws.chat` — description pruned, prelude not installed, dispatch denied.
+    assert!(
+        !desc_a.contains("ws.chat."),
+        "default description must not mention ws.chat"
+    );
+    let (err, text) = bridge_a.call_js("return typeof ws.chat").await;
+    assert!(!err, "typeof ws.chat probe must succeed on A: {text}");
+    assert!(
+        text.contains("undefined"),
+        "ws.chat must be undefined on the default session: {text}"
+    );
+    let (err, text) = bridge_a
+        .call_js("return await host({ method: 'chat.unread' })")
+        .await;
+    assert!(err, "chat.unread must be denied by default: {text}");
+    assert!(
+        text.contains(
+            "host: method `chat.unread` is disabled in settings (agentFeatures.unreadSummaries = false)"
+        ),
+        "chat.unread denial must name the toggle: {text}"
+    );
 
     let (err, text) = bridge_a.call_js("return await ws.hook.list()").await;
     assert!(!err, "ws.hook.list on full session must succeed: {text}");
@@ -651,7 +676,7 @@ async fn agent_features_gate_new_sessions_only() {
         "pr-monitor bindings must be installed on the full session: {text}"
     );
 
-    // ===== Flip the toggles off =====
+    // ===== Flip the toggles (six defaults off; opt-in unreadSummaries on) =====
     let flip = wss_rpc(
         &mut rpc,
         30,
@@ -663,13 +688,14 @@ async fn agent_features_gate_new_sessions_only() {
             { "path": "agentFeatures.richChatBlocks", "value": false },
             { "path": "agentFeatures.attentionRequests", "value": false },
             { "path": "agentFeatures.prMonitor", "value": false },
+            { "path": "agentFeatures.unreadSummaries", "value": true },
         ] }),
     )
     .await;
     assert_eq!(
         flip["result"]["applied"].as_array().map(Vec::len),
-        Some(6),
-        "all six toggles applied: {flip}"
+        Some(7),
+        "all seven toggles applied: {flip}"
     );
 
     // ===== Session B: created AFTER the flip =====
@@ -757,9 +783,30 @@ async fn agent_features_gate_new_sessions_only() {
         "ws.agent.reportToParent(",
         // `prMonitor` is method-level: `ws.pr.snapshot` survives it.
         "ws.pr.snapshot(",
+        // `unreadSummaries` was flipped ON: B gains the ws.chat namespace.
+        "ws.chat.unread(",
     ] {
         assert!(desc_b.contains(kept), "gated description missing {kept}");
     }
+
+    // `unreadSummaries` on: `ws.chat.unread()` dispatches on B and returns
+    // the digest of B's own unread tail — the mock provider's "done" reply
+    // sits after B's (human-attributed) prompt row, so exactly one
+    // assistant message is unread.
+    let (err, text) = bridge_b.call_js("return await ws.chat.unread()").await;
+    assert!(!err, "ws.chat.unread must dispatch on B: {text}");
+    let digest: serde_json::Value = serde_json::from_str(&text).expect("digest JSON");
+    assert_eq!(digest["messages"], json!(1), "one unread reply: {digest}");
+    assert_eq!(digest["turns"], json!(1), "one unread turn: {digest}");
+    assert_eq!(
+        digest["items"][0]["role"],
+        json!("assistant"),
+        "the unread item is the assistant reply: {digest}"
+    );
+    assert!(
+        digest["toMessageId"].is_string(),
+        "digest range ids populated: {digest}"
+    );
 
     // B's JS prelude: the gated `ws.*` namespaces are not even defined, and
     // the method-level attentionRequests gate leaves the rest of `ws.agent`

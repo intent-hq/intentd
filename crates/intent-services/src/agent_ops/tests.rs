@@ -26084,6 +26084,228 @@ async fn mark_seen_fails_closed() {
     ));
 }
 
+// -------------------------------------------------------------------------
+// `chat.unread` (ws.chat.unread): unread digest with human-boundary reset.
+// -------------------------------------------------------------------------
+
+/// Append one message row with `role`, plain text, and optional metadata.
+async fn append_msg(
+    svc: &Services,
+    id: &AgentId,
+    role: &str,
+    text: &str,
+    metadata: Option<serde_json::Value>,
+) -> intent_core::AgentMessage {
+    svc.store()
+        .append_agent_message_with_metadata(
+            id,
+            role,
+            &json!([{ "type": "text", "text": text }]),
+            metadata.as_ref(),
+            &now_iso(),
+        )
+        .await
+        .expect("append message")
+}
+
+/// Marker present: the digest covers only rows after it; a human user
+/// message resets the collection; machine-attributed user rows are content.
+#[tokio::test]
+async fn chat_unread_scans_from_marker_with_human_reset() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let seen = append_msg(&svc, &id, "assistant", "old reply", None).await;
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), seen.id.clone())
+        .await
+        .expect("mark seen");
+
+    // After the marker: assistant + system rows, then a HUMAN user message
+    // (boundary reset), then the actual unread tail.
+    append_msg(&svc, &id, "assistant", "dropped by reset", None).await;
+    append_msg(&svc, &id, "system", "dropped notice", None).await;
+    append_msg(&svc, &id, "user", "human reply", None).await;
+    let a2a = append_msg(
+        &svc,
+        &id,
+        "user",
+        "a2a delivery",
+        Some(json!({ "fromAgentId": "agent-123", "fromAgentName": "Sibling" })),
+    )
+    .await;
+    append_msg(&svc, &id, "tool", "tool row is ignored", None).await;
+    let reply = append_msg(&svc, &id, "assistant", "unread reply", None).await;
+
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(2));
+    assert_eq!(digest["turns"], json!(1));
+    assert_eq!(digest["truncatedMessages"], json!(0));
+    assert_eq!(digest["fromMessageId"], json!(a2a.id));
+    assert_eq!(digest["toMessageId"], json!(reply.id));
+    let items = digest["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["role"], json!("user"));
+    assert_eq!(items[0]["head"], json!("a2a delivery"));
+    assert_eq!(items[1]["role"], json!("assistant"));
+    assert_eq!(items[1]["head"], json!("unread reply"));
+
+    // Read-only: the seen marker did not move.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
+}
+
+/// No marker: the scan covers the whole transcript. A trailing human user
+/// message empties the digest (zero counts, null range).
+#[tokio::test]
+async fn chat_unread_without_marker_and_empty_after_human() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let first = append_msg(&svc, &id, "assistant", "first reply", None).await;
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(1));
+    assert_eq!(digest["fromMessageId"], json!(first.id));
+    assert_eq!(digest["toMessageId"], json!(first.id));
+
+    // A human user message at the tail resets everything → empty digest.
+    append_msg(&svc, &id, "user", "human catches up", None).await;
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(0));
+    assert_eq!(digest["turns"], json!(0));
+    assert_eq!(digest["truncatedMessages"], json!(0));
+    assert_eq!(digest["fromMessageId"], json!(null));
+    assert_eq!(digest["toMessageId"], json!(null));
+    assert_eq!(digest["items"], json!([]));
+}
+
+/// Digest truncation: 100-item cap keeps the OLDEST rows (the head of the
+/// tail), `truncatedMessages` reports the overflow, and each `head` is capped
+/// at 100 chars. Machine-attributed `source`/`type` user rows count as
+/// content and turn starts.
+#[tokio::test]
+async fn chat_unread_truncates_items_and_heads() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let long_text = "x".repeat(250);
+    let first = append_msg(
+        &svc,
+        &id,
+        "user",
+        &long_text,
+        Some(json!({ "source": "system" })),
+    )
+    .await;
+    for i in 0..104 {
+        append_msg(&svc, &id, "assistant", &format!("reply {i}"), None).await;
+    }
+    let hook_wake = append_msg(
+        &svc,
+        &id,
+        "user",
+        "hook fired",
+        Some(json!({ "type": "hook_dispatch" })),
+    )
+    .await;
+
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(106));
+    assert_eq!(digest["turns"], json!(2));
+    assert_eq!(digest["truncatedMessages"], json!(6));
+    assert_eq!(digest["fromMessageId"], json!(first.id));
+    assert_eq!(digest["toMessageId"], json!(hook_wake.id));
+    let items = digest["items"].as_array().expect("items");
+    assert_eq!(items.len(), 100);
+    assert_eq!(items[0]["id"], json!(first.id));
+    assert_eq!(
+        items[0]["head"].as_str().expect("head").chars().count(),
+        100
+    );
+}
+
+/// A present-but-dangling seen marker (markSeen accepts unknown ids by
+/// design; `editAndRegenerate` can orphan a valid one) falls back to the
+/// whole-transcript scan instead of blocking the read.
+#[tokio::test]
+async fn chat_unread_dangling_marker_scans_whole_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let first = append_msg(&svc, &id, "assistant", "first reply", None).await;
+    let second = append_msg(&svc, &id, "assistant", "second reply", None).await;
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), "msg-never-existed".to_string())
+        .await
+        .expect("markSeen accepts dangling ids");
+
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(2));
+    assert_eq!(digest["fromMessageId"], json!(first.id));
+    assert_eq!(digest["toMessageId"], json!(second.id));
+}
+
+/// The question wizard's flattened answer row (`type: "question_answers"`)
+/// is typed BY the human — it must reset the unread boundary, not be
+/// digested as machine content.
+#[tokio::test]
+async fn chat_unread_question_answers_row_resets_boundary() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    append_msg(&svc, &id, "assistant", "asked questions", None).await;
+    append_msg(
+        &svc,
+        &id,
+        "user",
+        "Q: pick one\nA: option b",
+        Some(json!({
+            "type": "question_answers",
+            "answeredQuestionsMessageId": "msg-questions"
+        })),
+    )
+    .await;
+    let reply = append_msg(&svc, &id, "assistant", "post-answer reply", None).await;
+
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(1));
+    assert_eq!(digest["fromMessageId"], json!(reply.id));
+    assert_eq!(digest["toMessageId"], json!(reply.id));
+}
+
+/// Fails closed like `agent.markSeen`: unknown agent and workspace mismatch
+/// are both `NotFound`.
+#[tokio::test]
+async fn chat_unread_fails_closed() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    assert!(matches!(
+        svc.agent_chat_unread_op(ws.clone(), missing).await,
+        Err(Error::NotFound(_))
+    ));
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    assert!(matches!(
+        svc.agent_chat_unread_op(other_ws, id).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
 /// An assistant content-block array carrying `n` question resource blocks.
 fn question_blocks_n(n: usize) -> serde_json::Value {
     let mut blocks = vec![json!({ "type": "text", "text": "I have questions." })];

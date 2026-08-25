@@ -5798,10 +5798,11 @@ mod workspace_api_tool_tests {
         );
 
         // Byte-identity needs every gate open (the defaults plus the opt-in
-        // `peerAgents` toggle, the one default-off gate).
+        // `peerAgents` and `unreadSummaries` toggles, the default-off gates).
         let all_on_srv = server("amber-forest", None).with_agent_features(
             intent_core::settings_file::AgentFeaturesSettings {
                 peer_agents: true,
+                unread_summaries: true,
                 ..Default::default()
             },
         );
@@ -6113,12 +6114,13 @@ mod workspace_api_tool_tests {
         );
 
         // A top-level bridge with every gate open (the defaults plus the
-        // opt-in `peerAgents` toggle) stays byte-identical to the static
-        // const.
+        // opt-in `peerAgents` and `unreadSummaries` toggles) stays
+        // byte-identical to the static const.
         let top = server("amber-forest", None)
             .with_sub_agent(false)
             .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
                 peer_agents: true,
+                unread_summaries: true,
                 ..Default::default()
             });
         let resp = top
@@ -6173,6 +6175,30 @@ mod workspace_api_tool_tests {
         assert!(
             !text.contains("disabled in settings"),
             "sub-agent denial must not masquerade as a settings gate: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_dispatch_denies_chat_unread_with_top_level_rule() {
+        // Same layer (c) for `chat.*`: even when the workspace toggle is ON,
+        // a sub-agent's raw `host({...})` frame gets the top-level-only rule
+        // named — not a misleading "disabled in settings" denial.
+        let srv = server("amber-forest", None)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                unread_summaries: true,
+                ..Default::default()
+            })
+            .with_sub_agent(true);
+        let resp = call_workspace_api(&srv, "return await host({ method: 'chat.unread' });").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("only available to top-level agents"),
+            "expected the top-level-only rule named, got: {text}"
+        );
+        assert!(
+            !text.contains("disabled in settings"),
+            "sub-agent chat denial must not masquerade as a settings gate: {text}"
         );
     }
 

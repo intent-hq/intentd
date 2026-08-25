@@ -282,6 +282,7 @@ impl WorkspaceMcpServer {
         let mut features = self.agent_features.clone();
         if self.is_sub_agent {
             features.structured_questions = false;
+            features.unread_summaries = false;
         }
         features
     }

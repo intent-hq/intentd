@@ -20,6 +20,7 @@ use serde_json::Value;
 pub(crate) mod agent;
 pub(crate) mod app;
 pub(crate) mod browser;
+pub(crate) mod chat;
 pub(crate) mod comment;
 pub(crate) mod cross_workspace;
 pub(crate) mod event;
@@ -58,17 +59,18 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 }
 
 /// `prelude_for` plus the sub-agent flag: a sub-agent environment forces
-/// `structuredQuestions` off so `ws.app.question` is omitted through the
-/// exact same pruning machinery as the settings toggle (the surfaces cannot
-/// drift). Mirrors `WorkspaceMcpServer::effective_agent_features`; used by
-/// the background hook scheduler for hooks owned by background/delegated
-/// sessions.
+/// `structuredQuestions` and `unreadSummaries` off so `ws.app.question` and
+/// `ws.chat` are omitted through the exact same pruning machinery as the
+/// settings toggles (the surfaces cannot drift). Mirrors
+/// `WorkspaceMcpServer::effective_agent_features`; used by the background
+/// hook scheduler for hooks owned by background/delegated sessions.
 #[must_use]
 pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
     let forced;
-    let features = if is_sub_agent && features.structured_questions {
+    let features = if is_sub_agent && (features.structured_questions || features.unread_summaries) {
         forced = AgentFeaturesSettings {
             structured_questions: false,
+            unread_summaries: false,
             ..features.clone()
         };
         &forced
@@ -102,6 +104,9 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     }
     if features.terminal_access {
         fragments.push(terminal::PRELUDE);
+    }
+    if features.unread_summaries {
+        fragments.push(chat::PRELUDE);
     }
     fragments.push(file::PRELUDE);
     let app = app::prelude_for(features);
@@ -220,6 +225,18 @@ pub(crate) async fn try_dispatch(
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("chat.") {
+        return chat::dispatch(
+            api,
+            workspace_id,
+            caller_agent_id,
+            turn_attachments,
+            rest,
+            args,
+        )
+        .await
+        .map(Some);
     }
     if let Some(rest) = method.strip_prefix("app.") {
         return app::try_dispatch(
@@ -367,6 +384,20 @@ mod prelude_tests {
                 );
             }
         }
+    }
+
+    // `unreadSummaries` is opt-in (default off): the default prelude omits
+    // `ws.chat`, enabling the toggle installs it, and the sub-agent bridge
+    // forces it back off even when the setting is on (no user-facing chat).
+    #[test]
+    fn unread_summaries_gates_chat_prelude() {
+        assert!(!prelude_for(&AgentFeaturesSettings::default()).contains("ws.chat = {"));
+        let features = AgentFeaturesSettings {
+            unread_summaries: true,
+            ..AgentFeaturesSettings::default()
+        };
+        assert!(prelude_for(&features).contains("ws.chat = {"));
+        assert!(!prelude_for_bridge(&features, true).contains("ws.chat = {"));
     }
 
     // `structuredQuestions` off removes only `ws.app.question`; the rest of
