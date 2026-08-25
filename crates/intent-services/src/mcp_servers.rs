@@ -553,6 +553,13 @@ impl McpHub {
     /// [`Connection`], or the url + headers of an `http` endpoint. Untracked
     /// ids are `NotFound`; `sse` servers don't support tool calls (the daemon
     /// only holds a reachability probe for them, never a live session).
+    ///
+    /// A remote entry whose tracked state is not `running` (a failed probe
+    /// keeps it tracked as `error` so the health sweep re-probes it) is also
+    /// `NotFound`: forwarding to it would bypass the hub's liveness state.
+    /// The gate is never permanent — [`Self::health_tick`] re-probes every
+    /// [`HEALTH_INTERVAL`] and a config update re-probes immediately, either
+    /// of which flips a recovered server back to `running`.
     fn tool_target(&self, server_id: &str) -> Result<ToolTarget> {
         let map = self.inner.servers.lock().unwrap();
         let rs = map
@@ -570,6 +577,13 @@ impl McpHub {
                     return Err(Error::Unsupported(
                         "tool calls not supported over sse".to_string(),
                     ));
+                }
+                let state = rs.status.get("state").and_then(Value::as_str);
+                if state != Some("running") {
+                    return Err(Error::NotFound(format!(
+                        "mcp server {server_id} is not running (state: {})",
+                        state.unwrap_or("unknown")
+                    )));
                 }
                 let url = rs
                     .config
@@ -2990,6 +3004,57 @@ mod tests {
             assert!(matches!(err, Error::Unsupported(_)), "got: {err}");
             assert!(format!("{err}").contains("not supported over sse"));
         }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_rejected_for_remote_in_error_state() {
+        // A failed probe keeps the remote tracked with state `error`; the
+        // forwarder must honor that liveness state instead of forwarding to
+        // an endpoint the hub reports as not running.
+        let h = remote_hub("r-err", "http", "http://127.0.0.1:1", json!({}));
+        h.inner
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut("r-err")
+            .unwrap()
+            .status = status_error("r-err", "probe failed");
+        for err in [
+            h.list_tools("r-err").await.unwrap_err(),
+            h.call_tool("r-err", "t", json!({}), None)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::NotFound(_)), "got: {err}");
+            let msg = format!("{err}");
+            assert!(msg.contains("is not running"), "got: {msg}");
+            assert!(msg.contains("state: error"), "got: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_tick_reprobe_unbricks_error_state_remote_for_tools() {
+        // A transient probe failure must not permanently gate tool calls: the
+        // health sweep's re-probe flips a recovered server back to `running`,
+        // after which forwarding works again.
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r-rec", "http", &url, json!({}));
+        h.inner
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut("r-rec")
+            .unwrap()
+            .status = status_error("r-rec", "transient probe failure");
+        let err = h
+            .call_tool("r-rec", "t1", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err}");
+        h.health_tick().await;
+        assert_eq!(h.status("r-rec")["state"], json!("running"));
+        let result = h.call_tool("r-rec", "t1", json!({}), None).await.unwrap();
+        assert_eq!(result["content"][0]["text"], json!("http-ok"));
     }
 
     #[tokio::test]
