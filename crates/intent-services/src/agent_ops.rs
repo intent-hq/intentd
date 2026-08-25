@@ -10138,13 +10138,24 @@ impl Services {
             is_background: None,
             name_explicitly_set: None,
         };
+        // monorepo#3442: the live caller becomes the created agent's
+        // `parent_agent_id`, so a wakeOrCreate-created agent is a delegated
+        // child (`agent.reportToParent` works, attention/failure events carry
+        // the parent). A Deleted caller is filtered out — it can never receive
+        // the report wake — mirroring `agent_delegate_op`'s deleted-parent
+        // guard (same `caller_deleted` pre-gate as the SUB-1 blocks). The
+        // depth guard inside `agent_create_op` reads the parent's persisted
+        // `delegation_depth` against the same `MAX_DELEGATION_DEPTH` the B3
+        // pre-check above already enforced, so a pass there cannot regress
+        // into a rejection here (an explicit lower `delegationDepth` on the
+        // wire cannot bypass a caller already at the cap).
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
                 name,
                 model,
                 specialist,
-                None,
+                input.caller_agent_id.clone().filter(|_| !caller_deleted),
                 Some(task_note_id.clone()),
                 skip_auto_commit,
                 extra,
