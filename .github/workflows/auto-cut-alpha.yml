@@ -388,13 +388,13 @@ jobs:
             # comments — counts as human (fail safe: unknown authorship
             # blocks). Comment authors are read via comments(first: 100)
             # with no nested pagination (--paginate follows only the
-            # reviewThreads pageInfo): past 100 comments the remaining
-            # authors go unchecked, acceptable because a thread that long
-            # has human participation in practice — and the failure mode
-            # is blocking, never skipping a human thread. pipefail makes a
-            # gh failure fail the whole pipeline (awk still prints 0, but
-            # the substitution's exit status is gh's), so a flaked read
-            # retries instead of being mistaken for "no unresolved
+            # reviewThreads pageInfo), so a thread with more than 100
+            # comments (totalCount > 100) is treated as human too:
+            # authorship past the first page is unverifiable in one read,
+            # and unverifiable authorship must block, never skip. pipefail
+            # makes a gh failure fail the whole pipeline (awk still prints
+            # 0, but the substitution's exit status is gh's), so a flaked
+            # read retries instead of being mistaken for "no unresolved
             # threads".
             if ! unresolved=$(gh api graphql --paginate \
               -f query='query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
@@ -403,7 +403,7 @@ jobs:
                     reviewThreads(first: 100, after: $endCursor) {
                       nodes {
                         isResolved
-                        comments(first: 100) { nodes { author { __typename } } }
+                        comments(first: 100) { totalCount nodes { author { __typename } } }
                       }
                       pageInfo { hasNextPage endCursor }
                     }
@@ -415,7 +415,7 @@ jobs:
               -F pr="$number" \
               --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
                 | select(.isResolved | not)
-                | select(([.comments.nodes[].author.__typename] | length > 0 and all(. == "Bot")) | not)]
+                | select((.comments.totalCount <= 100 and ([.comments.nodes[].author.__typename] | length > 0 and all(. == "Bot"))) | not)]
               | length' \
               | awk '{ sum += $1 } END { print sum + 0 }'); then
               transient "reviewThreads query failed for Release PR #$number (transient API error?)"
