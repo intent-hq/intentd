@@ -2965,9 +2965,23 @@ impl Store {
         row.as_ref().map(map_message_row).transpose()
     }
 
-    /// Number of live delegated children of `parent_agent_id`: sessions
-    /// carrying this `parent_agent_id` whose status is still non-terminal
-    /// (not `Completed`/`error`/`deleted`). Deliberately UNSCOPED by
+    /// Number of RUNNING delegated children of `parent_agent_id`: sessions
+    /// carrying this `parent_agent_id` whose status is genuinely in-flight —
+    /// `pending`/`active`/`Processing`/`Waiting`, the same in-flight set as
+    /// the archive guardrail (`is_running_or_queued`); the startup heal
+    /// sweep's `is_stale_in_flight_status` covers the non-queued subset.
+    /// Idle children (`Idle` / `idle`) do NOT count: an idle-but-restorable
+    /// delegate is unsettled lifecycle state, not active work, and counting
+    /// it made `runningSubAgents` stick forever (intent-hq/monorepo#3384).
+    /// Persisted-status-only aggregate: a child sitting `Idle` with
+    /// queued-but-undelivered messages, or a fresh delegate in the window
+    /// before its first turn flips it `Active`, reports as not running — the
+    /// runtime `is_responding` signal the archive guardrail adds on top is
+    /// invisible at the store level, and briefly undercounting is the right
+    /// trade for a field named "running" (do not widen this back toward
+    /// unsettled-counting). An
+    /// allowlist (`IN`), not a terminal-status blocklist, so a future status
+    /// variant defaults to "not running". Deliberately UNSCOPED by
     /// workspace — a Chief parent can delegate into another workspace
     /// (`agent.delegate` cross-workspace), and `parent_agent_id` is globally
     /// unique. One aggregate statement over `idx_agent_parent`, so cost is
@@ -2977,26 +2991,28 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn count_unsettled_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
-        let terminal = [
-            AgentStatus::Completed,
-            AgentStatus::Error,
-            AgentStatus::Deleted,
+    pub async fn count_running_child_agents(&self, parent_agent_id: &AgentId) -> Result<u64> {
+        let running = [
+            AgentStatus::Pending,
+            AgentStatus::Active,
+            AgentStatus::Processing,
+            AgentStatus::Waiting,
         ]
         .iter()
         .map(enum_to_db)
         .collect::<Result<Vec<_>>>()?;
         let n: i64 = sqlx::query(
             "SELECT COUNT(*) AS n FROM agent_session \
-             WHERE parent_agent_id = ? AND status NOT IN (?, ?, ?)",
+             WHERE parent_agent_id = ? AND status IN (?, ?, ?, ?)",
         )
         .bind(&parent_agent_id.0)
-        .bind(&terminal[0])
-        .bind(&terminal[1])
-        .bind(&terminal[2])
+        .bind(&running[0])
+        .bind(&running[1])
+        .bind(&running[2])
+        .bind(&running[3])
         .fetch_one(self.read_pool())
         .await
-        .map_err(|e| Error::Internal(format!("count unsettled child agents failed: {e}")))?
+        .map_err(|e| Error::Internal(format!("count running child agents failed: {e}")))?
         .get::<i64, _>("n");
         Ok(n.cast_unsigned())
     }
