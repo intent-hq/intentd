@@ -2267,8 +2267,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.agent.snapshot` (MCP-only, PROTOCOL §7.1): the calling agent's own
     /// compact state digest — active hooks, completion watches, queued
-    /// messages, event subscriptions, unsettled children, pending structured
-    /// questions, pending attention request, current UTC time. Zero-count and
+    /// messages, event subscriptions, actively running (in-flight) children,
+    /// pending structured questions, pending attention request, current UTC
+    /// time. Zero-count and
     /// null fields are omitted from the returned object; `time` is always
     /// present. Never gated by `agentFeatures.stateSnapshot` (the toggle
     /// governs only the per-turn prompt injection). A workspace mismatch

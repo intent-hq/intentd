@@ -27415,13 +27415,15 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     let child = create_agent(&svc, &ws, "Child").await;
     let other = create_agent(&svc, &ws, "Other").await;
 
-    // Parent linkage: `child` is an unsettled delegate of `parent`.
+    // Parent linkage: `child` is an actively running delegate of `parent`
+    // (freshly created sessions persist as `Idle`, which does not count).
     let mut child_session = svc
         .store()
         .get_agent_session(&child)
         .await
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
+    child_session.status = intent_core::AgentStatus::Active;
     svc.store()
         .update_agent_session(&ws, &child_session)
         .await
@@ -27561,7 +27563,70 @@ async fn agent_snapshot_excludes_settled_children() {
     );
 }
 
-/// An unsettled child delegated into ANOTHER workspace (Chief cross-workspace
+/// Regression (monorepo#3384): an IDLE child — non-terminal but not doing
+/// any work — must not count toward `runningSubAgents`. Both idle variants
+/// are excluded: legacy `Idle` (persisted on creation) and `RuntimeIdle`
+/// (persisted at end-of-turn), so a parent whose delegates all finished
+/// their turns reports no running children instead of a count stuck at the
+/// delegate total forever.
+#[tokio::test]
+async fn agent_snapshot_excludes_idle_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Legacy `Idle`: the status a freshly created session persists.
+    let created_idle = create_agent(&svc, &ws, "Created Idle").await;
+    let mut created_session = svc
+        .store()
+        .get_agent_session(&created_idle)
+        .await
+        .expect("created-idle session");
+    assert_eq!(created_session.status, intent_core::AgentStatus::Idle);
+    created_session.parent_agent_id = Some(parent.clone());
+    svc.store()
+        .update_agent_session(&ws, &created_session)
+        .await
+        .expect("link created-idle child");
+    // `RuntimeIdle`: the status end_turn persists when a turn finishes.
+    let turn_idle = create_agent(&svc, &ws, "Turn Idle").await;
+    let mut turn_session = svc
+        .store()
+        .get_agent_session(&turn_idle)
+        .await
+        .expect("turn-idle session");
+    turn_session.parent_agent_id = Some(parent.clone());
+    turn_session.status = intent_core::AgentStatus::RuntimeIdle;
+    svc.store()
+        .update_agent_session(&ws, &turn_session)
+        .await
+        .expect("link turn-idle child");
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(
+        !v.as_object().unwrap().contains_key("runningSubAgents"),
+        "idle children must not count as running: {v}"
+    );
+
+    // Flip one child into an in-flight status: it counts again.
+    turn_session.status = intent_core::AgentStatus::Active;
+    svc.store()
+        .update_agent_session(&ws, &turn_session)
+        .await
+        .expect("activate child");
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        v["runningSubAgents"],
+        json!(1),
+        "only the active child counts: {v}"
+    );
+}
+
+/// A running child delegated into ANOTHER workspace (Chief cross-workspace
 /// delegation) still counts toward `runningSubAgents` — child discovery keys
 /// on `parent_agent_id` alone, never on the parent's home workspace.
 #[tokio::test]
@@ -27580,6 +27645,7 @@ async fn agent_snapshot_counts_cross_workspace_children() {
         .await
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
+    child_session.status = intent_core::AgentStatus::Active;
     svc.store()
         .update_agent_session(&other_ws, &child_session)
         .await
