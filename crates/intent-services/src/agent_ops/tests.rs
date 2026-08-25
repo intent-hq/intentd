@@ -16879,6 +16879,163 @@ async fn app_agents_wait_rejects_idle_target_with_no_waiting_reasons() {
     }
 }
 
+/// Mutual-wait guard: `agent.watch` on a target that already holds a live
+/// UNGROUPED watch on the caller is rejected with an error naming both
+/// agents and pointing at the settle alternatives — no reverse watch is
+/// registered.
+#[tokio::test]
+async fn agent_watch_rejected_when_target_watches_caller() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    svc.agent_watch_op(ws.clone(), b.clone(), a.clone())
+        .await
+        .expect("B watches A");
+
+    let err = svc
+        .agent_watch_op(ws.clone(), a.clone(), b.clone())
+        .await
+        .expect_err("watching back an agent already waiting on you must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => {
+            assert!(
+                msg.contains(&a.0) && msg.contains(&b.0),
+                "error names both agents: {msg}"
+            );
+            assert!(
+                msg.contains("reportToParent") && msg.contains("agent.send"),
+                "error points at the settle alternatives: {msg}"
+            );
+        }
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&a).is_empty(),
+        "rejection is side-effect free — no reverse watch registered"
+    );
+}
+
+/// Mutual-wait guard: a GROUPED reverse watch (the target waits on the
+/// caller via an `after_all` group) triggers the same rejection.
+#[tokio::test]
+async fn agent_watch_rejected_when_target_holds_grouped_watch_on_caller() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    svc.app_agents_wait_op(
+        ws.clone(),
+        b.clone(),
+        vec![a.0.clone()],
+        Some("after_all".to_string()),
+    )
+    .await
+    .expect("B waits on A (grouped)");
+
+    let err = svc
+        .agent_watch_op(ws.clone(), a.clone(), b.clone())
+        .await
+        .expect_err("grouped reverse watch must trigger the rejection too");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}"
+    );
+    assert!(
+        svc.list_watches_for_parent(&a).is_empty(),
+        "no reverse watch registered"
+    );
+}
+
+/// Mutual-wait guard boundary: a `report_delivered` reverse watch has
+/// already delivered its report-time wake — the target is not waiting on
+/// the caller, so watching it back is accepted.
+#[tokio::test]
+async fn agent_watch_accepted_when_reverse_watch_is_report_delivered() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    svc.agent_watch_op(ws.clone(), b.clone(), a.clone())
+        .await
+        .expect("B watches A");
+    let watch_id = svc.list_watches_for_parent(&b)[0].id.clone();
+    assert!(svc.mark_watch_report_delivered(&watch_id));
+
+    svc.agent_watch_op(ws.clone(), a.clone(), b.clone())
+        .await
+        .expect("report_delivered reverse watch does not trigger the rejection");
+    assert_eq!(
+        svc.list_watches_for_parent(&a).len(),
+        1,
+        "watch registered normally"
+    );
+}
+
+/// Mutual-wait guard (`app.agents.waitFor` call site): BOTH modes are
+/// rejected when any target already watches the caller, side-effect free —
+/// no watches (not even for a valid co-target listed first) and no group.
+#[tokio::test]
+async fn app_agents_wait_rejected_when_target_watches_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    svc.agent_watch_op(ws.clone(), watcher.clone(), caller.clone())
+        .await
+        .expect("Watcher watches Caller");
+
+    for mode in [None, Some("after_all".to_string())] {
+        let err = svc
+            .app_agents_wait_op(
+                ws.clone(),
+                caller.clone(),
+                vec![other.0.clone(), watcher.0.clone()],
+                mode.clone(),
+            )
+            .await
+            .expect_err("waitFor on an agent already waiting on the caller must be rejected");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&watcher.0),
+                "error names the offending target: {msg}"
+            ),
+            other => panic!("expected Error::InvalidParams, got {other:?}"),
+        }
+        assert!(
+            svc.list_watches_for_parent(&caller).is_empty(),
+            "rejection leaves no watches (not even for the valid co-target)"
+        );
+        assert!(
+            svc.delegation_group_for_parent(&caller).is_none(),
+            "rejection leaves no partially-initialized group"
+        );
+    }
+}
+
+/// Mutual-wait guard boundary: `app.agents.waitFor` on targets that do NOT
+/// watch the caller registers normally in both modes.
+#[tokio::test]
+async fn app_agents_wait_accepted_when_targets_do_not_watch_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let t1 = create_agent(&svc, &ws, "T1").await;
+    let t2 = create_agent(&svc, &ws, "T2").await;
+
+    let res = svc
+        .app_agents_wait_op(
+            ws.clone(),
+            caller.clone(),
+            vec![t1.0.clone(), t2.0.clone()],
+            None,
+        )
+        .await
+        .expect("targets not watching the caller are accepted");
+    assert_eq!(res["ok"], json!(true));
+    assert_eq!(
+        svc.list_watches_for_parent(&caller).len(),
+        2,
+        "both watches registered"
+    );
+}
+
 /// monorepo#2972 guard boundary: a `RuntimeIdle` target whose pending message
 /// queue holds a ready-to-send entry WILL run again — the registration is
 /// accepted, no instant wake fires (the queue-interim classification defers
