@@ -7,7 +7,10 @@
 //!   tolerates-and-ignores the retired path while `settings.get` rejects it;
 //! - default-provider switch (monorepo#3177): a `settings.update` batch
 //!   switching `providers.active` re-resolves `model.default` for the new
-//!   provider (cached catalog default, else cleared).
+//!   provider (cached catalog default, else cleared);
+//! - `tokenImpact` annotations: every `agentFeatures.*` definition in
+//!   `settings.list` carries its approximate token-impact string, and
+//!   unannotated definitions omit the optional key.
 
 #![cfg(unix)]
 
@@ -420,6 +423,79 @@ async fn retired_workspace_overrides_over_wss() {
         resp["error"]["code"],
         json!(-32602),
         "settings.get on the retired path must reject as unknown: {resp}"
+    );
+}
+
+/// `tokenImpact` over WSS (§5.12): every `agentFeatures.*` definition in
+/// `settings.list` carries its approximate token-impact annotation, and
+/// unannotated definitions omit the key entirely.
+#[tokio::test]
+async fn agent_features_token_impact_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let resp = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    let settings = resp["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let entry = |path: &str| {
+        settings
+            .iter()
+            .find(|e| e["path"] == json!(path))
+            .unwrap_or_else(|| panic!("missing setting {path}"))
+    };
+
+    for (path, impact) in [
+        ("agentFeatures.backgroundHooks", "~620 tokens/session"),
+        ("agentFeatures.hostExec", "~50 tokens/session"),
+        ("agentFeatures.scripts", "~240 tokens/session"),
+        ("agentFeatures.terminalAccess", "~50 tokens/session"),
+        ("agentFeatures.browserAutomation", "~50 tokens/session"),
+        ("agentFeatures.richChatBlocks", "~310 tokens/session"),
+        ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+        ("agentFeatures.attentionRequests", "~340 tokens/session"),
+        ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
+        ("agentFeatures.prMonitor", "~290 tokens/session"),
+        (
+            "agentFeatures.taskGraph",
+            "~170 tokens/session + variable per completion wake",
+        ),
+    ] {
+        assert_eq!(
+            entry(path)["tokenImpact"],
+            json!(impact),
+            "{path} tokenImpact over the wire"
+        );
+    }
+
+    // Unannotated definitions omit the key entirely (optional field).
+    assert!(
+        !entry("git.autoCommit")
+            .as_object()
+            .expect("setting object")
+            .contains_key("tokenImpact"),
+        "unannotated setting must omit tokenImpact"
     );
 }
 
