@@ -6564,15 +6564,18 @@ impl Services {
                 );
             }
         }
-        // 6. monorepo#1229: attention fan-out to explicit `agent.watch`
-        // watchers (`wake_on_attention`). The caller's parent is excluded —
-        // step 5 already woke it directly — so a parent that ALSO explicitly
+        // 6. monorepo#1229: attention fan-out to the caller's watchers. Every
+        // active completion watch is woken — auto-registered
+        // (wakeOrCreate/delegate SUB-1) watches included, not just explicit
+        // `agent.watch` registrations (monorepo#3443 widened the fan-out past
+        // the old `wake_on_attention` filter). The caller's parent is
+        // excluded — step 5 already woke it directly — so a parent that ALSO
         // watches its child never receives a duplicate attention wake.
         // Watches are left in place (attention is not a completion).
         for watch in self
             .find_watches_for_child(&caller)
             .into_iter()
-            .filter(|w| w.wake_on_attention && Some(&w.parent_agent_id) != parent.as_ref())
+            .filter(|w| Some(&w.parent_agent_id) != parent.as_ref())
         {
             // Attention is not a completion, so the watch is left in place —
             // say so explicitly (issue monorepo#2051) to avoid reading as
@@ -8163,10 +8166,11 @@ impl Services {
 
     /// `agent.watch` (monorepo#1229): explicit caller→target subscription to
     /// the target's harness-curated completion set — idle/completed, failed,
-    /// deleted, blocker raised, discussion requested. Unlike the
-    /// auto-registered delegation/SUB-1 watches this watch is
-    /// `wake_on_attention` (the attention fan-out in
-    /// `agent_request_attention_op` wakes it). The registration is durably
+    /// deleted, blocker raised, discussion requested. Like the
+    /// auto-registered delegation/SUB-1 watches, the attention fan-out in
+    /// `agent_request_attention_op` wakes it (monorepo#3443 widened the
+    /// fan-out to every active watch; the persisted `wake_on_attention` flag
+    /// still records the explicit registration). The registration is durably
     /// persisted before returning. Fails closed on a nonexistent target and
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
     /// cross-workspace targets for non-chief callers, the idle-target

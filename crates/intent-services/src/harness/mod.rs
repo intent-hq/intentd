@@ -214,8 +214,10 @@ pub(crate) trait Harness: Send + Sync {
         kind: &str,
         reason: &str,
     ) -> String;
-    /// Attention-request fan-out wake to an explicit watcher (monorepo#1229);
-    /// `grouped_watch` flips the completion promise to group settlement.
+    /// Attention-request fan-out wake to a watcher (monorepo#1229; since
+    /// monorepo#3443 every active watch, not just explicit `agent.watch`
+    /// registrations); `grouped_watch` flips the completion promise to group
+    /// settlement.
     fn attention_watcher_wake(
         &self,
         agent_name: &str,
