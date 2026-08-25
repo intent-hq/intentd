@@ -1697,8 +1697,10 @@ mod tests {
     // preamble and Examples block byte-identical, every indent-2 method line
     // present with its signature intact and its summary either whole or cut
     // at a sentence boundary, and no continuation lines in the API section.
-    // Swept across both chief variants and every gating combination so the
-    // condensed text can never drift from the gated full text.
+    // Swept across both chief variants and the defaults plus each gating
+    // toggle disabled individually — including `task_graph`, which rewrites
+    // doc lines via `replacen` OFF-variants rather than prefix-pruning — so
+    // the condensed text can never drift from the gated full text.
     #[test]
     fn condensed_description_derives_from_full_assembly() {
         let mut feature_sets: Vec<AgentFeaturesSettings> = vec![AgentFeaturesSettings::default()];
@@ -1707,6 +1709,10 @@ mod tests {
             disable(&mut features);
             feature_sets.push(features);
         }
+        feature_sets.push(AgentFeaturesSettings {
+            task_graph: false,
+            ..AgentFeaturesSettings::default()
+        });
         for is_chief in [false, true] {
             for features in &feature_sets {
                 let full = workspace_api_description(is_chief, features);
@@ -1745,6 +1751,62 @@ mod tests {
                         assert!(
                             full_line[cond_line.len()..].starts_with(' '),
                             "chief={is_chief}: cut must fall before a space:\n{cond_line}"
+                        );
+                        // A mid-abbreviation or mid-parenthetical cut ends
+                        // with '.' too and would slip past the boundary
+                        // checks above — require balanced backticks/parens
+                        // and a non-dotted last word on the kept text.
+                        assert!(
+                            cond_line.matches('`').count() % 2 == 0,
+                            "chief={is_chief}: cut left an unbalanced backtick:\n{cond_line}"
+                        );
+                        if full_line.matches('(').count() == full_line.matches(')').count() {
+                            assert!(
+                                cond_line.matches('(').count() == cond_line.matches(')').count(),
+                                "chief={is_chief}: cut left an unbalanced paren:\n{cond_line}"
+                            );
+                        }
+                        let last_word = cond_line
+                            .trim_end_matches('.')
+                            .rsplit([' ', '('])
+                            .next()
+                            .unwrap_or("");
+                        assert!(
+                            !matches!(
+                                last_word.to_ascii_lowercase().as_str(),
+                                "e.g" | "i.e" | "etc" | "vs" | "cf" | "approx" | "min" | "no"
+                            ),
+                            "chief={is_chief}: cut fell after an abbreviation:\n{cond_line}"
+                        );
+                    }
+                }
+                // A first physical line that wraps mid-sentence into a
+                // continuation line would be kept whole (no `. ` found)
+                // while its continuation is dropped, leaving dangling text:
+                // any full method line owning continuation lines must either
+                // get cut or end with terminal punctuation.
+                let mut full_lines = full_api.lines().peekable();
+                while let Some(line) = full_lines.next() {
+                    if !line.starts_with("  ws.") {
+                        continue;
+                    }
+                    let has_continuation = full_lines.peek().is_some_and(|next| {
+                        let t = next.trim_start();
+                        !t.is_empty() && next.len() - t.len() >= 4
+                    });
+                    if has_continuation {
+                        let cond_line = cond_methods
+                            .iter()
+                            .find(|c| line.starts_with(*c))
+                            .unwrap_or_else(|| {
+                                panic!("chief={is_chief}: no condensed line for:\n{line}")
+                            });
+                        assert!(
+                            cond_line.len() < line.len()
+                                || cond_line.ends_with('.')
+                                || cond_line.ends_with(':'),
+                            "chief={is_chief}: uncut line with dropped continuation does not \
+                             end a sentence:\n{cond_line}"
                         );
                     }
                 }

@@ -99,10 +99,11 @@ pub struct WorkspaceMcpServer {
     is_sub_agent: bool,
     /// Whether `tools/list` serves the compact `workspace_api` description
     /// (`ProviderConfig::truncates_tool_descriptions` — providers whose MCP
-    /// client cuts long descriptions at ~2k chars). The full reference then
-    /// rides the session's system prompt via
-    /// [`Self::full_workspace_api_description`]. Defaults to `false`: every
-    /// non-flagged provider keeps today's full description byte-identical.
+    /// client cuts long descriptions at ~2k chars). The condensed reference
+    /// then rides the session's system prompt via
+    /// [`Self::condensed_workspace_api_description`]. Defaults to `false`:
+    /// every non-flagged provider keeps today's full description
+    /// byte-identical.
     compact_tool_descriptions: bool,
 }
 
