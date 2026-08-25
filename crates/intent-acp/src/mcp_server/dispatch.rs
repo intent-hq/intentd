@@ -734,6 +734,13 @@ pub(super) const SUB_AGENT_SPAWN_PEER_DENIED: &str =
     "ws.agent.spawnPeer is only available to top-level agents — use \
      ws.agent.create or ws.agent.delegate to start sub-agents instead";
 
+/// The dispatch-layer denial for a sub-agent's `chat.*` frame — names the
+/// top-level-only rule instead of misleading with "disabled in settings"
+/// when the workspace toggle is actually on.
+pub(super) const SUB_AGENT_CHAT_DENIED: &str =
+    "ws.chat.unread is only available to top-level agents — a sub-agent has \
+     no user-facing chat to digest";
+
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
@@ -751,10 +758,10 @@ async fn workspace_host_dispatch(
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
-    // Sub-agent question gate FIRST: the redirect error must win over the
+    // Sub-agent gates FIRST: the redirect errors must win over the
     // feature-gate denial (a sub-agent bridge's effective features force
-    // `structuredQuestions` off, which would otherwise claim the frame with
-    // a misleading "disabled in settings").
+    // `structuredQuestions` / `unreadSummaries` off, which would otherwise
+    // claim the frame with a misleading "disabled in settings").
     if is_sub_agent && method.starts_with("app.question.") {
         return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
     }
@@ -763,6 +770,9 @@ async fn workspace_host_dispatch(
     // the actionable message rather than a settings complaint.
     if is_sub_agent && method == "agent.spawnPeer" {
         return Err(format!("host: {SUB_AGENT_SPAWN_PEER_DENIED}"));
+    }
+    if is_sub_agent && method.starts_with("chat.") {
+        return Err(format!("host: {SUB_AGENT_CHAT_DENIED}"));
     }
     if let Some(feature) = super::tools::denied_feature(agent_features, method) {
         return Err(format!(

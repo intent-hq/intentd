@@ -6703,7 +6703,25 @@ async fn queued_message_metadata_survives_drain_over_wss() {
 // the dequeue-wait [SYSTEM NOTE] and WITHOUT the queueInfo metadata stamp —
 // the sub-threshold hop reads exactly like an immediate delivery (PROTOCOL
 // §5.5), while caller-supplied messageMetadata still persists verbatim.
+//
+// Load-tolerant by measurement (monorepo#3409): under parallel suite load,
+// scheduling delay can legitimately push the real queue wait past the 5s
+// threshold, so the test measures an upper bound on the wait client-side and
+// asserts conditionally — the strong no-annotation assertions when the run
+// provably stayed sub-threshold (the norm), internal-consistency assertions
+// on the annotation otherwise. The exact threshold gate itself is covered
+// deterministically by `agent_manager::tests::dequeue_wait_tests`.
 // ---------------------------------------------------------------------------
+
+/// Production default of `DEQUEUE_WAIT_ANNOTATION_MIN_MS`
+/// (`intent-services/src/agent_manager.rs`, monorepo#2353) — this test runs
+/// without the `INTENTD_DEQUEUE_WAIT_MIN_MS` override.
+const PROD_DEQUEUE_WAIT_MIN_MS: u128 = 5_000;
+
+/// Slack for comparing the daemon's wall-clock `waitedMs` against the test's
+/// monotonic upper bound (covers wall-clock adjustments between the daemon's
+/// `queuedAt` mint and its dequeue reading).
+const WALL_CLOCK_SLACK_MS: u128 = 1_000;
 
 #[tokio::test]
 async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
@@ -6742,7 +6760,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:queue:processing", "agent:stream:end"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -6770,7 +6788,11 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     sleep(Duration::from_millis(200)).await;
 
     // Second send while busy — queues, waits ~2s, drains sub-threshold.
+    // The stopwatch starts BEFORE the queuing send is issued, so it strictly
+    // precedes the daemon minting `queuedAt` — any elapsed reading is a safe
+    // upper bound on the daemon-measured dequeue wait.
     let metadata = json!({ "type": "event_notification" });
+    let queue_wait_clock = std::time::Instant::now();
     let send2 = wss_rpc(
         &mut rpc,
         12,
@@ -6785,19 +6807,42 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
+    let queued_id = send2["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
 
-    // Wait for both turns to finish (first send + drained queued send).
+    // Wait for both turns to finish (first send + drained queued send). The
+    // drain-start signal `agent:queue:processing` (monorepo#1022) is emitted
+    // immediately AFTER `annotate_dequeue_wait` stamps the entry, so the
+    // elapsed reading at that frame (matched to the queued entry's id)
+    // strictly upper-bounds the daemon-measured wait.
     let mut stream_end_count = 0;
-    for _ in 0..120 {
+    let mut wait_upper_bound: Option<Duration> = None;
+    for _ in 0..240 {
         let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:end" {
-            stream_end_count += 1;
-            if stream_end_count >= 2 {
-                break;
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:queue:processing")
+                if evt["data"]["messageId"].as_str() == Some(&queued_id) =>
+            {
+                wait_upper_bound = Some(queue_wait_clock.elapsed());
             }
+            Some("agent:stream:end") => {
+                stream_end_count += 1;
+                if stream_end_count >= 2 {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
     assert_eq!(stream_end_count, 2, "both turns must complete");
+    // The subscription predates the queuing send and events are delivered in
+    // order, so the drain-start frame must have been observed — no loose
+    // fallback that could misclassify an incorrectly annotated run.
+    let wait_upper_bound =
+        wait_upper_bound.expect("agent:queue:processing frame for the queued entry");
 
     let convo = wss_rpc(
         &mut rpc,
@@ -6817,21 +6862,63 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
                     .is_some_and(|t| t.contains("sub-threshold queued message"))
         })
         .expect("drained user message row present");
-    // No dequeue-wait system note on the persisted content.
     let text = drained["contentBlocks"][0]["text"].as_str().unwrap();
-    assert!(
-        !text.contains("This message was queued at"),
-        "sub-threshold drain must not carry the dequeue-wait note: {drained}"
-    );
-    // No queueInfo stamp — neither on the row metadata nor the in-block fold.
-    assert!(
-        drained["metadata"]["queueInfo"].is_null(),
-        "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
-    );
-    assert!(
-        drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
-        "sub-threshold drain must not fold queueInfo into the block: {drained}"
-    );
+    let annotated = text.contains("This message was queued at");
+    if annotated {
+        // Loaded run (monorepo#3409): the annotation is only legitimate when
+        // the wait genuinely reached the threshold — hold the daemon to
+        // internal consistency: the queueInfo stamp must carry the entry's
+        // queuedAt and a waitedMs at/above the threshold and within the
+        // observed upper bound (small slack for wall-clock adjustments
+        // between the daemon's `queuedAt` mint and the dequeue reading).
+        eprintln!(
+            "sub-threshold window overrun under load (upper bound \
+             {wait_upper_bound:?}); asserting over-threshold consistency"
+        );
+        // Symmetric wall-clock slack: the daemon gates the annotation on a
+        // wall-clock reading (`now_utc() - queuedAt`), so a forward clock
+        // step can legitimately annotate while the monotonic bound sits just
+        // under the threshold.
+        assert!(
+            wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS >= PROD_DEQUEUE_WAIT_MIN_MS,
+            "dequeue-wait note appeared although the observed wait upper \
+             bound {wait_upper_bound:?} is sub-threshold: {drained}"
+        );
+        let queue_info = &drained["metadata"]["queueInfo"];
+        assert_eq!(
+            queue_info["queuedAt"], send2["queuedMessage"]["queuedAt"],
+            "annotated drain must stamp the entry's queuedAt: {drained}"
+        );
+        let waited_ms = queue_info["waitedMs"]
+            .as_u64()
+            .expect("annotated drain stamps integer waitedMs");
+        assert!(
+            u128::from(waited_ms) >= PROD_DEQUEUE_WAIT_MIN_MS,
+            "annotation implies an over-threshold daemon-measured wait, got \
+             waitedMs={waited_ms}: {drained}"
+        );
+        assert!(
+            u128::from(waited_ms) <= wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS,
+            "daemon-measured wait ({waited_ms}ms) exceeds the observed upper \
+             bound {wait_upper_bound:?}: {drained}"
+        );
+        assert_eq!(
+            drained["contentBlocks"][0]["messageMetadata"], drained["metadata"],
+            "annotated drain must fold the same messageMetadata: {drained}"
+        );
+    } else {
+        // The norm — the drain reads exactly like an immediate delivery: no
+        // dequeue-wait system note (checked above) and no queueInfo stamp,
+        // neither on the row metadata nor the in-block fold.
+        assert!(
+            drained["metadata"]["queueInfo"].is_null(),
+            "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
+        );
+        assert!(
+            drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
+            "sub-threshold drain must not fold queueInfo into the block: {drained}"
+        );
+    }
     // Caller-supplied messageMetadata still persists verbatim.
     assert_eq!(
         drained["metadata"]["type"], "event_notification",

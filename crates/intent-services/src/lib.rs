@@ -22700,6 +22700,14 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_chat_unread(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.agent_chat_unread_op(workspace_id, agent_id).await })
+    }
+
     fn agent_edit_and_regenerate(
         &self,
         workspace_id: WorkspaceId,

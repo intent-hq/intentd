@@ -111,5 +111,6 @@ pub use traits::{
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
 };
 pub use turn_attachments::{
-    new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
+    new_attachment_id, AttachmentPolicy, SummarizeGate, TurnAttachment, TurnAttachmentRegistry,
+    ATTACHMENT_ID_KEY,
 };

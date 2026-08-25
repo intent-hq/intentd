@@ -66,6 +66,33 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 /// consumers (activity feeds, filters) can trace provenance.
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 
+/// `chat.unread` digest caps: at most this many items in the digest (older
+/// overflow reported via `truncatedMessages`) …
+const UNREAD_DIGEST_MAX_ITEMS: usize = 100;
+/// … each item's `head` truncated to this many characters.
+const UNREAD_DIGEST_HEAD_CHARS: usize = 100;
+/// Transcript page size for the `chat.unread` forward scan — bounded pages
+/// instead of one full-transcript hydration (RPC cost contract).
+const UNREAD_SCAN_PAGE: i64 = 200;
+
+/// Whether a user-role message row was machine-delivered rather than typed
+/// by the human: A2A sends stamp `fromAgentId`, daemon-initiated deliveries
+/// stamp `source` (system notices, `wake_or_create`), and hook / PR-monitor
+/// wakes stamp a metadata `type`. Absence of all three means a human-authored
+/// message (FE-attached metadata like `userAppMessageId` carries none of
+/// them). One `type` is exempt: the question wizard's flattened answer row
+/// ([`QUESTION_ANSWERS_METADATA_TYPE`]) is typed BY the human — the FE's
+/// canonical authorship predicate treats it as user-authored, so it must
+/// reset the unread boundary like any other human message.
+fn user_message_is_machine(metadata: Option<&Value>) -> bool {
+    metadata.is_some_and(|md| {
+        if md.get("type").and_then(Value::as_str) == Some(QUESTION_ANSWERS_METADATA_TYPE) {
+            return false;
+        }
+        md.get("fromAgentId").is_some() || md.get("source").is_some() || md.get("type").is_some()
+    })
+}
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -5898,6 +5925,131 @@ impl Services {
             "agent.markSeen: seen-marker CAS did not settle after \
              {MARK_SEEN_CAS_ATTEMPTS} attempts for agent {agent_id}"
         )))
+    }
+
+    /// `chat.unread`: compact digest of the calling agent's own unread
+    /// conversation tail (MCP-only surface behind `ws.chat.unread()`; not a
+    /// wire RPC). Scans forward
+    /// from the message after the persisted seen marker
+    /// ([`AgentSession::last_seen_message_id`]; the whole transcript when the
+    /// marker is absent or dangling, e.g. truncated by
+    /// `agent.editAndRegenerate`). Each HUMAN-authored user message resets
+    /// the collection — proof of user presence — so the digest covers only
+    /// non-human messages after the newest human user message: assistant
+    /// messages, system notices, and machine-attributed user-role deliveries
+    /// (A2A sends carrying `fromAgentId`, daemon-sourced rows carrying
+    /// `source`, hook/PR-monitor wakes carrying their metadata `type`).
+    /// Tool-role rows are neither content nor boundaries. Read-only — never
+    /// moves the seen marker. Fails closed on a nonexistent agent or a
+    /// workspace mismatch (`NotFound`).
+    ///
+    /// Truncation semantics: `items` keeps the OLDEST
+    /// [`UNREAD_DIGEST_MAX_ITEMS`] rows of the tail (the newest overflow into
+    /// `truncatedMessages`), while `fromMessageId..toMessageId` — and
+    /// therefore the summarize gate armed from them — span the ENTIRE tail,
+    /// including rows not shown as items. Memory is bounded accordingly:
+    /// only the capped, head-truncated items are retained across pages; the
+    /// rest of the tail contributes counts and the range end only.
+    pub(crate) async fn agent_chat_unread_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        // Metadata-only lookup (no transcript hydration); workspace mismatch
+        // surfaces as NotFound (same defense as `agent.markSeen`).
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        // Scan start: the row after the marker. A dangling marker (unknown
+        // id, or truncated by `agent.editAndRegenerate`) never blocks the
+        // read — scan the whole transcript, matching the markSeen gate's
+        // treatment of dangling ids.
+        let mut offset = match session.last_seen_message_id() {
+            Some(marker) => self
+                .store
+                .get_agent_message_index(&agent_id, marker)
+                .await?
+                .map_or(0, |idx| idx + 1),
+            None => 0,
+        };
+        // Bounded collection: only the first UNREAD_DIGEST_MAX_ITEMS rows of
+        // the current tail are retained (heads pre-truncated); rows past the
+        // cap contribute `messages` / `toMessageId` only, so memory stays
+        // O(cap) regardless of tail length.
+        let mut collected: Vec<(String, String, String)> = Vec::new();
+        let mut messages: usize = 0;
+        let mut last_id: Option<String> = None;
+        let mut turns: usize = 0;
+        loop {
+            let page = self
+                .store
+                .get_agent_messages_page(&agent_id, offset, UNREAD_SCAN_PAGE)
+                .await?;
+            let n = i64::try_from(page.len()).unwrap_or(i64::MAX);
+            for msg in page {
+                match msg.role.as_str() {
+                    "user" if !user_message_is_machine(msg.metadata.as_ref()) => {
+                        // Human-authored user message: the user saw
+                        // everything before it — drop the collection.
+                        collected.clear();
+                        messages = 0;
+                        last_id = None;
+                        turns = 0;
+                    }
+                    "user" => {
+                        // Machine-attributed user-role delivery: digest
+                        // CONTENT, and the start of a new turn.
+                        turns += 1;
+                        messages += 1;
+                        if collected.len() < UNREAD_DIGEST_MAX_ITEMS {
+                            let text = crate::search_ops::message_text(&msg.content);
+                            let head: String =
+                                text.chars().take(UNREAD_DIGEST_HEAD_CHARS).collect();
+                            collected.push((msg.id.clone(), msg.role, head));
+                        }
+                        last_id = Some(msg.id);
+                    }
+                    "assistant" | "system" => {
+                        if turns == 0 {
+                            // Tail begins mid-turn (no collected user row):
+                            // count the partial turn once.
+                            turns = 1;
+                        }
+                        messages += 1;
+                        if collected.len() < UNREAD_DIGEST_MAX_ITEMS {
+                            let text = crate::search_ops::message_text(&msg.content);
+                            let head: String =
+                                text.chars().take(UNREAD_DIGEST_HEAD_CHARS).collect();
+                            collected.push((msg.id.clone(), msg.role, head));
+                        }
+                        last_id = Some(msg.id);
+                    }
+                    _ => {}
+                }
+            }
+            if n < UNREAD_SCAN_PAGE {
+                break;
+            }
+            offset += n;
+        }
+        let truncated = messages.saturating_sub(UNREAD_DIGEST_MAX_ITEMS);
+        let from_message_id = collected
+            .first()
+            .map_or(Value::Null, |(id, _, _)| json!(id));
+        let to_message_id = last_id.map_or(Value::Null, |id| json!(id));
+        let items: Vec<Value> = collected
+            .into_iter()
+            .map(|(id, role, head)| json!({ "id": id, "role": role, "head": head }))
+            .collect();
+        Ok(json!({
+            "turns": if messages == 0 { 0 } else { turns },
+            "messages": messages,
+            "truncatedMessages": truncated,
+            "fromMessageId": from_message_id,
+            "toMessageId": to_message_id,
+            "items": items,
+        }))
     }
 
     /// Number of question resource blocks on the dismissed assistant message.
