@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 
+use intent_core::config::DEFAULT_UNREAD_SUMMARIZE_THRESHOLD;
 use intent_core::settings_file::AgentFeaturesSettings;
 use serde_json::{json, Map, Value};
 
@@ -142,7 +143,7 @@ Namespaces (index — full signatures in API below):
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
-  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
@@ -151,6 +152,7 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
+  ws.chat.* — unread chat digest
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
@@ -283,6 +285,8 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
+  ws.chat.unread() → { turns, messages, truncatedMessages, fromMessageId, toMessageId, items: [{ id, role, head }] }  // Compact digest of YOUR OWN conversation's unread tail — the messages delivered since the user last read it (assistant replies, system notices, and machine deliveries like A2A messages or hook wakes; a message typed by the user resets the tail). Up to 100 items, each `head` the first 100 chars. Check it each turn when the snapshot reports unread messages; when more than 4 messages are unread, consider summarizing them for the user instead of leaving the backlog unread. Read-only — never marks anything seen.
+
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
@@ -351,7 +355,7 @@ Namespaces (index — full signatures in API below):
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
-  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
@@ -359,6 +363,7 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
+  ws.chat.* — unread chat digest
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
@@ -510,6 +515,8 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
+  ws.chat.unread() → { turns, messages, truncatedMessages, fromMessageId, toMessageId, items: [{ id, role, head }] }  // Compact digest of YOUR OWN conversation's unread tail — the messages delivered since the user last read it (assistant replies, system notices, and machine deliveries like A2A messages or hook wakes; a message typed by the user resets the tail). Up to 100 items, each `head` the first 100 chars. Check it each turn when the snapshot reports unread messages; when more than 4 messages are unread, consider summarizing them for the user instead of leaving the backlog unread. Read-only — never marks anything seen.
+
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
@@ -596,6 +603,9 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
     }
     if !features.structured_questions {
         out.push(("ws.app.question.", "agentFeatures.structuredQuestions"));
+    }
+    if !features.unread_summaries {
+        out.push(("ws.chat.", "agentFeatures.unreadSummaries"));
     }
     if !features.attention_requests {
         out.push((
@@ -707,6 +717,12 @@ pub fn workspace_api_description(
     };
     let gated = gated_prefixes(features);
     if gated.is_empty() && features.task_graph {
+        // Every gate open with a non-default summarize threshold still
+        // rewrites the `ws.chat.unread` guidance; the default threshold
+        // keeps the static const byte-identical.
+        if features.unread_summarize_threshold != DEFAULT_UNREAD_SUMMARIZE_THRESHOLD {
+            return Cow::Owned(render_unread_threshold(base, features));
+        }
         return Cow::Borrowed(base);
     }
     // Method doc lines sit at exactly two spaces of indentation
@@ -789,8 +805,34 @@ pub fn workspace_api_description(
                 1,
             );
     }
+    if features.unread_summaries
+        && features.unread_summarize_threshold != DEFAULT_UNREAD_SUMMARIZE_THRESHOLD
+    {
+        out = render_unread_threshold(&out, features);
+    }
     Cow::Owned(out)
 }
+
+/// Rewrite the `ws.chat.unread` doc line's summarize guidance with the
+/// configured `agentFeatures.unreadSummarizeThreshold`. The static consts
+/// carry the default threshold verbatim (a drift test pins the needle), so
+/// this is only called when the setting differs. A no-op when the doc line
+/// was pruned (`unreadSummaries = false`).
+fn render_unread_threshold(text: &str, features: &AgentFeaturesSettings) -> String {
+    text.replacen(
+        UNREAD_THRESHOLD_NEEDLE,
+        &format!(
+            "when more than {} messages are unread",
+            features.unread_summarize_threshold
+        ),
+        1,
+    )
+}
+
+/// The default-threshold guidance clause inside the `ws.chat.unread` doc
+/// line, rewritten by [`render_unread_threshold`] when
+/// `agentFeatures.unreadSummarizeThreshold` is non-default.
+const UNREAD_THRESHOLD_NEEDLE: &str = "when more than 4 messages are unread";
 
 /// The `Namespaces` index header line as it appears verbatim in both static
 /// description variants. [`compact_workspace_api_description`] anchors on it,
@@ -1078,6 +1120,7 @@ mod tests {
     const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
+    const BINDINGS_CHAT: &str = include_str!("bindings/chat.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
     const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
     const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
@@ -1107,6 +1150,7 @@ mod tests {
             ("hook", BINDINGS_HOOK),
             ("script", BINDINGS_SCRIPT),
             ("terminal", BINDINGS_TERMINAL),
+            ("chat", BINDINGS_CHAT),
             ("file", BINDINGS_FILE),
         ]
     }
@@ -1418,6 +1462,8 @@ mod tests {
                 state_snapshot: false,
                 pr_monitor: false,
                 task_graph: false,
+                unread_summaries: false,
+                ..AgentFeaturesSettings::default()
             },
         ));
         for is_chief in [false, true] {
@@ -1615,7 +1661,7 @@ mod tests {
             (false, WORKSPACE_API_DESCRIPTION),
             (true, WORKSPACE_API_DESCRIPTION_CHIEF),
         ] {
-            let index = help_index(is_chief, &AgentFeaturesSettings::default());
+            let index = help_index(is_chief, &all_gates_open());
             assert!(index.starts_with("Namespaces"));
             for ns in index_namespaces(desc) {
                 assert!(
@@ -1768,9 +1814,13 @@ mod tests {
     }
 
     // Every gate open: the defaults (all toggles on, `taskGraph` included
-    // since the default flip).
+    // since the default flip) plus the opt-in `unreadSummaries` (default
+    // off).
     fn all_gates_open() -> AgentFeaturesSettings {
-        AgentFeaturesSettings::default()
+        AgentFeaturesSettings {
+            unread_summaries: true,
+            ..AgentFeaturesSettings::default()
+        }
     }
 
     // Hard requirement: with every gate open (the defaults), the assembled
@@ -1966,6 +2016,8 @@ mod tests {
             state_snapshot: false,
             pr_monitor: false,
             task_graph: false,
+            unread_summaries: false,
+            ..AgentFeaturesSettings::default()
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -2172,6 +2224,8 @@ mod tests {
             state_snapshot: false,
             pr_monitor: false,
             task_graph: false,
+            unread_summaries: false,
+            ..AgentFeaturesSettings::default()
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),

@@ -107,13 +107,29 @@ struct Entry {
     registered_at: Instant,
 }
 
+/// The message range a `ws.chat.unread` read covered — the same-turn
+/// summarize gate's arm state (`ws.chat.summarizeUnread` may only run over a
+/// range read earlier in the SAME turn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizeGate {
+    /// First unread message id the digest covered (`None` for an empty tail
+    /// boundary — never armed in practice, the binding skips empty digests).
+    pub from_message_id: Option<String>,
+    /// Last unread message id the digest covered.
+    pub to_message_id: String,
+}
+
 /// Daemon-wide registry of pending turn attachments, keyed by agent. Shared
 /// (via `Arc`) between the per-agent MCP dispatch (registration side) and the
-/// transcript writer in `intent-services` (claim/drain side).
+/// transcript writer in `intent-services` (claim/drain side). Also carries
+/// the per-turn `ws.chat.unread` summarize-gate arm state ([`SummarizeGate`])
+/// — same lifecycle as attachments: registered mid-dispatch, cleared when
+/// the turn finishes.
 #[derive(Default)]
 pub struct TurnAttachmentRegistry {
     inner: Mutex<HashMap<AgentId, Vec<Entry>>>,
     batch_seq: AtomicU64,
+    summarize_gates: Mutex<HashMap<AgentId, SummarizeGate>>,
 }
 
 impl TurnAttachmentRegistry {
@@ -236,6 +252,7 @@ impl TurnAttachmentRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn finish_turn(&self, agent_id: &AgentId) -> Vec<TurnAttachment> {
+        self.summarize_gates.lock().unwrap().remove(agent_id);
         let mut inner = self.inner.lock().unwrap();
         let Some(mut entries) = inner.remove(agent_id) else {
             return Vec::new();
@@ -246,6 +263,34 @@ impl TurnAttachmentRegistry {
             .filter(|e| e.attachment.policy == AttachmentPolicy::AtTurnEnd)
             .map(|e| e.attachment)
             .collect()
+    }
+
+    /// Arm `agent_id`'s same-turn summarize gate over the message range a
+    /// `ws.chat.unread` read just covered. A repeat read within the same turn
+    /// re-arms with the newer range. Cleared by [`Self::finish_turn`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn arm_summarize_gate(&self, agent_id: &AgentId, from: Option<&str>, to: &str) {
+        self.summarize_gates.lock().unwrap().insert(
+            agent_id.clone(),
+            SummarizeGate {
+                from_message_id: from.map(str::to_string),
+                to_message_id: to.to_string(),
+            },
+        );
+    }
+
+    /// The caller's current summarize-gate arm state, if a `ws.chat.unread`
+    /// read armed it earlier in the same turn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn summarize_gate(&self, agent_id: &AgentId) -> Option<SummarizeGate> {
+        self.summarize_gates.lock().unwrap().get(agent_id).cloned()
     }
 }
 
