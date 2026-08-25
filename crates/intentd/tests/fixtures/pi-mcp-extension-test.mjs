@@ -55,8 +55,10 @@ function spawnMock() {
   );
   assert.equal(tools[0].inputSchema.type, "object", "tools carry a JSON-schema inputSchema");
 
-  // tools/call round-trips (mock answers unknown methods with an empty result).
-  assert.deepEqual(await client.callTool("echo", { input: "x" }), {});
+  // tools/call round-trips (mock answers `<tool>:<args.input>` as text content).
+  assert.deepEqual(await client.callTool("echo", { input: "x" }), {
+    content: [{ type: "text", text: "echo:x" }],
+  });
 
   // Server death rejects new requests instead of hanging.
   child.kill();
@@ -135,7 +137,7 @@ function fakePi() {
   assert.equal(typeof echo.parameters, "object", "tool parameters carry the MCP inputSchema");
   assert.deepEqual(
     await echo.execute("tc-1", { input: "x" }),
-    { content: [{ type: "text", text: "{}" }], details: {} },
+    { content: [{ type: "text", text: "echo:x" }], details: {} },
     "execute forwards tools/call and maps the result",
   );
 
@@ -143,7 +145,7 @@ function fakePi() {
   for (const s of serverSockets.splice(0)) s.destroy();
   await new Promise((resolve) => setTimeout(resolve, 50));
   const retried = await echo.execute("tc-2", { input: "y" });
-  assert.equal(retried.content[0].text, "{}", "execute reconnects after a dropped connection");
+  assert.equal(retried.content[0].text, "echo:y", "execute reconnects after a dropped connection");
 }
 
 // --- 5. Graceful degradation ----------------------------------------------
