@@ -17,7 +17,7 @@ use intent_services::EventBus;
 use serde_json::{json, Map, Value};
 
 use crate::events::{error_frame, success_frame};
-use crate::host_env::{detect_display_server, detect_has_display, local_hostname};
+use crate::host_env::{detect_display_server, detect_has_display, local_hostname, pretty_hostname};
 use crate::host_ops;
 use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
 
@@ -142,12 +142,14 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
 }
 
 /// Build the `host.status` result JSON (§5.14): `{ os, arch, hostname,
-/// hasDisplay, locality, displayServer? }`. `displayServer` is omitted when no
-/// display server is detected. Pure (inputs injected) so it is unit-testable.
+/// prettyHostname, hasDisplay, locality, displayServer? }`. `displayServer` is
+/// omitted when no display server is detected. Pure (inputs injected) so it is
+/// unit-testable.
 pub(crate) fn host_status_json(
     os: &str,
     arch: &str,
     hostname: &str,
+    pretty_hostname: &str,
     has_display: bool,
     display_server: Option<&str>,
     is_local: bool,
@@ -156,6 +158,7 @@ pub(crate) fn host_status_json(
         "os": os,
         "arch": arch,
         "hostname": hostname,
+        "prettyHostname": pretty_hostname,
         "hasDisplay": has_display,
         "locality": if is_local { "local" } else { "remote" },
     });
@@ -200,6 +203,7 @@ pub(crate) async fn handle(
                 std::env::consts::OS,
                 std::env::consts::ARCH,
                 &local_hostname(),
+                &pretty_hostname(),
                 detect_has_display(),
                 detect_display_server().as_deref(),
                 is_local,

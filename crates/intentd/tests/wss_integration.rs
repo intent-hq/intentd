@@ -5765,6 +5765,13 @@ async fn wss_host_status_reports_remote_locality() {
     assert!(h["os"].is_string());
     assert!(h["arch"].is_string());
     assert!(h["hostname"].is_string());
+    assert!(
+        !h["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty: {h}"
+    );
     assert!(h["hasDisplay"].is_boolean());
     srv.ws.stop().await;
 }
