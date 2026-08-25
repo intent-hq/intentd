@@ -1511,6 +1511,22 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             true,
         ),
+        boolean(
+            "agentFeatures.unreadSummaries",
+            "Unread summaries",
+            "Expose the unread-digest surface (ws.chat.unread) to top-level agents; applies to new sessions only",
+            "agentFeatures",
+            false,
+        ),
+        number(
+            "agentFeatures.unreadSummarizeThreshold",
+            "Unread summarize threshold",
+            "Unread-message count at which ws.chat.unread guidance suggests summarizing instead of reading in full; applies to new sessions only",
+            "agentFeatures",
+            Some(1.0),
+            Some(1_000.0),
+            4.0,
+        ),
         number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
@@ -3021,6 +3037,7 @@ mod tests {
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
+            ("agentFeatures.unreadSummaries", false),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
