@@ -3601,24 +3601,22 @@ impl AgentManager {
         }
         Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
-    /// Compute the fire-once workspace-naming instruction for the outbound
-    /// prompt, or `None` when it should be omitted. Ported from the reference
+    /// Compute the fire-once agent/workspace naming instruction for the
+    /// outbound prompt, or `None` when both independently gated instructions
+    /// should be omitted. Ported from the reference
     /// `agent-backend-handler.service.ts` (`namingInstructions` block):
     ///
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
-    /// * Fires only when the workspace lookup succeeds AND the current title
-    ///   is empty/whitespace OR still shaped like an auto-generated slug
-    ///   ([`intent_core::slug::is_workspace_slug`]).
-    /// * Names the concrete daemon tool the agent must call — spelled the way
-    ///   the session's provider will actually surface it (see
-    ///   [`workspace_naming_tool_reference`]) — not the FE `workspace_api`
-    ///   JS surface (which daemon-spawned agents do not have).
-    ///
-    /// The agent-rename half of the reference block is intentionally SKIPPED:
-    /// the daemon currently exposes no `set_agent_name` tool. Restore that
-    /// branch once such a tool exists.
-    async fn build_workspace_naming_instruction(
+    /// * Agent naming fires only when the name was not explicitly set and the
+    ///   session has no recognized specialist. It uses the provider-correct
+    ///   workspace API MCP tool to call `ws.workspace.setAgentName`.
+    /// * Workspace naming fires only when the workspace lookup succeeds AND
+    ///   the current title is empty/whitespace or still shaped like an
+    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
+    /// * Workspace naming names the concrete daemon tool the session's
+    ///   provider surfaces (see [`workspace_naming_tool_reference`]).
+    async fn build_first_turn_naming_instruction(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
@@ -3632,32 +3630,48 @@ impl AgentManager {
         if messages.iter().any(|m| m.role == "assistant") {
             return None;
         }
-        let workspace = self.services.store.get_workspace(workspace_id).await.ok()?;
-        let title = workspace.title.trim();
-        let needs_rename = title.is_empty() || is_workspace_slug(title);
-        if !needs_rename {
+        let session = self.services.store.get_agent_session(agent_id).await;
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let workspace_path = workspace.as_ref().and_then(crate::git_ops::worktree_path);
+        let needs_agent_name = session.as_ref().is_ok_and(|s| {
+            !s.name_explicitly_set
+                && !self
+                    .services
+                    .session_has_recognized_specialist(s, workspace_path.as_deref())
+        });
+        let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
+            let title = workspace.title.trim();
+            title.is_empty() || is_workspace_slug(title)
+        });
+        if !needs_agent_name && !needs_workspace_title {
             return None;
         }
-        // Spell the rename tool the way this session's provider surfaces it;
-        // a failed session lookup (or an unresolvable provider) falls back to
-        // the generic phrasing.
         let configured_default =
             crate::agent_session::derived_default_provider(&self.services.effective_settings());
-        let tool_ref = match self.services.store.get_agent_session(agent_id).await {
-            Ok(s) => session_provider_id(&s, configured_default.as_deref())
-                .map_or(GENERIC_NAMING_TOOL_REFERENCE, |p| {
-                    workspace_naming_tool_reference(&p)
-                }),
+        let provider_id = match &session {
+            Ok(s) => session_provider_id(s, configured_default.as_deref()),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
                     error = %e,
                     "naming nudge: session lookup failed; using generic tool phrasing"
                 );
-                GENERIC_NAMING_TOOL_REFERENCE
+                None
             }
         };
-        Some(crate::harness::latest().naming_nudge(tool_ref))
+        let agent_tool_ref = needs_agent_name.then(|| {
+            provider_id.as_deref().map_or(
+                GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+                agent_naming_tool_reference,
+            )
+        });
+        let workspace_tool_ref = needs_workspace_title.then(|| {
+            provider_id.as_deref().map_or(
+                GENERIC_NAMING_TOOL_REFERENCE,
+                workspace_naming_tool_reference,
+            )
+        });
+        Some(crate::harness::latest().naming_nudge(agent_tool_ref, workspace_tool_ref))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -3708,15 +3722,13 @@ impl AgentManager {
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
         let body = self.build_turn_body(agent_id, &combined).await;
-        // Fire-once workspace-naming instruction (port of
+        // Fire-once agent/workspace naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
-        // first turn of an agent in a still-untitled / slug-titled workspace,
-        // a `<system>` block asking the agent to set the workspace title as
-        // its first action. Never mutates the persisted user message;
-        // agent-rename half is deferred until the daemon exposes a
-        // `set_agent_name` tool.
+        // first turn, a `<system>` block asks eligible ordinary agents to name
+        // themselves and independently asks for a workspace title when needed.
+        // Never mutates the persisted user message.
         let naming = self
-            .build_workspace_naming_instruction(agent_id, workspace_id)
+            .build_first_turn_naming_instruction(agent_id, workspace_id)
             .await;
         // `stdinContext` renders verbatim as a `Context:` block; the
         // trailing separator matches the reference `acp-provider.ts` so
@@ -8125,7 +8137,15 @@ fn session_provider_id(session: &AgentSession, configured_default: Option<&str>)
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
 /// tool naming convention is unknown (or its workspace-MCP wiring hasn't
 /// landed yet). Wording owned by the harness (H5).
-pub(crate) use crate::harness::v1::GENERIC_NAMING_TOOL_REFERENCE;
+pub(crate) use crate::harness::v1::{
+    GENERIC_AGENT_NAMING_TOOL_REFERENCE, GENERIC_NAMING_TOOL_REFERENCE,
+};
+
+/// Provider-correct spelling of the workspace API MCP tool used for agent
+/// self-naming.
+pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
+    crate::harness::latest().agent_naming_tool_reference(provider_id)
+}
 
 /// Provider-correct spelling of the workspace-MCP rename tool for the naming
 /// nudge (e.g. auggie → `set_workspace_title_workspace-mcp`, opencode →
@@ -10925,7 +10945,7 @@ mod role_reminder_tests {
             backend_session_id: None,
             acp_session_id: None,
             name: "Builder".to_string(),
-            name_explicitly_set: false,
+            name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
             effort_levels: None,
@@ -11000,6 +11020,208 @@ mod role_reminder_tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    async fn configure_agent_name(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        name: &str,
+        explicitly_set: bool,
+        specialist: Option<&str>,
+    ) {
+        let mut session = mgr
+            .services
+            .store
+            .get_agent_session(agent_id)
+            .await
+            .expect("session");
+        session.name = name.to_string();
+        session.name_explicitly_set = explicitly_set;
+        session.specialist = specialist.map(str::to_string);
+        let workspace_id = session.workspace_id.clone();
+        mgr.services
+            .store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("update session");
+    }
+
+    async fn set_workspace_title(mgr: &AgentManager, workspace_id: &WorkspaceId, title: &str) {
+        let mut workspace = mgr
+            .services
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .expect("workspace");
+        workspace.title = title.to_string();
+        mgr.services
+            .store
+            .update_workspace(&workspace)
+            .await
+            .expect("update workspace");
+    }
+
+    #[tokio::test]
+    async fn generated_agent_naming_nudge_does_not_depend_on_workspace_title() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "start",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(text.contains(
+            "`ws.workspace.setAgentName` through the `workspace_api` tool from the workspace MCP server"
+        ));
+        assert!(!text.contains("This workspace needs a title"));
+    }
+
+    #[tokio::test]
+    async fn generated_agent_naming_nudge_uses_provider_correct_workspace_api_tool() {
+        for (provider, expected) in [
+            ("auggie", "the `workspace_api_workspace-mcp` tool"),
+            ("opencode", "the `workspace-mcp_workspace_api` tool"),
+            (
+                "claude-code",
+                "the `workspace_api` tool from the workspace MCP server",
+            ),
+        ] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            let workspace_id = WorkspaceId::from("ws-1");
+            configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+            let mut session = mgr
+                .services
+                .store
+                .get_agent_session(&agent_id)
+                .await
+                .expect("session");
+            session.provider = Some(provider.to_string());
+            mgr.services
+                .store
+                .update_agent_session(&workspace_id, &session)
+                .await
+                .expect("update provider");
+            let text = prompt_text(
+                &mgr.build_turn_prompt(&agent_id, &workspace_id, "start", &TurnOptions::default())
+                    .await,
+            );
+            assert!(
+                text.contains(expected),
+                "provider {provider} used the wrong workspace API tool: {text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_agent_and_untitled_workspace_receive_both_naming_instructions() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        set_workspace_title(&mgr, &workspace_id, "").await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &workspace_id, "start", &TurnOptions::default())
+                .await,
+        );
+        let agent_pos = text
+            .find("ws.workspace.setAgentName")
+            .expect("agent naming");
+        let workspace_pos = text
+            .find("This workspace needs a title")
+            .expect("workspace naming");
+        assert!(agent_pos < workspace_pos);
+    }
+
+    #[tokio::test]
+    async fn explicit_and_specialist_names_do_not_receive_agent_naming_instruction() {
+        let (explicit_mgr, explicit_id, _explicit_db) = manager_with(None, None).await;
+        configure_agent_name(&explicit_mgr, &explicit_id, "User Choice", true, None).await;
+        let explicit = prompt_text(
+            &explicit_mgr
+                .build_turn_prompt(
+                    &explicit_id,
+                    &WorkspaceId::from("ws-1"),
+                    "start",
+                    &TurnOptions::default(),
+                )
+                .await,
+        );
+        assert_eq!(explicit, "start");
+
+        let (specialist_mgr, specialist_id, _specialist_db) =
+            manager_with(Some("implementor"), None).await;
+        configure_agent_name(
+            &specialist_mgr,
+            &specialist_id,
+            "Implementor",
+            false,
+            Some("implementor"),
+        )
+        .await;
+        let specialist = prompt_text(
+            &specialist_mgr
+                .build_turn_prompt(
+                    &specialist_id,
+                    &WorkspaceId::from("ws-1"),
+                    "start",
+                    &TurnOptions::default(),
+                )
+                .await,
+        );
+        assert!(!specialist.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn unknown_specialist_with_generated_name_receives_agent_naming_instruction() {
+        let (mgr, agent_id, _db) = manager_with(Some("no-such-specialist"), None).await;
+        configure_agent_name(
+            &mgr,
+            &agent_id,
+            "Agent abc123",
+            false,
+            Some("no-such-specialist"),
+        )
+        .await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "start",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(text.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn agent_naming_instruction_is_first_turn_only() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        configure_agent_name(&mgr, &agent_id, "Agent abc123", false, None).await;
+        let workspace_id = WorkspaceId::from("ws-1");
+        let first = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
+                .await,
+        );
+        assert!(first.contains("ws.workspace.setAgentName"));
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "ready" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("assistant message");
+        let later = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &workspace_id, "later", &TurnOptions::default())
+                .await,
+        );
+        assert_eq!(later, "later");
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but

@@ -204,6 +204,8 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
 /// landed yet).
 pub(crate) const GENERIC_NAMING_TOOL_REFERENCE: &str =
     "the `set_workspace_title` tool from the workspace MCP server";
+pub(crate) const GENERIC_AGENT_NAMING_TOOL_REFERENCE: &str =
+    "the `workspace_api` tool from the workspace MCP server";
 
 impl Harness for V1 {
     fn join_prompt_layers(&self, parts: &[String]) -> String {
@@ -345,10 +347,34 @@ impl Harness for V1 {
         }
     }
 
-    fn naming_nudge(&self, tool_reference: &str) -> String {
-        format!(
-            "<system>\nThis workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-        )
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str {
+        match provider_id {
+            "auggie" => "the `workspace_api_workspace-mcp` tool",
+            "opencode" => "the `workspace-mcp_workspace_api` tool",
+            _ => GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        }
+    }
+
+    fn naming_nudge(
+        &self,
+        agent_tool_reference: Option<&str>,
+        workspace_tool_reference: Option<&str>,
+    ) -> String {
+        let mut instructions = Vec::new();
+        if let Some(tool_reference) = agent_tool_reference {
+            instructions.push(format!(
+                "This agent still has a generated name. Early in your first turn, call \
+                 `ws.workspace.setAgentName` through {tool_reference} with a short 1–5 word \
+                 task-specific name. Do this independently of workspace title naming and in \
+                 parallel with information-gathering."
+            ));
+        }
+        if let Some(tool_reference) = workspace_tool_reference {
+            instructions.push(format!(
+                "This workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering."
+            ));
+        }
+        format!("<system>\n{}\n</system>", instructions.join("\n"))
     }
 
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String {
