@@ -52,6 +52,10 @@ pub(crate) const DEFAULT_WORKSPACE_API_TOON_OUTPUT: bool = true;
 /// agent (`hooks.maxPerAgent`).
 pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
 
+/// Default for `agentFeatures.unreadSummarizeThreshold` — the unread-message
+/// count at which the `ws.chat.unread` guidance suggests summarizing.
+pub const DEFAULT_UNREAD_SUMMARIZE_THRESHOLD: u32 = 4;
+
 /// Default daemon-wide cap on outstanding slow-path RPCs
 /// (`server.maxOutstandingRpcs`); `0` means unlimited.
 pub const DEFAULT_SERVER_MAX_OUTSTANDING_RPCS: u32 = 256;
