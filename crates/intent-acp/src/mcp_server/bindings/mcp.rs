@@ -49,14 +49,81 @@ async fn call_tool(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, S
         None | Some(Value::Null) => json!({}),
         Some(v) => v.clone(),
     };
-    let timeout_ms = match opt_i64(args, "timeoutMs") {
-        Some(ms) => Some(
-            u64::try_from(ms)
-                .map_err(|_| "timeoutMs must be a non-negative integer".to_string())?,
-        ),
-        None => None,
+    // `opt_i64` returns `None` for fractional values, so the presence check
+    // keeps a bad `timeoutMs` from silently falling back to the default.
+    let timeout_ms = match args.get("timeoutMs") {
+        None | Some(Value::Null) => None,
+        Some(_) => match opt_i64(args, "timeoutMs") {
+            Some(ms) if ms > 0 => Some(ms.unsigned_abs()),
+            _ => return Err("timeoutMs must be a positive integer".to_string()),
+        },
     };
     api.mcp_call_tool(server_id, tool_name, tool_args, timeout_ms)
         .await
         .map_err(map_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use intent_core::{BoxFuture, Result};
+    use std::sync::Mutex;
+
+    /// `WorkspaceApi` whose `mcp_call_tool` records the timeouts it received,
+    /// so the tests can pin the binding's `timeoutMs` validation.
+    #[derive(Default)]
+    struct FakeApi {
+        seen_timeouts: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn mcp_call_tool(
+            &self,
+            _server_id: String,
+            _tool_name: String,
+            _args: Value,
+            timeout_ms: Option<u64>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.seen_timeouts.lock().unwrap().push(timeout_ms);
+            Box::pin(async move { Ok(json!({ "content": [] })) })
+        }
+    }
+
+    async fn call(
+        api: &Arc<dyn WorkspaceApi>,
+        timeout: Option<Value>,
+    ) -> std::result::Result<Value, String> {
+        let mut args = json!({ "serverId": "s1", "toolName": "t1" });
+        if let Some(t) = timeout {
+            args["timeoutMs"] = t;
+        }
+        call_tool(api, &args).await
+    }
+
+    #[tokio::test]
+    async fn timeout_omitted_forwards_none() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        call(&api, None).await.unwrap();
+        assert_eq!(*fake.seen_timeouts.lock().unwrap(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn timeout_positive_integer_forwards() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        call(&api, Some(json!(1500))).await.unwrap();
+        assert_eq!(*fake.seen_timeouts.lock().unwrap(), vec![Some(1500)]);
+    }
+
+    #[tokio::test]
+    async fn timeout_zero_negative_and_fractional_rejected() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        for bad in [json!(0), json!(-5), json!(1.5), json!("nope")] {
+            let err = call(&api, Some(bad.clone())).await.unwrap_err();
+            assert!(err.contains("positive integer"), "{bad}: {err}");
+        }
+        assert!(fake.seen_timeouts.lock().unwrap().is_empty());
+    }
 }

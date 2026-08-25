@@ -529,10 +529,14 @@ async fn hook_calls_mcp_tool_end_to_end_and_gated_toggle_rejects() {
     // Prelude pruning: `ws.mcp` is gone, so using it throws a TypeError.
     assert!(text.contains("typeof=undefined"), "ws.mcp pruned: {text}");
     assert!(text.contains("TypeError"), "clear TypeError on use: {text}");
-    // Defense in depth: the raw dispatch frame is denied with the settings
-    // gate naming the toggle.
+    // Defense in depth: the raw dispatch frame is denied at the dispatch
+    // layer (the `host: method` prefix pins that gate specifically, not the
+    // service-layer `require_agent_mcp` error) with the settings gate naming
+    // the toggle.
     assert!(
-        text.contains("disabled in settings (agentFeatures.mcpTools = false)"),
+        text.contains(
+            "host: method `mcp.callTool` is disabled in settings (agentFeatures.mcpTools = false)"
+        ),
         "dispatch denied with the settings gate: {text}"
     );
 }
