@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.57] - 2026-08-25
+
+### 🚀 Features
+
+- *(acp)* Ws.chat.unread() unread digest behind opt-in unreadSummaries toggle ([#1469](https://github.com/intent-hq/intentd/pull/1469))
+- Peer agent collaboration - agentFeatures settings, soft agent retire ([#1451](https://github.com/intent-hq/intentd/pull/1451))
+
+### 🧪 Testing
+
+- *(intentd)* Deflake sub-threshold dequeue-annotation WSS e2e via measured wait ([#1472](https://github.com/intent-hq/intentd/pull/1472))
+
+### ⚙️ Miscellaneous Tasks
+
+- Revert ws.chat.unread() unread digest ([#1469](https://github.com/intent-hq/intentd/pull/1469)) ([#1475](https://github.com/intent-hq/intentd/pull/1475))
+
+
 ## [0.7.56] - 2026-08-25
 
 ### 🚀 Features
