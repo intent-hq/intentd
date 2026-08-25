@@ -134,6 +134,8 @@ pub mod workspace_vocabulary;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod v1_1_goldens;
+#[cfg(test)]
 mod v1_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
@@ -1207,8 +1209,8 @@ impl Services {
 
     /// Resolve the default `agent_type` declared by a specialist's `agentType`
     /// frontmatter (§18.2 / SP-B). Used at spawn time to engage the matching
-    /// internal tool denylist (§18.4) — e.g. the `ralph` specialist →
-    /// `ralph-loop`. Returns `None` when the specialist is unknown or declares no
+    /// internal tool denylist (§18.4) — e.g. a specialist declaring `task-loop`.
+    /// Returns `None` when the specialist is unknown or declares no
     /// `agentType`, leaving the caller's default agent type intact.
     pub(crate) fn specialist_agent_type(
         &self,
@@ -1217,6 +1219,27 @@ impl Services {
     ) -> Option<String> {
         self.specialists_service()
             .resolve_agent_type(specialist_id, workspace_path)
+    }
+
+    /// Whether a session's specialist id resolved to a real specialist. New
+    /// sessions carry a frozen identity snapshot; legacy sessions resolve from
+    /// the harness-pinned specialist registry.
+    pub(crate) fn session_has_recognized_specialist(
+        &self,
+        session: &AgentSession,
+        workspace_path: Option<&Path>,
+    ) -> bool {
+        let Some(specialist_id) = session.specialist.as_deref() else {
+            return false;
+        };
+        if Self::session_metadata_str(session, "specialistName").is_some() {
+            return true;
+        }
+        let entry = crate::harness::resolve_entry(&session.harness_version);
+        self.specialists_service()
+            .with_embedded(entry.doctrine.specialists)
+            .resolve_display_name(specialist_id, workspace_path)
+            .is_some()
     }
 
     /// Resolve every non-hidden specialist's delegation `modelOptions`

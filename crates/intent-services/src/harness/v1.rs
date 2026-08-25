@@ -24,8 +24,8 @@ static DOCTRINE: Doctrine = Doctrine {
     specialists: crate::specialists::EMBEDDED_BUNDLED_V1,
 };
 
-/// The v1 registry row. `version` is intent-core's stamped `"1.0"` (asserted
-/// equal to `CURRENT_HARNESS_VERSION` by registry tests); the feature
+/// The v1 registry row. `version` is the stamped `"1.0"` every pre-1.1
+/// session carries (and the migration-0096 backfill value); the feature
 /// defaults are the `[agentFeatures]` defaults this doctrine was written
 /// against (all on), used to gate legacy NULL-snapshot sessions the way a
 /// live read would have when v1 was current.
@@ -38,7 +38,9 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
 };
 
 /// Human-readable labels for every `agentFeatures` toggle v1 knows about.
-const FEATURE_LABELS: &[(&str, &str)] = &[
+/// Shared with v1.1 (`super::v1_1::ENTRY`), whose feature surface is
+/// unchanged.
+pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("backgroundHooks", "Background hooks (ws.hook.*)"),
     ("hostExec", "Host command execution (ws.host.exec)"),
     ("scripts", "Saved scripts (ws.script.*)"),
@@ -202,6 +204,8 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
 /// landed yet).
 pub(crate) const GENERIC_NAMING_TOOL_REFERENCE: &str =
     "the `set_workspace_title` tool from the workspace MCP server";
+pub(crate) const GENERIC_AGENT_NAMING_TOOL_REFERENCE: &str =
+    "the `workspace_api` tool from the workspace MCP server";
 
 impl Harness for V1 {
     fn join_prompt_layers(&self, parts: &[String]) -> String {
@@ -343,10 +347,34 @@ impl Harness for V1 {
         }
     }
 
-    fn naming_nudge(&self, tool_reference: &str) -> String {
-        format!(
-            "<system>\nThis workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-        )
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str {
+        match provider_id {
+            "auggie" => "the `workspace_api_workspace-mcp` tool",
+            "opencode" => "the `workspace-mcp_workspace_api` tool",
+            _ => GENERIC_AGENT_NAMING_TOOL_REFERENCE,
+        }
+    }
+
+    fn naming_nudge(
+        &self,
+        agent_tool_reference: Option<&str>,
+        workspace_tool_reference: Option<&str>,
+    ) -> String {
+        let mut instructions = Vec::new();
+        if let Some(tool_reference) = agent_tool_reference {
+            instructions.push(format!(
+                "This agent still has a generated name. Early in your first turn, call \
+                 `ws.workspace.setAgentName` through {tool_reference} with a short 1–5 word \
+                 task-specific name. Do this independently of workspace title naming and in \
+                 parallel with information-gathering."
+            ));
+        }
+        if let Some(tool_reference) = workspace_tool_reference {
+            instructions.push(format!(
+                "This workspace needs a title. As your first action, call {tool_reference} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering."
+            ));
+        }
+        format!("<system>\n{}\n</system>", instructions.join("\n"))
     }
 
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String {

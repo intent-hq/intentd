@@ -3,9 +3,11 @@
 //! prompt or per-turn prompt envelope.
 //!
 //! One trait, one module per version. [`Harness`] exposes a method per text
-//! surface; each version implements it ([`v1`] = today's post-#2457 set,
+//! surface; each version implements it ([`v1`] = the post-#2457 set,
 //! byte-pinned by `crate::v1_goldens` and
-//! `agent_manager::v1_turn_envelope_goldens`). Call sites carry typed data
+//! `agent_manager::v1_turn_envelope_goldens`; [`v1_1`] reuses v1's text
+//! surfaces and swaps in its own doctrine, byte-pinned by
+//! `crate::v1_1_goldens`). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version starts as `pub use` re-exports of the prior version's
@@ -21,11 +23,12 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (intent-core's `"1.0"` form) to the pair, so a
-//! session keeps assembling the exact doctrine it was created with even after
-//! the binary ships a newer set. All past versions stay bundled.
+//! session `harnessVersion` (intent-core's `"1.0"` / `"1.1"` form) to the
+//! pair, so a session keeps assembling the exact doctrine it was created with
+//! even after the binary ships a newer set. All past versions stay bundled.
 
 pub(crate) mod v1;
+pub(crate) mod v1_1;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -124,8 +127,17 @@ pub(crate) trait Harness: Send + Sync {
     /// Provider-correct spelling of the workspace-MCP rename tool for the
     /// naming nudge.
     fn naming_tool_reference(&self, provider_id: &str) -> &'static str;
-    /// Fire-once `<system>` workspace-naming instruction.
-    fn naming_nudge(&self, tool_reference: &str) -> String;
+    /// Provider-correct spelling of the workspace API MCP tool used for agent
+    /// self-naming.
+    fn agent_naming_tool_reference(&self, provider_id: &str) -> &'static str;
+    /// Fire-once `<system>` agent/workspace naming instruction. The caller
+    /// independently gates each instruction; each tool reference is present
+    /// only when its corresponding name still needs attention.
+    fn naming_nudge(
+        &self,
+        agent_tool_reference: Option<&str>,
+        workspace_tool_reference: Option<&str>,
+    ) -> String;
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
@@ -347,7 +359,7 @@ pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 /// bundled so an old session keeps resolving the doctrine it was created
 /// with. Adding a version = a `resources/**/<ver>/` directory + a module +
 /// one row here.
-static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY];
+static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY, &v1_1::ENTRY];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
 /// exists; the tail fallback is unreachable and only avoids a panic path.
@@ -390,7 +402,7 @@ mod tests {
     }
 
     /// The registry keys on the exact version string sessions are stamped
-    /// with (intent-core's `CURRENT_HARNESS_VERSION`, "1.0"): the stamp and
+    /// with (intent-core's `CURRENT_HARNESS_VERSION`, "1.1"): the stamp and
     /// the resolved harness can never drift.
     #[test]
     fn registry_resolves_stamped_current_version() {
@@ -400,6 +412,48 @@ mod tests {
             data_ptr(resolve_entry(intent_core::CURRENT_HARNESS_VERSION).harness),
             data_ptr(&v1::V1)
         ));
+    }
+
+    /// A "1.0"-stamped session keeps resolving the v1 row (its original
+    /// doctrine), and the v1↔v1.1 rows share text surfaces but differ in
+    /// doctrine exactly where the rewrites landed.
+    #[test]
+    fn registry_pins_v1_sessions_to_v1_doctrine() {
+        let v1_entry = resolve_entry("1.0");
+        assert_eq!(v1_entry.version, "1.0");
+        assert!(std::ptr::eq(
+            v1_entry.doctrine.instructions,
+            std::ptr::addr_of!(crate::instructions::V1)
+        ));
+        let v1_1_entry = resolve_entry("1.1");
+        assert_eq!(v1_1_entry.version, "1.1");
+        assert!(std::ptr::eq(
+            v1_1_entry.doctrine.instructions,
+            std::ptr::addr_of!(crate::instructions::V1_1)
+        ));
+        // Same Harness singleton (text surfaces unchanged) …
+        assert!(std::ptr::eq(
+            data_ptr(v1_entry.harness),
+            data_ptr(v1_1_entry.harness)
+        ));
+        // … different common.md (the rewrites), identical specialist bytes.
+        assert_ne!(
+            v1_entry.doctrine.instructions.common,
+            v1_1_entry.doctrine.instructions.common
+        );
+        assert_eq!(
+            v1_entry.doctrine.specialists.len(),
+            v1_1_entry.doctrine.specialists.len()
+        );
+        for ((id_a, body_a), (id_b, body_b)) in v1_entry
+            .doctrine
+            .specialists
+            .iter()
+            .zip(v1_1_entry.doctrine.specialists.iter())
+        {
+            assert_eq!(id_a, id_b);
+            assert_eq!(body_a, body_b, "specialist {id_a} diverged");
+        }
     }
 
     #[test]
