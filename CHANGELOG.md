@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.55] - 2026-08-24
+
+### 🚀 Features
+
+- *(services)* Derive workspace unread from per-agent seen markers ([#1450](https://github.com/intent-hq/intentd/pull/1450))
+
+
 ## [0.7.54] - 2026-08-24
 
 ### 🚀 Features

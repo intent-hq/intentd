@@ -1944,6 +1944,20 @@ impl Services {
     /// fetches diffs on demand via `git.diffs`, and embedding the rollup on
     /// every workspace re-read pinned the blocking pool.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+        self.enrich_workspace_aggregates_with_unread(ws, None).await;
+    }
+
+    /// [`Self::enrich_workspace_aggregates`] with the caller's batch-derived
+    /// unread value threaded to the displayStatus derivation: the list path
+    /// computes the whole list's unread set in ONE statement
+    /// (`workspaces_with_unread_top_level_sessions`) and hands each row its
+    /// membership here, so enrichment issues no per-row unread probe.
+    /// `None` (single-row callers) keeps the bounded per-workspace probe.
+    pub(crate) async fn enrich_workspace_aggregates_with_unread(
+        &self,
+        ws: &mut Workspace,
+        unread: Option<bool>,
+    ) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
             Some(ws.updated_at.as_str()),
@@ -1993,7 +2007,8 @@ impl Services {
         // Derived "current cycle" display status over the active/latest PR
         // and the taskStats computed above; never persisted. See
         // [`Services::enrich_display_status`] (workspace_status module).
-        self.enrich_display_status(ws, sessions.as_deref()).await;
+        self.enrich_display_status(ws, sessions.as_deref(), unread)
+            .await;
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -2556,6 +2571,88 @@ impl Services {
             } else {
                 // Our generation is older; abort this task immediately.
                 handle.abort();
+            }
+        }
+    }
+
+    /// Post-seen-marker settlement of the workspace-level `unread` state
+    /// (§5.1): when advancing a per-agent seen marker (`agent.markSeen`, or
+    /// the `workspace.markSeen` mark-all loop) leaves the workspace with no
+    /// unread top-level session, clear the stored legacy flag and emit ONE
+    /// self-sufficient `workspace:attention-changed { none }` — clients
+    /// clear the blue dot together whether they track the derived or the
+    /// stored flag. The clear is ATOMIC
+    /// ([`intent_store::Store::clear_workspace_unread_if_all_seen`]): the
+    /// guarded UPDATE re-checks the derivation inside the write itself
+    /// (`attention = unread AND NOT EXISTS <unread session>`), so an
+    /// assistant message landing between the probe below and the write can
+    /// never have a freshly-raised unread retired — the write declines and
+    /// stays silent (`review_required` is likewise never touched).
+    /// `was_unread` is the derivation observed before the marker write; a
+    /// still-unread workspace (other sessions pending) is a silent no-op, so
+    /// partial reads never emit. Best-effort: a probe failure fails closed
+    /// (no emit we cannot confirm) and a write failure skips the settle —
+    /// the marker write is the contract; reads re-derive.
+    pub(crate) async fn settle_workspace_unread_after_seen(
+        &self,
+        workspace_id: &WorkspaceId,
+        was_unread: bool,
+    ) {
+        if workspace_id.is_chief() {
+            return;
+        }
+        let still_unread = self
+            .store
+            .workspace_has_unread_top_level_session(workspace_id)
+            .await
+            .unwrap_or(true);
+        if still_unread {
+            return;
+        }
+        self.park_attention_write().await;
+        // Atomic settle-clear of the stored legacy flag: guard + derivation
+        // re-check in one UPDATE, `updated_at` untouched — acknowledging is
+        // not "activity" (monorepo#1466).
+        let cleared = self
+            .store
+            .clear_workspace_unread_if_all_seen(workspace_id)
+            .await
+            .unwrap_or(false);
+        if cleared {
+            publish_event(
+                self.event_bus.as_ref(),
+                attention_changed_event(workspace_id, WorkspaceAttention::None),
+            )
+            .await;
+            return;
+        }
+        if was_unread {
+            // The derivation transitioned while the stored flag was already
+            // clear (e.g. a turn-end raise was skipped, or a store error
+            // dropped it): the read paths were serving derived `unread`, so
+            // clients still need the clear — unless `review_required` holds
+            // the dot (it wins on reads; emitting `none` would wrongly
+            // retire it), or the derivation flipped back to unread in the
+            // park gap (a new assistant message landed; emitting `none`
+            // would contradict what reads now serve).
+            let derived_unread = self
+                .store
+                .workspace_has_unread_top_level_session(workspace_id)
+                .await
+                .unwrap_or(true);
+            if derived_unread {
+                return;
+            }
+            match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.attention == WorkspaceAttention::ReviewRequired => {}
+                Ok(_) => {
+                    publish_event(
+                        self.event_bus.as_ref(),
+                        attention_changed_event(workspace_id, WorkspaceAttention::None),
+                    )
+                    .await;
+                }
+                Err(_) => {}
             }
         }
     }
@@ -13278,6 +13375,17 @@ impl WorkspaceApi for Services {
             // O(workspaces × workdir diff).
             let started = std::time::Instant::now();
             let count = list.len();
+            // Batch unread derivation (§5.1): ONE indexed statement for the
+            // whole list instead of a per-row EXISTS probe, so the hot RPC's
+            // statement count stays independent of the workspace count
+            // (AGENTS.md RPC cost contract). A batch failure degrades to
+            // `None` per row — enrichment falls back to its bounded
+            // per-workspace probe rather than serving the stale stored flag.
+            let unread_set = store
+                .workspaces_with_unread_top_level_sessions()
+                .await
+                .ok()
+                .map(Arc::new);
             let enrich_gate = Arc::new(tokio::sync::Semaphore::new(
                 workspace_aggregates::MAX_CONCURRENT_ENRICHMENTS,
             ));
@@ -13286,6 +13394,7 @@ impl WorkspaceApi for Services {
                 let mut ws = ws.clone();
                 let this = this.clone();
                 let enrich_gate = Arc::clone(&enrich_gate);
+                let unread_set = unread_set.clone();
                 join.spawn(async move {
                     // The semaphore is never closed, so acquisition can only
                     // fail on a bug; fail loudly rather than dropping the bound.
@@ -13297,7 +13406,9 @@ impl WorkspaceApi for Services {
                     // Delete grace window (§5.1): surface the in-memory
                     // pending-deletion deadline; O(1) map read, never persisted.
                     ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                    this.enrich_workspace_aggregates(&mut ws).await;
+                    let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
+                    this.enrich_workspace_aggregates_with_unread(&mut ws, unread)
+                        .await;
                     (idx, ws)
                 });
             }
@@ -13371,6 +13482,10 @@ impl WorkspaceApi for Services {
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
             let cow_supported = this.compute_cow_supported().await;
+            // Batch unread derivation, same as the full list path: ONE
+            // statement for the whole snapshot; a batch failure degrades to
+            // the per-workspace probe inside `enrich_display_status`.
+            let unread_set = store.workspaces_with_unread_top_level_sessions().await.ok();
             for ws in &mut list {
                 ws.activity = this.workspace_activity(&ws.id);
                 // Delete grace window (§5.1): surface the in-memory
@@ -13390,7 +13505,8 @@ impl WorkspaceApi for Services {
                 // Same derivation + baseline seeding as the enriched path
                 // (see [`Services::enrich_display_status`]).
                 ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
-                this.enrich_display_status(ws, None).await;
+                let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
+                this.enrich_display_status(ws, None, unread).await;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
@@ -17154,24 +17270,58 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(chief_workspace());
             }
-            this.park_attention_write().await;
-            // "Seen" clears the unread flag; review-required attention persists.
-            // Merely looking at a workspace is not "activity", so `updated_at`
-            // (which feeds the derived `lastActivity`) stays untouched
-            // (intent-hq/monorepo#1466). Scoped, conditional write
-            // (monorepo#1481): one UPDATE guarded on `attention = unread`
-            // touching only the attention column — a concurrent mutation of
-            // any other column is never clobbered — whose row count decides
-            // "changed", so the clear-only-when-unread rule and the emit
-            // decision are atomic rather than read-based.
-            let changed = store
-                .set_workspace_attention(
-                    &id,
-                    WorkspaceAttention::None,
-                    None,
-                    Some(WorkspaceAttention::Unread),
-                )
+            // Workspace-seen = every conversation seen (§5.1): advance each
+            // top-level session's seen marker to its `last_message_id`
+            // through the `agent.markSeen` op (§5.5) — same monotonic CAS,
+            // same per-agent `agent:updated` marker event, so per-agent
+            // clients converge — which also settles the derived workspace
+            // `unread`: the last unread session's advance clears the stored
+            // legacy flag and emits ONE
+            // `workspace:attention-changed { none }`. Marker advances are
+            // the call's contract, so failures PROPAGATE: a failed
+            // pending-list read or per-session write returns the error
+            // instead of silently reporting "seen" while a session stays
+            // unread (the guarded clear below then never retires a dot the
+            // derivation still raises). The one tolerated failure is a
+            // racing `agent.delete` (`NotFound`): a deleted session no
+            // longer feeds the derivation, so skipping it is correct.
+            // Background/child sessions are untouched (their markers are
+            // conversation-entry state, and they never feed the derivation).
+            let pending = store
+                .list_top_level_sessions_with_unseen_last_message(&id)
                 .await?;
+            for (agent_id, last_message_id) in pending {
+                match this
+                    .agent_mark_seen_op(id.clone(), AgentId(agent_id.clone()), last_message_id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(Error::NotFound(_)) => {
+                        tracing::debug!(
+                            workspace = %id.as_str(),
+                            agent = %agent_id,
+                            "workspace.markSeen: session deleted mid-call; skipping"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            this.park_attention_write().await;
+            // Legacy stored-flag clear (kept for the no-sessions/stale-flag
+            // case; after the mark-all above it is normally a no-op — the
+            // settle already cleared and emitted). Review-required attention
+            // persists. Merely looking at a workspace is not "activity", so
+            // `updated_at` (which feeds the derived `lastActivity`) stays
+            // untouched (intent-hq/monorepo#1466). Atomic settle-clear
+            // (monorepo#1481 pattern, hardened): one UPDATE guarded on
+            // `attention = unread` AND the derivation re-checked inside the
+            // write — touching only the attention column, so a concurrent
+            // mutation of any other column is never clobbered and an
+            // assistant message landing after the mark-all loop can never
+            // have its fresh unread retired — whose row count decides
+            // "changed", so the clear rule and the emit decision are atomic
+            // rather than read-based.
+            let changed = store.clear_workspace_unread_if_all_seen(&id).await?;
             if changed {
                 // The unread flag is not a displayStatus axis (§6.5), so
                 // clearing it never moves the derived rollup — no recompute.
@@ -20093,8 +20243,15 @@ impl WorkspaceApi for Services {
             // `page_token`); otherwise the legacy bare array is preserved verbatim.
             let paginate = params.paginate.unwrap_or(false) || params.page_token.is_some();
             // Mirror `buildQueryFilters`: each option is applied only when
-            // truthy (empty strings / 0 are skipped); `limit || 50`.
-            let legacy_limit = params.limit.filter(|&l| l != 0).unwrap_or(50);
+            // truthy (empty strings / 0 are skipped); `limit || 50`, clamped
+            // (monorepo#3347) — previously an unclamped limit reached SQL
+            // directly, where a negative value even means "no limit", making
+            // the response byte ceiling defeatable by sheer row count.
+            let legacy_limit = params
+                .limit
+                .filter(|&l| l != 0)
+                .unwrap_or(50)
+                .clamp(1, event_ops::EVENT_QUERY_MAX_LEGACY_LIMIT);
             let mut q = EventQuery {
                 workspace_id: Some(workspace_id),
                 limit: Some(legacy_limit),
@@ -20137,10 +20294,20 @@ impl WorkspaceApi for Services {
                 q.since = Some(iso_minutes_ago(m));
             }
             if !paginate {
-                // Legacy bare array (store yields newest→oldest).
+                // Legacy bare array (store yields newest→oldest), bounded
+                // below the transport's large-frame advisory (monorepo#3347).
                 let events = store.query_events(&q).await?;
-                return serde_json::to_value(events)
-                    .map_err(|e| Error::Internal(format!("serialize events failed: {e}")));
+                let mut rows = event_ops::serialize_event_rows(events)
+                    .map_err(|e| Error::Internal(format!("serialize events failed: {e}")))?;
+                let trimmed = event_ops::bound_event_rows(&mut rows);
+                if trimmed > 0 {
+                    tracing::debug!(
+                        trimmed,
+                        rows = rows.len(),
+                        "event.query response over size budget; row payloads trimmed"
+                    );
+                }
+                return Ok(serde_json::Value::Array(rows));
             }
             // Paginated: clamp the page size, page backward via OFFSET, and fetch
             // one extra row to decide whether an older page remains. The store
@@ -20159,10 +20326,20 @@ impl WorkspaceApi for Services {
             } else {
                 serde_json::Value::Null
             };
-            let items = serde_json::to_value(events)
+            // The page is bounded the same way as the legacy array
+            // (monorepo#3347); `nextToken` is unaffected by trimming.
+            let mut rows = event_ops::serialize_event_rows(events)
                 .map_err(|e| Error::Internal(format!("serialize events failed: {e}")))?;
+            let trimmed = event_ops::bound_event_rows(&mut rows);
+            if trimmed > 0 {
+                tracing::debug!(
+                    trimmed,
+                    rows = rows.len(),
+                    "event.query response over size budget; row payloads trimmed"
+                );
+            }
             Ok(serde_json::json!({
-                "items": items,
+                "items": serde_json::Value::Array(rows),
                 "nextToken": next_token,
             }))
         })

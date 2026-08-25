@@ -5975,6 +5975,156 @@ async fn query_opt_in_pagination_envelope_and_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
+/// Insert an event whose `data` payload is roughly `data_bytes` bytes.
+async fn insert_big_event(svc: &Services, ws: &WorkspaceId, i: usize, data_bytes: usize) {
+    svc.store()
+        .insert_event(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: format!("2026-01-01T00:{:02}:{:02}Z", i / 60, i % 60),
+            event_type: "note:updated".to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some("a1".to_string()),
+                name: Some("name-a1".to_string()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({ "blob": "x".repeat(data_bytes) }),
+        })
+        .await
+        .expect("insert event");
+}
+
+/// Regression (monorepo#3347): a busy workspace's `event.query` no longer
+/// serializes past the transport's 1 MiB large-frame advisory. Both response
+/// shapes (legacy bare array and paginated envelope) are bounded by
+/// per-row payload trimming with observable `truncated` / `originalBytes`
+/// markers, row count is preserved, and the caller-supplied legacy `limit`
+/// is clamped (a negative value previously meant "no limit" in SQL).
+#[tokio::test]
+async fn query_response_size_is_bounded_below_frame_advisory() {
+    const ONE_MIB: usize = 1024 * 1024;
+    let (_tmp, svc, ws) = event_setup().await;
+    // 60 rows × ~30 KiB ≈ 1.8 MiB serialized — past the advisory before the fix.
+    for i in 0..60 {
+        insert_big_event(&svc, &ws, i, 30 * 1024).await;
+    }
+
+    // Legacy bare array: all 60 rows survive, total stays under 1 MiB, and
+    // trimmed rows carry the additive markers.
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("legacy query");
+    let arr = rows.as_array().expect("bare array (non-paginated)");
+    assert_eq!(arr.len(), 60, "no rows may be dropped");
+    let size = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "legacy response must stay under 1 MiB: {size}"
+    );
+    assert!(
+        arr.iter()
+            .any(|r| r["truncated"] == serde_json::json!(true)),
+        "trimming must be observable via row markers"
+    );
+    for row in arr {
+        assert!(row["id"].as_str().is_some(), "identity survives: {row}");
+        assert_eq!(row["type"], serde_json::json!("note:updated"));
+        assert_eq!(row["actor"]["type"], serde_json::json!("agent"));
+        if row["truncated"] == serde_json::json!(true) {
+            assert!(row["originalBytes"].as_u64().is_some(), "marker: {row}");
+        }
+    }
+
+    // Paginated envelope: same bound on a full page.
+    let page = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(200),
+                paginate: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("paginated query");
+    assert_eq!(page["items"].as_array().expect("items").len(), 60);
+    let size = serde_json::to_string(&page).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "paginated response must stay under 1 MiB: {size}"
+    );
+
+    // Legacy limit clamp: a negative limit no longer means "no limit" — it
+    // clamps to 1 row instead of returning the whole table.
+    let neg = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(-1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("negative-limit query");
+    assert_eq!(neg.as_array().expect("bare array").len(), 1);
+
+    // A small query on the same store is returned untouched: no markers.
+    // (The clamp's UPPER bound is pinned by query_legacy_limit_upper_clamp.)
+    let small = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("small query");
+    let small_arr = small.as_array().expect("bare array");
+    assert_eq!(small_arr.len(), 3);
+    assert!(
+        small_arr.iter().all(|r| r.get("truncated").is_none()),
+        "under-budget responses stay byte-identical: {small}"
+    );
+}
+
+/// The legacy `event.query` limit's UPPER bound (monorepo#3347): a limit past
+/// 500 is clamped to exactly 500 rows — the second half of the [1, 500]
+/// contract (the lower bound is covered by the regression test above).
+#[tokio::test]
+async fn query_legacy_limit_upper_clamp() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for i in 0..510 {
+        insert_big_event(&svc, &ws, i, 16).await;
+    }
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("over-limit query");
+    assert_eq!(
+        rows.as_array().expect("bare array").len(),
+        500,
+        "limit > 500 clamps to EVENT_QUERY_MAX_LEGACY_LIMIT rows"
+    );
+}
+
 #[tokio::test]
 async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     let (_tmp, svc, ws) = event_setup().await;
@@ -32546,5 +32696,575 @@ mod agent_summary_excludes_deleted {
             vec![active_id],
             "agentIds stays consistent with agents"
         );
+    }
+}
+
+/// Daemon-side derived workspace `unread` (§5.1): unread = any top-level
+/// (non-background, non-deleted) session whose newest user/assistant message
+/// is an assistant message the per-agent seen marker (`agent.markSeen`,
+/// §5.5) has not caught up with. Read paths serve the derivation (stored
+/// `review_required` still wins), `agent.markSeen` settles the workspace
+/// flag when the last unread session is read, and `workspace.markSeen`
+/// advances every top-level marker.
+mod derived_workspace_unread {
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        harness_with_park(None).await
+    }
+
+    /// Harness variant with the monorepo#1481 attention-write park seam
+    /// armed, so settle-race tests can hold the settlement immediately
+    /// before its atomic clear (the probe→write gap).
+    async fn harness_with_park(
+        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+    ) -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let mut services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        if let Some(park) = park {
+            services = services.with_attention_write_park(park);
+        }
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+        }
+    }
+
+    /// Insert a top-level session and append `roles` in order, returning the
+    /// LAST appended message id.
+    async fn seed_session(h: &Harness, id: &str, roles: &[&str]) -> String {
+        seed_session_with(h, mk_session(&h.ws, id), roles).await
+    }
+
+    async fn seed_session_with(h: &Harness, session: AgentSession, roles: &[&str]) -> String {
+        let agent_id = session.id.clone();
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+        let mut last = String::new();
+        for role in roles {
+            let msg = h
+                .store
+                .append_agent_message(
+                    &agent_id,
+                    role,
+                    &json!([{ "type": "text", "text": "m" }]),
+                    &now_iso(),
+                )
+                .await
+                .expect("append message");
+            last = msg.id;
+        }
+        last
+    }
+
+    fn subscribe_attention(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_silent(sub: &mut Subscription) {
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(res.is_err(), "expected no attention event: {res:?}");
+    }
+
+    /// Served attention over `workspace.get` (the enrichment path).
+    async fn served_attention(h: &Harness) -> WorkspaceAttention {
+        h.services
+            .get_workspace(h.ws.clone())
+            .await
+            .expect("get workspace")
+            .attention
+    }
+
+    /// Store-level derivation truth table: no agents / unseen-assistant /
+    /// seen / user-last / background / child / deleted sessions.
+    #[tokio::test]
+    async fn derivation_truth_table() {
+        let h = harness().await;
+        let probe = || h.store.workspace_has_unread_top_level_session(&h.ws);
+
+        // No agents: not unread.
+        assert!(!probe().await.expect("probe"));
+
+        // Top-level session with no messages: not unread.
+        h.store
+            .insert_agent_session(&mk_session(&h.ws, "agent-empty"))
+            .await
+            .expect("insert");
+        assert!(!probe().await.expect("probe"));
+
+        // User-last session: not unread.
+        seed_session(&h, "agent-user-last", &["assistant", "user"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Background session with an unseen assistant last: never unread.
+        let mut background = mk_session(&h.ws, "agent-background");
+        background.is_background = true;
+        seed_session_with(&h, background, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Child session with an unseen assistant last: never unread.
+        let mut child = mk_session(&h.ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-empty"));
+        seed_session_with(&h, child, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Deleted session with an unseen assistant last: never unread.
+        let mut deleted = mk_session(&h.ws, "agent-deleted");
+        deleted.status = AgentStatus::Deleted;
+        seed_session_with(&h, deleted, &["user", "assistant"]).await;
+        assert!(!probe().await.expect("probe"));
+
+        // Top-level unseen assistant last: unread.
+        let last = seed_session(&h, "agent-unread", &["user", "assistant"]).await;
+        assert!(probe().await.expect("probe"));
+
+        // Marker caught up: not unread again.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-unread"), last)
+            .await
+            .expect("mark seen");
+        assert!(!probe().await.expect("probe"));
+    }
+
+    /// Read paths serve the derivation: an unseen assistant last message
+    /// reads `unread` even when the stored flag is `none`, and a stale
+    /// stored `unread` reads `none` once every marker is caught up.
+    #[tokio::test]
+    async fn reads_serve_derived_attention_over_stored_flag() {
+        let h = harness().await;
+        // Derived unread, stored none.
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Stale stored unread + marker caught up: derived none wins.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed stale");
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // list_workspaces serves the same derivation.
+        let listed = h
+            .services
+            .list_workspaces(false)
+            .await
+            .expect("list workspaces");
+        let row = listed.iter().find(|w| w.id == h.ws).expect("row");
+        assert_eq!(row.attention, WorkspaceAttention::None);
+    }
+
+    /// Stored `review_required` always wins over the derivation — in both
+    /// directions (derived unread and derived none).
+    #[tokio::test]
+    async fn review_required_wins_over_derivation() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::ReviewRequired;
+        h.store.update_workspace(&ws).await.expect("seed review");
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+
+        // markSeen advances the marker but leaves review_required in place
+        // (and never emits attention-changed { none } while it holds).
+        let mut sub = subscribe_attention(&h);
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+        assert_eq!(
+            served_attention(&h).await,
+            WorkspaceAttention::ReviewRequired
+        );
+    }
+
+    /// `agent.markSeen` partial vs final clear: reading one of two unread
+    /// agents stays silent; reading the last one clears the stored flag and
+    /// emits exactly one `workspace:attention-changed { none }`.
+    #[tokio::test]
+    async fn agent_mark_seen_partial_then_final_clear() {
+        let h = harness().await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let last_b = seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        // Partial: agent-b still unread — no workspace-level emission.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last_a)
+            .await
+            .expect("mark a seen");
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        // Final: last unread agent read — stored flag cleared + one emit.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-b"), last_b)
+            .await
+            .expect("mark b seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.attention, WorkspaceAttention::None);
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Idempotent re-mark: no duplicate emission.
+        h.services
+            .agent_mark_seen_op(
+                h.ws.clone(),
+                AgentId::from("agent-b"),
+                h.store
+                    .get_agent_session_summary(&AgentId::from("agent-b"))
+                    .await
+                    .expect("summary")
+                    .last_seen_message_id()
+                    .expect("marker")
+                    .to_string(),
+            )
+            .await
+            .expect("re-mark");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The final `agent.markSeen` clears the derived state even when the
+    /// stored flag was never raised (e.g. the turn-end raise was skipped):
+    /// clients tracking the derived value still get the clear.
+    #[tokio::test]
+    async fn agent_mark_seen_emits_clear_without_stored_flag() {
+        let h = harness().await;
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        let mut sub = subscribe_attention(&h);
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+    }
+
+    /// `workspace.markSeen` advances every top-level session's marker to its
+    /// `last_message_id` (background/child sessions untouched), clears the
+    /// derived + stored unread, and emits exactly one attention-changed.
+    #[tokio::test]
+    async fn workspace_mark_seen_marks_all_top_level_sessions() {
+        let h = harness().await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let last_b = seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        let mut background = mk_session(&h.ws, "agent-background");
+        background.is_background = true;
+        seed_session_with(&h, background, &["user", "assistant"]).await;
+        let mut child = mk_session(&h.ws, "agent-child");
+        child.parent_agent_id = Some(AgentId::from("agent-a"));
+        seed_session_with(&h, child, &["user", "assistant"]).await;
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        let mut sub = subscribe_attention(&h);
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        // Exactly one workspace-level clear.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut sub).await;
+
+        // Top-level markers advanced to each session's last message.
+        for (id, last) in [("agent-a", &last_a), ("agent-b", &last_b)] {
+            let s = h
+                .store
+                .get_agent_session_summary(&AgentId::from(id))
+                .await
+                .expect("summary");
+            assert_eq!(s.last_seen_message_id(), Some(last.as_str()));
+        }
+        // Child/background markers untouched.
+        for id in ["agent-background", "agent-child"] {
+            let s = h
+                .store
+                .get_agent_session_summary(&AgentId::from(id))
+                .await
+                .expect("summary");
+            assert_eq!(s.last_seen_message_id(), None, "{id} marker untouched");
+        }
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::None);
+
+        // Idempotent: a second markSeen is silent.
+        h.services.mark_seen(h.ws.clone()).await.expect("again");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The turn-end raise still only emits on the none→unread transition
+    /// (guarded write), and the derivation agrees with the raise.
+    #[tokio::test]
+    async fn turn_end_raise_transition_only() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        let mut sub = subscribe_attention(&h);
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "unread" })
+        );
+
+        // Re-raise while already unread: guarded no-op, no spam.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("re-raise");
+        assert_silent(&mut sub).await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// Settle race: an assistant message landing in the gap between the
+    /// settle's unread probe and its attention write must NOT be retired.
+    /// Parks the settlement immediately before the write, seeds a fresh
+    /// unread session while parked, and asserts the atomic clear declines —
+    /// stored flag still `unread`, no `{ none }` emit — so subscribers never
+    /// believe the workspace is caught up while the derivation reads unread.
+    #[tokio::test]
+    async fn settle_race_new_message_in_gap_never_clears() {
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_park(Some(park.clone())).await;
+        let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Stored flag raised as the turn-end gate would have left it (seeded
+        // via the store — the armed park would hold the service-path raise).
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.attention = WorkspaceAttention::Unread;
+        h.store.update_workspace(&ws).await.expect("seed flag");
+
+        let mut sub = subscribe_attention(&h);
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let task = tokio::spawn(async move {
+            services
+                .agent_mark_seen_op(ws_id, AgentId::from("agent-a"), last_a)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("settle reaches the attention write window");
+
+        // New unread session lands while the settle sits parked between its
+        // probe (which saw "all seen") and its write.
+        seed_session(&h, "agent-b", &["user", "assistant"]).await;
+        park.release.notify_one();
+
+        task.await.expect("join").expect("mark seen");
+        // The atomic clear re-checked the derivation inside the write and
+        // declined; the fallback emit re-probed and stayed silent too.
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::Unread,
+            "stored unread must survive a message landing in the settle gap"
+        );
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+    }
+
+    /// `workspace.markSeen` propagates marker-advance failures instead of
+    /// swallowing them: a failed per-session advance (here: the message
+    /// table dropped out from under the monotonicity gate) surfaces as the
+    /// call's error, the stored `unread` flag survives, and no `{ none }`
+    /// event is emitted — the caller never sees "seen" while a session
+    /// stays unread.
+    #[tokio::test]
+    async fn workspace_mark_seen_propagates_marker_failures() {
+        let h = harness().await;
+        seed_session(&h, "agent-a", &["user", "assistant"]).await;
+        // Persist a dangling current marker so the monotonicity gate must
+        // resolve transcript positions (and hit the induced store failure).
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), "stale".into())
+            .await
+            .expect("seed marker");
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        // Force the per-session advance to fail hard (not NotFound).
+        sqlx::query("DROP TABLE agent_message")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_message");
+
+        let mut sub = subscribe_attention(&h);
+        let err = h.services.mark_seen(h.ws.clone()).await;
+        assert!(err.is_err(), "marker failure must propagate: {err:?}");
+        assert_silent(&mut sub).await;
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.attention,
+            WorkspaceAttention::Unread,
+            "stored unread must survive a failed mark-all"
+        );
+    }
+
+    /// Batch list-path derivation (`workspaces_with_unread_top_level_sessions`)
+    /// agrees with the per-workspace EXISTS probe: only workspaces with an
+    /// unread top-level session appear in the set, and a marker catch-up
+    /// removes them.
+    #[tokio::test]
+    async fn batch_unread_set_matches_single_probe() {
+        let h = harness().await;
+        // Second workspace, fully seen.
+        let ws_seen = WorkspaceId::new();
+        h.store
+            .insert_workspace(&workspace(&ws_seen))
+            .await
+            .expect("ws2");
+        let seen_session = mk_session(&ws_seen, "agent-seen");
+        let last_seen = seed_session_with(&h, seen_session, &["user", "assistant"]).await;
+        h.services
+            .agent_mark_seen_op(ws_seen.clone(), AgentId::from("agent-seen"), last_seen)
+            .await
+            .expect("catch up ws2");
+        // Primary workspace unread.
+        let last = seed_session(&h, "agent-a", &["user", "assistant"]).await;
+
+        let set = h
+            .store
+            .workspaces_with_unread_top_level_sessions()
+            .await
+            .expect("batch probe");
+        assert!(set.contains(h.ws.as_str()), "unread workspace in the set");
+        assert!(
+            !set.contains(ws_seen.as_str()),
+            "caught-up workspace absent"
+        );
+
+        // Marker catch-up drains the set.
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last)
+            .await
+            .expect("mark seen");
+        let set = h
+            .store
+            .workspaces_with_unread_top_level_sessions()
+            .await
+            .expect("batch probe");
+        assert!(!set.contains(h.ws.as_str()), "seen workspace drained");
     }
 }
