@@ -241,8 +241,12 @@ fn bound_event_rows_prefers_newer_rows() {
     bound_event_rows(&mut rows);
     let first = intent_core::slim_body_size(&rows[0]);
     let last = intent_core::slim_body_size(&rows[59]);
+    // Equal-sized rows converge to near-identical shares; integer-division
+    // remainders in the fair-share walk can hand later rows a few extra
+    // bytes, so the "newer rows keep at least as much" property is asserted
+    // with a small tolerance rather than strictly.
     assert!(
-        first >= last,
+        first + 16 >= last,
         "newest row ({first}B) must keep at least as much as the oldest ({last}B)"
     );
     assert!(
@@ -269,6 +273,67 @@ fn bound_event_rows_giant_row_does_not_starve_siblings() {
     assert_eq!(rows[0]["data"]["blob"].as_str().map(str::len), Some(512));
     assert_eq!(rows[2]["data"]["blob"].as_str().map(str::len), Some(512));
     assert!(total_size(&rows) <= EVENT_QUERY_RESPONSE_BUDGET_BYTES + 3 * 1024);
+}
+
+/// Escaping-heavy payloads cannot defeat the byte ceiling: `cap_json_value`
+/// budgets raw string length, but a string of quotes doubles when
+/// JSON-escaped — the converging re-cap in `cap_event_row` must bound the
+/// SERIALIZED size, not the raw size (PR #1461 review).
+#[test]
+fn bound_event_rows_escaping_heavy_payload_stays_bounded() {
+    // One giant row of quotes: raw 2 MiB, serializes to ~4 MiB.
+    let mut rows = vec![
+        serde_json::to_value(ev(
+            "note:updated",
+            Some("a1"),
+            ActorType::Agent,
+            "2026-01-01T00:00:00Z",
+            json!({ "blob": "\"".repeat(2 * 1024 * 1024) }),
+        ))
+        .expect("serialize event"),
+        big_row(1, 512),
+    ];
+    let trimmed = bound_event_rows(&mut rows);
+    assert_eq!(trimmed, 1, "only the outlier is trimmed");
+    let wire = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        wire <= EVENT_QUERY_RESPONSE_BUDGET_BYTES + 2 * 1024,
+        "post-trim SERIALIZED size {wire} must respect the budget despite 2x escaping"
+    );
+    assert_eq!(rows[0]["truncated"], json!(true));
+}
+
+/// Oversized identity-adjacent fields (actor.name, sessionId, …) are trimmed
+/// too — they are caller-influenced and stored unbounded, so leaving them
+/// untrimmable would defeat the ceiling (PR #1461 review). `actor.type` is
+/// required on the wire and always survives.
+#[test]
+fn bound_event_rows_trims_oversized_actor_and_session_fields() {
+    let mut giant = ev(
+        "note:updated",
+        Some("a1"),
+        ActorType::Agent,
+        "2026-01-01T00:00:00Z",
+        json!({}),
+    );
+    giant.actor.name = Some("n".repeat(EVENT_QUERY_RESPONSE_BUDGET_BYTES));
+    giant.session_id = Some("s".repeat(EVENT_QUERY_RESPONSE_BUDGET_BYTES));
+    let mut rows = vec![
+        serde_json::to_value(giant).expect("serialize event"),
+        big_row(1, 512),
+    ];
+    let trimmed = bound_event_rows(&mut rows);
+    assert_eq!(trimmed, 1, "the identity-bloated row is trimmed");
+    assert!(total_size(&rows) <= EVENT_QUERY_RESPONSE_BUDGET_BYTES + 2 * 1024);
+    assert_eq!(
+        rows[0]["actor"]["type"],
+        json!("agent"),
+        "required actor.type survives trimming: {}",
+        rows[0]
+    );
+    assert_eq!(rows[0]["truncated"], json!(true));
+    // The small row after the outlier survives untouched.
+    assert_eq!(rows[1]["data"]["blob"].as_str().map(str::len), Some(512));
 }
 
 /// Non-object rows (defensive: rows are always serialized `Event` objects)

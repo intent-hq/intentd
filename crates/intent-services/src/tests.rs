@@ -6080,6 +6080,7 @@ async fn query_response_size_is_bounded_below_frame_advisory() {
     assert_eq!(neg.as_array().expect("bare array").len(), 1);
 
     // A small query on the same store is returned untouched: no markers.
+    // (The clamp's UPPER bound is pinned by query_legacy_limit_upper_clamp.)
     let small = svc
         .event_query(
             ws.clone(),
@@ -6095,6 +6096,32 @@ async fn query_response_size_is_bounded_below_frame_advisory() {
     assert!(
         small_arr.iter().all(|r| r.get("truncated").is_none()),
         "under-budget responses stay byte-identical: {small}"
+    );
+}
+
+/// The legacy `event.query` limit's UPPER bound (monorepo#3347): a limit past
+/// 500 is clamped to exactly 500 rows — the second half of the [1, 500]
+/// contract (the lower bound is covered by the regression test above).
+#[tokio::test]
+async fn query_legacy_limit_upper_clamp() {
+    let (_tmp, svc, ws) = event_setup().await;
+    for i in 0..510 {
+        insert_big_event(&svc, &ws, i, 16).await;
+    }
+    let rows = svc
+        .event_query(
+            ws.clone(),
+            intent_core::EventQueryParams {
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("over-limit query");
+    assert_eq!(
+        rows.as_array().expect("bare array").len(),
+        500,
+        "limit > 500 clamps to EVENT_QUERY_MAX_LEGACY_LIMIT rows"
     );
 }
 
