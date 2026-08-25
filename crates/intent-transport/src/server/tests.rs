@@ -124,6 +124,13 @@ async fn handle_pairing_info_local_success() {
     assert!(result["certFingerprint"].is_string());
     assert!(result["localIps"].is_array());
     assert!(result["hostname"].is_string());
+    assert!(
+        !result["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
