@@ -6760,7 +6760,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:stream:start", "agent:stream:end"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:queue:processing", "agent:stream:end"], "workspaceId": ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -6807,17 +6807,25 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
     .await;
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second send should queue: {send2}");
+    let queued_id = send2["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
 
     // Wait for both turns to finish (first send + drained queued send). The
-    // queued entry is dequeued — and the annotation decision made — between
-    // the first turn's end and the second turn's start, so the elapsed
-    // reading at the second `agent:stream:start` upper-bounds the wait.
+    // drain-start signal `agent:queue:processing` (monorepo#1022) is emitted
+    // immediately AFTER `annotate_dequeue_wait` stamps the entry, so the
+    // elapsed reading at that frame (matched to the queued entry's id)
+    // strictly upper-bounds the daemon-measured wait.
     let mut stream_end_count = 0;
     let mut wait_upper_bound: Option<Duration> = None;
     for _ in 0..240 {
         let frame = wss_event(&mut sub, 30).await;
-        match frame["params"]["event"]["type"].as_str() {
-            Some("agent:stream:start") if stream_end_count == 1 && wait_upper_bound.is_none() => {
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:queue:processing")
+                if evt["data"]["messageId"].as_str() == Some(&queued_id) =>
+            {
                 wait_upper_bound = Some(queue_wait_clock.elapsed());
             }
             Some("agent:stream:end") => {
@@ -6830,8 +6838,11 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
         }
     }
     assert_eq!(stream_end_count, 2, "both turns must complete");
-    // Fallback (second-start frame missed): still an upper bound, just looser.
-    let wait_upper_bound = wait_upper_bound.unwrap_or_else(|| queue_wait_clock.elapsed());
+    // The subscription predates the queuing send and events are delivered in
+    // order, so the drain-start frame must have been observed — no loose
+    // fallback that could misclassify an incorrectly annotated run.
+    let wait_upper_bound =
+        wait_upper_bound.expect("agent:queue:processing frame for the queued entry");
 
     let convo = wss_rpc(
         &mut rpc,
