@@ -5475,77 +5475,9 @@ impl Services {
                 );
                 continue;
             }
-            // Report-time wake suppression: if the watch has already delivered the
-            // report wake (via agent.reportToParent), skip delivery ONLY for
-            // agent:idle. agent:failed / agent:deleted still deliver (failure after
-            // reporting is a new signal, not a duplicate).
-            if watch.report_delivered && event.event_type == intent_core::events::AGENT_IDLE {
-                tracing::debug!(
-                    child = %child_id.0,
-                    parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — report already delivered at reportToParent time"
-                );
-                // Remove the watch now that the completion cycle is done —
-                // BEFORE the awaited marker write below (PR #1313 review): a
-                // re-arm adopts the existing watch id, so an await parked
-                // between the loop's watch snapshot and this removal would
-                // widen the window where the stale snapshot removes a
-                // freshly re-armed watch (losing its future wake). The
-                // reorder leaves only a marker-less instant in which a
-                // re-arm's registration reconcile could replay the
-                // historical completion — a bounded single duplicate
-                // (fail-open), strictly better than a lost wake.
-                let removed = self.remove_watch(&watch.id);
-                // monorepo#2842: the completion cycle ends here for this
-                // parent — the report-time wake already delivered this
-                // completion, so persist its identity for the pair. A watch
-                // re-armed later (or a boot reconcile replaying the child's
-                // historical completion after a restart) matches the marker
-                // and is skipped instead of re-delivering. Keyed on the
-                // SESSION's report timestamp (not the event's): this branch
-                // is reached by unreported idle payloads too, and the cycle
-                // being retired is the session's persisted report. A
-                // best-effort write: a failure only loses the dedup for this
-                // completion. Recorded even when the watch was concurrently
-                // removed — the report-time wake was delivered either way.
-                if let Some(identity) = session_report_ts.as_deref() {
-                    if let Err(e) = self
-                        .store
-                        .record_completion_wake_delivery(
-                            &watch.parent_agent_id,
-                            child_id,
-                            identity,
-                            &now_iso(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            child = %child_id.0,
-                            parent = %watch.parent_agent_id.0,
-                            error = %e,
-                            "completion wake dedup record failed at report-delivered retirement"
-                        );
-                    }
-                }
-                if removed {
-                    self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
-                        .await;
-                    // Watch-removal backstop (issue intent-hq/monorepo#1643):
-                    // this retirement delivers NO wake, so a holder whose own
-                    // idle was deferred (interim-skip marker recorded) loses
-                    // its last trigger when this was its last outgoing watch.
-                    // Same shape as the `agent.unwatch` /
-                    // `agent.cancelSubscriptions` backstops; the redelivery's
-                    // own guards make it a no-op otherwise. Box::pin breaks
-                    // the async-recursion cycle (deliver -> redeliver ->
-                    // deliver).
-                    Box::pin(
-                        self.redeliver_completion_after_queue_mutation(&watch.parent_agent_id),
-                    )
-                    .await;
-                }
-                continue;
-            }
+            // A report wake is progress, not terminal settlement. It never
+            // consumes or suppresses this completion watch; the final idle,
+            // failure, or deletion below owns durable retirement.
             // monorepo#840: suppress a repeated identical failure wake to the
             // same parent. Checked BEFORE the watch removal so a suppressed
             // delivery leaves the watch in place for a future distinct signal.
@@ -5605,67 +5537,21 @@ impl Services {
                     continue;
                 }
             }
-            // STAB-18 fix: remove the ungrouped watch BEFORE delivery so a
-            // reprocessed event or reentrant loop cannot deliver the same
-            // completion twice. The watch is atomically removed from the registry;
-            // if delivery fails the parent misses the wake, but that's safer than
-            // duplicate delivery (which we observed in production: STAB-5). Group
-            // watches are still removed AFTER group settlement as before.
-            let removed = self.remove_watch(&watch.id);
-            if !removed {
-                // Watch was concurrently removed (e.g. by another event or
-                // cancelSubscriptions); skip delivery to avoid a duplicate.
+            if !self
+                .find_watches_for_child(child_id)
+                .iter()
+                .any(|current| current.id == watch.id)
+            {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "watch already removed, skipping delivery"
+                    "watch already removed, skipping terminal delivery"
                 );
                 continue;
             }
-            // monorepo#2842: persist the completion's identity for this pair
-            // — AFTER the one-shot watch removal committed the delivery
-            // decision, but BEFORE the wake send (PR #1313 review):
-            // `deliver_parent_wake` persists the wake and spawns the
-            // parent's worker before returning, so a worker turn re-arming a
-            // watch on the already-completed child in that window must
-            // already find the marker (its registration reconcile would
-            // otherwise replay the historical completion). The write covers
-            // `record_identity` (the event-carried identity, or the
-            // session's report cycle a report-less Gap B settlement wake
-            // settles). Best-effort: a write failure only loses the dedup
-            // for this completion (the pre-fix behavior). If the send below
-            // fails, the parent misses the wake either way (the watch is
-            // already removed — the STAB-18 stance: a missed wake beats a
-            // duplicate), so recording first costs nothing. NB this stance
-            // consciously applies to FAILURE identities too (monorepo#2862),
-            // inverting the #840 in-memory record's after-send ordering: a
-            // failed send now also suppresses the boot/re-arm replay that
-            // could previously have healed the missed failure wake — same
-            // missed-beats-duplicate tradeoff as completions.
-            if let Some(identity) = record_identity {
-                if let Err(e) = self
-                    .store
-                    .record_completion_wake_delivery(
-                        &watch.parent_agent_id,
-                        child_id,
-                        identity,
-                        &now_iso(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        child = %child_id.0,
-                        parent = %watch.parent_agent_id.0,
-                        error = %e,
-                        "completion wake dedup record failed"
-                    );
-                }
-            }
-            // `remove_watch` just retired the one-shot watch, so the wake
-            // carries the retirement + re-arm suffix (issue monorepo#2051)
-            // and the machine-readable `watchStillArmed: false` metadata
-            // flag (monorepo#2060, mirroring the hook wakes'
-            // `hookStillActive`) so consumers don't parse the note text.
+            // The terminal wake carries the one-shot retirement contract. Its
+            // stable id makes a crash retry idempotent while the persisted
+            // watch remains armed as the recovery record.
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let mut metadata = build_event_notification_metadata(&[event]);
             metadata["watchStillArmed"] = serde_json::json!(false);
@@ -5690,11 +5576,12 @@ impl Services {
             }
             crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &stamped_triggers);
             if let Err(e) = self
-                .deliver_parent_wake(
+                .deliver_parent_wake_durable(
                     &parent_ws,
                     watch.parent_agent_id.clone(),
                     wake,
                     Some(metadata),
+                    format!("completion-wake:{}", watch.id),
                 )
                 .await
             {
@@ -5705,11 +5592,30 @@ impl Services {
                 );
                 continue;
             }
-            // monorepo#840: record the delivered failure only AFTER the wake
-            // succeeded, so a failed delivery never suppresses the next
-            // identical failure the parent has yet to hear about (unlike the
-            // completion marker above, a failure watch is NOT consumed by a
-            // suppressed delivery — the retry re-delivers).
+            let delivered_at = now_iso();
+            if let Err(e) = self
+                .store
+                .retire_completion_watch_after_delivery(
+                    &watch.id,
+                    &watch.parent_agent_id,
+                    child_id,
+                    record_identity,
+                    &delivered_at,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %watch.parent_agent_id.0,
+                    watch = %watch.id,
+                    "terminal wake is durable but watch retirement failed; stable-id retry remains armed"
+                );
+                continue;
+            }
+            self.remove_watch_after_delivery_commit(&watch.id);
+            // Record the delivered failure only after both the wake and watch
+            // retirement are durable. A failed send or transaction therefore
+            // never suppresses recovery.
             if let Some(err) = failure_error_text.as_deref() {
                 self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
@@ -5770,35 +5676,15 @@ impl Services {
         }
     }
 
-    /// Fire a delegation group's single aggregated wake if it is ready (sealed,
-    /// complete, undelivered). `take_group_if_ready` flips `delivered` and removes
-    /// the group atomically, so this fires at most once even under concurrent
-    /// completions; on a send error we log and accept the dropped wake (mirroring
-    /// the immediate path's best-effort delivery). The wake is delivered in the
-    /// group's anchor workspace (`group.workspace_id`, the parent's home).
+    /// Fire a delegation group's single aggregated wake if it is ready. The
+    /// complete persisted group remains restart-recoverable until the stable-id
+    /// wake is durable and group/watch settlement commits atomically.
     pub(crate) async fn try_fire_group(&self, group_id: &str) {
-        let Some(group) = self.take_group_if_ready(group_id).await else {
+        let Some(group) = self.take_group_if_ready(group_id) else {
             return;
         };
         let workspace_id = &group.workspace_id;
-        // STAB-129: settle the group's watches BEFORE the wake delivery await.
-        // A member recorded via `agent:failed` (e.g. the `session/prompt` idle
-        // timeout firing mid-turn) may still be working and settle for real
-        // later; dropping every group watch here would leave the parent with
-        // no wake path for that late settlement. `settle_group_watches`
-        // atomically converts each failed-not-deleted member's grouped watch
-        // into an ungrouped watch (and drops the rest), so there is no
-        // window in which the child has neither a live group nor a watch.
         let failed_children = failed_group_children(&group);
-        let retained = self.settle_group_watches(group_id, &failed_children);
-        if retained > 0 {
-            tracing::info!(
-                parent = %group.parent_agent_id.0,
-                group = %group_id,
-                retained,
-                "retained watch(es) for failed group member(s) after settlement"
-            );
-        }
         let wake = format_group_wake(&group);
         let event_refs: Vec<&Event> = group
             .raw_events
@@ -5837,11 +5723,12 @@ impl Services {
         }
         crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
         if let Err(e) = self
-            .deliver_parent_wake(
+            .deliver_parent_wake_durable(
                 workspace_id,
                 group.parent_agent_id.clone(),
                 wake,
                 Some(metadata),
+                format!("completion-group-wake:{group_id}"),
             )
             .await
         {
@@ -5850,6 +5737,31 @@ impl Services {
                 parent = %group.parent_agent_id.0,
                 group = %group_id,
                 "failed to deliver aggregated after_all wake to parent"
+            );
+            self.release_group_delivery(group_id);
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .settle_delegation_group_after_delivery(group_id, &failed_children)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                "aggregated wake is durable but group settlement failed; stable-id retry remains armed"
+            );
+            self.release_group_delivery(group_id);
+            return;
+        }
+        let retained = self.finalize_group_delivery(group_id, &failed_children);
+        if retained > 0 {
+            tracing::info!(
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                retained,
+                "retained watch(es) for failed group member(s) after settlement"
             );
         }
         self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
@@ -6535,13 +6447,80 @@ impl Services {
         content: String,
         message_metadata: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        self.deliver_parent_wake_with_id(
+            workspace_id,
+            parent_agent_id,
+            content,
+            message_metadata,
+            None,
+        )
+        .await
+    }
+
+    /// Deliver one terminal wake under a stable message id. A restart retry
+    /// that finds the id in the durable transcript or queue is a successful
+    /// no-op; the caller can then finish retiring its persisted watch/group.
+    pub(crate) async fn deliver_parent_wake_durable(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        content: String,
+        message_metadata: Option<serde_json::Value>,
+        message_id: String,
+    ) -> Result<serde_json::Value> {
+        self.deliver_parent_wake_with_id(
+            workspace_id,
+            parent_agent_id,
+            content,
+            message_metadata,
+            Some(message_id),
+        )
+        .await
+    }
+
+    async fn deliver_parent_wake_with_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        content: String,
+        message_metadata: Option<serde_json::Value>,
+        message_id: Option<String>,
+    ) -> Result<serde_json::Value> {
+        if let Some(id) = message_id.as_deref() {
+            let queued = self
+                .queue_snapshot(&parent_agent_id)
+                .iter()
+                .any(|entry| entry["id"].as_str() == Some(id));
+            let persisted = self
+                .store
+                .get_agent_message_by_id(&parent_agent_id, id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        parent = %parent_agent_id.0,
+                        message_id = %id,
+                        error = %e,
+                        "completion wake idempotency read failed; retrying delivery"
+                    );
+                    None
+                })
+                .is_some();
+            if queued || persisted {
+                return Ok(serde_json::json!({
+                    "success": true,
+                    "queued": queued,
+                    "duplicate": true,
+                    "messageId": id,
+                }));
+            }
+        }
         if let Some(manager) = self.agent_manager() {
             manager
                 .send_message(
                     parent_agent_id,
                     workspace_id.clone(),
                     content,
-                    None,
+                    message_id,
                     crate::agent_manager::TurnOptions {
                         message_metadata,
                         ..Default::default()
@@ -6554,13 +6533,15 @@ impl Services {
             // appending a user row that would bury the pending Q&A
             // (mirrors the manager path's `send_message` gate).
             if self.question_hold_active(&parent_agent_id).await {
-                let (queued, position) = self.enqueue_message(
+                let (queued, position) = self.enqueue_message_with_id_and_origin(
                     &parent_agent_id,
+                    message_id,
                     content,
                     None,
                     None,
                     message_metadata,
                     None,
+                    false,
                     false,
                 );
                 let result = serde_json::json!({
@@ -6599,15 +6580,28 @@ impl Services {
                 content
             };
             let blocks = serde_json::json!([{ "type": "text", "text": content }]);
-            self.store
-                .append_agent_message_with_metadata(
-                    &parent_agent_id,
-                    "user",
-                    &blocks,
-                    message_metadata.as_ref(),
-                    &now_iso(),
-                )
-                .await?;
+            if let Some(id) = message_id.as_deref() {
+                self.store
+                    .append_agent_message_with_id(
+                        &parent_agent_id,
+                        id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &now_iso(),
+                    )
+                    .await?;
+            } else {
+                self.store
+                    .append_agent_message_with_metadata(
+                        &parent_agent_id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &now_iso(),
+                    )
+                    .await?;
+            }
             self.invalidate_agent_list_cache(workspace_id);
             Ok(serde_json::json!({ "success": true, "queued": false }))
         }

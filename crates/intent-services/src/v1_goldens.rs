@@ -1204,10 +1204,7 @@ async fn golden_report_to_parent_wake_bytes() {
     assert_eq!(
         texts,
         vec![format!(
-            "[WORKSPACE EVENTS] Child agent {child_name} ({id}) reported. Report: Task \
-             finished. NOTE: this report consumed your one-shot watch on this agent — it \
-             will NOT fire again on completion (failure/deletion still deliver). Call \
-             ws.agent.watch(\"{id}\") again to be woken at its next completion.",
+            "[WORKSPACE EVENTS] Child agent {child_name} ({id}) reported. Report: Task finished.",
             id = child.0
         )]
     );

@@ -6440,12 +6440,10 @@ impl Services {
                 .await;
         }
 
-        // Immediate parent wake for non-grouped children: if this child is in an
-        // `after_all` delegation group, skip the immediate wake — the group's
-        // aggregated wake will fold this report in when all children settle. Otherwise,
-        // deliver the wake NOW unconditionally to the parent, then mark the parent's
-        // ungrouped watches to suppress their agent:idle delivery (report-time wake
-        // requirement).
+        // Immediate progress wake for non-grouped children. A report does not
+        // consume a terminal completion watch: idle/failure/deletion still owns
+        // the final wake and durable one-shot retirement. Grouped reports remain
+        // deferred to the single after_all aggregate.
         let grouped = self.child_in_undelivered_group(&parent, &caller);
         if !grouped {
             // Deliver the wake in the parent's HOME workspace: for a
@@ -6457,33 +6455,19 @@ impl Services {
                 .get_agent_session(&parent)
                 .await
                 .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
-            // Mark any ungrouped watches whose parent matches this parent as
-            // report_delivered, so deliver_completion_to_watches will skip agent:idle
-            // for them (suppressing the duplicate wake). Do NOT mark watches for other
-            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
-            // completion wake and should not receive the report wake. The marking runs
-            // BEFORE the wake is built (issue intent-hq/monorepo#2528) so the wake's
-            // disarm disclosure — text suffix + metadata — reflects the actual flip.
             let watches = self.find_watches_for_child(&caller);
-            let mut marked = false;
-            for watch in watches.iter().filter(|w| {
-                w.group_id.is_none() && w.parent_agent_id == parent && !w.report_delivered
-            }) {
-                marked |= self.mark_watch_report_delivered(&watch.id);
-            }
+            let watch_still_armed = watches
+                .iter()
+                .any(|watch| watch.group_id.is_none() && watch.parent_agent_id == parent);
             // Deliver exactly ONE wake to the parent, regardless of watch count.
             // Format the wake message with the persisted report. "reported", not
-            // "completed" — a report is not necessarily a completion (monorepo#2528).
-            // `marked` = the flip disarmed the parent's one-shot watch for
-            // agent:idle — it never fires on the child's completion again
-            // (failure/deletion still deliver); the wake discloses it with the
-            // re-arm pointer, mirroring the #2051 retirement note in
-            // `format_completion_wake`. Wording owned by the harness (H6).
+            // "completed" — a report is not necessarily a completion. Passing
+            // false omits the terminal retirement/re-arm suffix.
             let wake_text = crate::harness::latest().report_to_parent_wake(
                 &session.name,
                 &caller.0,
                 &report_text,
-                marked,
+                false,
             );
             // Build event notification metadata (mirroring deliver_completion_to_watches).
             let mut metadata = json!({
@@ -6509,82 +6493,22 @@ impl Services {
                     }
                 }]
             });
-            // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
-            // the reporting child's linked task-note id plus its recorded
-            // flipped completions (consumed here — this report wake is the
-            // completion cycle's one wake, since it disarms the idle-time
-            // delivery) so the delivery path can compute the "tasks now
-            // unblocked" section fresh at render time. Only the triggering
-            // facts are stored here.
-            let mut trigger_tasks: Vec<(String, String)> = Vec::new();
-            if let Some(note_id) = &task_note_id {
-                trigger_tasks.push((workspace_id.0.clone(), note_id.0.clone()));
-            }
-            for pair in self.take_flipped_completion_triggers(&caller).await {
-                if !trigger_tasks.contains(&pair) {
-                    trigger_tasks.push(pair);
-                }
-            }
-            ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
-            // Machine-readable disarm flag (monorepo#2060 parity, the
-            // `hookStillActive` twin): present iff this call flipped a watch;
-            // omitted entirely when nothing was disarmed.
-            if marked {
-                metadata["watchStillArmed"] = json!(false);
+            // Progress does not consume completion trigger facts. They remain
+            // available for the terminal wake that retires the watch.
+            if watch_still_armed {
+                metadata["watchStillArmed"] = json!(true);
             }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
-            match self
+            if let Err(e) = self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
                 .await
             {
-                Ok(_) => {
-                    // monorepo#2889: the parent just heard THIS report cycle —
-                    // record its identity (the report timestamp, the same
-                    // #2842 identity) in the per-pair delivery marker so the
-                    // same cycle's completion wake cannot re-embed the report
-                    // body. The `report_delivered` watch flag alone does not
-                    // survive the cycle: every re-arm path (agent.watch
-                    // adoption, SUB-1 sender auto-subscribe, watch reuse)
-                    // clears it as fresh interest (monorepo#2532), and a
-                    // parent with NO watch at report time still receives this
-                    // wake. The marker skip in
-                    // `deliver_completion_to_watches` leaves the watch ARMED,
-                    // so a re-armed watch still fires on a FUTURE cycle (new
-                    // timestamp). Grouped children never reach here (their
-                    // report defers to the aggregated wake), and a failed
-                    // send records nothing (the parent never heard the
-                    // report, so the completion wake must still carry it).
-                    // Best-effort: a write failure only restores the pre-fix
-                    // duplicate for this cycle.
-                    if let Err(e) = self
-                        .store
-                        .record_completion_wake_delivery(&parent, &caller, &saved_at, &now_iso())
-                        .await
-                    {
-                        tracing::warn!(
-                            parent = %parent.0,
-                            child = %caller.0,
-                            error = %e,
-                            "completion wake dedup record failed at reportToParent delivery"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        parent = %parent.0,
-                        child = %caller.0,
-                        "failed to deliver reportToParent wake to parent"
-                    );
-                }
-            }
-            // Marking flips the parent's waiting projection (report_delivered
-            // watches are excluded), so publish the refreshed flags in the
-            // parent's HOME workspace — the watch anchor — to keep connected
-            // clients from serving a stale `isWaitingForOtherAgents: true`.
-            if marked {
-                self.publish_subscriptions_changed(&parent_home_ws, &parent)
-                    .await;
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver reportToParent progress wake to parent"
+                );
             }
         }
 
@@ -11327,8 +11251,47 @@ impl Services {
         interrupt: bool,
         user_origin: bool,
     ) -> (QueuedMessage, usize) {
+        self.enqueue_message_with_id_and_origin(
+            agent_id,
+            None,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            user_origin,
+        )
+    }
+
+    /// Queue a message under a caller-selected durable id. Completion-watch
+    /// delivery uses this so a restart retry adopts the already-persisted queue
+    /// entry instead of creating a duplicate terminal wake.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_message_with_id_and_origin(
+        &self,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        user_origin: bool,
+    ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
-        let id = new_message_id();
+        let id = message_id.unwrap_or_else(new_message_id);
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.entry(agent_id.clone()).or_default();
+        if let Some((position, existing)) =
+            queue.iter().enumerate().find(|(_, queued)| queued.id == id)
+        {
+            return (existing.clone(), position);
+        }
         let queued = QueuedMessage {
             turn_id: id.clone(),
             id,
@@ -11346,11 +11309,6 @@ impl Services {
             interrupt_priority: interrupt,
             user_origin,
         };
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard.entry(agent_id.clone()).or_default();
         let position = if interrupt {
             // Behind earlier interrupts, ahead of every normal entry.
             let idx = queue.iter().take_while(|m| m.interrupt_priority).count();
