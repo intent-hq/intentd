@@ -144,24 +144,6 @@ fn claim_all(_: &AgentId) -> bool {
 fn release_none(_: &AgentId) {}
 
 #[test]
-fn title_case_ascii_capitalizes_first_char() {
-    assert_eq!(super::title_case_ascii("bearer"), "Bearer");
-    assert_eq!(super::title_case_ascii("basic"), "Basic");
-    assert_eq!(super::title_case_ascii("foo"), "Foo");
-    assert_eq!(super::title_case_ascii("a"), "A");
-}
-
-#[test]
-fn title_case_ascii_empty_string_returns_empty() {
-    assert_eq!(super::title_case_ascii(""), "");
-}
-
-#[test]
-fn title_case_ascii_already_capitalized_unchanged() {
-    assert_eq!(super::title_case_ascii("Bearer"), "Bearer");
-}
-
-#[test]
 fn compute_process_cap_reserves_8gb_and_budgets_1gb_per_agent() {
     assert_eq!(compute_process_cap(8 * super::GB), 4);
     assert_eq!(compute_process_cap(16 * super::GB), 8);
@@ -12940,6 +12922,81 @@ mod merge_user_mcp_servers_tests {
             }
             other => panic!("expected http, got {other:?}"),
         }
+    }
+
+    /// The reshape path builds its header via the shared
+    /// `McpOauthService::authorization_header`, so an expired bag carrying
+    /// refresh metadata is refreshed before the header is injected.
+    #[tokio::test]
+    async fn reshape_refreshes_expired_oauth_bag_via_shared_service() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"access_token":"refreshed-tok","expires_in":3600}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
+        // Server id unique to this test: refresh single-flight/cooldown state
+        // lives in process-wide statics keyed by server id.
+        let server_id = "srv-reshape-refresh";
+        write_servers(
+            &secrets,
+            &json!({
+                "srv-reshape-refresh": {
+                    "id": server_id, "name": "reshape-refresh", "transport": "http",
+                    "url": "https://example.test/mcp", "enabled": true
+                }
+            }),
+        );
+        let expired = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 100;
+        mgr.services
+            .store
+            .set_mcp_oauth_token(
+                server_id,
+                &serde_json::to_string(&json!({
+                    "access_token": "stale-tok",
+                    "token_type": "bearer",
+                    "expires_at": expired,
+                    "refresh_token": "rt-1",
+                    "token_endpoint": format!("http://{addr}/token"),
+                    "client_id": "cid-1",
+                }))
+                .unwrap(),
+                "2026-07-05T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        let mut out = NormalizedMcpServers::new();
+        mgr.merge_user_mcp_servers(&mut out).await.unwrap();
+        match out.get("reshape-refresh").expect("http server merged") {
+            NormalizedMcpServer::Http { headers, .. } => {
+                let headers = headers.as_ref().expect("auth header written");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer refreshed-tok"),
+                    "expired bag refreshed through the shared service",
+                );
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+        endpoint.await.unwrap();
     }
 
     #[tokio::test]
