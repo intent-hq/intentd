@@ -71,11 +71,51 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
     ),
 ];
 
+/// The v1.1 embedded specialist bundle (`resources/specialists/v1.1/`):
+/// byte-identical copies of the v1 files (the v1→v1.1 doctrine diff is
+/// instruction-only — the feature-section rewrites in `common.md`), kept as
+/// a separate directory so each version's resources stay self-contained.
+/// The v1.1 harness doctrine (`crate::harness::v1_1::ENTRY`) points here.
+pub(crate) const EMBEDDED_BUNDLED_V1_1: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v1.1/chief-of-staff.md"),
+    ),
+    (
+        "developer",
+        include_str!("../resources/specialists/v1.1/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v1.1/implementor.md"),
+    ),
+    (
+        "pr-reviewer",
+        include_str!("../resources/specialists/v1.1/pr-reviewer.md"),
+    ),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1.1/ralph.md"),
+    ),
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v1.1/spec-writer.md"),
+    ),
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v1.1/ui-designer.md"),
+    ),
+    (
+        "verifier",
+        include_str!("../resources/specialists/v1.1/verifier.md"),
+    ),
+];
+
 /// The embedded bundled floor the specialist 3-tier resolution uses by
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1_1;
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.

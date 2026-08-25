@@ -26,6 +26,7 @@
 //! the binary ships a newer set. All past versions stay bundled.
 
 pub(crate) mod v1;
+pub(crate) mod v1_1;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -347,7 +348,7 @@ pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 /// bundled so an old session keeps resolving the doctrine it was created
 /// with. Adding a version = a `resources/**/<ver>/` directory + a module +
 /// one row here.
-static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY];
+static REGISTRY: &[&HarnessEntry] = &[&v1::ENTRY, &v1_1::ENTRY];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
 /// exists; the tail fallback is unreachable and only avoids a panic path.
@@ -390,7 +391,7 @@ mod tests {
     }
 
     /// The registry keys on the exact version string sessions are stamped
-    /// with (intent-core's `CURRENT_HARNESS_VERSION`, "1.0"): the stamp and
+    /// with (intent-core's `CURRENT_HARNESS_VERSION`, "1.1"): the stamp and
     /// the resolved harness can never drift.
     #[test]
     fn registry_resolves_stamped_current_version() {
@@ -400,6 +401,48 @@ mod tests {
             data_ptr(resolve_entry(intent_core::CURRENT_HARNESS_VERSION).harness),
             data_ptr(&v1::V1)
         ));
+    }
+
+    /// A "1.0"-stamped session keeps resolving the v1 row (its original
+    /// doctrine), and the v1↔v1.1 rows share text surfaces but differ in
+    /// doctrine exactly where the rewrites landed.
+    #[test]
+    fn registry_pins_v1_sessions_to_v1_doctrine() {
+        let v1_entry = resolve_entry("1.0");
+        assert_eq!(v1_entry.version, "1.0");
+        assert!(std::ptr::eq(
+            v1_entry.doctrine.instructions,
+            std::ptr::addr_of!(crate::instructions::V1)
+        ));
+        let v1_1_entry = resolve_entry("1.1");
+        assert_eq!(v1_1_entry.version, "1.1");
+        assert!(std::ptr::eq(
+            v1_1_entry.doctrine.instructions,
+            std::ptr::addr_of!(crate::instructions::V1_1)
+        ));
+        // Same Harness singleton (text surfaces unchanged) …
+        assert!(std::ptr::eq(
+            data_ptr(v1_entry.harness),
+            data_ptr(v1_1_entry.harness)
+        ));
+        // … different common.md (the rewrites), identical specialist bytes.
+        assert_ne!(
+            v1_entry.doctrine.instructions.common,
+            v1_1_entry.doctrine.instructions.common
+        );
+        assert_eq!(
+            v1_entry.doctrine.specialists.len(),
+            v1_1_entry.doctrine.specialists.len()
+        );
+        for ((id_a, body_a), (id_b, body_b)) in v1_entry
+            .doctrine
+            .specialists
+            .iter()
+            .zip(v1_1_entry.doctrine.specialists.iter())
+        {
+            assert_eq!(id_a, id_b);
+            assert_eq!(body_a, body_b, "specialist {id_a} diverged");
+        }
     }
 
     #[test]
