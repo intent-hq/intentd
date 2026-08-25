@@ -114,6 +114,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
     "agentFeatures.taskGraph",
+    "agentFeatures.unreadSummaries",
+    "agentFeatures.unreadSummarizeThreshold",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
 ];
