@@ -4269,19 +4269,24 @@ impl AgentManager {
         // drain and `mark_idle` below then no-op (handle removed, registry
         // deregistered), same as the wedged-transport kill; idempotent when
         // the wedged arm already tore the child down.
-        let provider_kills_on_interrupt = session
-            .as_ref()
-            .and_then(|s| {
-                session_provider_id(
-                    s,
-                    crate::agent_session::derived_default_provider(
-                        &self.services.effective_settings(),
-                    )
+        let session_provider = session.as_ref().and_then(|s| {
+            session_provider_id(
+                s,
+                crate::agent_session::derived_default_provider(&self.services.effective_settings())
                     .as_deref(),
-                )
-            })
-            .and_then(|id| intent_providers::find_provider(&id))
-            .is_some_and(|p| p.kills_child_on_interrupt);
+            )
+        });
+        let provider_kills_on_interrupt = session_provider
+            .as_deref()
+            .and_then(intent_providers::find_provider)
+            .is_some_and(|p| p.kills_child_on_interrupt)
+            // `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock provider the
+            // quirk (auggie-like) so the E2E suite can exercise this teardown
+            // fence against the real daemon — the quirk lookup is static, so
+            // the seam lives here rather than in the spawn resolution's
+            // MOCK_AGENT_* overrides.
+            || (session_provider.as_deref() == Some("mock")
+                && std::env::var("MOCK_AGENT_KILLS_ON_INTERRUPT").is_ok_and(|v| v == "1"));
         if provider_kills_on_interrupt {
             tracing::info!(
                 agent = %agent_id,
