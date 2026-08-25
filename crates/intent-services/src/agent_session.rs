@@ -2388,17 +2388,8 @@ impl Services {
                     maybe = notifications.recv(), if !closed => match maybe {
                         Some(note) => {
                             activity.touch();
-                            if stall_emitted {
-                                stall_emitted = false;
-                                self.publish_status_event(
-                                    workspace_id,
-                                    agent_id,
-                                    "resumed",
-                                    "Stream activity resumed",
-                                    "info",
-                                )
+                            self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
                                 .await;
-                            }
                             any_update_received = true;
                             updates_applied |= self
                                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2431,6 +2422,8 @@ impl Services {
             if attempt_result.is_err() {
                 while let Ok(note) = notifications.try_recv() {
                     activity.touch();
+                    self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                        .await;
                     any_update_received = true;
                     updates_applied |= self
                         .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2465,6 +2458,8 @@ impl Services {
                     // this attempt's error instead of retrying.
                     while let Ok(note) = notifications.try_recv() {
                         activity.touch();
+                        self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                            .await;
                         any_update_received = true;
                         updates_applied |= self
                             .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -2492,6 +2487,8 @@ impl Services {
         // carrying a long tail it never had.
         while let Ok(note) = notifications.try_recv() {
             activity.touch();
+            self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                .await;
             any_update_received = true;
             updates_applied |= self
                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
@@ -4138,6 +4135,33 @@ impl Services {
             }),
         )
         .await;
+    }
+
+    /// Clear an emitted mid-turn stall on stream activity
+    /// (intent-hq/monorepo#3402): when a `stalled` status is outstanding,
+    /// publish the paired `resumed` `agent:stream:status` and re-arm the
+    /// detector. Called from EVERY point `run_prompt_turn` observes a
+    /// `session/update` — the select-loop arm AND the buffered `try_recv`
+    /// drains (`prompt_fut` can win the `select!` with notes still queued;
+    /// without this, a stalled turn that resolves with buffered activity
+    /// would end on `stalled` → `stream:end` with no `resumed` between).
+    async fn clear_stream_stall(
+        &self,
+        stall_emitted: &mut bool,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        if *stall_emitted {
+            *stall_emitted = false;
+            self.publish_status_event(
+                workspace_id,
+                agent_id,
+                "resumed",
+                "Stream activity resumed",
+                "info",
+            )
+            .await;
+        }
     }
 
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).

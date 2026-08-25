@@ -4990,6 +4990,166 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
     );
 }
 
+/// Mock agent for the drained-`resumed` regression below: `session/prompt`
+/// goes SILENT (stall fires) until `release_error` fires, then resolves the
+/// prompt with a transient-classified JSON-RPC error, waits 100ms (long
+/// enough for the daemon to settle into its retry backoff, far shorter than
+/// the 1s backoff), and only THEN streams `update` — so the note is
+/// guaranteed to be picked up by a buffered `try_recv` drain, never by the
+/// select-loop arm.
+fn spawn_stall_then_error_then_update_mock_agent<R, W>(
+    read: R,
+    write: W,
+    update: String,
+    release_error: tokio::sync::oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        let mut release = Some(release_error);
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                if let Some(release_error) = release.take() {
+                    let _ = release_error.await;
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32603, "message": FETCH_EPIPE_UNAVAILABLE },
+                    });
+                    write
+                        .write_all(format!("{resp}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    write
+                        .write_all(format!("{update}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// Regression (PR #1462 review): `resumed` must be emitted even when the
+/// stalled turn's next `session/update` is observed by a buffered `try_recv`
+/// drain instead of the select-loop arm. Deterministic drain-path shape: the
+/// stall fires, the attempt then fails with a transient-classified error
+/// (arming the monorepo#3007 retry backoff with nothing buffered), and the
+/// update lands mid-backoff — the post-backoff drain must clear the stall and
+/// publish `resumed` before the turn settles, so subscribers never see
+/// `stalled` as the turn's last word despite stream activity.
+#[tokio::test]
+async fn buffered_update_drained_after_stall_still_emits_resumed() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "1000"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "buffered while backing off" } }
+        }
+    })
+    .to_string();
+    let (release_error_tx, release_error_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let _agent = spawn_stall_then_error_then_update_mock_agent(
+        c2a_agent,
+        a2c_agent,
+        chunk,
+        release_error_rx,
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-stall-drain"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    // The silent window crosses the 50ms threshold → one stalled status.
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    // Fail the attempt: transient error now, update 100ms into the 1s
+    // backoff. The update flips any_update_received in the backoff drain,
+    // abandoning the retry, so the turn settles with the attempt's error.
+    release_error_tx.send(()).expect("mock alive");
+    timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("turn settles")
+        .expect("worker task")
+        .expect_err("abandoned retry surfaces the attempt's error");
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt", "stalled", "resumed"],
+        "the drained buffered update still clears the stall with a resumed"
+    );
+}
+
 /// A turn whose silences never reach the stall threshold emits NO
 /// stalled/resumed statuses — the only `agent:stream:status` is the
 /// turn-startup "prompt" hint.
