@@ -17743,15 +17743,25 @@ impl WorkspaceApi for Services {
             // never regresses from Ok(_) to Err on transient conditions the
             // caller cannot act on — e.g. the check-then-insert race between
             // concurrent list callers (whichever loses the insert would trip
-            // the unique constraint). Log-warn and fall through to
-            // `store.list_notes`, which returns the freshly-seeded row when
-            // the winning insert already committed, or the pre-existing
-            // empty/other shape when the reseed genuinely could not run.
+            // the unique constraint) — except when the failure was itself
+            // caused by the workspace vanishing mid-reseed (see the re-check
+            // below). Log-warn and fall through to `store.list_notes`, which
+            // returns the freshly-seeded row when the winning insert already
+            // committed, or the pre-existing empty/other shape when the
+            // reseed genuinely could not run.
             if !id.is_chief() {
                 if let Err(e) = ensure_spec_note(&store, bus.as_ref(), &id).await {
                     if matches!(e, Error::NotFound(_)) {
                         return Err(e);
                     }
+                    // The pre-write existence check races a concurrent
+                    // `workspace.delete`: the row can vanish between that
+                    // SELECT and the reseed INSERT, surfacing as an FK
+                    // violation (`Internal`) rather than `NotFound`. Re-check
+                    // the row so that window still maps to
+                    // workspace-not-found instead of a best-effort empty
+                    // list (monorepo#3404 review).
+                    store.get_workspace(&id).await?;
                     tracing::warn!(
                         workspace_id = %id.0,
                         error = %e,
