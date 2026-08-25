@@ -702,7 +702,7 @@ async fn tunnel_connect_timeout_answers_open_err() {
     srv.ws.stop().await;
 }
 
-/// A `DATA` message over the 1 MiB inbound cap closes the connection with
+/// A `DATA` message over the inbound message cap closes the connection with
 /// `1009 Message Too Big`, and an over-limit single frame still terminates
 /// the connection.
 #[tokio::test]
@@ -713,7 +713,9 @@ async fn tunnel_oversize_data_closes_with_1009() {
     let srv = start().await;
     let echo_port = spawn_echo_listener().await;
 
-    // Over-limit fragmented `DATA` on a live stream: the first fragment sits
+    // Over-limit fragmented `DATA` on a live stream (the WS-level cap fires
+    // before frame decode, so the open stream isn't required — it's kept for
+    // the realistic live-stream shape): the first fragment sits
     // exactly at the cap (legal on its own), the continuation pushes the
     // accumulated size past it, surfacing tungstenite's message-capacity
     // error only after the client has finished writing — so the 1009 close
