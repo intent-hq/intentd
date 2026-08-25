@@ -125,7 +125,9 @@ fn registry_field_parity() {
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");
-    // Un-gated (monorepo#1902): cortex carries no feature code.
+    // Hidden by default: cortex gates on INTENTD_ENABLE_CORTEX (env-var
+    // escape hatch — a feature code would be unconditionally gated).
+    assert_eq!(cortex.requires_env_var, Some("INTENTD_ENABLE_CORTEX"));
     assert_eq!(cortex.requires_feature_code, None);
 
     let oc = find_provider("opencode").unwrap();
@@ -161,6 +163,9 @@ fn registry_field_parity() {
     assert_eq!(droid.model_flag, Some("--model"));
     assert!(droid.supports_rules_file);
     assert_eq!(droid.rules_flag, Some("--append-system-prompt-file"));
+    // Hidden by default: droid gates on INTENTD_ENABLE_DROID.
+    assert_eq!(droid.requires_env_var, Some("INTENTD_ENABLE_DROID"));
+    assert_eq!(droid.requires_feature_code, None);
 
     let grok = find_provider("grok").unwrap();
     assert_eq!(grok.display_name, "Grok Build");
@@ -204,6 +209,29 @@ fn registry_field_parity() {
     assert_eq!(unsloth.auth_check_args, None);
     assert_eq!(unsloth.npx_only_package, None);
     assert_eq!(unsloth.fallback_npx_package, None);
+}
+
+/// cortex and droid are hidden by default: gated off when their enable env
+/// vars are absent, un-gated when set. Both sides exercised via the
+/// injectable env probe — never by mutating the process environment.
+#[test]
+fn cortex_and_droid_gate_on_enable_env_vars() {
+    for (id, var) in [
+        ("cortex", "INTENTD_ENABLE_CORTEX"),
+        ("droid", "INTENTD_ENABLE_DROID"),
+    ] {
+        let cfg = find_provider(id).unwrap();
+        let reason = gated_reason_with_env(cfg, &|_| false).expect("gated when env var unset");
+        assert!(
+            reason.contains(var),
+            "{id} gate names its env var: {reason}"
+        );
+        assert_eq!(
+            gated_reason_with_env(cfg, &|v| v == var),
+            None,
+            "{id} is un-gated when {var} is set"
+        );
+    }
 }
 
 /// Exactly claude-code, codex, droid, and grok consume MCP servers from the

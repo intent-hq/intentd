@@ -135,7 +135,7 @@ pub fn resolve_on_path(command: &str) -> Option<PathBuf> {
 /// Why a provider is gated off, or `None` when it is eligible for probing.
 /// This is the single source of the env-var/feature-code gate shared by
 /// discovery (`gatedOff`), `providers.catalog` (`visible`), and the
-/// `models.list` cortex source.
+/// `models.list` cortex/droid sources.
 #[must_use]
 pub fn gated_reason(provider: &ProviderConfig) -> Option<String> {
     gated_reason_with_env(provider, &|var| std::env::var_os(var).is_some())
