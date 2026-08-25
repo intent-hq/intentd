@@ -836,8 +836,11 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
 /// the silence live instead of an indefinite spinner. 90s sits well below the
 /// #2669 silent-tail suspicion window and far below the 30-minute prompt idle
 /// timeout, which remains the only terminal mechanism — the stall event never
-/// cancels or fails the turn. Overridable via `INTENTD_STREAM_STALL_MS`
-/// (test seam).
+/// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
+/// while ≥1 recorded tool call is still open the stalled advisory is fully
+/// suppressed regardless of silence duration — long tool runs are expected
+/// silence — with the 30-minute prompt idle timeout as the backstop for hung
+/// tools. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
 pub(crate) fn stream_stall_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
