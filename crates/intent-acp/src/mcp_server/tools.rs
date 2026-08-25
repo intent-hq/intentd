@@ -2317,8 +2317,7 @@ mod tests {
         for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
             assert!(desc.contains(UNREAD_THRESHOLD_NEEDLE));
         }
-        assert!(UNREAD_THRESHOLD_NEEDLE
-            .contains(&DEFAULT_UNREAD_SUMMARIZE_THRESHOLD.to_string()));
+        assert!(UNREAD_THRESHOLD_NEEDLE.contains(&DEFAULT_UNREAD_SUMMARIZE_THRESHOLD.to_string()));
     }
 
     // A non-default `unreadSummarizeThreshold` rewrites the `ws.chat.unread`

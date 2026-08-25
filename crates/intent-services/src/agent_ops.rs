@@ -5811,9 +5811,7 @@ impl Services {
         let from_message_id = collected
             .first()
             .map_or(Value::Null, |(id, _, _)| json!(id));
-        let to_message_id = collected
-            .last()
-            .map_or(Value::Null, |(id, _, _)| json!(id));
+        let to_message_id = collected.last().map_or(Value::Null, |(id, _, _)| json!(id));
         let items: Vec<Value> = collected
             .into_iter()
             .take(UNREAD_DIGEST_MAX_ITEMS)

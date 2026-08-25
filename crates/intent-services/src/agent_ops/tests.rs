@@ -26065,7 +26065,10 @@ async fn chat_unread_truncates_items_and_heads() {
     let items = digest["items"].as_array().expect("items");
     assert_eq!(items.len(), 100);
     assert_eq!(items[0]["id"], json!(first.id));
-    assert_eq!(items[0]["head"].as_str().expect("head").chars().count(), 100);
+    assert_eq!(
+        items[0]["head"].as_str().expect("head").chars().count(),
+        100
+    );
 }
 
 /// Fails closed like `agent.markSeen`: unknown agent and workspace mismatch
