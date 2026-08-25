@@ -6449,6 +6449,21 @@ impl AgentManager {
                 return true;
             }
         }
+        // Soft-retire gate: a retired session is inert — a delayed
+        // `session/update` must not open an implicit harness-wake turn (the
+        // same inertness the queue-drain and retry paths enforce). Skip the
+        // tick, leaving buffered notifications untouched: `agent.restore`
+        // returns the session to service and a later tick consumes them.
+        // Checked after the peek so idle agents cost no store read, and
+        // fail-open on a lookup error like the queue-drain gate.
+        if let Ok(Some(_)) = self
+            .services
+            .store
+            .get_agent_session_retired_at(agent_id)
+            .await
+        {
+            return true;
+        }
         // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
         // append a fresh assistant message, burying the pending Q&A the hold
         // protects. Skip the tick (buffered notifications stay untouched)

@@ -728,6 +728,12 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
      ws.agent.requestDiscussion when you need user/coordinator input, or report \
      progress with ws.agent.reportToParent";
 
+/// The dispatch-layer denial for a sub-agent's `agent.spawnPeer` frame —
+/// spawning independent top-level peers is a top-level-agent capability.
+pub(super) const SUB_AGENT_SPAWN_PEER_DENIED: &str =
+    "ws.agent.spawnPeer is only available to top-level agents — use \
+     ws.agent.create or ws.agent.delegate to start sub-agents instead";
+
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
@@ -751,6 +757,12 @@ async fn workspace_host_dispatch(
     // a misleading "disabled in settings").
     if is_sub_agent && method.starts_with("app.question.") {
         return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
+    }
+    // Top-level-only rule for peer spawning: like the question gate, this
+    // redirect must win over the feature-gate denial so a sub-agent gets
+    // the actionable message rather than a settings complaint.
+    if is_sub_agent && method == "agent.spawnPeer" {
+        return Err(format!("host: {SUB_AGENT_SPAWN_PEER_DENIED}"));
     }
     if let Some(feature) = super::tools::denied_feature(agent_features, method) {
         return Err(format!(
