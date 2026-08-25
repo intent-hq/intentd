@@ -883,6 +883,11 @@ pub struct AgentFeaturesSettings {
     /// (`ws.agent.spawnPeer`) to agents. Defaults **off** (opt-in), unlike
     /// the other toggles.
     pub peer_agents: bool,
+    /// `agentFeatures.mcpTools` — expose the user's external MCP servers'
+    /// tools to agents (`ws.mcp.*`). Unlike the prompt-gating toggles, this
+    /// is also enforced server-side on every forwarded call, reading the
+    /// live setting.
+    pub mcp_tools: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -900,6 +905,7 @@ impl Default for AgentFeaturesSettings {
             pr_monitor: true,
             task_graph: true,
             peer_agents: false,
+            mcp_tools: true,
         }
     }
 }

@@ -12285,6 +12285,32 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn mcp_list_servers(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.mcp_servers_service().agent_list_servers().await })
+    }
+
+    fn mcp_list_tools(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.mcp_servers_service()
+                .agent_list_tools(&server_id)
+                .await
+        })
+    }
+
+    fn mcp_call_tool(
+        &self,
+        server_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.mcp_servers_service()
+                .agent_call_tool(&server_id, &tool_name, args, timeout_ms)
+                .await
+        })
+    }
+
     fn search_in_files(
         &self,
         workspace_id: WorkspaceId,
