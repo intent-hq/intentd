@@ -800,13 +800,14 @@ pub(crate) const NAMESPACE_INDEX_HEADER: &str =
     "Namespaces (index — full signatures in API below):";
 
 /// The header [`compact_workspace_api_description`] swaps in: same index, but
-/// the full signatures live in the system prompt (under
+/// the signatures + one-line summaries live in the system prompt (under
 /// [`WORKSPACE_API_SYSTEM_PROMPT_HEADING`]) rather than below, with
-/// `ws.help()` as the in-tool fallback.
-pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — full docs: \"Workspace API Reference\" in your system prompt, or ws.help()):";
+/// `ws.help()` as the full-docs fallback.
+pub(crate) const NAMESPACE_INDEX_HEADER_COMPACT: &str = "Namespaces (index — condensed: system-prompt \"Workspace API Reference\"; full docs: ws.help()):";
 
-/// Heading of the system-prompt section that carries the full `ws.*` API
-/// reference for providers whose client truncates long MCP tool descriptions
+/// Heading of the system-prompt section that carries the condensed `ws.*` API
+/// reference (signatures + one-line summaries) for providers whose client
+/// truncates long MCP tool descriptions
 /// (`ProviderConfig::truncates_tool_descriptions`). The compact description's
 /// index header points at this section by name, so the two must not drift.
 pub const WORKSPACE_API_SYSTEM_PROMPT_HEADING: &str = "# Workspace API Reference";
@@ -1661,6 +1662,17 @@ mod tests {
             "compact index header must name the `{section_name}` system-prompt section"
         );
         assert!(NAMESPACE_INDEX_HEADER_COMPACT.contains("ws.help()"));
+        // The system-prompt section carries the condensed rendering, so the
+        // header must not advertise it as "full docs" — that label belongs to
+        // ws.help() alone.
+        assert!(
+            NAMESPACE_INDEX_HEADER_COMPACT.contains("condensed:"),
+            "compact index header must describe the system-prompt section as condensed"
+        );
+        assert!(
+            NAMESPACE_INDEX_HEADER_COMPACT.contains("full docs: ws.help()"),
+            "compact index header must reserve the full-docs label for ws.help()"
+        );
     }
 
     // ---- condensed description (system-prompt reference) tests -------------

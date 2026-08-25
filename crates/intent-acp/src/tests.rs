@@ -5878,7 +5878,7 @@ mod workspace_api_tool_tests {
             "feature pruning must still apply to the compact description"
         );
         assert!(
-            compact.contains("system prompt"),
+            compact.contains("system-prompt \"Workspace API Reference\""),
             "compact description must point at the system-prompt reference"
         );
 
