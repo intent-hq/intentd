@@ -9258,24 +9258,91 @@ mod change_event_parity {
         assert_eq!(ev["data"]["noteId"], "spec");
     }
 
-    /// A `note.list` for a workspace id that has no matching workspace row
-    /// must not regress from `Ok([])` to `Err`: the reseed attempt trips the
-    /// `note.workspace_id → workspace.id` FK, but the failure is swallowed
-    /// (best-effort self-heal) and the empty listing is returned unchanged.
-    /// No `note:created` fires.
+    /// Regression guard for monorepo#3404: a `note.list` for a workspace id
+    /// that has no matching workspace row returns `NotFound("workspace …")` —
+    /// the spec reseed verifies the workspace exists before any INSERT, so no
+    /// raw `note.workspace_id → workspace.id` FK violation occurs and no
+    /// `note:created` fires.
     #[tokio::test]
-    async fn note_list_tolerates_reseed_failure_for_unknown_workspace() {
+    async fn note_list_returns_workspace_not_found_for_unknown_workspace() {
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
         let unknown = intent_core::WorkspaceId::new();
 
-        let notes = h.services.list_notes(&unknown).await.expect("list");
-        assert!(notes.is_empty());
+        let err = h
+            .services
+            .list_notes(&unknown)
+            .await
+            .expect_err("unknown workspace must error");
+        match err {
+            intent_core::Error::NotFound(msg) => {
+                assert!(
+                    msg.contains("workspace"),
+                    "not-found must name the workspace, got: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got: {other:?}"),
+        }
 
         let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(
             none.is_err(),
             "unknown-workspace list must not publish a reseed event"
+        );
+    }
+
+    /// Regression guard for monorepo#3404 (deletion shape): after a workspace
+    /// row is deleted, `note.list` with the stale id returns
+    /// `NotFound("workspace …")` instead of attempting the spec reseed INSERT
+    /// against the gone FK target. No `note:created` fires.
+    #[tokio::test]
+    async fn note_list_returns_workspace_not_found_after_workspace_deletion() {
+        use intent_core::{NoteId, WorkspaceCreate};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Doomed".to_string()),
+                    branch: Some("feat/doomed-list".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let _ = recv_one(&mut sub).await; // workspace:created
+        let _ = recv_one(&mut sub).await; // note:created (initial seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
+
+        // Drop the spec first so the reseed path (not the spec-exists fast
+        // path) is what the stale list exercises, then delete the workspace
+        // row itself. Store-level deletes publish nothing.
+        h.store
+            .delete_note(&created.id, &NoteId::from("spec"))
+            .await
+            .expect("delete spec");
+        h.store
+            .delete_workspace(&created.id)
+            .await
+            .expect("delete workspace");
+
+        let err = h
+            .services
+            .list_notes(&created.id)
+            .await
+            .expect_err("deleted workspace must error");
+        assert!(
+            matches!(&err, intent_core::Error::NotFound(msg) if msg.contains("workspace")),
+            "expected workspace NotFound, got: {err:?}"
+        );
+
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(
+            none.is_err(),
+            "deleted-workspace list must not publish a reseed event"
         );
     }
 
