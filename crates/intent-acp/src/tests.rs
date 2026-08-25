@@ -5852,8 +5852,10 @@ mod workspace_api_tool_tests {
         // A bridge flagged for a truncating provider serves the compact
         // `workspace_api` description (whole text under the ~2k cutoff, no
         // API sections), while `full_workspace_api_description()` returns
-        // exactly what the unflagged bridge's tools/list serves — the text
-        // the spawn path appends to the system prompt.
+        // exactly what the unflagged bridge's tools/list serves, and
+        // `condensed_workspace_api_description()` — the text the spawn path
+        // appends to the system prompt — matches the tools module rendering
+        // for the same gating.
         let compact_srv = server("amber-forest", None)
             .with_agent_features(no_hooks_features())
             .with_compact_tool_descriptions(true);
@@ -5876,7 +5878,7 @@ mod workspace_api_tool_tests {
             "feature pruning must still apply to the compact description"
         );
         assert!(
-            compact.contains("system prompt"),
+            compact.contains("system-prompt \"Workspace API Reference\""),
             "compact description must point at the system-prompt reference"
         );
 
@@ -5890,6 +5892,24 @@ mod workspace_api_tool_tests {
             compact_srv.full_workspace_api_description(),
             full,
             "full_workspace_api_description must match the unflagged tools/list text"
+        );
+
+        // The bridge-level condensed rendering (what the spawn path appends
+        // to the system prompt) applies this bridge's gating: derived from
+        // the same assembly, so the pruned namespace stays absent and the
+        // text is well under the full reference's size.
+        let condensed = compact_srv.condensed_workspace_api_description();
+        assert!(
+            !condensed.contains("ws.hook."),
+            "feature pruning must apply to the condensed system-prompt reference"
+        );
+        assert!(
+            condensed.len() < full.len(),
+            "condensed reference must be smaller than the full text"
+        );
+        assert!(
+            condensed.contains("\nAPI:"),
+            "condensed reference must keep the API section"
         );
     }
 

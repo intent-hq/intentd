@@ -2634,18 +2634,20 @@ impl AgentManager {
             // directive, matching the reference `isSubAgent` derivation.
             // Fetch workspace for mode-dependent prompt hints (Task 6).
             let workspace = self.services.store.get_workspace(&workspace_id).await.ok();
-            // Truncating providers get the full `workspace_api` reference in
-            // the prompt (this bridge's exact per-agent assembly — gating,
-            // chief-ness, and model options identical to what a non-flagged
-            // provider's tools/list would serve). Invariant: truncating
-            // providers must go through this `rules_file.is_none()` branch —
-            // the bridge serves the compact description unconditionally, so a
-            // caller-supplied rules file would leave its "Workspace API
-            // Reference" pointer dangling (ws.help() as the only fallback).
+            // Truncating providers get the condensed `workspace_api`
+            // reference in the prompt (this bridge's exact per-agent assembly
+            // — gating, chief-ness, and model options as a non-flagged
+            // provider's tools/list — with method summaries cut at the first
+            // sentence; full docs stay reachable via ws.help()). Invariant:
+            // truncating providers must go through this `rules_file.is_none()`
+            // branch — the bridge serves the compact description
+            // unconditionally, so a caller-supplied rules file would leave
+            // its "Workspace API Reference" pointer dangling (ws.help() as
+            // the only fallback).
             let workspace_api_docs = opts
                 .provider
                 .truncates_tool_descriptions
-                .then(|| server.full_workspace_api_description());
+                .then(|| server.condensed_workspace_api_description());
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
