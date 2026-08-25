@@ -41,6 +41,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for a single health `ping`.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default timeout for a forwarded `tools/list` / `tools/call`.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on a caller-supplied tool-call timeout, kept below the 60s hook
+/// budget so a forwarded call always resolves within one hook run.
+const TOOL_TIMEOUT_CAP: Duration = Duration::from_secs(55);
 /// `Accept` header required by MCP streamable HTTP (the server may answer a
 /// POST with either a plain JSON body or an SSE stream).
 const HTTP_ACCEPT: &str = "application/json, text/event-stream";
@@ -229,6 +234,17 @@ async fn write_configs(secrets: &AsyncSecretStore, map: &Map<String, Value>) -> 
     let raw = serde_json::to_string(&Value::Object(map.clone()))
         .map_err(|e| Error::Internal(format!("encode mcp.servers failed: {e}")))?;
     secrets.store(SETTING_KEY, &raw).await
+}
+
+/// Resolved forwarding target for one tool request against a tracked server.
+enum ToolTarget {
+    /// Forward over the live stdio [`Connection`].
+    Stdio(Arc<Connection>),
+    /// Forward over a stateless streamable-HTTP session.
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 /// Transport-specific runtime half of a tracked server entry.
@@ -528,6 +544,98 @@ impl McpHub {
         };
         for mut rs in victims {
             reap(&mut rs).await;
+        }
+    }
+
+    // -- tool forwarding (tools/list + tools/call) --------------------------
+
+    /// Resolve the forwarding target for a tracked server: the live stdio
+    /// [`Connection`], or the url + headers of an `http` endpoint. Untracked
+    /// ids are `NotFound`; `sse` servers don't support tool calls (the daemon
+    /// only holds a reachability probe for them, never a live session).
+    fn tool_target(&self, server_id: &str) -> Result<ToolTarget> {
+        let map = self.inner.servers.lock().unwrap();
+        let rs = map
+            .get(server_id)
+            .ok_or_else(|| Error::NotFound(format!("mcp server {server_id} is not running")))?;
+        match &rs.runtime {
+            ServerRuntime::Stdio { conn, .. } => Ok(ToolTarget::Stdio(conn.clone())),
+            ServerRuntime::Remote => {
+                let transport = rs
+                    .config
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .unwrap_or("http");
+                if transport == "sse" {
+                    return Err(Error::Unsupported(
+                        "tool calls not supported over sse".to_string(),
+                    ));
+                }
+                let url = rs
+                    .config
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        Error::InvalidParams(format!("{transport} server requires a url"))
+                    })?
+                    .to_string();
+                Ok(ToolTarget::Http {
+                    url,
+                    headers: config_headers(&rs.config),
+                })
+            }
+        }
+    }
+
+    /// Forward `tools/list` to a running server, returning the raw MCP result
+    /// (`{ tools: [...] }`). Bounded by [`TOOL_TIMEOUT`].
+    pub async fn list_tools(&self, server_id: &str) -> Result<Value> {
+        self.forward(server_id, "tools/list", json!({}), TOOL_TIMEOUT)
+            .await
+    }
+
+    /// Forward `tools/call` to a running server, returning the raw MCP result.
+    /// `timeout` (capped at [`TOOL_TIMEOUT_CAP`]) defaults to [`TOOL_TIMEOUT`].
+    pub async fn call_tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let timeout = timeout.unwrap_or(TOOL_TIMEOUT).min(TOOL_TIMEOUT_CAP);
+        let params = json!({ "name": tool_name, "arguments": args });
+        self.forward(server_id, "tools/call", params, timeout).await
+    }
+
+    /// Forward one tool request to the server's transport. stdio reuses the
+    /// live [`Connection`]; `http` runs a stateless streamable-HTTP session
+    /// per call (initialize → notifications/initialized → the request), the
+    /// whole session bounded by `timeout` on top of each request's own bound.
+    async fn forward(
+        &self,
+        server_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        match self.tool_target(server_id)? {
+            ToolTarget::Stdio(conn) => {
+                conn.request_timeout(method, params, timeout)
+                    .await
+                    .map_err(|e| match e {
+                        intent_acp::AcpError::Timeout(_) => {
+                            Error::Internal(format!("mcp {method} timed out"))
+                        }
+                        other => Error::Internal(format!("mcp {method} failed: {other}")),
+                    })
+            }
+            ToolTarget::Http { url, headers } => {
+                tokio::time::timeout(timeout, http_tool_session(&url, &headers, method, params))
+                    .await
+                    .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?
+            }
         }
     }
 }
@@ -861,18 +969,84 @@ async fn probe_http_handshake(
         }
         _ => None,
     };
-    // Best-effort session teardown (spec: clients SHOULD send HTTP DELETE).
-    if let Some(sid) = sid {
-        let mut req = client.delete(url).header("Mcp-Session-Id", sid);
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        if let Some(ver) = ver {
-            req = req.header("MCP-Protocol-Version", ver);
-        }
-        let _ = req.send().await;
-    }
+    delete_session(client, url, headers, sid, ver).await;
     Ok(tool_count)
+}
+
+/// Best-effort streamable-HTTP session teardown (spec: clients SHOULD send
+/// HTTP DELETE). No-op when the server issued no session id.
+async fn delete_session(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+    session: Option<&str>,
+    protocol_version: Option<&str>,
+) {
+    let Some(sid) = session else { return };
+    let mut req = client.delete(url).header("Mcp-Session-Id", sid);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(ver) = protocol_version {
+        req = req.header("MCP-Protocol-Version", ver);
+    }
+    let _ = req.send().await;
+}
+
+/// One stateless streamable-HTTP tool session: `initialize` →
+/// `notifications/initialized` → `method` (`tools/list` / `tools/call`) →
+/// best-effort session DELETE. Returns the request's JSON-RPC `result`.
+/// Mirrors [`probe_http_handshake`]'s session handling (headers injected on
+/// every request, redirects never followed, credentials never echoed in
+/// errors); the caller bounds the whole session with its own timeout.
+async fn http_tool_session(
+    url: &str,
+    headers: &[(String, String)],
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(HANDSHAKE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Error::Internal(format!("http client init failed: {e}")))?;
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_HTTP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "intentd", "version": env!("CARGO_PKG_VERSION") },
+        },
+    });
+    let resp = post_rpc(&client, url, headers, None, None, &init).await?;
+    check_http_status(resp.status())?;
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let envelope = read_rpc_response(resp, 1).await?;
+    let result = validate_rpc_result(&envelope, 1, "initialize")?;
+    let proto = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let sid = session.as_deref();
+    let ver = proto.as_deref();
+    let inited = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    let _ = post_rpc(&client, url, headers, sid, ver, &inited).await;
+    let req = json!({ "jsonrpc": "2.0", "id": 2, "method": method, "params": params });
+    let outcome = async {
+        let resp = post_rpc(&client, url, headers, sid, ver, &req).await?;
+        check_http_status(resp.status())?;
+        let envelope = read_rpc_response(resp, 2).await?;
+        validate_rpc_result(&envelope, 2, method).cloned()
+    }
+    .await;
+    delete_session(&client, url, headers, sid, ver).await;
+    outcome
 }
 
 /// Validate a JSON-RPC 2.0 response envelope: `jsonrpc: "2.0"`, matching `id`,
@@ -2464,5 +2638,315 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("timed out connecting to"));
+    }
+
+    // -- tool forwarding (tools/list + tools/call) ---------------------------
+
+    use tokio::io::AsyncBufReadExt;
+
+    /// A hub tracking a stdio server whose [`Connection`] is duplex-backed:
+    /// the test drives the server side by hand over the returned streams.
+    /// The `Child` slot is filled with a real (idle) `sleep` so the runtime
+    /// shape matches production; `kill_on_drop` reaps it.
+    fn stdio_hub_with_duplex(
+        id: &str,
+    ) -> (McpHub, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (c2s_client, c2s_server) = tokio::io::duplex(65536);
+        let (s2c_server, s2c_client) = tokio::io::duplex(65536);
+        let conn = Connection::new(c2s_client, s2c_client, None, ConnectionHooks::default());
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let h = McpHub::new();
+        let rs = RunningServer {
+            config: stdio_cfg(id, "sleep"),
+            runtime: ServerRuntime::Stdio {
+                child,
+                pid: None,
+                conn: Arc::new(conn),
+            },
+            status: status_value(id, "running", None, None, None, None),
+            failures: 0,
+        };
+        h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
+        (h, c2s_server, s2c_server)
+    }
+
+    /// A hub tracking a remote server entry without probing it.
+    fn remote_hub(id: &str, transport: &str, url: &str, headers: Value) -> McpHub {
+        let mut config = remote_cfg(id, transport, url);
+        config["headers"] = headers;
+        let h = McpHub::new();
+        let rs = RunningServer {
+            config,
+            runtime: ServerRuntime::Remote,
+            status: status_value(id, "running", None, None, None, None),
+            failures: 0,
+        };
+        h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
+        h
+    }
+
+    #[tokio::test]
+    async fn list_tools_unknown_server_is_not_found() {
+        let h = McpHub::new();
+        let err = h.list_tools("ghost").await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_unknown_server_is_not_found() {
+        let h = McpHub::new();
+        let err = h
+            .call_tool("ghost", "t", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn tool_calls_rejected_over_sse() {
+        let h = remote_hub("s", "sse", "http://127.0.0.1:1", json!({}));
+        for err in [
+            h.list_tools("s").await.unwrap_err(),
+            h.call_tool("s", "t", json!({}), None).await.unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::Unsupported(_)), "got: {err}");
+            assert!(format!("{err}").contains("not supported over sse"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_list_tools_round_trip() {
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let responder = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["method"], json!("tools/list"));
+            let id = req["id"].as_i64().unwrap();
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"echo\"}}]}}}}\n"
+            );
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let result = h.list_tools("s1").await.unwrap();
+        responder.await.unwrap();
+        assert_eq!(result["tools"][0]["name"], json!("echo"));
+    }
+
+    #[tokio::test]
+    async fn stdio_call_tool_round_trip() {
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let responder = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["method"], json!("tools/call"));
+            assert_eq!(req["params"]["name"], json!("echo"));
+            assert_eq!(req["params"]["arguments"], json!({ "x": 1 }));
+            let id = req["id"].as_i64().unwrap();
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n"
+            );
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let result = h
+            .call_tool("s1", "echo", json!({ "x": 1 }), None)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(result["content"][0]["text"], json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn stdio_call_tool_surfaces_server_error_message() {
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let responder = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_i64().unwrap();
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32602,\"message\":\"no such tool\"}}}}\n"
+            );
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let err = h
+            .call_tool("s1", "nope", json!({}), None)
+            .await
+            .unwrap_err();
+        responder.await.unwrap();
+        assert!(format!("{err}").contains("no such tool"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn stdio_call_tool_times_out() {
+        // The server side never answers; the per-call timeout must fire.
+        let (h, _c2s, _s2c) = stdio_hub_with_duplex("s1");
+        let err = h
+            .call_tool("s1", "slow", json!({}), Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+    }
+
+    /// Body-aware streamable-HTTP stub for the tool-forwarding tests: answers
+    /// `initialize` / `notifications/initialized` / `tools/list` /
+    /// `tools/call` based on the request body (a `tools/call` naming the tool
+    /// `boom` gets a JSON-RPC error envelope).
+    async fn http_tool_stub() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    while let Some(req) = read_http_request(&mut sock).await {
+                        let resp = if req.contains("\"method\":\"initialize\"") {
+                            ok_json_response(
+                                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}"#,
+                            )
+                        } else if req.contains("notifications/initialized") {
+                            "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n".to_string()
+                        } else if req.contains("\"method\":\"tools/list\"") {
+                            ok_json_response(
+                                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"t1"},{"name":"t2"}]}}"#,
+                            )
+                        } else if req.contains("\"method\":\"tools/call\"") {
+                            if req.contains("\"name\":\"boom\"") {
+                                ok_json_response(
+                                    r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"tool exploded"}}"#,
+                                )
+                            } else {
+                                ok_json_response(
+                                    r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"http-ok"}]}}"#,
+                                )
+                            }
+                        } else {
+                            // DELETE session teardown and anything else.
+                            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n".to_string()
+                        };
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Read one full HTTP request (headers + content-length body) as a string.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match sock.read(&mut tmp).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+            let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let cl = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let body_end = pos + 4 + cl;
+            while buf.len() < body_end {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            return Some(String::from_utf8_lossy(&buf[..body_end]).to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_list_tools_round_trip() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r1", "http", &url, json!({}));
+        let result = h.list_tools("r1").await.unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(result["tools"][0]["name"], json!("t1"));
+    }
+
+    #[tokio::test]
+    async fn http_call_tool_round_trip() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r1", "http", &url, json!({}));
+        let result = h
+            .call_tool("r1", "t1", json!({ "a": 1 }), None)
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], json!("http-ok"));
+    }
+
+    #[tokio::test]
+    async fn http_call_tool_surfaces_server_error_message() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r1", "http", &url, json!({}));
+        let err = h
+            .call_tool("r1", "boom", json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("tool exploded"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_call_tool_times_out() {
+        // A listener that accepts but never answers; the caller-supplied
+        // timeout bounds the whole session.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let h = remote_hub("r1", "http", &url, json!({}));
+        let err = h
+            .call_tool("r1", "t", json!({}), Some(Duration::from_millis(200)))
+            .await
+            .unwrap_err();
+        hold.abort();
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_tool_error_never_echoes_configured_headers() {
+        let (url, _guard) =
+            http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
+        let h = remote_hub(
+            "r1",
+            "http",
+            &url,
+            json!({ "Authorization": "Bearer supersecret-token" }),
+        );
+        let err = h.call_tool("r1", "t", json!({}), None).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("supersecret-token"), "leaked secret: {msg}");
+        assert!(msg.contains("authentication failed"), "got: {msg}");
     }
 }
