@@ -386,6 +386,20 @@ mod prelude_tests {
         }
     }
 
+    // `unreadSummaries` is opt-in (default off): the default prelude omits
+    // `ws.chat`, enabling the toggle installs it, and the sub-agent bridge
+    // forces it back off even when the setting is on (no user-facing chat).
+    #[test]
+    fn unread_summaries_gates_chat_prelude() {
+        assert!(!prelude_for(&AgentFeaturesSettings::default()).contains("ws.chat = {"));
+        let features = AgentFeaturesSettings {
+            unread_summaries: true,
+            ..AgentFeaturesSettings::default()
+        };
+        assert!(prelude_for(&features).contains("ws.chat = {"));
+        assert!(!prelude_for_bridge(&features, true).contains("ws.chat = {"));
+    }
+
     // `structuredQuestions` off removes only `ws.app.question`; the rest of
     // the `ws.app.*` prelude (chief-gated server-side) stays installed.
     #[test]

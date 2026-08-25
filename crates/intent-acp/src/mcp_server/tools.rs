@@ -1093,9 +1093,10 @@ mod tests {
         PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
         REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
         TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
-        TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
-        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        TASK_GRAPH_UNBLOCKED_WAKE_XREF, UNREAD_THRESHOLD_NEEDLE, WORKSPACE_API_DESCRIPTION,
+        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
+    use intent_core::config::DEFAULT_UNREAD_SUMMARIZE_THRESHOLD;
     use std::collections::HashSet;
 
     // Source of every `ws.<ns>.<method>` binding actually dispatched by
@@ -1810,6 +1811,7 @@ mod tests {
                 &["ws.pr.monitors", "ws.pr.monitor", "ws.pr.unmonitor"],
                 |f| f.pr_monitor = false,
             ),
+            (&["ws.chat."], |f| f.unread_summaries = false),
         ]
     }
 
@@ -2279,6 +2281,17 @@ mod tests {
             denied_feature(&all_off, "agent.requestDiscussionHistory"),
             None
         );
+        // `unreadSummaries` denies the whole `chat.` namespace when off —
+        // including by default (opt-in toggle) — and opens it when on.
+        assert_eq!(
+            denied_feature(&all_off, "chat.unread"),
+            Some("agentFeatures.unreadSummaries")
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "chat.unread"),
+            Some("agentFeatures.unreadSummaries")
+        );
+        assert_eq!(denied_feature(&all_gates_open(), "chat.unread"), None);
         // Enabled toggles never deny.
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "hook.schedule"),
@@ -2292,6 +2305,49 @@ mod tests {
             denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
             None
         );
+    }
+
+    // ---- ws.chat.unread summarize-threshold guidance ------------------------
+
+    // Guard: the default-threshold guidance clause matches both static
+    // variants verbatim, so the threshold `replacen` cannot silently become
+    // a no-op — and the needle carries the default value the consts render.
+    #[test]
+    fn unread_threshold_needle_matches_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(desc.contains(UNREAD_THRESHOLD_NEEDLE));
+        }
+        assert!(UNREAD_THRESHOLD_NEEDLE
+            .contains(&DEFAULT_UNREAD_SUMMARIZE_THRESHOLD.to_string()));
+    }
+
+    // A non-default `unreadSummarizeThreshold` rewrites the `ws.chat.unread`
+    // guidance in the assembled description (both variants, gates open or
+    // not); the default renders the consts' verbatim text.
+    #[test]
+    fn unread_threshold_parameterizes_guidance() {
+        let features = AgentFeaturesSettings {
+            unread_summarize_threshold: 9,
+            ..all_gates_open()
+        };
+        for is_chief in [false, true] {
+            let desc = workspace_api_description(is_chief, &features);
+            assert!(desc.contains("when more than 9 messages are unread"));
+            assert!(!desc.contains(UNREAD_THRESHOLD_NEEDLE));
+            // Default threshold: the guidance renders the default value.
+            let default_desc = workspace_api_description(is_chief, &all_gates_open());
+            assert!(default_desc.contains(UNREAD_THRESHOLD_NEEDLE));
+        }
+        // With `unreadSummaries` off the doc line is pruned entirely — no
+        // guidance text survives to rewrite.
+        let off = AgentFeaturesSettings {
+            unread_summarize_threshold: 9,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let desc = workspace_api_description(is_chief, &off);
+            assert!(!desc.contains("messages are unread"));
+        }
     }
 
     // ---- specialist modelOptions injection ---------------------------------

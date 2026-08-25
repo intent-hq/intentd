@@ -415,6 +415,38 @@ mod tests {
     }
 
     #[test]
+    fn summarize_gate_arms_rearms_and_clears_at_turn_end() {
+        let reg = TurnAttachmentRegistry::new();
+        let a = agent();
+        assert_eq!(reg.summarize_gate(&a), None);
+        reg.arm_summarize_gate(&a, Some("msg-1"), "msg-9");
+        assert_eq!(
+            reg.summarize_gate(&a),
+            Some(SummarizeGate {
+                from_message_id: Some("msg-1".into()),
+                to_message_id: "msg-9".into(),
+            })
+        );
+        // A repeat read re-arms with the newer range; other agents are
+        // unaffected.
+        reg.arm_summarize_gate(&a, None, "msg-12");
+        assert_eq!(
+            reg.summarize_gate(&a),
+            Some(SummarizeGate {
+                from_message_id: None,
+                to_message_id: "msg-12".into(),
+            })
+        );
+        assert_eq!(
+            reg.summarize_gate(&AgentId::from_string("agent-other")),
+            None
+        );
+        // Turn end clears the gate.
+        reg.finish_turn(&a);
+        assert_eq!(reg.summarize_gate(&a), None);
+    }
+
+    #[test]
     fn pending_count_by_mime_filters_and_scopes() {
         let reg = TurnAttachmentRegistry::new();
         let a = agent();
