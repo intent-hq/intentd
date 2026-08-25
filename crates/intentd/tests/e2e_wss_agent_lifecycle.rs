@@ -14705,3 +14705,262 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
     }
     assert!(settled, "agent session settled to idle; last: {last}");
 }
+
+/// `kills_child_on_interrupt` quirk fence over the real WSS wire
+/// (intent-hq/monorepo#2763): a provider whose cancellation is unreliable
+/// keeps streaming `session/update` chunks long after `session/cancel` —
+/// those zombie chunks must NOT leak into the next turn's transcript. The
+/// mock parks the first turn (`parkIfPromptEndsWith`), and on cancel resolves
+/// it as `cancelled` but keeps emitting marker chunks every 100ms for 3s
+/// (`zombieAfterCancel`) — far past the daemon's bounded 500ms post-interrupt
+/// drain cap. `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock the quirk, so
+/// the interrupt tears the child down and the stragglers die with the
+/// process. Without the quirk (env seam off) the kept-alive child's zombies
+/// outlive the drain window, buffer in the shared notifications channel, and
+/// bleed into the follow-up turn's assistant message — the pre-fix failure.
+/// Asserts:
+/// - the interrupt lands normally (stream:end `stopReason: "interrupted"`);
+/// - the daemon log carries the quirk-teardown INFO line (the quirk arm ran,
+///   not a coincidental clean cancel);
+/// - the follow-up turn completes normally on a RESPAWNED child (prompt log:
+///   its `session/prompt` is that process's turn 1) — teardown kept the agent
+///   resumable;
+/// - no post-interrupt `chat:stream:delta` and no persisted assistant message
+///   carries the zombie marker.
+#[tokio::test]
+async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
+    const ZOMBIE_MARKER: &str = "ZOMBIE-CHUNK-2763";
+    const PARK_MARKER: &str = "PARK-FIRST-TURN-2763";
+    let Some(script) = gate("WSS kill-on-interrupt zombie-fence E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().to_string();
+    // 30 chunks × 100ms = 3s of stragglers — comfortably past the 500ms
+    // post-interrupt drain cap, so a kept-alive child provably leaks them
+    // into the follow-up turn (the pre-fix failure this test regresses).
+    let behavior = json!({
+        "parkIfPromptEndsWith": PARK_MARKER,
+        "zombieAfterCancel": { "marker": ZOMBIE_MARKER, "count": 30, "intervalMs": 100 },
+        "response": "resumed after respawn",
+    })
+    .to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        ("MOCK_AGENT_KILLS_ON_INTERRUPT", "1"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE any turn so no delta is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "ZombieFence", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": format!("do the parked work {PARK_MARKER}") }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The parked turn streams nothing; poll turn-liveness until the prompt is
+    // provably in flight before interrupting it.
+    let mut in_flight = false;
+    for i in 0..100 {
+        let got = wss_rpc(
+            &mut rpc,
+            100 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["turnInFlight"] == true {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "first turn is in flight before the stop");
+
+    // Interrupt mid-turn. The mock resolves the cancel politely, then keeps
+    // streaming zombie chunks; the quirk tears the child down underneath them.
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("terminal stream:end reached the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("stop must not fail the agent: {ev}"),
+            Some("agent:stream:end") => {
+                assert_eq!(
+                    ev["data"]["stopReason"], "interrupted",
+                    "interrupt stream:end carries stopReason: {ev}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // The quirk-teardown INFO line proves the quirk arm produced the kill —
+    // not a coincidental clean settle.
+    let log_path = data_dir.join("daemon.log");
+    let mut quirk_ran = false;
+    for _ in 0..200 {
+        if tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default()
+            .contains("kills_child_on_interrupt quirk")
+        {
+            quirk_ran = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(quirk_ran, "daemon log carries the quirk-teardown line");
+
+    // Let the zombie stream run well past the 500ms drain cap before the
+    // follow-up: a kept-alive child would still be emitting stragglers into
+    // its buffered channel right now.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Follow-up turn: completes normally on a respawned child, with ZERO
+    // zombie-marker deltas.
+    let resumed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow up after the interrupt" }),
+    )
+    .await;
+    assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
+
+    let mut saw_resume_end = false;
+    let mut tainted_deltas: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !saw_resume_end {
+        let frame = wss_event_opt_until(&mut sub, deadline)
+            .await
+            .expect("follow-up turn reached stream:end on the WSS subscriber");
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => panic!("follow-up must not fail: {ev}"),
+            Some("chat:stream:delta") => {
+                let data = serde_json::to_string(&ev["data"]).unwrap_or_default();
+                if data.contains(ZOMBIE_MARKER) {
+                    tainted_deltas.push(data);
+                }
+            }
+            Some("agent:stream:end") => saw_resume_end = true,
+            _ => {}
+        }
+    }
+    assert!(
+        tainted_deltas.is_empty(),
+        "the cancelled turn's zombie chunks streamed into the follow-up (monorepo#2763): {tainted_deltas:?}"
+    );
+
+    // Transcript: the follow-up response landed and NO assistant message
+    // carries the zombie marker.
+    let conv = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let assistant_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    assert!(
+        assistant_texts
+            .iter()
+            .any(|t| t.contains("resumed after respawn")),
+        "follow-up turn completed after the teardown: {conv}"
+    );
+    let tainted: Vec<&String> = assistant_texts
+        .iter()
+        .filter(|t| t.contains(ZOMBIE_MARKER))
+        .collect();
+    assert!(
+        tainted.is_empty(),
+        "zombie chunks leaked into a persisted assistant message (monorepo#2763): {tainted:?}"
+    );
+
+    // Prompt log: the follow-up prompt is the receiving PROCESS's turn 1 — the
+    // daemon spawned a FRESH child (the kept-alive old child would have
+    // received it as its turn 2), proving teardown + respawn-resume.
+    let log = std::fs::read_to_string(&prompt_log).expect("prompt log");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    assert_eq!(entries.len(), 2, "two prompts total: {entries:?}");
+    assert!(
+        entries[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains(PARK_MARKER)),
+        "first prompt is the parked turn: {entries:?}"
+    );
+    assert_eq!(
+        entries[1]["turn"], 1,
+        "follow-up prompt is the FRESH child's turn 1 (teardown happened): {entries:?}"
+    );
+}
