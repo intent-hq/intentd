@@ -345,6 +345,50 @@ async fn retired_agents_are_inert_until_restored() {
     assert_eq!(r2["restored"], json!(false));
 }
 
+/// Projection-cost contract (PR review): the default `agent.list` projection
+/// load excludes soft-retired sessions at the SQL layer, so its cost stays
+/// O(rows returned) instead of growing with every retired session kept. The
+/// `includeRetired` variant bypasses the active-only cache and still serves
+/// full message projections for retired rows.
+#[tokio::test]
+async fn retired_sessions_are_excluded_from_default_projection_load() {
+    let (_t, svc, ws) = setup().await;
+    let live = create_agent(&svc, &ws, "Live").await;
+    let old = create_agent(&svc, &ws, "Old").await;
+    let content = serde_json::json!([{ "type": "text", "text": "kept transcript" }]);
+    svc.store()
+        .append_agent_message(&old, "user", &content, &intent_core::now_iso())
+        .await
+        .expect("append");
+    svc.agent_retire_op(old.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    // The active-only store read omits the retired session entirely.
+    let active = svc
+        .store()
+        .get_active_agent_session_message_projections(&ws)
+        .await
+        .expect("active projections");
+    assert!(active.contains_key(&live.0), "live session projected");
+    assert!(
+        !active.contains_key(&old.0),
+        "retired session must not be loaded by the default projection read"
+    );
+
+    // includeRetired still serves the retired row WITH its projections
+    // (message_count from the direct, cache-bypassing load).
+    let all = svc
+        .agent_list_including_retired_op(ws.clone())
+        .await
+        .expect("list all");
+    let row = all.iter().find(|a| a.id == old).expect("retired row");
+    assert_eq!(
+        row.message_count, 1,
+        "retired row keeps its message projection in the includeRetired read"
+    );
+}
+
 #[tokio::test]
 async fn retire_and_restore_reject_cross_workspace_targets() {
     let (_t, svc, ws) = setup().await;
@@ -12253,12 +12297,24 @@ async fn watch_completion_skips_when_parent_deleted() {
 
 /// A foreground/coordinator sender is auto-subscribed: exactly one
 /// caller→target watch, subscription id returned (the TS
-/// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`).
+/// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`). The
+/// target is a BACKGROUND worker — an independent top-level foreground
+/// target would suppress the watch (peer rule, tested below).
 #[tokio::test]
 async fn sender_watch_registers_ungrouped_for_foreground_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("flag background");
 
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
@@ -12284,6 +12340,16 @@ async fn sender_watch_silently_adopts_existing_watch_for_pair() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("flag background");
     let existing = svc
         .register_completion_watch(
             &ws,
@@ -12402,13 +12468,26 @@ async fn sender_watch_skips_child_via_created_by_metadata() {
 }
 
 /// The child→parent suppression is one-directional: a child sending to a
-/// NON-parent target (an unrelated sibling) still gets the SUB-1
-/// caller→target watch.
+/// NON-parent target (a sibling child of the same coordinator) still gets
+/// the SUB-1 caller→target watch.
 #[tokio::test]
 async fn sender_watch_still_registers_for_child_sending_to_non_parent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Coordinator").await;
-    let sibling = create_agent(&svc, &ws, "Sibling").await;
+    let created_sibling = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Sibling".to_string()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create sibling");
+    let sibling = AgentId::from(created_sibling["agent"]["id"].as_str().unwrap());
     let created = svc
         .agent_create_op(
             ws.clone(),
@@ -12467,6 +12546,33 @@ async fn sender_watch_still_registers_for_parent_sending_to_child() {
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, child);
+}
+
+/// SUB-1 independent-peer suppression: a target that is a top-level
+/// FOREGROUND agent (no parent linkage, depth 0, not background) is a
+/// co-equal peer — messaging it does NOT passively subscribe the sender to
+/// its completion. `ok: false`, no subscription id, no watch; peers are
+/// watched explicitly with `agent.watch`.
+#[tokio::test]
+async fn sender_watch_skips_independent_top_level_foreground_target() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let session = svc
+        .store()
+        .get_agent_session(&peer)
+        .await
+        .expect("peer session");
+    assert!(session.parent_agent_id.is_none());
+    assert!(!session.is_background);
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), peer)
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert!(resp["subscriptionId"].is_null());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
 /// `agent.wakeOrCreate` woke-existing with a caller: the caller gets a completion
