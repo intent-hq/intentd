@@ -38,9 +38,9 @@ use crate::config::{
     DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
     DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_UNREAD_SUMMARIZE_THRESHOLD, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT, MAX_CONCURRENT_ADAPTERS_LIMIT,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -821,8 +821,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on** except the opt-in
-/// `unreadSummaries`; changes apply to new agent sessions only.
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[allow(clippy::struct_excessive_bools)]
@@ -873,15 +873,6 @@ pub struct AgentFeaturesSettings {
     /// Defaults **on** like the other toggles (originally opt-in —
     /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
-    /// `agentFeatures.unreadSummaries` — expose the unread-digest surface
-    /// (`ws.chat.*`) to agents. Defaults **off** (opt-in), unlike the other
-    /// toggles.
-    pub unread_summaries: bool,
-    /// `agentFeatures.unreadSummarizeThreshold` — the unread-message count at
-    /// which the `ws.chat.unread` guidance suggests summarizing instead of
-    /// reading in full. Docs-only knob: it parameterizes the tool description
-    /// text, never gates dispatch.
-    pub unread_summarize_threshold: u32,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -898,8 +889,6 @@ impl Default for AgentFeaturesSettings {
             state_snapshot: true,
             pr_monitor: true,
             task_graph: true,
-            unread_summaries: false,
-            unread_summarize_threshold: DEFAULT_UNREAD_SUMMARIZE_THRESHOLD,
         }
     }
 }
