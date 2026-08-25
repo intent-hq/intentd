@@ -304,13 +304,18 @@ async fn create(
 
 /// Cap on live top-level agents for `ws.agent.spawnPeer`, read from
 /// `agents.maxTopLevelAgents` (settings) with the compiled default as the
-/// fallback when the settings read fails.
+/// fallback when the settings read fails. `settings.get` normalizes number
+/// settings to the float wire shape (e.g. `20.0`), so the value is read as
+/// `f64` — `as_u64` would return `None` for floats and silently ignore
+/// user overrides.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn max_top_level_agents(api: &Arc<dyn WorkspaceApi>) -> u64 {
     api.settings_get("agents.maxTopLevelAgents".to_string())
         .await
         .ok()
-        .and_then(|v| v.get("value").and_then(Value::as_u64))
-        .unwrap_or(u64::from(DEFAULT_MAX_TOP_LEVEL_AGENTS))
+        .and_then(|v| v.get("value").and_then(Value::as_f64))
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map_or(u64::from(DEFAULT_MAX_TOP_LEVEL_AGENTS), |n| n as u64)
 }
 
 /// Live (non-deleted, non-retired) TOP-LEVEL (depth-0, parentless) agents in
