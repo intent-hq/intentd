@@ -988,6 +988,39 @@ async function dispatch(msg) {
         log('neverResolveOnCancel: leaving parked prompt(s) unresolved');
         return;
       }
+      // Post-cancel zombie stream (monorepo#2763): with the opt-in
+      // `zombieAfterCancel` config set ({ marker, count?, intervalMs? }),
+      // resolve the parked prompt as `cancelled` but KEEP streaming marker
+      // chunks on a timer for longer than the daemon's bounded 500ms
+      // post-interrupt drain cap — modelling a provider whose cancellation is
+      // unreliable (auggie): the child acknowledges the cancel yet keeps
+      // emitting late `session/update`s for the dead turn. Without the
+      // `kills_child_on_interrupt` teardown these stragglers outlive the
+      // drain window, buffer in the kept-alive child's notifications channel,
+      // and bleed into the NEXT turn's transcript. Strictly gated on the new
+      // key so every existing cancel behavior is unaffected.
+      if (behavior.zombieAfterCancel && typeof behavior.zombieAfterCancel.marker === 'string') {
+        const zombie = behavior.zombieAfterCancel;
+        const count = Number.isFinite(zombie.count) ? zombie.count : 30;
+        const intervalMs = Number.isFinite(zombie.intervalMs) ? zombie.intervalMs : 100;
+        while (pendingPromptIds.length) {
+          result(pendingPromptIds.shift(), { stopReason: 'cancelled' });
+        }
+        log(`zombieAfterCancel: streaming ${count} marker chunks every ${intervalMs}ms`);
+        let emitted = 0;
+        const timer = setInterval(() => {
+          emitted += 1;
+          note('session/update', {
+            sessionId: SESSION_ID,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `${zombie.marker}-${emitted}\n` },
+            },
+          });
+          if (emitted >= count) clearInterval(timer);
+        }, intervalMs);
+        return;
+      }
       // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop
       // reason and stay alive for a follow-up (resume) prompt — the observable
       // keep-alive interrupt. Notification itself gets no reply.
