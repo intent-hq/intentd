@@ -89,7 +89,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     if features.browser_automation {
         fragments.push(browser::PRELUDE);
     }
-    let agent = agent::prelude_for(features);
+    let agent = agent::prelude_for(features, is_sub_agent);
     fragments.extend([agent.as_ref(), event::PRELUDE, git::PRELUDE]);
     if features.host_exec {
         fragments.push(host::PRELUDE);
@@ -421,15 +421,27 @@ mod prelude_tests {
         assert!(agent::PRELUDE.contains(agent::RETIRE_PRELUDE_SEGMENT));
     }
 
+    // Guard: the spawnPeer segment gated by `peerAgents` + the top-level-only
+    // rule still matches the `ws.agent` prelude verbatim, so the `replacen`
+    // scrub cannot silently become a no-op after a prelude edit.
+    #[test]
+    fn spawn_peer_prelude_segment_matches_agent_prelude() {
+        assert!(agent::PRELUDE.contains(agent::SPAWN_PEER_PRELUDE_SEGMENT));
+    }
+
     // `peerAgents` defaults OFF (the one opt-in toggle): the default prelude
-    // omits the `retire` installer; opting in installs it, and the two
-    // `ws.agent` scrubs compose independently.
+    // omits the `retire` and `spawnPeer` installers; opting in installs
+    // them, and the `ws.agent` scrubs compose independently.
     #[test]
     fn peer_agents_gates_retire_installer_in_prelude() {
         let js = prelude_for(&AgentFeaturesSettings::default());
         assert!(
             !js.contains("retire:"),
             "retire installed with peerAgents off"
+        );
+        assert!(
+            !js.contains("spawnPeer:"),
+            "spawnPeer installed with peerAgents off"
         );
         assert!(
             js.contains("reportBlocker:"),
@@ -441,6 +453,10 @@ mod prelude_tests {
             ..AgentFeaturesSettings::default()
         });
         assert!(js.contains("retire:"), "opting in must install retire");
+        assert!(
+            js.contains("spawnPeer:"),
+            "opting in must install spawnPeer"
+        );
 
         let js = prelude_for(&AgentFeaturesSettings {
             peer_agents: true,
@@ -448,7 +464,28 @@ mod prelude_tests {
             ..AgentFeaturesSettings::default()
         });
         assert!(js.contains("retire:"));
+        assert!(js.contains("spawnPeer:"));
         assert!(!js.contains("reportBlocker:"));
         assert!(js.contains("reportToParent:"));
+    }
+
+    // Top-level-only rule: a sub-agent bridge's prelude omits the
+    // `spawnPeer` installer even with `peerAgents` on; `retire` (self-scoped,
+    // available to every agent when the toggle is on) survives.
+    #[test]
+    fn sub_agent_bridge_prelude_omits_spawn_peer() {
+        let features = AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        };
+        let js = prelude_for_bridge(&features, true);
+        assert!(
+            !js.contains("spawnPeer:"),
+            "spawnPeer must be scrubbed on sub-agent bridges"
+        );
+        assert!(js.contains("retire:"), "retire must survive for sub-agents");
+
+        let js = prelude_for_bridge(&features, false);
+        assert!(js.contains("spawnPeer:"));
     }
 }
