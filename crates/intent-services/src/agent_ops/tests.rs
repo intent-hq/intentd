@@ -12807,6 +12807,43 @@ async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
     );
 }
 
+/// monorepo#3442 (fail-closed): a caller whose persisted `delegation_depth`
+/// column is at `MAX_DELEGATION_DEPTH` cannot bypass the cap with an explicit
+/// lower wire `delegationDepth`. The B3 pre-check reads the wire value and
+/// passes, but `agent_create_op`'s LC-1 guard reads the column and rejects —
+/// pre-fix this path never fired on the create branch (parent was `None`) and
+/// produced a parentless agent; post-fix the call errors.
+#[tokio::test]
+async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Capped coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Depth cap fail-closed").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    session.delegation_depth = Some(MAX_DELEGATION_DEPTH);
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("persist capped depth");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        delegation_depth: Some(0),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect_err("LC-1 must reject a caller stored at the cap");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("maximum delegation depth")),
+        "expected the LC-1 depth rejection, got {err:?}"
+    );
+}
+
 /// monorepo#994: the queued-to-active branch shares the wake-branch SUB-1
 /// block, so a Deleted caller gets no caller→assignee watch.
 #[tokio::test]

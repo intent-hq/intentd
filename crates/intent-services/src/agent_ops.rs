@@ -10154,13 +10154,20 @@ impl Services {
         // a wakeOrCreate-created agent is a delegated child
         // (`agent.reportToParent` works, attention/failure events carry the
         // parent). A Deleted caller and an unknown/unresolvable `callerAgentId`
-        // both stay parentless — mirroring `agent_delegate_op`'s deleted-parent
-        // guard and preventing a dangling parent from a client-supplied ID. The
-        // depth guard inside `agent_create_op` reads the parent's persisted
-        // `delegation_depth` against the same `MAX_DELEGATION_DEPTH` the B3
-        // pre-check above already enforced, so a pass there cannot regress
-        // into a rejection here (an explicit lower `delegationDepth` on the
-        // wire cannot bypass a caller already at the cap).
+        // both stay parentless. This is deliberately STRICTER than
+        // `agent_delegate_op`, which passes its parent unfiltered and only
+        // skips watch registration for a Deleted parent — here a parent that
+        // can never receive the report wake is not recorded at all. Note
+        // `build_create_metadata` above still records the raw wire caller as
+        // `createdByAgentId` (creation provenance) even when the parent is
+        // filtered out, so the two fields can intentionally diverge on the
+        // deleted-caller path. Depth guards: the B3 pre-check reads the wire
+        // `delegationDepth` (else the caller's `metadata.delegationDepth`),
+        // while `agent_create_op`'s LC-1 guard reads the parent's persisted
+        // `delegation_depth` column — so a caller whose column is at
+        // `MAX_DELEGATION_DEPTH` passing an explicit lower wire depth clears
+        // B3 but is rejected by LC-1. That pass-then-reject is intentional
+        // fail-closed behavior: the wire value cannot bypass the stored cap.
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
