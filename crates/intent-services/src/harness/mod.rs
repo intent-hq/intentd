@@ -437,8 +437,8 @@ mod tests {
             data_ptr(v1_1_entry.harness)
         ));
         // … different common.md (the rewrites), identical specialist prompt
-        // bodies (v1.1 frontmatter additionally carries the picker-metadata
-        // keys — role/teamAgents/icon).
+        // bodies and frontmatter modulo the picker-metadata keys the v1.1
+        // copies additionally carry (role/teamAgents/icon).
         assert_ne!(
             v1_entry.doctrine.instructions.common,
             v1_1_entry.doctrine.instructions.common
@@ -454,9 +454,17 @@ mod tests {
             .zip(v1_1_entry.doctrine.specialists.iter())
         {
             assert_eq!(id_a, id_b);
-            let (_, body_a) = crate::specialists::parse_frontmatter(content_a);
-            let (_, body_b) = crate::specialists::parse_frontmatter(content_b);
+            let (mut fm_a, body_a) = crate::specialists::parse_frontmatter(content_a);
+            let (mut fm_b, body_b) = crate::specialists::parse_frontmatter(content_b);
             assert_eq!(body_a, body_b, "specialist {id_a} body diverged");
+            for key in crate::specialists::PICKER_METADATA_KEYS {
+                fm_a.remove(*key);
+                fm_b.remove(*key);
+            }
+            assert_eq!(
+                fm_a, fm_b,
+                "specialist {id_a} frontmatter diverged beyond the picker-metadata keys"
+            );
         }
     }
 

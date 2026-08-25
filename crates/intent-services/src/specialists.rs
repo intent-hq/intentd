@@ -215,15 +215,33 @@ fn escape_yaml(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
-/// Reverse [`escape_yaml`] for a double-quoted scalar (port of
-/// `unescapeYamlValue`).
+/// Reverse [`escape_yaml`] for a double-quoted scalar. Decoded in a single
+/// left-to-right pass so an escaped backslash never re-combines with the
+/// following character (sequential `replace` calls corrupted `foo\nbar` —
+/// literal backslash + `n` — into backslash + real newline); an unrecognized
+/// escape is carried verbatim (lenient, like the rest of the parser).
 fn unescape_yaml(value: &str) -> String {
-    value
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            // A trailing lone backslash is carried verbatim, like `\\`.
+            Some('\\') | None => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 /// Split optional leading `---`-delimited YAML frontmatter from the markdown
@@ -290,7 +308,9 @@ pub(crate) fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// absent = standard) and `icon` names a client-side avatar design; both are
 /// render-only metadata for pickers (never consulted at delegation time).
 /// `role` is validated on `specialist.create`/`edit` ([`validate_role_spec`])
-/// but read leniently — an unknown on-disk value is carried verbatim.
+/// but read leniently — an out-of-enum on-disk value is normalized to
+/// omitted (which inherits), so `list`/`get` never serve a value the strict
+/// write validation would reject when a client echoes the def back.
 /// `roleReminder` stays winner-takes-all — it is carried through only when
 /// present in the winning file (an omitted key falls back to auto-derivation
 /// from the winning body, so inheriting a lower tier's reminder would pin a
@@ -322,10 +342,19 @@ const INHERITED_CONFIG_KEYS: &[&str] = &[
 /// explicit-clear empty string.
 const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
 
+/// The picker-metadata frontmatter keys (PROTOCOL §5.11) — the only
+/// frontmatter allowed to diverge between the v1 and v1.1 bundled specialist
+/// copies. Consumed only by the cross-version goldens (`v1_1_goldens`,
+/// `harness::tests`), which compare frontmatter modulo this set — hence the
+/// allow: the lib build has no reader.
+#[allow(dead_code)]
+pub(crate) const PICKER_METADATA_KEYS: &[&str] = &["role", "icon", TEAM_AGENTS_KEY];
+
 /// Strictly validate a wire `role` value (`specialist.create`/`edit` specs):
 /// when present it must be a string in [`ROLE_VALUES`] (`""` is the
 /// explicit clear); anything else → `-32602`. Files are read leniently — an
-/// unknown on-disk value is carried verbatim like any other scalar.
+/// out-of-enum on-disk value is normalized to omitted by
+/// [`build_def_inheriting`] (like an unparseable `teamAgents`), never served.
 fn validate_role_spec(value: Option<&Value>) -> Result<()> {
     let Some(value) = value else { return Ok(()) };
     match value.as_str() {
@@ -333,6 +362,17 @@ fn validate_role_spec(value: Option<&Value>) -> Result<()> {
         _ => Err(Error::InvalidParams(
             "role must be \"orchestrator\", \"internal\", or \"\"".to_string(),
         )),
+    }
+}
+
+/// Strictly validate a wire `icon` value (`specialist.create`/`edit` specs):
+/// when present it must be a string (`""` is the explicit clear); any other
+/// JSON type → `-32602`. Icon names are free-form (they name client-side
+/// avatar designs), so no enum is enforced.
+fn validate_icon_spec(value: Option<&Value>) -> Result<()> {
+    match value {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(_) => Err(Error::InvalidParams("icon must be a string".to_string())),
     }
 }
 
@@ -588,7 +628,15 @@ fn build_def_inheriting(
     def.insert("name".into(), json!(name));
     def.insert("description".into(), json!(description));
     for &key in OPTIONAL_FRONTMATTER_KEYS {
-        match fm.get(key).and_then(Value::as_str) {
+        // Lenient read normalization: an out-of-enum on-disk `role` is
+        // treated like an omitted key (which inherits), mirroring the
+        // unparseable-`teamAgents` case — `list`/`get` must never serve a
+        // value the strict write validation would reject on echo-back.
+        let value = fm
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| key != "role" || ROLE_VALUES.contains(v));
+        match value {
             Some(v) if !v.is_empty() => {
                 def.insert(key.into(), json!(v));
             }
@@ -1228,6 +1276,7 @@ impl SpecialistsService {
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
         validate_role_spec(spec.get("role"))?;
+        validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if path.exists() {
@@ -1264,6 +1313,7 @@ impl SpecialistsService {
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
         validate_role_spec(spec.get("role"))?;
+        validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
         let path = dir.join(format!("{id}.md"));
         if !path.exists() {
@@ -1386,6 +1436,39 @@ mod tests {
         assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
         assert_eq!(def["behaviorPrompt"], "You loop.\nForever.");
+    }
+
+    #[test]
+    fn escape_yaml_round_trips_backslash_sequences() {
+        // Regression: the sequential-replace unescaper corrupted a literal
+        // backslash followed by `n`/`t`/`\` — `foo\nbar` (backslash + n)
+        // escaped to `foo\\nbar` but decoded back as backslash + newline.
+        // The single-pass decoder round-trips every such value.
+        let cases = [
+            "foo\\nbar",
+            "foo\\\\nbar",
+            "tab\\tstop",
+            "trailing\\",
+            "real\nnewline",
+            "mixed \\n and \n and \\\\ and \"quotes\"",
+        ];
+        for value in cases {
+            assert_eq!(
+                unescape_yaml(&escape_yaml(value)),
+                value,
+                "escape→unescape round-trips {value:?}"
+            );
+        }
+        // The full file path round-trips a description carrying the same
+        // hazard (frontmatter scalars are the consumers of the escaper).
+        let spec = json!({
+            "name": "Z",
+            "description": "path C:\\new\\table",
+            "prompt": "body"
+        });
+        let rendered = render_file("z", &spec);
+        let def = build_def("z", &rendered, "user", Path::new("/tmp/z.md"));
+        assert_eq!(def["description"], "path C:\\new\\table");
     }
 
     #[test]
@@ -2777,18 +2860,43 @@ mod tests {
 
     #[test]
     fn role_and_team_agents_frontmatter_are_lenient_on_read() {
-        // Files are never rejected on read: an unknown role carries verbatim,
-        // an unparseable teamAgents is treated as omitted, and unusable
-        // entries are skipped individually (all-unusable ⇒ omitted, not
-        // clear).
+        // Files are never rejected on read: an out-of-enum role is
+        // normalized to omitted (so get→modify→edit never echoes a value the
+        // strict write validation rejects), an unparseable teamAgents is
+        // treated as omitted, and unusable entries are skipped individually
+        // (all-unusable ⇒ omitted, not clear).
         let content =
             "---\nname: \"Z\"\ndescription: \"d\"\nrole: \"mystery\"\nteamAgents: not-json\n---\n\nbody";
         let def = build_def("z", content, "user", Path::new("/tmp/z.md"));
-        assert_eq!(def["role"], "mystery", "unknown role is carried verbatim");
+        assert!(
+            def.get("role").is_none(),
+            "out-of-enum role is normalized to omitted"
+        );
         assert!(
             def.get("teamAgents").is_none(),
             "unparseable value is treated as omitted"
         );
+        // An out-of-enum role inherits like an omitted key: the def echoed
+        // by get is always writable back through the strict edit validation.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nrole: \"internal\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nrole: \"mystery\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["role"], "internal",
+            "an out-of-enum role inherits the lower tier's value like an omitted key"
+        );
+        let echoed = got["specialist"].clone();
+        svc.edit("zeta", &echoed, "user", None)
+            .expect("a get→edit echo of a def never fails role validation");
         let mixed = "---\nname: \"Z\"\ndescription: \"d\"\nteamAgents: [\"implementor\", 42, \"\", \"verifier\"]\n---\n\nbody";
         let def = build_def("z", mixed, "user", Path::new("/tmp/z.md"));
         assert_eq!(
@@ -2814,6 +2922,8 @@ mod tests {
         let invalid_specs = [
             json!({ "name": "Z", "description": "d", "role": "manager" }),
             json!({ "name": "Z", "description": "d", "role": 42 }),
+            json!({ "name": "Z", "description": "d", "icon": 42 }),
+            json!({ "name": "Z", "description": "d", "icon": ["coordinator"] }),
             json!({ "name": "Z", "description": "d", "teamAgents": "not-an-array" }),
             json!({ "name": "Z", "description": "d", "teamAgents": [42] }),
             json!({ "name": "Z", "description": "d", "teamAgents": [""] }),

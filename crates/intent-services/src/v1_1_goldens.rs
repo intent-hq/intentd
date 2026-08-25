@@ -85,8 +85,10 @@ fn v1_1_is_the_latest_entry() {
 /// The v1.1 specialist bundle carries body-identical copies of the v1
 /// prompts (the v1.1 doctrine diff is instruction-only); only the
 /// picker-metadata frontmatter (`role`/`teamAgents`/`icon`, PROTOCOL §5.11)
-/// diverges. If a prompt-body edit is ever wanted, it needs a new harness
-/// version — not an in-place v1.1 edit.
+/// diverges — every OTHER frontmatter key (`name`/`description`/`hidden`/
+/// `agentType`/`roleReminder`/`modelOptions`/…) stays pinned to its v1
+/// value. If a prompt-body (or non-metadata frontmatter) edit is ever
+/// wanted, it needs a new harness version — not an in-place v1.1 edit.
 #[test]
 fn v1_1_specialist_bodies_are_identical_to_v1() {
     let v1 = crate::specialists::EMBEDDED_BUNDLED_V1;
@@ -94,9 +96,17 @@ fn v1_1_specialist_bodies_are_identical_to_v1() {
     assert_eq!(v1.len(), v1_1.len());
     for ((id_a, content_a), (id_b, content_b)) in v1.iter().zip(v1_1.iter()) {
         assert_eq!(id_a, id_b);
-        let (_, body_a) = crate::specialists::parse_frontmatter(content_a);
-        let (_, body_b) = crate::specialists::parse_frontmatter(content_b);
+        let (mut fm_a, body_a) = crate::specialists::parse_frontmatter(content_a);
+        let (mut fm_b, body_b) = crate::specialists::parse_frontmatter(content_b);
         assert_eq!(body_a, body_b, "specialist {id_a} body diverged from v1");
+        for key in crate::specialists::PICKER_METADATA_KEYS {
+            fm_a.remove(*key);
+            fm_b.remove(*key);
+        }
+        assert_eq!(
+            fm_a, fm_b,
+            "specialist {id_a} frontmatter diverged from v1 beyond the picker-metadata keys"
+        );
     }
 }
 

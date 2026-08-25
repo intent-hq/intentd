@@ -819,6 +819,163 @@ async fn specialist_model_options_round_trip_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for the picker-metadata fields (`role`/`teamAgents`/`icon`,
+/// PROTOCOL §5.11): a user-tier override that omits the keys inherits the
+/// bundled tier's values on `specialist.get` and `specialist.list`, `create`
+/// round-trips supplied values and agrees with the following `get`, `edit`
+/// clears them, and invalid wire shapes (out-of-enum `role`, non-string
+/// `icon`, non-array `teamAgents`) are rejected with `-32602`.
+#[tokio::test]
+async fn specialist_picker_metadata_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
+    let bundled_dir = data_dir.join("bundled-specialists");
+    std::fs::create_dir_all(&bundled_dir).expect("mkdir bundled dir");
+    std::fs::write(
+        bundled_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"Bundled\"\nrole: \"orchestrator\"\nicon: \"coordinator\"\nteamAgents: [\"implementor\",\"verifier\"]\n---\n\nBundled body.",
+    )
+    .expect("write bundled zeta");
+
+    // Hermetic user tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/. Omits the metadata keys: inherits.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"User override\"\n---\n\nUser body.",
+    )
+    .expect("write user zeta");
+
+    let bundled_dir_str = bundled_dir
+        .to_str()
+        .expect("bundled dir to str")
+        .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // get — omitted keys inherit the bundled tier's metadata.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
+    let def = &got["specialist"];
+    assert_eq!(def["source"], "user", "user tier wins the merge");
+    assert_eq!(def["role"], "orchestrator", "role inherits over WSS");
+    assert_eq!(def["icon"], "coordinator", "icon inherits over WSS");
+    assert_eq!(
+        def["teamAgents"],
+        json!(["implementor", "verifier"]),
+        "teamAgents inherits over WSS"
+    );
+
+    // list — the same fold applies to the list projection.
+    let list = wss_rpc(&mut ws, 3, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let zeta = specs
+        .iter()
+        .find(|s| s["id"] == "zeta")
+        .expect("zeta listed");
+    assert_eq!(zeta["role"], "orchestrator", "role in specialist.list");
+    assert_eq!(zeta["icon"], "coordinator", "icon in specialist.list");
+    assert_eq!(
+        zeta["teamAgents"],
+        json!(["implementor", "verifier"]),
+        "teamAgents in specialist.list"
+    );
+
+    // create — supplied metadata round-trips through the write path and
+    // agrees with the following get.
+    let created = wss_rpc(
+        &mut ws,
+        4,
+        "specialist.create",
+        json!({
+            "id": "sigma",
+            "scope": "user",
+            "spec": {
+                "id": "sigma", "name": "Sigma", "description": "Authored",
+                "role": "internal", "icon": "verifier",
+                "teamAgents": ["implementor"],
+                "prompt": "Sigma body."
+            }
+        }),
+    )
+    .await;
+    assert_eq!(created["specialist"]["role"], "internal");
+    assert_eq!(created["specialist"]["icon"], "verifier");
+    assert_eq!(created["specialist"]["teamAgents"], json!(["implementor"]));
+    let got = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "sigma" })).await;
+    assert_eq!(
+        got["specialist"]["role"], created["specialist"]["role"],
+        "create response agrees with the following get over WSS"
+    );
+
+    // edit — the explicit clears drop the fields.
+    let edited = wss_rpc(
+        &mut ws,
+        6,
+        "specialist.edit",
+        json!({
+            "id": "sigma",
+            "scope": "user",
+            "spec": {
+                "id": "sigma", "name": "Sigma", "description": "Authored",
+                "role": "", "icon": "", "teamAgents": [],
+                "prompt": "Sigma body."
+            }
+        }),
+    )
+    .await;
+    assert!(edited["specialist"].get("role").is_none(), "role cleared");
+    assert!(edited["specialist"].get("icon").is_none(), "icon cleared");
+    assert!(
+        edited["specialist"].get("teamAgents").is_none(),
+        "teamAgents cleared"
+    );
+
+    // create — invalid wire shapes are rejected with -32602 (PROTOCOL §9).
+    let invalid_specs = [
+        json!({ "id": "tau", "name": "Tau", "description": "Bad", "role": "manager", "prompt": "b" }),
+        json!({ "id": "tau", "name": "Tau", "description": "Bad", "icon": 42, "prompt": "b" }),
+        json!({ "id": "tau", "name": "Tau", "description": "Bad", "teamAgents": "not-an-array", "prompt": "b" }),
+    ];
+    for (i, spec) in invalid_specs.iter().enumerate() {
+        let rejected = wss_rpc_raw(
+            &mut ws,
+            7 + i64::try_from(i).expect("index fits in i64"),
+            "specialist.create",
+            json!({ "id": "tau", "scope": "user", "spec": spec }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], -32602,
+            "invalid picker metadata → -32602 over WSS: {rejected}"
+        );
+    }
+
+    drop(daemon);
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
