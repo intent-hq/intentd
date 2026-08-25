@@ -179,5 +179,154 @@ pub(crate) fn build_workspace_summary(
     }
 }
 
+/// Serialized-size ceiling for one `event.query` response (monorepo#3347).
+/// Sized comfortably below the transport's 1 MiB large-frame advisory
+/// (`LARGE_MESSAGE_WARN_BYTES`): [`bound_event_rows`] charges each row its
+/// ACTUAL post-cap serialized size against this budget, so the response
+/// total stays within `budget + Σ(per-row identity fields + marker)` — the
+/// identity fields are normally small daemon-generated scalars (uuid ids,
+/// ISO timestamps, enum actor types), keeping the worst case under the
+/// advisory even at [`EVENT_QUERY_MAX_LEGACY_LIMIT`] rows. Rows whose
+/// stored strings are pathological get every trimmable field capped —
+/// see [`EVENT_ROW_TRIM_FIELDS`] — so the only untrimmable floor is the
+/// bounded scalar set (`id`, `workspaceId`, `type`, `timestamp`).
+pub(crate) const EVENT_QUERY_RESPONSE_BUDGET_BYTES: usize = 700 * 1024;
+
+/// Row-count cap for the legacy (non-paginated) `event.query` path
+/// (monorepo#3347). Previously the caller-supplied limit was passed to SQL
+/// unclamped (a negative value even meant "no limit"), so the byte ceiling
+/// above could be defeated by sheer row count — the identity fields of an
+/// unbounded row set are themselves unbounded. 500 keeps the FE's 300-row
+/// boot snapshot intact; the paginated path keeps its own [1, 200] clamp.
+pub(crate) const EVENT_QUERY_MAX_LEGACY_LIMIT: i64 = 500;
+
+/// The per-row fields eligible for trimming, in cap order: the small
+/// identity-adjacent fields first (their tiny intact copies are admitted
+/// before the payload spends the shared budget), then the bulky
+/// type-specific payload and free-form metadata. `actor` and the
+/// session/correlation/parent ids are normally small daemon-generated
+/// scalars that pass through intact — but they are caller-influenced
+/// (`actor.name`, free-form `actor.metadata`) and stored unbounded, so
+/// leaving them untrimmable would let a pathological row defeat the
+/// response ceiling. The truly untrimmable floor is the bounded
+/// daemon-generated scalar set: `id`, `workspaceId`, `type`, `timestamp`,
+/// plus the two markers.
+const EVENT_ROW_TRIM_FIELDS: [&str; 6] = [
+    "actor",
+    "sessionId",
+    "correlationId",
+    "parentEventId",
+    "data",
+    "metadata",
+];
+
+/// Serialize an `event.query` row set to wire-shape JSON values, ready for
+/// [`bound_event_rows`]. Pure so the service layer maps the error itself.
+pub(crate) fn serialize_event_rows(
+    events: Vec<Event>,
+) -> std::result::Result<Vec<Value>, serde_json::Error> {
+    events.into_iter().map(serde_json::to_value).collect()
+}
+
+/// Bound the serialized size of an `event.query` row set (monorepo#3347).
+///
+/// A row set whose total serialized size fits [`EVENT_QUERY_RESPONSE_BUDGET_BYTES`]
+/// is returned untouched (byte-identical wire behavior for the common case).
+/// Over budget, rows are walked in wire order (newest→oldest) with a running
+/// budget: each row gets a fair share of what remains (`remaining / rows_left`,
+/// so small rows donate their unused share to the rows after them), and a row
+/// over its share has its [`EVENT_ROW_TRIM_FIELDS`] replaced by
+/// [`intent_core::cap_json_value`] bounded previews plus additive row-level
+/// markers `truncated: true` and `originalBytes` (the row's full serialized
+/// size), so the trimming is observable rather than silent. Row count and the
+/// per-row identity shape are preserved — no rows are dropped, and a trimmed
+/// row always keeps `actor.type` (required on the wire).
+///
+/// `cap_json_value` budgets strings by RAW UTF-8 length, but the row is
+/// JSON-serialized afterward, so escaping-heavy content (quotes, backslashes,
+/// control chars — up to 6 output bytes per input byte) can serialize well
+/// past the allowance. The cap therefore measures the row's ACTUAL serialized
+/// size after each pass and proportionally shrinks the allowance and re-caps
+/// until the row fits its share — the same converging shrink as
+/// `AgentLite::cap_list_previews` — so the wire bound holds regardless of
+/// content.
+///
+/// Returns the number of trimmed rows (`0` = response untouched).
+pub(crate) fn bound_event_rows(rows: &mut [Value]) -> usize {
+    let total: usize = rows.iter().map(intent_core::slim_body_size).sum();
+    if total <= EVENT_QUERY_RESPONSE_BUDGET_BYTES {
+        return 0;
+    }
+    let n = rows.len();
+    let mut remaining = EVENT_QUERY_RESPONSE_BUDGET_BYTES;
+    let mut trimmed = 0usize;
+    for (i, row) in rows.iter_mut().enumerate() {
+        let size = intent_core::slim_body_size(row);
+        let share = remaining / (n - i);
+        if size <= share {
+            remaining -= size;
+            continue;
+        }
+        if !row.is_object() {
+            // Rows are always serialized `Event` objects; charge anything
+            // else defensively and move on.
+            remaining = remaining.saturating_sub(size);
+            continue;
+        }
+        remaining = remaining.saturating_sub(cap_event_row(row, share, size));
+        trimmed += 1;
+    }
+    trimmed
+}
+
+/// Cap one over-share `event.query` row in place: replace its
+/// [`EVENT_ROW_TRIM_FIELDS`] with bounded previews, stamp the
+/// `truncated` / `originalBytes` markers, and converge on the row's ACTUAL
+/// serialized size (escaping-aware — see [`bound_event_rows`]). `size` is the
+/// row's full pre-cap serialized size. Returns the post-cap serialized size
+/// to charge against the running budget. The row must be an object.
+fn cap_event_row(row: &mut Value, share: usize, size: usize) -> usize {
+    let obj = row.as_object_mut().expect("caller checked is_object");
+    let bulk: usize = EVENT_ROW_TRIM_FIELDS
+        .iter()
+        .filter_map(|k| obj.get(*k))
+        .map(intent_core::slim_body_size)
+        .sum();
+    let base = size.saturating_sub(bulk);
+    // `actor.type` is required on the wire; a starved cap may drop it from
+    // the actor preview, so it is restored after every pass (a tiny bounded
+    // enum string — "user"/"agent"/"system"/"tool").
+    let actor_type = obj.get("actor").and_then(|a| a.get("type")).cloned();
+    obj.insert("truncated".to_string(), Value::Bool(true));
+    obj.insert("originalBytes".to_string(), Value::from(size));
+    // The trimmable fields share the allowance sequentially, small
+    // identity-adjacent fields first (see EVENT_ROW_TRIM_FIELDS order).
+    let mut allowance = share.saturating_sub(base);
+    loop {
+        let obj = row.as_object_mut().expect("still an object");
+        let mut budget = allowance;
+        for key in EVENT_ROW_TRIM_FIELDS {
+            if let Some(v) = obj.get_mut(key) {
+                let capped = intent_core::cap_json_value(v, &mut budget);
+                *v = capped;
+            }
+        }
+        if let (Some(t), Some(actor)) = (&actor_type, obj.get_mut("actor")) {
+            if let Some(actor_obj) = actor.as_object_mut() {
+                actor_obj.insert("type".to_string(), t.clone());
+            }
+        }
+        let actual = intent_core::slim_body_size(row);
+        if actual <= share || allowance == 0 {
+            return actual;
+        }
+        // Escaping made the capped row serialize past its share: shrink the
+        // allowance proportionally and re-cap (re-capping the already-capped
+        // fields only shrinks them further). `actual > share` makes the new
+        // allowance strictly smaller, so the loop converges.
+        allowance = allowance * share / actual;
+    }
+}
+
 #[cfg(test)]
 mod tests;

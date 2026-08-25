@@ -20254,8 +20254,15 @@ impl WorkspaceApi for Services {
             // `page_token`); otherwise the legacy bare array is preserved verbatim.
             let paginate = params.paginate.unwrap_or(false) || params.page_token.is_some();
             // Mirror `buildQueryFilters`: each option is applied only when
-            // truthy (empty strings / 0 are skipped); `limit || 50`.
-            let legacy_limit = params.limit.filter(|&l| l != 0).unwrap_or(50);
+            // truthy (empty strings / 0 are skipped); `limit || 50`, clamped
+            // (monorepo#3347) — previously an unclamped limit reached SQL
+            // directly, where a negative value even means "no limit", making
+            // the response byte ceiling defeatable by sheer row count.
+            let legacy_limit = params
+                .limit
+                .filter(|&l| l != 0)
+                .unwrap_or(50)
+                .clamp(1, event_ops::EVENT_QUERY_MAX_LEGACY_LIMIT);
             let mut q = EventQuery {
                 workspace_id: Some(workspace_id),
                 limit: Some(legacy_limit),
@@ -20298,10 +20305,20 @@ impl WorkspaceApi for Services {
                 q.since = Some(iso_minutes_ago(m));
             }
             if !paginate {
-                // Legacy bare array (store yields newest→oldest).
+                // Legacy bare array (store yields newest→oldest), bounded
+                // below the transport's large-frame advisory (monorepo#3347).
                 let events = store.query_events(&q).await?;
-                return serde_json::to_value(events)
-                    .map_err(|e| Error::Internal(format!("serialize events failed: {e}")));
+                let mut rows = event_ops::serialize_event_rows(events)
+                    .map_err(|e| Error::Internal(format!("serialize events failed: {e}")))?;
+                let trimmed = event_ops::bound_event_rows(&mut rows);
+                if trimmed > 0 {
+                    tracing::debug!(
+                        trimmed,
+                        rows = rows.len(),
+                        "event.query response over size budget; row payloads trimmed"
+                    );
+                }
+                return Ok(serde_json::Value::Array(rows));
             }
             // Paginated: clamp the page size, page backward via OFFSET, and fetch
             // one extra row to decide whether an older page remains. The store
@@ -20320,10 +20337,20 @@ impl WorkspaceApi for Services {
             } else {
                 serde_json::Value::Null
             };
-            let items = serde_json::to_value(events)
+            // The page is bounded the same way as the legacy array
+            // (monorepo#3347); `nextToken` is unaffected by trimming.
+            let mut rows = event_ops::serialize_event_rows(events)
                 .map_err(|e| Error::Internal(format!("serialize events failed: {e}")))?;
+            let trimmed = event_ops::bound_event_rows(&mut rows);
+            if trimmed > 0 {
+                tracing::debug!(
+                    trimmed,
+                    rows = rows.len(),
+                    "event.query response over size budget; row payloads trimmed"
+                );
+            }
             Ok(serde_json::json!({
-                "items": items,
+                "items": serde_json::Value::Array(rows),
                 "nextToken": next_token,
             }))
         })
