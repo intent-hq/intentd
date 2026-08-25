@@ -6875,8 +6875,12 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
             "sub-threshold window overrun under load (upper bound \
              {wait_upper_bound:?}); asserting over-threshold consistency"
         );
+        // Symmetric wall-clock slack: the daemon gates the annotation on a
+        // wall-clock reading (`now_utc() - queuedAt`), so a forward clock
+        // step can legitimately annotate while the monotonic bound sits just
+        // under the threshold.
         assert!(
-            wait_upper_bound.as_millis() >= PROD_DEQUEUE_WAIT_MIN_MS,
+            wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS >= PROD_DEQUEUE_WAIT_MIN_MS,
             "dequeue-wait note appeared although the observed wait upper \
              bound {wait_upper_bound:?} is sub-threshold: {drained}"
         );
