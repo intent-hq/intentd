@@ -12904,6 +12904,178 @@ async fn wake_or_create_skips_watch_when_caller_deleted_create_branch() {
     assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
+/// monorepo#3442: the `created_new` branch persists the live caller as the
+/// created session's `parent_agent_id`, making a wakeOrCreate-created agent a
+/// delegated child — so `agent.reportToParent` succeeds for it and delivers
+/// the report wake to the caller, like a delegate child.
+#[tokio::test]
+async fn wake_or_create_created_new_sets_parent_to_live_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Parent linkage").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert_eq!(
+        session.parent_agent_id,
+        Some(caller.clone()),
+        "wakeOrCreate-created agent must be a delegated child of the caller"
+    );
+
+    // `reportToParent` succeeds for the child: report persisted on the session
+    // and the wake delivered to the caller.
+    let baseline = parent_message_count(&svc, &caller).await;
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(created.clone()))
+        .await
+        .expect("reportToParent must succeed for a wakeOrCreate-created child");
+    assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert_eq!(session.completion_report.as_deref(), Some("shipped it"));
+}
+
+/// monorepo#3442: the caller-less create path keeps `parent_agent_id` unset —
+/// `reportToParent` stays unavailable for such agents.
+#[tokio::test]
+async fn wake_or_create_created_new_without_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "No caller parent").await;
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "kickoff".into(),
+            AgentWakeOrCreateInput::default(),
+        )
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(session.parent_agent_id.is_none());
+}
+
+/// monorepo#3442: a Deleted caller must not become a parent (it can never
+/// receive the report wake) — mirrors `agent_delegate_op`'s deleted-parent
+/// guard, sharing the monorepo#994 `caller_deleted` pre-gate.
+#[tokio::test]
+async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Deleted caller parent").await;
+    flag_agent_deleted(&svc, &caller).await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(
+        session.parent_agent_id.is_none(),
+        "deleted caller must not become a parent"
+    );
+}
+
+/// monorepo#3442: an unknown `callerAgentId` (no session resolves for it) must
+/// not be persisted as the child's parent — a dangling parent would enable
+/// `reportToParent` against a nonexistent recipient and emit an unresolvable
+/// `parentAgentId`. Parentage derives from the resolved `caller_session`, not
+/// the raw client-supplied ID.
+#[tokio::test]
+async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Unknown caller parent").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(AgentId::from("agent-00000000-dead-beef-0000-000000000000")),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(
+        session.parent_agent_id.is_none(),
+        "unknown caller must not become a dangling parent"
+    );
+}
+
+/// monorepo#3442 (fail-closed): a caller whose persisted `delegation_depth`
+/// column is at `MAX_DELEGATION_DEPTH` cannot bypass the cap with an explicit
+/// lower wire `delegationDepth`. The B3 pre-check reads the wire value and
+/// passes, but `agent_create_op`'s LC-1 guard reads the column and rejects —
+/// pre-fix this path never fired on the create branch (parent was `None`) and
+/// produced a parentless agent; post-fix the call errors.
+#[tokio::test]
+async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Capped coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Depth cap fail-closed").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    session.delegation_depth = Some(MAX_DELEGATION_DEPTH);
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("persist capped depth");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        delegation_depth: Some(0),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect_err("LC-1 must reject a caller stored at the cap");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("maximum delegation depth")),
+        "expected the LC-1 depth rejection, got {err:?}"
+    );
+}
+
 /// monorepo#994: the queued-to-active branch shares the wake-branch SUB-1
 /// block, so a Deleted caller gets no caller→assignee watch.
 #[tokio::test]

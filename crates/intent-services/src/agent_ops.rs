@@ -9943,6 +9943,16 @@ impl Services {
         {
             crate::agent_subscriptions::check_watch_scope(&session.workspace_id, &workspace_id)?;
         }
+        // monorepo#3442: the caller becomes the created agent's parent ONLY
+        // when its session actually resolved and is not Deleted. Derived from
+        // `caller_session` (not the raw wire `callerAgentId`) so an unknown
+        // client-supplied ID can never be persisted as a dangling parent —
+        // a dangling parent would enable `agent.reportToParent` against a
+        // nonexistent recipient and emit an unresolvable `parentAgentId`.
+        let caller_parent = caller_session
+            .as_ref()
+            .filter(|s| s.status != AgentStatus::Deleted)
+            .map(|s| s.id.clone());
 
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
@@ -10233,13 +10243,33 @@ impl Services {
             is_background: None,
             name_explicitly_set: None,
         };
+        // monorepo#3442: the resolved live caller (`caller_parent`, derived
+        // from the single `caller_session` lookup — never the raw wire
+        // `callerAgentId`) becomes the created agent's `parent_agent_id`, so
+        // a wakeOrCreate-created agent is a delegated child
+        // (`agent.reportToParent` works, attention/failure events carry the
+        // parent). A Deleted caller and an unknown/unresolvable `callerAgentId`
+        // both stay parentless. This is deliberately STRICTER than
+        // `agent_delegate_op`, which passes its parent unfiltered and only
+        // skips watch registration for a Deleted parent — here a parent that
+        // can never receive the report wake is not recorded at all. Note
+        // `build_create_metadata` above still records the raw wire caller as
+        // `createdByAgentId` (creation provenance) even when the parent is
+        // filtered out, so the two fields can intentionally diverge on the
+        // deleted-caller path. Depth guards: the B3 pre-check reads the wire
+        // `delegationDepth` (else the caller's `metadata.delegationDepth`),
+        // while `agent_create_op`'s LC-1 guard reads the parent's persisted
+        // `delegation_depth` column — so a caller whose column is at
+        // `MAX_DELEGATION_DEPTH` passing an explicit lower wire depth clears
+        // B3 but is rejected by LC-1. That pass-then-reject is intentional
+        // fail-closed behavior: the wire value cannot bypass the stored cap.
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
                 name,
                 model,
                 specialist,
-                None,
+                caller_parent,
                 Some(task_note_id.clone()),
                 skip_auto_commit,
                 extra,
