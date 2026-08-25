@@ -632,7 +632,8 @@ impl McpHub {
                     })
             }
             ToolTarget::Http { url, headers } => {
-                tokio::time::timeout(timeout, http_tool_session(&url, &headers, method, params))
+                let session = http_tool_session(&url, &headers, method, params, timeout);
+                tokio::time::timeout(timeout, session)
                     .await
                     .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?
             }
@@ -912,7 +913,7 @@ async fn probe_sse(
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.send().await.map_err(|e| classify_send_error(&e, url))?;
+    let resp = req.send().await.map_err(|e| classify_send_error(e, url))?;
     check_http_status(resp.status())
 }
 
@@ -998,15 +999,19 @@ async fn delete_session(
 /// best-effort session DELETE. Returns the request's JSON-RPC `result`.
 /// Mirrors [`probe_http_handshake`]'s session handling (headers injected on
 /// every request, redirects never followed, credentials never echoed in
-/// errors); the caller bounds the whole session with its own timeout.
+/// errors). `timeout` bounds each request in the session so a slow tool can
+/// use the caller's full budget (a client-level [`HANDSHAKE_TIMEOUT`] would
+/// silently cap `tools/call` at 10s regardless of `timeoutMs`); the caller
+/// additionally bounds the whole session with the same timeout.
 async fn http_tool_session(
     url: &str,
     headers: &[(String, String)],
     method: &str,
     params: Value,
+    timeout: Duration,
 ) -> Result<Value> {
     let client = reqwest::Client::builder()
-        .timeout(HANDSHAKE_TIMEOUT)
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::Internal(format!("http client init failed: {e}")))?;
@@ -1091,13 +1096,13 @@ async fn post_rpc(
     if let Some(ver) = protocol_version {
         req = req.header("MCP-Protocol-Version", ver);
     }
-    req.send().await.map_err(|e| classify_send_error(&e, url))
+    req.send().await.map_err(|e| classify_send_error(e, url))
 }
 
 /// Read a JSON-RPC response envelope from a streamable-HTTP reply: a JSON body
 /// directly, or the SSE frame carrying the response with `id`. The per-request
 /// SSE stream closes once the response is delivered, and the read is bounded
-/// by the client-wide [`HANDSHAKE_TIMEOUT`] either way.
+/// by the client-wide timeout either way.
 async fn read_rpc_response(mut resp: reqwest::Response, id: u64) -> Result<Value> {
     let ct = resp
         .headers()
@@ -1148,14 +1153,37 @@ fn sse_response_for_id(buf: &str, id: u64) -> Option<Value> {
 }
 
 /// Map a transport-level reqwest failure onto a user-facing `lastError`.
-fn classify_send_error(e: &reqwest::Error, url: &str) -> Error {
+/// These strings also reach agents through `ws.mcp.*` errors, so the URL is
+/// scrubbed of credentials and the reqwest error is stripped of its own URL
+/// echo before formatting. The timeout arm covers connect *and* response-read
+/// expiry, so it must not claim the failure happened while "connecting".
+fn classify_send_error(e: reqwest::Error, url: &str) -> Error {
+    let url = scrub_url(url);
     if e.is_timeout() {
-        Error::Internal(format!("timed out connecting to {url}"))
+        Error::Internal(format!("request to {url} timed out"))
     } else if e.is_connect() {
         Error::Internal(format!("unreachable from daemon host: {url}"))
     } else {
+        let e = e.without_url();
         Error::Internal(format!("request to {url} failed: {e}"))
     }
+}
+
+/// Strip credential-bearing parts (userinfo, query, fragment) from a
+/// configured URL before it is embedded in an error message: remote MCP URLs
+/// may carry tokens as `user:pass@` userinfo or `?token=…` query params, and
+/// the non-sensitive server projection deliberately withholds the URL from
+/// agents — the error path must not undo that. Unparseable URLs are replaced
+/// wholesale rather than echoed.
+fn scrub_url(url: &str) -> String {
+    let Ok(mut u) = reqwest::Url::parse(url) else {
+        return "<configured url>".to_string();
+    };
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.set_query(None);
+    u.set_fragment(None);
+    u.to_string()
 }
 
 /// Map a non-success HTTP status onto a user-facing `lastError`.
@@ -2880,10 +2908,7 @@ mod tests {
         hold.abort();
         assert_eq!(v["status"], json!("error"));
         assert!(v.get("statusCode").is_none());
-        assert!(v["errorMessage"]
-            .as_str()
-            .unwrap()
-            .contains("timed out connecting to"));
+        assert!(v["errorMessage"].as_str().unwrap().contains("timed out"));
     }
 
     // -- tool forwarding (tools/list + tools/call) ---------------------------
@@ -3194,5 +3219,92 @@ mod tests {
         let msg = format!("{err}");
         assert!(!msg.contains("supersecret-token"), "leaked secret: {msg}");
         assert!(msg.contains("authentication failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn scrub_url_strips_userinfo_query_and_fragment() {
+        let scrubbed = scrub_url("https://user:hunter2@mcp.example.com:8443/rpc?token=tok123#f");
+        assert!(!scrubbed.contains("user"), "userinfo leaked: {scrubbed}");
+        assert!(!scrubbed.contains("hunter2"), "password leaked: {scrubbed}");
+        assert!(!scrubbed.contains("tok123"), "query leaked: {scrubbed}");
+        assert!(!scrubbed.contains('#'), "fragment leaked: {scrubbed}");
+        assert_eq!(scrubbed, "https://mcp.example.com:8443/rpc");
+        assert_eq!(scrub_url("not a url"), "<configured url>");
+    }
+
+    #[tokio::test]
+    async fn http_tool_session_request_bound_tracks_caller_timeout() {
+        // The session's per-request client timeout must be the caller's
+        // timeout, not the fixed 10s HANDSHAKE_TIMEOUT — otherwise a slow
+        // HTTP tool silently caps at ~10s regardless of `timeoutMs`. A
+        // never-answering listener + a short session timeout proves the
+        // request bound follows the parameter: with the old fixed bound this
+        // would take the full 10s.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let err = http_tool_session(
+            &url,
+            &[],
+            "tools/call",
+            json!({}),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        hold.abort();
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "request bound did not track the caller timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_timeout_does_not_claim_connecting() {
+        // A request timeout covers connect *and* response-read expiry, so the
+        // message must not misreport it as a connect failure.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let e = client.post(&url).send().await.unwrap_err();
+        hold.abort();
+        assert!(e.is_timeout(), "expected a timeout error: {e}");
+        let msg = format!("{}", classify_send_error(e, &url));
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(!msg.contains("connecting"), "misreported: {msg}");
+    }
+
+    #[tokio::test]
+    async fn http_tool_error_never_echoes_url_credentials() {
+        // Unreachable endpoint with credentials embedded in the URL: the
+        // agent-facing error must carry the scrubbed URL only.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://user:hunter2@{addr}/rpc?token=tok123");
+        let h = remote_hub("r1", "http", &url, json!({}));
+        let err = h.call_tool("r1", "t", json!({}), None).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("hunter2"), "password leaked: {msg}");
+        assert!(!msg.contains("tok123"), "query token leaked: {msg}");
+        assert!(msg.contains("unreachable from daemon host"), "got: {msg}");
     }
 }
