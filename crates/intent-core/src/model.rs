@@ -2504,6 +2504,13 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 /// Read back by [`AgentSession::is_initial_agent`].
 pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 
+/// Sponsor attribution key in `agent_session.metadata` JSON: stamped by
+/// `ws.agent.spawnPeer` with the spawning agent's id so `agent.list` /
+/// `agent.get` can serve `metadata.sponsorAgentId` on peer rows. Rides the
+/// existing free-form `metadata` column (no schema migration), like
+/// [`IS_INITIAL_AGENT_KEY`]. Read back by [`AgentSession::sponsor_agent_id`].
+pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
+
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
 /// user-originated entry point — which always delivers immediately; it
@@ -2818,6 +2825,18 @@ impl AgentSession {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     }
+
+    /// The sponsor attribution persisted under [`SPONSOR_AGENT_ID_KEY`] in
+    /// the session's free-form `metadata`: the agent that spawned this
+    /// independent peer via `ws.agent.spawnPeer`. `None` for non-peer
+    /// sessions (absent, empty, or non-string values all read as `None`).
+    pub fn sponsor_agent_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(SPONSOR_AGENT_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
@@ -2888,6 +2907,14 @@ pub struct AgentMetadata {
     /// initial-agent orchestration). Omitted otherwise — never `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_initial_agent: Option<bool>,
+    /// Sponsor attribution for `ws.agent.spawnPeer`-created peers: the agent
+    /// that spawned this INDEPENDENT top-level agent. Attribution only —
+    /// unlike `createdByAgentId` it implies no parent linkage, no reporting
+    /// obligation, and no delegation depth. Rides the free-form session
+    /// `metadata` under [`SPONSOR_AGENT_ID_KEY`] (like
+    /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsor_agent_id: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -3108,6 +3135,7 @@ impl AgentLite {
         });
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
+        let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -3127,6 +3155,7 @@ impl AgentLite {
             pending_questions_message_id,
             last_seen_message_id,
             is_initial_agent,
+            sponsor_agent_id,
         };
         Self {
             id: session.id,

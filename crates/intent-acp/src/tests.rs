@@ -8342,6 +8342,7 @@ mod wsapi4_bindings_tests {
                 pending_questions_message_id: None,
                 last_seen_message_id: None,
                 is_initial_agent: None,
+                sponsor_agent_id: None,
             },
         }
     }

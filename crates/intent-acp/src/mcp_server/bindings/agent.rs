@@ -11,11 +11,12 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS;
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
     model::{AgentDelegateInput, BatchTaskEntry},
-    AgentCreateExtra, AgentId, AgentWakeOrCreateInput, Error, MessageOrigin, NoteId, WorkspaceApi,
-    WorkspaceId, MAX_DELEGATION_DEPTH,
+    AgentCreateExtra, AgentId, AgentStatus, AgentWakeOrCreateInput, Error, MessageOrigin, NoteId,
+    WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
 
@@ -31,6 +32,8 @@ pub(crate) const PRELUDE: &str = r"
     ws.agent = {
         create: (name, message, opts) =>
             host({ method: 'agent.create', args: { name, message, ...(opts || {}) } }),
+        spawnPeer: (name, message, opts) =>
+            host({ method: 'agent.spawnPeer', args: { name, message, ...(opts || {}) } }),
         delegate: (opts) => host({ method: 'agent.delegate', args: { ...(opts || {}) } }),
         send: (agentId, message, priority, messageMetadata) => {
             const opts = priority !== null && typeof priority === 'object' ? priority : { priority };
@@ -87,15 +90,28 @@ pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (
 /// verbatim).
 pub(crate) const RETIRE_PRELUDE_SEGMENT: &str = "        retire: (reason) =>\n            host({ method: 'agent.retire', args: { reason } }),\n";
 
+/// The `ws.agent.spawnPeer` installer lines inside [`PRELUDE`], removed when
+/// `agentFeatures.peerAgents` is off (the opt-in toggle) AND on sub-agent
+/// bridges — spawning peers is a top-level-agent capability, like
+/// `ws.app.question.ask` (a unit test guards that this segment still matches
+/// the prelude verbatim).
+pub(crate) const SPAWN_PEER_PRELUDE_SEGMENT: &str = "        spawnPeer: (name, message, opts) =>\n            host({ method: 'agent.spawnPeer', args: { name, message, ...(opts || {}) } }),\n";
+
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
 /// off the two attention-request installers are omitted, and with
 /// `agentFeatures.peerAgents` off (the default — it is the one opt-in
-/// toggle) the `retire` installer is omitted, so agent code touching them
-/// fails with a clear `not a function` `TypeError`. Every other `ws.agent.*`
-/// method (including `reportToParent`) stays un-gated. With both toggles on
-/// this borrows [`PRELUDE`] byte-identically.
-pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {
-    if features.attention_requests && features.peer_agents {
+/// toggle) the `retire` and `spawnPeer` installers are omitted, so agent
+/// code touching them fails with a clear `not a function` `TypeError`.
+/// `spawnPeer` is additionally omitted on sub-agent bridges regardless of
+/// the toggle — it is top-level-only, like `ws.app.question`. Every other
+/// `ws.agent.*` method (including `reportToParent`) stays un-gated. With
+/// both toggles on (top-level bridge) this borrows [`PRELUDE`]
+/// byte-identically.
+pub(crate) fn prelude_for(
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+) -> Cow<'static, str> {
+    if features.attention_requests && features.peer_agents && !is_sub_agent {
         return Cow::Borrowed(PRELUDE);
     }
     let mut js = PRELUDE.to_string();
@@ -104,6 +120,9 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str>
     }
     if !features.peer_agents {
         js = js.replacen(RETIRE_PRELUDE_SEGMENT, "", 1);
+    }
+    if !features.peer_agents || is_sub_agent {
+        js = js.replacen(SPAWN_PEER_PRELUDE_SEGMENT, "", 1);
     }
     Cow::Owned(js)
 }
@@ -117,6 +136,7 @@ pub(crate) async fn dispatch(
 ) -> Result<Value, String> {
     match method {
         "create" => create(api, ws, caller, args).await,
+        "spawnPeer" => spawn_peer(api, ws, caller, args).await,
         "delegate" => delegate(api, ws, caller, args).await,
         "send" => send(api, ws, caller, args).await,
         "sendToTask" => send_to_task(api, ws, caller, args).await,
@@ -279,6 +299,174 @@ async fn create(
         "agentId": agent_id,
         "name": agent_name,
         "subscriptionId": subscription_id,
+    }))
+}
+
+/// Cap on live top-level agents for `ws.agent.spawnPeer`, read from
+/// `agents.maxTopLevelAgents` (settings) with the compiled default as the
+/// fallback when the settings read fails.
+async fn max_top_level_agents(api: &Arc<dyn WorkspaceApi>) -> u64 {
+    api.settings_get("agents.maxTopLevelAgents".to_string())
+        .await
+        .ok()
+        .and_then(|v| v.get("value").and_then(Value::as_u64))
+        .unwrap_or(u64::from(DEFAULT_MAX_TOP_LEVEL_AGENTS))
+}
+
+/// Live (non-deleted, non-retired) TOP-LEVEL (depth-0, parentless) agents in
+/// the workspace — the population `agents.maxTopLevelAgents` caps on the
+/// peer-spawn path. Depth is read like the `create` depth guard: session
+/// `delegationDepth` metadata, absent reads as 0; parentless is required so
+/// a child row with scrubbed metadata never counts.
+fn count_live_top_level(agents: &[intent_core::AgentLite]) -> u64 {
+    agents
+        .iter()
+        .filter(|a| {
+            a.status != AgentStatus::Deleted
+                && a.retired_at.is_none()
+                && a.parent_agent_id.is_none()
+                && a.metadata.delegation_depth.unwrap_or(0) == 0
+        })
+        .count() as u64
+}
+
+/// The daemon-prepended sponsor preamble on a spawned peer's initial
+/// message: names the sponsor, states the peer's independent co-equal
+/// standing (no reporting obligation — `reportToParent` does not apply),
+/// and points at `ws.agent.list` / `ws.agent.send` for team coordination.
+fn sponsor_preamble(sponsor_id: &AgentId, sponsor_name: Option<&str>) -> String {
+    let sponsor = match sponsor_name {
+        Some(n) => format!("{n} ({})", sponsor_id.as_str()),
+        None => sponsor_id.as_str().to_string(),
+    };
+    format!(
+        "[You were spawned as an independent top-level agent by {sponsor} (your sponsor). \
+         You are a co-equal peer, not a sub-agent: you have no parent and no obligation to \
+         report progress or status to your sponsor — `ws.agent.reportToParent` does not \
+         apply to you. Use `ws.agent.list` to discover the other agents in this workspace \
+         and `ws.agent.send` to reach them.]\n\n"
+    )
+}
+
+/// `ws.agent.spawnPeer`: create an INDEPENDENT top-level agent — depth 0,
+/// no `parentAgentId`, no `createdByAgentId`, no auto-subscribe of the
+/// spawner — with metadata `sponsorAgentId` = caller and the sponsor
+/// preamble prepended to the delivered initial message. Peers are
+/// FOREGROUND by default (`isBackground: false`). Guarded by the
+/// `agents.maxTopLevelAgents` cap on live (non-deleted, non-retired)
+/// top-level agents; the depth guard never applies (peers are depth 0, so
+/// peer-of-peer chains always spawn). Feature-gated behind
+/// `agentFeatures.peerAgents` and top-level-only at the dispatch layer.
+async fn spawn_peer(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller = caller.ok_or_else(|| "spawnPeer requires an agent caller identity".to_string())?;
+    let name = req_str(args, "name").map_err(|_| "name is required".to_string())?;
+    let initial_message =
+        req_str(args, "message").map_err(|_| "message is required".to_string())?;
+    // Runaway-spawn guard: reject when live top-level agents are already at
+    // the `agents.maxTopLevelAgents` cap. Advisory (check-then-create, no
+    // atomicity) — the cap bounds runaway loops, not a hard invariant.
+    let cap = max_top_level_agents(api).await;
+    let live = count_live_top_level(&api.agent_list(ws.clone()).await.map_err(map_err)?);
+    if live >= cap {
+        return Err(format!(
+            "Cannot spawn peer: the workspace already has {live} live top-level agents, at the `agents.maxTopLevelAgents` cap ({cap}). Retire or delete an agent, or raise the cap in settings."
+        ));
+    }
+    let sponsor_name = api
+        .agent_get(caller.clone(), Some(ws.clone()))
+        .await
+        .ok()
+        .map(|lite| lite.name);
+    // Kickoff = daemon-prepended sponsor preamble, caller message after.
+    // Persisted as `metadata.initialMessage` AND delivered, so the stored
+    // copy matches what the peer actually received (parity with `create`).
+    let kickoff = format!(
+        "{}{initial_message}",
+        sponsor_preamble(caller, sponsor_name.as_deref())
+    );
+    let is_background = opt_bool(args, "isBackground").unwrap_or(false);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("initialMessage".to_string(), Value::String(kickoff.clone()));
+    metadata.insert("isBackground".to_string(), Value::Bool(is_background));
+    metadata.insert(
+        "sponsorAgentId".to_string(),
+        Value::String(caller.as_str().to_string()),
+    );
+    if let Some(bp) = opt_str(args, "behaviorPrompt") {
+        metadata.insert("behaviorPrompt".to_string(), Value::String(bp));
+    }
+    let extra = AgentCreateExtra {
+        metadata: Some(Value::Object(metadata)),
+        is_background: Some(is_background),
+        provider: opt_str(args, "provider"),
+        reasoning_effort: opt_str(args, "reasoningEffort"),
+        ..AgentCreateExtra::default()
+    };
+    // `parent_agent_id: None` is the independence seam: the peer is created
+    // exactly like a user-created top-level agent (depth 0, parentless), so
+    // the depth guard, child-linkage suppressions and `reportToParent`
+    // plumbing never see the sponsor.
+    let created = api
+        .agent_create(
+            ws.clone(),
+            Some(name),
+            opt_str(args, "model"),
+            opt_str(args, "specialist"),
+            None,
+            opt_str(args, "idempotencyKey").or_else(|| Some(uuid::Uuid::new_v4().to_string())),
+            extra,
+        )
+        .await
+        .map_err(map_err)?;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let agent_name = created["agent"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // NO completion watch for the caller — peers are independent; the
+    // sponsor is not auto-woken when the peer finishes (watch explicitly
+    // with `ws.agent.watch` if desired).
+    //
+    // Deliver the kickoff with the same daemon-stamped sender attribution
+    // as other agent sends. Failure is non-fatal (the session exists).
+    let kickoff_metadata = merge_sender_attribution(
+        explicit_metadata(args),
+        Some(caller),
+        sponsor_name.as_deref(),
+    );
+    if let Err(e) = api
+        .agent_send_message(
+            ws.clone(),
+            AgentId::from(agent_id.as_str()),
+            kickoff,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            kickoff_metadata,
+            MessageOrigin::Automatic,
+        )
+        .await
+    {
+        tracing::warn!(agent = %agent_id, error = %e, "agent.spawnPeer: failed to start peer turn");
+    }
+    Ok(json!({
+        "ok": true,
+        "id": agent_id,
+        "agentId": agent_id,
+        "name": agent_name,
+        "sponsorAgentId": caller.as_str(),
     }))
 }
 

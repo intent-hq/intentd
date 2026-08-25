@@ -7980,7 +7980,11 @@ impl Services {
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
     /// wakeup cards unrelated to their own task — or the caller is a child
-    /// of the target (watches are auto-registered parent→child only).
+    /// of the target (watches are auto-registered parent→child only), or
+    /// the TARGET is an independent top-level foreground agent (not a
+    /// child, not background): messaging a co-equal peer must not passively
+    /// subscribe the sender to its completion — watch peers explicitly with
+    /// `agent.watch`.
     /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_for_sender_op(
         &self,
@@ -8033,6 +8037,39 @@ impl Services {
                 caller = %caller_agent_id.0,
                 target = %target_agent_id.0,
                 "skipping SUB-1 auto-watch — target already in undelivered after_all group"
+            );
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        // SUB-1 independent-peer suppression (spawnPeer): a top-level
+        // FOREGROUND target is a co-equal peer, not a worker — messaging it
+        // must not passively subscribe the sender to its completion (peers
+        // are watched explicitly with `agent.watch`). The auto-watch is
+        // armed only for targets that are delegated/created children (parent
+        // linkage, `createdByAgentId`, or depth >= 1) or background agents
+        // (the send-and-await-result worker shape the SUB-1 watch exists
+        // for). The bindings only attach the "You will be notified"
+        // notification when a subscription id comes back, so this skip also
+        // removes that text for depth-0 foreground targets.
+        let target_is_child = target_session.parent_agent_id.is_some()
+            || target_session.delegation_depth.unwrap_or(0) >= 1
+            || target_session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("createdByAgentId"))
+                .and_then(Value::as_str)
+                .is_some();
+        let target_is_background = target_session.is_background
+            || target_session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("isBackground"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if !target_is_child && !target_is_background {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — target is an independent top-level foreground agent"
             );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }

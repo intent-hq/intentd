@@ -225,12 +225,22 @@ impl WorkspaceMcpServer {
     /// `tools/list` serves the compact variant.
     #[must_use]
     pub fn full_workspace_api_description(&self) -> String {
-        tools::workspace_api_description_with_model_options(
+        let desc = tools::workspace_api_description_with_model_options(
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
-        )
-        .into_owned()
+        );
+        // Top-level-only rule for peer spawning: sub-agent bridges never
+        // advertise `ws.agent.spawnPeer` even with `peerAgents` on (the
+        // co-gated `ws.agent.retire` survives — it is self-scoped). The
+        // effective-features trick cannot express that split, so the doc
+        // line is scrubbed here; dispatch denies the frame as defense in
+        // depth (`SUB_AGENT_SPAWN_PEER_DENIED`).
+        if self.is_sub_agent {
+            tools::scrub_spawn_peer_doc(&desc)
+        } else {
+            desc.into_owned()
+        }
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation

@@ -11157,9 +11157,11 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
 /// `parent_agent_id` linkage), the child sends a coordination message back to
 /// its parent through `ws.agent.send`, and:
 /// - the child's persisted send tool result carries NO `subscriptionId` (the
-///   SUB-1 sender auto-watch is suppressed for child→parent sends), while a
-///   parentless bystander's identical send DOES get one — and only the
-///   bystander is later woken by the parent's completion;
+///   SUB-1 sender auto-watch is suppressed for child→parent sends — and the
+///   parent is also an independent top-level FOREGROUND target, which the
+///   target-side suppression skips), while a parentless bystander sending to
+///   the CHILD (a created worker target) DOES get one — and only the
+///   bystander is later woken by the child's completion;
 /// - the parent's `chat.subscribe` delta for the delivered row lifts the
 ///   persisted `agent_message` sender-attribution `metadata` onto the wire
 ///   entity (§7.1), while a human `agent.sendMessage` row carries no
@@ -11175,15 +11177,20 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     let ws_id = seed_workspace_only(&data_dir).await;
     // Rule 1 (parent kickoff): spawn the child through the real MCP
     // `workspace_api` binding so the session persists `parent_agent_id`.
-    // Rule 2 (child kickoff + bystander kickoff): find the parent by name and
-    // send to it — same code path for both callers; only the caller's parent
-    // linkage differs. `emitToolBlocks` persists the tool results so the
-    // suppression (no `subscriptionId`) is asserted from the transcript.
+    // Rule 2 (child kickoff): find the parent by name and send to it — the
+    // caller's parent linkage AND the target's top-level shape both suppress
+    // the watch. Rule 3 (bystander kickoff): send to the CHILD — a created
+    // worker target, so the sender watch IS armed. `emitToolBlocks` persists
+    // the tool results so the suppression (no `subscriptionId`) is asserted
+    // from the transcript.
     let spawn_code = "return await ws.agent.create('ChildC', 'please MESSAGE_PARENT now', \
                       { model: 'mock:default' });";
     let send_code = "const agents = await ws.agent.list(true); \
                      const target = agents.find(a => a.name === 'Coordinator'); \
                      return await ws.agent.send(target.id, 'child says hi');";
+    let bystander_code = "const agents = await ws.agent.list(true); \
+                          const target = agents.find(a => a.name === 'ChildC'); \
+                          return await ws.agent.send(target.id, 'bystander says hi');";
     let behavior = json!({
         "rules": [
             {
@@ -11202,6 +11209,15 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
                     "arguments": { "code": send_code, "summary": "send to parent e2e" }
                 },
                 "response": "sent upward",
+                "emitToolBlocks": true
+            },
+            {
+                "ifPromptContains": "MESSAGE_CHILD",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": bystander_code, "summary": "send to child e2e" }
+                },
+                "response": "sent sideways",
                 "emitToolBlocks": true
             }
         ],
@@ -11505,8 +11521,10 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         }
     }
 
-    // Contrast: a parentless BYSTANDER running the identical send DOES get
-    // the SUB-1 sender watch — and is later woken by the parent's completion.
+    // Contrast: a parentless BYSTANDER sending to the CHILD — a created
+    // worker target (parent linkage), not an independent top-level peer —
+    // DOES get the SUB-1 sender watch, and is later woken by the child's
+    // completion.
     let bystander = wss_rpc(
         &mut rpc,
         15,
@@ -11519,7 +11537,7 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         &mut rpc,
         16,
         "agent.sendMessage",
-        json!({ "workspaceId": &ws_id, "agentId": &bystander_id, "content": "please MESSAGE_PARENT now" }),
+        json!({ "workspaceId": &ws_id, "agentId": &bystander_id, "content": "please MESSAGE_CHILD now" }),
     )
     .await;
     assert_eq!(sent["success"], true, "bystander kickoff ok: {sent}");
@@ -11552,16 +11570,16 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         json!({ "workspaceId": &ws_id, "agentId": &bystander_id }),
     )
     .await;
-    let result = send_tool_result(&conv, &parent_id);
+    let result = send_tool_result(&conv, &child_id);
     assert!(
         result["subscriptionId"].is_string(),
-        "a non-child sender still gets the SUB-1 watch: {result}"
+        "a non-child sender to a worker target still gets the SUB-1 watch: {result}"
     );
 
-    // The parent's post-send idle fires the bystander's watch — the
-    // wake lands in the bystander transcript. The CHILD, whose watch was
-    // suppressed, has no wake despite the parent idling multiple times since
-    // its earlier send.
+    // The child's post-send idle fires the bystander's watch — the
+    // wake lands in the bystander transcript. The CHILD, whose own watch on
+    // the parent was suppressed, has no wake despite the parent idling
+    // multiple times since its earlier send.
     let mut woken = false;
     for attempt in 0..120i64 {
         let conv = wss_rpc(
