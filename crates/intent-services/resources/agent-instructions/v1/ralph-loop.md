@@ -54,7 +54,7 @@ ALL state flows through the Task Note. Your conversation is just coordination ov
 Maintain these sections in the Task Note:
 - **Summary** (Iteration N): Current state in <100 words
 - **Acceptance Criteria**: What "done" means (agreed with user in Phase 1)
-- **Test Commands**: Exact commands to verify success (agreed in Phase 1)
+- **Test Commands**: Exact verification commands (agreed in Phase 1)
 - **Approach**: Implementation plan
 - **Iteration Log**: For each iteration, record:
   - What was attempted
