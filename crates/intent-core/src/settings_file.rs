@@ -821,8 +821,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on**; changes apply to new agent
-/// sessions only.
+/// (`agentFeatures.*`). All default **on** except the opt-in
+/// `unreadSummaries`; changes apply to new agent sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[allow(clippy::struct_excessive_bools)]

@@ -26071,6 +26071,58 @@ async fn chat_unread_truncates_items_and_heads() {
     );
 }
 
+/// A present-but-dangling seen marker (markSeen accepts unknown ids by
+/// design; `editAndRegenerate` can orphan a valid one) falls back to the
+/// whole-transcript scan instead of blocking the read.
+#[tokio::test]
+async fn chat_unread_dangling_marker_scans_whole_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    let first = append_msg(&svc, &id, "assistant", "first reply", None).await;
+    let second = append_msg(&svc, &id, "assistant", "second reply", None).await;
+    svc.agent_mark_seen_op(ws.clone(), id.clone(), "msg-never-existed".to_string())
+        .await
+        .expect("markSeen accepts dangling ids");
+
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(2));
+    assert_eq!(digest["fromMessageId"], json!(first.id));
+    assert_eq!(digest["toMessageId"], json!(second.id));
+}
+
+/// The question wizard's flattened answer row (`type: "question_answers"`)
+/// is typed BY the human — it must reset the unread boundary, not be
+/// digested as machine content.
+#[tokio::test]
+async fn chat_unread_question_answers_row_resets_boundary() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Reader").await;
+    append_msg(&svc, &id, "assistant", "asked questions", None).await;
+    append_msg(
+        &svc,
+        &id,
+        "user",
+        "Q: pick one\nA: option b",
+        Some(json!({
+            "type": "question_answers",
+            "answeredQuestionsMessageId": "msg-questions"
+        })),
+    )
+    .await;
+    let reply = append_msg(&svc, &id, "assistant", "post-answer reply", None).await;
+
+    let digest = svc
+        .agent_chat_unread_op(ws.clone(), id.clone())
+        .await
+        .expect("digest");
+    assert_eq!(digest["messages"], json!(1));
+    assert_eq!(digest["fromMessageId"], json!(reply.id));
+    assert_eq!(digest["toMessageId"], json!(reply.id));
+}
+
 /// Fails closed like `agent.markSeen`: unknown agent and workspace mismatch
 /// are both `NotFound`.
 #[tokio::test]

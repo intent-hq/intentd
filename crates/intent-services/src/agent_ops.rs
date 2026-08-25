@@ -80,9 +80,15 @@ const UNREAD_SCAN_PAGE: i64 = 200;
 /// stamp `source` (system notices, `wake_or_create`), and hook / PR-monitor
 /// wakes stamp a metadata `type`. Absence of all three means a human-authored
 /// message (FE-attached metadata like `userAppMessageId` carries none of
-/// them).
+/// them). One `type` is exempt: the question wizard's flattened answer row
+/// ([`QUESTION_ANSWERS_METADATA_TYPE`]) is typed BY the human — the FE's
+/// canonical authorship predicate treats it as user-authored, so it must
+/// reset the unread boundary like any other human message.
 fn user_message_is_machine(metadata: Option<&Value>) -> bool {
     metadata.is_some_and(|md| {
+        if md.get("type").and_then(Value::as_str) == Some(QUESTION_ANSWERS_METADATA_TYPE) {
+            return false;
+        }
         md.get("fromAgentId").is_some() || md.get("source").is_some() || md.get("type").is_some()
     })
 }
@@ -5744,6 +5750,14 @@ impl Services {
     /// Tool-role rows are neither content nor boundaries. Read-only — never
     /// moves the seen marker. Fails closed on a nonexistent agent or a
     /// workspace mismatch (`NotFound`).
+    ///
+    /// Truncation semantics: `items` keeps the OLDEST
+    /// [`UNREAD_DIGEST_MAX_ITEMS`] rows of the tail (the newest overflow into
+    /// `truncatedMessages`), while `fromMessageId..toMessageId` — and
+    /// therefore the summarize gate armed from them — span the ENTIRE tail,
+    /// including rows not shown as items. Memory is bounded accordingly:
+    /// only the capped, head-truncated items are retained across pages; the
+    /// rest of the tail contributes counts and the range end only.
     pub(crate) async fn agent_chat_unread_op(
         &self,
         workspace_id: WorkspaceId,
@@ -5767,7 +5781,13 @@ impl Services {
                 .map_or(0, |idx| idx + 1),
             None => 0,
         };
+        // Bounded collection: only the first UNREAD_DIGEST_MAX_ITEMS rows of
+        // the current tail are retained (heads pre-truncated); rows past the
+        // cap contribute `messages` / `toMessageId` only, so memory stays
+        // O(cap) regardless of tail length.
         let mut collected: Vec<(String, String, String)> = Vec::new();
+        let mut messages: usize = 0;
+        let mut last_id: Option<String> = None;
         let mut turns: usize = 0;
         loop {
             let page = self
@@ -5781,14 +5801,22 @@ impl Services {
                         // Human-authored user message: the user saw
                         // everything before it — drop the collection.
                         collected.clear();
+                        messages = 0;
+                        last_id = None;
                         turns = 0;
                     }
                     "user" => {
                         // Machine-attributed user-role delivery: digest
                         // CONTENT, and the start of a new turn.
                         turns += 1;
-                        let text = crate::search_ops::message_text(&msg.content);
-                        collected.push((msg.id, msg.role, text));
+                        messages += 1;
+                        if collected.len() < UNREAD_DIGEST_MAX_ITEMS {
+                            let text = crate::search_ops::message_text(&msg.content);
+                            let head: String =
+                                text.chars().take(UNREAD_DIGEST_HEAD_CHARS).collect();
+                            collected.push((msg.id.clone(), msg.role, head));
+                        }
+                        last_id = Some(msg.id);
                     }
                     "assistant" | "system" => {
                         if turns == 0 {
@@ -5796,8 +5824,14 @@ impl Services {
                             // count the partial turn once.
                             turns = 1;
                         }
-                        let text = crate::search_ops::message_text(&msg.content);
-                        collected.push((msg.id, msg.role, text));
+                        messages += 1;
+                        if collected.len() < UNREAD_DIGEST_MAX_ITEMS {
+                            let text = crate::search_ops::message_text(&msg.content);
+                            let head: String =
+                                text.chars().take(UNREAD_DIGEST_HEAD_CHARS).collect();
+                            collected.push((msg.id.clone(), msg.role, head));
+                        }
+                        last_id = Some(msg.id);
                     }
                     _ => {}
                 }
@@ -5807,19 +5841,14 @@ impl Services {
             }
             offset += n;
         }
-        let messages = collected.len();
         let truncated = messages.saturating_sub(UNREAD_DIGEST_MAX_ITEMS);
         let from_message_id = collected
             .first()
             .map_or(Value::Null, |(id, _, _)| json!(id));
-        let to_message_id = collected.last().map_or(Value::Null, |(id, _, _)| json!(id));
+        let to_message_id = last_id.map_or(Value::Null, |id| json!(id));
         let items: Vec<Value> = collected
             .into_iter()
-            .take(UNREAD_DIGEST_MAX_ITEMS)
-            .map(|(id, role, text)| {
-                let head: String = text.chars().take(UNREAD_DIGEST_HEAD_CHARS).collect();
-                json!({ "id": id, "role": role, "head": head })
-            })
+            .map(|(id, role, head)| json!({ "id": id, "role": role, "head": head }))
             .collect();
         Ok(json!({
             "turns": if messages == 0 { 0 } else { turns },

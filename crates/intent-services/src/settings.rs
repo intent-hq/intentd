@@ -1562,7 +1562,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             Some(1.0),
             Some(1_000.0),
-            4.0,
+            f64::from(intent_core::config::DEFAULT_UNREAD_SUMMARIZE_THRESHOLD),
         ),
         number(
             "prMonitor.debounceSeconds",
@@ -3089,6 +3089,20 @@ mod tests {
             );
             assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
         }
+
+        // The one non-boolean in the category: the summarize-threshold number
+        // pins its default to the shared const so the catalog cannot drift
+        // from the struct default and the doc needle.
+        let threshold = find_definition("agentFeatures.unreadSummarizeThreshold")
+            .expect("agentFeatures.unreadSummarizeThreshold missing");
+        assert!(matches!(threshold.ty, SettingType::Number { .. }));
+        assert_eq!(
+            threshold.default_value,
+            Some(json!(f64::from(
+                intent_core::config::DEFAULT_UNREAD_SUMMARIZE_THRESHOLD
+            ))),
+            "threshold default must derive from DEFAULT_UNREAD_SUMMARIZE_THRESHOLD"
+        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-agentfeat-{tag}.db"));

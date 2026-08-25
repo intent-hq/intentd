@@ -8,7 +8,11 @@
 //! namespace from the prelude and tool description, and the dispatch host
 //! denies its frames (`gated_prefixes`), the same machinery as the other
 //! feature gates. A successful read arms the caller's same-turn summarize
-//! gate over exactly the returned range (cleared at turn end).
+//! gate over the returned `fromMessageId..toMessageId` range (cleared at
+//! turn end). On a truncated digest that range spans the ENTIRE unread tail
+//! — `items` keeps only the oldest rows — so the gate deliberately covers
+//! rows not shown as items (a summarize consumer hydrates full messages
+//! itself).
 
 use std::sync::Arc;
 
