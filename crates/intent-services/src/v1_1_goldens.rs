@@ -82,17 +82,71 @@ fn v1_1_is_the_latest_entry() {
     );
 }
 
-/// The v1.1 specialist bundle is a byte-identical copy of v1's (the v1.1
-/// diff is instruction-only). If a specialist edit is ever wanted, it needs
-/// a new harness version — not an in-place v1.1 edit.
+/// The v1.1 specialist bundle carries body-identical copies of the v1
+/// prompts (the v1.1 doctrine diff is instruction-only); only the
+/// picker-metadata frontmatter (`role`/`teamAgents`/`icon`, PROTOCOL §5.11)
+/// diverges — every OTHER frontmatter key (`name`/`description`/`hidden`/
+/// `agentType`/`roleReminder`/`modelOptions`/…) stays pinned to its v1
+/// value. If a prompt-body (or non-metadata frontmatter) edit is ever
+/// wanted, it needs a new harness version — not an in-place v1.1 edit.
 #[test]
-fn v1_1_specialists_are_byte_identical_to_v1() {
+fn v1_1_specialist_bodies_are_identical_to_v1() {
     let v1 = crate::specialists::EMBEDDED_BUNDLED_V1;
     let v1_1 = crate::specialists::EMBEDDED_BUNDLED_V1_1;
     assert_eq!(v1.len(), v1_1.len());
-    for ((id_a, body_a), (id_b, body_b)) in v1.iter().zip(v1_1.iter()) {
+    for ((id_a, content_a), (id_b, content_b)) in v1.iter().zip(v1_1.iter()) {
         assert_eq!(id_a, id_b);
-        assert_eq!(body_a, body_b, "specialist {id_a} diverged from v1");
+        let (mut fm_a, body_a) = crate::specialists::parse_frontmatter(content_a);
+        let (mut fm_b, body_b) = crate::specialists::parse_frontmatter(content_b);
+        assert_eq!(body_a, body_b, "specialist {id_a} body diverged from v1");
+        for key in crate::specialists::PICKER_METADATA_KEYS {
+            fm_a.remove(*key);
+            fm_b.remove(*key);
+        }
+        assert_eq!(
+            fm_a, fm_b,
+            "specialist {id_a} frontmatter diverged from v1 beyond the picker-metadata keys"
+        );
+    }
+}
+
+/// The v1.1 bundle's picker-metadata frontmatter (intent-hq/monorepo#3007):
+/// spec-writer is the orchestrator with its advisory team roster,
+/// implementor/verifier are internal, and every specialist carries an icon.
+#[test]
+fn v1_1_specialists_carry_picker_metadata() {
+    use serde_json::json;
+    let expectations: &[(&str, Option<&str>, Option<serde_json::Value>, &str)] = &[
+        ("chief-of-staff", None, None, "chief-of-staff"),
+        ("developer", None, None, "verifier"),
+        ("implementor", Some("internal"), None, "implementor"),
+        ("pr-reviewer", None, None, "pr-reviewer"),
+        ("ralph", None, None, "ralph"),
+        (
+            "spec-writer",
+            Some("orchestrator"),
+            Some(json!(r#"["implementor","verifier"]"#)),
+            "coordinator",
+        ),
+        ("ui-designer", None, None, "ui-designer"),
+        ("verifier", Some("internal"), None, "verifier"),
+    ];
+    let v1_1 = crate::specialists::EMBEDDED_BUNDLED_V1_1;
+    assert_eq!(v1_1.len(), expectations.len());
+    for ((id, content), (exp_id, role, team, icon)) in v1_1.iter().zip(expectations) {
+        assert_eq!(id, exp_id);
+        let (fm, _) = crate::specialists::parse_frontmatter(content);
+        assert_eq!(
+            fm.get("role").and_then(serde_json::Value::as_str),
+            *role,
+            "{id}: role"
+        );
+        assert_eq!(fm.get("teamAgents"), team.as_ref(), "{id}: teamAgents");
+        assert_eq!(
+            fm.get("icon").and_then(serde_json::Value::as_str),
+            Some(*icon),
+            "{id}: icon"
+        );
     }
 }
 
