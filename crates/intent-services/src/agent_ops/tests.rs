@@ -27205,6 +27205,161 @@ async fn agent_watch_attention_fanout_excludes_parent() {
     );
 }
 
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+/// monorepo#3443: the attention fan-out reaches EVERY active completion
+/// watch, not just explicit `agent.watch` registrations — a watcher holding
+/// only an auto-registered (wakeOrCreate/delegate SUB-1 shape,
+/// `wake_on_attention: false`) watch is woken at raise time.
+#[tokio::test]
+async fn attention_fanout_reaches_auto_registered_watch() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    // Auto-registered watch (the delegation/SUB-1 registration path): the
+    // attention flag stays false.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        None,
+    )
+    .expect("auto-registered watch");
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].wake_on_attention,
+        "auto-registered watch does not set the attention flag"
+    );
+    let baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(target.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        baseline + 1,
+        "auto-registered watcher receives the attention wake"
+    );
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("reports a blocker: sandbox exploded"),
+        "watcher wake is kind-flavored with the reason: {text}"
+    );
+    // Attention is not a completion: the watch survives, flag intact.
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1, "watch survives the attention wake");
+    assert!(!watches[0].wake_on_attention, "attention flag unchanged");
+}
+
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+/// monorepo#3443: an auto-registered GROUPED watch (`wake_on_attention:
+/// false`, `group_id` set — the `after_all` delegation shape) also receives
+/// the attention wake, with the grouped settlement-promise wording.
+#[tokio::test]
+async fn attention_fanout_reaches_auto_registered_grouped_watch() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        Some("group-1".into()),
+    )
+    .expect("auto-registered grouped watch");
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].wake_on_attention,
+        "auto-registered grouped watch does not set the attention flag"
+    );
+    let baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(target.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        baseline + 1,
+        "auto-registered grouped watcher receives the attention wake"
+    );
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("you will be woken when its delegation group settles"),
+        "grouped attention wake promises the settlement wake: {text}"
+    );
+    assert!(
+        !text.contains("you will still be woken at its completion"),
+        "grouped attention wake must not promise an individual completion wake: {text}"
+    );
+    // Attention is not a completion: the grouped watch survives untouched.
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1, "watch survives the attention wake");
+    assert!(!watches[0].wake_on_attention, "attention flag unchanged");
+}
+
+/// monorepo#3443: a delegating parent whose ONLY watch on the child is the
+/// auto-registered delegation watch (`wake_on_attention: false`) still gets
+/// exactly ONE attention wake — the direct step-5 parent wake; the widened
+/// fan-out keeps excluding the parent.
+#[tokio::test]
+async fn attention_fanout_excludes_parent_with_auto_registered_watch_only() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].wake_on_attention,
+        "delegation watch does not set the attention flag"
+    );
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "exactly one attention wake for the delegating parent"
+    );
+}
+
 /// `reportToParent` idle suppression stays scoped to the parent's own
 /// watch: a third-party watcher still receives the `agent:idle`
 /// wake after the child reported.

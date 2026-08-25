@@ -64,12 +64,14 @@ pub(crate) struct CompletionWatch {
     /// still delivers for `agent:failed` / `agent:deleted` (failure after
     /// reporting is a new signal, not a duplicate).
     pub report_delivered: bool,
-    /// Explicit `agent.watch` registration (monorepo#1229): the watcher is
-    /// also woken when the child raises an attention request
-    /// (`agent.reportBlocker` / `agent.requestDiscussion`). Auto-registered
-    /// watches (delegation, SUB-1 sender watches) leave this `false`; the
-    /// child's parent is excluded from the attention fan-out because
-    /// `agent_request_attention_op` already wakes it directly.
+    /// Set by explicit `agent.watch` registration (monorepo#1229);
+    /// auto-registered watches (delegation, SUB-1 sender watches) leave this
+    /// `false`. Since monorepo#3443 the flag no longer gates the attention
+    /// fan-out — `agent_request_attention_op` wakes EVERY active watch when
+    /// the child raises an attention request (`agent.reportBlocker` /
+    /// `agent.requestDiscussion`), excluding only the child's parent, which
+    /// it already wakes directly. The field is kept as the persisted record
+    /// of an explicit registration.
     pub wake_on_attention: bool,
 }
 
@@ -221,11 +223,13 @@ impl Services {
     }
 
     /// Explicit `agent.watch` registration (monorepo#1229): an ungrouped
-    /// watch that also wakes on the child's attention requests, with an
-    /// AWAITED persist (the registration is the caller's durable contract).
+    /// watch with an AWAITED persist (the registration is the caller's
+    /// durable contract). Attention wakes reach every active watch
+    /// regardless of the `wake_on_attention` flag (monorepo#3443); the flag
+    /// is kept as the persisted record of an explicit registration.
     /// Adoption strengthens an existing watch for the pair
     /// (`wake_on_attention` set) — grouped watches keep their group but gain
-    /// the attention flag.
+    /// the flag.
     pub(crate) async fn register_agent_watch_durable(
         &self,
         parent_workspace_id: &WorkspaceId,
