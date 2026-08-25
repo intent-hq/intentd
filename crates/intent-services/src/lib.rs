@@ -18726,6 +18726,20 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
+            if let Some(caller) = caller_agent_id.as_ref() {
+                if let Ok(session) = store.get_agent_session(caller).await {
+                    if session.workspace_id == workspace_id
+                        && session.task_note_id.as_ref() == Some(&note_id)
+                    {
+                        if let Some(reason) = services.assignment_quarantine_reason(&session).await
+                        {
+                            return Err(Error::InvalidParams(format!(
+                                "assignment update quarantined: {reason}"
+                            )));
+                        }
+                    }
+                }
+            }
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let Some(mut task) = note.metadata.task.clone() else {
                 return Err(Error::Internal(

@@ -3195,6 +3195,7 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
             "workspaceId": ws_id,
             "agentInstructions": "do the delegated work",
             "taskText": task_text,
+            "scope": ["crates\\intent-core", "./crates/intent-core/"],
             "model": "mock:default",
         }),
     )
@@ -3205,6 +3206,16 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         .expect("child agent id")
         .to_string();
     assert!(!child_id.is_empty(), "non-empty child agentId");
+    assert_eq!(
+        delegated["taskRevision"].as_str().map(str::len),
+        Some(64),
+        "delegate returns the assignment revision over WSS: {delegated}"
+    );
+    assert_eq!(
+        delegated["scopeHash"].as_str().map(str::len),
+        Some(64),
+        "delegate returns the canonical scope hash over WSS: {delegated}"
+    );
     // NAME-1: the wire result carries the task-derived name, not the generic
     // `Agent xxxxxx` uuid-suffix fallback that used to leak into the FE.
     assert_eq!(
@@ -3228,6 +3239,14 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
         got["agent"]["nameExplicitlySet"].as_bool(),
         Some(false),
         "delegated child stays renameable-with-guard over WSS: {got}"
+    );
+    assert_eq!(
+        got["agent"]["metadata"]["taskRevision"], delegated["taskRevision"],
+        "assignment revision survives persistence and projection: {got}"
+    );
+    assert_eq!(
+        got["agent"]["metadata"]["scopeHash"], delegated["scopeHash"],
+        "scope hash survives persistence and projection: {got}"
     );
 
     // Every stream event must carry the CHILD id; collect past the terminal
