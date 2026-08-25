@@ -2124,12 +2124,21 @@ impl Services {
                 .await?
         };
         // Message projections are the expensive half (full-workspace COUNT
-        // aggregate + preview columns). Cache per workspace; invalidated on
-        // transcript writes and session create/delete.
-        let mut projections = self
-            .agent_list_cache
-            .get_or_load(&self.store, &workspace_id)
-            .await?;
+        // aggregate + preview columns). The default read serves them from the
+        // per-workspace cache (active sessions only, matching the row set
+        // above — cost stays O(rows returned)); invalidated on transcript
+        // writes and session create/delete. `includeRetired` needs retired
+        // rows' projections too, so it loads directly, bypassing the cache
+        // in both directions.
+        let mut projections = if include_retired {
+            self.store
+                .get_agent_session_message_projections(&workspace_id)
+                .await?
+        } else {
+            self.agent_list_cache
+                .get_or_load(&self.store, &workspace_id)
+                .await?
+        };
         // Idle-visibility: overlay each agent's active-hook metadata
         // (`waitingOnHooks`, omitted when empty) from one workspace-wide
         // hook query.

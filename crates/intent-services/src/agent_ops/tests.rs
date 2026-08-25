@@ -345,6 +345,50 @@ async fn retired_agents_are_inert_until_restored() {
     assert_eq!(r2["restored"], json!(false));
 }
 
+/// Projection-cost contract (PR review): the default `agent.list` projection
+/// load excludes soft-retired sessions at the SQL layer, so its cost stays
+/// O(rows returned) instead of growing with every retired session kept. The
+/// `includeRetired` variant bypasses the active-only cache and still serves
+/// full message projections for retired rows.
+#[tokio::test]
+async fn retired_sessions_are_excluded_from_default_projection_load() {
+    let (_t, svc, ws) = setup().await;
+    let live = create_agent(&svc, &ws, "Live").await;
+    let old = create_agent(&svc, &ws, "Old").await;
+    let content = serde_json::json!([{ "type": "text", "text": "kept transcript" }]);
+    svc.store()
+        .append_agent_message(&old, "user", &content, &intent_core::now_iso())
+        .await
+        .expect("append");
+    svc.agent_retire_op(old.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    // The active-only store read omits the retired session entirely.
+    let active = svc
+        .store()
+        .get_active_agent_session_message_projections(&ws)
+        .await
+        .expect("active projections");
+    assert!(active.contains_key(&live.0), "live session projected");
+    assert!(
+        !active.contains_key(&old.0),
+        "retired session must not be loaded by the default projection read"
+    );
+
+    // includeRetired still serves the retired row WITH its projections
+    // (message_count from the direct, cache-bypassing load).
+    let all = svc
+        .agent_list_including_retired_op(ws.clone())
+        .await
+        .expect("list all");
+    let row = all.iter().find(|a| a.id == old).expect("retired row");
+    assert_eq!(
+        row.message_count, 1,
+        "retired row keeps its message projection in the includeRetired read"
+    );
+}
+
 #[tokio::test]
 async fn retire_and_restore_reject_cross_workspace_targets() {
     let (_t, svc, ws) = setup().await;

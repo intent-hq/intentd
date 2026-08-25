@@ -14667,6 +14667,77 @@ mod harness_wake_tests {
         assert!(!mgr.is_busy(&id), "slot never claimed");
     }
 
+    /// Soft-retire inertness at the listener level (PR review): a retired
+    /// session's live handle can still receive a delayed out-of-turn
+    /// `session/update`, but the tick must NOT open an implicit harness-wake
+    /// turn — retiring removes event subscriptions, not the handle, so this
+    /// gate is what keeps a retired session from persisting new turns. The
+    /// buffered notification stays untouched; after `agent.restore` the next
+    /// tick consumes it into a normal implicit turn.
+    #[tokio::test]
+    async fn retired_session_skips_wake_tick_until_restore() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        mgr.services
+            .agent_retire_op(id.clone(), Some(ws.clone()), None)
+            .await
+            .expect("retire");
+
+        note_tx.send(chunk_note("late child tail")).unwrap();
+        assert!(
+            mgr.wake_listener_tick(&id, &ws).await,
+            "listener keeps running (handle stays alive) while retired"
+        );
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:start")
+        })
+        .await;
+        assert!(
+            !events.iter().any(|e| e.event_type == "agent:stream:start"),
+            "no implicit turn driven on a retired session"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no assistant row persisted while retired"
+        );
+        assert!(!mgr.is_busy(&id), "slot never claimed while retired");
+
+        // Restore returns the session to service; the buffered notification
+        // was left untouched and the next tick consumes it normally.
+        mgr.services
+            .agent_restore_op(id.clone(), Some(ws.clone()))
+            .await
+            .expect("restore");
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:stream:end"),
+            "post-restore tick opens the implicit turn"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the parked burst persisted after restore"
+        );
+        assert_eq!(messages[0].content[0]["text"], json!("late child tail"));
+    }
+
     /// monorepo#2118 (PR review) — a tick losing the slot to a held REAP
     /// claim must NOT drive a harness wake turn: unlike a loss to a prompt
     /// worker (which owns the slot and finishes the turn), nobody owns the
