@@ -149,7 +149,11 @@ impl<'a> McpOauthService<'a> {
     /// returns the bag unchanged. Single-flight per server id: concurrent
     /// header builds serialize on a per-server lock and re-read the persisted
     /// bag under it, so one expiry triggers one POST; a failed attempt arms
-    /// [`REFRESH_FAILURE_COOLDOWN`].
+    /// [`REFRESH_FAILURE_COOLDOWN`]. `mcp.oauth.set` / `mcp.oauth.delete` do
+    /// not take the lock, so the post-refresh persist is guarded: the merged
+    /// bag is written back only when the stored bag still matches the
+    /// snapshot the refresh was computed from — an external replace/revoke
+    /// that raced the POST always wins.
     async fn refresh_if_expired(&self, server_id: &str, bag: Value) -> Value {
         match parse_expires_at(&bag) {
             ExpiresAt::Absent => return bag,
@@ -175,11 +179,18 @@ impl<'a> McpOauthService<'a> {
         let _guard = lock.lock().await;
         // Re-read under the lock: a concurrent build may have refreshed and
         // persisted while this task waited, in which case the fresh bag is
-        // used as-is (one POST per expiry, not one per caller).
-        let bag = match self.store.get_mcp_oauth_token(server_id).await {
-            Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or(bag),
-            _ => bag,
-        };
+        // used as-is (one POST per expiry, not one per caller). The raw
+        // snapshot is kept so the post-refresh persist can detect an
+        // external `mcp.oauth.set`/`delete` that raced the refresh POST.
+        let snapshot = self
+            .store
+            .get_mcp_oauth_token(server_id)
+            .await
+            .unwrap_or(None);
+        let bag = snapshot
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(bag);
         let ExpiresAt::EpochMs(at_ms) = parse_expires_at(&bag) else {
             return bag;
         };
@@ -196,27 +207,72 @@ impl<'a> McpOauthService<'a> {
             Ok(resp) => {
                 REFRESH_FAILED_AT.lock().unwrap().remove(server_id);
                 let merged = merge_refresh_response(&bag, &resp);
-                match serde_json::to_string(&merged) {
-                    Ok(raw) => {
-                        if let Err(e) = self
-                            .store
-                            .set_mcp_oauth_token(server_id, &raw, &now_iso())
-                            .await
-                        {
-                            tracing::warn!(
+                // The `mcp.oauth.set`/`delete` RPCs write without taking the
+                // refresh lock, so the stored bag may have been replaced or
+                // revoked while the POST was in flight. Persist the merged
+                // bag only when the store still holds the exact snapshot
+                // this refresh was computed from; otherwise the external
+                // mutation wins and the refreshed token is dropped.
+                match self.store.get_mcp_oauth_token(server_id).await {
+                    Ok(current) if current.is_some() && current == snapshot => {
+                        match serde_json::to_string(&merged) {
+                            Ok(raw) => {
+                                if let Err(e) = self
+                                    .store
+                                    .set_mcp_oauth_token(server_id, &raw, &now_iso())
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        server = %server_id,
+                                        error = %e,
+                                        "failed to persist refreshed mcp oauth bag"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(
                                 server = %server_id,
                                 error = %e,
-                                "failed to persist refreshed mcp oauth bag"
-                            );
+                                "failed to encode refreshed mcp oauth bag"
+                            ),
                         }
+                        merged
                     }
-                    Err(e) => tracing::warn!(
-                        server = %server_id,
-                        error = %e,
-                        "failed to encode refreshed mcp oauth bag"
-                    ),
+                    Ok(Some(current)) => {
+                        // Replaced mid-refresh: the header is built from the
+                        // replacement the user just stored, not the token
+                        // refreshed from superseded credentials.
+                        tracing::warn!(
+                            server = %server_id,
+                            "mcp oauth bag replaced during refresh; \
+                             discarding refreshed token and using the replacement"
+                        );
+                        serde_json::from_str(&current).unwrap_or(Value::Null)
+                    }
+                    Ok(None) => {
+                        // Deleted (revoked) mid-refresh: honor the
+                        // revocation fully — no persist and no header for
+                        // this request either, since a token minted from
+                        // revoked credentials must not outlive the delete.
+                        tracing::warn!(
+                            server = %server_id,
+                            "mcp oauth bag deleted during refresh; discarding refreshed token"
+                        );
+                        Value::Null
+                    }
+                    Err(e) => {
+                        // Stored state unverifiable: fail-soft — use the
+                        // fresh token for this one request but skip the
+                        // persist so a concurrent mutation is never
+                        // clobbered.
+                        tracing::warn!(
+                            server = %server_id,
+                            error = %e,
+                            "failed to re-read mcp oauth bag after refresh; \
+                             using refreshed token without persisting"
+                        );
+                        merged
+                    }
                 }
-                merged
             }
             Err(e) => {
                 REFRESH_FAILED_AT
@@ -1002,5 +1058,73 @@ mod tests {
             1,
             "second build within the cooldown must not retry the refresh"
         );
+    }
+
+    /// Waits until the mock endpoint has received the refresh POST, i.e. the
+    /// refresh is in flight (the delayed response has not been sent yet).
+    async fn wait_for_hit(ep: &TokenEndpoint) {
+        while ep.hits.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_during_inflight_refresh_is_not_clobbered_by_persist() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        let body = r#"{"access_token":"new-token","expires_in":3600}"#;
+        let resp: &'static str = Box::leak(ok_token_response(body).into_boxed_str());
+        let ep = token_endpoint(resp, 500).await;
+        let id = unique_id("race-set");
+        svc.set(&id, refreshable_bag(&ep.url, json!(now_secs() - 100)))
+            .await
+            .unwrap();
+        // Replace the bag through mcp.oauth.set while the refresh POST is
+        // held open by the mock endpoint's response delay.
+        let (hdr, ()) = tokio::join!(svc.authorization_header(&id), async {
+            wait_for_hit(&ep).await;
+            svc.set(
+                &id,
+                json!({ "access_token": "replacement-token", "token_type": "Bearer" }),
+            )
+            .await
+            .unwrap();
+        });
+        // The externally-set bag wins; the refresh result is discarded.
+        let raw = store.get_mcp_oauth_token(&id).await.unwrap().unwrap();
+        let persisted: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            persisted["access_token"],
+            json!("replacement-token"),
+            "refresh persist must not clobber a bag replaced mid-refresh"
+        );
+        // The header is built from the current (replacement) stored bag.
+        assert_eq!(hdr.unwrap().as_deref(), Some("Bearer replacement-token"));
+    }
+
+    #[tokio::test]
+    async fn delete_during_inflight_refresh_is_not_resurrected_by_persist() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        let body = r#"{"access_token":"new-token","expires_in":3600}"#;
+        let resp: &'static str = Box::leak(ok_token_response(body).into_boxed_str());
+        let ep = token_endpoint(resp, 500).await;
+        let id = unique_id("race-delete");
+        svc.set(&id, refreshable_bag(&ep.url, json!(now_secs() - 100)))
+            .await
+            .unwrap();
+        // Revoke the bag through mcp.oauth.delete while the refresh POST is
+        // held open by the mock endpoint's response delay.
+        let (hdr, ()) = tokio::join!(svc.authorization_header(&id), async {
+            wait_for_hit(&ep).await;
+            svc.delete(&id).await.unwrap();
+        });
+        assert!(
+            store.get_mcp_oauth_token(&id).await.unwrap().is_none(),
+            "refresh persist must not resurrect a bag deleted mid-refresh"
+        );
+        // The revocation is honored for this request too: no header from a
+        // token minted off revoked credentials.
+        assert!(hdr.unwrap().is_none());
     }
 }
