@@ -1221,6 +1221,27 @@ impl Services {
             .resolve_agent_type(specialist_id, workspace_path)
     }
 
+    /// Whether a session's specialist id resolved to a real specialist. New
+    /// sessions carry a frozen identity snapshot; legacy sessions resolve from
+    /// the harness-pinned specialist registry.
+    pub(crate) fn session_has_recognized_specialist(
+        &self,
+        session: &AgentSession,
+        workspace_path: Option<&Path>,
+    ) -> bool {
+        let Some(specialist_id) = session.specialist.as_deref() else {
+            return false;
+        };
+        if Self::session_metadata_str(session, "specialistName").is_some() {
+            return true;
+        }
+        let entry = crate::harness::resolve_entry(&session.harness_version);
+        self.specialists_service()
+            .with_embedded(entry.doctrine.specialists)
+            .resolve_display_name(specialist_id, workspace_path)
+            .is_some()
+    }
+
     /// Resolve every non-hidden specialist's delegation `modelOptions`
     /// (PROTOCOL §5.11) through the 3-tier fold, for injection into the
     /// per-agent `workspace_api` tool description at bridge creation. Each
