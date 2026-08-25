@@ -5236,6 +5236,13 @@ async fn drain_emits_queue_processing_with_turn_id() {
 /// tests to distinguish slug-shaped vs custom titles).
 async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, title: &str) {
     seed_agent(mgr, ws, id).await;
+    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    session.name_explicitly_set = true;
+    mgr.services
+        .store
+        .update_agent_session(ws, &session)
+        .await
+        .expect("mark agent name explicit");
     let mut workspace = mgr.services.store.get_workspace(ws).await.unwrap();
     workspace.title = title.to_string();
     mgr.services
