@@ -77,7 +77,7 @@ const UNREAD_SCAN_PAGE: i64 = 200;
 
 /// Whether a user-role message row was machine-delivered rather than typed
 /// by the human: A2A sends stamp `fromAgentId`, daemon-initiated deliveries
-/// stamp `source` (system notices, wake_or_create), and hook / PR-monitor
+/// stamp `source` (system notices, `wake_or_create`), and hook / PR-monitor
 /// wakes stamp a metadata `type`. Absence of all three means a human-authored
 /// message (FE-attached metadata like `userAppMessageId` carries none of
 /// them).
@@ -5773,7 +5773,7 @@ impl Services {
                 .store
                 .get_agent_messages_page(&agent_id, offset, UNREAD_SCAN_PAGE)
                 .await?;
-            let n = page.len() as i64;
+            let n = i64::try_from(page.len()).unwrap_or(i64::MAX);
             for msg in page {
                 match msg.role.as_str() {
                     "user" if !user_message_is_machine(msg.metadata.as_ref()) => {

@@ -26072,7 +26072,7 @@ async fn chat_unread_truncates_items_and_heads() {
 }
 
 /// Fails closed like `agent.markSeen`: unknown agent and workspace mismatch
-/// are both NotFound.
+/// are both `NotFound`.
 #[tokio::test]
 async fn chat_unread_fails_closed() {
     let (_t, svc, ws) = setup().await;
