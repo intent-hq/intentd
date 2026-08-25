@@ -168,7 +168,10 @@ impl<'a> McpOauthService<'a> {
             ExpiresAt::EpochMs(_) => {}
         }
         if RefreshParams::from_bag(&bag).is_none() {
-            tracing::warn!(
+            // debug, not warn: this fires on every header build for a stale
+            // legacy bag without refresh metadata, and agent spawns reshape
+            // all configured servers — WARN here would spam the logs.
+            tracing::debug!(
                 server = %server_id,
                 "mcp oauth token expired but bag lacks refresh metadata \
                  (refresh_token/token_endpoint/client_id); using stored access token"
@@ -409,13 +412,17 @@ impl RefreshParams {
 }
 
 /// Run one RFC 6749 §6 `refresh_token` grant: form-encoded POST to the bag's
-/// `token_endpoint`, bounded by [`REFRESH_HTTP_TIMEOUT`]. Returns the parsed
-/// 2xx JSON body (guaranteed to carry a non-empty `access_token`) or an error
-/// string that never contains credential material — only the endpoint
-/// URL/status can appear in it.
+/// `token_endpoint`, bounded by [`REFRESH_HTTP_TIMEOUT`]. Redirects are never
+/// followed: the form body carries `refresh_token` (and `client_secret`) that
+/// a 307/308 would re-send to a possibly cross-host target — a 3xx answer
+/// falls into the non-2xx fail-soft path instead. Returns the parsed 2xx JSON
+/// body (guaranteed to carry a non-empty `access_token`) or an error string
+/// that never contains credential material — only the endpoint URL/status can
+/// appear in it.
 async fn run_refresh(params: &RefreshParams) -> std::result::Result<Value, String> {
     let client = reqwest::Client::builder()
         .timeout(REFRESH_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("http client build failed: {e}"))?;
     let mut form: Vec<(&str, &str)> = vec![
@@ -483,7 +490,7 @@ fn merge_refresh_response(bag: &Value, resp: &Value) -> Value {
     {
         merged.insert("refresh_token".to_string(), json!(r));
     }
-    match resp.get("expires_in").and_then(Value::as_u64) {
+    match parse_expires_in(resp) {
         Some(secs) => {
             merged.insert(
                 "expires_at".to_string(),
@@ -495,6 +502,21 @@ fn merge_refresh_response(bag: &Value, resp: &Value) -> Value {
         }
     }
     Value::Object(merged)
+}
+
+/// Parse the refresh response's `expires_in` lifetime in seconds. Accepts
+/// JSON numbers and numeric strings (some non-conforming servers return
+/// `"3600"`), consistent with the bag's `expires_at` parsing — otherwise a
+/// stringified lifetime would drop `expires_at` from the merged bag and
+/// permanently disable refresh for it.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn parse_expires_in(resp: &Value) -> Option<u64> {
+    let n = match resp.get("expires_in")? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }?;
+    n.is_finite().then_some(n.max(0.0) as u64)
 }
 
 #[cfg(test)]
@@ -813,6 +835,8 @@ mod tests {
     const HTTP_500: &str =
         "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
+    const HTTP_302: &str = "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:9/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
     fn now_secs() -> u64 {
         now_epoch_ms() / 1000
     }
@@ -1126,5 +1150,48 @@ mod tests {
         // The revocation is honored for this request too: no header from a
         // token minted off revoked credentials.
         assert!(hdr.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn redirecting_token_endpoint_is_not_followed() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        // A redirect answer must not be chased (the form body carries the
+        // refresh_token); it falls into the non-2xx fail-soft path.
+        let ep = token_endpoint(HTTP_302, 0).await;
+        let id = unique_id("redirect");
+        svc.set(&id, refreshable_bag(&ep.url, json!(now_secs() - 100)))
+            .await
+            .unwrap();
+        let hdr = svc.authorization_header(&id).await.unwrap();
+        assert_eq!(hdr.as_deref(), Some("Bearer old-token"));
+        assert_eq!(
+            ep.hits.load(Ordering::SeqCst),
+            1,
+            "redirect must not be followed (one hit, no chase)"
+        );
+    }
+
+    #[tokio::test]
+    async fn string_expires_in_still_sets_expires_at() {
+        let (_tmp, store) = open().await;
+        let svc = McpOauthService::new(&store);
+        let body = r#"{"access_token":"new-token","expires_in":"3600"}"#;
+        let resp: &'static str = Box::leak(ok_token_response(body).into_boxed_str());
+        let ep = token_endpoint(resp, 0).await;
+        let id = unique_id("str-exp");
+        svc.set(&id, refreshable_bag(&ep.url, json!(now_secs() - 100)))
+            .await
+            .unwrap();
+        let before_ms = now_epoch_ms();
+        let hdr = svc.authorization_header(&id).await.unwrap();
+        assert_eq!(hdr.as_deref(), Some("Bearer new-token"));
+        let raw = store.get_mcp_oauth_token(&id).await.unwrap().unwrap();
+        let persisted: Value = serde_json::from_str(&raw).unwrap();
+        let expires_at = persisted["expires_at"].as_u64().unwrap();
+        assert!(
+            expires_at >= before_ms + 3_500_000,
+            "stringified expires_in must still recompute expires_at, got {expires_at}"
+        );
     }
 }
