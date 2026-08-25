@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.58] - 2026-08-25
+
+### 🚀 Features
+
+- *(specialists)* Role/teamAgents/icon picker-metadata frontmatter keys ([#1477](https://github.com/intent-hq/intentd/pull/1477))
+- *(acp)* Add ws.agent.spawnPeer with top-level gating and target-side sender watch ([#1468](https://github.com/intent-hq/intentd/pull/1468))
+
+### 🐛 Bug Fixes
+
+- *(agents)* Fan attention wakes out to all active completion watches ([#1478](https://github.com/intent-hq/intentd/pull/1478))
+- *(services)* Set parent_agent_id on wakeOrCreate-created agents ([#1476](https://github.com/intent-hq/intentd/pull/1476))
+
+
 ## [0.7.57] - 2026-08-25
 
 ### 🚀 Features
