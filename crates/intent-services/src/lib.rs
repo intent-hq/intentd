@@ -7078,6 +7078,13 @@ async fn ensure_spec_note(
         Err(Error::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
+    // The reseed writes target `note.workspace_id → workspace(id)` (migration
+    // 0030), so a deleted/nonexistent workspace has no FK target: verify the
+    // workspace row exists before attempting any write and surface
+    // `NotFound("workspace …")` instead of a raw SQLite FK violation
+    // (monorepo#3404). Only the rare missing-spec path pays this SELECT — the
+    // spec-exists fast path above returned already.
+    store.get_workspace(workspace_id).await?;
     // Self-heal for workspaces damaged by the pre-#110 global-note-identity
     // bug: agents that hit "no `spec` yet" fell back to `note.create` and
     // captured a random UUID id, leaving `isSpecNote()` (id-based) blind to
@@ -17751,17 +17758,36 @@ impl WorkspaceApi for Services {
             // FK target), so skip the reseed; `store.list_notes` returns an
             // empty vec for it naturally.
             //
-            // The reseed is best-effort so `note.list` never regresses from
-            // Ok(_) to Err on transient conditions the caller cannot act on:
-            // an FK violation for a bare/nonexistent workspace id (previous
-            // behaviour was Ok([])) and the check-then-insert race between
+            // A missing workspace row is the caller's problem, not a reseed
+            // hiccup: `ensure_spec_note` verifies the row exists before any
+            // write and returns `NotFound("workspace …")` when it is gone
+            // (deleted, or never existed), which propagates as a proper
+            // workspace-not-found instead of a best-effort empty list + raw
+            // FK WARN (monorepo#3404).
+            //
+            // Every other reseed failure stays best-effort so `note.list`
+            // never regresses from Ok(_) to Err on transient conditions the
+            // caller cannot act on — e.g. the check-then-insert race between
             // concurrent list callers (whichever loses the insert would trip
-            // the unique constraint). Log-warn and fall through to
-            // `store.list_notes`, which returns the freshly-seeded row when
-            // the winning insert already committed, or the pre-existing
-            // empty/other shape when the reseed genuinely could not run.
+            // the unique constraint) — except when the failure was itself
+            // caused by the workspace vanishing mid-reseed (see the re-check
+            // below). Log-warn and fall through to `store.list_notes`, which
+            // returns the freshly-seeded row when the winning insert already
+            // committed, or the pre-existing empty/other shape when the
+            // reseed genuinely could not run.
             if !id.is_chief() {
                 if let Err(e) = ensure_spec_note(&store, bus.as_ref(), &id).await {
+                    if matches!(e, Error::NotFound(_)) {
+                        return Err(e);
+                    }
+                    // The pre-write existence check races a concurrent
+                    // `workspace.delete`: the row can vanish between that
+                    // SELECT and the reseed INSERT, surfacing as an FK
+                    // violation (`Internal`) rather than `NotFound`. Re-check
+                    // the row so that window still maps to
+                    // workspace-not-found instead of a best-effort empty
+                    // list (monorepo#3404 review).
+                    store.get_workspace(&id).await?;
                     tracing::warn!(
                         workspace_id = %id.0,
                         error = %e,
