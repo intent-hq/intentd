@@ -216,6 +216,16 @@ pub struct ProviderConfig {
     /// `workspace_api` tool is served a compact description and the full
     /// `ws.*` API reference is appended to the system prompt instead.
     pub truncates_tool_descriptions: bool,
+    /// When true, the keep-alive interrupt (`agent.stop` / message
+    /// preemption) tears the child process down AFTER sending the polite
+    /// `session/cancel`, instead of keeping it alive for an in-place resume.
+    /// For providers whose cancellation is unreliable (auggie leaks the
+    /// cancelled turn's subprocesses and keeps burning tokens — see
+    /// intent-hq/monorepo#2763), a live-but-wedged child is worse than a
+    /// respawn: the persisted `acpSessionId` survives the teardown, so the
+    /// next `agent.sendMessage` respawns the child and resumes the session
+    /// via the normal `session/load` ladder.
+    pub kills_child_on_interrupt: bool,
 }
 
 impl ProviderConfig {
@@ -261,6 +271,7 @@ impl ProviderConfig {
             requires_secondary_binary: None,
             terminal_requires_shell: false,
             truncates_tool_descriptions: false,
+            kills_child_on_interrupt: false,
         }
     }
 
@@ -319,6 +330,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_command_hint: Some("auggie login"),
         login_docs_url: Some("https://docs.augmentcode.com/cli/overview"),
         short_name: "Auggie",
+        // auggie's `session/cancel` is unreliable: the cancelled turn's
+        // subprocesses leak and keep consuming tokens
+        // (intent-hq/monorepo#2763), so interrupts tear the child down and
+        // the next send respawns + resumes off the persisted `acpSessionId`.
+        kills_child_on_interrupt: true,
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
