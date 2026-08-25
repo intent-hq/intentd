@@ -2719,6 +2719,14 @@ pub struct AgentSession {
     /// pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// ISO timestamp the session was soft-retired at (`ws.agent.retire`),
+    /// or `None` for active sessions. A retired session keeps its full
+    /// conversation (still searchable) but is INERT: excluded from default
+    /// `agent.list` reads, unreachable on the agent-facing MCP surface, and
+    /// nothing may start a turn on it. Cleared by the user/FE-initiated
+    /// `agent.restore` wire method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     /// Harness version this session was stamped with at creation
     /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
     /// upgrade never changes it, and there is no upgrade/migration/pinning
@@ -3060,6 +3068,13 @@ pub struct AgentLite {
     /// (not `null`) when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// ISO timestamp the session was soft-retired at; mirrors
+    /// [`AgentSession::retired_at`]. Omitted for active sessions. Rows
+    /// carrying it appear in `agent.list` only with `includeRetired: true`
+    /// (and always in `agent.get`, so clients can render the preserved
+    /// conversation read-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     /// Harness version the session was stamped with at creation; mirrors
     /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
     #[serde(default = "default_harness_version")]
@@ -3158,6 +3173,7 @@ impl AgentLite {
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             pending_delete_at: session.pending_delete_at,
+            retired_at: session.retired_at,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
             metadata,
@@ -5075,6 +5091,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -5167,6 +5184,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -5275,6 +5293,7 @@ mod tests {
                 stop_reason_timestamp: None,
                 session_corrupted: false,
                 pending_delete_at: None,
+                retired_at: None,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
                 sandbox_id: None,
@@ -5363,6 +5382,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -5442,6 +5462,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -5534,6 +5555,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

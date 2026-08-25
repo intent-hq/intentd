@@ -1722,6 +1722,7 @@ fn session_from_legacy_json(
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         created_at,
         updated_at,
     };

@@ -18,8 +18,8 @@ use tokio::time::timeout;
 
 use intent_core::events::{
     AGENT_ATTENTION_REQUESTED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE,
-    AGENT_MESSAGE, AGENT_RENAMED, AGENT_SESSION_STATS_CHANGED, AGENT_SUBSCRIPTIONS_CHANGED,
-    AGENT_UPDATED,
+    AGENT_MESSAGE, AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_SESSION_STATS_CHANGED,
+    AGENT_SUBSCRIPTIONS_CHANGED, AGENT_UPDATED,
 };
 use intent_core::{ActorType, Event, EventActor, SessionStats};
 
@@ -238,6 +238,132 @@ async fn delete_skips_emit_when_session_already_gone() {
         res.is_err(),
         "expected no agent:deleted emit for a missing session"
     );
+}
+
+// ================================================================
+// Soft retire / restore (`ws.agent.retire` → `agent.restore`)
+// ================================================================
+
+#[tokio::test]
+async fn retire_sets_mark_emits_event_and_preserves_the_row() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Elder").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RETIRED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_retire_op(id.clone(), Some(ws.clone()), Some("handing off".into()))
+        .await
+        .expect("retire");
+    assert_eq!(r["success"], json!(true));
+    let retired_at = r["retiredAt"].as_str().expect("retiredAt").to_string();
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_RETIRED);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(batch[0].data["agentName"].as_str(), Some("Elder"));
+    assert_eq!(batch[0].data["reason"].as_str(), Some("handing off"));
+
+    // The row survives with the mark set and the conversation intact.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.retired_at.as_deref(), Some(retired_at.as_str()));
+
+    // Idempotent: a second retire preserves the original timestamp.
+    let r2 = svc
+        .agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .expect("re-retire");
+    assert_eq!(r2["alreadyRetired"], json!(true));
+    assert_eq!(r2["retiredAt"].as_str(), Some(retired_at.as_str()));
+}
+
+#[tokio::test]
+async fn retired_agents_are_inert_until_restored() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Dormant").await;
+    svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    // Default list excludes the retired session…
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(rows.iter().all(|a| a.id != id), "retired row in agent.list");
+    // …the includeRetired variant serves it, carrying retiredAt…
+    let all = svc
+        .agent_list_including_retired_op(ws.clone())
+        .await
+        .expect("list all");
+    let row = all.iter().find(|a| a.id == id).expect("retired row");
+    assert!(row.retired_at.is_some(), "retiredAt missing on wire row");
+    // …and interaction paths fail closed with the retired error.
+    let err = svc
+        .agent_send_message_op(id.clone(), "hi".into(), None, None, None, None)
+        .await
+        .expect_err("send to retired agent must fail");
+    assert!(err.to_string().contains("retired"), "got: {err}");
+    let observer = create_agent(&svc, &ws, "Obs").await;
+    let err = svc
+        .agent_watch_op(ws.clone(), observer, id.clone())
+        .await
+        .expect_err("watch on retired agent must fail");
+    assert!(err.to_string().contains("retired"), "got: {err}");
+
+    // Restore returns it to service and emits agent:restored.
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RESTORED.to_string()],
+        ..Default::default()
+    });
+    let r = svc
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    assert_eq!(r["restored"], json!(true));
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch[0].event_type, AGENT_RESTORED);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(rows.iter().any(|a| a.id == id), "restored row missing");
+    svc.agent_send_message_op(id.clone(), "hi again".into(), None, None, None, None)
+        .await
+        .expect("send after restore");
+
+    // Restoring a non-retired session is the documented no-op.
+    let r2 = svc
+        .agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("no-op restore");
+    assert_eq!(r2["restored"], json!(false));
+}
+
+#[tokio::test]
+async fn retire_and_restore_reject_cross_workspace_targets() {
+    let (_t, svc, ws) = setup().await;
+    let other = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other))
+        .await
+        .expect("other ws");
+    let id = create_agent(&svc, &ws, "Scoped").await;
+
+    svc.agent_retire_op(id.clone(), Some(other.clone()), None)
+        .await
+        .expect_err("cross-workspace retire must fail");
+    svc.agent_restore_op(id.clone(), Some(other))
+        .await
+        .expect_err("cross-workspace restore must fail");
+    // The mark was never set.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert!(session.retired_at.is_none());
 }
 
 #[tokio::test]
@@ -22121,6 +22247,41 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
         Err(Error::NotFound(_))
     ));
     assert_eq!(persisted_queue(&svc, &target).await.len(), 2);
+}
+
+/// Soft-retire inertness: a session interrupted mid-turn and then retired
+/// must not be redriven via `resume_interrupted_agent` — the retired probe
+/// after the atomic claim rejects with the agent.restore hint, and the row
+/// resets to pending so the interruption stays resolvable after restore.
+#[tokio::test]
+async fn resume_interrupted_rejects_retired_session_and_resets_to_pending() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "RetiredInterrupted").await;
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    let err = svc
+        .resume_interrupted_agent(&id)
+        .await
+        .expect_err("retired session must not be redriven");
+    assert!(
+        err.to_string().contains("retired"),
+        "error names the retired state: {err}"
+    );
+
+    // The claim was rolled back: the row is pending again, so a restore
+    // followed by a resume completes normally.
+    svc.agent_restore_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    svc.resume_interrupted_agent(&id)
+        .await
+        .expect("resume after restore");
 }
 
 /// Resume appends the system interruption marker before the continuation, and

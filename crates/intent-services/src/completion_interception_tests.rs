@@ -176,6 +176,7 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
