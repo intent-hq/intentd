@@ -951,6 +951,9 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
+        // Ralph remains in the pinned v1 doctrine for existing sessions, but
+        // is retired from new-session catalogs (including Settings).
+        acc.remove("ralph");
         let specialists: Vec<Value> = acc.into_values().collect();
         Ok(json!({ "specialists": specialists }))
     }
@@ -1166,20 +1169,20 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_captures_optional_scalars() {
-        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\n---\n\nYou loop.";
         let (fm, body) = parse_frontmatter(content);
         assert_eq!(fm.get("codingAgent").unwrap(), "claude");
         assert_eq!(fm.get("model").unwrap(), "opus4.5");
         // Retired keys are stripped on parse (RETIRED_FRONTMATTER_KEYS).
         assert!(fm.get("modelTier").is_none());
         assert_eq!(fm.get("roleReminder").unwrap(), "Never stop early");
-        assert_eq!(fm.get("agentType").unwrap(), "ralph-loop");
+        assert_eq!(fm.get("agentType").unwrap(), "task-loop");
         assert_eq!(body, "You loop.");
     }
 
     #[test]
     fn build_def_emits_wire_fields() {
-        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+        let content = "---\nname: \"Ralph\"\ndescription: \"Loops\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"task-loop\"\n---\n\nYou loop.";
         let def = build_def("ralph", content, "user", Path::new("/tmp/ralph.md"));
         assert_eq!(def["id"], "ralph");
         assert_eq!(def["name"], "Ralph");
@@ -1189,7 +1192,7 @@ mod tests {
         // A retired `modelTier:` frontmatter line is never echoed on the wire.
         assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
-        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.");
         assert_eq!(def["behaviorPrompt"], "You loop.");
         assert_eq!(def["source"], "user");
@@ -1218,7 +1221,7 @@ mod tests {
             "model": "opus4.5",
             "modelTier": "smart",
             "roleReminder": "Never stop early",
-            "agentType": "ralph-loop",
+            "agentType": "task-loop",
             "prompt": "You loop.\nForever."
         });
         let rendered = render_file("ralph", &spec);
@@ -1229,7 +1232,7 @@ mod tests {
         assert_eq!(def["model"], "opus4.5");
         assert!(def.get("modelTier").is_none());
         assert_eq!(def["roleReminder"], "Never stop early");
-        assert_eq!(def["agentType"], "ralph-loop");
+        assert_eq!(def["agentType"], "task-loop");
         assert_eq!(def["prompt"], "You loop.\nForever.");
         assert_eq!(def["behaviorPrompt"], "You loop.\nForever.");
     }
@@ -1587,7 +1590,8 @@ mod tests {
     #[test]
     fn embedded_bundled_resolves_all_eight_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
-        // get()/list()/resolve_agent_type()/resolve_role_reminder().
+        // get()/resolve_agent_type()/resolve_role_reminder(). Ralph is the one
+        // retired id intentionally omitted from list().
         let dir = TempSpecialistsDir::new();
         let svc = service_over(&dir);
         for id in EMBEDDED_IDS {
@@ -1603,9 +1607,11 @@ mod tests {
         }
         let list = svc.list(None).unwrap();
         let specs = list["specialists"].as_array().unwrap();
-        for id in EMBEDDED_IDS {
+        assert_eq!(specs.len(), 7, "Ralph is excluded from the catalog");
+        for id in EMBEDDED_IDS.into_iter().filter(|id| *id != "ralph") {
             assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
         }
+        assert!(!specs.iter().any(|s| s["id"] == "ralph"));
         // The bundled chief-of-staff is flagged hidden; every other embedded
         // definition omits the field (absent ⇒ not hidden).
         for spec in specs {
@@ -1615,12 +1621,19 @@ mod tests {
                 assert!(spec.get("hidden").is_none(), "{}: not hidden", spec["id"]);
             }
         }
-        // Frontmatter-driven resolution works too: ralph declares an agentType,
-        // implementor an explicit roleReminder.
+        // Ralph remains fully resolvable for pinned v1 sessions even though it
+        // is absent from the catalog.
+        let ralph = svc.get("ralph", None).unwrap();
+        assert_eq!(ralph["specialist"]["hidden"], true);
         assert_eq!(
             svc.resolve_agent_type("ralph", None).as_deref(),
             Some("ralph-loop")
         );
+        let (name, reminder) = svc.resolve_role_reminder("ralph", None).unwrap();
+        assert_eq!(name, "Ralph");
+        assert!(reminder.starts_with("You are Ralph."));
+
+        // Implementor also declares an explicit roleReminder.
         let (name, reminder) = svc.resolve_role_reminder("implementor", None).unwrap();
         assert_eq!(name, "Implementor");
         assert!(reminder.starts_with("Stay within task scope."));
@@ -1957,7 +1970,8 @@ mod tests {
     #[test]
     fn user_override_of_embedded_inherits_scalars_at_spawn() {
         // The embedded floor participates in the fold: a user ralph.md that
-        // omits agentType keeps the embedded value at spawn time.
+        // omits agentType keeps the embedded value at spawn time, but remains
+        // absent from list() as a retired catalog id.
         let user = TempSpecialistsDir::new();
         let bundled = TempSpecialistsDir::new();
         user.write(
@@ -1972,6 +1986,12 @@ mod tests {
         );
         let got = svc.get("ralph", None).unwrap();
         assert_eq!(got["specialist"]["source"], "user");
+        assert_eq!(got["specialist"]["hidden"], true);
+        assert!(svc.list(None).unwrap()["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|spec| spec["id"] != "ralph"));
         assert!(
             got["specialist"].get("modelTier").is_none(),
             "modelTier is retired and never emitted"
