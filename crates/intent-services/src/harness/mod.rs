@@ -3,9 +3,11 @@
 //! prompt or per-turn prompt envelope.
 //!
 //! One trait, one module per version. [`Harness`] exposes a method per text
-//! surface; each version implements it ([`v1`] = today's post-#2457 set,
+//! surface; each version implements it ([`v1`] = the post-#2457 set,
 //! byte-pinned by `crate::v1_goldens` and
-//! `agent_manager::v1_turn_envelope_goldens`). Call sites carry typed data
+//! `agent_manager::v1_turn_envelope_goldens`; [`v1_1`] reuses v1's text
+//! surfaces and swaps in its own doctrine, byte-pinned by
+//! `crate::v1_1_goldens`). Call sites carry typed data
 //! into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version starts as `pub use` re-exports of the prior version's
@@ -21,9 +23,9 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (intent-core's `"1.0"` form) to the pair, so a
-//! session keeps assembling the exact doctrine it was created with even after
-//! the binary ships a newer set. All past versions stay bundled.
+//! session `harnessVersion` (intent-core's `"1.0"` / `"1.1"` form) to the
+//! pair, so a session keeps assembling the exact doctrine it was created with
+//! even after the binary ships a newer set. All past versions stay bundled.
 
 pub(crate) mod v1;
 pub(crate) mod v1_1;
