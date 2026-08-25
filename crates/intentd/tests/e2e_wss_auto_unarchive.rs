@@ -5,9 +5,10 @@
 //! `agent.sendMessage` (a direct send claims the in-flight slot — the
 //! archived gates only park queued wakes/drains) → asserts:
 //! - the turn runs to completion (`agent:stream:end` with no `stopReason`),
-//! - ONE §6.5 `workspace:updated` delta lands with
+//! - a §6.5 `workspace:updated` delta lands with
 //!   `changes: { archived: false, status: "Active", archivedAt: null,
-//!   autoUnarchive: { reason: "agent_activity", agentId, agentName } }`,
+//!   autoUnarchive: { reason: "agent_activity", agentId, agentName } }`
+//!   (unrelated activity deltas may interleave on the same event type),
 //! - a follow-up `workspace.get` shows the row Active with no `archivedAt`.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
@@ -379,8 +380,8 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
     assert_eq!(archived["workspace"]["archived"], json!(true));
     assert_eq!(archived["workspace"]["status"], json!("Archived"));
 
-    // SUBSCRIBER conn — subscribe AFTER the archive so the only
-    // workspace:updated delta observable below is the auto-unarchive's.
+    // SUBSCRIBER conn — subscribe AFTER the archive so the archive's own
+    // workspace:updated delta is never observable below.
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_resp = wss_rpc(
         &mut sub,
@@ -410,7 +411,9 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Collect the stamped delta and the turn's normal completion; relative
-    // order is unspecified.
+    // order is unspecified. Keep only the workspace:updated frame carrying
+    // the autoUnarchive stamp — under load unrelated activity deltas (e.g.
+    // a bare lastActivity change) interleave on the same event type.
     let mut unarchive_delta = None;
     let mut stream_end = None;
     for _ in 0..80 {
@@ -421,7 +424,11 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
         let event = &frame["params"]["event"];
         match event["type"].as_str() {
             Some("workspace:updated") => {
-                unarchive_delta = Some(event["data"].clone());
+                if unarchive_delta.is_none()
+                    && event["data"]["changes"].get("autoUnarchive").is_some()
+                {
+                    unarchive_delta = Some(event["data"].clone());
+                }
             }
             Some("agent:stream:end") => {
                 stream_end = Some(event["data"].clone());

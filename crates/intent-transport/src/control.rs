@@ -58,6 +58,10 @@ pub struct SystemStatus {
     pub local_ips: Vec<String>,
     /// Local OS hostname (same source as `server.pairingInfo`).
     pub hostname: String,
+    /// OS "pretty" device name (macOS Computer Name), falling back to the
+    /// hostname when unavailable (same source as `server.pairingInfo` /
+    /// `host.status`).
+    pub pretty_hostname: String,
     /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
     /// full core, so values may exceed 100 on multi-core hosts. The first
     /// sample after startup may legitimately read 0.
@@ -258,6 +262,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "fingerprint": status.fingerprint,
         "localIps": status.local_ips,
         "hostname": status.hostname,
+        "prettyHostname": status.pretty_hostname,
         "protocolVersion": PROTOCOL_VERSION,
         "host": {
             "os": status.os,

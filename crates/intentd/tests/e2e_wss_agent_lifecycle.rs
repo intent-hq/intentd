@@ -965,6 +965,168 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
     }
 }
 
+/// intent-hq/monorepo#3402 over the real WSS wire: a mid-turn stream silence
+/// past the (lowered) stall threshold delivers the advisory
+/// `agent:stream:status` `phase: "stalled"` frame — `level: "warn"` plus the
+/// additive `silentMs` — to an `events.subscribe` subscriber, and the stream
+/// coming back delivers the paired `phase: "resumed"` (`level: "info"`, no
+/// `silentMs`) BEFORE the turn's first `agent:stream:activity`; the turn then
+/// ends normally with one terminal `agent:stream:end`. The mock parks
+/// `firstTurnDelayMs` of silence after `session/prompt` before streaming its
+/// response, so the stall window is deterministic. Margins: the stall fires
+/// ~1s into a 3s park (checker cadence ~166ms at the 1s threshold), leaving
+/// ~2s of slack each way for saturated CI runners.
+#[tokio::test]
+async fn mid_turn_stall_and_resume_status_over_wss() {
+    let Some(script) = gate("WSS mid-turn stall status E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "back after the stall",
+        "firstTurnDelayMs": 3000,
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Staller", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "go stall mid-turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect frames until the terminal stream:end, recording every status
+    // frame's arrival ordinal so stalled/resumed can be ordered against the
+    // first activity.
+    let mut status_frames: Vec<(usize, Value)> = Vec::new();
+    let mut first_activity_at: Option<usize> = None;
+    let mut ends = 0u32;
+    for i in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:stream:status") => status_frames.push((i, event.clone())),
+            Some("agent:stream:activity") => {
+                if first_activity_at.is_none() {
+                    first_activity_at = Some(i);
+                }
+            }
+            Some("agent:stream:end") => {
+                ends += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        ends, 1,
+        "stalls never fail the turn — one terminal stream:end"
+    );
+
+    // Exactly one stalled and one resumed rode the wire, in that order.
+    let stalled: Vec<&(usize, Value)> = status_frames
+        .iter()
+        .filter(|(_, e)| e["data"]["phase"] == json!("stalled"))
+        .collect();
+    let resumed: Vec<&(usize, Value)> = status_frames
+        .iter()
+        .filter(|(_, e)| e["data"]["phase"] == json!("resumed"))
+        .collect();
+    assert_eq!(stalled.len(), 1, "one stalled frame: {status_frames:?}");
+    assert_eq!(resumed.len(), 1, "one resumed frame: {status_frames:?}");
+    let (stalled_at, stalled_ev) = stalled[0];
+    let (resumed_at, resumed_ev) = resumed[0];
+    assert!(stalled_at < resumed_at, "stalled precedes resumed");
+    let first_activity_at = first_activity_at.expect("stream activity observed");
+    assert!(
+        *resumed_at < first_activity_at,
+        "resumed lands before the first activity frame that cleared it"
+    );
+
+    // Payload contract (§6.5 self-sufficient status shape + #3402 additions).
+    let data = &stalled_ev["data"];
+    assert_eq!(data["agentId"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(data["workspaceId"].as_str(), Some(ws_id.as_str()));
+    assert_eq!(data["level"], json!("warn"), "stalled is warn: {data}");
+    let silent_ms = data["silentMs"].as_u64().expect("stalled carries silentMs");
+    assert!(
+        silent_ms >= 1000,
+        "silence past the lowered threshold: {silent_ms}"
+    );
+    assert_eq!(
+        data["message"],
+        json!(format!("No model activity for {}s", silent_ms / 1000)),
+        "stalled message derives from silentMs: {data}"
+    );
+    assert!(data["timestamp"].as_u64().is_some(), "epoch-ms timestamp");
+
+    let data = &resumed_ev["data"];
+    assert_eq!(data["agentId"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(data["workspaceId"].as_str(), Some(ws_id.as_str()));
+    assert_eq!(data["level"], json!("info"), "resumed is info: {data}");
+    assert_eq!(data["message"], json!("Stream activity resumed"));
+    assert!(
+        data.get("silentMs").is_none(),
+        "resumed carries no silentMs: {data}"
+    );
+    assert!(data["timestamp"].as_u64().is_some(), "epoch-ms timestamp");
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
@@ -5655,6 +5817,82 @@ async fn event_query_event_type_glob_over_wss() {
             .any(|e| e["type"].as_str().unwrap_or_default().starts_with("note:")),
         "bare * must behave like no type filter: {star_rows}"
     );
+}
+
+/// Regression (monorepo#3347): a busy workspace's `event.query` response no
+/// longer serializes past the transport's 1 MiB large-frame advisory over the
+/// real WSS wire. Seeds 50 `note:created` events with ~30 KiB caller-supplied
+/// titles (~1.5 MiB of raw event data), then asserts the queried row set is
+/// bounded with additive `truncated` / `originalBytes` markers, row identity
+/// preserved, and no rows dropped.
+#[tokio::test]
+async fn event_query_response_bounded_over_wss() {
+    const ONE_MIB: usize = 1024 * 1024;
+    const SEEDED: usize = 50;
+    let (_daemon, ws_id, _note_id, port, fingerprint) = boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Seed notes whose ~30 KiB titles land verbatim in the `note:created`
+    // event payload — ~1.5 MiB of event data total.
+    let big_title = "t".repeat(30 * 1024);
+    for i in 0..SEEDED {
+        let created = wss_rpc(
+            &mut rpc,
+            i64::try_from(i).expect("value fits in i64") + 1,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": big_title, "content": format!("n{i}") }),
+        )
+        .await;
+        assert!(created["note"]["id"].as_str().is_some(), "note {i} created");
+    }
+
+    // Event writes commit asynchronously relative to the RPC responses; poll
+    // until all seeded `note:created` events are visible.
+    let mut id = i64::try_from(SEEDED).expect("value fits in i64") + 1;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let rows = loop {
+        let rows = wss_rpc(
+            &mut rpc,
+            id,
+            "event.query",
+            json!({ "workspaceId": ws_id, "eventType": "note:created", "limit": 100 }),
+        )
+        .await;
+        id += 1;
+        if rows.as_array().expect("rows array").len() >= SEEDED {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "seeded note:created events never all appeared: {} rows",
+            rows.as_array().expect("rows array").len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let arr = rows.as_array().expect("rows array");
+    assert_eq!(arr.len(), SEEDED, "no rows may be dropped");
+    let size = serde_json::to_string(&rows).expect("serialize").len();
+    assert!(
+        size < ONE_MIB,
+        "event.query response must stay under the 1 MiB frame advisory: {size}"
+    );
+    assert!(
+        arr.iter().any(|r| r["truncated"] == json!(true)),
+        "trimming must be observable via row markers: {size} bytes"
+    );
+    for row in arr {
+        assert!(row["id"].as_str().is_some(), "row identity survives: {row}");
+        assert_eq!(row["type"], json!("note:created"));
+        assert!(row["timestamp"].as_str().is_some());
+        if row["truncated"] == json!(true) {
+            assert!(
+                row["originalBytes"].as_u64().is_some(),
+                "trimmed rows carry originalBytes: {row}"
+            );
+        }
+    }
 }
 
 /// WSS-2 (subscriptions): narrow `eventTypes` filters route only matching

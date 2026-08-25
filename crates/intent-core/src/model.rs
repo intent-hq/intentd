@@ -2456,13 +2456,15 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "1.0";
+pub const CURRENT_HARNESS_VERSION: &str = "1.1";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
-/// the migration-0096 backfill.
+/// the migration-0096 backfill. Deliberately the literal "1.0", NOT
+/// [`CURRENT_HARNESS_VERSION`]: a version bump must never relabel pre-feature
+/// payloads to a doctrine they were not created under.
 fn default_harness_version() -> String {
-    CURRENT_HARNESS_VERSION.to_string()
+    "1.0".to_string()
 }
 
 /// Metadata key under which the question-dismissal marker is persisted on the

@@ -246,6 +246,13 @@ async fn server_pairing_info_over_uds() {
     assert_eq!(result["path"].as_str().unwrap(), "/ws");
     assert!(result["localIps"].is_array());
     assert!(result["hostname"].is_string());
+    assert!(
+        !result["prettyHostname"]
+            .as_str()
+            .expect("prettyHostname is string")
+            .is_empty(),
+        "prettyHostname non-empty"
+    );
 
     daemon.child.kill().ok();
 }

@@ -22,9 +22,9 @@ use intent_services::{
 use intent_store::Store;
 use intent_transport::{
     collect_local_ips, detect_has_display, ensure_tls_certificate, get_or_create_token,
-    local_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
-    PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer,
-    WsOptions,
+    local_hostname, pretty_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus,
+    FileTokenStore, PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore,
+    WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -2270,8 +2270,9 @@ struct DaemonControl {
     /// Latest descendant-tree memory sample (agent child processes and
     /// everything they spawn) from the background sampler.
     child_usage: Arc<ChildTreeUsage>,
-    /// Cached route-discovery snapshot (`localIps` + `hostname`) from the
-    /// background sampler, so `status()` never enumerates interfaces inline.
+    /// Cached route-discovery snapshot (`localIps` + `hostname` +
+    /// `prettyHostname`) from the background sampler, so `status()` never
+    /// enumerates interfaces inline.
     route_info: Arc<RouteInfo>,
     /// Latest workspaces-root disk sample (available/total bytes) from the
     /// background sampler, so `status()` never calls `statfs(2)` inline.
@@ -2319,17 +2320,18 @@ impl ProcUsage {
     }
 }
 
-/// Cached route-discovery snapshot (`localIps` + `hostname`) for
-/// `system.status` (§5.7), written by the background sampler task and read
-/// from `status()` without touching the OS. `localIps` is invalidated by
-/// external network activity, so per the derived-field ladder it is refreshed
-/// off the read path (TTL cache) rather than computed inline on read.
+/// Cached route-discovery snapshot (`localIps` + `hostname` +
+/// `prettyHostname`) for `system.status` (§5.7), written by the background
+/// sampler task and read from `status()` without touching the OS. `localIps`
+/// is invalidated by external network activity, so per the derived-field
+/// ladder it is refreshed off the read path (TTL cache) rather than computed
+/// inline on read.
 struct RouteInfo {
-    inner: std::sync::RwLock<(Vec<String>, String)>,
+    inner: std::sync::RwLock<(Vec<String>, String, String)>,
 }
 
 impl RouteInfo {
-    fn load(&self) -> (Vec<String>, String) {
+    fn load(&self) -> (Vec<String>, String, String) {
         self.inner.read().expect("route info lock poisoned").clone()
     }
 }
@@ -2341,7 +2343,7 @@ impl RouteInfo {
 /// read path free of `getifaddrs(3)`/hostname syscalls.
 fn spawn_route_info_sampler() -> Arc<RouteInfo> {
     let info = Arc::new(RouteInfo {
-        inner: std::sync::RwLock::new((collect_local_ips(), local_hostname())),
+        inner: std::sync::RwLock::new((collect_local_ips(), local_hostname(), pretty_hostname())),
     });
     let task_info = info.clone();
     tokio::spawn(async move {
@@ -2350,7 +2352,7 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let sample = (collect_local_ips(), local_hostname());
+            let sample = (collect_local_ips(), local_hostname(), pretty_hostname());
             *task_info.inner.write().expect("route info lock poisoned") = sample;
         }
     });
@@ -2962,7 +2964,7 @@ impl SystemControl for DaemonControl {
         // `server.pairingInfo`, so a remote caller can refresh its stored
         // host list from `system.status` alone. Served from the background
         // sampler's TTL cache — never enumerated inline on the read path.
-        let (local_ips, hostname) = self.route_info.load();
+        let (local_ips, hostname, pretty_hostname) = self.route_info.load();
         // Derived transport surface: UDS always serves; `tcp`/`listenMode`
         // reflect the live TCP listener state (runtime toggles included), so
         // `listenMode` is `both` while the listener is up and `uds` otherwise.
@@ -2994,6 +2996,7 @@ impl SystemControl for DaemonControl {
             uptime_seconds: self.start_time.elapsed().as_secs(),
             local_ips,
             hostname,
+            pretty_hostname,
             cpu_percent,
             memory_bytes,
             child_processes: child_tree.as_ref().map(|s| s.count),
