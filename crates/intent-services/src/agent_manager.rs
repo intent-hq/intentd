@@ -8051,7 +8051,7 @@ const DEFAULT_AGENT_TYPE: &str = "interactive";
 
 /// Derive the spawn `agent_type` for a session (SP-B): when the session was
 /// created with a specialist that declares an `agentType` frontmatter scalar
-/// (e.g. `ralph` → `ralph-loop`), that value becomes the agent's type so the
+/// (e.g. `reviewer` → `task-loop`), that value becomes the agent's type so the
 /// matching internal tool denylist (§18.4,
 /// [`get_tool_denylist_for_agent_type`](intent_acp::get_tool_denylist_for_agent_type))
 /// engages on spawn. Otherwise (no specialist, or a specialist without
