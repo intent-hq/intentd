@@ -28,6 +28,7 @@ pub(crate) mod git;
 pub(crate) mod help;
 pub(crate) mod hook;
 pub(crate) mod host;
+pub(crate) mod mcp;
 pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
@@ -102,6 +103,9 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     }
     if features.terminal_access {
         fragments.push(terminal::PRELUDE);
+    }
+    if features.mcp_tools {
+        fragments.push(mcp::PRELUDE);
     }
     fragments.push(file::PRELUDE);
     let app = app::prelude_for(features);
@@ -215,6 +219,9 @@ pub(crate) async fn try_dispatch(
         return terminal::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("mcp.") {
+        return mcp::dispatch(api, workspace_id, rest, args).await.map(Some);
     }
     if let Some(rest) = method.strip_prefix("file.") {
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
@@ -335,6 +342,7 @@ mod prelude_tests {
             ("ws.terminal = {", |f| f.terminal_access = false),
             ("ws.browser = {", |f| f.browser_automation = false),
             ("ws.app.question = {", |f| f.structured_questions = false),
+            ("ws.mcp = {", |f| f.mcp_tools = false),
         ];
         let markers: Vec<&str> = cases.iter().map(|(m, _)| *m).collect();
         for (marker, disable) in &cases {

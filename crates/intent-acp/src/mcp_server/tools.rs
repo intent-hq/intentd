@@ -142,7 +142,7 @@ Namespaces (index — full signatures in API below):
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
-  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
@@ -151,6 +151,7 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
+  ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
@@ -285,6 +286,10 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
+  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear); `state` is the live hub state (running|stopped|error|starting).
+  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled or not running.
+  ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
+
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
@@ -353,7 +358,7 @@ Namespaces (index — full signatures in API below):
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
-  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
@@ -361,6 +366,7 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
+  ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
@@ -514,6 +520,10 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
+  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear); `state` is the live hub state (running|stopped|error|starting).
+  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled or not running.
+  ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
+
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
@@ -624,6 +634,9 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
         // rule lives in the bridge/dispatch layers, not here.
         out.push(("ws.agent.retire", "agentFeatures.peerAgents"));
         out.push(("ws.agent.spawnPeer", "agentFeatures.peerAgents"));
+    }
+    if !features.mcp_tools {
+        out.push(("ws.mcp.", "agentFeatures.mcpTools"));
     }
     out
 }
@@ -1215,6 +1228,7 @@ mod tests {
     const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
+    const BINDINGS_MCP: &str = include_str!("bindings/mcp.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
     const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
     const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
@@ -1244,6 +1258,7 @@ mod tests {
             ("hook", BINDINGS_HOOK),
             ("script", BINDINGS_SCRIPT),
             ("terminal", BINDINGS_TERMINAL),
+            ("mcp", BINDINGS_MCP),
             ("file", BINDINGS_FILE),
         ]
     }
@@ -2192,6 +2207,7 @@ mod tests {
             (&["ws.agent.retire", "ws.agent.spawnPeer"], |f| {
                 f.peer_agents = false;
             }),
+            (&["ws.mcp."], |f| f.mcp_tools = false),
         ]
     }
 
@@ -2640,6 +2656,10 @@ mod tests {
             denied_feature(&all_off, "agent.reportBlocker"),
             Some("agentFeatures.attentionRequests")
         );
+        assert_eq!(
+            denied_feature(&all_off, "mcp.callTool"),
+            Some("agentFeatures.mcpTools")
+        );
         // `ws.agent.snapshot()` is NEVER gated: `stateSnapshot` governs only
         // the turn-prompt injection, so even a session created with the
         // toggle already off keeps the tool callable.
@@ -2692,6 +2712,10 @@ mod tests {
         );
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
+            None
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "mcp.listServers"),
             None
         );
     }
