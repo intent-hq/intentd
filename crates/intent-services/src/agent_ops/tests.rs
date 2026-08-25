@@ -28239,8 +28239,7 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     let child = create_agent(&svc, &ws, "Child").await;
     let other = create_agent(&svc, &ws, "Other").await;
 
-    // Parent linkage: `child` is an actively running delegate of `parent`
-    // (freshly created sessions persist as `Idle`, which does not count).
+    // Parent linkage: `child` is an actively executing delegate of `parent`.
     let mut child_session = svc
         .store()
         .get_agent_session(&child)
@@ -28248,6 +28247,7 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
     child_session.status = intent_core::AgentStatus::Active;
+    child_session.is_active = true;
     svc.store()
         .update_agent_session(&ws, &child_session)
         .await
@@ -28285,6 +28285,8 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     assert_eq!(v["agentWatches"], json!(1));
     assert_eq!(v["queuedMessages"], json!(2));
     assert_eq!(v["eventSubscriptions"], json!(1));
+    assert_eq!(v["activeSubAgents"], json!(1));
+    assert_eq!(v["unsettledSubAgents"], json!(1));
     assert_eq!(v["runningSubAgents"], json!(1));
     assert_eq!(v["pendingAttention"], json!("blocker"));
     // Zero-count fields stay omitted.
@@ -28359,32 +28361,77 @@ async fn agent_snapshot_line_gated_by_session_snapshot_not_live_setting() {
     );
 }
 
-/// A settled (terminal) child no longer counts toward `runningSubAgents`.
+/// Completed, failed, and deleted children are settled and omitted from all
+/// child-agent counts, even if their runtime-active flag is stale.
 #[tokio::test]
 async fn agent_snapshot_excludes_settled_children() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
-    let child = create_agent(&svc, &ws, "Child").await;
-    let mut child_session = svc
-        .store()
-        .get_agent_session(&child)
-        .await
-        .expect("child session");
-    child_session.parent_agent_id = Some(parent.clone());
-    child_session.status = intent_core::AgentStatus::Completed;
-    svc.store()
-        .update_agent_session(&ws, &child_session)
-        .await
-        .expect("settle child");
+    for status in [
+        intent_core::AgentStatus::Completed,
+        intent_core::AgentStatus::Error,
+        intent_core::AgentStatus::Deleted,
+    ] {
+        let child = create_agent(&svc, &ws, &format!("Child {status:?}")).await;
+        let mut child_session = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        child_session.parent_agent_id = Some(parent.clone());
+        child_session.status = status;
+        child_session.is_active = true;
+        svc.store()
+            .update_agent_session(&ws, &child_session)
+            .await
+            .expect("settle child");
+    }
 
     let v = svc
         .agent_snapshot_op(ws.clone(), parent.clone())
         .await
         .expect("snapshot");
-    assert!(
-        !v.as_object().unwrap().contains_key("runningSubAgents"),
-        "settled child must not count: {v}"
-    );
+    let obj = v.as_object().unwrap();
+    for key in ["activeSubAgents", "unsettledSubAgents", "runningSubAgents"] {
+        assert!(
+            !obj.contains_key(key),
+            "settled children must not count: {v}"
+        );
+    }
+}
+
+/// Idle children remain unsettled. This includes a child whose runtime turn
+/// ended while a hook keeps future work armed; neither is actively executing.
+#[tokio::test]
+async fn agent_snapshot_counts_idle_and_hook_waiting_children_as_unsettled_only() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    for (name, has_hook) in [("Idle", false), ("Hook waiter", true)] {
+        let child = create_agent(&svc, &ws, name).await;
+        let mut child_session = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        child_session.parent_agent_id = Some(parent.clone());
+        child_session.status = intent_core::AgentStatus::RuntimeIdle;
+        child_session.is_active = false;
+        svc.store()
+            .update_agent_session(&ws, &child_session)
+            .await
+            .expect("link idle child");
+        if has_hook {
+            seed_active_hook(&svc, &ws, &child, "waiting-hook").await;
+        }
+    }
+
+    let v = svc
+        .agent_snapshot_op(ws.clone(), parent.clone())
+        .await
+        .expect("snapshot");
+    assert!(v.get("activeSubAgents").is_none(), "no live turns: {v}");
+    assert_eq!(v["unsettledSubAgents"], json!(2));
+    assert!(v.get("runningSubAgents").is_none(), "no running turns: {v}");
 }
 
 /// Regression (monorepo#3384): an IDLE child — non-terminal but not doing
@@ -28479,6 +28526,11 @@ async fn agent_snapshot_counts_cross_workspace_children() {
         .agent_snapshot_op(ws.clone(), parent.clone())
         .await
         .expect("snapshot");
+    assert_eq!(
+        v["unsettledSubAgents"],
+        json!(1),
+        "cross-workspace child must be unsettled: {v}"
+    );
     assert_eq!(
         v["runningSubAgents"],
         json!(1),

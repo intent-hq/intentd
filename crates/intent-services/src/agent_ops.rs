@@ -299,9 +299,13 @@ pub(crate) struct AgentSnapshot {
     /// Active workspace event subscriptions owned by this agent.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) event_subscriptions: usize,
-    /// Delegated child agents genuinely in flight (pending/active/
-    /// Processing/Waiting status) — idle/restorable children do not count
-    /// (monorepo#3384).
+    /// Delegated children that are executing a live runtime turn now.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) active_sub_agents: usize,
+    /// Delegated children not yet settled, including idle/background waiters.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) unsettled_sub_agents: usize,
+    /// Legacy compatibility count for children in an in-flight status.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) running_sub_agents: usize,
     /// Structured questions still pending presentation/answer.
@@ -333,6 +337,8 @@ impl AgentSnapshot {
             && self.agent_watches == 0
             && self.queued_messages == 0
             && self.event_subscriptions == 0
+            && self.active_sub_agents == 0
+            && self.unsettled_sub_agents == 0
             && self.running_sub_agents == 0
             && self.num_questions_asked == 0
             && self.pr_monitors.is_empty()
@@ -9229,19 +9235,21 @@ impl Services {
             .get(agent_id)
             .map_or(0, std::vec::Vec::len);
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
-        // Delegated children genuinely in flight (pending/active/Processing/
-        // Waiting) — idle/restorable children are NOT "running"
-        // (monorepo#3384). One aggregate statement over the
-        // `parent_agent_id` index, unscoped by workspace so a Chief
-        // parent's cross-workspace delegates count too — O(this agent's
-        // children), never O(workspace sessions). Fails open to 0.
-        let running_sub_agents = usize::try_from(
-            self.store
-                .count_running_child_agents(agent_id)
-                .await
-                .unwrap_or(0),
-        )
-        .expect("value fits in usize");
+        // One aggregate statement over `idx_agent_parent`, unscoped by
+        // workspace so Chief cross-workspace delegates count too. Active is
+        // the live runtime-turn subset (`is_active`); unsettled also includes
+        // idle children waiting on hooks or other background work. The legacy
+        // running preserves the existing in-flight-status count. Fails open.
+        let child_counts = self
+            .store
+            .count_child_agents(agent_id)
+            .await
+            .unwrap_or_default();
+        let active_sub_agents = usize::try_from(child_counts.active).expect("value fits in usize");
+        let unsettled_sub_agents =
+            usize::try_from(child_counts.unsettled).expect("value fits in usize");
+        let running_sub_agents =
+            usize::try_from(child_counts.running).expect("value fits in usize");
         let num_questions_asked = self.pending_question_count(agent_id).await;
         // Per-agent indexed read over this agent's monitor rows; labels only,
         // no snapshot hydration. Fails open to empty.
@@ -9261,6 +9269,8 @@ impl Services {
             agent_watches,
             queued_messages,
             event_subscriptions,
+            active_sub_agents,
+            unsettled_sub_agents,
             running_sub_agents,
             num_questions_asked,
             pr_monitors,
