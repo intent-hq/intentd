@@ -12,11 +12,12 @@
 
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
-    AGENT_RENAMED, AGENT_RESTORED, AGENT_STARTED, AGENT_STATUS_CHANGED, AGENT_STREAM_END,
-    AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
-    NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
+    AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
+    AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
+    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED,
+    TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
     extract_spec_task_ids, now_iso, AgentId, ConversationProjection, Event, Note, NoteId,
@@ -394,6 +395,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_STATUS_CHANGED,
             AGENT_RENAMED,
             AGENT_UPDATED,
+            AGENT_RETIRED,
             AGENT_RESTORED,
             AGENT_DELETED,
         ],
@@ -1662,9 +1664,13 @@ pub(crate) async fn task_delta(
 }
 
 /// Map an `agent` channel lifecycle event by re-reading the [`AgentLite`].
-/// `agent:created` → `added`, `agent:deleted` → `removedIds`, every other
-/// lifecycle/status event → `updated`. The agent id is read from `data.agentId`
-/// (falling back to the agent-scoped `sessionId`).
+/// `agent:created` / `agent:restored` → `added`, `agent:deleted` /
+/// `agent:retired` → `removedIds`, every other lifecycle/status event →
+/// `updated`. Retirement maps to removal (and restore to re-add) because the
+/// channel's seq-0 snapshot is the default `agent.list`, which excludes
+/// retired rows — deltas must converge on the same state a fresh snapshot
+/// would serve. The agent id is read from `data.agentId` (falling back to
+/// the agent-scoped `sessionId`).
 pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
     let agent_id = event
         .data
@@ -1672,13 +1678,13 @@ pub(crate) async fn agent_delta(api: &dyn WorkspaceApi, event: &Event) -> Option
         .and_then(Value::as_str)
         .or(event.session_id.as_deref())?;
     match event.event_type.as_str() {
-        AGENT_DELETED => Some(json!({ "removedIds": [agent_id] })),
-        AGENT_CREATED => {
+        AGENT_DELETED | AGENT_RETIRED => Some(json!({ "removedIds": [agent_id] })),
+        AGENT_CREATED | AGENT_RESTORED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
             Some(json!({ "added": [serde_json::to_value(agent).ok()?] }))
         }
         AGENT_STARTED | AGENT_COMPLETED | AGENT_FAILED | AGENT_IDLE | AGENT_STATUS_CHANGED
-        | AGENT_RENAMED | AGENT_UPDATED | AGENT_RESTORED => {
+        | AGENT_RENAMED | AGENT_UPDATED => {
             let agent = api.agent_get(AgentId::from(agent_id), None).await.ok()?;
             Some(json!({ "updated": [serde_json::to_value(agent).ok()?] }))
         }

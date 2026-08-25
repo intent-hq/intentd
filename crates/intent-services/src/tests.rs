@@ -334,6 +334,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -500,6 +501,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -631,6 +633,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
 
     for i in 0..WORKSPACES {
@@ -1073,6 +1076,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -1367,6 +1371,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2016,6 +2021,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .expect("session");
@@ -3890,6 +3896,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -6223,6 +6230,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         })
         .await
         .expect("insert agent session");
@@ -6576,6 +6584,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -6811,6 +6820,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -6964,6 +6974,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -7946,6 +7957,7 @@ mod change_event_parity {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -9831,6 +9843,7 @@ mod mcp_callback {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -18140,6 +18153,7 @@ mod search_adapters {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -20014,6 +20028,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20158,6 +20173,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20292,6 +20308,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20422,6 +20439,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20552,6 +20570,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -20686,6 +20705,7 @@ mod rules {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -24628,6 +24648,7 @@ mod file_ops_service {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         };
         store
             .insert_agent_session(&agent)
@@ -25658,6 +25679,7 @@ mod heal_stale_agent_sessions {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -27871,6 +27893,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         is_background: false,
         metadata: None,
     };
@@ -27916,6 +27939,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         is_background: false,
         metadata: None,
     };
@@ -28040,6 +28064,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        retired_at: None,
         is_background: false,
         metadata: None,
     };
@@ -28972,6 +28997,7 @@ mod last_activity_events {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -29232,6 +29258,7 @@ mod turn_end_unread_gate {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -29642,6 +29669,7 @@ mod turn_token_usage {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 
@@ -32005,6 +32033,7 @@ mod agent_delete_grace_window {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -32804,6 +32833,7 @@ mod derived_workspace_unread {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
         }
     }
 

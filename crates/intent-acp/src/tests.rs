@@ -5797,9 +5797,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Byte-identity needs every gate open (the defaults).
-        let all_on_srv = server("amber-forest", None)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
+        // Byte-identity needs every gate open (the defaults plus the opt-in
+        // `peerAgents` toggle, the default-off gate).
+        let all_on_srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: true,
+                ..Default::default()
+            },
+        );
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -6024,6 +6029,67 @@ mod workspace_api_tool_tests {
         }
     }
 
+    #[tokio::test]
+    async fn peer_agents_off_denies_retire() {
+        // `peerAgents` defaults OFF (the one opt-in toggle), so the default
+        // bridge prunes/denies `ws.agent.retire` on all three layers.
+        let srv = server("amber-forest", None)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
+        // Layer (a): the description does not advertise it.
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("ws.agent.retire"),
+            "default description must not advertise ws.agent.retire"
+        );
+        // Layer (b): the installer is not in the prelude; sibling ws.agent.*
+        // methods survive.
+        let resp = call_workspace_api(
+            &srv,
+            "return { r: typeof ws.agent.retire, rb: typeof ws.agent.reportBlocker };",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["r"], json!("undefined"));
+        assert_eq!(body["rb"], json!("function"));
+        // Layer (c): the raw frame is denied with the settings error.
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'agent.retire', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("disabled in settings") && text.contains("agentFeatures.peerAgents"),
+            "expected explicit disabled-in-settings denial, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_agents_on_installs_and_advertises_retire() {
+        // Opting in installs the binding and advertises the doc line.
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: true,
+                ..Default::default()
+            },
+        );
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(desc.contains("ws.agent.retire(reason?)"));
+        let resp = call_workspace_api(&srv, "return typeof ws.agent.retire;").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(tool_text(&resp), "\"function\"");
+    }
+
     // ---- sub-agent question gating (description / prelude / dispatch) ------
 
     #[tokio::test]
@@ -6046,11 +6112,15 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A top-level bridge with every gate open (the defaults) stays
-        // byte-identical to the static const.
+        // A top-level bridge with every gate open (the defaults plus the
+        // opt-in `peerAgents` toggle) stays byte-identical to the static
+        // const.
         let top = server("amber-forest", None)
             .with_sub_agent(false)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: true,
+                ..Default::default()
+            });
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -8179,6 +8249,7 @@ mod wsapi4_bindings_tests {
     type DelegateCall = (Option<String>, Option<String>);
     type WakeOrCreateCall = (String, String, Option<String>, Option<Value>);
     type AttentionCall = (String, String, Option<String>);
+    type RetireCall = (String, Option<String>, Option<String>);
 
     #[derive(Default)]
     struct FakeApi {
@@ -8194,6 +8265,11 @@ mod wsapi4_bindings_tests {
         watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
         report_to_parent_calls: Mutex<Vec<Option<String>>>,
         request_attention_calls: Mutex<Vec<AttentionCall>>,
+        agent_delete_calls: Mutex<Vec<(String, Option<String>)>>,
+        agent_retire_calls: Mutex<Vec<RetireCall>>,
+        /// Agent ids `agent_is_retired` reports as retired (same-turn
+        /// dispatch-guard tests).
+        retired_agent_ids: Mutex<Vec<String>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
         /// When set, `agent_get` fails with this error (name-lookup failure path).
         agent_get_error: Mutex<Option<String>>,
@@ -8266,6 +8342,7 @@ mod wsapi4_bindings_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            retired_at: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -8587,6 +8664,43 @@ mod wsapi4_bindings_tests {
                     "savedAt": "2026-01-01T00:00:00Z",
                 }))
             })
+        }
+
+        fn agent_delete(
+            &self,
+            agent_id: AgentId,
+            workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_delete_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                workspace_id.as_ref().map(|w| w.as_str().to_string()),
+            ));
+            Box::pin(async move { Ok(json!({ "success": true })) })
+        }
+
+        fn agent_retire(
+            &self,
+            agent_id: AgentId,
+            workspace_id: Option<WorkspaceId>,
+            reason: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_retire_calls.lock().unwrap().push((
+                agent_id.as_str().to_string(),
+                workspace_id.as_ref().map(|w| w.as_str().to_string()),
+                reason,
+            ));
+            Box::pin(
+                async move { Ok(json!({ "success": true, "retiredAt": "2026-01-01T00:00:00Z" })) },
+            )
+        }
+
+        fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
+            let retired = self
+                .retired_agent_ids
+                .lock()
+                .unwrap()
+                .contains(&agent_id.as_str().to_string());
+            Box::pin(async move { retired })
         }
 
         fn event_query(
@@ -9759,6 +9873,102 @@ mod wsapi4_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("reason is required"));
         assert!(api.request_attention_calls.lock().unwrap().is_empty());
+    }
+
+    /// A bridge with `peerAgents` opted in (the toggle defaults off), so the
+    /// `retire` binding is installed and dispatchable.
+    fn peer_agents_features() -> intent_core::settings_file::AgentFeaturesSettings {
+        intent_core::settings_file::AgentFeaturesSettings {
+            peer_agents: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_retire_soft_retires_exactly_the_caller() {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_agent_features(peer_agents_features())
+            .with_caller_agent_id(Some(AgentId::from("agent-self-1")));
+        let resp = call(&srv, "return await ws.agent.retire('handing off to peer');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["retired"], json!(true));
+        assert_eq!(v["retiredAt"], json!("2026-01-01T00:00:00Z"));
+        assert_eq!(v["agentId"], json!("agent-self-1"));
+        assert_eq!(v["reason"], json!("handing off to peer"));
+        // Exactly one SOFT retire, targeting the caller, workspace-scoped,
+        // carrying the reason — and no hard delete.
+        assert_eq!(
+            *api.agent_retire_calls.lock().unwrap(),
+            vec![(
+                "agent-self-1".to_string(),
+                Some("amber-forest".to_string()),
+                Some("handing off to peer".to_string())
+            )]
+        );
+        assert!(api.agent_delete_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_retire_reason_is_optional() {
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_agent_features(peer_agents_features())
+            .with_caller_agent_id(Some(AgentId::from("agent-self-2")));
+        let resp = call(&srv, "return await ws.agent.retire();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["retired"], json!(true));
+        assert!(v.get("reason").is_none(), "no reason key when omitted");
+        assert_eq!(api.agent_retire_calls.lock().unwrap().len(), 1);
+        assert_eq!(api.agent_retire_calls.lock().unwrap()[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn agent_retire_without_caller_is_rejected() {
+        // FE/RPC front door: no caller identity → clear error, no retire.
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_agent_features(peer_agents_features());
+        let resp = call(
+            &srv,
+            "return await host({ method: 'agent.retire', args: {} });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("retire requires an agent caller identity"));
+        assert!(api.agent_retire_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_caller_is_rejected_at_dispatch() {
+        // Same-turn inertness: once the caller's session is marked retired,
+        // every subsequent workspace_api host frame from it fails closed —
+        // the retiring turn cannot keep acting after the mark lands.
+        let api = Arc::new(FakeApi::default());
+        api.retired_agent_ids
+            .lock()
+            .unwrap()
+            .push("agent-self-3".to_string());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from("agent-self-3")));
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("retired"));
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn non_retired_caller_passes_dispatch_guard() {
+        // Control: a caller whose session is not retired dispatches normally.
+        let api = Arc::new(FakeApi::default());
+        let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_caller_agent_id(Some(AgentId::from("agent-self-4")));
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        assert_eq!(*api.agent_list_calls.lock().unwrap(), 1);
     }
 
     // ================================================================
