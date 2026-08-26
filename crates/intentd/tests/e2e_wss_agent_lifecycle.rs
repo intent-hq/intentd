@@ -1127,6 +1127,196 @@ async fn mid_turn_stall_and_resume_status_over_wss() {
     assert!(data["timestamp"].as_u64().is_some(), "epoch-ms timestamp");
 }
 
+/// Tool-call-aware stall suppression over the real WSS wire
+/// (intent-hq/monorepo#3466): silence past the (lowered) stall threshold
+/// while a tool call is IN FLIGHT emits NO advisory `agent:stream:status`
+/// `phase: "stalled"` frame — a long tool run is expected silence, not a
+/// stall — and the turn still ends with one normal terminal
+/// `agent:stream:end`.
+///
+/// Two agents against one daemon prove the suppression is attributable to
+/// the open tool call rather than a broken harness: the TOOL agent's mock
+/// echoes a `tool_call` update (open, `in_progress`, never closed within
+/// the turn) before parking 3s of silence, while the CONTROL agent parks
+/// the identical 3s silence with no tool call open. Same 1s threshold, same
+/// tail: the control turn MUST put a `stalled` frame on the wire, the tool
+/// turn MUST NOT. Margins match [`mid_turn_stall_and_resume_status_over_wss`]:
+/// the checker fires ~1s into a 3s park (~166ms cadence at the 1s
+/// threshold), leaving ~2s of slack for saturated CI runners.
+#[tokio::test]
+async fn open_tool_call_suppresses_stall_status_over_wss() {
+    let Some(script) = gate("WSS tool-aware stall suppression E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // `silentTailBeforeResultMs` parks AFTER the last session/update and
+    // before the prompt resolves, so for the tool rule the silence spans a
+    // window where the `tool_call` echoed via `rawUpdates` is still open.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "TOOL_SILENCE",
+                "rawUpdates": [
+                    { "sessionUpdate": "tool_call", "toolCallId": "tc_stall_e2e",
+                      "title": "bash: cargo test --workspace", "kind": "execute",
+                      "status": "in_progress" }
+                ],
+                "response": "tool still running",
+                "silentTailBeforeResultMs": 3000,
+            },
+            {
+                "ifPromptContains": "BARE_SILENCE",
+                "response": "about to go silent",
+                "silentTailBeforeResultMs": 3000,
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_STREAM_STALL_MS", "1000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE either turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "mock:default" }),
+    )
+    .await;
+    let tool_id = created["agent"]["id"]
+        .as_str()
+        .expect("tool agent id")
+        .to_string();
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Control", "model": "mock:default" }),
+    )
+    .await;
+    let control_id = created["agent"]["id"]
+        .as_str()
+        .expect("control agent id")
+        .to_string();
+
+    // Drive the TOOL turn: an open tool call spans the whole silent tail, so
+    // no stalled frame may ride the wire before its terminal stream:end.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": tool_id, "content": "TOOL_SILENCE" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let tool_statuses = timeout(Duration::from_secs(30), async {
+        let mut frames: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(tool_id.as_str()) {
+                continue;
+            }
+            match ev["type"].as_str() {
+                Some("agent:stream:status") => frames.push(ev["data"].clone()),
+                Some("agent:stream:end") => return frames,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("tool turn reached its terminal stream:end in time");
+    let stalled: Vec<&Value> = tool_statuses
+        .iter()
+        .filter(|d| d["phase"] == json!("stalled"))
+        .collect();
+    assert!(
+        stalled.is_empty(),
+        "no stalled advisory while a tool call is in flight: {tool_statuses:?}"
+    );
+
+    // Drive the CONTROL turn: the identical silent tail with NO open tool
+    // call MUST stall — proving the harness detects stalls and the tool
+    // turn's absence above is the suppression, not a broken setup.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": control_id, "content": "BARE_SILENCE" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let control_statuses = timeout(Duration::from_secs(30), async {
+        let mut frames: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["data"]["agentId"].as_str() != Some(control_id.as_str()) {
+                continue;
+            }
+            match ev["type"].as_str() {
+                Some("agent:stream:status") => frames.push(ev["data"].clone()),
+                Some("agent:stream:end") => return frames,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("control turn reached its terminal stream:end in time");
+    let stalled: Vec<&Value> = control_statuses
+        .iter()
+        .filter(|d| d["phase"] == json!("stalled"))
+        .collect();
+    assert_eq!(
+        stalled.len(),
+        1,
+        "the tool-free control turn stalls on the same silence: {control_statuses:?}"
+    );
+    let data = stalled[0];
+    assert_eq!(data["agentId"].as_str(), Some(control_id.as_str()));
+    assert_eq!(data["level"], json!("warn"), "stalled is warn: {data}");
+    assert!(
+        data["silentMs"].as_u64().expect("silentMs") >= 1000,
+        "control silence past the lowered threshold: {data}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
