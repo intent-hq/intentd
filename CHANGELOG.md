@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.62] - 2026-08-26
+
+### 🚀 Features
+
+- Add scoped sibling workspace proposals ([#1453](https://github.com/intent-hq/intentd/pull/1453))
+- Harden agent coordination and runtime diagnostics ([#1484](https://github.com/intent-hq/intentd/pull/1484))
+
+
 ## [0.7.61] - 2026-08-26
 
 ### 🚀 Features
