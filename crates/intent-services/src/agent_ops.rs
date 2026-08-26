@@ -3914,12 +3914,22 @@ impl Services {
                 active.join(", ")
             )));
         }
-        let Some(now) = self.retire_one_session(&session, reason.as_deref()).await? else {
-            // Lost the CAS to a concurrent retire: re-read the winner's
-            // timestamp and report `alreadyRetired`.
-            let session = self.store.get_agent_session_summary(&agent_id).await?;
-            let existing = session.retired_at.unwrap_or_else(now_iso);
-            return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
+        let mut session = session;
+        let now = loop {
+            if let Some(now) = self.retire_one_session(&session, reason.as_deref()).await? {
+                break now;
+            }
+            // Lost the CAS to a concurrent retire: re-read. While the
+            // winner's mark is set, report `alreadyRetired` with its real
+            // timestamp; if a concurrent restore already cleared it again,
+            // retry the retire instead of fabricating a timestamp for an
+            // agent that is not actually retired.
+            session = self.store.get_agent_session_summary(&agent_id).await?;
+            if let Some(existing) = session.retired_at.clone() {
+                return Ok(
+                    json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
+                );
+            }
         };
         // Cascade (confirmed decision): every non-terminal,
         // not-already-retired descendant retires with the parent, each

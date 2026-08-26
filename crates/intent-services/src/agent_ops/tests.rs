@@ -10543,6 +10543,102 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     assert_eq!(loaded, 0, "orphaned rows must be pruned, not rehydrated");
 }
 
+/// Soft-retire inertness on the event-subscription surface: subscribing AS
+/// a retired agent is rejected fail-closed, and a persisted row whose
+/// subscriber retired while the daemon was down (crash window after the
+/// retire mark but before the teardown's row delete) is pruned at startup
+/// instead of rehydrated.
+#[tokio::test]
+async fn event_subscriptions_reject_and_prune_retired_subscribers() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let subscriber = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        let subscriber = create_agent(&svc, &ws, "Watcher").await;
+        svc.agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["file:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe while live");
+        // The write-through persist is async; wait for the row.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let rows = svc
+                .store()
+                .list_event_subscriptions()
+                .await
+                .expect("list rows");
+            if rows.len() == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscription row never persisted"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Simulate the crash window: mark retired directly at the store —
+        // the retire op's live teardown never runs.
+        let now = now_iso();
+        svc.store()
+            .set_agent_session_retired_at(&ws, &subscriber, Some(&now), &now)
+            .await
+            .expect("mark retired");
+        subscriber
+    }; // Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new(store).with_event_bus(bus);
+    let loaded = svc
+        .heal_event_subscriptions_on_startup()
+        .await
+        .expect("heal");
+    assert_eq!(loaded, 0, "retired subscriber's row pruned, not rehydrated");
+    assert!(
+        svc.store()
+            .list_event_subscriptions()
+            .await
+            .expect("list rows")
+            .is_empty(),
+        "persisted row deleted by the prune"
+    );
+
+    // Registering a NEW subscription against the retired agent fails closed.
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["file:*".into()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("subscribe as a retired agent must fail");
+    assert!(err.to_string().contains("retired"), "got: {err}");
+
+    // Restore lifts the rejection.
+    svc.agent_restore_op(subscriber.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    svc.agent_subscribe(
+        ws.clone(),
+        Some(subscriber),
+        vec!["file:*".into()],
+        None,
+        None,
+    )
+    .await
+    .expect("subscribe after restore");
+}
+
 /// monorepo#947: `agent.getSubscriptions` lists the caller's live event
 /// subscriptions (additive `eventSubscriptions` field alongside the
 /// unchanged completion-watch payload), and unsubscribing removes the entry.
@@ -28078,6 +28174,164 @@ async fn agent_watch_resolved_when_target_is_cascade_retired() {
         parent_message_count(&svc, &watcher).await,
         1,
         "exactly one wake for the cascaded retire"
+    );
+}
+
+/// Retiring an agent whose watcher was hook-deferred settles the watch with
+/// the RETIRED notice, not a stale synthesized `agent:idle`: the retire
+/// sweep cancels the owner's last hook, whose terminal-transition backstop
+/// (`redeliver_completion_after_queue_mutation`) must defer to the
+/// `agent:retired` emit instead of consuming the watch with a completed
+/// wake first.
+#[tokio::test]
+async fn retire_settles_hook_deferred_watch_with_retired_notice() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let _hook = seed_active_hook(&svc, &ws, &target, "pr-watch").await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+    // The target idles while its hook is active: deferred — interim-skip
+    // marker recorded, no wake, watch armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &target,
+        json!({ "agentId": target.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "idle deferred while the hook is active"
+    );
+    assert_eq!(svc.find_watches_for_child(&target).len(), 1);
+
+    // Retire: the sweep cancels the hook — whose terminal backstop re-runs
+    // the deferred redelivery — and the agent:retired emit resolves the
+    // watch. Exactly one wake, carrying the retired wording.
+    svc.agent_retire_op(target.clone(), Some(ws.clone()), Some("handing off".into()))
+        .await
+        .expect("retire");
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &target).await;
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("retired."),
+        "retired notice, not a stale completion: {text}"
+    );
+    assert!(
+        !text.contains("completed"),
+        "no synthesized completed wake before the retire emit: {text}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "exactly one wake for the retire"
+    );
+}
+
+/// Cross-workspace cascade at the services level: a settled descendant
+/// living in a DIFFERENT workspace retires with the parent — its active
+/// hook and PR monitor are cancelled, its watcher resolves with the retired
+/// notice, and its `agent:retired` event lands in the child's own
+/// workspace.
+#[tokio::test]
+async fn retire_cascade_reaches_cross_workspace_descendants() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other workspace");
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let watcher = create_agent(&svc, &other_ws, "Watcher").await;
+    let child = create_agent(&svc, &other_ws, "RemoteChild").await;
+
+    // Watch (same-workspace watcher next to the child) while the child is
+    // still watchable, THEN park it settled under the cross-workspace
+    // parent with an active hook + PR monitor.
+    svc.register_completion_watch(
+        &other_ws,
+        &other_ws,
+        watcher.clone(),
+        "Watcher".into(),
+        child.clone(),
+        None,
+    )
+    .expect("watch the remote child");
+    link_child(
+        &svc,
+        &other_ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    let hook = seed_active_hook(&svc, &other_ws, &child, "remote-watch").await;
+    let monitor = seed_active_pr_monitor(&svc, &other_ws, &child, 41).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RETIRED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), Some("wrapping up".into()))
+        .await
+        .expect("retire parent");
+
+    // Two emits: the parent's in its workspace, the cascaded child's in the
+    // CHILD's own workspace.
+    let mut events = Vec::new();
+    while events.len() < 2 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription closed");
+        events.extend(batch);
+    }
+    let child_event = events
+        .iter()
+        .find(|e| e.data["agentId"].as_str() == Some(child.0.as_str()))
+        .expect("child agent:retired emit");
+    assert_eq!(
+        child_event.workspace_id, other_ws,
+        "child's agent:retired lands in its own workspace"
+    );
+    assert_eq!(
+        child_event.data["reason"].as_str(),
+        Some("parent Parent retired")
+    );
+
+    // Rows retired on both sides of the workspace boundary.
+    for id in [&parent, &child] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_some(), "{id} retired by the cascade");
+    }
+    // The remote child's hook and PR monitor are cancelled by its cleanup.
+    let stored = svc.store().get_hook(&hook.hook_id).await.expect("hook");
+    assert_eq!(stored.state, intent_core::HookState::Cancelled);
+    assert!(stored.next_run_at.is_none());
+    let stored = svc
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .expect("monitor");
+    assert_eq!(stored.state, intent_core::PrMonitorState::Cancelled);
+
+    // The watcher resolves with the retired notice.
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &child).await;
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("retired."),
+        "cross-workspace cascade wake carries the retired verb: {text}"
     );
 }
 

@@ -4770,6 +4770,20 @@ impl Services {
         if self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()) {
             return;
         }
+        // Soft-retire inertness: a retired session's watches settle via its
+        // own terminal `agent:retired` emit, never a synthesized
+        // `agent:idle`. The retire sweep cancels the owner's hooks and PR
+        // monitors, and each cancellation re-enters here through the
+        // terminal-transition backstop BEFORE the retired event publishes —
+        // without this guard, a hook-deferred watcher would be settled with
+        // a stale completed notice instead of the retired one. Consume the
+        // marker (nothing may redeliver it later; a restored agent's next
+        // real idle emits fresh) and let the retire emit resolve the
+        // watches. Lookup failures fall through (conservative: not retired).
+        if let Ok(Some(_)) = self.store.get_agent_session_retired_at(child_id).await {
+            self.take_interim_skipped_idle(child_id);
+            return;
+        }
         // Idle-visibility deferral: an idle agent still owning active
         // background hooks OR active PR monitors has not settled — leave the
         // marker in place (like the busy guard) so the hook's own terminal
