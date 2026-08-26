@@ -9601,6 +9601,143 @@ async fn durable_completion_queue_retry_adopts_existing_message_id() {
     assert_eq!(svc.queue_snapshot(&parent).len(), 1);
 }
 
+#[tokio::test]
+async fn failed_terminal_wake_retries_without_another_event() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let watch_id = svc
+        .register_completion_watch_durable(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .await
+        .expect("register watch");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER fail_completion_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected completion wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    sqlx::query("DROP TRIGGER fail_completion_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(&svc, &parent).await == 1
+                && svc.find_watches_for_child(&child).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry delivers and retires without another event");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].id,
+        format!("completion-wake:{watch_id}"),
+        "retry keeps the stable delivery id"
+    );
+    svc.handle_completion_event(&event).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "retired watch cannot produce a duplicate wake"
+    );
+    wait_for_persisted_watches(&svc, 0).await;
+}
+
+#[tokio::test]
+async fn failed_aggregated_wake_retries_without_another_event() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    let group_id = svc
+        .delegation_group_for_parent(&parent)
+        .expect("delegation group")
+        .group_id;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+
+    sqlx::query(
+        "CREATE TRIGGER fail_group_wake BEFORE INSERT ON agent_message BEGIN
+         SELECT RAISE(FAIL, 'injected group wake failure'); END",
+    )
+    .execute(svc.store().write_pool())
+    .await
+    .expect("install failure trigger");
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert!(svc.delegation_group_for_parent(&parent).is_some());
+
+    sqlx::query("DROP TRIGGER fail_group_wake")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("remove failure trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if parent_message_count(&svc, &parent).await == 1
+                && svc.delegation_group_for_parent(&parent).is_none()
+                && svc.list_watches_for_parent(&parent).is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("group retry delivers and settles without another event");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].id,
+        format!("completion-group-wake:{group_id}")
+    );
+    svc.handle_completion_event(&event).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+}
+
 /// A report is a progress wake: it says "reported", omits terminal retirement,
 /// and exposes that the completion watch is still armed.
 #[tokio::test]

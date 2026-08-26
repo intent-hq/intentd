@@ -8816,6 +8816,52 @@ async fn wss_note_save_asset_round_trip() {
     srv.ws.stop().await;
 }
 
+/// An authenticated, fingerprint-pinned WSS client can serve the selected
+/// screenshot reverse request and return its result over the same connection.
+#[tokio::test]
+async fn wss_browser_screenshot_reverse_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"browser.exec","params":{"actions":[{"action":"screenshot"}]}}"#
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send browser.exec");
+
+    let mut final_response = None;
+    while final_response.is_none() {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                if frame["method"] == "browser.exec" {
+                    assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": frame["id"],
+                        "result": { "success": true, "results": [{ "success": true }] }
+                    });
+                    ws.send(Message::Text(reply.to_string().into()))
+                        .await
+                        .expect("send reverse reply");
+                } else if frame["id"] == 1 {
+                    final_response = Some(frame);
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                ws.send(Message::Pong(payload)).await.expect("pong");
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let response = final_response.expect("browser.exec response");
+    assert!(response.get("error").is_none(), "unexpected: {response}");
+    assert_eq!(response["result"]["success"], true);
+    srv.ws.stop().await;
+}
+
 /// Client-called `host.openInEditor` over WSS (PROTOCOL §5.14): a WSS
 /// connection resolves as remote, so the daemon re-dispatches the intent to
 /// the connected client as the FE-served reverse RPC (`id: "rev-<n>"`) and

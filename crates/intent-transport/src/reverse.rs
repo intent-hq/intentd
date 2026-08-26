@@ -114,34 +114,32 @@ impl ReverseChannel {
             "jsonrpc": "2.0", "id": id, "method": method, "params": params,
         }))
         .unwrap_or_default();
-        if self.out_tx.send(frame).await.is_err() {
-            self.pending
-                .lock()
-                .expect("reverse pending poisoned")
-                .remove(&id);
-            return Err(ReverseError {
+        let result = match tokio::time::timeout(timeout, async {
+            self.out_tx.send(frame).await.map_err(|_| ReverseError {
                 code: 0,
                 message: "client connection closed".to_string(),
-            });
-        }
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ReverseError {
+            })?;
+            rx.await.map_err(|_| ReverseError {
                 code: 0,
                 message: "reverse response channel dropped".to_string(),
+            })?
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ReverseError {
+                code: 0,
+                message: format!("reverse request timed out: {method}"),
             }),
-            Err(_) => {
-                self.pending
-                    .lock()
-                    .expect("reverse pending poisoned")
-                    .remove(&id);
-                Err(ReverseError {
-                    code: 0,
-                    message: format!("reverse request timed out: {method}"),
-                })
-            }
-        }
+        };
+        // `route_response` normally removes the entry first. Every other exit
+        // (queue timeout, response timeout, or closed connection) cleans it up
+        // here so a late response cannot address an abandoned request.
+        self.pending
+            .lock()
+            .expect("reverse pending poisoned")
+            .remove(&id);
+        result
     }
 
     /// Try to route an inbound frame as a response to a pending reverse request.

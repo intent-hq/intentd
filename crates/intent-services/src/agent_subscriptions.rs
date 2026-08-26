@@ -992,6 +992,17 @@ impl Services {
         }
     }
 
+    /// Whether an in-memory delegation group still needs settlement. The
+    /// durable wake retry task stops after delivery or cancellation removes it.
+    pub(crate) fn has_delegation_group(&self, group_id: &str) -> bool {
+        self.agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .delegation_groups
+            .iter()
+            .any(|group| group.group_id == group_id)
+    }
+
     /// Finalize a group after its aggregated wake and the matching store
     /// settlement are durable. Every completion watch carrying `group_id` is
     /// dropped, EXCEPT that watches on children listed in `retain_children`
