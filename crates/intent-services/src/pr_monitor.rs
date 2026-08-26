@@ -2639,6 +2639,14 @@ mod tests {
             .iter()
             .any(|c| c == "branch is now behind its base"));
 
+        let queued = snapshot(|s| s.requirements.is_in_merge_queue = Some(true));
+        assert!(diff_snapshots(&base, &queued)
+            .iter()
+            .any(|c| c == "entered the merge queue"));
+        assert!(diff_snapshots(&queued, &base)
+            .iter()
+            .any(|c| c == "left the merge queue"));
+
         let unmergeable = snapshot(|s| s.requirements.mergeable = Some(false));
         assert!(diff_snapshots(&base, &unmergeable)
             .iter()

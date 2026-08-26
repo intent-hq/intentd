@@ -851,6 +851,9 @@ impl Harness for V1 {
         if r.is_behind {
             lines.push("branch is behind its base".to_string());
         }
+        if r.is_in_merge_queue == Some(true) {
+            lines.push("in merge queue".to_string());
+        }
         if let Some(reason) = &r.merge_blocked_reason {
             lines.push(format!("blocked: {reason}"));
         }
@@ -977,6 +980,13 @@ impl Harness for V1 {
                 "branch is now behind its base".to_string()
             } else {
                 "branch is no longer behind its base".to_string()
+            });
+        }
+        if o.is_in_merge_queue != n.is_in_merge_queue {
+            changes.push(if n.is_in_merge_queue == Some(true) {
+                "entered the merge queue".to_string()
+            } else {
+                "left the merge queue".to_string()
             });
         }
         if o.mergeable != n.mergeable {

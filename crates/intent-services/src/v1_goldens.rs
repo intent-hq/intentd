@@ -759,8 +759,8 @@ fn golden_pr_monitor_diff_lines() {
 }
 
 /// Checklist branch lines beyond the happy path: draft, conflicts, behind,
-/// failing required checks, changes-requested, blocked reason, and the two
-/// rules-unknown renderings. (The per-field diff LINES beyond
+/// merge-queued, failing required checks, changes-requested, blocked reason,
+/// and the two rules-unknown renderings. (The per-field diff LINES beyond
 /// `golden_pr_monitor_diff_lines` are byte-pinned by `pr_monitor::tests::
 /// diff_detects_each_field_class` and companions — exact `assert_eq` on each
 /// line — so they are not re-pinned here.)
@@ -778,6 +778,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     r.checks.pending_required = vec![];
     r.approvals.changes_requested = 1;
     r.merge_blocked_reason = Some("merge conflicts".to_string());
+    r.is_in_merge_queue = Some(true);
     assert_eq!(
         crate::pr_monitor::render_checklist(&s),
         "- state: open\n\
@@ -787,6 +788,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - unresolved threads: 1 (resolution required to merge)\n\
          - merge conflicts present\n\
          - branch is behind its base\n\
+         - in merge queue\n\
          - blocked: merge conflicts"
     );
     // Rules-unknown: approvals fall back to the bare count, threads drop the
