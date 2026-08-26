@@ -7819,6 +7819,22 @@ impl Services {
                 )?;
             }
         }
+        // The top-level `specialist` is likewise the batch default shared by
+        // every entry that doesn't override it — validate it once up front
+        // (monorepo#3497) so an unknown default fails with one crisp `-32602`
+        // instead of N identical per-row `error` dispositions. Per-entry
+        // `specialist` overrides stay per-row via the single-task path, like
+        // the other per-entry options.
+        if let Some(spec_id) = input.specialist.as_deref() {
+            let workspace_path = self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w));
+            self.specialists_service()
+                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+        }
         // Depth + watch-scope guards up front (the same checks the
         // single-task path runs before any side-effectful work) so a
         // rejection is one clear error before any child is created, not N
@@ -10546,8 +10562,10 @@ impl Services {
         // specialist that no longer resolves (a stale id persisted before the
         // monorepo#3497 strict validation, or a since-deleted user/project
         // specialist file) is dropped with a warn instead of failing the wake
-        // — the strict `-32602` in `agent_create_op` applies to the
-        // client-supplied `create.specialist`, never to legacy stored state.
+        // — the strict `-32602` above applies to the client-supplied
+        // `create.specialist`, never to legacy stored state. Dropping means
+        // the `.or()` below falls through to the (already-validated)
+        // `create.specialist` when one was supplied, else no specialist.
         let inherited_specialist = inheritance_source
             .as_ref()
             .and_then(|s| s.specialist.clone())
@@ -10559,7 +10577,8 @@ impl Services {
                 if !known {
                     tracing::warn!(
                         specialist = %spec_id,
-                        "agent.wakeOrCreate: dropping inherited specialist that no longer resolves"
+                        fallback = create_opts.specialist.as_deref().unwrap_or("none"),
+                        "agent.wakeOrCreate: dropping inherited specialist that no longer resolves; falling back to create.specialist"
                     );
                 }
                 known
