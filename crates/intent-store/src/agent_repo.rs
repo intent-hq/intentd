@@ -3198,6 +3198,33 @@ impl Store {
         })
     }
 
+    /// List the summary rows (no message logs, no prompt/image payloads) of
+    /// every delegated child of `parent_agent_id`. Deliberately UNSCOPED by
+    /// workspace for the same reason as [`Store::count_child_agents`] —
+    /// delegation can cross workspaces and `parent_agent_id` is globally
+    /// unique. Forced through `idx_agent_parent`, so cost is O(this agent's
+    /// children). Used by the retire guard/cascade to walk the descendant
+    /// tree (§5.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_child_agent_summaries(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session INDEXED BY idx_agent_parent \
+             WHERE parent_agent_id = ? ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&parent_agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list child agent summaries failed: {e}")))?;
+        rows.iter().map(map_session_summary_row).collect()
+    }
+
     /// Compatibility helper for callers that only need the legacy unsettled
     /// count. New snapshot code uses [`Store::count_child_agents`] so both
     /// counts come from one indexed aggregate statement.
@@ -9757,6 +9784,90 @@ mod tests {
                 .expect("legacy count"),
             counts.unsettled
         );
+    }
+
+    /// `list_child_agent_summaries` returns every direct child — any status,
+    /// any workspace (delegation crosses workspaces) — and nothing else.
+    #[tokio::test]
+    async fn list_child_agent_summaries_returns_direct_children_across_workspaces() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-list-child-summaries");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws = WorkspaceId("ws-parent".to_string());
+        let other_ws = WorkspaceId("ws-child-remote".to_string());
+        insert_test_workspace(&store, &ws).await;
+        insert_test_workspace(&store, &other_ws).await;
+
+        let parent = AgentId("agent-parent".to_string());
+        for (suffix, status, workspace_id) in [
+            ("local", AgentStatus::RuntimeIdle, &ws),
+            ("remote", AgentStatus::Active, &other_ws),
+            ("terminal", AgentStatus::Completed, &ws),
+        ] {
+            let id = AgentId(format!("agent-child-{suffix}"));
+            let mut session = baseline_test_session(&id, workspace_id, &ts, Some("acp-live"));
+            session.parent_agent_id = Some(parent.clone());
+            session.status = status;
+            store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert child");
+        }
+        // A grandchild (child of a child) is NOT a direct child of `parent`.
+        let mut grandchild = baseline_test_session(
+            &AgentId("agent-grandchild".to_string()),
+            &ws,
+            &ts,
+            Some("acp-live"),
+        );
+        grandchild.parent_agent_id = Some(AgentId("agent-child-local".to_string()));
+        store
+            .insert_agent_session(&grandchild)
+            .await
+            .expect("insert grandchild");
+        // An unrelated agent with a different parent.
+        let mut unrelated = baseline_test_session(
+            &AgentId("agent-unrelated".to_string()),
+            &ws,
+            &ts,
+            Some("acp-live"),
+        );
+        unrelated.parent_agent_id = Some(AgentId("agent-other-parent".to_string()));
+        store
+            .insert_agent_session(&unrelated)
+            .await
+            .expect("insert unrelated child");
+
+        let children = store
+            .list_child_agent_summaries(&parent)
+            .await
+            .expect("list children");
+        let mut ids: Vec<&str> = children.iter().map(|s| s.id.0.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "agent-child-local",
+                "agent-child-remote",
+                "agent-child-terminal"
+            ]
+        );
+        // Summaries carry the fields the retire guard/cascade reads.
+        let remote = children
+            .iter()
+            .find(|s| s.id.0 == "agent-child-remote")
+            .unwrap();
+        assert_eq!(remote.workspace_id, other_ws);
+        assert_eq!(remote.status, AgentStatus::Active);
+        assert!(remote.retired_at.is_none());
+
+        let none = store
+            .list_child_agent_summaries(&AgentId("agent-child-remote".to_string()))
+            .await
+            .expect("leaf has no children");
+        assert!(none.is_empty());
     }
 
     /// Insert a minimal workspace row so agent-session FKs resolve.

@@ -12,15 +12,16 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use intent_core::events::{
-    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
-    COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
-    GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, LINE_ATTRIBUTION_UPDATED,
-    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE,
-    SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED, TASK_AGENT_UNLINKED,
-    TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_SETUP_COMPLETED,
-    WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED, CHANGES_GIT_STATUS,
+    CHANGES_METRICS_CHANGED, COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL,
+    GIT_PUSH, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED,
+    LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
+    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED,
+    WORKSPACE_SETUP_COMPLETED, WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED,
+    WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -4238,7 +4239,8 @@ impl Services {
     }
 
     /// Spawn the AS-3 completion-delivery worker: subscribe to the AGENT
-    /// completion event set (agent:idle / agent:failed / agent:deleted) across
+    /// completion event set (agent:idle / agent:failed / agent:deleted /
+    /// agent:retired) across
     /// every workspace and, on each child completion, wake every parent holding
     /// a completion watch for that child (the same `agent_send_message_op`
     /// path reportToParent uses), removing the watch after delivery.
@@ -4259,6 +4261,7 @@ impl Services {
                     AGENT_IDLE.to_string(),
                     AGENT_FAILED.to_string(),
                     AGENT_DELETED.to_string(),
+                    AGENT_RETIRED.to_string(),
                 ],
                 ..Default::default()
             };
@@ -5358,7 +5361,11 @@ impl Services {
                 // Route the child's completion into the parent's after_all
                 // delegation group instead of waking immediately. The group's own
                 // fire path removes these watches once it settles (AS-4).
-                let deleted = event.event_type == AGENT_DELETED;
+                // A retired child records in the deleted bucket: like a
+                // deletion it is a terminal, non-completing settlement (the
+                // session is inert), so the group must not hang on it.
+                let deleted =
+                    event.event_type == AGENT_DELETED || event.event_type == AGENT_RETIRED;
                 // Prefer the child's persisted completionReport (set by
                 // `agent.reportToParent`, whose immediate send is suppressed for
                 // grouped children) over the event's lastResponseSummary,

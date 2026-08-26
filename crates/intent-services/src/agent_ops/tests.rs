@@ -411,6 +411,273 @@ async fn retire_and_restore_reject_cross_workspace_targets() {
     assert!(session.retired_at.is_none());
 }
 
+/// Link `child` under `parent` and pin its persisted status — the fixture
+/// for the retire guard/cascade tests below.
+async fn link_child(
+    svc: &Services,
+    ws: &WorkspaceId,
+    child: &AgentId,
+    parent: &AgentId,
+    status: intent_core::AgentStatus,
+) {
+    let mut s = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    s.parent_agent_id = Some(parent.clone());
+    s.status = status;
+    svc.store()
+        .update_agent_session(ws, &s)
+        .await
+        .expect("link child");
+}
+
+/// Guard: `ws.agent.retire` FAILS (`InvalidParams`, nothing mutated) while a
+/// descendant is still running a turn — transitively: an active grandchild
+/// under an idle child blocks the retire just like a direct child would.
+#[tokio::test]
+async fn retire_rejects_while_a_descendant_is_running_a_turn() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Busy").await;
+    link_child(&svc, &ws, &child, &parent, intent_core::AgentStatus::Active).await;
+
+    let err = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect_err("retire with an active child must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("Busy"), "error names the active child: {msg}");
+    assert!(msg.contains("running a turn"), "got: {msg}");
+    // Nothing mutated: neither the parent nor the child is retired.
+    for id in [&parent, &child] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "no partial retire for {id}");
+    }
+
+    // Transitive: settle the child, hang an active grandchild under it —
+    // the guard still rejects and names the grandchild.
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    let grandchild = create_agent(&svc, &ws, "DeepWorker").await;
+    link_child(
+        &svc,
+        &ws,
+        &grandchild,
+        &child,
+        intent_core::AgentStatus::Processing,
+    )
+    .await;
+    let err = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect_err("retire with an active grandchild must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("DeepWorker"),
+        "error names the grandchild: {msg}"
+    );
+    for id in [&parent, &child, &grandchild] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "no partial retire for {id}");
+    }
+
+    // A `pending` descendant (queued turn) blocks too.
+    link_child(
+        &svc,
+        &ws,
+        &grandchild,
+        &child,
+        intent_core::AgentStatus::Pending,
+    )
+    .await;
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect_err("retire with a pending descendant must fail");
+}
+
+/// Cascade: retiring the parent retires every settled/idle descendant with
+/// it — each with its own `agent:retired` emit carrying the cascade reason —
+/// while terminal children, already-retired children (timestamp preserved),
+/// and unrelated bystanders are untouched. A second retire of the parent is
+/// the documented idempotent no-op (no re-cascade, no re-emit).
+#[tokio::test]
+async fn retire_cascades_to_settled_descendants() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "IdleChild").await;
+    let grandchild = create_agent(&svc, &ws, "WaitingGrandchild").await;
+    let done = create_agent(&svc, &ws, "DoneChild").await;
+    let veteran = create_agent(&svc, &ws, "VeteranChild").await;
+    let bystander = create_agent(&svc, &ws, "Bystander").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    link_child(
+        &svc,
+        &ws,
+        &grandchild,
+        &child,
+        intent_core::AgentStatus::Waiting,
+    )
+    .await;
+    link_child(
+        &svc,
+        &ws,
+        &done,
+        &parent,
+        intent_core::AgentStatus::Completed,
+    )
+    .await;
+    link_child(
+        &svc,
+        &ws,
+        &veteran,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    // Pre-retire the veteran: its timestamp must survive the cascade.
+    let r = svc
+        .agent_retire_op(veteran.clone(), Some(ws.clone()), None)
+        .await
+        .expect("pre-retire veteran");
+    let veteran_retired_at = r["retiredAt"].as_str().expect("retiredAt").to_string();
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_RETIRED.to_string()],
+        ..Default::default()
+    });
+    let r = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), Some("wrapping up".into()))
+        .await
+        .expect("retire parent");
+    assert_eq!(r["success"], json!(true));
+    assert!(r.get("alreadyRetired").is_none());
+
+    // Three emits: the parent (caller's reason) + the two cascaded
+    // descendants (cascade reason naming the parent).
+    let mut events = Vec::new();
+    while events.len() < 3 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription closed");
+        events.extend(batch);
+    }
+    let reason_of = |id: &AgentId| {
+        events
+            .iter()
+            .find(|e| e.data["agentId"].as_str() == Some(id.0.as_str()))
+            .unwrap_or_else(|| panic!("no agent:retired for {id}"))
+            .data["reason"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(reason_of(&parent).as_deref(), Some("wrapping up"));
+    assert_eq!(reason_of(&child).as_deref(), Some("parent Parent retired"));
+    assert_eq!(
+        reason_of(&grandchild).as_deref(),
+        Some("parent Parent retired")
+    );
+
+    // Rows: parent + cascaded descendants retired; terminal child and
+    // bystander untouched; the veteran keeps its original timestamp.
+    for id in [&parent, &child, &grandchild] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_some(), "{id} retired by the cascade");
+    }
+    for id in [&done, &bystander] {
+        let s = svc.store().get_agent_session(id).await.expect("session");
+        assert!(s.retired_at.is_none(), "{id} must not be cascade-retired");
+    }
+    let s = svc
+        .store()
+        .get_agent_session(&veteran)
+        .await
+        .expect("veteran");
+    assert_eq!(
+        s.retired_at.as_deref(),
+        Some(veteran_retired_at.as_str()),
+        "pre-retired child keeps its original timestamp"
+    );
+
+    // Idempotent short-circuit: re-retiring the already-retired parent
+    // reports alreadyRetired without re-walking the tree or re-emitting.
+    let r2 = svc
+        .agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("re-retire");
+    assert_eq!(r2["alreadyRetired"], json!(true));
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no re-emit on the idempotent retire"
+    );
+}
+
+/// Restore does NOT resurrect the cascade: restoring the parent clears only
+/// the parent's mark — cascaded children stay retired until each is
+/// individually restored via its own `agent.restore`.
+#[tokio::test]
+async fn restoring_the_parent_does_not_restore_cascaded_children() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire parent");
+    let s = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(s.retired_at.is_some(), "child cascade-retired");
+
+    let r = svc
+        .agent_restore_op(parent.clone(), Some(ws.clone()))
+        .await
+        .expect("restore parent");
+    assert_eq!(r["restored"], json!(true));
+    let s = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent");
+    assert!(s.retired_at.is_none(), "parent restored");
+    let s = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(
+        s.retired_at.is_some(),
+        "cascaded child stays retired after the parent's restore"
+    );
+
+    // The child is individually restorable.
+    let r = svc
+        .agent_restore_op(child.clone(), Some(ws.clone()))
+        .await
+        .expect("restore child");
+    assert_eq!(r["restored"], json!(true));
+    let s = svc.store().get_agent_session(&child).await.expect("child");
+    assert!(s.retired_at.is_none());
+}
+
 #[tokio::test]
 async fn completion_delivery_wakes_watching_parent_and_removes_watch() {
     let (_t, svc, ws) = setup().await;
@@ -27945,6 +28212,334 @@ async fn agent_watch_removed_after_target_deleted() {
         metadata["watchStillArmed"],
         json!(false),
         "deleted wake carries watchStillArmed: false: {metadata}"
+    );
+}
+
+/// `agent:retired` is terminal like `agent:deleted`: the live retire emit
+/// (through the real bus + delivery worker, proving the subscription filter
+/// covers it) wakes the watcher exactly once with the retired wording and no
+/// re-arm pointer, and the watch is removed. A later `agent.restore` does
+/// NOT re-create the resolved watch.
+#[tokio::test]
+async fn agent_watch_resolved_when_target_retires() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
+        .await
+        .expect("watch");
+
+    svc.agent_retire_op(target.clone(), Some(ws.clone()), Some("handing off".into()))
+        .await
+        .expect("retire");
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &target).await;
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("Target (agent-") || text.contains(&target.0),
+        "retired wake names the agent: {text}"
+    );
+    assert!(
+        text.contains("retired."),
+        "retired wake uses the retired settlement verb: {text}"
+    );
+    assert!(
+        text.contains("the watch is now retired"),
+        "retired wake states the retirement: {text}"
+    );
+    assert!(
+        text.contains("The agent retired and cannot be re-watched or woken again"),
+        "retired wake states the target cannot be re-watched: {text}"
+    );
+    assert!(
+        !text.contains("ws.agent.watch("),
+        "retired wake carries no dead-end re-arm pointer: {text}"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "retired wake carries watchStillArmed: false: {metadata}"
+    );
+    // The persisted row is retired with the in-memory watch.
+    wait_for_persisted_watches(&svc, 0).await;
+
+    // agent:restored does NOT re-create the resolved watch.
+    svc.agent_restore_op(target.clone(), Some(ws.clone()))
+        .await
+        .expect("restore");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        svc.find_watches_for_child(&target).is_empty(),
+        "restore must not resurrect the resolved watch"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "restore delivers no extra wake"
+    );
+}
+
+/// A CASCADED retire resolves the child's watchers too: the parent's retire
+/// cascade emits the child's own `agent:retired` (cascade reason) through
+/// the real bus + delivery worker, so a watcher on the settled child gets
+/// exactly one retired-notice wake and its watch is removed — the full
+/// per-child cleanup, not just the parent's.
+#[tokio::test]
+async fn agent_watch_resolved_when_target_is_cascade_retired() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Kid").await;
+
+    // Watch while the child is still watchable, THEN park it settled under
+    // the parent (a bare idle target with nothing pending rejects new
+    // watches, but an existing watch stays armed).
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch the child");
+    link_child(
+        &svc,
+        &ws,
+        &child,
+        &parent,
+        intent_core::AgentStatus::RuntimeIdle,
+    )
+    .await;
+
+    // Retire the PARENT: the cascade retires the child, whose own
+    // agent:retired emit resolves the watch.
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), Some("wrapping up".into()))
+        .await
+        .expect("retire parent");
+    wait_for_message_count(&svc, &watcher, 1).await;
+    wait_for_child_watch_cleanup(&svc, &child).await;
+
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains(&child.0),
+        "retired wake names the cascaded child: {text}"
+    );
+    assert!(
+        text.contains("retired."),
+        "retired wake uses the retired settlement verb: {text}"
+    );
+    assert!(
+        text.contains("the watch is now retired"),
+        "retired wake states the retirement: {text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "cascaded retire removes the child's watch"
+    );
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "exactly one wake for the cascaded retire"
+    );
+}
+
+/// A retired member of an `after_all` delegation group records as settled
+/// (deleted bucket), so the group fires its aggregated wake instead of
+/// hanging on the inert child.
+#[tokio::test]
+async fn after_all_group_settles_retired_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // The child retires (live event path, direct dispatch).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_RETIRED,
+        &child,
+        json!({ "agentId": child.0, "agentName": "Child", "retiredAt": now_iso() }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group still open");
+    assert!(
+        group.deleted_agent_ids.contains(&child),
+        "retired child recorded as settled (deleted bucket)"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The parent idles: group seals, is complete, and fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake fired instead of hanging on the retired member"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("retired."),
+        "aggregated wake's child line says the member retired: {text}"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// Rehydration reconciliation: a child that RETIRED while the daemon was
+/// down resolves its rehydrated watch immediately at startup with the
+/// retired notice instead of leaving the parent waiting forever.
+#[tokio::test]
+async fn completion_watch_rehydration_resolves_retired_child() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child)
+    }; // old Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // The child retired during the downtime.
+    let now = now_iso();
+    store
+        .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
+        .await
+        .expect("mark child retired");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated before reconciliation");
+
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "reconciliation delivered the retired wake"
+    );
+    let text = parent_messages_text(&restarted, &parent).await;
+    assert!(
+        text.contains("The agent retired and cannot be re-watched or woken again"),
+        "rehydration wake carries the retired notice: {text}"
+    );
+    assert!(restarted.find_watches_for_child(&child).is_empty());
+    wait_for_persisted_watches(&restarted, 0).await;
+}
+
+/// Group rehydration reconciliation: an `after_all` member that RETIRED
+/// while the daemon was down records as settled at startup, so the
+/// rehydrated group fires instead of hanging.
+#[tokio::test]
+async fn group_rehydration_settles_retired_child() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let gid = svc.get_or_create_delegation_group(&ws, &parent);
+        svc.enroll_child_in_group(&gid, &child);
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            Some(gid.clone()),
+        )
+        .expect("grouped watch");
+        // Persist the open group before the "crash".
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&ws)
+                .await
+                .expect("list groups");
+            if rows.iter().any(|r| r.group_id == gid) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (parent, child)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let now = now_iso();
+    store
+        .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
+        .await
+        .expect("mark child retired");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .rehydrate_delegation_groups(&ws)
+        .await
+        .expect("rehydrate groups");
+    assert_eq!(loaded, 1, "group rehydrated");
+
+    // The retired member reconciled as settled and the sealed group fired.
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "rehydrated group fired instead of hanging on the retired member"
+    );
+    let text = parent_messages_text(&restarted, &parent).await;
+    assert!(
+        text.contains("retired."),
+        "aggregated wake's child line says the member retired: {text}"
     );
 }
 

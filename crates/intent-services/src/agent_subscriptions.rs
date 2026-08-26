@@ -1385,8 +1385,9 @@ impl Services {
 
     /// Reconcile one watch's child against current agent state (mirrors the
     /// STAB-108 group reconciliation): if the child already completed /
-    /// failed / was deleted, synthesize the matching completion event and
-    /// route it through [`Services::deliver_completion_to_watches`] so the
+    /// failed / was deleted / retired, synthesize the matching completion
+    /// event and route it through
+    /// [`Services::deliver_completion_to_watches`] so the
     /// parent wakes now instead of waiting for an event that already fired.
     /// Used both at startup rehydration (child settled while the daemon was
     /// down) and at `agent.watch` / `app.agents.waitFor` registration time
@@ -1404,12 +1405,24 @@ impl Services {
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    // A retired session (`retired_at` set) is inert — no
+                    // future completion can fire, so the watch resolves NOW
+                    // with a synthetic `agent:retired` (a child that retired
+                    // while the daemon was down, or a watch racing a
+                    // concurrent retire). Deletion still wins: a deleted row
+                    // stays deleted regardless of the retire mark.
+                    let is_retired = !is_deleted && session.retired_at.is_some();
                     let is_completed = matches!(session.status, AgentStatus::Completed);
                     let is_failed = matches!(session.status, AgentStatus::Error);
                     // RuntimeIdle: genuinely complete only with a completion
                     // report and no interrupted row (same conservative
-                    // predicate as reconcile_group_on_rehydration).
-                    let is_idle_complete = if matches!(session.status, AgentStatus::RuntimeIdle) {
+                    // predicate as reconcile_group_on_rehydration). A retired
+                    // child skips this block entirely — its idle-deferral
+                    // early-returns (agent-waiting / hooks / monitors) must
+                    // not leave a watch armed on an inert session.
+                    let is_idle_complete = if !is_retired
+                        && matches!(session.status, AgentStatus::RuntimeIdle)
+                    {
                         let has_report = session.completion_report.is_some();
                         let settled = match self.store.get_interrupted_agent(child_id).await {
                             Ok(opt) => has_report && opt.is_none(),
@@ -1471,6 +1484,11 @@ impl Services {
                     };
                     let event_type = if is_deleted {
                         intent_core::events::AGENT_DELETED
+                    } else if is_retired {
+                        // Retired outranks failed/completed: whatever the
+                        // status was when the mark landed, the session is
+                        // inert now and "retired" is the accurate settlement.
+                        intent_core::events::AGENT_RETIRED
                     } else if is_failed {
                         intent_core::events::AGENT_FAILED
                     } else if is_completed || is_idle_complete {
@@ -1670,13 +1688,17 @@ impl Services {
                     // - Otherwise, skip (child may be interrupted/healing)
 
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    // A retired child (`retired_at` set) settles like a
+                    // deleted one: the session is inert, no future completion
+                    // can fire, so the group must not hang on it. Deletion
+                    // still wins for the event kind.
+                    let is_retired = !is_deleted && session.retired_at.is_some();
                     let is_explicitly_completed = matches!(session.status, AgentStatus::Completed);
                     let is_failed = matches!(session.status, AgentStatus::Error);
 
-                    let is_idle_and_genuinely_complete = if matches!(
-                        session.status,
-                        AgentStatus::RuntimeIdle
-                    ) {
+                    let is_idle_and_genuinely_complete = if !is_retired
+                        && matches!(session.status, AgentStatus::RuntimeIdle)
+                    {
                         // Check if there's a completion report and no interrupted row
                         let has_completion_report = session.completion_report.is_some();
                         let interrupted_check = self.store.get_interrupted_agent(&child_id).await;
@@ -1697,15 +1719,19 @@ impl Services {
                     };
 
                     let should_record = is_deleted
+                        || is_retired
                         || is_explicitly_completed
                         || is_failed
                         || is_idle_and_genuinely_complete;
 
                     if should_record {
-                        // Build a synthetic agent:idle, agent:failed, or agent:deleted event
+                        // Build a synthetic agent:idle, agent:failed,
+                        // agent:deleted, or agent:retired event.
                         // Prefer the child's persisted completion_report when present
                         let event_type = if is_deleted {
                             intent_core::events::AGENT_DELETED
+                        } else if is_retired {
+                            intent_core::events::AGENT_RETIRED
                         } else if is_failed {
                             intent_core::events::AGENT_FAILED
                         } else {
@@ -1861,9 +1887,15 @@ impl Services {
                             stall.as_ref(),
                         );
 
-                        // Record the completion
+                        // Record the completion. Retired records in the
+                        // deleted bucket (terminal, non-completing — same as
+                        // the live delivery path).
                         self.record_group_child_completion(
-                            group_id, &child_id, is_deleted, summary, event,
+                            group_id,
+                            &child_id,
+                            is_deleted || is_retired,
+                            summary,
+                            event,
                         )
                         .await;
                     }

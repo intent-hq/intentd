@@ -1013,6 +1013,46 @@ impl Services {
         }
     }
 
+    /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE
+    /// (`scheduled`/`running`) hook owned by the retiring agent through the
+    /// shared cancel transition ([`Services::cancel_active_hook`]) — task
+    /// aborted, state persisted to `cancelled`, `nextRunAt` cleared,
+    /// `hook:cancelled` emitted, waiting recomputed (§5.1). NO wake notice:
+    /// the owner retired itself and is inert, so parking a notice in its
+    /// queue is noise (the backstop in `cancel_active_hook` settles any
+    /// deferred watches directly). Restore does NOT resurrect cancelled
+    /// hooks (mirrors the unarchive precedent) — the agent re-registers if
+    /// the condition still matters. Best-effort per hook: a store failure
+    /// is logged and the sweep moves on — retiring must not fail because
+    /// one hook row would not update.
+    pub(crate) async fn cancel_agent_hooks(&self, agent_id: &AgentId) {
+        let hooks = match self.store.list_hooks_by_agent(agent_id).await {
+            Ok(hooks) => hooks,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "retire hook sweep: hook list failed; skipping"
+                );
+                return;
+            }
+        };
+        for hook in hooks {
+            if !matches!(hook.state, HookState::Scheduled | HookState::Running) {
+                continue;
+            }
+            let hook_id = hook.hook_id.clone();
+            if let Err(e) = self.cancel_active_hook(hook, None).await {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    hook = %hook_id.0,
+                    error = %e,
+                    "retire hook sweep: cancel failed; continuing"
+                );
+            }
+        }
+    }
+
     /// Delete teardown (`workspace.delete`): eagerly abort every live hook
     /// scheduler task owned by the workspace. The store cascade drops the
     /// hook rows themselves, but without this sweep a live task would only
@@ -1100,10 +1140,14 @@ impl Services {
                 continue;
             }
             // Prune hooks whose owner no longer exists (deleted agents keep
-            // their session row with status `deleted`).
-            let owner_gone = match self.store.get_agent_session_status(&hook.agent_id).await {
-                Ok(AgentStatus::Deleted) | Err(Error::NotFound(_)) => true,
-                Ok(_) => false,
+            // their session row with status `deleted`) or is soft-retired —
+            // the retire-time sweep ([`Services::cancel_agent_hooks`]) could
+            // have been missed by a crash window.
+            let owner_gone = match self.store.get_agent_session_summary(&hook.agent_id).await {
+                Ok(session) => {
+                    session.status == AgentStatus::Deleted || session.retired_at.is_some()
+                }
+                Err(Error::NotFound(_)) => true,
                 Err(e) => return Err(e),
             };
             if owner_gone {
@@ -2790,6 +2834,144 @@ mod tests {
         // manager attached, so nothing can spawn a turn).
         let text = wait_for_wake(&svc, &owner, "workspace was archived").await;
         assert!(text.contains("cancelled"), "{text}");
+    }
+
+    /// Retire sweep (`ws.agent.retire`): the retiring agent's ACTIVE hooks
+    /// are cancelled through the shared transition — task aborted, row
+    /// `cancelled`, `nextRunAt` cleared, `hook:cancelled` emitted — with NO
+    /// wake notice (the owner retired itself and is inert). Terminal hooks
+    /// and other agents' hooks are untouched, and `agent.restore` does NOT
+    /// resurrect the cancelled hooks.
+    #[tokio::test]
+    async fn retire_cancels_active_hooks_without_waking_the_owner() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // A terminal hook first: an immediate dispatch short-circuits the
+        // schedule, leaving a `dispatched` row with no live task.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "already-done",
+                    "code": "return { dispatch: true, message: 'done' };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule dispatched");
+        let dispatched: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(dispatched.state, HookState::Dispatched);
+        // An active hook with a live scheduler task.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watching",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule active");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+        // A bystander agent's active hook must survive the sweep.
+        let bystander = AgentId::from("agent-bystander");
+        svc.store()
+            .insert_agent_session(&agent(&ws, "agent-bystander"))
+            .await
+            .unwrap();
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &bystander,
+                &json!({
+                    "name": "bystander",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule bystander");
+        let bystander_hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+
+        let res = svc
+            .agent_retire_op(owner.clone(), None, None)
+            .await
+            .expect("retire");
+        assert_eq!(res["success"], json!(true));
+
+        assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+        assert!(stored.next_run_at.is_none());
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
+        assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
+        // Terminal hooks and the bystander's hook are untouched.
+        let stored = svc.store().get_hook(&dispatched.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Dispatched);
+        let stored = svc.store().get_hook(&bystander_hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Scheduled);
+        assert!(svc.hook_task_alive(&bystander_hook.hook_id));
+        // NO wake notice from the sweep (contrast the archive sweep, which
+        // does notify). The only message is the terminal hook's own earlier
+        // dispatch wake.
+        let session = svc.store().get_agent_session(&owner).await.unwrap();
+        let text = serde_json::to_string(&session.messages).unwrap();
+        assert!(
+            !text.contains("cancelled"),
+            "no cancellation wake queued for the retired owner: {text}"
+        );
+
+        // Restore does NOT resurrect: the row stays cancelled and boot
+        // rehydration resumes nothing new (the bystander's live task is
+        // skipped by idempotence).
+        svc.agent_restore_op(owner.clone(), None)
+            .await
+            .expect("restore");
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 0);
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+    }
+
+    /// Restart backstop: boot rehydration prunes (cancels) active hook rows
+    /// whose owner is soft-retired — a crash window could have missed the
+    /// retire-time sweep ([`Services::cancel_agent_hooks`]).
+    #[tokio::test]
+    async fn rehydration_prunes_hooks_of_retired_owner() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let row = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "stranded".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        svc.store().insert_hook(&row).await.unwrap();
+        assert!(svc
+            .store()
+            .set_agent_session_retired_at(&ws, &owner, Some(&now_iso()), &now_iso())
+            .await
+            .unwrap());
+
+        assert_eq!(svc.rehydrate_hooks().await.unwrap(), 0);
+        assert!(!svc.hook_task_alive(&row.hook_id));
+        let pruned = svc.store().get_hook(&row.hook_id).await.unwrap();
+        assert_eq!(pruned.state, HookState::Cancelled);
+        assert!(pruned.next_run_at.is_none());
     }
 
     /// Persisted `workspace:updated` archive deltas for a workspace,
