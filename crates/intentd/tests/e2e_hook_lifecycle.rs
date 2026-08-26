@@ -11,7 +11,9 @@
 //!     `agent.getQueue` (`messageMetadata.type == "hook_wake"`), with
 //!     `hook:run-completed` + `hook:dispatched` on the wire.
 //!  2. Agent turn 2 schedules a watcher hook that reads a seeded note —
-//!     `hook:scheduled` observed; `hook.list` reports both hooks;
+//!     `hook:scheduled` observed; `hook.list` reports both hooks; a follow-up
+//!     agent turn recovers the RETIRED dispatcher's row via `ws.hook.get`
+//!     (MCP-only) and proves it still carries the original `code`;
 //!     `hook.runNow` drives `hook:run-started` + `hook:run-completed`.
 //!  3. The test plants an EVICT marker in the note over the wire and calls
 //!     `hook.runNow` again — the run throws, `hook:evicted` carries
@@ -471,9 +473,23 @@ async fn hook_lifecycle_over_wss() {
 
     // Agent-JS payloads, one per prompt marker. The inner hook scripts are
     // JSON-escaped into the outer `ws.hook.schedule` calls.
+    let dispatcher_code = "return { dispatch: true, message: 'CI is red' };";
     let schedule_dispatch_js = format!(
         "return await ws.hook.schedule({{ name: 'dispatcher', code: {}, delayMs: 60000 }});",
-        json!("return { dispatch: true, message: 'CI is red' };")
+        json!(dispatcher_code)
+    );
+    // Retired-hook recovery: `ws.hook.get` on the dispatcher AFTER it retired
+    // must return the full row — original `code` included — through the real
+    // prelude → ACP callback → service → store route.
+    let get_retired_js = format!(
+        "const hooks = await ws.hook.list(); \
+         const retired = hooks.find(h => h.name === 'dispatcher'); \
+         const row = await ws.hook.get(retired.hookId); \
+         const out = ['getState=' + row.state]; \
+         out.push('codeMatch=' + (row.code === {code})); \
+         out.push('idMatch=' + (row.hookId === retired.hookId)); \
+         return out.join(' ');",
+        code = json!(dispatcher_code)
     );
     let watcher_inner = format!(
         "console.log('watcher checked the note'); \
@@ -562,6 +578,15 @@ async fn hook_lifecycle_over_wss() {
                     "arguments": { "code": schedule_watch_js, "summary": "schedule watcher" },
                 },
                 "response": "scheduled watcher",
+            },
+            {
+                "ifPromptContains": "GET_RETIRED",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": get_retired_js, "summary": "recover retired hook code" },
+                },
+                "emitToolBlocks": true,
+                "response": "recovered retired hook",
             },
             {
                 "ifPromptContains": "SCHEDULE_CANCELME",
@@ -820,6 +845,32 @@ async fn hook_lifecycle_over_wss() {
     // A one-shot hook's sole fire is still counted: `dispatchCount` means
     // "fires so far" for every hook, not just perpetual ones.
     assert_eq!(dispatcher["dispatchCount"], 1, "{dispatcher}");
+
+    // Retired-hook recovery over the production MCP route: the agent calls
+    // `ws.hook.get` on the RETIRED dispatcher and gets the full row back —
+    // terminal state, matching id, and the original `code` verbatim — so a
+    // retired hook's script can be recovered to re-arm it.
+    let sent = wss_rpc(
+        &mut rpc,
+        210,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "GET_RETIRED" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    for (i, needle) in ["getState=dispatched", "codeMatch=true", "idMatch=true"]
+        .into_iter()
+        .enumerate()
+    {
+        await_conversation_contains(
+            &mut rpc,
+            211 + i64::try_from(i).expect("fits in i64") * 20,
+            &ws_id,
+            &agent_id,
+            needle,
+        )
+        .await;
+    }
 
     // FE trigger: hook.runNow drives run-started + run-completed (still
     // scheduled — the note has no EVICT marker yet).
