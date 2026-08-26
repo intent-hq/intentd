@@ -812,7 +812,11 @@ mod tests {
     /// The poisoned home directory backing [`hermetic_config_git`]: its
     /// `.gitconfig` (and XDG `git/config`) define github.com credential
     /// helpers exactly the way `gh auth setup-git` does on dev hosts
-    /// (monorepo#3164). Written once per process; tests share it read-only.
+    /// (monorepo#3164). Written once per process and shared read-only by the
+    /// tests in that process — under a per-test-process runner like nextest
+    /// each process writes its own pid-keyed dir. The dirs are not cleaned
+    /// up (a few bytes in the temp dir; a `Drop` guard cannot outlive the
+    /// `'static` sharing).
     fn poisoned_home() -> &'static Path {
         static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         DIR.get_or_init(|| {
@@ -874,7 +878,11 @@ mod tests {
                 .args(["config", "--get-all", GITHUB_HELPER_KEY])
                 .output()
                 .expect("git must be runnable");
-            assert!(out.status.success());
+            assert!(
+                out.status.success(),
+                "git config read failed without {dropped}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             let values = String::from_utf8_lossy(&out.stdout);
             assert!(
                 values.starts_with("\n!/poisoned/gh auth git-credential\n"),
