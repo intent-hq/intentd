@@ -237,13 +237,20 @@
 //! read on demand via `agent.getMessageBlock`;
 //! `projection: "slim"` remains accepted as an explicit no-op and any other
 //! value stays `-32602`. No method-catalog change — 297 router methods,
-//! 336 total.
+//! 336 total. Version 8.1 adds the optional `projection` param on
+//! `note.list` (additive; §5.2): absent / `null` / `"full"` keep the full
+//! rows byte-identical to before (full stays the default — consumers still
+//! read `content` off list rows, monorepo#3573); `"slim"` serves bounded
+//! listing rows with `content` omitted, replaced by `contentPreview` (first
+//! 500 chars) plus `contentLength` (total chars, the `note.listVersions`
+//! unit), every other Note field unchanged; any other value is `-32602`.
+//! No method-catalog change — 297 router methods, 336 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "8.0";
+pub const PROTOCOL_VERSION: &str = "8.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

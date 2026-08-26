@@ -680,8 +680,16 @@ async fn dispatch(
                 Some(s) if !s.is_empty() => WorkspaceId::from(s),
                 _ => return Err(invalid_params("workspaceId is required")),
             };
+            let projection = parse_note_list_projection(params)?;
             let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
-            Ok(json!({ "notes": notes }))
+            match projection {
+                Some(intent_core::NoteListProjection::Slim) => {
+                    let rows: Vec<Value> =
+                        notes.iter().map(intent_core::note_list_slim_row).collect();
+                    Ok(json!({ "notes": rows }))
+                }
+                None => Ok(json!({ "notes": notes })),
+            }
         }
         "note.get" => {
             let ws = require_ws_note(params)?;
@@ -4056,6 +4064,23 @@ fn parse_projection(
             Ok(Some(intent_core::ConversationProjection::Slim))
         }
         Some(_) => Err(invalid_params("projection must be \"slim\"")),
+    }
+}
+
+/// Parse the optional `projection` param on `note.list` (§5.2): absent /
+/// `null` / `"full"` mean full rows (`None` — byte-identical to before, so
+/// existing clients are unaffected), `"slim"` selects the bounded listing
+/// rows (`content` → `contentPreview` + `contentLength`), anything else is
+/// `-32602`. Unlike the conversation reads above, full stays the default —
+/// consumers (iOS) still read `content` off list rows (monorepo#3573).
+fn parse_note_list_projection(
+    params: &Map<String, Value>,
+) -> Result<Option<intent_core::NoteListProjection>, RpcErr> {
+    match params.get("projection") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "full" => Ok(None),
+        Some(Value::String(s)) if s == "slim" => Ok(Some(intent_core::NoteListProjection::Slim)),
+        Some(_) => Err(invalid_params("projection must be \"slim\" or \"full\"")),
     }
 }
 
