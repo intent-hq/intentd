@@ -29023,6 +29023,105 @@ mod last_activity_events {
         assert!(usage.last_scan_at.is_some(), "scan timestamp set");
     }
 
+    /// Whether a debounced `lastActivity` derivation is pending for the
+    /// harness workspace (the schedule inserts into the debouncers map
+    /// synchronously; the default 3s window keeps the entry observable).
+    fn last_activity_pending(h: &Harness) -> bool {
+        h.services
+            .last_activity_debouncers
+            .lock()
+            .expect("debouncers lock")
+            .contains_key(&h.ws)
+    }
+
+    /// Message-append role gating (§10.1): `agent.appendMessage` schedules
+    /// the debounced `lastActivity` only for `role: "user"` appends —
+    /// assistant/system/tool transcript writes are mid-turn noise for the
+    /// workspace ordering.
+    #[tokio::test]
+    async fn append_message_op_schedules_last_activity_only_for_user_role() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        h.services
+            .agent_append_message_op(
+                agent_id.clone(),
+                "assistant".into(),
+                serde_json::json!("mid-turn note"),
+                None,
+            )
+            .await
+            .expect("assistant append");
+        assert!(
+            !last_activity_pending(&h),
+            "assistant-role append must not schedule lastActivity"
+        );
+
+        h.services
+            .agent_append_message_op(agent_id, "user".into(), serde_json::json!("hi"), None)
+            .await
+            .expect("user append");
+        assert!(
+            last_activity_pending(&h),
+            "user-role append must schedule lastActivity"
+        );
+    }
+
+    /// Store-only force-send gating (§10.1): `agent.sendQueuedMessageNow` on
+    /// the no-manager path schedules the debounced `lastActivity` only for
+    /// user-origin entries — parity with the queue-drain `persist_user` gate.
+    #[tokio::test]
+    async fn send_queued_message_now_op_schedules_last_activity_only_for_user_origin() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let (auto_entry, _) = h.services.enqueue_message_with_origin(
+            &agent_id,
+            "wake".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        h.services
+            .agent_send_queued_message_now_op(agent_id.clone(), auto_entry.id)
+            .await
+            .expect("force-send automatic entry");
+        assert!(
+            !last_activity_pending(&h),
+            "automatic-origin force-send must not schedule lastActivity"
+        );
+
+        let (user_entry, _) = h.services.enqueue_message_with_origin(
+            &agent_id,
+            "human".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        h.services
+            .agent_send_queued_message_now_op(agent_id, user_entry.id)
+            .await
+            .expect("force-send user entry");
+        assert!(
+            last_activity_pending(&h),
+            "user-origin force-send must schedule lastActivity"
+        );
+    }
+
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),

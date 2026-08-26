@@ -12804,6 +12804,60 @@ async fn persist_user_schedules_last_activity_only_for_user_origin() {
     );
 }
 
+/// Direct-send origin gating (§10.1): [`AgentManager::send_message`]
+/// schedules the debounced `lastActivity` only when
+/// `TurnOptions::origin.is_user()` — an `Automatic`-origin direct send
+/// (internal wake / agent-to-agent delivery) must not. Each half uses its
+/// own workspace and asserts synchronously after the call returns: the gate
+/// runs inline before `spawn_worker`, and on the current-thread test runtime
+/// the spawned worker has not run yet, so a later turn-end schedule cannot
+/// mask the read.
+#[tokio::test]
+async fn send_message_schedules_last_activity_only_for_user_origin() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+
+    let (ws_auto, auto_id) = (WorkspaceId::from("ws-la-send-a"), AgentId::from("a-la-s-a"));
+    seed_agent(&mgr, &ws_auto, &auto_id).await;
+    let _agent_a = track_mock_agent(&mgr, &auto_id, false);
+    mgr.send_message(
+        auto_id,
+        ws_auto.clone(),
+        "wake".to_string(),
+        None,
+        super::TurnOptions {
+            origin: intent_core::MessageOrigin::Automatic,
+            ..super::TurnOptions::default()
+        },
+    )
+    .await
+    .expect("automatic-origin direct send");
+    assert!(
+        !last_activity_pending(&mgr, &ws_auto),
+        "automatic-origin direct send must not schedule lastActivity"
+    );
+
+    let (ws_user, user_id) = (WorkspaceId::from("ws-la-send-u"), AgentId::from("a-la-s-u"));
+    seed_agent(&mgr, &ws_user, &user_id).await;
+    let _agent_u = track_mock_agent(&mgr, &user_id, false);
+    mgr.send_message(
+        user_id,
+        ws_user.clone(),
+        "human".to_string(),
+        None,
+        super::TurnOptions {
+            origin: intent_core::MessageOrigin::User,
+            ..super::TurnOptions::default()
+        },
+    )
+    .await
+    .expect("user-origin direct send");
+    assert!(
+        last_activity_pending(&mgr, &ws_user),
+        "user-origin direct send must schedule lastActivity"
+    );
+}
+
 #[test]
 fn text_prompt_produces_one_acp_text_content_block() {
     let prompt = text_prompt("ping");

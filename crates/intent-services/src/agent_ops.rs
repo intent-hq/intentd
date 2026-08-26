@@ -5243,6 +5243,12 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else if entry.user_origin {
+            // Schedule debounced lastActivity event (§10.1) for USER-origin
+            // entries only — parity with the queue-drain `persist_user` gate:
+            // on this store-only path no turn runs, so the user's force-sent
+            // message is itself the boundary.
+            self.schedule_last_activity_event(session.workspace_id.clone());
         }
         // Publish agent:message events using the store-returned message id.
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
