@@ -9223,6 +9223,110 @@ mod wsapi4_bindings_tests {
         assert_eq!(*api.agent_list_calls.lock().unwrap(), 1);
     }
 
+    /// Seed `agent_list_rows` with a live/completed top-level pair plus a
+    /// live/errored child of `a-top` (the `ws.agent.list` filter tests).
+    fn seed_agent_list_filter_rows(api: &FakeApi) {
+        let ws = WorkspaceId::from_string("amber-forest");
+        let top = stub_agent("a-top", &ws);
+        let mut top_done = stub_agent("a-top-done", &ws);
+        top_done.status = AgentStatus::Completed;
+        let mut child = stub_agent("a-child", &ws);
+        child.parent_agent_id = Some(AgentId::from("a-top"));
+        let mut child_err = stub_agent("a-child-err", &ws);
+        child_err.parent_agent_id = Some(AgentId::from("a-top"));
+        child_err.status = AgentStatus::Error;
+        *api.agent_list_rows.lock().unwrap() = Some(vec![top, top_done, child, child_err]);
+    }
+
+    async fn agent_list_ids(srv: &WorkspaceMcpServer, code: &str) -> Vec<String> {
+        let resp = call(srv, code).await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{}", text(&resp));
+        body(&resp)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn agent_list_omits_terminal_rows_unless_include_completed() {
+        let (srv, api) = server();
+        seed_agent_list_filter_rows(&api);
+        assert_eq!(
+            agent_list_ids(&srv, "return await ws.agent.list();").await,
+            ["a-top", "a-child"]
+        );
+        // Legacy bare-boolean form.
+        assert_eq!(
+            agent_list_ids(&srv, "return await ws.agent.list(true);").await,
+            ["a-top", "a-top-done", "a-child", "a-child-err"]
+        );
+        // Object form.
+        assert_eq!(
+            agent_list_ids(
+                &srv,
+                "return await ws.agent.list({ includeCompleted: true });"
+            )
+            .await,
+            ["a-top", "a-top-done", "a-child", "a-child-err"]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_list_scope_and_parent_filters() {
+        let (srv, api) = server();
+        seed_agent_list_filter_rows(&api);
+        assert_eq!(
+            agent_list_ids(&srv, "return await ws.agent.list({ scope: 'top-level' });").await,
+            ["a-top"]
+        );
+        assert_eq!(
+            agent_list_ids(&srv, "return await ws.agent.list({ scope: 'subagents' });").await,
+            ["a-child"]
+        );
+        assert_eq!(
+            agent_list_ids(
+                &srv,
+                "return await ws.agent.list({ parentAgentId: 'a-top', includeCompleted: true });"
+            )
+            .await,
+            ["a-child", "a-child-err"]
+        );
+        assert_eq!(
+            agent_list_ids(
+                &srv,
+                "return await ws.agent.list({ parentAgentId: 'a-other' });"
+            )
+            .await,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_list_rejects_invalid_filter_combos() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.agent.list({ scope: 'bogus' });").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let t = text(&resp);
+        assert!(
+            t.contains("\"top-level\"") && t.contains("\"subagents\""),
+            "error must name the valid scope values: {t}"
+        );
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.list({ scope: 'top-level', parentAgentId: 'a-top' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(
+            text(&resp).contains("cannot be combined"),
+            "{}",
+            text(&resp)
+        );
+    }
+
     #[tokio::test]
     async fn agent_status_forwards_agent_id() {
         let (srv, api) = server();
