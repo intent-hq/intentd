@@ -28823,8 +28823,10 @@ mod last_activity_events {
         );
     }
 
-    /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
-    /// when the token tallies actually changed (idempotent re-scan is silent).
+    /// `scan_workspace_token_usage` emits `workspace:tokenUsage-changed` only
+    /// when the token tallies actually changed (idempotent re-scan is silent)
+    /// and — since a token recompute is not a turn boundary — never schedules
+    /// a `workspace:updated { lastActivity }`.
     #[tokio::test]
     async fn token_usage_scan_only_on_change() {
         let _guard = DebounceEnvGuard::new("100");
@@ -28839,17 +28841,18 @@ mod last_activity_events {
             .expect("scan 1");
         assert!(changed1, "first scan changed (none -> zero)");
 
-        // Consume the first scan's events deterministically instead of a
-        // sleep-based drain: under coverage CI the debounced lastActivity
-        // task can fire late and leak into the no-emit assertion below
-        // (monorepo#934). The immediate tokenUsage-changed lands first, then
-        // the debounced workspace:updated { lastActivity } (guaranteed to
-        // emit: the seeded workspace has no stored lastActivity).
+        // The immediate tokenUsage-changed lands; no debounced
+        // workspace:updated { lastActivity } follows (turn-boundary-only
+        // scheduling — a token recompute is mid-turn bookkeeping).
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
-        let ev = recv_one(&mut sub).await;
-        assert_envelope(&ev, &h.ws.0, "workspace:updated");
-        assert!(ev["data"]["changes"]["lastActivity"].is_string());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "token recompute must not emit a lastActivity workspace:updated"
+        );
 
         // Second scan (tallies unchanged, no emit).
         let changed2 = h
@@ -28859,8 +28862,8 @@ mod last_activity_events {
             .expect("scan 2");
         assert!(!changed2, "second scan unchanged");
 
-        // Nothing is pending from the first scan anymore, so any event in
-        // this window would be a real over-emit from the idempotent re-scan.
+        // Any event in this window would be a real over-emit from the
+        // idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             timeout(Duration::from_millis(50), sub.recv())
@@ -29018,6 +29021,105 @@ mod last_activity_events {
         assert_eq!(usage.totals.cache_read_tokens, 50, "50 from agent 1");
         assert_eq!(usage.by_agent_id.len(), 2, "two agents");
         assert!(usage.last_scan_at.is_some(), "scan timestamp set");
+    }
+
+    /// Whether a debounced `lastActivity` derivation is pending for the
+    /// harness workspace (the schedule inserts into the debouncers map
+    /// synchronously; the default 3s window keeps the entry observable).
+    fn last_activity_pending(h: &Harness) -> bool {
+        h.services
+            .last_activity_debouncers
+            .lock()
+            .expect("debouncers lock")
+            .contains_key(&h.ws)
+    }
+
+    /// Message-append role gating (§10.1): `agent.appendMessage` schedules
+    /// the debounced `lastActivity` only for `role: "user"` appends —
+    /// assistant/system/tool transcript writes are mid-turn noise for the
+    /// workspace ordering.
+    #[tokio::test]
+    async fn append_message_op_schedules_last_activity_only_for_user_role() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        h.services
+            .agent_append_message_op(
+                agent_id.clone(),
+                "assistant".into(),
+                serde_json::json!("mid-turn note"),
+                None,
+            )
+            .await
+            .expect("assistant append");
+        assert!(
+            !last_activity_pending(&h),
+            "assistant-role append must not schedule lastActivity"
+        );
+
+        h.services
+            .agent_append_message_op(agent_id, "user".into(), serde_json::json!("hi"), None)
+            .await
+            .expect("user append");
+        assert!(
+            last_activity_pending(&h),
+            "user-role append must schedule lastActivity"
+        );
+    }
+
+    /// Store-only force-send gating (§10.1): `agent.sendQueuedMessageNow` on
+    /// the no-manager path schedules the debounced `lastActivity` only for
+    /// user-origin entries — parity with the queue-drain `persist_user` gate.
+    #[tokio::test]
+    async fn send_queued_message_now_op_schedules_last_activity_only_for_user_origin() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let (auto_entry, _) = h.services.enqueue_message_with_origin(
+            &agent_id,
+            "wake".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        h.services
+            .agent_send_queued_message_now_op(agent_id.clone(), auto_entry.id)
+            .await
+            .expect("force-send automatic entry");
+        assert!(
+            !last_activity_pending(&h),
+            "automatic-origin force-send must not schedule lastActivity"
+        );
+
+        let (user_entry, _) = h.services.enqueue_message_with_origin(
+            &agent_id,
+            "human".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        h.services
+            .agent_send_queued_message_now_op(agent_id, user_entry.id)
+            .await
+            .expect("force-send user entry");
+        assert!(
+            last_activity_pending(&h),
+            "user-origin force-send must schedule lastActivity"
+        );
     }
 
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {

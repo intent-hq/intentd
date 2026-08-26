@@ -4755,6 +4755,7 @@ impl AgentManager {
                 AgentStatus::Active,
                 true,
                 Some(None),
+                true,
             )
             .await;
         }
@@ -5009,9 +5010,14 @@ impl AgentManager {
             }),
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.services
-            .schedule_last_activity_event(workspace_id.clone());
+        // Schedule debounced lastActivity event (§10.1) only when the flip
+        // ENDS a turn (transition to a non-active state): lastActivity moves
+        // at turn boundaries, so turn-start/mid-turn status flips must not
+        // churn the workspace ordering.
+        if !is_active {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
     }
 
     /// Persist `agent_session.status` + `is_active` + optional `stop_reason` and
@@ -5020,6 +5026,11 @@ impl AgentManager {
     /// untouched, `Some(None)` clears it, `Some(Some(reason))` sets it. All failures
     /// are logged and swallowed: the runtime turn is the source of truth and a
     /// transient store/bus error must not abort the in-flight slot transition.
+    ///
+    /// `turn_boundary` marks whether a non-active flip actually ENDS a turn:
+    /// the `agent.retry` Error-clear (see [`AgentManager::persist_retry_status`])
+    /// persists a non-active status without any turn having run, so it passes
+    /// `false` and must not bump `lastActivity` (§10.1 turn-boundary policy).
     #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
@@ -5028,6 +5039,7 @@ impl AgentManager {
         status: AgentStatus,
         is_active: bool,
         stop_reason: Option<Option<String>>,
+        turn_boundary: bool,
     ) {
         let ts = now_iso();
         // Clone stop_reason for event emission (we need it after the store call moves it).
@@ -5083,9 +5095,14 @@ impl AgentManager {
             data,
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.services
-            .schedule_last_activity_event(workspace_id.clone());
+        // Schedule debounced lastActivity event (§10.1) only when the flip
+        // ENDS a turn (transition to a non-active state on a real turn
+        // boundary) — same gate as [`persist_status`], plus the
+        // `turn_boundary` opt-out for the no-turn `agent.retry` Error-clear.
+        if !is_active && turn_boundary {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
     }
 
     /// Forget a finished worker's join handle.
@@ -5473,6 +5490,13 @@ impl AgentManager {
         self.services
             .publish_agent_message_events(&workspace_id, &agent_id, &message, Some(&turn_id))
             .await;
+        // Schedule debounced lastActivity event (§10.1) for USER-origin sends
+        // only: a human sending into the workspace is a turn boundary, an
+        // internal wake/agent-to-agent delivery is not.
+        if options.origin.is_user() {
+            self.services
+                .schedule_last_activity_event(workspace_id.clone());
+        }
         // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
         // `question_answers` naming the marked assistant message resolves the
         // pending Q&A and clears the marker (a stale/foreign
@@ -5740,6 +5764,7 @@ impl AgentManager {
                 next.file_blocks.as_ref(),
                 next.message_metadata.as_ref(),
                 Some(&next.turn_id),
+                next.user_origin,
             )
             .await
         };
@@ -6808,9 +6833,18 @@ impl AgentManager {
         let is_active = false;
         // Clear stop_reason on retry: the agent is starting fresh, not stuck in an error.
         // Route through persist_status_with_stop_reason to ensure the agent:status-changed
-        // event carries stopReason: null.
-        self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
-            .await;
+        // event carries stopReason: null. `turn_boundary: false` — this flip
+        // clears an Error park without any turn having run, so it must not
+        // bump lastActivity (§10.1 turn-boundary policy).
+        self.persist_status_with_stop_reason(
+            agent_id,
+            workspace_id,
+            status,
+            is_active,
+            Some(None),
+            false,
+        )
+        .await;
         // Clearing the Error park retires the `failed` displayStatus rung
         // (§6.5 step 0): recompute-and-compare so the demotion emits.
         self.services
@@ -8733,6 +8767,7 @@ async fn run_message_worker(
                                 None,
                                 Some(&nudge_metadata),
                                 Some(&nudge_turn_id),
+                                false,
                             )
                             .await;
                             content = nudge;
@@ -8893,6 +8928,7 @@ async fn run_message_worker(
                                     None,
                                     None,
                                     Some(&warning_turn_id),
+                                    false,
                                 )
                                 .await;
                                 content = warning;
@@ -9258,6 +9294,7 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                     Some(&next.turn_id),
+                    next.user_origin,
                 )
                 .await
             };
@@ -9516,6 +9553,7 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                     Some(&next.turn_id),
+                    next.user_origin,
                 )
                 .await
             };
@@ -9707,6 +9745,7 @@ async fn prepare_flush_turn(
             entries[i].file_blocks.as_ref(),
             entries[i].message_metadata.as_ref(),
             Some(&combined_turn_id),
+            entries[i].user_origin,
         )
         .await
         {
@@ -9811,6 +9850,10 @@ async fn prepare_flush_turn(
 /// [`persist_retry_backoff_ms`]); on exhaustion the drain call sites fail
 /// closed — they do NOT start the turn, park the agent in `Error`, and
 /// requeue with `persisted: false` so `agent.retry` re-attempts the append.
+/// `user_origin` marks whether the entry was originated by a human user (the
+/// queue entry's `user_origin` flag): only those appends schedule the
+/// debounced `lastActivity` event (§10.1) — internal wakes, agent-to-agent
+/// deliveries and system-injected turns are not workspace-ordering activity.
 #[allow(clippy::too_many_arguments)]
 async fn persist_user(
     mgr: &AgentManager,
@@ -9821,6 +9864,7 @@ async fn persist_user(
     file_blocks: Option<&Value>,
     message_metadata: Option<&Value>,
     turn_id: Option<&str>,
+    user_origin: bool,
 ) -> bool {
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
@@ -9905,8 +9949,9 @@ async fn persist_user(
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-    } else {
-        // Schedule debounced lastActivity event (§10.1).
+    } else if user_origin {
+        // Schedule debounced lastActivity event (§10.1) for USER-origin
+        // entries only — see the doc comment above.
         mgr.services
             .schedule_last_activity_event(workspace_id.clone());
     }

@@ -3771,8 +3771,6 @@ impl Services {
             json!({ "agentId": agent_id.0, "modelId": model_id }),
         )
         .await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.schedule_last_activity_event(workspace_id.clone());
         Ok(json!({ "success": true, "modelId": model_id }))
     }
 
@@ -4379,8 +4377,6 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.schedule_last_activity_event(workspace_id.clone());
         // `status` / `isBackground` feed the needs_attention derivation (a
         // deleted or background session's pending request/question no longer
         // counts): recompute-and-compare (§6.5 step 0); other fields skip the
@@ -4431,8 +4427,11 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-        } else {
-            // Schedule debounced lastActivity event (§10.1).
+        } else if role == "user" {
+            // Schedule debounced lastActivity event (§10.1) only for
+            // user-role appends: lastActivity moves at turn boundaries —
+            // agent/system transcript writes are mid-turn noise for the
+            // workspace ordering.
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
         self.publish_agent_message_events(&session.workspace_id, &agent_id, &message, None)
@@ -5433,8 +5432,11 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-        } else {
-            // Schedule debounced lastActivity event (§10.1).
+        } else if entry.user_origin {
+            // Schedule debounced lastActivity event (§10.1) for USER-origin
+            // entries only — parity with the queue-drain `persist_user` gate:
+            // on this store-only path no turn runs, so the user's force-sent
+            // message is itself the boundary.
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
         // Publish agent:message events using the store-returned message id.
@@ -6477,8 +6479,6 @@ impl Services {
             json!({ "agentId": caller.0, "completionReportLength": report_len }),
         )
         .await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.schedule_last_activity_event(workspace_id.clone());
         // TASK-B: move the linked task note to `review_required` so the FE
         // reflects the child's completion. Terminal statuses (`complete`,
         // `cancelled`) are never overwritten; agents without a linked note are
@@ -11073,9 +11073,6 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-        } else {
-            // Schedule debounced lastActivity event (§10.1).
-            self.schedule_last_activity_event(workspace_id.clone());
         }
         // Publish agent:message events using the store-returned message id.
         // Wake deliveries carry no user retry record, so no turnId (spec
