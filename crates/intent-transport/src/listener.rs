@@ -321,6 +321,7 @@ where
     // EOF after a server-initiated close (e.g. an oversized frame).
     drop(subs);
     drop(forwards);
+    reverse.close();
     drop(reverse_guard);
     drop(reverse);
     drop(out_tx);

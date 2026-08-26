@@ -222,3 +222,29 @@ async fn blocked_request_fails_when_connection_closes() {
     assert!(err.message.contains("closed"));
     assert!(reverse.pending.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn accepted_request_fails_when_connection_closes() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let reverse = ReverseChannel::new(out_tx);
+    let caller = reverse.clone();
+    let request = tokio::spawn(async move {
+        caller
+            .request(
+                "browser.exec",
+                json!({ "actions": [{ "action": "screenshot" }] }),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    let frame = out_rx.recv().await.expect("accepted reverse frame");
+    assert!(frame.contains("screenshot"));
+
+    reverse.close();
+    let err = request
+        .await
+        .expect("join")
+        .expect_err("connection close wakes response waiter");
+    assert!(err.message.contains("closed"));
+    assert!(reverse.pending.lock().unwrap().is_empty());
+}

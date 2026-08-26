@@ -178,6 +178,18 @@ impl ReverseChannel {
         }
         true
     }
+
+    /// Fail all accepted requests when the owning client connection closes.
+    /// This also wakes requests whose frames already left the outbound queue.
+    pub(crate) fn close(&self) {
+        let pending = std::mem::take(&mut *self.pending.lock().expect("reverse pending poisoned"));
+        for (_, sender) in pending {
+            let _ = sender.send(Err(ReverseError {
+                code: 0,
+                message: "client connection closed".to_string(),
+            }));
+        }
+    }
 }
 
 pub mod primary;
