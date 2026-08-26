@@ -1,0 +1,53 @@
+# Auto-close fork PRs: external (fork) pull requests are not accepted
+# (intent-hq/monorepo#417). CI is already fork-guarded (ci.yml /
+# v-release.yml skip every job when the head repo differs from the base
+# repo), so fork PRs get no CI at all; this workflow closes them with a
+# courteous pointer at the contribution policy.
+#
+# Safety: this uses pull_request_target, which runs in the BASE repo's
+# context with an elevated token — so it must NEVER check out or execute
+# anything from the PR head. It doesn't: there is no actions/checkout, the
+# script only calls the GitHub API with the PR number from the event
+# payload, and the token is scoped to pull-requests:write only (the
+# top-level permissions block zeroes everything else).
+name: Close fork PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    # Fork PRs only — same-repo PRs are left completely alone.
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: number,
+              body: [
+                "Thanks for taking the time to put this together! This repository",
+                "doesn't currently accept external pull requests, so this PR is being",
+                "closed automatically (no CI was run on it).",
+                "",
+                "If you've found a bug or have a feature request, we'd still love to",
+                "hear about it — please open an issue on our tracker at",
+                "https://github.com/intent-hq/monorepo/issues and we'll take a look.",
+              ].join("\n"),
+            });
+            await github.rest.pulls.update({
+              owner,
+              repo,
+              pull_number: number,
+              state: "closed",
+            });
