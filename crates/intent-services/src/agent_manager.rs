@@ -4755,6 +4755,7 @@ impl AgentManager {
                 AgentStatus::Active,
                 true,
                 Some(None),
+                true,
             )
             .await;
         }
@@ -5025,6 +5026,11 @@ impl AgentManager {
     /// untouched, `Some(None)` clears it, `Some(Some(reason))` sets it. All failures
     /// are logged and swallowed: the runtime turn is the source of truth and a
     /// transient store/bus error must not abort the in-flight slot transition.
+    ///
+    /// `turn_boundary` marks whether a non-active flip actually ENDS a turn:
+    /// the `agent.retry` Error-clear (see [`AgentManager::persist_retry_status`])
+    /// persists a non-active status without any turn having run, so it passes
+    /// `false` and must not bump `lastActivity` (§10.1 turn-boundary policy).
     #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
@@ -5033,6 +5039,7 @@ impl AgentManager {
         status: AgentStatus,
         is_active: bool,
         stop_reason: Option<Option<String>>,
+        turn_boundary: bool,
     ) {
         let ts = now_iso();
         // Clone stop_reason for event emission (we need it after the store call moves it).
@@ -5089,9 +5096,10 @@ impl AgentManager {
         };
         crate::publish_event(self.services.event_bus.as_ref(), event).await;
         // Schedule debounced lastActivity event (§10.1) only when the flip
-        // ENDS a turn (transition to a non-active state) — same turn-boundary
-        // gate as [`persist_status`].
-        if !is_active {
+        // ENDS a turn (transition to a non-active state on a real turn
+        // boundary) — same gate as [`persist_status`], plus the
+        // `turn_boundary` opt-out for the no-turn `agent.retry` Error-clear.
+        if !is_active && turn_boundary {
             self.services
                 .schedule_last_activity_event(workspace_id.clone());
         }
@@ -6813,9 +6821,18 @@ impl AgentManager {
         let is_active = false;
         // Clear stop_reason on retry: the agent is starting fresh, not stuck in an error.
         // Route through persist_status_with_stop_reason to ensure the agent:status-changed
-        // event carries stopReason: null.
-        self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
-            .await;
+        // event carries stopReason: null. `turn_boundary: false` — this flip
+        // clears an Error park without any turn having run, so it must not
+        // bump lastActivity (§10.1 turn-boundary policy).
+        self.persist_status_with_stop_reason(
+            agent_id,
+            workspace_id,
+            status,
+            is_active,
+            Some(None),
+            false,
+        )
+        .await;
         // Clearing the Error park retires the `failed` displayStatus rung
         // (§6.5 step 0): recompute-and-compare so the demotion emits.
         self.services

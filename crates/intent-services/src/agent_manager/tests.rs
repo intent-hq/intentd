@@ -10117,8 +10117,15 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
         event_types: vec!["agent:status-changed".to_string()],
         ..Default::default()
     });
-    mgr.persist_status_with_stop_reason(&id, &ws, AgentStatus::RuntimeIdle, false, Some(None))
-        .await;
+    mgr.persist_status_with_stop_reason(
+        &id,
+        &ws,
+        AgentStatus::RuntimeIdle,
+        false,
+        Some(None),
+        true,
+    )
+    .await;
     let session = mgr
         .services
         .store
@@ -12728,18 +12735,35 @@ async fn persist_status_schedules_last_activity_only_on_turn_end() {
 }
 
 /// Turn-boundary gating (§10.1) on the stop-reason companion: same
-/// non-active-only rule as [`AgentManager::persist_status`].
+/// non-active-only rule as [`AgentManager::persist_status`], plus the
+/// `turn_boundary: false` opt-out for the no-turn `agent.retry` Error-clear.
 #[tokio::test]
 async fn persist_status_with_stop_reason_schedules_last_activity_only_on_turn_end() {
     let (_tmp, mgr) = manager().await;
     let (ws, id) = (WorkspaceId::from("ws-la-sr"), AgentId::from("a-la-sr"));
     seed_agent(&mgr, &ws, &id).await;
 
-    mgr.persist_status_with_stop_reason(&id, &ws, AgentStatus::Active, true, Some(None))
+    mgr.persist_status_with_stop_reason(&id, &ws, AgentStatus::Active, true, Some(None), true)
         .await;
     assert!(
         !last_activity_pending(&mgr, &ws),
         "turn-start flip (is_active) must not schedule lastActivity"
+    );
+
+    // Non-active flip that is NOT a turn boundary (the agent.retry
+    // Error-clear shape): must not schedule.
+    mgr.persist_status_with_stop_reason(
+        &id,
+        &ws,
+        AgentStatus::RuntimeIdle,
+        false,
+        Some(None),
+        false,
+    )
+    .await;
+    assert!(
+        !last_activity_pending(&mgr, &ws),
+        "no-turn retry-shaped flip must not schedule lastActivity"
     );
 
     mgr.persist_status_with_stop_reason(
@@ -12748,6 +12772,7 @@ async fn persist_status_with_stop_reason_schedules_last_activity_only_on_turn_en
         AgentStatus::Error,
         false,
         Some(Some("boom".into())),
+        true,
     )
     .await;
     assert!(
