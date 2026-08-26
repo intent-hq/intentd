@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.63] - 2026-08-26
+
+### 🚀 Features
+
+- *(services)* Reject unknown specialist ids at spawn and update seams ([#1498](https://github.com/intent-hq/intentd/pull/1498))
+
+### ⚡ Performance
+
+- *(store)* Keep message content out of the search.messages ranking phase ([#1494](https://github.com/intent-hq/intentd/pull/1494))
+- *(store)* Batch agent queue write-through into chunked bulk inserts ([#1499](https://github.com/intent-hq/intentd/pull/1499))
+
+### 🧪 Testing
+
+- *(intent-git)* Poison hermetic config reads so CI exercises host-gitconfig isolation ([#1495](https://github.com/intent-hq/intentd/pull/1495))
+
+
 ## [0.7.62] - 2026-08-26
 
 ### 🚀 Features
