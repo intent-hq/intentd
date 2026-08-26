@@ -2124,12 +2124,21 @@ impl Services {
                 .await?
         };
         // Message projections are the expensive half (full-workspace COUNT
-        // aggregate + preview columns). Cache per workspace; invalidated on
-        // transcript writes and session create/delete.
-        let mut projections = self
-            .agent_list_cache
-            .get_or_load(&self.store, &workspace_id)
-            .await?;
+        // aggregate + preview columns). The default read serves them from the
+        // per-workspace cache (active sessions only, matching the row set
+        // above — cost stays O(rows returned)); invalidated on transcript
+        // writes and session create/delete. `includeRetired` needs retired
+        // rows' projections too, so it loads directly, bypassing the cache
+        // in both directions.
+        let mut projections = if include_retired {
+            self.store
+                .get_agent_session_message_projections(&workspace_id)
+                .await?
+        } else {
+            self.agent_list_cache
+                .get_or_load(&self.store, &workspace_id)
+                .await?
+        };
         // Idle-visibility: overlay each agent's active-hook metadata
         // (`waitingOnHooks`, omitted when empty) from one workspace-wide
         // hook query.
@@ -2945,6 +2954,34 @@ impl Services {
                 )));
             }
         }
+        // Specialist alias canonicalization (PROTOCOL §5.11): a `specialist`
+        // naming an alias (e.g. `"coordinator"`) is rewritten to the claiming
+        // specialist's CANONICAL id (`"spec-writer"`) before any downstream
+        // rung runs, so display-name/model/effort resolution, the prompt
+        // snapshot, and the persisted `session.specialist` (surfaced as
+        // `metadata.specialist`) all see the canonical id. A directly-known
+        // id passes through unchanged, and an unknown id is left as-is —
+        // preserving the existing lenient behavior (unknown specialist never
+        // fails the create; monorepo#3497 tracks tightening that everywhere).
+        // SECURITY: the project tier resolves against the stored workspace
+        // record's path, never a client-supplied one (same rationale as the
+        // model resolution below).
+        let specialist = match specialist {
+            Some(spec_id) => {
+                let wp = self
+                    .store
+                    .get_workspace(&workspace_id)
+                    .await
+                    .ok()
+                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                Some(
+                    self.specialists_service()
+                        .canonical_id(&spec_id, wp.as_deref())
+                        .unwrap_or(spec_id),
+                )
+            }
+            None => None,
+        };
         let now = now_iso();
         // Derive an omitted name from the specialist's resolved display name
         // (frontmatter `name`, 3-tier project > user > bundled — the same
@@ -4028,7 +4065,28 @@ impl Services {
                     session.system_prompt = update_optional_string(value, "systemPrompt")?;
                 }
                 "specialist" => {
-                    session.specialist = update_optional_string(value, "specialist")?;
+                    // Same alias canonicalization as `agent_create_op`
+                    // (PROTOCOL §5.11): an alias is rewritten to the claiming
+                    // specialist's canonical id before persistence so
+                    // `metadata.specialist` never carries an alias; a
+                    // directly-known or unknown id passes through unchanged
+                    // (lenient, monorepo#3497).
+                    session.specialist = match update_optional_string(value, "specialist")? {
+                        Some(spec_id) => {
+                            let wp = self
+                                .store
+                                .get_workspace(&session.workspace_id)
+                                .await
+                                .ok()
+                                .and_then(|w| crate::git_ops::worktree_path(&w));
+                            Some(
+                                self.specialists_service()
+                                    .canonical_id(&spec_id, wp.as_deref())
+                                    .unwrap_or(spec_id),
+                            )
+                        }
+                        None => None,
+                    };
                 }
                 "taskNoteId" => {
                     session.task_note_id =
@@ -6595,15 +6653,18 @@ impl Services {
                 );
             }
         }
-        // 6. monorepo#1229: attention fan-out to explicit `agent.watch`
-        // watchers (`wake_on_attention`). The caller's parent is excluded —
-        // step 5 already woke it directly — so a parent that ALSO explicitly
+        // 6. monorepo#1229: attention fan-out to the caller's watchers. Every
+        // active completion watch is woken — auto-registered
+        // (wakeOrCreate/delegate SUB-1) watches included, not just explicit
+        // `agent.watch` registrations (monorepo#3443 widened the fan-out past
+        // the old `wake_on_attention` filter). The caller's parent is
+        // excluded — step 5 already woke it directly — so a parent that ALSO
         // watches its child never receives a duplicate attention wake.
         // Watches are left in place (attention is not a completion).
         for watch in self
             .find_watches_for_child(&caller)
             .into_iter()
-            .filter(|w| w.wake_on_attention && Some(&w.parent_agent_id) != parent.as_ref())
+            .filter(|w| Some(&w.parent_agent_id) != parent.as_ref())
         {
             // Attention is not a completion, so the watch is left in place —
             // say so explicitly (issue monorepo#2051) to avoid reading as
@@ -7980,7 +8041,11 @@ impl Services {
     /// delegated background task session — those often send sibling
     /// coordination messages, and passively subscribing them creates noisy
     /// wakeup cards unrelated to their own task — or the caller is a child
-    /// of the target (watches are auto-registered parent→child only).
+    /// of the target (watches are auto-registered parent→child only), or
+    /// the TARGET is an independent top-level foreground agent (not a
+    /// child, not background): messaging a co-equal peer must not passively
+    /// subscribe the sender to its completion — watch peers explicitly with
+    /// `agent.watch`.
     /// Idempotent: reuses an existing watch when one already exists.
     pub(crate) async fn agent_watch_completion_for_sender_op(
         &self,
@@ -8033,6 +8098,39 @@ impl Services {
                 caller = %caller_agent_id.0,
                 target = %target_agent_id.0,
                 "skipping SUB-1 auto-watch — target already in undelivered after_all group"
+            );
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
+        // SUB-1 independent-peer suppression (spawnPeer): a top-level
+        // FOREGROUND target is a co-equal peer, not a worker — messaging it
+        // must not passively subscribe the sender to its completion (peers
+        // are watched explicitly with `agent.watch`). The auto-watch is
+        // armed only for targets that are delegated/created children (parent
+        // linkage, `createdByAgentId`, or depth >= 1) or background agents
+        // (the send-and-await-result worker shape the SUB-1 watch exists
+        // for). The bindings only attach the "You will be notified"
+        // notification when a subscription id comes back, so this skip also
+        // removes that text for depth-0 foreground targets.
+        let target_is_child = target_session.parent_agent_id.is_some()
+            || target_session.delegation_depth.unwrap_or(0) >= 1
+            || target_session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("createdByAgentId"))
+                .and_then(Value::as_str)
+                .is_some();
+        let target_is_background = target_session.is_background
+            || target_session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("isBackground"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if !target_is_child && !target_is_background {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — target is an independent top-level foreground agent"
             );
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
@@ -8194,10 +8292,11 @@ impl Services {
 
     /// `agent.watch` (monorepo#1229): explicit caller→target subscription to
     /// the target's harness-curated completion set — idle/completed, failed,
-    /// deleted, blocker raised, discussion requested. Unlike the
-    /// auto-registered delegation/SUB-1 watches this watch is
-    /// `wake_on_attention` (the attention fan-out in
-    /// `agent_request_attention_op` wakes it). The registration is durably
+    /// deleted, blocker raised, discussion requested. Like the
+    /// auto-registered delegation/SUB-1 watches, the attention fan-out in
+    /// `agent_request_attention_op` wakes it (monorepo#3443 widened the
+    /// fan-out to every active watch; the persisted `wake_on_attention` flag
+    /// still records the explicit registration). The registration is durably
     /// persisted before returning. Fails closed on a nonexistent target and
     /// rejects self-watching; the shared `check_watch_scope` gate rejects
     /// cross-workspace targets for non-chief callers, the idle-target
@@ -9893,6 +9992,16 @@ impl Services {
         {
             crate::agent_subscriptions::check_watch_scope(&session.workspace_id, &workspace_id)?;
         }
+        // monorepo#3442: the caller becomes the created agent's parent ONLY
+        // when its session actually resolved and is not Deleted. Derived from
+        // `caller_session` (not the raw wire `callerAgentId`) so an unknown
+        // client-supplied ID can never be persisted as a dangling parent —
+        // a dangling parent would enable `agent.reportToParent` against a
+        // nonexistent recipient and emit an unresolvable `parentAgentId`.
+        let caller_parent = caller_session
+            .as_ref()
+            .filter(|s| s.status != AgentStatus::Deleted)
+            .map(|s| s.id.clone());
 
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
@@ -10183,13 +10292,33 @@ impl Services {
             is_background: None,
             name_explicitly_set: None,
         };
+        // monorepo#3442: the resolved live caller (`caller_parent`, derived
+        // from the single `caller_session` lookup — never the raw wire
+        // `callerAgentId`) becomes the created agent's `parent_agent_id`, so
+        // a wakeOrCreate-created agent is a delegated child
+        // (`agent.reportToParent` works, attention/failure events carry the
+        // parent). A Deleted caller and an unknown/unresolvable `callerAgentId`
+        // both stay parentless. This is deliberately STRICTER than
+        // `agent_delegate_op`, which passes its parent unfiltered and only
+        // skips watch registration for a Deleted parent — here a parent that
+        // can never receive the report wake is not recorded at all. Note
+        // `build_create_metadata` above still records the raw wire caller as
+        // `createdByAgentId` (creation provenance) even when the parent is
+        // filtered out, so the two fields can intentionally diverge on the
+        // deleted-caller path. Depth guards: the B3 pre-check reads the wire
+        // `delegationDepth` (else the caller's `metadata.delegationDepth`),
+        // while `agent_create_op`'s LC-1 guard reads the parent's persisted
+        // `delegation_depth` column — so a caller whose column is at
+        // `MAX_DELEGATION_DEPTH` passing an explicit lower wire depth clears
+        // B3 but is rejected by LC-1. That pass-then-reject is intentional
+        // fail-closed behavior: the wire value cannot bypass the stored cap.
         let created = self
             .agent_create_op(
                 workspace_id.clone(),
                 name,
                 model,
                 specialist,
-                None,
+                caller_parent,
                 Some(task_note_id.clone()),
                 skip_auto_commit,
                 extra,

@@ -1564,6 +1564,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             false,
         ),
+        boolean(
+            "agentFeatures.mcpTools",
+            "External MCP tools",
+            "Expose external MCP server tools (ws.mcp.*) to agents; enforced server-side on every forwarded call",
+            "agentFeatures",
+            true,
+        )
+        .with_token_impact("~170 tokens/session"),
         number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
@@ -3107,6 +3115,7 @@ mod tests {
             ("agentFeatures.prMonitor", true),
             ("agentFeatures.taskGraph", true),
             ("agentFeatures.peerAgents", false),
+            ("agentFeatures.mcpTools", true),
         ];
         for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

@@ -345,6 +345,50 @@ async fn retired_agents_are_inert_until_restored() {
     assert_eq!(r2["restored"], json!(false));
 }
 
+/// Projection-cost contract (PR review): the default `agent.list` projection
+/// load excludes soft-retired sessions at the SQL layer, so its cost stays
+/// O(rows returned) instead of growing with every retired session kept. The
+/// `includeRetired` variant bypasses the active-only cache and still serves
+/// full message projections for retired rows.
+#[tokio::test]
+async fn retired_sessions_are_excluded_from_default_projection_load() {
+    let (_t, svc, ws) = setup().await;
+    let live = create_agent(&svc, &ws, "Live").await;
+    let old = create_agent(&svc, &ws, "Old").await;
+    let content = serde_json::json!([{ "type": "text", "text": "kept transcript" }]);
+    svc.store()
+        .append_agent_message(&old, "user", &content, &intent_core::now_iso())
+        .await
+        .expect("append");
+    svc.agent_retire_op(old.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire");
+
+    // The active-only store read omits the retired session entirely.
+    let active = svc
+        .store()
+        .get_active_agent_session_message_projections(&ws)
+        .await
+        .expect("active projections");
+    assert!(active.contains_key(&live.0), "live session projected");
+    assert!(
+        !active.contains_key(&old.0),
+        "retired session must not be loaded by the default projection read"
+    );
+
+    // includeRetired still serves the retired row WITH its projections
+    // (message_count from the direct, cache-bypassing load).
+    let all = svc
+        .agent_list_including_retired_op(ws.clone())
+        .await
+        .expect("list all");
+    let row = all.iter().find(|a| a.id == old).expect("retired row");
+    assert_eq!(
+        row.message_count, 1,
+        "retired row keeps its message projection in the includeRetired read"
+    );
+}
+
 #[tokio::test]
 async fn retire_and_restore_reject_cross_workspace_targets() {
     let (_t, svc, ws) = setup().await;
@@ -9545,10 +9589,11 @@ async fn models_list_unknown_provider_degrades_to_static_never_errors() {
 }
 
 #[tokio::test]
-async fn models_list_cortex_gate_is_open_and_serves_empty_list() {
+async fn models_list_cortex_gate_is_closed_and_serves_empty_list_with_warning() {
     let (_t, svc, _ws) = setup().await;
-    // cortex is un-gated (monorepo#1902): empty list with no gating warning
-    // under its own source tag — the provider CLI owns model selection.
+    // cortex is hidden by default (INTENTD_ENABLE_CORTEX unset in the test
+    // environment): empty list with a gating warning naming the env var,
+    // under its own source tag.
     let res = svc
         .models_list_op(Some("cortex".to_string()), true)
         .await
@@ -9556,9 +9601,10 @@ async fn models_list_cortex_gate_is_open_and_serves_empty_list() {
     assert_eq!(res["providerId"], "cortex");
     assert_eq!(res["source"], "cortex");
     assert!(res["models"].as_array().unwrap().is_empty());
+    let warning = res["warning"].as_str().expect("closed gate ⇒ warning");
     assert!(
-        res.get("warning").is_none(),
-        "open gate ⇒ no warning: {res}"
+        warning.contains("INTENTD_ENABLE_CORTEX"),
+        "gate warning names the env var: {res}"
     );
 }
 
@@ -12251,12 +12297,24 @@ async fn watch_completion_skips_when_parent_deleted() {
 
 /// A foreground/coordinator sender is auto-subscribed: exactly one
 /// caller→target watch, subscription id returned (the TS
-/// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`).
+/// `maybeSubscribeCallerToAgentCompletionForCoordinationMessage`). The
+/// target is a BACKGROUND worker — an independent top-level foreground
+/// target would suppress the watch (peer rule, tested below).
 #[tokio::test]
 async fn sender_watch_registers_ungrouped_for_foreground_caller() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("flag background");
 
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
@@ -12282,6 +12340,16 @@ async fn sender_watch_silently_adopts_existing_watch_for_pair() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("flag background");
     let existing = svc
         .register_completion_watch(
             &ws,
@@ -12400,13 +12468,26 @@ async fn sender_watch_skips_child_via_created_by_metadata() {
 }
 
 /// The child→parent suppression is one-directional: a child sending to a
-/// NON-parent target (an unrelated sibling) still gets the SUB-1
-/// caller→target watch.
+/// NON-parent target (a sibling child of the same coordinator) still gets
+/// the SUB-1 caller→target watch.
 #[tokio::test]
 async fn sender_watch_still_registers_for_child_sending_to_non_parent() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Coordinator").await;
-    let sibling = create_agent(&svc, &ws, "Sibling").await;
+    let created_sibling = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Sibling".to_string()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create sibling");
+    let sibling = AgentId::from(created_sibling["agent"]["id"].as_str().unwrap());
     let created = svc
         .agent_create_op(
             ws.clone(),
@@ -12465,6 +12546,33 @@ async fn sender_watch_still_registers_for_parent_sending_to_child() {
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
     assert_eq!(watches[0].child_agent_id, child);
+}
+
+/// SUB-1 independent-peer suppression: a target that is a top-level
+/// FOREGROUND agent (no parent linkage, depth 0, not background) is a
+/// co-equal peer — messaging it does NOT passively subscribe the sender to
+/// its completion. `ok: false`, no subscription id, no watch; peers are
+/// watched explicitly with `agent.watch`.
+#[tokio::test]
+async fn sender_watch_skips_independent_top_level_foreground_target() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let session = svc
+        .store()
+        .get_agent_session(&peer)
+        .await
+        .expect("peer session");
+    assert!(session.parent_agent_id.is_none());
+    assert!(!session.is_background);
+
+    let resp = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), peer)
+        .await
+        .expect("sender watch");
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert!(resp["subscriptionId"].is_null());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
 /// `agent.wakeOrCreate` woke-existing with a caller: the caller gets a completion
@@ -12796,6 +12904,178 @@ async fn wake_or_create_skips_watch_when_caller_deleted_create_branch() {
     );
     assert!(resp.get("message").is_none());
     assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// monorepo#3442: the `created_new` branch persists the live caller as the
+/// created session's `parent_agent_id`, making a wakeOrCreate-created agent a
+/// delegated child — so `agent.reportToParent` succeeds for it and delivers
+/// the report wake to the caller, like a delegate child.
+#[tokio::test]
+async fn wake_or_create_created_new_sets_parent_to_live_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Parent linkage").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert_eq!(
+        session.parent_agent_id,
+        Some(caller.clone()),
+        "wakeOrCreate-created agent must be a delegated child of the caller"
+    );
+
+    // `reportToParent` succeeds for the child: report persisted on the session
+    // and the wake delivered to the caller.
+    let baseline = parent_message_count(&svc, &caller).await;
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(created.clone()))
+        .await
+        .expect("reportToParent must succeed for a wakeOrCreate-created child");
+    assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert_eq!(session.completion_report.as_deref(), Some("shipped it"));
+}
+
+/// monorepo#3442: the caller-less create path keeps `parent_agent_id` unset —
+/// `reportToParent` stays unavailable for such agents.
+#[tokio::test]
+async fn wake_or_create_created_new_without_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "No caller parent").await;
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "kickoff".into(),
+            AgentWakeOrCreateInput::default(),
+        )
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(session.parent_agent_id.is_none());
+}
+
+/// monorepo#3442: a Deleted caller must not become a parent (it can never
+/// receive the report wake) — mirrors `agent_delegate_op`'s deleted-parent
+/// guard, sharing the monorepo#994 `caller_deleted` pre-gate.
+#[tokio::test]
+async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Deleted caller parent").await;
+    flag_agent_deleted(&svc, &caller).await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(
+        session.parent_agent_id.is_none(),
+        "deleted caller must not become a parent"
+    );
+}
+
+/// monorepo#3442: an unknown `callerAgentId` (no session resolves for it) must
+/// not be persisted as the child's parent — a dangling parent would enable
+/// `reportToParent` against a nonexistent recipient and emit an unresolvable
+/// `parentAgentId`. Parentage derives from the resolved `caller_session`, not
+/// the raw client-supplied ID.
+#[tokio::test]
+async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Unknown caller parent").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(AgentId::from("agent-00000000-dead-beef-0000-000000000000")),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let session = svc
+        .store()
+        .get_agent_session(&created)
+        .await
+        .expect("created session");
+    assert!(
+        session.parent_agent_id.is_none(),
+        "unknown caller must not become a dangling parent"
+    );
+}
+
+/// monorepo#3442 (fail-closed): a caller whose persisted `delegation_depth`
+/// column is at `MAX_DELEGATION_DEPTH` cannot bypass the cap with an explicit
+/// lower wire `delegationDepth`. The B3 pre-check reads the wire value and
+/// passes, but `agent_create_op`'s LC-1 guard reads the column and rejects —
+/// pre-fix this path never fired on the create branch (parent was `None`) and
+/// produced a parentless agent; post-fix the call errors.
+#[tokio::test]
+async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Capped coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Depth cap fail-closed").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    session.delegation_depth = Some(MAX_DELEGATION_DEPTH);
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("persist capped depth");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        delegation_depth: Some(0),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect_err("LC-1 must reject a caller stored at the cap");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("maximum delegation depth")),
+        "expected the LC-1 depth rejection, got {err:?}"
+    );
 }
 
 /// monorepo#994: the queued-to-active branch shares the wake-branch SUB-1
@@ -27096,6 +27376,161 @@ async fn agent_watch_attention_fanout_excludes_parent() {
         parent_message_count(&svc, &parent).await,
         baseline + 1,
         "exactly one attention wake for a parent that also watches"
+    );
+}
+
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+/// monorepo#3443: the attention fan-out reaches EVERY active completion
+/// watch, not just explicit `agent.watch` registrations — a watcher holding
+/// only an auto-registered (wakeOrCreate/delegate SUB-1 shape,
+/// `wake_on_attention: false`) watch is woken at raise time.
+#[tokio::test]
+async fn attention_fanout_reaches_auto_registered_watch() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    // Auto-registered watch (the delegation/SUB-1 registration path): the
+    // attention flag stays false.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        None,
+    )
+    .expect("auto-registered watch");
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].wake_on_attention,
+        "auto-registered watch does not set the attention flag"
+    );
+    let baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(target.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        baseline + 1,
+        "auto-registered watcher receives the attention wake"
+    );
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("reports a blocker: sandbox exploded"),
+        "watcher wake is kind-flavored with the reason: {text}"
+    );
+    // Attention is not a completion: the watch survives, flag intact.
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1, "watch survives the attention wake");
+    assert!(!watches[0].wake_on_attention, "attention flag unchanged");
+}
+
+#[allow(clippy::similar_names)] // watcher vs the recorded watches - deliberate
+/// monorepo#3443: an auto-registered GROUPED watch (`wake_on_attention:
+/// false`, `group_id` set — the `after_all` delegation shape) also receives
+/// the attention wake, with the grouped settlement-promise wording.
+#[tokio::test]
+async fn attention_fanout_reaches_auto_registered_grouped_watch() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        target.clone(),
+        Some("group-1".into()),
+    )
+    .expect("auto-registered grouped watch");
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].wake_on_attention,
+        "auto-registered grouped watch does not set the attention flag"
+    );
+    let baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(target.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        baseline + 1,
+        "auto-registered grouped watcher receives the attention wake"
+    );
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("you will be woken when its delegation group settles"),
+        "grouped attention wake promises the settlement wake: {text}"
+    );
+    assert!(
+        !text.contains("you will still be woken at its completion"),
+        "grouped attention wake must not promise an individual completion wake: {text}"
+    );
+    // Attention is not a completion: the grouped watch survives untouched.
+    let watches = svc.list_watches_for_parent(&watcher);
+    assert_eq!(watches.len(), 1, "watch survives the attention wake");
+    assert!(!watches[0].wake_on_attention, "attention flag unchanged");
+}
+
+/// monorepo#3443: a delegating parent whose ONLY watch on the child is the
+/// auto-registered delegation watch (`wake_on_attention: false`) still gets
+/// exactly ONE attention wake — the direct step-5 parent wake; the widened
+/// fan-out keeps excluding the parent.
+#[tokio::test]
+async fn attention_fanout_excludes_parent_with_auto_registered_watch_only() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let watches = svc.list_watches_for_parent(&parent);
+    assert_eq!(watches.len(), 1);
+    assert!(
+        !watches[0].wake_on_attention,
+        "delegation watch does not set the attention flag"
+    );
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "need input".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 1,
+        "exactly one attention wake for the delegating parent"
     );
 }
 

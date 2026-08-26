@@ -1179,6 +1179,68 @@ async fn note_list_reseeds_missing_spec_over_wss() {
     );
 }
 
+/// Regression guard for monorepo#3404 over the wire: `note.list` for a
+/// workspace that does not exist (deleted, or never created) returns the
+/// standard not-found error envelope (`-32602` with `error.data.code:
+/// "not-found"`, §9) instead of a best-effort empty list — the spec reseed
+/// verifies the workspace row before attempting any INSERT, so no raw FK
+/// violation is logged and no `note:created` is emitted.
+#[tokio::test]
+async fn note_list_unknown_workspace_not_found_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap then delete a workspace off the UDS so the WSS call runs
+    // against a genuinely-deleted row (the shape from the issue: a client
+    // holding a stale workspace id across a deletion).
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "GoneSoon", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let del = uds_rpc(
+        &socket,
+        3,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(del.get("error").is_none(), "workspace.delete: {del}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Deleted workspace: standard not-found error envelope.
+    let stale = wss_rpc_envelope(&mut rpc, 4, "note.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(stale["jsonrpc"], json!("2.0"));
+    assert_eq!(stale["error"]["code"], json!(-32602), "{stale}");
+    assert_eq!(
+        stale["error"]["data"]["code"],
+        json!("not-found"),
+        "{stale}"
+    );
+
+    // Never-existed workspace id: same envelope.
+    let missing = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "note.list",
+        json!({ "workspaceId": "ws_does_not_exist" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], json!(-32602), "{missing}");
+    assert_eq!(
+        missing["error"]["data"]["code"],
+        json!("not-found"),
+        "{missing}"
+    );
+}
+
 /// Drain any additional `events.event` frames matching `event_type` in
 /// `window` ms; return the first extra observed, or `None` if the socket
 /// stayed quiet. Non-matching frames (heartbeats, unrelated event types) are

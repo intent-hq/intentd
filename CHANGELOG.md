@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.60] - 2026-08-26
+
+### 🚀 Features
+
+- *(providers)* Gate cortex and droid behind enable env vars ([#1482](https://github.com/intent-hq/intentd/pull/1482))
+
+### 🐛 Bug Fixes
+
+- *(services)* Suppress mid-turn stall advisory while a tool call is in flight ([#1481](https://github.com/intent-hq/intentd/pull/1481))
+
+### 🧪 Testing
+
+- *(intentd)* Deflake tunnel oversize 1009 close under parallel suite load ([#1486](https://github.com/intent-hq/intentd/pull/1486))
+
+
+## [0.7.59] - 2026-08-26
+
+### 🚀 Features
+
+- Allow MCP tool calls from hooks via ws.mcp.* bindings ([#1483](https://github.com/intent-hq/intentd/pull/1483))
+- *(providers)* Kills_child_on_interrupt quirk tears down leaking providers after cancel ([#1479](https://github.com/intent-hq/intentd/pull/1479))
+
+### 🐛 Bug Fixes
+
+- Return workspace-not-found from note.list instead of raw FK error on spec reseed ([#1473](https://github.com/intent-hq/intentd/pull/1473))
+
+
+## [0.7.58] - 2026-08-25
+
+### 🚀 Features
+
+- *(specialists)* Role/teamAgents/icon picker-metadata frontmatter keys ([#1477](https://github.com/intent-hq/intentd/pull/1477))
+- *(acp)* Add ws.agent.spawnPeer with top-level gating and target-side sender watch ([#1468](https://github.com/intent-hq/intentd/pull/1468))
+
+### 🐛 Bug Fixes
+
+- *(agents)* Fan attention wakes out to all active completion watches ([#1478](https://github.com/intent-hq/intentd/pull/1478))
+- *(services)* Set parent_agent_id on wakeOrCreate-created agents ([#1476](https://github.com/intent-hq/intentd/pull/1476))
+
+
 ## [0.7.57] - 2026-08-25
 
 ### 🚀 Features

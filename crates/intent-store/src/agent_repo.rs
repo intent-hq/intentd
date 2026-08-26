@@ -989,14 +989,45 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
-        let sql = "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
+        self.session_message_projections(workspace_id, false).await
+    }
+
+    /// [`Store::get_agent_session_message_projections`] restricted to ACTIVE
+    /// (not soft-retired) sessions — the variant the default `agent.list`
+    /// projection cache loads, so its aggregate cost scales with the rows
+    /// that read returns rather than with every retired session ever kept
+    /// (RPC cost contract). The filter runs in SQL (`retired_at IS NULL`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn get_active_agent_session_message_projections(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
+        self.session_message_projections(workspace_id, true).await
+    }
+
+    async fn session_message_projections(
+        &self,
+        workspace_id: &WorkspaceId,
+        active_only: bool,
+    ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
+        let retired_filter = if active_only {
+            " AND s.retired_at IS NULL"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
             s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
             s.last_message_id, s.last_tool_use_preview \
             FROM agent_session s \
             LEFT JOIN agent_message m ON m.agent_id = s.id \
-            WHERE s.workspace_id = ? \
-            GROUP BY s.id";
-        let rows = sqlx::query(sql)
+            WHERE s.workspace_id = ?{retired_filter} \
+            GROUP BY s.id"
+        );
+        let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await

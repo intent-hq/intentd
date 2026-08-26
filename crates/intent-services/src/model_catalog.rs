@@ -99,26 +99,29 @@ fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     })
 }
 
-/// cortex source: registry-gated catalog. The gate is open by default —
-/// cortex's config demands no env var or feature code (un-gated,
-/// monorepo#1902) — but the check stays wired through
-/// [`intent_providers::gated_reason`] (the single gate shared with
-/// `providers.catalog` and discovery's `gatedOff`) so a future gating field
-/// re-closes it; closed means an empty list + warning (mirroring the
-/// reference FE's default-deny). Cortex has no dynamic model discovery (and
-/// the static tier catalog is retired), so an open gate also serves an empty
-/// list — the provider CLI owns model selection.
+/// Evaluate a provider's registry gate ([`intent_providers::gated_reason`] —
+/// the single gate shared with `providers.catalog` and discovery's
+/// `gatedOff`). A missing provider config is treated as gated (explicit
+/// default-deny), not as an open gate.
+fn source_gated_reason(provider_id: &str) -> Option<String> {
+    match intent_providers::find_provider(provider_id) {
+        None => Some("provider config missing".to_string()),
+        Some(cfg) => intent_providers::gated_reason(cfg),
+    }
+}
+
+/// cortex source: registry-gated catalog. Cortex is gated behind
+/// `INTENTD_ENABLE_CORTEX` (hidden by default — not yet well-tested); a
+/// closed gate means an empty list + warning (mirroring the reference FE's
+/// default-deny). Cortex has no dynamic model discovery (and the static tier
+/// catalog is retired), so an open gate also serves an empty list — the
+/// provider CLI owns model selection.
 fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
-        // A missing provider config is treated as gated (explicit default-deny),
-        // not as an open gate.
-        let gated = match intent_providers::find_provider("cortex") {
-            None => Some("provider config missing".to_string()),
-            Some(cfg) => intent_providers::gated_reason(cfg),
-        };
         ModelFetchResult {
             models: Some(Vec::new()),
-            warning: gated.map(|reason| format!("Cortex not available ({reason})")),
+            warning: source_gated_reason("cortex")
+                .map(|reason| format!("Cortex not available ({reason})")),
         }
     })
 }
@@ -187,8 +190,20 @@ fn pi_version() -> String {
 }
 
 /// droid source: ACP probe via a resolved `droid` binary (no adapter pin).
+/// Droid is gated behind `INTENTD_ENABLE_DROID` (hidden by default — not yet
+/// well-tested): a closed gate serves an empty list + warning without ever
+/// probing the binary (empty successes are never cached, so a gated probe
+/// cannot masquerade as a last-good list).
 fn droid_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    provider_models_fetch("droid")
+    Box::pin(async {
+        if let Some(reason) = source_gated_reason("droid") {
+            return ModelFetchResult {
+                models: Some(Vec::new()),
+                warning: Some(format!("Droid not available ({reason})")),
+            };
+        }
+        from_provider_fetch(crate::provider_models::fetch_provider_models("droid").await)
+    })
 }
 
 /// opencode source: native `opencode models` CLI (no adapter pin).

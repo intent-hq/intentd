@@ -5873,7 +5873,22 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-send"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive semantics under test require a provider WITHOUT the
+    // `kills_child_on_interrupt` quirk (seed_agent's auggie now has it —
+    // monorepo#2763; the flagged teardown is covered by
+    // `interrupt_kills_child_for_provider_with_kill_quirk`). The env var +
+    // spawned_provider alignment keep the follow-up send on the live-child
+    // reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → `interrupt` would fall back to the kill path).
     mgr.services
@@ -5933,6 +5948,58 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     assert!(serde_json::to_string(&last.content)
         .unwrap()
         .contains("urgent"));
+}
+
+/// Provider `kills_child_on_interrupt` quirk (intent-hq/monorepo#2763): a
+/// keep-alive interrupt on a session whose provider carries the flag (auggie
+/// — `seed_agent`'s default) tears the child down AFTER the polite
+/// `session/cancel` — the handle is removed — while the persisted
+/// `acpSessionId` survives, keeping the agent resumable via respawn +
+/// the `start_session` resume ladder on the next send.
+#[tokio::test]
+async fn interrupt_kills_child_for_provider_with_kill_quirk() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-quirk"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // A live `acpSessionId` keeps the interrupt on the keep-alive path (no
+    // session → `interrupt` falls back to the hard kill path anyway).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-quirk")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    // The terminal stream:end is still emitted (the teardown happens after
+    // the cancel, before the terminal emits — same shape as keep-alive).
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:stream:end"),
+        "interrupt emits the terminal stream:end (got {types:?})"
+    );
+    // The quirk tore the child down: no live handle survives.
+    assert!(
+        !mgr.handles.lock().unwrap().contains_key(&id),
+        "kills_child_on_interrupt tears the child handle down"
+    );
+    // The persisted acpSessionId survives the teardown, so the next
+    // `agent.sendMessage` respawns the child and resumes the session.
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.acp_session_id.as_deref(),
+        Some("acp-int-quirk"),
+        "acpSessionId survives the quirk teardown (agent stays resumable)"
+    );
+    assert!(!mgr.is_busy(&id), "the in-flight slot was released");
 }
 
 /// Sender attribution on preemption: an agent-to-agent interrupt send (the
@@ -6231,7 +6298,20 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-redeliver"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive semantics under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    // Env var + spawned_provider alignment keep the follow-up send on the
+    // live-child reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     // A live `acpSessionId` keeps the stop on the keep-alive interrupt path.
     mgr.services
         .store
@@ -6351,7 +6431,20 @@ async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-progress"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive semantics under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    // Env var + spawned_provider alignment keep the follow-up send on the
+    // live-child reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-stop-progress")
@@ -6840,7 +6933,20 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-busy"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive semantics under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    // Env var + spawned_provider alignment keep the delivered send on the
+    // live-child reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → the preemption would be skipped).
     mgr.services
@@ -7088,7 +7194,20 @@ async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-zero"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive in-place resume under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    // Env var + spawned_provider alignment keep the follow-up send on the
+    // live-child reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-zero")
@@ -7348,7 +7467,20 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-noidle"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive in-place resume under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    // Env var + spawned_provider alignment keep the follow-up send on the
+    // live-child reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     // Keep the preemption on the keep-alive interrupt path (no session →
     // `interrupt` would fall back to the kill path).
     mgr.services
@@ -7484,7 +7616,20 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-dup"));
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive semantics under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    // Env var + spawned_provider alignment keep the delivered sends on the
+    // live-child reuse path (no respawn, no resolve_spawn failure).
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".to_string();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-dup")
@@ -8250,6 +8395,9 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     let ws = WorkspaceId::from("ws-archive");
     let id = AgentId::from("a-archive-busy");
     seed_agent(&mgr, &ws, &id).await;
+    // Keep-alive semantics under test: use a provider without the
+    // `kills_child_on_interrupt` quirk (auggie now kills — monorepo#2763).
+    set_session_provider(&mgr, &ws, &id, "mock").await;
     let _agent = track_mock_agent(&mgr, &id, false);
     // An `acpSessionId` is required for the keep-alive interrupt (otherwise
     // `interrupt` falls back to the hard `stop` kill path).
@@ -14665,6 +14813,77 @@ mod harness_wake_tests {
             "no assistant row persisted"
         );
         assert!(!mgr.is_busy(&id), "slot never claimed");
+    }
+
+    /// Soft-retire inertness at the listener level (PR review): a retired
+    /// session's live handle can still receive a delayed out-of-turn
+    /// `session/update`, but the tick must NOT open an implicit harness-wake
+    /// turn — retiring removes event subscriptions, not the handle, so this
+    /// gate is what keeps a retired session from persisting new turns. The
+    /// buffered notification stays untouched; after `agent.restore` the next
+    /// tick consumes it into a normal implicit turn.
+    #[tokio::test]
+    async fn retired_session_skips_wake_tick_until_restore() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        mgr.services
+            .agent_retire_op(id.clone(), Some(ws.clone()), None)
+            .await
+            .expect("retire");
+
+        note_tx.send(chunk_note("late child tail")).unwrap();
+        assert!(
+            mgr.wake_listener_tick(&id, &ws).await,
+            "listener keeps running (handle stays alive) while retired"
+        );
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:start")
+        })
+        .await;
+        assert!(
+            !events.iter().any(|e| e.event_type == "agent:stream:start"),
+            "no implicit turn driven on a retired session"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no assistant row persisted while retired"
+        );
+        assert!(!mgr.is_busy(&id), "slot never claimed while retired");
+
+        // Restore returns the session to service; the buffered notification
+        // was left untouched and the next tick consumes it normally.
+        mgr.services
+            .agent_restore_op(id.clone(), Some(ws.clone()))
+            .await
+            .expect("restore");
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:stream:end"),
+            "post-restore tick opens the implicit turn"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "the parked burst persisted after restore"
+        );
+        assert_eq!(messages[0].content[0]["text"], json!("late child tail"));
     }
 
     /// monorepo#2118 (PR review) — a tick losing the slot to a held REAP

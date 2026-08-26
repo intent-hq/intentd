@@ -142,7 +142,7 @@ Namespaces (index — full signatures in API below):
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
-  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
@@ -151,6 +151,7 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
+  ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
@@ -214,6 +215,7 @@ API:
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
+  ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
@@ -285,6 +287,10 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
+  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear); `state` is the live hub state (running|stopped|error|starting).
+  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled or not running.
+  ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
+
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
@@ -353,7 +359,7 @@ Namespaces (index — full signatures in API below):
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
-  ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
+  ws.primitive.* — rich note blocks
   ws.agent.* — create/delegate/message/watch agents
   ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
@@ -361,6 +367,7 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.browser.* — Chrome DevTools browser automation
   ws.terminal.* — read workspace terminal output
+  ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
@@ -447,6 +454,7 @@ API:
   ws.agent.create(name, message, opts?) → { ok, id?, text?, ... }  // Create and start an agent immediately. You are auto-subscribed to its completion events and will be woken when it finishes.
     Specialists include `"implementor"` for implementation work and `"verifier"` for review/verification. `createLinkedNote=true` with `noteContent` creates a linked note; agents are background by default unless `isBackground=false`.
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
+  ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.
   ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, provider?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
     Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `provider` pins the child's ACP provider explicitly (disambiguates a bare `model` that exists under multiple providers); it must name a known, available provider, and a compound `model` naming a different provider is rejected. `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
@@ -514,6 +522,10 @@ API:
   ws.terminal.list() → [terminals]  // Active workspace terminal sessions.
   ws.terminal.readOutput(terminalId, maxLines?) → string  // Read a terminal output buffer. Use `ws.terminal.list()` first to discover terminal IDs.
 
+  ws.mcp.listServers() → { servers: [{ id, name, transport, enabled, state, toolCount? }] }  // The user-configured external MCP servers, projected to non-sensitive fields only (`env`/`headers`/`command` never appear); `state` is the live hub state (running|stopped|error|starting).
+  ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled or not running.
+  ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
+
   ws.crossWorkspace.listSiblings() → [workspaces]  // Other workspaces sharing the same repository (repo-scoped).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
@@ -577,8 +589,8 @@ static ALL_TOOLS_CHIEF: &[ToolDef] = &[ToolDef {
 
 /// The `ws.` path prefixes gated by each disabled `[agentFeatures]` toggle.
 /// Namespace-level prefixes end with `.`; method-level prefixes (the
-/// `attentionRequests` pair, the `peerAgents` retire entry) name one full
-/// method each. Shared by the description assembler below, the prelude
+/// `attentionRequests` pair, the `peerAgents` retire/spawnPeer entries) name
+/// one full method each. Shared by the description assembler below, the prelude
 /// assembler in [`super::bindings`], and the dispatch deny in
 /// [`super::bindings`] (via [`denied_feature`]), so the three layers cannot
 /// drift.
@@ -618,9 +630,15 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
         out.push(("ws.pr.unmonitor", "agentFeatures.prMonitor"));
     }
     if !features.peer_agents {
-        // Method-level: `ws.agent.retire` is the only `ws.agent.*` surface
-        // gated by the opt-in peerAgents toggle (default off).
+        // Method-level: `ws.agent.retire` and `ws.agent.spawnPeer` are the
+        // only `ws.agent.*` surfaces gated by the opt-in peerAgents toggle
+        // (default off). `spawnPeer` is additionally top-level-only — that
+        // rule lives in the bridge/dispatch layers, not here.
         out.push(("ws.agent.retire", "agentFeatures.peerAgents"));
+        out.push(("ws.agent.spawnPeer", "agentFeatures.peerAgents"));
+    }
+    if !features.mcp_tools {
+        out.push(("ws.mcp.", "agentFeatures.mcpTools"));
     }
     out
 }
@@ -671,6 +689,22 @@ const TASK_GRAPH_SETCONTENT_XREF: &str = "; the fence line takes optional `key=`
 const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR: &str = " The fence line takes optional attributes — `@@@task key=api dependsOn=a,b conflictsWith=c effort=2h` — bare tokens, comma-separated lists, whitespace-tolerant; `dependsOn`/`conflictsWith` values resolve against sibling block `key=`s, then exact sibling titles, then existing task-note ids, and `effort` seeds the estimated effort.\n    Conversion never fails on bad attributes: blocks always convert, and unresolvable/ambiguous references or rejected edges (cycle, tree ancestor/descendant) are skipped with a warning naming the block and reference. `createdTasks` is `[{ key?, title, noteId }]` in block order; check `warnings` after converting.";
 const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR_OFF: &str =
     " `createdTasks` is `[{ key?, title, noteId }]` in block order; `warnings` names skipped relation references.";
+
+/// The `ws.agent.spawnPeer` doc line (one line, no continuations, identical
+/// in both static variants — a drift test pins it). Pruned from the
+/// assembled description via [`gated_prefixes`] when `peerAgents` is off;
+/// scrubbed by [`scrub_spawn_peer_doc`] on sub-agent bridges when the toggle
+/// is ON, because spawning peers is top-level-only (like `ws.app.question.*`)
+/// while the co-gated `ws.agent.retire` stays available to sub-agents.
+pub(crate) const SPAWN_PEER_DOC_LINE: &str = "  ws.agent.spawnPeer(name, message, opts?) → { ok, id, agentId, name, sponsorAgentId }  // Spawn an INDEPENDENT top-level agent — a co-equal peer, not a sub-agent: no parent linkage, no delegation depth, no completion watch on you, and `reportToParent` does not apply to it. You are recorded as its `sponsorAgentId` (attribution only) and a sponsor preamble telling it of its independent standing is prepended to your message. Peers are FOREGROUND by default (`isBackground: false`); `opts` also takes `specialist`, `model`, `provider`, `reasoningEffort`, `behaviorPrompt`. Top-level agents only, and refused when live top-level agents are at the `agents.maxTopLevelAgents` cap. Use `create` instead when you want a child you are woken for; watch a peer explicitly with `watch` if you care about its completion.\n";
+
+/// Drop the `ws.agent.spawnPeer` doc line from an assembled description for
+/// a sub-agent bridge (top-level-only rule; the dispatch layer denies the
+/// frame with `SUB_AGENT_SPAWN_PEER_DENIED` as defense in depth). No-op when
+/// the line is already pruned by the `peerAgents` gate.
+pub(crate) fn scrub_spawn_peer_doc(desc: &str) -> String {
+    desc.replacen(SPAWN_PEER_DOC_LINE, "", 1)
+}
 
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
@@ -1012,7 +1046,12 @@ pub(super) fn help_namespace(
             let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
             if indent == 2 && trimmed.starts_with("ws.") {
-                in_segment = trimmed.starts_with(&dot_prefix) || trimmed.starts_with(&call_prefix);
+                in_segment = (trimmed.starts_with(&dot_prefix)
+                    || trimmed.starts_with(&call_prefix))
+                    // Top-level-only rule: a sub-agent bridge's help output
+                    // must not advertise `spawnPeer` (dispatch denies it
+                    // with the redirect error).
+                    && !(is_sub_agent && trimmed.starts_with("ws.agent.spawnPeer("));
             } else if indent < 4 || trimmed.is_empty() {
                 in_segment = false;
             }
@@ -1178,15 +1217,16 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
 mod tests {
     use super::{
         compact_workspace_api_description, condensed_workspace_api_description, denied_feature,
-        first_sentence_end, help_index, help_namespace, workspace_api_description,
-        workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
-        SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
-        HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
-        PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
-        PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
-        TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS,
-        TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION,
-        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        first_sentence_end, help_index, help_namespace, scrub_spawn_peer_doc,
+        workspace_api_description, workspace_api_description_with_model_options,
+        AgentFeaturesSettings, Cow, SpecialistModelOption, SpecialistModelOptions,
+        HOOK_HOST_EXEC_DOC_XREF, HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER,
+        NAMESPACE_INDEX_HEADER_COMPACT, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
+        PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
+        REPORT_TO_PARENT_ATTENTION_XREF, SPAWN_PEER_DOC_LINE, TASK_GRAPH_BATCH_FORM_LINE,
+        TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
+        TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1212,6 +1252,7 @@ mod tests {
     const BINDINGS_HOOK: &str = include_str!("bindings/hook.rs");
     const BINDINGS_SCRIPT: &str = include_str!("bindings/script.rs");
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
+    const BINDINGS_MCP: &str = include_str!("bindings/mcp.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
     const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
     const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
@@ -1241,6 +1282,7 @@ mod tests {
             ("hook", BINDINGS_HOOK),
             ("script", BINDINGS_SCRIPT),
             ("terminal", BINDINGS_TERMINAL),
+            ("mcp", BINDINGS_MCP),
             ("file", BINDINGS_FILE),
         ]
     }
@@ -1553,6 +1595,7 @@ mod tests {
                 pr_monitor: false,
                 task_graph: false,
                 peer_agents: false,
+                mcp_tools: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1585,6 +1628,55 @@ mod tests {
         for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
             assert!(desc.contains(NAMESPACE_INDEX_HEADER));
         }
+    }
+
+    // The spawnPeer doc-line const the sub-agent scrub anchors on must appear
+    // verbatim in both static variants — a reworded doc line would silently
+    // turn `scrub_spawn_peer_doc` into a no-op.
+    #[test]
+    fn spawn_peer_doc_line_present_in_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(desc.contains(SPAWN_PEER_DOC_LINE));
+        }
+    }
+
+    // The sub-agent scrub removes exactly the spawnPeer doc line (retire and
+    // the rest of `ws.agent` survive), and composes with the peerAgents gate
+    // (already-pruned input is a no-op).
+    #[test]
+    fn scrub_spawn_peer_doc_removes_only_spawn_peer() {
+        let features = AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        };
+        let full = workspace_api_description(false, &features);
+        let scrubbed = scrub_spawn_peer_doc(&full);
+        assert!(!scrubbed.contains("ws.agent.spawnPeer("));
+        assert!(scrubbed.contains("ws.agent.retire("));
+        assert!(scrubbed.contains("ws.agent.create("));
+        assert_eq!(scrubbed.len(), full.len() - SPAWN_PEER_DOC_LINE.len());
+
+        // peerAgents off (the default): the gate already pruned the line,
+        // so the sub-agent scrub composes as a no-op.
+        let gated = workspace_api_description(false, &AgentFeaturesSettings::default());
+        assert!(!gated.contains("ws.agent.spawnPeer("));
+        assert_eq!(scrub_spawn_peer_doc(&gated), gated.as_ref());
+    }
+
+    // ws.help("agent") on a sub-agent bridge omits the spawnPeer doc line
+    // (top-level-only rule) while a top-level bridge with peerAgents on
+    // serves it.
+    #[test]
+    fn help_namespace_agent_omits_spawn_peer_for_sub_agents() {
+        let features = AgentFeaturesSettings {
+            peer_agents: true,
+            ..AgentFeaturesSettings::default()
+        };
+        let top = help_namespace(false, &features, false, "agent").unwrap();
+        assert!(top.contains("ws.agent.spawnPeer("));
+        let sub = help_namespace(false, &features, true, "agent").unwrap();
+        assert!(!sub.contains("ws.agent.spawnPeer("));
+        assert!(sub.contains("ws.agent.retire("));
     }
 
     // The compact description is a pure derivation of the full assembly: the
@@ -2136,7 +2228,10 @@ mod tests {
                 &["ws.pr.monitors", "ws.pr.monitor", "ws.pr.unmonitor"],
                 |f| f.pr_monitor = false,
             ),
-            (&["ws.agent.retire"], |f| f.peer_agents = false),
+            (&["ws.agent.retire", "ws.agent.spawnPeer"], |f| {
+                f.peer_agents = false;
+            }),
+            (&["ws.mcp."], |f| f.mcp_tools = false),
         ]
     }
 
@@ -2343,6 +2438,7 @@ mod tests {
             pr_monitor: false,
             task_graph: false,
             peer_agents: false,
+            mcp_tools: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features);
@@ -2550,6 +2646,7 @@ mod tests {
             pr_monitor: false,
             task_graph: false,
             peer_agents: false,
+            mcp_tools: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -2583,6 +2680,10 @@ mod tests {
             denied_feature(&all_off, "agent.reportBlocker"),
             Some("agentFeatures.attentionRequests")
         );
+        assert_eq!(
+            denied_feature(&all_off, "mcp.callTool"),
+            Some("agentFeatures.mcpTools")
+        );
         // `ws.agent.snapshot()` is NEVER gated: `stateSnapshot` governs only
         // the turn-prompt injection, so even a session created with the
         // toggle already off keeps the tool callable.
@@ -2597,8 +2698,8 @@ mod tests {
         // Sibling `ws.agent.*` methods pass even with attentionRequests off.
         assert_eq!(denied_feature(&all_off, "agent.reportToParent"), None);
         assert_eq!(denied_feature(&all_off, "agent.list"), None);
-        // `peerAgents` gates exactly `agent.retire` — off by DEFAULT (the
-        // one opt-in toggle), so the defaults deny it too.
+        // `peerAgents` gates exactly `agent.retire` + `agent.spawnPeer` —
+        // off by DEFAULT (the one opt-in toggle), so the defaults deny both.
         assert_eq!(
             denied_feature(&all_off, "agent.retire"),
             Some("agentFeatures.peerAgents")
@@ -2608,6 +2709,15 @@ mod tests {
             Some("agentFeatures.peerAgents")
         );
         assert_eq!(denied_feature(&all_gates_open(), "agent.retire"), None);
+        assert_eq!(
+            denied_feature(&all_off, "agent.spawnPeer"),
+            Some("agentFeatures.peerAgents")
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "agent.spawnPeer"),
+            Some("agentFeatures.peerAgents")
+        );
+        assert_eq!(denied_feature(&all_gates_open(), "agent.spawnPeer"), None);
         // Method-level entries match exactly: a longer method sharing the
         // gated method as a prefix is not over-denied.
         assert_eq!(
@@ -2626,6 +2736,10 @@ mod tests {
         );
         assert_eq!(
             denied_feature(&AgentFeaturesSettings::default(), "agent.requestDiscussion"),
+            None
+        );
+        assert_eq!(
+            denied_feature(&AgentFeaturesSettings::default(), "mcp.listServers"),
             None
         );
     }
