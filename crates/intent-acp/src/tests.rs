@@ -458,6 +458,49 @@ async fn stderr_capture_survives_invalid_utf8() {
     drop(conn);
 }
 
+/// monorepo#3570: `stderr_captured` is per-connection — `true` only when THIS
+/// child wrote at least one stderr line the capture sink accepted, so stale
+/// daily files an earlier run left in the same per-agent dir can't turn a
+/// silent child into a misleading "stderr captured at …" WARN claim.
+#[tokio::test]
+async fn stderr_captured_flag_is_per_connection() {
+    let tmp = test_temp_dir("intent-acp-stderr-flag-");
+    let dir = tmp.path().join("logs");
+    // Stale file from a "previous run" of the same agent.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("2020-01-01.log"), "old run\n").unwrap();
+
+    // A child that writes nothing: the flag stays false despite the
+    // populated dir.
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, stderr_w) = connect_mock(hooks);
+    drop(stderr_w); // EOF, no output
+    assert!(conn.await_stderr_settled(Duration::from_secs(2)).await);
+    assert!(
+        !conn.stderr_captured(),
+        "silent child must not claim capture (stale dir entries exist)"
+    );
+    drop(conn);
+
+    // A child that writes: the flag flips.
+    let hooks = ConnectionHooks {
+        stderr_log_dir: Some(dir.clone()),
+        ..ConnectionHooks::default()
+    };
+    let (conn, _responder, mut stderr_w) = connect_mock(hooks);
+    stderr_w.write_all(b"fresh crash output\n").await.unwrap();
+    stderr_w.flush().await.unwrap();
+    drop(stderr_w);
+    assert!(conn.await_stderr_settled(Duration::from_secs(2)).await);
+    assert!(
+        conn.stderr_captured(),
+        "child that wrote stderr reports capture"
+    );
+}
+
 /// Minimal portable ACP responder: echoes a `{protocolVersion:1}` result for
 /// every line carrying an integer `id`. Used as a real mock child process.
 #[cfg(unix)]

@@ -130,15 +130,18 @@ impl StderrLogSink {
     /// Hand a line to the writer task without ever awaiting: on a full
     /// channel (stalled disk) or a closed one (writer exited after an I/O
     /// error) the line is dropped — capture is best-effort by design.
-    fn send_line(&mut self, line: &str) {
+    /// Returns whether the writer accepted the line.
+    fn send_line(&mut self, line: &str) -> bool {
         match self.tx.try_send(line.to_string()) {
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !self.drop_warned {
                     self.drop_warned = true;
                     tracing::warn!("agent stderr log capture dropping lines (writer backlogged)");
                 }
+                false
             }
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
@@ -338,6 +341,7 @@ pub struct Connection {
     stderr: Arc<Mutex<StderrBuffer>>,
     auth_error: Arc<AtomicBool>,
     stderr_settled: watch::Receiver<bool>,
+    stderr_captured: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -432,9 +436,11 @@ impl Connection {
         // capture for the rest of the child's life. At EOF it finishes the
         // sink (drain backlog + flush) and then flips the settled watch.
         let (settled_tx, stderr_settled) = watch::channel(stderr.is_none());
+        let stderr_captured = Arc::new(AtomicBool::new(false));
         if let Some(stderr) = stderr {
             let stderr_buf_task = Arc::clone(&stderr_buf);
             let auth_flag = Arc::clone(&auth_error);
+            let captured_flag = Arc::clone(&stderr_captured);
             let patterns: Vec<String> = hooks
                 .auth_error_patterns
                 .iter()
@@ -458,7 +464,9 @@ impl Connection {
                     }
                     let line = String::from_utf8_lossy(&buf);
                     if let Some(sink) = log_sink.as_mut() {
-                        sink.send_line(&line);
+                        if sink.send_line(&line) {
+                            captured_flag.store(true, Ordering::SeqCst);
+                        }
                     }
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -489,6 +497,7 @@ impl Connection {
             stderr: stderr_buf,
             auth_error,
             stderr_settled,
+            stderr_captured,
             tasks,
         }
     }
@@ -678,6 +687,15 @@ impl Connection {
         tokio::time::timeout(timeout, rx.wait_for(|settled| *settled))
             .await
             .is_ok_and(|r| r.is_ok())
+    }
+
+    /// Whether THIS connection's child wrote at least one stderr line that
+    /// the capture sink accepted (monorepo#3570). Distinguishes a fresh
+    /// capture from stale daily files an earlier child left in the same
+    /// per-agent dir, so the "stderr captured at <dir>" WARN never points at
+    /// a directory this child contributed nothing to.
+    pub fn stderr_captured(&self) -> bool {
+        self.stderr_captured.load(Ordering::SeqCst)
     }
 }
 
