@@ -9,7 +9,7 @@
 //! `agent:stream:end` is emitted per turn — `complete` and `error` both map to it
 //! (PROTOCOL §7).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -306,6 +306,13 @@ struct Transcript {
     /// this turn (§5.23). Cumulative per ACP session, so the last one wins;
     /// `None` when the provider reported no cost.
     usage_cost: Option<UsageCost>,
+    /// `toolCallId`s recorded by [`record_tool`](Self::record_tool) whose
+    /// latest status is non-terminal (neither `completed` nor `error`).
+    /// Drives tool-call-aware stall suppression (intent-hq/monorepo#3466):
+    /// while non-empty, the mid-turn `stalled` advisory is suppressed —
+    /// long tool runs are legitimately silent. Anonymous updates dropped by
+    /// `record_tool` (STAB-124) never enter this set.
+    open_tool_calls: HashSet<String>,
 }
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
@@ -335,7 +342,14 @@ impl Transcript {
             tool_result_index: HashMap::new(),
             proposal_index: HashMap::new(),
             usage_cost: None,
+            open_tool_calls: HashSet::new(),
         }
+    }
+
+    /// Number of recorded tool calls still awaiting a terminal
+    /// `tool_call_update` (see [`open_tool_calls`](Self::open_tool_calls)).
+    fn open_tool_call_count(&self) -> usize {
+        self.open_tool_calls.len()
     }
 
     /// The stable block id for a 0-based block index (`{messageId}:{index}`).
@@ -487,6 +501,17 @@ impl Transcript {
         let mut result_index = None;
         let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
+        // Stall suppression bookkeeping (intent-hq/monorepo#3466): every
+        // recorded (non-dropped) update flips the id's membership on its
+        // latest status — open on a non-terminal status, closed on a
+        // terminal one. Reaching here means the update was NOT dropped
+        // (anonymous first sights returned above), so STAB-124 stale ids
+        // can never leak into the set.
+        if completed {
+            self.open_tool_calls.remove(&tc.tool_call_id);
+        } else {
+            self.open_tool_calls.insert(tc.tool_call_id.clone());
+        }
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
@@ -811,8 +836,11 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
 /// the silence live instead of an indefinite spinner. 90s sits well below the
 /// #2669 silent-tail suspicion window and far below the 30-minute prompt idle
 /// timeout, which remains the only terminal mechanism — the stall event never
-/// cancels or fails the turn. Overridable via `INTENTD_STREAM_STALL_MS`
-/// (test seam).
+/// cancels or fails the turn. Tool-call-aware (intent-hq/monorepo#3466):
+/// while ≥1 recorded tool call is still open the stalled advisory is fully
+/// suppressed regardless of silence duration — long tool runs are expected
+/// silence — with the 30-minute prompt idle timeout as the backstop for hung
+/// tools. Overridable via `INTENTD_STREAM_STALL_MS` (test seam).
 pub(crate) fn stream_stall_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_STREAM_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -2376,6 +2404,16 @@ impl Services {
         // detector, so a later second stall in the same turn reports again.
         // Advisory only: turn resolution is untouched (the 30-minute prompt
         // idle timeout stays the terminal backstop).
+        //
+        // Tool-call-aware (intent-hq/monorepo#3466): while ≥1 recorded tool
+        // call is still open (`transcript.open_tool_call_count() > 0`), the
+        // arm emits nothing regardless of silence duration — long tool runs
+        // (builds, test suites) are legitimately silent between `tool_call`
+        // and the terminal `tool_call_update`. Once the last open call
+        // resolves, the standard threshold applies to subsequent silence
+        // (`activity` was touched by the resolving update, so the window
+        // restarts from that point). Hung tools stay covered by the
+        // 30-minute prompt idle timeout.
         let stall_threshold_ms = stream_stall_ms();
         let stall_check = Duration::from_millis((stall_threshold_ms / 6).clamp(10, 15_000));
         let mut stall_emitted = false;
@@ -2399,7 +2437,7 @@ impl Services {
                     },
                     () = tokio::time::sleep(stall_check), if !stall_emitted => {
                         let silent_ms = activity.idle_ms();
-                        if silent_ms >= stall_threshold_ms {
+                        if silent_ms >= stall_threshold_ms && transcript.open_tool_call_count() == 0 {
                             stall_emitted = true;
                             tracing::warn!(
                                 agent = %agent_id,

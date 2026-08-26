@@ -4950,6 +4950,52 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.mcp.listServers` (agent bridge/hook surface only — no wire
+    /// method): the configured external MCP servers projected to a
+    /// non-sensitive allowlist — `{ servers: [{ id, name, transport,
+    /// enabled, state, toolCount? }] }`. `env`/`headers` never appear.
+    /// Gated server-side on `agentFeatures.mcpTools` and
+    /// `mcp.enableUserServers`.
+    fn mcp_list_servers(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_list_servers not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.mcp.listTools` (agent bridge/hook surface only — no wire method):
+    /// forward `tools/list` to one running external MCP server, returning
+    /// the raw MCP result (`{ tools: [...] }`). Same settings gates as
+    /// [`Self::mcp_list_servers`], plus the per-server disabled list.
+    fn mcp_list_tools(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = server_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_list_tools not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.mcp.callTool` (agent bridge/hook surface only — no wire method):
+    /// forward `tools/call` to one running external MCP server, returning
+    /// the raw MCP result. `timeout_ms` is a caller override the hub caps at
+    /// its own bound. Same settings gates as [`Self::mcp_list_tools`].
+    fn mcp_call_tool(
+        &self,
+        server_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (server_id, tool_name, args, timeout_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::mcp_call_tool not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* — commit→push→PR→merge orchestration (PROTOCOL §5.18).
     // ------------------------------------------------------------------------

@@ -3848,7 +3848,8 @@ async fn wss_debug_sample_stacks_returns_report() {
 /// provider registry is compiled-in daemon data. Asserts the documented
 /// result shape: one row per `ACP_PROVIDERS` entry in registry order,
 /// daemon-evaluated `visible` with the raw gating fields passed through
-/// (mock's env-var gate; cortex is un-gated — monorepo#1902), and no default
+/// (env-var gates: mock, plus cortex/droid hidden by default behind
+/// `INTENTD_ENABLE_CORTEX` / `INTENTD_ENABLE_DROID`), and no default
 /// designation or tier metadata anywhere in the payload.
 #[tokio::test]
 async fn wss_providers_catalog_round_trip() {
@@ -3912,14 +3913,26 @@ async fn wss_providers_catalog_round_trip() {
         );
     }
 
-    // Gating: cortex is un-gated (monorepo#1902) — visible, with no gating
-    // fields on the row; ungated providers are visible.
+    // Gating: cortex and droid are hidden by default — visible: false with
+    // the raw requiresEnvVar passed through (the test daemon sets neither
+    // enable var); ungated providers are visible.
     let cortex = &providers[3];
     assert_eq!(cortex["shortName"], "Cortex");
-    assert_eq!(cortex["visible"], Value::Bool(true));
+    assert_eq!(cortex["visible"], Value::Bool(false));
+    assert_eq!(
+        cortex["requiresEnvVar"].as_str(),
+        Some("INTENTD_ENABLE_CORTEX")
+    );
     assert!(
         cortex.get("requiresFeatureCode").is_none(),
         "cortex must carry no requiresFeatureCode: {resp}"
+    );
+    let droid = &providers[7];
+    assert_eq!(droid["shortName"], "Droid");
+    assert_eq!(droid["visible"], Value::Bool(false));
+    assert_eq!(
+        droid["requiresEnvVar"].as_str(),
+        Some("INTENTD_ENABLE_DROID")
     );
     let auggie = &providers[0];
     assert_eq!(auggie["shortName"], "Auggie");
@@ -4681,8 +4694,8 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
     // through the generic cache. Unknown providers degrade to the empty
     // static fallback (`source: "static"` + warning, never an error); cortex
-    // is un-gated (monorepo#1902) and serves an open-gate empty list with no
-    // warning under its own source tag.
+    // is hidden by default (the test daemon sets no INTENTD_ENABLE_CORTEX)
+    // and serves a gated empty list with a warning under its own source tag.
     let srv = start(WsOptions::default()).await;
 
     let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
@@ -4724,12 +4737,15 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .as_array()
         .expect("models")
         .is_empty());
+    let warning = resp["result"]["warning"]
+        .as_str()
+        .expect("closed gate ⇒ warning");
     assert!(
-        resp["result"].get("warning").is_none(),
-        "open gate ⇒ no warning: {resp}"
+        warning.contains("INTENTD_ENABLE_CORTEX"),
+        "gate warning names the env var: {resp}"
     );
-    // Open-gate empty success is fresh, not stale: exactly the documented
-    // keys, with no warning and no stale flag.
+    // Gated empty success is fresh, not stale: exactly the documented keys,
+    // with the gating warning and no stale flag.
     let mut keys: Vec<_> = resp["result"]
         .as_object()
         .expect("result object")
@@ -4737,7 +4753,11 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .cloned()
         .collect();
     keys.sort();
-    assert_eq!(keys, ["models", "providerId", "source"], "{resp}");
+    assert_eq!(
+        keys,
+        ["models", "providerId", "source", "warning"],
+        "{resp}"
+    );
 
     // Legacy path with only `forceRefresh` (no providerId): still routes and
     // keeps the legacy shape. On a fresh daemon there is no last-good cache

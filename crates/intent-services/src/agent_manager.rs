@@ -4258,6 +4258,42 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             }
         }
+        // Provider quirk teardown (intent-hq/monorepo#2763): providers with
+        // unreliable cancellation (auggie) leak the cancelled turn's
+        // subprocesses and keep burning tokens after `session/cancel`, so
+        // keeping their child alive buys nothing. Tear the CHILD down after
+        // the polite cancel above gave the provider its chance to settle —
+        // `kill_child_only` preserves the persisted `acpSessionId`, so the
+        // AGENT stays resumable: the next send respawns the child and resumes
+        // the session via the `start_session` resume ladder. The STAB-124
+        // drain and `mark_idle` below then no-op (handle removed, registry
+        // deregistered), same as the wedged-transport kill; idempotent when
+        // the wedged arm already tore the child down.
+        let session_provider = session.as_ref().and_then(|s| {
+            session_provider_id(
+                s,
+                crate::agent_session::derived_default_provider(&self.services.effective_settings())
+                    .as_deref(),
+            )
+        });
+        let provider_kills_on_interrupt = session_provider
+            .as_deref()
+            .and_then(intent_providers::find_provider)
+            .is_some_and(|p| p.kills_child_on_interrupt)
+            // `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock provider the
+            // quirk (auggie-like) so the E2E suite can exercise this teardown
+            // fence against the real daemon — the quirk lookup is static, so
+            // the seam lives here rather than in the spawn resolution's
+            // MOCK_AGENT_* overrides.
+            || (session_provider.as_deref() == Some("mock")
+                && std::env::var("MOCK_AGENT_KILLS_ON_INTERRUPT").is_ok_and(|v| v == "1"));
+        if provider_kills_on_interrupt {
+            tracing::info!(
+                agent = %agent_id,
+                "provider kills_child_on_interrupt quirk: tearing the child down after session/cancel (monorepo#2763)"
+            );
+            self.kill_child_only(agent_id).await;
+        }
         // STAB-124: the cancelled child echoes `tool_call_update`s for the
         // aborted tool call (title-less, status failed). With the worker gone,
         // they buffer in the handle's notification channel and would be drained
