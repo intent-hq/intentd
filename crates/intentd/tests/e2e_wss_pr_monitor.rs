@@ -156,6 +156,8 @@ struct ForgeState {
     checks: Vec<(String, CheckState, bool)>,
     /// The authoritative review decision served by `merge_requirements`.
     review_decision: ReviewDecision,
+    /// The merge-queue signal served by `merge_requirements`.
+    in_merge_queue: Option<bool>,
 }
 
 impl Default for ForgeState {
@@ -166,6 +168,7 @@ impl Default for ForgeState {
             get_pr_calls: 0,
             checks: vec![("build".into(), CheckState::Pending, true)],
             review_decision: ReviewDecision::ReviewRequired,
+            in_merge_queue: None,
         }
     }
 }
@@ -311,9 +314,9 @@ impl SourceControl for StubForge {
         Ok(Vec::new())
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
-        let (checks, review_decision) = {
+        let (checks, review_decision, in_merge_queue) = {
             let s = self.state.lock().unwrap();
-            (s.checks.clone(), s.review_decision)
+            (s.checks.clone(), s.review_decision, s.in_merge_queue)
         };
         Ok(MergeRequirementSignals {
             merge_state_status: Some("CLEAN".into()),
@@ -337,7 +340,7 @@ impl SourceControl for StubForge {
                     .map(|(name, _, _)| name.clone())
                     .collect(),
             }),
-            is_in_merge_queue: None,
+            is_in_merge_queue: in_merge_queue,
         })
     }
     async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
@@ -737,6 +740,75 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
         .await
         .expect("agent snapshot");
     assert_eq!(snap["prMonitors"], json!(["o/r#42"]), "snapshot: {snap}");
+}
+
+/// `isInMergeQueue` over the wire (PROTOCOL §5.42 additive-field convention):
+/// omitted from `prMonitor.list`'s `lastSnapshot` while the forge reports the
+/// PR not queued (or unknown), present as `true` after the PR enters the
+/// merge queue, and the transition surfaces as a `prMonitor:changed` line.
+#[tokio::test]
+async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    // Not queued at registration: the key is OMITTED (never null/false).
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        row["lastSnapshot"].get("isInMergeQueue").is_none(),
+        "not queued: the key is omitted, not null: {row}"
+    );
+
+    // The PR enters the merge queue; the next poll carries the flag over the
+    // wire and the FE-facing changed event names the transition.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    fx.forge.edit(|s| s.in_merge_queue = Some(true));
+    fx.services.poll_pr_monitors().await;
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        evt["data"]["changes"]
+            .as_array()
+            .expect("changes array")
+            .iter()
+            .any(|c| c == "entered the merge queue"),
+        "the transition line names the queue entry: {evt}"
+    );
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["isInMergeQueue"],
+        json!(true),
+        "queued: the flag is present and true: {row}"
+    );
 }
 
 /// `prMonitor.flush` over the wire delivers the pending debounced wake right

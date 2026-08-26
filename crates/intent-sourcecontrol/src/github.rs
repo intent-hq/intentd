@@ -780,6 +780,25 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
 }
 ";
 
+/// [`MERGE_REQUIREMENTS_QUERY`] minus the `isInMergeQueue` selection, for
+/// hosts whose GraphQL schema predates merge queues (older GHES): GraphQL
+/// rejects the WHOLE query on an unknown field, so the probe retries once
+/// with this selection and the signal degrades to `None` instead of failing
+/// the entire checklist.
+fn merge_requirements_query_without_merge_queue() -> String {
+    MERGE_REQUIREMENTS_QUERY.replace("\n      isInMergeQueue", "")
+}
+
+/// True when a merge-requirements probe error is GraphQL rejecting the
+/// `isInMergeQueue` selection as unknown (the schema-validation wording is
+/// `Field 'isInMergeQueue' doesn't exist on type 'PullRequest'`; octocrab
+/// folds GraphQL errors into their message text, which [`From`] maps onto
+/// [`Error::Api`]). Any other error — auth, rate limit, network — stays a
+/// hard failure.
+fn merge_queue_field_unsupported(err: &Error) -> bool {
+    matches!(err, Error::Api(msg) if msg.contains("isInMergeQueue"))
+}
+
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
 /// commit on the PR is its head).
 const ROLLUP_CONTEXTS_POINTER: &str =
@@ -1294,15 +1313,37 @@ impl SourceControl for GitHubSourceControl {
         repo: &RepoRef,
         number: u64,
     ) -> Result<MergeRequirementSignals> {
+        let variables = json!({
+            "owner": repo.owner,
+            "repo": repo.name,
+            "prNumber": number,
+        });
         let payload = json!({
             "query": MERGE_REQUIREMENTS_QUERY,
-            "variables": {
-                "owner": repo.owner,
-                "repo": repo.name,
-                "prNumber": number,
-            },
+            "variables": variables,
         });
-        let resp: Value = self.client.graphql(&payload).await?;
+        // Schema tolerance: a host whose GraphQL schema lacks
+        // `isInMergeQueue` (older GHES) rejects the WHOLE query, so retry
+        // once without that selection — the signal degrades to `None`
+        // instead of failing the entire checklist.
+        let resp: Value = match self.client.graphql(&payload).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let err = Error::from(err);
+                if !merge_queue_field_unsupported(&err) {
+                    return Err(err);
+                }
+                tracing::debug!(
+                    pr_number = number,
+                    "merge_requirements: host schema lacks isInMergeQueue, retrying without it"
+                );
+                let fallback = json!({
+                    "query": merge_requirements_query_without_merge_queue(),
+                    "variables": variables,
+                });
+                self.client.graphql(&fallback).await?
+            }
+        };
         let data = graphql_data(resp)?;
         let pr = data.pointer("/repository/pullRequest");
         let merge_state_status = pr
@@ -1809,6 +1850,49 @@ mod tests {
 
         let no_data = graphql_data(Value::Null).unwrap_err();
         assert!(matches!(no_data, Error::Api(_)));
+    }
+
+    #[test]
+    fn merge_queue_fallback_query_drops_only_that_selection() {
+        // The degraded query differs from the primary by exactly the
+        // `isInMergeQueue` line — everything else survives verbatim.
+        let fallback = merge_requirements_query_without_merge_queue();
+        assert!(!fallback.contains("isInMergeQueue"));
+        assert!(MERGE_REQUIREMENTS_QUERY.contains("isInMergeQueue"));
+        for kept in [
+            "mergeStateStatus",
+            "reviewDecision",
+            "baseRefName",
+            "statusCheckRollup",
+        ] {
+            assert!(fallback.contains(kept), "fallback keeps {kept}");
+        }
+        assert_eq!(
+            fallback.lines().count(),
+            MERGE_REQUIREMENTS_QUERY.lines().count() - 1,
+            "exactly one line removed"
+        );
+    }
+
+    #[test]
+    fn merge_queue_field_unsupported_matches_only_the_schema_rejection() {
+        // The GraphQL schema-validation wording on a host that predates
+        // merge queues names the unknown field; octocrab folds GraphQL
+        // errors into `Error::Api` message text.
+        let schema = Error::Api(
+            "GraphQL Error: Field 'isInMergeQueue' doesn't exist on type 'PullRequest'".into(),
+        );
+        assert!(merge_queue_field_unsupported(&schema));
+
+        // Any other failure — auth, rate limit, unrelated API error — stays
+        // a hard failure rather than triggering the degraded retry.
+        for hard in [
+            Error::Api("500: something broke".into()),
+            Error::Auth("Bad credentials".into()),
+            Error::RateLimited("API rate limit exceeded".into()),
+        ] {
+            assert!(!merge_queue_field_unsupported(&hard), "{hard:?}");
+        }
     }
 
     #[test]
