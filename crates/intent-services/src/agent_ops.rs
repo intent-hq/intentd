@@ -2746,7 +2746,8 @@ impl Services {
     /// the continuation cursor(s) at the first excluded row, so existing
     /// token loops resume seamlessly with more round-trips. `totalMessages`
     /// / `truncated` semantics are unchanged (transcript-wide, not
-    /// page-length). Full (absent-projection) reads are never budgeted.
+    /// page-length). Slim is the wire default since v8.0; an unbudgeted full
+    /// read (`projection: None`) survives only as an internal test seam.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn agent_get_conversation_op(
         &self,

@@ -169,7 +169,8 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         .await
         .map_err(map_err)?;
 
-    // Fetch full conversation (use agent.getConversation which returns { messages, ... })
+    // Fetch the conversation under the slim projection (§5.5): bounded
+    // tool/image block bodies, like every other consumer since v8.0.
     let conversation_result = api
         .agent_get_conversation(
             agent_id.clone(),
@@ -178,7 +179,7 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
             None,
             None,
             None,
-            None,
+            Some(intent_core::ConversationProjection::Slim),
         )
         .await
         .map_err(map_err)?;

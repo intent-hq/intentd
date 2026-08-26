@@ -268,12 +268,13 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) if s == "incremental" => DeltaEncoding::Incremental,
         Some(_) => return Err("deltaEncoding must be \"full\" or \"incremental\"".to_string()),
     };
-    // `projection` is optional: absent / `null` serve full fidelity, `"slim"`
-    // bounds tool/image block bodies (§5.5); any other value is `-32602` (a
-    // silently ignored typo would hand the client the full-size frames it
-    // opted out of).
+    // `projection` is optional: absent / `null` and the explicit `"slim"`
+    // all select the slim projection — slim is the wire default since v8.0,
+    // so no subscription class can receive unbudgeted tool/image bodies
+    // (§5.5); any other value is `-32602` (a silently ignored typo could
+    // otherwise select a projection the client did not intend).
     let projection = match params.get("projection") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => Some(ConversationProjection::Slim),
         Some(Value::String(s)) if s == "slim" => Some(ConversationProjection::Slim),
         Some(_) => return Err("projection must be \"slim\"".to_string()),
     };

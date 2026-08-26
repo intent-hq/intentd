@@ -1015,6 +1015,9 @@ async fn read_conversation(
     let _ = require_active_target(api, ws, &agent_id).await?;
     let last_n = args.get("lastN").and_then(Value::as_i64);
     let page_token = opt_str(args, "pageToken");
+    // Slim projection (§5.5): agents get bounded tool/image bodies like every
+    // other consumer since v8.0; full blocks are read on demand via
+    // `agent.getMessageBlock`.
     let v = api
         .agent_get_conversation(
             agent_id,
@@ -1023,7 +1026,7 @@ async fn read_conversation(
             page_token,
             None,
             None,
-            None,
+            Some(intent_core::ConversationProjection::Slim),
         )
         .await
         .map_err(map_err)?;
