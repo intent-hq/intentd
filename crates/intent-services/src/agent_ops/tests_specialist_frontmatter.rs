@@ -878,6 +878,94 @@ async fn injection_frozen_after_specialist_file_edit() {
     assert_eq!(inj.role_reminder.as_deref(), Some("Stay frozen"));
 }
 
+/// Specialist alias canonicalization (PROTOCOL §5.11): creating an agent
+/// with an alias persists the CANONICAL specialist id, and the specialist's
+/// resolution (display name, prompt snapshot) applies as if the canonical id
+/// had been passed. The bundled `spec-writer` carries `aliases:
+/// ["coordinator"]`, so this exercises the embedded floor end to end.
+#[tokio::test]
+async fn alias_create_persists_canonical_specialist_id() {
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+
+    let extra = intent_core::AgentCreateExtra {
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            None, // no name: derive from the specialist display name
+            None,
+            Some("coordinator".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    // The canonical id is persisted and surfaced, never the alias.
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"].as_str(),
+        Some("spec-writer")
+    );
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
+    // Downstream resolution ran against the canonical specialist: the
+    // derived display name and frozen prompt snapshot are spec-writer's.
+    assert_eq!(session.name, "Coordinator");
+    let meta = session.metadata.expect("metadata");
+    assert_eq!(meta["specialistName"].as_str(), Some("Coordinator"));
+
+    // A directly-known canonical id is untouched.
+    let extra = intent_core::AgentCreateExtra {
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Direct".to_string()),
+            None,
+            Some("spec-writer".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"].as_str(),
+        Some("spec-writer")
+    );
+
+    // An unknown specialist id passes through unchanged (lenient create,
+    // monorepo#3497 tracks tightening).
+    let extra = intent_core::AgentCreateExtra {
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Unknown".to_string()),
+            None,
+            Some("no-such-specialist".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    assert_eq!(
+        created["agent"]["metadata"]["specialist"].as_str(),
+        Some("no-such-specialist")
+    );
+}
+
 /// Companion pin: a pre-change-style session (no frozen snapshot keys in its
 /// metadata) resolves live and DOES pick up the file edit — legacy behavior
 /// unchanged.

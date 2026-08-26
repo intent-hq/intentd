@@ -342,13 +342,14 @@ const INHERITED_CONFIG_KEYS: &[&str] = &[
 /// explicit-clear empty string.
 const ROLE_VALUES: &[&str] = &["orchestrator", "internal", ""];
 
-/// The picker-metadata frontmatter keys (PROTOCOL §5.11) — the only
+/// The picker/routing-metadata frontmatter keys (PROTOCOL §5.11) — the only
 /// frontmatter allowed to diverge between the v1 and v1.1 bundled specialist
-/// copies. Consumed only by the cross-version goldens (`v1_1_goldens`,
-/// `harness::tests`), which compare frontmatter modulo this set — hence the
-/// allow: the lib build has no reader.
+/// copies (none of them reach assembled prompt bytes, so the v1 doctrine
+/// stays frozen). Consumed only by the cross-version goldens
+/// (`v1_1_goldens`, `harness::tests`), which compare frontmatter modulo this
+/// set — hence the allow: the lib build has no reader.
 #[allow(dead_code)]
-pub(crate) const PICKER_METADATA_KEYS: &[&str] = &["role", "icon", TEAM_AGENTS_KEY];
+pub(crate) const PICKER_METADATA_KEYS: &[&str] = &["role", "icon", TEAM_AGENTS_KEY, ALIASES_KEY];
 
 /// Strictly validate a wire `role` value (`specialist.create`/`edit` specs):
 /// when present it must be a string in [`ROLE_VALUES`] (`""` is the
@@ -541,6 +542,52 @@ fn parse_team_agents_frontmatter(raw: &str) -> Option<Vec<Value>> {
     Some(normalized)
 }
 
+/// Frontmatter/wire key for a specialist's alternate ids (PROTOCOL §5.11):
+/// spawn/delegation callers may address the specialist by any listed alias,
+/// and resolution maps the alias to this canonical definition — the CANONICAL
+/// id is what gets persisted on created sessions (`metadata.specialist`), so
+/// downstream consumers keying on the id never see an alias. Encoded in
+/// frontmatter as a **single-line JSON-array scalar** (e.g.
+/// `aliases: ["coordinator"]`) so it fits the line-based parser and
+/// round-trips losslessly. Resolution follows the same inherit-on-omit fold
+/// as [`TEAM_AGENTS_KEY`]: an omitted key inherits the lower tiers' effective
+/// list, an explicit `[]` clears it, and a non-empty list overrides it
+/// wholesale.
+///
+/// Collision rules (deterministic):
+/// - A canonical specialist id always wins over any alias — alias lookup only
+///   runs after direct resolution misses, so an alias shadowing a real id is
+///   simply never consulted.
+/// - When multiple specialists claim the same alias, the one with the
+///   lexicographically smallest canonical id wins (ids are scanned in
+///   ascending order).
+const ALIASES_KEY: &str = "aliases";
+
+/// Strictly validate a wire `aliases` value (`specialist.create`/`edit`
+/// specs): must be a JSON array of non-empty (non-whitespace) strings.
+/// Returns the entries in input order (`None` when the key is absent — the
+/// inherit-on-omit case); any invalid shape → `-32602`.
+fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
+    let Some(value) = value else { return Ok(None) };
+    let Some(arr) = value.as_array() else {
+        return Err(Error::InvalidParams(
+            "aliases must be an array of specialist-id strings".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() => out.push(json!(s)),
+            _ => {
+                return Err(Error::InvalidParams(
+                    "aliases entries must be non-empty strings".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 /// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
 /// `model.workspaceOverrides` setting (PROTOCOL §5.11/§5.12): old files and
 /// old-client `specialist.create`/`edit` specs may still carry them, but they
@@ -656,14 +703,16 @@ fn build_def_inheriting(
             Some(_) | None => {}
         }
     }
-    // `modelOptions` / `teamAgents` (PROTOCOL §5.11): same inherit-on-omit
-    // fold as the config scalars — an omitted key inherits the lower tiers'
-    // effective list, an explicit `[]` clears it, and a non-empty list
-    // overrides it wholesale. Unparseable frontmatter is tolerated like an
-    // omitted key (files are never rejected on read).
-    let json_array_keys: [(&str, FrontmatterListParser); 2] = [
+    // `modelOptions` / `teamAgents` / `aliases` (PROTOCOL §5.11): same
+    // inherit-on-omit fold as the config scalars — an omitted key inherits
+    // the lower tiers' effective list, an explicit `[]` clears it, and a
+    // non-empty list overrides it wholesale. Unparseable frontmatter is
+    // tolerated like an omitted key (files are never rejected on read).
+    // `aliases` reuses the `teamAgents` lenient string-array parser.
+    let json_array_keys: [(&str, FrontmatterListParser); 3] = [
         (MODEL_OPTIONS_KEY, parse_model_options_frontmatter),
         (TEAM_AGENTS_KEY, parse_team_agents_frontmatter),
+        (ALIASES_KEY, parse_team_agents_frontmatter),
     ];
     for (key, parse) in json_array_keys {
         match fm.get(key).and_then(Value::as_str).and_then(parse) {
@@ -713,9 +762,9 @@ fn build_def_inheriting(
 /// explicit empty string writes `key: ""` — the explicit-clear that stops
 /// inheritance — while an absent key writes nothing (inherits); an empty
 /// `roleReminder` is skipped like an absent one. Supplied
-/// [`MODEL_OPTIONS_KEY`] / [`TEAM_AGENTS_KEY`] lists are written as
-/// single-line JSON-array scalars (an explicit `[]` is the clear; an absent
-/// key writes nothing). The body is
+/// [`MODEL_OPTIONS_KEY`] / [`TEAM_AGENTS_KEY`] / [`ALIASES_KEY`] lists are
+/// written as single-line JSON-array scalars (an explicit `[]` is the clear;
+/// an absent key writes nothing). The body is
 /// taken from `prompt`, falling back to the `behaviorPrompt` alias (mirroring
 /// `SpecialistProposalPayload`). Only documented fields are written so
 /// parse→write→parse round-trips losslessly.
@@ -746,6 +795,9 @@ fn render_file(id: &str, spec: &Value) -> String {
     }
     if let Ok(Some(agents)) = validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY)) {
         fm.push(format!("{TEAM_AGENTS_KEY}: {}", Value::Array(agents)));
+    }
+    if let Ok(Some(aliases)) = validate_aliases_spec(spec.get(ALIASES_KEY)) {
+        fm.push(format!("{ALIASES_KEY}: {}", Value::Array(aliases)));
     }
     if let Some(hidden) = hidden_state(spec.get("hidden")) {
         fm.push(format!("hidden: {hidden}"));
@@ -924,7 +976,22 @@ impl SpecialistsService {
         Some(build_def_inheriting(id, &content, source, &path, inherited))
     }
 
-    /// Resolve a single id through the 3-tier order project > user > bundled.
+    /// Resolve a single id through the 3-tier order project > user > bundled,
+    /// falling back to alias lookup ([`ALIASES_KEY`]) when no specialist
+    /// carries the id directly. A canonical id therefore always wins over an
+    /// alias with the same spelling — the alias scan only runs after direct
+    /// resolution misses. The returned def is the canonical specialist's
+    /// (its `id` field carries the CANONICAL id, never the alias).
+    fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
+        if let Some(def) = self.resolve_direct(id, workspace_path) {
+            return Some(def);
+        }
+        let canonical = self.alias_target(id, workspace_path)?;
+        self.resolve_direct(&canonical, workspace_path)
+    }
+
+    /// Resolve a single id through the 3-tier order project > user > bundled
+    /// — direct lookup only, no alias fallback.
     /// Within the bundled tier an on-disk file wins over the embedded copy;
     /// the compile-time embedded set (`self.embedded`, the latest bundle
     /// unless a session pinned one via [`Self::with_embedded`]) is the
@@ -936,7 +1003,7 @@ impl SpecialistsService {
     /// (PROTOCOL §5.11).
     /// SECURITY: validates the id before file access to prevent path traversal
     /// (review thread `PRRT_kwDOS9Wxuc6SIlcV`).
-    fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
+    fn resolve_direct(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
         // Validate id before passing to load_from_dir to prevent path traversal
         // attacks on ALL frontmatter lookups (resolve_agent_type, resolve_model,
         // resolve_role_reminder, resolve_prompt_injection).
@@ -955,6 +1022,41 @@ impl SpecialistsService {
             }
         }
         resolved
+    }
+
+    /// Map an alias to the canonical id of the specialist claiming it via
+    /// [`ALIASES_KEY`], or `None` when no resolved specialist does. Scans the
+    /// full resolved catalog ([`Self::collect_catalog`]) in ascending
+    /// canonical-id order, so when multiple specialists claim the same alias
+    /// the lexicographically smallest canonical id wins deterministically.
+    /// Only runs after direct resolution misses (see [`Self::resolve`]), so
+    /// an alias can never shadow a canonical id.
+    fn alias_target(&self, alias: &str, workspace_path: Option<&Path>) -> Option<String> {
+        validate_id(alias).ok()?;
+        let catalog = self.collect_catalog(workspace_path);
+        for (canonical, def) in catalog {
+            let claims = def
+                .get(ALIASES_KEY)
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(alias)));
+            if claims {
+                return Some(canonical);
+            }
+        }
+        None
+    }
+
+    /// Map an id-or-alias to its canonical specialist id: a directly-known
+    /// id returns itself; an alias returns the canonical id of the specialist
+    /// claiming it ([`Self::alias_target`]); an unknown id returns `None`.
+    /// Spawn/delegation seams call this before persisting a session's
+    /// `specialist` so `metadata.specialist` always carries the canonical id
+    /// (e.g. spawning with `"coordinator"` persists `"spec-writer"`).
+    pub(crate) fn canonical_id(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        if self.resolve_direct(id, workspace_path).is_some() {
+            return Some(id.to_string());
+        }
+        self.alias_target(id, workspace_path)
     }
 
     /// The def inherited from the tiers **below** `scope` — the same fold
@@ -1123,13 +1225,16 @@ impl SpecialistsService {
         }
     }
 
-    /// `specialist.list` → `{ specialists: SpecialistDef[] }` resolved in tier
-    /// order (embedded < bundled dir < user < project), higher tiers overriding
-    /// lower ones for the same id while `hidden` and the config scalars
-    /// inherit across tiers (PROTOCOL §5.11). `workspace_path` adds the
-    /// project tier.
-    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
-    pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
+    /// The full resolved catalog in tier order (embedded < bundled dir <
+    /// user < project), higher tiers overriding lower ones for the same id
+    /// while `hidden` and the config scalars inherit across tiers (PROTOCOL
+    /// §5.11). Keyed by id (a `BTreeMap`, so iteration is ascending-id — the
+    /// deterministic order the alias-collision rule relies on). Shared by
+    /// [`Self::list`] and [`Self::alias_target`].
+    fn collect_catalog(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> std::collections::BTreeMap<String, Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
             acc.insert(
@@ -1146,6 +1251,15 @@ impl SpecialistsService {
         if let Some(wp) = workspace_path {
             Self::collect_dir(&project_dir(wp), "project", &mut acc);
         }
+        acc
+    }
+
+    /// `specialist.list` → `{ specialists: SpecialistDef[] }`, the resolved
+    /// catalog ([`Self::collect_catalog`]); `workspace_path` adds the project
+    /// tier.
+    #[allow(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
+    pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
+        let mut acc = self.collect_catalog(workspace_path);
         // Ralph remains in the pinned v1 doctrine for existing sessions, but
         // is retired from new-session catalogs (including Settings).
         acc.remove("ralph");
@@ -1275,6 +1389,7 @@ impl SpecialistsService {
         }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
+        validate_aliases_spec(spec.get(ALIASES_KEY))?;
         validate_role_spec(spec.get("role"))?;
         validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
@@ -1312,6 +1427,7 @@ impl SpecialistsService {
         }
         validate_model_options_spec(spec.get(MODEL_OPTIONS_KEY))?;
         validate_team_agents_spec(spec.get(TEAM_AGENTS_KEY))?;
+        validate_aliases_spec(spec.get(ALIASES_KEY))?;
         validate_role_spec(spec.get("role"))?;
         validate_icon_spec(spec.get("icon"))?;
         let dir = self.writable_dir(scope, workspace_path)?;
@@ -1610,6 +1726,109 @@ mod tests {
         );
         let def = svc.resolve("implementor", None).expect("resolves");
         assert_eq!(def["name"], "File Implementor");
+    }
+
+    /// Alias resolution (PROTOCOL §5.11): an `aliases` entry resolves to the
+    /// claiming specialist's def — the def's `id` carries the CANONICAL id,
+    /// never the alias — and `canonical_id` maps id-or-alias accordingly.
+    #[test]
+    fn aliases_resolve_to_the_canonical_specialist() {
+        let dir = TempSpecialistsDir::new();
+        dir.write(
+            "spec-writer",
+            "---\nname: \"Coordinator\"\ndescription: \"d\"\naliases: [\"coordinator\"]\n---\n\ncoordinator body",
+        );
+        let svc = service_over(&dir);
+        // Direct id still resolves.
+        assert_eq!(
+            svc.resolve("spec-writer", None).unwrap()["id"],
+            "spec-writer"
+        );
+        // Alias resolves to the canonical def (id field is canonical).
+        let via_alias = svc.resolve("coordinator", None).expect("alias resolves");
+        assert_eq!(via_alias["id"], "spec-writer");
+        assert_eq!(via_alias["behaviorPrompt"], "coordinator body");
+        assert_eq!(via_alias["aliases"], json!(["coordinator"]));
+        // canonical_id: direct id → itself, alias → canonical, unknown → None.
+        assert_eq!(
+            svc.canonical_id("spec-writer", None).as_deref(),
+            Some("spec-writer")
+        );
+        assert_eq!(
+            svc.canonical_id("coordinator", None).as_deref(),
+            Some("spec-writer")
+        );
+        assert_eq!(svc.canonical_id("nope", None), None);
+        // `specialist.get` serves the alias as the canonical resolved view.
+        let got = svc.get("coordinator", None).unwrap();
+        assert_eq!(got["specialist"]["id"], "spec-writer");
+    }
+
+    /// A canonical id always beats an alias with the same spelling, and
+    /// duplicate alias claims resolve to the lexicographically smallest
+    /// canonical id.
+    #[test]
+    fn alias_collisions_are_deterministic() {
+        let dir = TempSpecialistsDir::new();
+        // `verifier` exists directly AND is claimed as an alias — the direct
+        // definition wins.
+        dir.write(
+            "verifier",
+            "---\nname: \"Verifier\"\ndescription: \"d\"\n---\n\nverifier body",
+        );
+        dir.write(
+            "grabber",
+            "---\nname: \"Grabber\"\ndescription: \"d\"\naliases: [\"verifier\",\"helper\"]\n---\n\ngrabber body",
+        );
+        // Two specialists claim `helper`; `aaa` < `grabber` wins.
+        dir.write(
+            "aaa",
+            "---\nname: \"Aaa\"\ndescription: \"d\"\naliases: [\"helper\"]\n---\n\naaa body",
+        );
+        let svc = service_over(&dir);
+        assert_eq!(svc.resolve("verifier", None).unwrap()["id"], "verifier");
+        assert_eq!(svc.canonical_id("helper", None).as_deref(), Some("aaa"));
+    }
+
+    /// The bundled v1.1 spec-writer carries the `coordinator` alias, so the
+    /// embedded floor alone resolves `coordinator` → `spec-writer`.
+    #[test]
+    fn bundled_coordinator_alias_resolves_to_spec_writer() {
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty);
+        assert_eq!(
+            svc.canonical_id("coordinator", None).as_deref(),
+            Some("spec-writer")
+        );
+        let def = svc.resolve("coordinator", None).expect("alias resolves");
+        assert_eq!(def["id"], "spec-writer");
+        assert_eq!(def["name"], "Coordinator");
+    }
+
+    /// `render_file` writes a supplied `aliases` list as a single-line JSON
+    /// array that round-trips through `build_def`, and rejects bad shapes on
+    /// the write path (`validate_aliases_spec`).
+    #[test]
+    fn render_file_round_trips_aliases() {
+        let spec = json!({
+            "name": "Coordinator",
+            "description": "d",
+            "aliases": ["coordinator"],
+            "prompt": "body"
+        });
+        let rendered = render_file("spec-writer", &spec);
+        assert!(rendered.contains("aliases: [\"coordinator\"]"));
+        let def = build_def("spec-writer", &rendered, "user", Path::new("/tmp/s.md"));
+        assert_eq!(def["aliases"], json!(["coordinator"]));
+        // Invalid shapes are -32602 on create/edit.
+        assert!(validate_aliases_spec(Some(&json!("coordinator"))).is_err());
+        assert!(validate_aliases_spec(Some(&json!([""]))).is_err());
+        assert!(validate_aliases_spec(Some(&json!([42]))).is_err());
+        assert!(matches!(validate_aliases_spec(None), Ok(None)));
+        assert!(matches!(
+            validate_aliases_spec(Some(&json!([]))),
+            Ok(Some(v)) if v.is_empty()
+        ));
     }
 
     /// The base-tier replacement ([`REPLACEMENT_DIR_ENV`]) excludes the

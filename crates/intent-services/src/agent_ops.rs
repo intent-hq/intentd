@@ -2954,6 +2954,34 @@ impl Services {
                 )));
             }
         }
+        // Specialist alias canonicalization (PROTOCOL §5.11): a `specialist`
+        // naming an alias (e.g. `"coordinator"`) is rewritten to the claiming
+        // specialist's CANONICAL id (`"spec-writer"`) before any downstream
+        // rung runs, so display-name/model/effort resolution, the prompt
+        // snapshot, and the persisted `session.specialist` (surfaced as
+        // `metadata.specialist`) all see the canonical id. A directly-known
+        // id passes through unchanged, and an unknown id is left as-is —
+        // preserving the existing lenient behavior (unknown specialist never
+        // fails the create; monorepo#3497 tracks tightening that everywhere).
+        // SECURITY: the project tier resolves against the stored workspace
+        // record's path, never a client-supplied one (same rationale as the
+        // model resolution below).
+        let specialist = match specialist {
+            Some(spec_id) => {
+                let wp = self
+                    .store
+                    .get_workspace(&workspace_id)
+                    .await
+                    .ok()
+                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                Some(
+                    self.specialists_service()
+                        .canonical_id(&spec_id, wp.as_deref())
+                        .unwrap_or(spec_id),
+                )
+            }
+            None => None,
+        };
         let now = now_iso();
         // Derive an omitted name from the specialist's resolved display name
         // (frontmatter `name`, 3-tier project > user > bundled — the same

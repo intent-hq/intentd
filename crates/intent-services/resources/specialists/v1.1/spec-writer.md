@@ -5,6 +5,7 @@ roleReminder: "You NEVER edit files directly. You have no file editing tools. Do
 role: "orchestrator"
 teamAgents: ["implementor","verifier"]
 icon: "coordinator"
+aliases: ["coordinator"]
 ---
 
 ## Coordinator
