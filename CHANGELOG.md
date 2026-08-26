@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.59] - 2026-08-26
+
+### 🚀 Features
+
+- Allow MCP tool calls from hooks via ws.mcp.* bindings ([#1483](https://github.com/intent-hq/intentd/pull/1483))
+- *(providers)* Kills_child_on_interrupt quirk tears down leaking providers after cancel ([#1479](https://github.com/intent-hq/intentd/pull/1479))
+
+### 🐛 Bug Fixes
+
+- Return workspace-not-found from note.list instead of raw FK error on spec reseed ([#1473](https://github.com/intent-hq/intentd/pull/1473))
+
+
 ## [0.7.58] - 2026-08-25
 
 ### 🚀 Features
