@@ -26,6 +26,10 @@
 //!   (mock ACP provider → `workspace_api` tool → service registry → wake
 //!   delivery), plus the non-chief gating error — see the three
 //!   `*_waitfor_*` tests at the bottom of this file.
+//! - `ws.app.agents.send` resolves a target across workspaces, delivers through
+//!   the real MCP bridge, and persists the exact Chief source attribution.
+//! - `ws.app.agents.ask` sends through the same ordinary path and wakes Chief
+//!   exactly once when the target's new turn completes.
 //! - `ws.workspace.archive` / `ws.workspace.unarchive` (#733): the regular-
 //!   workspace roundtrip through the real MCP bridge (tool result shapes,
 //!   `details()` reflecting the status flip, `workspace:updated` deltas over
@@ -2369,4 +2373,375 @@ async fn chief_workspace_archive_gated_over_wss() {
     assert_eq!(chief["status"], json!("Active"), "{chief}");
 
     let _ = wss_rpc_envelope(&mut rpc, 200, "agent.stop", json!({ "agentId": agent_id })).await;
+}
+
+/// Chief cross-workspace send over the real pinned-TLS WSS transport and mock
+/// ACP MCP bridge. The Chief knows only the target agent id. The daemon
+/// resolves its workspace and derives the source from the Chief prompt.
+#[tokio::test]
+async fn chief_agent_send_cross_workspace_over_wss() {
+    let Some(script) = gate("WSS Chief cross-workspace send E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+              const target = listing.threads.find((t) => t.agentName === 'Chief Send Target');\n\
+              return await ws.app.agents.send(target.agentId, 'Please report your status');";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "CHIEF_SEND",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "Chief cross-workspace send e2e" },
+            },
+            "response": "message sent",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    let (target_ws, target_id) =
+        seed_target(&mut rpc, 2, "Chief Send Workspace", "Chief Send Target").await;
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Sender",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let chief_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("chief id")
+        .to_string();
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "content": "Please CHIEF_SEND a status request to the target",
+        }),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], json!("2.0"));
+    assert_eq!(resp["id"], json!(5));
+    assert!(resp.get("error").is_none(), "Chief prompt failed: {resp}");
+    assert_eq!(resp["result"]["success"], json!(true));
+    let source_message_id = resp["result"]["messageId"]
+        .as_str()
+        .expect("source message id")
+        .to_string();
+    let source_url =
+        format!("intent://local/{CHIEF_WORKSPACE_ID}/agent/{chief_id}/message/{source_message_id}");
+
+    let send_result = poll_conversation(&mut rpc, 300, &chief_id, "Chief send tool result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v.get("sourceUrl").is_some())
+    })
+    .await;
+    assert_eq!(send_result["ok"], json!(true));
+    assert_eq!(send_result["success"], json!(true));
+    assert_eq!(send_result["queued"], json!(false));
+    assert_eq!(send_result["agentId"], json!(target_id));
+    assert_eq!(send_result["agentName"], json!("Chief Send Target"));
+    assert_eq!(send_result["workspaceId"], json!(target_ws));
+    assert_eq!(send_result["sourceMessageId"], json!(source_message_id));
+    assert_eq!(send_result["sourceUrl"], json!(source_url));
+
+    let delivered = poll_conversation(
+        &mut rpc,
+        500,
+        &target_id,
+        "Chief-attributed target row",
+        |m| {
+            m.as_array()?
+                .iter()
+                .find(|row| row["metadata"]["type"] == json!("chief_message"))
+                .cloned()
+        },
+    )
+    .await;
+    assert_eq!(delivered["role"], json!("user"));
+    assert_eq!(
+        delivered["contentBlocks"][0]["text"],
+        json!("Please report your status")
+    );
+    assert_eq!(
+        delivered["metadata"],
+        json!({
+            "type": "chief_message",
+            "fromAgentId": chief_id,
+            "fromAgentName": "Chief of Staff",
+            "fromWorkspaceId": CHIEF_WORKSPACE_ID,
+            "sourceMessageId": source_message_id,
+            "sourceUrl": source_url,
+        })
+    );
+
+    let _ = wss_rpc_envelope(&mut rpc, 700, "agent.stop", json!({ "agentId": chief_id })).await;
+    let _ = wss_rpc_envelope(&mut rpc, 701, "agent.stop", json!({ "agentId": target_id })).await;
+}
+
+/// Completion-only Chief ask over the real pinned-TLS WSS transport and mock
+/// ACP MCP bridge. The target first completes one turn, then the ask wakes that
+/// `RuntimeIdle` target and delivers exactly one completion wake for the new turn.
+#[tokio::test]
+async fn chief_agent_ask_completed_target_wakes_once_over_wss() {
+    let Some(script) = gate("WSS Chief completion-only ask E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+              const target = listing.threads.find((t) => t.agentName === 'Chief Ask Target');\n\
+              return await ws.app.agents.ask(target.agentId, 'Complete the requested work');";
+    let relay_js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+                    const target = listing.threads.find((t) => t.agentName === 'Chief Ask Target');\n\
+                    return { relayTurn: true, targetAgentId: target.agentId };";
+    let behavior = json!({
+        "response": "target turn complete",
+        "rules": [
+            {
+                "ifPromptContains": "hold busy",
+                "delayMs": 8000,
+                "response": "old busy turn completed",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS] Child agent Chief Ask Target",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": relay_js, "summary": "Mark Chief completion relay turn" },
+                },
+                "response": "E2E_FINAL_USER_VISIBLE_RELAY: Chief Ask Target completed",
+                "emitToolBlocks": true,
+            },
+            {
+                "ifPromptContains": "CHIEF_ASK",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": js, "summary": "Chief completion-only ask e2e" },
+                },
+                "response": "ask registered",
+                "emitToolBlocks": true,
+            }
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    disable_toon_output(&socket).await;
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("port fits");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    let (target_ws, target_id) =
+        seed_target(&mut rpc, 2, "Chief Ask Workspace", "Chief Ask Target").await;
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Asker",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let chief_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("chief id")
+        .to_string();
+
+    let first = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": target_ws,
+            "agentId": target_id,
+            "content": "complete the first turn",
+        }),
+    )
+    .await;
+    assert_eq!(first["result"]["success"], json!(true));
+    poll_conversation(&mut rpc, 100, &target_id, "target first completion", |m| {
+        let text = serde_json::to_string(m).ok()?;
+        text.contains("target turn complete").then_some(())
+    })
+    .await;
+    for request_id in 150..250 {
+        let active = wss_rpc_envelope(&mut rpc, request_id, "agent.listActive", json!({})).await;
+        let busy = active["result"]["streams"]
+            .as_array()
+            .is_some_and(|streams| streams.iter().any(|row| row["agentId"] == json!(target_id)));
+        if !busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let busy_send = wss_rpc_envelope(
+        &mut rpc,
+        250,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": target_ws,
+            "agentId": target_id,
+            "content": "hold busy before the Chief ask",
+        }),
+    )
+    .await;
+    assert_eq!(busy_send["result"]["success"], json!(true));
+    let mut observed_busy = false;
+    for request_id in 251..351 {
+        let active = wss_rpc_envelope(&mut rpc, request_id, "agent.listActive", json!({})).await;
+        observed_busy = active["result"]["streams"]
+            .as_array()
+            .is_some_and(|streams| streams.iter().any(|row| row["agentId"] == json!(target_id)));
+        if observed_busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        observed_busy,
+        "target must be busy before the interrupt ask"
+    );
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "content": "Please CHIEF_ASK the completed target",
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+
+    let ask_result = poll_conversation(&mut rpc, 300, &chief_id, "Chief ask tool result", |m| {
+        tool_result_jsons(m).into_iter().rev().find(|v| {
+            v["watch"]["results"][0]["subscriptionId"].is_string()
+                && v["send"]["agentId"] == json!(target_id)
+        })
+    })
+    .await;
+    assert_eq!(ask_result["ok"], json!(true));
+    assert!(ask_result["watch"]["results"][0]["subscriptionId"].is_string());
+    assert_eq!(ask_result["send"]["workspaceId"], json!(target_ws));
+
+    let wake = format!("[WORKSPACE EVENTS] Child agent Chief Ask Target ({target_id}) completed.");
+    let transcript =
+        poll_conversation(&mut rpc, 500, &chief_id, "Chief ask completion wake", |m| {
+            let text = serde_json::to_string(m).ok()?;
+            text.contains(&wake).then_some(text)
+        })
+        .await;
+    assert_eq!(
+        transcript.matches(&wake).count(),
+        1,
+        "one ask must deliver exactly one completion wake"
+    );
+    let relay_turn = poll_conversation(&mut rpc, 600, &chief_id, "Chief relay worker turn", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .find(|value| value["relayTurn"] == json!(true))
+    })
+    .await;
+    assert_eq!(relay_turn["targetAgentId"], json!(target_id));
+
+    let relay_messages = poll_conversation(
+        &mut rpc,
+        800,
+        &chief_id,
+        "Chief final user-visible relay",
+        |m| {
+            let text = serde_json::to_string(m).ok()?;
+            text.contains("E2E_FINAL_USER_VISIBLE_RELAY")
+                .then_some(m.clone())
+        },
+    )
+    .await;
+    assert_eq!(
+        tool_result_jsons(&relay_messages)
+            .iter()
+            .filter(|value| value["relayTurn"] == json!(true))
+            .count(),
+        1,
+        "the completion wake must run exactly one Chief worker turn"
+    );
+    assert_eq!(
+        relay_messages
+            .as_array()
+            .expect("Chief relay messages")
+            .iter()
+            .filter(|message| {
+                message["role"] == json!("assistant")
+                    && serde_json::to_string(message)
+                        .expect("serialize Chief relay message")
+                        .contains("E2E_FINAL_USER_VISIBLE_RELAY")
+            })
+            .count(),
+        1,
+        "the Chief worker turn must emit one final user-visible relay"
+    );
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        700,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
+    )
+    .await;
+    assert_eq!(resp["result"]["subscriptions"], json!([]));
+    let _ = wss_rpc_envelope(&mut rpc, 701, "agent.stop", json!({ "agentId": chief_id })).await;
 }
