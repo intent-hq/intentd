@@ -1841,6 +1841,14 @@ impl Services {
     /// `workspace.subscribe` seq-0 snapshot — serve a fresh `lastActivity` after a daemon
     /// restart (monorepo#1580).
     /// Best-effort: store/emit failures are logged but do not surface to the caller.
+    ///
+    /// Call sites are limited to TURN BOUNDARIES so the workspace ordering does
+    /// not churn on every mid-turn mutation: (a) a status persist that ends a
+    /// turn (transition to a non-active state), (b) a user-origin message
+    /// append (FE `agent.sendMessage` or a user-origin queue-drain delivery),
+    /// and (c) attention raises (`raise_attention` /
+    /// `agent_request_attention_op`). Agent-to-agent sends, wake deliveries,
+    /// agent-op mutations, and token-usage recomputes must NOT schedule.
     pub(crate) fn schedule_last_activity_event(&self, workspace_id: WorkspaceId) {
         // Cancel any pending debounce timer for this workspace and increment generation.
         let gen = if let Ok(mut gen_lock) = self.last_activity_debounce_gen.lock() {
@@ -4168,8 +4176,6 @@ impl Services {
             token_usage_changed_event(workspace_id, &usage),
         )
         .await;
-        // Schedule debounced lastActivity event (§10.1).
-        self.schedule_last_activity_event(workspace_id.clone());
         Ok(true)
     }
 
