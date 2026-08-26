@@ -49,6 +49,12 @@ on:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    # LOCAL CUSTOMIZATION: fork PRs get no CI — external PRs are not accepted
+    # (intent-hq/monorepo#417; close-fork-prs.yml auto-closes them). Skipping
+    # plan cascades over the needs chain to every other job, so a fork PR can
+    # never reach the self-hosted tinybox runner. Tag pushes and same-repo
+    # PRs are unaffected. Re-apply this after any `dist generate`.
+    if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: "tinybox"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -104,7 +110,11 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    # LOCAL CUSTOMIZATION: the leading `needs.plan.result == 'success'` guard
+    # short-circuits the fromJson calls when plan was skipped (fork PR — see
+    # plan's comment), which would otherwise choke on plan's empty outputs.
+    # Re-apply this after any `dist generate`.
+    if: ${{ needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
