@@ -7684,12 +7684,23 @@ impl AgentManager {
                 if let Some((status, dead)) = exited {
                     let (dead_child, dead_conn) =
                         dead.map_or((None, None), |(child, conn)| (child, Some(conn)));
+                    // The direct child is already reaped (`try_wait` above),
+                    // but same-group descendants can survive it: sweep the
+                    // process group via the spawn-time pid. Swept BEFORE the
+                    // settle await below so a descendant holding the stderr
+                    // write end open is killed first — EOF is then
+                    // deterministic and the capture includes its last output,
+                    // instead of the await burning its full bound and the
+                    // WARN underclaiming (monorepo#3570).
+                    if let Some(dead_child) = dead_child {
+                        kill_child_tree(dead_child, child_pid).await;
+                    }
                     // Honest capture hint (monorepo#3570): bounded-await the
-                    // stderr drain's settle (EOF + flush — the child already
-                    // exited, so EOF is normally immediate) and only name the
-                    // capture dir when THIS child's connection captured stderr
-                    // (not stale daily files from an earlier run) and a
-                    // capture file actually exists there.
+                    // stderr drain's settle (EOF + flush — the whole group is
+                    // dead now, so EOF is normally immediate) and only name
+                    // the capture dir when THIS child's connection captured
+                    // stderr (not stale daily files from an earlier run) and
+                    // a capture file actually exists there.
                     let mut hint = None;
                     if let Some(dir) = &stderr_dir {
                         if let Some(conn) = &dead_conn {
@@ -7712,12 +7723,6 @@ impl AgentManager {
                             exit_status = %status,
                             "idle agent child exited unexpectedly; handle reaped"
                         );
-                    }
-                    // The direct child is already reaped (`try_wait` above),
-                    // but same-group descendants can survive it: sweep the
-                    // process group via the spawn-time pid.
-                    if let Some(dead_child) = dead_child {
-                        kill_child_tree(dead_child, child_pid).await;
                     }
                     return true;
                 }

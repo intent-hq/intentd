@@ -329,8 +329,11 @@ fn dispatch(
 /// writer/reader tasks — but NOT the stderr drain task (monorepo#3570): the
 /// drain runs to the child's stderr EOF so the dying words a crashing child
 /// writes right as teardown drops the connection still reach the capture
-/// file. EOF is guaranteed because every teardown path kills the child's
-/// whole process group.
+/// file. Every teardown path kills the child's whole process group, which
+/// normally closes the pipe promptly — but a descendant that re-`setsid`
+/// into its OWN group survives the `killpg` and can hold the write end open,
+/// so the detached drain (and its capture file) may outlive the connection
+/// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
