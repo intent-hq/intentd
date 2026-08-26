@@ -1987,8 +1987,8 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
     .await;
 
     // Child schedules its hook, reports, and idles: the report SETTLES it
-    // despite the active hook (#1945) — the spawner's auto watch retires on
-    // the suppressed idle, leaving the child RuntimeIdle with a persisted
+    // despite the active hook (#1945). The spawner's auto watch then retires
+    // on the terminal idle, leaving the child RuntimeIdle with a persisted
     // report and an active hook.
     let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
     assert!(
@@ -2167,7 +2167,7 @@ async fn wake_rows_serialized(
 /// firing at the child's next genuine completion — is covered by the WATCH5
 /// adoption test above.)
 #[tokio::test]
-async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss() {
+async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     const SPAWN_GO: &str = "WATCH7_SPAWN_GO";
     const CHILD_GO: &str = "WATCH7_CHILD_GO";
     const CHILD_AGAIN: &str = "WATCH7_CHILD_AGAIN";

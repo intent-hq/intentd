@@ -2696,9 +2696,7 @@ async fn report_wake_then_rearm_still_delivers_terminal_completion() {
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // Mid-cycle re-arm: adoption clears report_delivered (fresh interest in
-    // the NEXT completion — monorepo#2532 Gap A), the exact live hole that
-    // let the settlement re-embed the already-delivered report.
+    // Mid-cycle re-arm adopts the terminal-ready watch without duplicating it.
     svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
         .await
         .expect("re-arm");
@@ -2706,7 +2704,7 @@ async fn report_wake_then_rearm_still_delivers_terminal_completion() {
     assert_eq!(watches.len(), 1, "adopted, not duplicated");
     assert!(
         !watches[0].report_delivered,
-        "re-arm reset report_delivered"
+        "adopted watch remains terminal-ready"
     );
 
     // Same-cycle settlement owns a distinct terminal wake.
@@ -2753,8 +2751,8 @@ async fn sender_auto_subscribe_after_report_still_gets_terminal_wake() {
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
 
-    // The parent messages the child mid-cycle: the sender auto-subscribe
-    // reuses the watch and clears report_delivered (monorepo#2532).
+    // The parent messages the child mid-cycle: sender auto-subscribe reuses
+    // the watch, which remained terminal-ready after the progress report.
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child.clone())
         .await
@@ -2762,7 +2760,10 @@ async fn sender_auto_subscribe_after_report_still_gets_terminal_wake() {
     assert_eq!(resp["ok"], json!(true));
     let watches = svc.find_watches_for_child(&child);
     assert_eq!(watches.len(), 1, "reused, not duplicated");
-    assert!(!watches[0].report_delivered, "reuse reset report_delivered");
+    assert!(
+        !watches[0].report_delivered,
+        "reused watch remains terminal-ready"
+    );
 
     // Same-cycle terminal settlement is a distinct wake.
     svc.handle_completion_event(&completion_event(
@@ -11408,10 +11409,8 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
 /// Report-time wake: a delegated caller's `reportToParent` delivers an
 /// immediate parent wake containing the report. The report is persisted on the
 /// child session (`completion_report`) and the TS-shaped result is returned.
-/// The watch is marked as `report_delivered`, so the child's subsequent
-/// `agent:idle` does NOT deliver a second wake (suppressed), which is asserted
-/// by the sibling `report_to_parent_delivers_immediate_wake_then_idle_suppressed`
-/// test.
+/// When a terminal watch exists, the progress wake leaves it armed so a later
+/// `agent:idle` can deliver the distinct completion wake.
 #[tokio::test]
 async fn report_to_parent_delivers_for_delegated_caller() {
     let (_t, svc, ws) = setup().await;
@@ -17279,7 +17278,7 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
     assert_eq!(watches.len(), 1, "adopted, not duplicated");
     assert!(
         !watches[0].report_delivered,
-        "adoption resets report_delivered"
+        "adopted watch remains terminal-ready"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -18035,12 +18034,9 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
     );
 }
 
-/// monorepo#2532 (PR #1250 review): the SUB-1 sender auto-subscribe REUSES a
-/// matching ungrouped watch via `find_and_refresh_ungrouped_watch` — after a
-/// reportToParent wake flipped it to `report_delivered`, sending follow-up
-/// work expresses fresh interest, so the reuse must reset `report_delivered`
-/// (in memory AND persisted) and the child's next genuine idle must wake the
-/// parent instead of silently retiring a dead watch.
+/// The SUB-1 sender auto-subscribe reuses the matching ungrouped watch after a
+/// progress report. The report leaves that watch armed, the reuse does not add
+/// a second durable row, and the child's terminal idle wakes the parent once.
 #[tokio::test]
 async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
     let (_t, svc, ws) = setup().await;
@@ -18058,18 +18054,20 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let baseline = parent_message_count(&svc, &parent).await;
+    let watches = svc.find_watches_for_child(&child);
+    assert_eq!(watches.len(), 1, "delegation armed one watch");
+    let watch_id = watches[0].id.clone();
 
     svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
         .await
         .expect("report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
     let watches = svc.find_watches_for_child(&child);
-    assert_eq!(watches.len(), 1);
-    assert!(watches[0].report_delivered, "report disarmed the watch");
+    assert_eq!(watches.len(), 1, "progress preserves the existing watch");
+    assert_eq!(watches[0].id, watch_id, "progress preserves watch identity");
+    assert!(!watches[0].report_delivered, "progress keeps watch armed");
 
-    // Follow-up work: the sender auto-subscribe reuses the existing watch
-    // and must re-arm it (fresh-interest reset, mirroring the
-    // insert_watch_in_memory adoption fix).
+    // Follow-up work: sender auto-subscribe must reuse the armed watch.
     let resp = svc
         .agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child.clone())
         .await
@@ -18077,9 +18075,10 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
     assert_eq!(resp["ok"], json!(true));
     let watches = svc.find_watches_for_child(&child);
     assert_eq!(watches.len(), 1, "reused, not duplicated");
+    assert_eq!(watches[0].id, watch_id, "sender reused the same watch");
     assert!(
         !watches[0].report_delivered,
-        "reuse resets report_delivered"
+        "sender reuse keeps the watch terminal-ready"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -18088,7 +18087,7 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
             .list_completion_watches()
             .await
             .expect("list persisted watches");
-        if rows.len() == 1 && !rows[0].report_delivered {
+        if rows.len() == 1 && rows[0].id == watch_id && !rows[0].report_delivered {
             break;
         }
         assert!(
@@ -18098,8 +18097,7 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // The child's next genuine idle fires the re-armed watch (pre-fix the
-    // stale report_delivered flag silently retired it without a wake).
+    // The child's terminal idle fires the existing watch exactly once.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
