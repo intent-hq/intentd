@@ -25,7 +25,7 @@ fn sha256_hex(s: &str) -> String {
 }
 
 /// SHA-256 pins of the v1.1-set composition with all-default agent features
-/// (the exact bytes new sessions receive). Counterpart of `v1_goldens`'
+/// (the exact bytes sessions stamped "1.1" receive). Counterpart of `v1_goldens`'
 /// `golden_bundled_doctrine_hashes`, over `instructions::V1_1`.
 #[test]
 fn golden_bundled_doctrine_hashes_v1_1() {
@@ -65,19 +65,17 @@ fn golden_bundled_doctrine_hashes_v1_1() {
     assert_eq!(actual, expected);
 }
 
-/// The v1.1 registry row is the latest: new sessions stamp "1.1" and the
-/// session-less composition resolves the v1.1 doctrine.
+/// The v1.1 registry row remains pinned after a later version becomes current.
 #[test]
-fn v1_1_is_the_latest_entry() {
-    assert_eq!(intent_core::CURRENT_HARNESS_VERSION, "1.1");
-    let latest = crate::harness::latest_entry();
-    assert_eq!(latest.version, "1.1");
+fn v1_1_registry_row_remains_pinned() {
+    let entry = crate::harness::resolve_entry("1.1");
+    assert_eq!(entry.version, "1.1");
     assert!(std::ptr::eq(
-        latest.doctrine.instructions,
+        entry.doctrine.instructions,
         std::ptr::addr_of!(crate::instructions::V1_1)
     ));
     assert_eq!(
-        latest.doctrine.specialists,
+        entry.doctrine.specialists,
         crate::specialists::EMBEDDED_BUNDLED_V1_1
     );
 }

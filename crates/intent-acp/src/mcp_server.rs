@@ -228,7 +228,9 @@ impl WorkspaceMcpServer {
             self.is_chief,
             &self.effective_agent_features(),
             &self.specialist_model_options,
-        );
+            self.is_sub_agent,
+        )
+        .into_owned();
         // Top-level-only rule for peer spawning: sub-agent bridges never
         // advertise `ws.agent.spawnPeer` even with `peerAgents` on (the
         // co-gated `ws.agent.retire` survives — it is self-scoped). The
@@ -238,7 +240,7 @@ impl WorkspaceMcpServer {
         if self.is_sub_agent {
             tools::scrub_spawn_peer_doc(&desc)
         } else {
-            desc.into_owned()
+            desc
         }
     }
 

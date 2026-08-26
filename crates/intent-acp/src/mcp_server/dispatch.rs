@@ -183,7 +183,8 @@ impl WorkspaceMcpServer {
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
-        let bindings_prelude = super::bindings::prelude_for(&effective_features);
+        let bindings_prelude =
+            super::bindings::prelude_for_bridge(&effective_features, self.is_sub_agent);
         let full_code = format!(
             "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
@@ -728,6 +729,10 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
      ws.agent.requestDiscussion when you need user/coordinator input, or report \
      progress with ws.agent.reportToParent";
 
+/// The dispatch-layer denial for a sub-agent's sibling-workspace proposal.
+pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
+    "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
+
 /// The dispatch-layer denial for a sub-agent's `agent.spawnPeer` frame —
 /// spawning independent top-level peers is a top-level-agent capability.
 pub(super) const SUB_AGENT_SPAWN_PEER_DENIED: &str =
@@ -757,6 +762,9 @@ async fn workspace_host_dispatch(
     // a misleading "disabled in settings").
     if is_sub_agent && method.starts_with("app.question.") {
         return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
+    }
+    if is_sub_agent && method == "workspace.proposeSibling" {
+        return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
     }
     // Top-level-only rule for peer spawning: like the question gate, this
     // redirect must win over the feature-gate denial so a sub-agent gets
