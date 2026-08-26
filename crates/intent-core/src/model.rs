@@ -2231,17 +2231,19 @@ pub struct AgentMessage {
     pub created_at: String,
 }
 
-/// The additive `projection` param on conversation reads (PROTOCOL §5.5):
-/// `agent.getConversation` and `chat.subscribe` accept `projection: "slim"`,
-/// which serves bounded `tool_use`/`tool_result`/`image` blocks so large
-/// transcripts never produce multi-MB RPC frames. Oversized `tool_use.input`
+/// The `projection` param on conversation reads (PROTOCOL §5.5):
+/// `agent.getConversation` and `chat.subscribe` serve bounded
+/// `tool_use`/`tool_result`/`image` blocks so large transcripts never
+/// produce multi-MB RPC frames. Slim is the wire default since v8.0 — an
+/// absent / `null` `projection` selects it, `"slim"` is an explicit no-op —
+/// so `None` survives only as an internal plumbing value meaning "no
+/// transform" (test seams and non-wire callers). Oversized `tool_use.input`
 /// / `tool_result.output` bodies are replaced by a
 /// [`SLIM_PROJECTION_BUDGET_BYTES`] preview with additive
 /// `*Truncated`/`*Bytes` flags; oversized `image.data` is replaced by the
 /// thumbnail persisted at message-write time (`dataIsThumbnail: true`), or
-/// omitted for pre-thumbnail rows. Absent param (`None` at every plumbing
-/// layer) keeps responses byte-identical to before — old clients are
-/// unaffected. Serve-time only; stored rows are untouched.
+/// omitted for pre-thumbnail rows. Full block bodies are read on demand via
+/// `agent.getMessageBlock`. Serve-time only; stored rows are untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationProjection {
     /// Bounded tool/image block bodies (previews + additive flags).

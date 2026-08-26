@@ -1250,10 +1250,9 @@ async fn dispatch(
                     "aroundMessageId and aroundIndex are mutually exclusive",
                 ));
             }
-            // Additive `projection` param (§5.5): absent / null keeps the
-            // response byte-identical to before; `"slim"` bounds tool/image
-            // block bodies; any other value is `-32602` (a silently ignored
-            // typo would hand the client full-size frames it opted out of).
+            // `projection` param (§5.5): slim is the wire default since
+            // v8.0 — absent / null and the explicit `"slim"` all serve
+            // bounded tool/image block bodies; any other value is `-32602`.
             let projection = parse_projection(params)?;
             match api
                 .agent_get_conversation(
@@ -4044,13 +4043,15 @@ fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
 }
 
 /// Parse the optional `projection` param on conversation reads (§5.5):
-/// absent / `null` mean full fidelity (`None`), `"slim"` selects the bounded
-/// tool/image projection, anything else is `-32602`.
+/// absent / `null` and the explicit `"slim"` all select the bounded
+/// tool/image projection — slim is the wire default since v8.0, so the
+/// unbudgeted full read is unreachable over the wire (full blocks are
+/// served per-block by `agent.getMessageBlock`); anything else is `-32602`.
 fn parse_projection(
     params: &Map<String, Value>,
 ) -> Result<Option<intent_core::ConversationProjection>, RpcErr> {
     match params.get("projection") {
-        None | Some(Value::Null) => Ok(None),
+        None | Some(Value::Null) => Ok(Some(intent_core::ConversationProjection::Slim)),
         Some(Value::String(s)) if s == "slim" => {
             Ok(Some(intent_core::ConversationProjection::Slim))
         }

@@ -29,8 +29,8 @@
 use intent_core::{cap_json_value, slim_body_size, SLIM_PROJECTION_BUDGET_BYTES};
 use serde_json::{json, Map, Value};
 
-/// Apply the slim conversation projection (PROTOCOL §5.5, opt-in via
-/// `projection: "slim"`) to one served message's content blocks: oversized
+/// Apply the slim conversation projection (PROTOCOL §5.5, the wire default
+/// since v8.0) to one served message's content blocks: oversized
 /// `tool_use.input` / `tool_result.output` bodies are replaced by a
 /// structure-preserving preview bounded by [`SLIM_PROJECTION_BUDGET_BYTES`]
 /// with additive `inputTruncated`/`inputBytes` (resp.

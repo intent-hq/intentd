@@ -9127,12 +9127,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
 }
 
 /// `agent.getConversation` / `chat.subscribe` slim projection over the real
-/// WSS wire (§5.5, §7.1): `projection: "slim"` bounds oversized
-/// `tool_use/tool_result` bodies (additive `inputTruncated`/`outputTruncated`
-/// flags, pairing ids intact) and swaps oversized image data for the
-/// write-time thumbnail (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the
-/// seq-0 snapshot of a slim subscription serves the same bounded blocks;
-/// absent param stays byte-identical full fidelity; a bad value is `-32602`.
+/// WSS wire (§5.5, §7.1): slim bounds oversized `tool_use/tool_result`
+/// bodies (additive `inputTruncated`/`outputTruncated` flags, pairing ids
+/// intact) and swaps oversized image data for the write-time thumbnail
+/// (`dataTruncated`/`dataIsThumbnail`/`dataBytes`); the seq-0 snapshot of a
+/// slim subscription serves the same bounded blocks; an absent param serves
+/// the same slim blocks (the v8.0 wire default); a bad value is `-32602`.
 #[tokio::test]
 async fn wss_conversation_slim_projection_bounds_blocks() {
     use base64::Engine as _;
@@ -9195,20 +9195,6 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
         .await
         .expect("append message");
 
-    // Absent param: byte-identical full fidelity.
-    let full = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
-        ),
-    )
-    .await;
-    assert_eq!(
-        full["result"]["messages"][0]["contentBlocks"], content,
-        "absent projection stays byte-identical"
-    );
-
     // Slim read: bounded bodies, additive flags, pairing intact.
     let slim = wss_call(
         srv.port,
@@ -9253,6 +9239,21 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
     };
     assert_slim_blocks(blocks, "slim read");
 
+    // Absent param: slim is the wire default since v8.0 — the same bounded
+    // blocks are served, so no consumer can pull an unbudgeted transcript.
+    let defaulted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let default_blocks = defaulted["result"]["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("defaulted blocks");
+    assert_slim_blocks(default_blocks, "absent-param read (slim default)");
+
     // chat.subscribe with the slim projection: the seq-0 snapshot serves the
     // same bounded blocks.
     let snap = chat_subscribe_snapshot(
@@ -9268,6 +9269,22 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
         .as_array()
         .expect("snapshot blocks");
     assert_slim_blocks(snap_blocks, "slim snapshot");
+
+    // chat.subscribe with NO projection param: slim is the wire default
+    // since v8.0 on the subscription snapshot too, not just the paged read.
+    let default_snap = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+        8,
+    )
+    .await;
+    let default_snap_blocks = default_snap["messages"][0]["contentBlocks"]
+        .as_array()
+        .expect("defaulted snapshot blocks");
+    assert_slim_blocks(default_snap_blocks, "absent-param snapshot (slim default)");
 
     // A bad projection value is -32602 on both methods.
     let bad = wss_call(
@@ -9298,8 +9315,8 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
 /// ~512KB page budget — every frame stays bounded by budget + one message —
 /// the `nextToken` walk reconstructs the full transcript with no gaps or
 /// duplicates, and the `chat.subscribe` seq-0 snapshot (which reuses the
-/// read) stays under the bound too. The full (absent-projection) read is
-/// unbudgeted.
+/// read) stays under the bound too. Slim is the wire default since v8.0,
+/// so absent-projection reads get the same budget.
 #[tokio::test]
 async fn wss_slim_conversation_pages_are_byte_budgeted() {
     use intent_core::{AgentId, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};

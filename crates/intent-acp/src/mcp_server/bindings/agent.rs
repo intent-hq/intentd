@@ -66,6 +66,8 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
+        getMessageBlock: (agentId, messageId, blockId) =>
+            host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
         reportToParent: (report) =>
             host({ method: 'agent.reportToParent', args: { report } }),
@@ -152,6 +154,7 @@ pub(crate) async fn dispatch(
         "snapshot" => snapshot(api, ws, caller).await,
         "wakeOrCreate" => wake_or_create(api, ws, caller, args).await,
         "readConversation" => read_conversation(api, ws, args).await,
+        "getMessageBlock" => get_message_block(api, ws, args).await,
         "summary" => summary(api, ws, args).await,
         "reportToParent" => report_to_parent(api, ws, caller, args).await,
         "requestDiscussion" => request_attention(api, ws, caller, "discussion", args).await,
@@ -1015,6 +1018,9 @@ async fn read_conversation(
     let _ = require_active_target(api, ws, &agent_id).await?;
     let last_n = args.get("lastN").and_then(Value::as_i64);
     let page_token = opt_str(args, "pageToken");
+    // Slim projection (§5.5): agents get bounded tool/image bodies like every
+    // other consumer since v8.0; full blocks are read on demand via
+    // `agent.getMessageBlock`.
     let v = api
         .agent_get_conversation(
             agent_id,
@@ -1023,11 +1029,31 @@ async fn read_conversation(
             page_token,
             None,
             None,
-            None,
+            Some(intent_core::ConversationProjection::Slim),
         )
         .await
         .map_err(map_err)?;
     Ok(v)
+}
+
+/// `ws.agent.getMessageBlock`: one FULL content block of one persisted
+/// message — the on-demand hydration counterpart of the slim
+/// `readConversation` above. Block ids are the served identity (persisted
+/// assistant ids and the synthetic `{messageId}:{index}` ids both resolve),
+/// and the returned block is the full, unprojected body.
+async fn get_message_block(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    let _ = require_active_target(api, ws, &agent_id).await?;
+    let message_id = req_str(args, "messageId").map_err(|_| "messageId is required".to_string())?;
+    let block_id = req_str(args, "blockId").map_err(|_| "blockId is required".to_string())?;
+    api.agent_get_message_block(agent_id, message_id, block_id, Some(ws.clone()))
+        .await
+        .map_err(map_err)
 }
 
 async fn summary(

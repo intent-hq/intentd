@@ -227,13 +227,23 @@
 //! agent family alongside the now-emitted `agent:restored`, and retirement
 //! itself stays MCP-only (`ws.agent.retire`, self-scoped, gated by
 //! `agentFeatures.peerAgents`) per the §6.8 principle — 297 router methods,
+//! 336 total. Version 8.0 makes the slim conversation projection the wire
+//! default (BREAKING; §5.5): an absent / `null` `projection` on
+//! `agent.getConversation` and `chat.subscribe` now serves slim (bounded
+//! tool/image block bodies + the slim page byte budget) instead of full
+//! fidelity, so no unbudgeted read remains on the conversation surfaces
+//! (`agent.getSession` still serves the full `messages` log and is the
+//! remaining known unbudgeted transcript read) — full block bodies are
+//! read on demand via `agent.getMessageBlock`;
+//! `projection: "slim"` remains accepted as an explicit no-op and any other
+//! value stays `-32602`. No method-catalog change — 297 router methods,
 //! 336 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.5";
+pub const PROTOCOL_VERSION: &str = "8.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

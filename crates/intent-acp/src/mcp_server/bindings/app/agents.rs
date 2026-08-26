@@ -20,6 +20,8 @@ pub(crate) const PRELUDE: &str = r"
         list: (options) => host({ method: 'app.agents.list', args: options || {} }),
         readConversation: (workspaceId, agentId, opts) =>
             host({ method: 'app.agents.readConversation', args: { workspaceId, agentId, ...(opts || {}) } }),
+        getMessageBlock: (workspaceId, agentId, messageId, blockId) =>
+            host({ method: 'app.agents.getMessageBlock', args: { workspaceId, agentId, messageId, blockId } }),
         waitFor: (options) => host({ method: 'app.agents.waitFor', args: options || {} }),
     };
 ";
@@ -28,6 +30,10 @@ const DEFAULT_LIST_LIMIT: i64 = 50;
 const MAX_LIST_LIMIT: i64 = 200;
 const DEFAULT_READ_LIMIT: i64 = 20;
 const MAX_READ_LIMIT: i64 = 100;
+/// Hard cap on `nextToken` continuations a single `readConversation` call
+/// follows when the slim page byte budget (§5.5) trims pages below their
+/// message limit. 100 messages at worst-case one message per 512 KiB page.
+const READ_PAGE_WALK_CAP: usize = 100;
 
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -45,6 +51,7 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "readConversation" => read_conversation(api, args).await,
+        "getMessageBlock" => get_message_block(api, args).await,
         "waitFor" => wait_for(api, workspace_id, caller, args).await,
         other => Err(format!("host: unknown method `app.agents.{other}`")),
     }
@@ -169,30 +176,54 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         .await
         .map_err(map_err)?;
 
-    // Fetch full conversation (use agent.getConversation which returns { messages, ... })
-    let conversation_result = api
+    // The conversation is read under the slim projection (§5.5): bounded
+    // tool/image block bodies, like every other consumer since v8.0. The
+    // slim service read is also BYTE-BUDGETED — one page can carry fewer
+    // messages than its `limit` (512 KiB page budget) — and its
+    // `totalMessages` is transcript-wide, not page-length. So: take the
+    // total from the service, resolve the requested window against it
+    // (turn indices are transcript positions), and follow the re-minted
+    // `nextToken` continuations until the window is covered — never slice
+    // a single page in memory, which under-reports totals and silently
+    // drops requested older turns.
+    let first_limit = if start_turn.is_some() || end_turn.is_some() {
+        // Turn-range mode: the window may sit far older than the newest
+        // page; the first read only resolves `totalMessages`.
+        1
+    } else {
+        normalize_limit(last_n, DEFAULT_READ_LIMIT, MAX_READ_LIMIT)?
+    };
+    let first_page = api
         .agent_get_conversation(
             agent_id.clone(),
-            None,
+            Some(first_limit),
             Some(workspace_id.clone()),
             None,
             None,
             None,
-            None,
+            Some(intent_core::ConversationProjection::Slim),
         )
         .await
         .map_err(map_err)?;
-    let all_messages = conversation_result
+    let mut rows: Vec<Value> = first_page
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let total_messages = all_messages.len();
+    let total_messages = first_page
+        .get("totalMessages")
+        .and_then(Value::as_u64)
+        .map_or(rows.len(), |t| {
+            usize::try_from(t).expect("value fits in usize")
+        });
+    let mut next_token = first_page
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
-    // Apply bounds: either turn-range or lastN
-    let (selected_messages, selected_start_turn, selected_end_turn) = if start_turn.is_some()
-        || end_turn.is_some()
-    {
+    // Resolve the requested global window [win_start, win_end) — 0-based
+    // transcript positions counted from the oldest message.
+    let (win_start, win_end) = if start_turn.is_some() || end_turn.is_some() {
         // Turn-based slicing (1-based, inclusive)
         let start =
             usize::try_from(start_turn.unwrap_or(1).max(1)).expect("value fits in usize") - 1; // convert to 0-based
@@ -204,16 +235,77 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         if end < start + 1 {
             return Err("endTurn must be greater than or equal to startTurn".to_string());
         }
-        let slice = all_messages[start..end].to_vec();
-        (slice, start + 1, end) // return 1-based
+        (start, end)
     } else {
         // lastN slicing (default 20, max 100)
         let limit = usize::try_from(normalize_limit(last_n, DEFAULT_READ_LIMIT, MAX_READ_LIMIT)?)
             .expect("value fits in usize");
-        let start = total_messages.saturating_sub(limit);
-        let slice = all_messages[start..].to_vec();
-        (slice, start + 1, total_messages)
+        (total_messages.saturating_sub(limit), total_messages)
     };
+
+    // Walk `nextToken` pages older until the collected suffix reaches
+    // `win_start`. `rows` is always a contiguous run ending at
+    // `min(win_end, total)` (rows newer than the window are dropped as we
+    // go, bounding memory to window + one page); `covered` counts the full
+    // suffix walked so far, so `total - covered` is the oldest index held.
+    let mut covered = rows.len();
+    let keep = win_end
+        .saturating_sub(total_messages.saturating_sub(covered))
+        .min(rows.len());
+    rows.truncate(keep);
+    let mut walk_guard = 0usize;
+    while total_messages.saturating_sub(covered) > win_start {
+        let Some(token) = next_token.take() else {
+            break;
+        };
+        walk_guard += 1;
+        if walk_guard > READ_PAGE_WALK_CAP {
+            break;
+        }
+        let missing = total_messages.saturating_sub(covered) - win_start;
+        let page = api
+            .agent_get_conversation(
+                agent_id.clone(),
+                Some(i64::try_from(missing.min(200)).expect("value fits in i64")),
+                Some(workspace_id.clone()),
+                Some(token),
+                None,
+                None,
+                Some(intent_core::ConversationProjection::Slim),
+            )
+            .await
+            .map_err(map_err)?;
+        let older = page
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if older.is_empty() {
+            break; // defensive: no forward progress
+        }
+        covered += older.len();
+        let mut merged = older;
+        merged.extend(rows);
+        rows = merged;
+        let keep = win_end
+            .saturating_sub(total_messages.saturating_sub(covered))
+            .min(rows.len());
+        rows.truncate(keep);
+        next_token = page
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    // Slice the window out of the collected run. `rows` covers
+    // [total - covered, min(win_end, total)); the window's local offset is
+    // its distance from the run's oldest held row.
+    let suffix_start = total_messages.saturating_sub(covered);
+    let local_start = win_start.saturating_sub(suffix_start).min(rows.len());
+    let selected_messages: Vec<Value> = rows.split_off(local_start);
+    // Report the range actually served: if the page walk stopped early
+    // (token exhausted or walk cap), the oldest held row bounds the start.
+    let (selected_start_turn, selected_end_turn) = (win_start.max(suffix_start) + 1, win_end);
 
     // Filter tool-call blocks if requested
     let filtered_messages: Vec<Value> = selected_messages
@@ -249,6 +341,35 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         "lastActivity": agent.last_activity,
         "messages": filtered_messages,
     }))
+}
+
+/// `ws.app.agents.getMessageBlock`: one FULL content block of one persisted
+/// message in the target workspace — the on-demand hydration counterpart of
+/// the slim `readConversation` above (§5.5). Block ids are the served
+/// identity (persisted assistant ids and synthetic `{messageId}:{index}` ids
+/// both resolve); the returned block is the full, unprojected body.
+async fn get_message_block(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let workspace_id_str =
+        opt_str(args, "workspaceId").ok_or_else(|| "workspaceId is required".to_string())?;
+    let agent_id_str = opt_str(args, "agentId").ok_or_else(|| "agentId is required".to_string())?;
+    let workspace_id = WorkspaceId::from(workspace_id_str.as_str());
+    let agent_id = AgentId::from(agent_id_str.as_str());
+    if workspace_id.is_chief() {
+        return Err(format!("Workspace not found: {workspace_id_str}"));
+    }
+    let message_id =
+        opt_str(args, "messageId").ok_or_else(|| "messageId is required".to_string())?;
+    let block_id = opt_str(args, "blockId").ok_or_else(|| "blockId is required".to_string())?;
+    // Validate workspace + agent exist for consistent chief-surface errors.
+    api.get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+    api.agent_get(agent_id.clone(), Some(workspace_id.clone()))
+        .await
+        .map_err(map_err)?;
+    api.agent_get_message_block(agent_id, message_id, block_id, Some(workspace_id))
+        .await
+        .map_err(map_err)
 }
 
 /// `ws.app.agents.waitFor({ agentIds, waitMode? })`: register completion
