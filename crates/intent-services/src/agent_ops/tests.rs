@@ -25974,6 +25974,101 @@ async fn dismiss_questions_event_omits_pending_marker_when_never_written() {
     );
 }
 
+/// Regression (PR #1496 review): the dismiss event's pending marker must not
+/// be the stale top-of-op snapshot. A marker clear that commits after the
+/// dismissal's snapshot but before its event would otherwise be followed by
+/// a dismiss event re-announcing the already-cleared marker, letting clients
+/// re-derive a hold that no longer exists. The dismiss op re-reads the marker
+/// under the per-agent mutation lock at emit time, so it publishes the
+/// post-clear value.
+#[tokio::test]
+async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(
+        svc.record_pending_questions_marker(&ws, &id, &asked.id)
+            .await
+    );
+
+    // Subscribe AFTER the marker write (it emits its own `agent:updated`).
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // Hold the agent's mutation lock so the dismiss op parks right before
+    // its emit-time marker re-read.
+    let gate = svc.pending_question_mutation_locks.lock_for(&id);
+    let guard = gate.lock().await;
+
+    let dismissing = {
+        let svc = svc.clone();
+        let ws = ws.clone();
+        let id = id.clone();
+        let message_id = asked.id.clone();
+        tokio::spawn(async move { svc.agent_dismiss_questions_op(ws, id, message_id).await })
+    };
+    // The dismissal marker persists BEFORE the lock acquisition: poll for it
+    // to know the op is parked at the gate.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let session = svc
+            .store()
+            .get_agent_session_summary(&id)
+            .await
+            .expect("session");
+        if session.dismissed_questions_message_id() == Some(asked.id.as_str()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dismissal marker never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Concurrent clear commits while the dismiss is parked (in production the
+    // clear path holds this same lock across its write + event; the direct
+    // store write stands in for a clear that already finished).
+    assert!(svc
+        .store()
+        .set_agent_session_metadata_key(
+            &ws,
+            &id,
+            intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+            "",
+            None,
+            &now_iso(),
+        )
+        .await
+        .expect("clear marker"));
+
+    drop(guard);
+    dismissing.await.expect("join").expect("dismiss");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        batch[0].data["dismissedQuestionsMessageId"].as_str(),
+        Some(asked.id.as_str())
+    );
+    // The event carries the post-clear value, not the stale snapshot.
+    assert_eq!(
+        batch[0].data["pendingQuestionsMessageId"].as_str(),
+        Some(""),
+        "dismiss event must reflect the concurrent clear: {:?}",
+        batch[0].data
+    );
+}
+
 /// Registry hygiene (monorepo#3179): deleting an agent evicts its entries
 /// from the pending-question mutation-lock map AND the dismissal-notice
 /// registry, so neither in-memory map grows unboundedly as agents churn on a

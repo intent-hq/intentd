@@ -6006,20 +6006,42 @@ impl Services {
         // can re-derive the hold from this one event without an extra
         // `agent.get` round-trip. Same projection rule as `AgentLite`:
         // present when the marker was ever written (the empty string is the
-        // authoritative clear), omitted for legacy marker-less sessions. Read
-        // from the summary snapshot above — the dismissal never mutates the
-        // pending marker, and a concurrent marker write emits its own
-        // `agent:updated` (ordered by the per-agent mutation lock).
-        let mut event_data = json!({
-            "agentId": agent_id.0,
-            "dismissedQuestionsMessageId": message_id,
-        });
-        if session.pending_questions_marker_written() {
-            event_data["pendingQuestionsMessageId"] =
-                json!(session.pending_questions_message_id().unwrap_or_default());
+        // authoritative clear), omitted for legacy marker-less sessions. The
+        // marker is RE-READ and the event published under the per-agent
+        // mutation lock — marker set/clear paths hold that lock across their
+        // write + event, so the value emitted here is coherent with the event
+        // order a client observes; the top-of-op snapshot could be stale by
+        // emit time and would let a client re-derive an already-cleared hold
+        // (PR #1496 review).
+        {
+            let lock = self.pending_question_mutation_locks.lock_for(&agent_id);
+            let _guard = lock.lock().await;
+            let marker_session = match self.store.get_agent_session_summary(&agent_id).await {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    // Best-effort: the dismissal marker is already persisted,
+                    // so keep the event flowing with the top-of-op snapshot
+                    // rather than failing the dismissal.
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "failed to re-read pending-questions marker for dismiss event"
+                    );
+                    session
+                }
+            };
+            let mut event_data = json!({
+                "agentId": agent_id.0,
+                "dismissedQuestionsMessageId": message_id,
+            });
+            if marker_session.pending_questions_marker_written() {
+                event_data["pendingQuestionsMessageId"] = json!(marker_session
+                    .pending_questions_message_id()
+                    .unwrap_or_default());
+            }
+            self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, event_data)
+                .await;
         }
-        self.publish_agent_mutation_event(&workspace_id, &agent_id, AGENT_UPDATED, event_data)
-            .await;
         // Dismissing the questions retires the question hold, which can
         // retire the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare.
