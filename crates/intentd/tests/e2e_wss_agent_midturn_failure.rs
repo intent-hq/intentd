@@ -645,6 +645,133 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     );
 }
 
+/// MIDTURN-1b (monorepo#3592): the terminal-failure stderr capture hint must
+/// sweep the process group BEFORE awaiting drain settlement. The mock's final
+/// gated exit leaves a same-group `sleep 300` holding the inherited stderr
+/// write end open, so the drain can only hit EOF once the hint's own group
+/// sweep kills the descendant. The settle bound is widened to 30s via
+/// `INTENTD_STDERR_SETTLE_TIMEOUT_MS` and the WARN hint is required well
+/// inside it: with the sweep-then-settle ordering the hint lands in a couple
+/// of seconds, while the regressed settle-then-sweep ordering burns the full
+/// widened bound and fails the ceiling deterministically (instead of racing
+/// the default 2s timeout). The sweep must also actually reap the holder.
+#[tokio::test]
+async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
+    let Some(script) = gate("WSS pipe-holding-descendant stderr hint E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let attempt_file = data_dir.join("attempts.txt");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // Attempt 1's death is consumed by the one-shot silent redrive; attempt 2
+    // (the terminal one) spawns the pipe-holding descendant before exiting.
+    let behavior = json!({
+        "exitDuringPromptAttempts": 2,
+        "holdStderrOpenOnExit": true,
+        "response": "unused",
+    })
+    .to_string();
+    let env: [(&str, &str); 8] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+        ("INTENTD_STDERR_SETTLE_TIMEOUT_MS", "30000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-STDERR-HOLD", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let started = std::time::Instant::now();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "dies holding stderr" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The WARN hint must name the capture path — and land well inside the
+    // widened 30s settle bound: the hint's own group sweep (not the timeout)
+    // is what unblocks the drain when a descendant holds the pipe.
+    let capture_dir = intent_core::agent_logs_root(&data_dir).join(&agent_id);
+    let expected_hint = format!("agent stderr captured at {}", capture_dir.display());
+    await_daemon_log_contains(&data_dir, &expected_hint).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "stderr hint arrived via the group sweep, not by exhausting the 30s \
+         settle bound (took {elapsed:?})"
+    );
+
+    // The capture holds the child's dying words, including the holder spawn —
+    // proving the drain reached EOF and flushed past the descendant.
+    let mut captured = String::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&capture_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(c) = tokio::fs::read_to_string(entry.path()).await {
+                captured.push_str(&c);
+            }
+        }
+    }
+    assert!(
+        captured.contains("exiting during prompt"),
+        "stderr capture under {} holds the child's last words; got: {captured:?}",
+        capture_dir.display()
+    );
+    let holder_pid: i32 = captured
+        .lines()
+        .find_map(|l| l.split("spawned stderr-holding descendant pid=").nth(1))
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("capture names the holder pid; got: {captured:?}"));
+
+    // The sweep reaped the pipe-holding descendant (it would otherwise live
+    // for 300s). Bounded poll: SIGKILL delivery + init reaping the orphan.
+    let holder = nix::unistd::Pid::from_raw(holder_pid);
+    let mut holder_dead = false;
+    for _ in 0..100 {
+        if nix::sys::signal::kill(holder, None).is_err() {
+            holder_dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        holder_dead,
+        "group sweep reaped the stderr-holding descendant (pid {holder_pid})"
+    );
+}
+
 /// MIDTURN-2 (STAB-54): `agent.retry` on an errored agent whose queue is
 /// EMPTY must not be an invisible no-op. The response carries
 /// `redriven: false` and the status clears to `idle` (not `pending` — nothing

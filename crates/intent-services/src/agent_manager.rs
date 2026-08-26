@@ -7704,7 +7704,7 @@ impl AgentManager {
                     let mut hint = None;
                     if let Some(dir) = &stderr_dir {
                         if let Some(conn) = &dead_conn {
-                            conn.await_stderr_settled(STDERR_SETTLE_TIMEOUT).await;
+                            conn.await_stderr_settled(stderr_settle_timeout()).await;
                             if conn.stderr_captured() && stderr_capture_dir_populated(dir) {
                                 hint = Some(dir);
                             }
@@ -10850,7 +10850,9 @@ async fn stderr_capture_hint(
     // `handle_terminal_turn_failure`'s own later `kill_child_only` degrades
     // to a no-op (the handle is already gone).
     mgr.kill_child_only(agent_id).await;
-    connection.await_stderr_settled(STDERR_SETTLE_TIMEOUT).await;
+    connection
+        .await_stderr_settled(stderr_settle_timeout())
+        .await;
     (connection.stderr_captured() && stderr_capture_dir_populated(&dir)).then_some(dir)
 }
 
@@ -10893,6 +10895,18 @@ mod stderr_capture_hint_tests {
 /// write end is already closed — EOF is normally immediate; the bound covers
 /// a same-group descendant holding the pipe open.
 const STDERR_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// [`STDERR_SETTLE_TIMEOUT`] with an `INTENTD_STDERR_SETTLE_TIMEOUT_MS` env
+/// override (monorepo#3592): the pipe-holding-descendant e2e widens the bound
+/// and requires the WARN well inside it, proving the hint settles via the
+/// group sweep instead of waiting the bound out — a reordering regression
+/// then fails deterministically instead of racing a 2s timeout.
+fn stderr_settle_timeout() -> Duration {
+    std::env::var("INTENTD_STDERR_SETTLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.trim().parse().ok())
+        .map_or(STDERR_SETTLE_TIMEOUT, Duration::from_millis)
+}
 
 /// Whether `run_prompt_turn` already emitted the terminal `agent:failed` +
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
