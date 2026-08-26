@@ -1069,6 +1069,33 @@ impl SpecialistsService {
         self.alias_target(id, workspace_path)
     }
 
+    /// Strict form of [`Self::canonical_id`] for the spawn/update seams
+    /// (monorepo#3497): an unknown id is rejected with `-32602` naming the
+    /// id and the known catalog ids, instead of being persisted verbatim
+    /// with no behavior prompt. The known-id list matches [`Self::list`]
+    /// (retired `ralph` excluded).
+    pub(crate) fn canonical_id_or_err(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Result<String> {
+        // Ralph remains resolvable for existing sessions (inheritance uses
+        // the lenient `canonical_id`), but is retired from new-session
+        // catalogs ([`Self::list`]) — so the strict seams reject it like any
+        // other undiscoverable id.
+        let mut catalog = self.collect_catalog(workspace_path);
+        catalog.remove("ralph");
+        if let Some(canonical) = self.canonical_id(id, workspace_path) {
+            if catalog.contains_key(&canonical) {
+                return Ok(canonical);
+            }
+        }
+        let known = catalog.into_keys().collect::<Vec<_>>().join(", ");
+        Err(Error::InvalidParams(format!(
+            "unknown specialist: {id} (known specialists: {known}; aliases are accepted)"
+        )))
+    }
+
     /// The def inherited from the tiers **below** `scope` — the same fold
     /// [`Self::resolve`] applies, stopped before `scope` — so that
     /// `specialist.create`/`edit` responses agree with an immediately-following
@@ -1813,6 +1840,37 @@ mod tests {
         let def = svc.resolve("coordinator", None).expect("alias resolves");
         assert_eq!(def["id"], "spec-writer");
         assert_eq!(def["name"], "Coordinator");
+    }
+
+    /// Strict-seam contract (monorepo#3497): `canonical_id_or_err` accepts
+    /// ids and aliases from the `specialist.list` catalog, and rejects both
+    /// an unknown id and the retired `ralph` — which the lenient
+    /// `canonical_id` still resolves for legacy stored sessions — with a
+    /// `-32602` naming the id and never listing `ralph` among the known ids.
+    #[test]
+    fn canonical_id_or_err_rejects_unknown_and_retired_ralph() {
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty);
+        assert_eq!(
+            svc.canonical_id_or_err("implementor", None).unwrap(),
+            "implementor"
+        );
+        assert_eq!(
+            svc.canonical_id_or_err("coordinator", None).unwrap(),
+            "spec-writer"
+        );
+        let err = svc.canonical_id_or_err("nope", None).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(err.to_string().contains("unknown specialist: nope"));
+        // Retired: lenient resolution still works (inheritance), strict rejects.
+        assert_eq!(svc.canonical_id("ralph", None).as_deref(), Some("ralph"));
+        let err = svc.canonical_id_or_err("ralph", None).unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(err.to_string().contains("unknown specialist: ralph"));
+        assert!(
+            !err.to_string().contains("ralph,") && !err.to_string().contains(", ralph"),
+            "known-id list must not advertise the retired ralph: {err}"
+        );
     }
 
     /// `render_file` writes a supplied `aliases` list as a single-line JSON
