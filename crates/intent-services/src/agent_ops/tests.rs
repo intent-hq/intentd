@@ -2243,9 +2243,9 @@ async fn fired_completion_watch_does_not_rehydrate() {
 
 /// Regression (intent-hq/monorepo#2842, restart replay): restart recovery
 /// must not re-deliver an already-delivered terminal completion. A child that
-/// reported (immediate parent wake) and completed retires its watch; when the
-/// parent re-arms a watch on the settled child and the daemon restarts, the
-/// boot reconciliation synthesizes the child's HISTORICAL completion — which
+/// reported (immediate progress wake) and completed (terminal wake) retires its
+/// watch; when the parent re-arms a watch on the settled child and the daemon
+/// restarts, the boot reconciliation synthesizes the child's HISTORICAL completion — which
 /// must NOT wake the parent again (the re-armed watch stays armed for a
 /// FUTURE completion), across any number of restarts.
 #[tokio::test]
@@ -2271,13 +2271,12 @@ async fn restart_reconcile_skips_already_delivered_completion() {
             .expect("delegate");
         let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
         let baseline = parent_message_count(&svc, &parent).await;
-        // Immediate report-time wake (marks the delegate watch
-        // report_delivered).
+        // Immediate progress wake leaves the delegate watch armed.
         svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child.clone()))
             .await
             .expect("report");
         assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-        // Real completion: the report_delivered watch retires silently.
+        // Real completion delivers the terminal wake and retires the watch.
         svc.handle_completion_event(&completion_event(
             &ws,
             AGENT_IDLE,
@@ -2285,7 +2284,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
             json!({ "agentId": child.0 }),
         ))
         .await;
-        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+        assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
         assert!(svc.find_watches_for_child(&child).is_empty());
         wait_for_persisted_watches(&svc, 0).await;
         // The parent re-arms a fresh watch on the settled child.
@@ -2329,7 +2328,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
             .expect("heal watches");
         assert_eq!(
             parent_message_count(&restarted, &parent).await,
-            baseline + 1,
+            baseline + 2,
             "restart {restart}: no duplicate completion wake"
         );
         assert_eq!(
@@ -2370,7 +2369,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
         json!({ "agentId": child.0 }),
     ))
     .await;
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     assert!(svc.find_watches_for_child(&child).is_empty());
 
     // Park the child in its terminal state (report retained), then re-watch:
@@ -2390,7 +2389,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
         .expect("re-watch");
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
+        baseline + 2,
         "re-arm must not fire on the historical completion"
     );
     assert_eq!(
@@ -2421,7 +2420,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     .await;
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 2,
+        baseline + 3,
         "future completion delivers exactly one wake"
     );
     assert!(
@@ -2439,7 +2438,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
         .expect("re-watch after delivery-path wake");
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 2,
+        baseline + 3,
         "delivery-path marker suppresses the replayed second completion"
     );
     assert_eq!(
@@ -2472,14 +2471,14 @@ async fn rearmed_watch_dedups_empty_report_completion() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let baseline = parent_message_count(&svc, &parent).await;
-    // Empty report: still persists the report + timestamp and delivers the
-    // immediate report-time wake (marks the delegate watch report_delivered).
+    // Empty report still persists the report + timestamp and delivers the
+    // immediate progress wake without consuming the completion watch.
     svc.agent_report_to_parent_op(ws.clone(), json!(""), Some(child.clone()))
         .await
         .expect("empty report");
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-    // Real completion: the report_delivered watch retires silently and the
-    // retirement branch records the marker (keyed on the session timestamp).
+    // Real completion delivers the terminal wake, retires the watch, and records
+    // the marker keyed on the session timestamp.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -2487,7 +2486,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
         json!({ "agentId": child.0 }),
     ))
     .await;
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     assert!(svc.find_watches_for_child(&child).is_empty());
 
     // Park the child terminal (empty report + timestamp retained), re-watch:
@@ -2508,7 +2507,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
         .expect("re-watch");
     assert_eq!(
         parent_message_count(&svc, &parent).await,
-        baseline + 1,
+        baseline + 2,
         "re-arm must not fire on the historical empty-report completion"
     );
     assert_eq!(
