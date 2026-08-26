@@ -5515,6 +5515,46 @@ mod workspace_api_tool_tests {
         WorkspaceMcpServer::new(api, WorkspaceId::from_string(id))
     }
 
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "test\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("README.md")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let commit_id = repo
+            .commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        let commit = repo.find_commit(commit_id).unwrap();
+        repo.branch("main", &commit, true).unwrap();
+        repo.branch("feature/ready", &commit, false).unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            false,
+            "test default branch",
+        )
+        .unwrap();
+        repo.set_head("refs/heads/feature/ready").unwrap();
+        drop(commit);
+        drop(tree);
+        drop(repo);
+        dir
+    }
+
+    fn server_with_repo(id: &str, repo: &std::path::Path) -> WorkspaceMcpServer {
+        let api = WorkspaceInfoMockApi::new(id, None);
+        {
+            let mut workspace = api.ws.lock().unwrap();
+            workspace.repository_path = Some(repo.to_string_lossy().into_owned());
+            workspace.repository_owner = Some("intent-hq".to_string());
+            workspace.repository_name = Some("intentd".to_string());
+        }
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string(id))
+    }
+
     async fn call_workspace_api(srv: &WorkspaceMcpServer, code: &str) -> Value {
         srv.handle_message(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5529,6 +5569,166 @@ mod workspace_api_tool_tests {
 
     fn tool_text(resp: &Value) -> &str {
         resp["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    fn tool_json(resp: &Value) -> Value {
+        serde_json::from_str(tool_text(resp)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_emits_scoped_exact_workspace_create_request() {
+        let repo = git_repo();
+        let srv = server_with_repo("amber-forest", repo.path());
+        let code = r#"return await ws.workspace.proposeSibling({
+            title: "Follow up",
+            initialPrompt: "Implement the isolated follow-up and test it.",
+            specialist: "implementor"
+        });"#;
+        let first_response = call_workspace_api(&srv, code).await;
+        let first = tool_json(&first_response);
+        let second = tool_json(&call_workspace_api(&srv, code).await);
+        let proposal = &first["proposal"];
+        let create = &proposal["preview"]["workspaceCreate"];
+        let params = &proposal["payload"]["params"];
+
+        assert_eq!(proposal["kind"], "workspace-create");
+        assert_eq!(proposal["payload"]["operation"], "workspace.create");
+        assert_eq!(create["mode"], "sibling");
+        assert_eq!(create["title"], "Follow up");
+        assert_eq!(
+            create["initialPrompt"],
+            "Implement the isolated follow-up and test it."
+        );
+        assert_eq!(create["branch"], "main");
+        assert_eq!(create["specialist"], "implementor");
+        assert_eq!(create["repoPath"], repo.path().to_string_lossy().as_ref());
+        assert_eq!(create["githubUrl"], "https://github.com/intent-hq/intentd");
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(params["repositoryOwner"], "intent-hq");
+        assert_eq!(params["repositoryName"], "intentd");
+        assert_eq!(params["baseRef"], "main");
+        assert_eq!(params["baseRef"], create["branch"]);
+        assert_eq!(params["initialAgent"]["prompt"], create["initialPrompt"]);
+        assert_eq!(params["initialAgent"]["specialist"], "implementor");
+        assert_eq!(params["initialAgent"]["metadata"]["isInitialAgent"], true);
+        assert_ne!(
+            params["idempotencyKey"], second["proposal"]["payload"]["params"]["idempotencyKey"],
+            "each proposal invocation must represent a new creation intent"
+        );
+        assert!(params["idempotencyKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("sibling-workspace-"));
+        let resource = &first_response["result"]["content"][1]["resource"];
+        assert_eq!(resource["mimeType"], "application/vnd.intent.proposal+json");
+        let proposal_text = resource["text"].as_str().unwrap();
+        let request_for_apply =
+            || serde_json::from_str::<Value>(proposal_text).unwrap()["payload"]["params"].clone();
+        let first_apply = request_for_apply();
+        let retry_apply = request_for_apply();
+        assert_eq!(first_apply, retry_apply);
+        assert_eq!(first_apply["idempotencyKey"], params["idempotencyKey"]);
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_preserves_valid_and_invalid_named_refs_without_fallback() {
+        let repo = git_repo();
+        let srv = server_with_repo("amber-forest", repo.path());
+        let valid = tool_json(
+            &call_workspace_api(
+                &srv,
+                "return await ws.workspace.proposeSibling({ title: 'Valid', initialPrompt: 'Do it.', baseRef: 'feature/ready' });",
+            )
+            .await,
+        );
+        assert_eq!(
+            valid["proposal"]["preview"]["workspaceCreate"]["branch"],
+            "feature/ready"
+        );
+        assert_eq!(
+            valid["proposal"]["payload"]["params"]["baseRef"],
+            "feature/ready"
+        );
+        assert!(valid["proposal"]["preview"].get("warnings").is_none());
+
+        for named_ref in ["missing", "stale/deleted"] {
+            let code = format!(
+                "return await ws.workspace.proposeSibling({{ title: 'Invalid', initialPrompt: 'Do it.', baseRef: '{named_ref}' }});"
+            );
+            let invalid = tool_json(&call_workspace_api(&srv, &code).await);
+            assert_eq!(
+                invalid["proposal"]["preview"]["workspaceCreate"]["branch"],
+                named_ref
+            );
+            assert_eq!(
+                invalid["proposal"]["payload"]["params"]["baseRef"],
+                named_ref
+            );
+            assert!(invalid["proposal"]["preview"]["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains(named_ref));
+        }
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_rejects_unknown_fields_bad_types_and_missing_repository() {
+        let repo = git_repo();
+        let srv = server_with_repo("amber-forest", repo.path());
+        for code in [
+            "return await ws.workspace.proposeSibling({ title: 'X', initialPrompt: 'Y', repositoryPath: '/tmp/other' });",
+            "return await ws.workspace.proposeSibling({ title: 'X', initialPrompt: 1 });",
+            "return await ws.workspace.proposeSibling({ title: 'X' });",
+        ] {
+            let response = call_workspace_api(&srv, code).await;
+            assert_eq!(response["result"]["isError"], true, "{response}");
+        }
+
+        let missing = server("amber-forest", None);
+        let response = call_workspace_api(
+            &missing,
+            "return await ws.workspace.proposeSibling({ title: 'X', initialPrompt: 'Y' });",
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true);
+        assert!(tool_text(&response).contains("no usable repository"));
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_is_hidden_and_raw_dispatch_denied_for_sub_agents() {
+        let top = server("amber-forest", None);
+        let top_list = top
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        assert!(top_list["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ws.workspace.proposeSibling("));
+        let top_type = call_workspace_api(&top, "return typeof ws.workspace.proposeSibling;").await;
+        assert_eq!(tool_text(&top_type), "\"function\"");
+
+        let sub = server("amber-forest", None).with_sub_agent(true);
+        let sub_list = sub
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        assert!(!sub_list["result"]["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("ws.workspace.proposeSibling("));
+        let sub_type = call_workspace_api(&sub, "return typeof ws.workspace.proposeSibling;").await;
+        assert_eq!(tool_text(&sub_type), "\"undefined\"");
+        let raw = call_workspace_api(
+            &sub,
+            "return await host({ method: 'workspace.proposeSibling', args: { title: 'X', initialPrompt: 'Y' } });",
+        )
+        .await;
+        assert_eq!(raw["result"]["isError"], true);
+        assert!(tool_text(&raw).contains("only available to foreground top-level agents"));
     }
 
     #[tokio::test]

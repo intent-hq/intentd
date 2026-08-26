@@ -167,6 +167,7 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
+  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
 
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
@@ -382,6 +383,7 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
+  ws.workspace.proposeSibling({ title, initialPrompt, specialist?, baseRef? }) → { ok, proposal, ... }  // Propose separate follow-up work in a sibling workspace for this repository. The title and self-contained initialPrompt are required; repository fields are inherited and cannot be supplied. Foreground top-level agents only.
 
   ws.app.agents.list({ workspaceId?, includeCompleted?, limit?, cursor? }?) → { threads, total, returned, nextCursor? }  // Chief workspace only. Lists readable agent threads across app workspaces; metadata only, no transcript content. Defaults to 50 threads, max 200.
   ws.app.agents.readConversation(workspaceId, agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { workspaceId, workspaceTitle, agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, includeToolCalls, taskNoteId?, messages }  // Chief workspace only. Reads a bounded cross-workspace agent conversation. Defaults to last 20 messages, max 100, and excludes tool-call blocks unless `includeToolCalls=true`.
@@ -834,6 +836,27 @@ pub fn workspace_api_description(
     Cow::Owned(out)
 }
 
+fn workspace_api_description_for_bridge(
+    is_chief: bool,
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+) -> Cow<'static, str> {
+    let base = workspace_api_description(is_chief, features);
+    if !is_sub_agent {
+        return base;
+    }
+    Cow::Owned(
+        base.lines()
+            .filter(|line| {
+                !line
+                    .trim_start()
+                    .starts_with("ws.workspace.proposeSibling(")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// The `Namespaces` index header line as it appears verbatim in both static
 /// description variants. [`compact_workspace_api_description`] anchors on it,
 /// and the `namespace_index_header_present_in_both_variants` drift test pins
@@ -1011,7 +1034,7 @@ pub(super) fn help_namespace(
         .trim_start_matches("ws.")
         .trim_end_matches('*')
         .trim_end_matches('.');
-    let desc = workspace_api_description(is_chief, features);
+    let desc = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
     if !ns.is_empty() {
         // Direct calls like `ws.help(...)` are documented without a trailing
         // dot, so match both the `ws.<ns>.` and `ws.<ns>(` spellings.
@@ -1090,8 +1113,9 @@ pub(crate) fn workspace_api_description_with_model_options(
     is_chief: bool,
     features: &AgentFeaturesSettings,
     model_options: &[SpecialistModelOptions],
+    is_sub_agent: bool,
 ) -> Cow<'static, str> {
-    let base = workspace_api_description(is_chief, features);
+    let base = workspace_api_description_for_bridge(is_chief, features, is_sub_agent);
     if model_options.is_empty() {
         return base;
     }
@@ -2760,7 +2784,7 @@ mod tests {
     fn no_model_options_keeps_description_byte_identical() {
         let features = all_gates_open();
         for is_chief in [false, true] {
-            let got = workspace_api_description_with_model_options(is_chief, &features, &[]);
+            let got = workspace_api_description_with_model_options(is_chief, &features, &[], false);
             assert!(
                 matches!(got, Cow::Borrowed(_)),
                 "no options must not reassemble"
@@ -2785,6 +2809,7 @@ mod tests {
                 is_chief,
                 &features,
                 &sample_options(),
+                false,
             );
             assert!(
                 got.contains("Specialist model options"),
@@ -2856,6 +2881,7 @@ mod tests {
             false,
             &AgentFeaturesSettings::default(),
             &options,
+            false,
         );
         assert!(
             got.contains(
@@ -2875,7 +2901,12 @@ mod tests {
             background_hooks: false,
             ..AgentFeaturesSettings::default()
         };
-        let got = workspace_api_description_with_model_options(false, &features, &sample_options());
+        let got = workspace_api_description_with_model_options(
+            false,
+            &features,
+            &sample_options(),
+            false,
+        );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
             got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
@@ -2900,6 +2931,7 @@ mod tests {
             false,
             &AgentFeaturesSettings::default(),
             &options,
+            false,
         );
         assert!(
             got.contains("`opencode:kimi-k3` (line one line two)"),

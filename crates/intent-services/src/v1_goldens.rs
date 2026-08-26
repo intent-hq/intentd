@@ -1596,8 +1596,8 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
 /// H2 regression: a session stamped `harnessVersion: "1.0"` (every pre-1.1
 /// session) resolves the v1 doctrine set and assembles the exact bytes the
 /// v1 layout produced — its common layer is the v1 body, not the v1.1
-/// rewrite (the v1 composition stays byte-pinned by the doctrine hashes
-/// below). A current-stamp session ("1.1") assembles byte-identical to the
+/// or v2 rewrite (the v1 composition stays byte-pinned by the doctrine hashes
+/// below). A current-stamp session ("2.0") assembles byte-identical to the
 /// session-less (latest) assembly, and an unknown/corrupt stamp falls back
 /// to the latest instead of failing.
 #[tokio::test]
@@ -1661,8 +1661,10 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     );
     assert_ne!(
         pinned_v1, latest,
-        "v1 doctrine differs from v1.1 (common.md)"
+        "v1 doctrine differs from latest v2 (common.md)"
     );
+    assert!(!pinned_v1.contains("ws.workspace.proposeSibling"));
+    assert!(latest.contains("ws.workspace.proposeSibling"));
     // Only the doctrine layer differs: the static layers after the
     // specialization rules are byte-identical.
     let latest_rules = crate::instructions::get_instruction_with_common_for(
@@ -1686,7 +1688,7 @@ async fn golden_v1_session_assembles_v1_doctrine() {
 /// composition) fails here and forces a harness-version decision. The
 /// hashes are of the v1-set composition with all-default agent features —
 /// pinned to `instructions::V1` explicitly (NOT the latest set) so the v1
-/// bytes stay frozen across later versions; `v1_1_goldens` pins the latest.
+/// bytes stay frozen across later versions; `v1_1_goldens` pins v1.1.
 #[test]
 fn golden_bundled_doctrine_hashes() {
     let features = intent_core::settings_file::AgentFeaturesSettings::default();
@@ -1707,7 +1709,7 @@ fn golden_bundled_doctrine_hashes() {
                 sha256_hex(&crate::instructions::get_instruction_with_common_for(
                     &crate::instructions::V1,
                     agent_type,
-                    &features
+                    &features,
                 ))
             )
         })
