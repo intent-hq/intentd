@@ -53,8 +53,11 @@ pub(crate) const PRELUDE: &str = r"
             const args = s === '' ? {} : s.startsWith('agent-') ? { agentId: s } : { subscriptionId: s };
             return host({ method: 'agent.unwatch', args });
         },
-        list: (includeCompleted) =>
-            host({ method: 'agent.list', args: { includeCompleted } }),
+        list: (optsOrIncludeCompleted) => {
+            const o = optsOrIncludeCompleted;
+            const args = o !== null && typeof o === 'object' ? { ...o } : { includeCompleted: o };
+            return host({ method: 'agent.list', args });
+        },
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
         getQueue: (agentId) => host({ method: 'agent.getQueue', args: { agentId } }),
         removeQueuedMessage: (agentId, messageId) =>
@@ -146,7 +149,7 @@ pub(crate) async fn dispatch(
         "unsubscribe" => unsubscribe(api, ws, args).await,
         "watch" => watch(api, ws, caller, args).await,
         "unwatch" => unwatch(api, ws, caller, args).await,
-        "list" => list(api, ws).await,
+        "list" => list(api, ws, args).await,
         "status" => status(api, ws, args).await,
         "getQueue" => get_queue(api, ws, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
@@ -804,11 +807,97 @@ async fn unwatch(
     Ok(merge_ok(v))
 }
 
-async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+/// `ws.agent.list` scope filter: `"top-level"` keeps only rows with no
+/// `parentAgentId`, `"subagents"` only rows with one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AgentListScope {
+    TopLevel,
+    Subagents,
+}
+
+/// Parsed `ws.agent.list` options (`{ includeCompleted?, scope?,
+/// parentAgentId? }`; the JS wrapper maps the legacy bare-boolean form to
+/// `{ includeCompleted }`).
+#[derive(Debug)]
+struct AgentListFilter {
+    include_completed: bool,
+    scope: Option<AgentListScope>,
+    parent_agent_id: Option<String>,
+}
+
+/// Like `opt_str`, but rejects a present-but-non-string value instead of
+/// silently ignoring it (a typo'd filter must not widen the result set).
+fn opt_str_strict(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("{key} must be a string, got: {other}")),
+    }
+}
+
+fn parse_agent_list_filter(args: &Value) -> Result<AgentListFilter, String> {
+    let scope = match opt_str_strict(args, "scope")?.as_deref() {
+        None => None,
+        Some("top-level") => Some(AgentListScope::TopLevel),
+        Some("subagents") => Some(AgentListScope::Subagents),
+        Some(other) => {
+            return Err(format!(
+                "invalid scope \"{other}\": valid values are \"top-level\" (agents with no parent) and \"subagents\" (agents with a parent)"
+            ));
+        }
+    };
+    let parent_agent_id = opt_str_strict(args, "parentAgentId")?;
+    if scope == Some(AgentListScope::TopLevel) && parent_agent_id.is_some() {
+        return Err(
+            "parentAgentId cannot be combined with scope \"top-level\": top-level agents have no parent. Drop one of the two filters (parentAgentId alone already returns only that agent's sub-agents)."
+                .to_string(),
+        );
+    }
+    Ok(AgentListFilter {
+        include_completed: opt_bool(args, "includeCompleted").unwrap_or(false),
+        scope,
+        parent_agent_id,
+    })
+}
+
+impl AgentListFilter {
+    /// Whether a row with this status/parent survives the filter. Terminal
+    /// statuses mirror the `ws.app.agents.list` `includeCompleted` set:
+    /// completed / error / deleted.
+    fn retains(&self, status: AgentStatus, parent_agent_id: Option<&str>) -> bool {
+        let terminal = matches!(
+            status,
+            AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+        );
+        if terminal && !self.include_completed {
+            return false;
+        }
+        match self.scope {
+            Some(AgentListScope::TopLevel) if parent_agent_id.is_some() => return false,
+            Some(AgentListScope::Subagents) if parent_agent_id.is_none() => return false,
+            _ => {}
+        }
+        match &self.parent_agent_id {
+            Some(p) => parent_agent_id == Some(p.as_str()),
+            None => true,
+        }
+    }
+}
+
+async fn list(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let filter = parse_agent_list_filter(args)?;
     // Soft retire: `agent_list` excludes retired sessions by default, so the
     // agent-facing list never shows them (the wire `includeRetired` escape
     // hatch is FE-only by design).
     let rows = api.agent_list(ws.clone()).await.map_err(map_err)?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| filter.retains(r.status, r.parent_agent_id.as_ref().map(AgentId::as_str)))
+        .collect();
     serde_json::to_value(rows).map_err(|e| e.to_string())
 }
 
@@ -1487,6 +1576,82 @@ fn merge_ok(mut v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_list_filter_omits_terminal_rows_by_default() {
+        let f = parse_agent_list_filter(&json!({})).expect("empty args parse");
+        assert!(f.retains(AgentStatus::Active, None));
+        assert!(f.retains(AgentStatus::RuntimeIdle, Some("agent-p")));
+        for terminal in [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ] {
+            assert!(!f.retains(terminal, None), "{terminal:?} must be omitted");
+        }
+        // The legacy boolean form arrives from the JS wrapper as
+        // `{ includeCompleted: true }`.
+        let f = parse_agent_list_filter(&json!({ "includeCompleted": true })).unwrap();
+        for terminal in [
+            AgentStatus::Completed,
+            AgentStatus::Error,
+            AgentStatus::Deleted,
+        ] {
+            assert!(f.retains(terminal, None), "{terminal:?} must be included");
+        }
+    }
+
+    #[test]
+    fn agent_list_filter_scope_splits_on_parent() {
+        let top = parse_agent_list_filter(&json!({ "scope": "top-level" })).unwrap();
+        assert!(top.retains(AgentStatus::Active, None));
+        assert!(!top.retains(AgentStatus::Active, Some("agent-p")));
+
+        let sub = parse_agent_list_filter(&json!({ "scope": "subagents" })).unwrap();
+        assert!(!sub.retains(AgentStatus::Active, None));
+        assert!(sub.retains(AgentStatus::Active, Some("agent-p")));
+    }
+
+    #[test]
+    fn agent_list_filter_parent_agent_id_matches_only_children() {
+        let f = parse_agent_list_filter(&json!({ "parentAgentId": "agent-p" })).unwrap();
+        assert!(f.retains(AgentStatus::Active, Some("agent-p")));
+        assert!(!f.retains(AgentStatus::Active, Some("agent-other")));
+        assert!(!f.retains(AgentStatus::Active, None));
+        // Terminal children stay omitted unless includeCompleted.
+        assert!(!f.retains(AgentStatus::Completed, Some("agent-p")));
+
+        // Redundant-but-consistent combo: subagents + parentAgentId.
+        let f =
+            parse_agent_list_filter(&json!({ "scope": "subagents", "parentAgentId": "agent-p" }))
+                .unwrap();
+        assert!(f.retains(AgentStatus::Active, Some("agent-p")));
+        assert!(!f.retains(AgentStatus::Active, Some("agent-other")));
+    }
+
+    #[test]
+    fn agent_list_filter_rejects_non_string_scope_and_parent() {
+        let err = parse_agent_list_filter(&json!({ "scope": 5 })).unwrap_err();
+        assert!(err.contains("scope must be a string"), "{err}");
+        let err = parse_agent_list_filter(&json!({ "parentAgentId": 5 })).unwrap_err();
+        assert!(err.contains("parentAgentId must be a string"), "{err}");
+        // Explicit null still means "absent", matching the JS wrapper.
+        let f = parse_agent_list_filter(&json!({ "scope": null, "parentAgentId": null })).unwrap();
+        assert!(f.retains(AgentStatus::Active, None));
+    }
+
+    #[test]
+    fn agent_list_filter_rejects_invalid_combos() {
+        let err = parse_agent_list_filter(&json!({ "scope": "bogus" })).unwrap_err();
+        assert!(
+            err.contains("\"top-level\"") && err.contains("\"subagents\""),
+            "error must name the valid values: {err}"
+        );
+        let err =
+            parse_agent_list_filter(&json!({ "scope": "top-level", "parentAgentId": "agent-p" }))
+                .unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
 
     fn entry(id: &str, extra: &Value) -> Value {
         let mut v = json!({
