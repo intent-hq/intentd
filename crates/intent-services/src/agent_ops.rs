@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -67,192 +67,9 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::Services;
-
-const TASK_REVISION_KEY: &str = "taskRevision";
-const EXPECTED_HEAD_SHA_KEY: &str = "expectedHeadSha";
-const SCOPE_HASH_KEY: &str = "scopeHash";
-const ASSIGNMENT_SCOPE_KEY: &str = "assignmentScope";
-const ASSIGNMENT_INSTRUCTIONS_KEY: &str = "assignmentInstructions";
-const ASSIGNMENT_TASK_NOTE_ID_KEY: &str = "assignmentTaskNoteId";
-
-#[derive(Debug)]
-struct AssignmentFence {
-    task_revision: String,
-    expected_head_sha: Option<String>,
-    scope_hash: String,
-    scope: Vec<String>,
-    instructions: String,
-    task_note_id: Option<NoteId>,
-}
-
-fn digest_json(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).expect("JSON value serialization cannot fail");
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    hex
-}
-
-fn canonical_assignment_scope(scope: Option<&[String]>) -> Result<Vec<String>> {
-    let mut canonical = Vec::new();
-    for raw in scope.unwrap_or_default() {
-        let normalized = raw.trim().replace('\\', "/");
-        if normalized.is_empty() {
-            return Err(Error::InvalidParams(
-                "agent.delegate: scope entries cannot be empty".to_string(),
-            ));
-        }
-        if normalized.starts_with('/') {
-            return Err(Error::InvalidParams(format!(
-                "agent.delegate: scope entries must be repository-relative: {raw}"
-            )));
-        }
-        let mut parts = Vec::new();
-        for part in normalized.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    return Err(Error::InvalidParams(format!(
-                        "agent.delegate: scope entries cannot contain '..': {raw}"
-                    )))
-                }
-                other => parts.push(other),
-            }
-        }
-        if parts.is_empty() {
-            return Err(Error::InvalidParams(format!(
-                "agent.delegate: scope entry has no repository-relative path: {raw}"
-            )));
-        }
-        canonical.push(parts.join("/"));
-    }
-    canonical.sort_unstable();
-    canonical.dedup();
-    Ok(canonical)
-}
-
-fn assignment_repository_path(workspace_path: &Path, scope: &[String]) -> Result<PathBuf> {
-    let workspace_root = workspace_path.canonicalize().map_err(|e| {
-        Error::Internal(format!(
-            "agent.delegate: resolve workspace repository path failed: {e}"
-        ))
-    })?;
-    let mut roots = Vec::new();
-    for entry in scope {
-        let mut candidate = workspace_root.join(entry);
-        while !candidate.exists() && candidate != workspace_root {
-            candidate.pop();
-        }
-        if candidate.is_file() {
-            candidate.pop();
-        }
-        let candidate = candidate.canonicalize().map_err(|e| {
-            Error::InvalidParams(format!(
-                "agent.delegate: resolve scope entry {entry} failed: {e}"
-            ))
-        })?;
-        if !candidate.starts_with(&workspace_root) {
-            return Err(Error::InvalidParams(format!(
-                "agent.delegate: scope entry resolves outside the workspace: {entry}"
-            )));
-        }
-        let mut probe = candidate;
-        let root = loop {
-            if probe.join(".git").exists() || intent_git::refs::rev_parse(&probe, "HEAD").is_ok() {
-                break probe;
-            }
-            if probe == workspace_root || !probe.pop() {
-                break workspace_root.clone();
-            }
-        };
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    if roots.len() > 1 {
-        return Err(Error::InvalidParams(
-            "agent.delegate: scope spans multiple Git repositories; split it into one delegation per repository"
-                .to_string(),
-        ));
-    }
-    Ok(roots.pop().unwrap_or(workspace_root))
-}
-
-fn assignment_content(content: &str) -> String {
-    content
-        .replace("\r\n", "\n")
-        .lines()
-        .take_while(|line| !line.trim().to_ascii_lowercase().starts_with("## progress"))
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
-}
-
-fn scope_overlaps_path(scope: &str, path: &str) -> bool {
-    scope.is_empty()
-        || scope == path
-        || path
-            .strip_prefix(scope)
-            .is_some_and(|rest| rest.starts_with('/'))
-        || scope
-            .strip_prefix(path)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-fn task_revision(note: Option<&intent_core::Note>, instructions: &str, scope: &[String]) -> String {
-    let acceptance = note
-        .and_then(|n| n.metadata.task.as_ref())
-        .map(|t| t.acceptance_criteria.clone())
-        .unwrap_or_default();
-    digest_json(&json!({
-        "title": note.map_or("", |n| n.title.trim()),
-        "content": note.map_or_else(String::new, |n| assignment_content(&n.content)),
-        "acceptanceCriteria": acceptance,
-        "instructions": instructions.trim(),
-        "scope": scope,
-    }))
-}
-
-fn assignment_fence(session: &AgentSession) -> Option<AssignmentFence> {
-    let metadata = session.metadata.as_ref()?;
-    let task_revision = metadata.get(TASK_REVISION_KEY)?.as_str()?.to_string();
-    let scope_hash = metadata.get(SCOPE_HASH_KEY)?.as_str()?.to_string();
-    let scope = metadata
-        .get(ASSIGNMENT_SCOPE_KEY)
-        .and_then(Value::as_array)?
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    Some(AssignmentFence {
-        task_revision,
-        expected_head_sha: metadata
-            .get(EXPECTED_HEAD_SHA_KEY)
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        scope_hash,
-        scope,
-        instructions: metadata
-            .get(ASSIGNMENT_INSTRUCTIONS_KEY)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        task_note_id: metadata
-            .get(ASSIGNMENT_TASK_NOTE_ID_KEY)
-            .and_then(Value::as_str)
-            .map(NoteId::from),
-    })
-}
 
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
@@ -6381,98 +6198,6 @@ impl Services {
         .await;
     }
 
-    /// Return a quarantine reason when a fenced delegated assignment is no
-    /// longer current. Legacy sessions without all fence fields fail open.
-    pub(crate) async fn assignment_quarantine_reason(
-        &self,
-        session: &AgentSession,
-    ) -> Option<String> {
-        let fence = assignment_fence(session)?;
-        if digest_json(&json!(fence.scope)) != fence.scope_hash {
-            return Some("scope-hash-invalid".to_string());
-        }
-        if !fence.scope.is_empty() {
-            let Some(expected_head) = fence.expected_head_sha.as_deref() else {
-                return Some("expected-head-missing".to_string());
-            };
-            let workspace_path = self
-                .store
-                .get_workspace(&session.workspace_id)
-                .await
-                .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w));
-            let assignment_repo = workspace_path.as_deref().and_then(|path| {
-                let workspace_root = path.canonicalize().ok()?;
-                assignment_repository_path(path, &fence.scope)
-                    .ok()
-                    .map(|repo| (workspace_root, repo))
-            });
-            if assignment_repo.as_ref().is_none_or(|path| {
-                !intent_git::refs::is_ancestor(&path.1, expected_head, "HEAD").unwrap_or(false)
-            }) {
-                return Some("expected-head-not-ancestor".to_string());
-            }
-            let (workspace_path, assignment_repo) = assignment_repo.expect("checked above");
-            let repo_relative_scopes = fence
-                .scope
-                .iter()
-                .filter_map(|scope| {
-                    workspace_path
-                        .join(scope)
-                        .strip_prefix(&assignment_repo)
-                        .ok()
-                        .map(|path| path.to_string_lossy().replace('\\', "/"))
-                })
-                .collect::<Vec<_>>();
-            let changed = intent_git::diff::diff_two_dot(&assignment_repo, expected_head, "HEAD")
-                .unwrap_or_default();
-            if changed.iter().any(|file| {
-                repo_relative_scopes
-                    .iter()
-                    .any(|scope| scope_overlaps_path(scope, &file.path))
-            }) {
-                return Some("scope-changed-since-delegation".to_string());
-            }
-        }
-        let task_note_id = fence.task_note_id.as_ref()?;
-        if session.task_note_id.as_ref() != Some(task_note_id) {
-            return Some("assignment-task-changed".to_string());
-        }
-        let Ok(note) = crate::fetch_note(&self.store, &session.workspace_id, task_note_id).await
-        else {
-            return Some("task-missing".to_string());
-        };
-        let current_revision = task_revision(Some(&note), &fence.instructions, &fence.scope);
-        if current_revision != fence.task_revision {
-            return Some("task-revision-mismatch".to_string());
-        }
-        let Some(task) = note.metadata.task.as_ref() else {
-            return Some("task-metadata-missing".to_string());
-        };
-        let mut newest_fence = None;
-        for agent_id in task.assigned_agent_ids.iter().rev() {
-            let Ok(assigned) = self.store.get_agent_session(agent_id).await else {
-                continue;
-            };
-            if assigned.task_note_id.as_ref() == Some(task_note_id) {
-                if let Some(assigned_fence) = assignment_fence(&assigned) {
-                    newest_fence = Some(assigned_fence);
-                    break;
-                }
-            }
-        }
-        let Some(newest) = newest_fence else {
-            return Some("assignment-no-longer-current".to_string());
-        };
-        if newest.scope_hash != fence.scope_hash {
-            return Some("scope-superseded".to_string());
-        }
-        if newest.task_revision != fence.task_revision {
-            return Some("task-revision-superseded".to_string());
-        }
-        None
-    }
-
     /// `agent.reportToParent`: a delegated child reports back to its parent
     /// (PROTOCOL §5.5). Caller identity comes only from the MCP front door; the
     /// RPC dispatch path passes `None`, so it always surfaces `-32603`. When the
@@ -6509,22 +6234,6 @@ impl Services {
             return Err(Error::NotFound(format!("agent session {caller}")));
         }
         let parent = session.parent_agent_id.clone().ok_or_else(not_delegated)?;
-        if let Some(reason) = self.assignment_quarantine_reason(&session).await {
-            let fence = assignment_fence(&session).expect("fenced session");
-            tracing::warn!(
-                agent = %caller.0,
-                task = ?session.task_note_id,
-                %reason,
-                "quarantined stale delegated-agent report"
-            );
-            return Ok(json!({
-                "ok": false,
-                "quarantined": true,
-                "reason": reason,
-                "taskRevision": fence.task_revision,
-                "scopeHash": fence.scope_hash,
-            }));
-        }
         // `report` is declared as a string on the MCP surface; coerce other
         // JSON shapes to their textual form for delivery.
         let report_text = match &report {
@@ -6803,22 +6512,6 @@ impl Services {
         // `NotFound` before any state changes.
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {caller}")));
-        }
-        if let Some(reason) = self.assignment_quarantine_reason(&session).await {
-            let fence = assignment_fence(&session).expect("fenced session");
-            tracing::warn!(
-                agent = %caller.0,
-                task = ?session.task_note_id,
-                %reason,
-                "quarantined stale delegated-agent attention request"
-            );
-            return Ok(json!({
-                "ok": false,
-                "quarantined": true,
-                "reason": reason,
-                "taskRevision": fence.task_revision,
-                "scopeHash": fence.scope_hash,
-            }));
         }
         // 1. Persist the pending attention request on the session via the
         // narrow attention writer (with `clear_attention_request` the only
@@ -7118,13 +6811,6 @@ impl Services {
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
         let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
-        let assignment_instructions = input
-            .agent_instructions
-            .as_deref()
-            .and_then(first_nonempty)
-            .or_else(|| task_text_msg.clone())
-            .unwrap_or_default();
-        let assignment_scope = canonical_assignment_scope(input.scope.as_deref())?;
         let mut message = input
             .agent_instructions
             .as_deref()
@@ -7140,17 +6826,6 @@ impl Services {
                 .ok(),
             None => None,
         };
-        // The legacy `noteId` + `taskText` form addresses a checkbox inside a
-        // regular containing note. Keep its session linkage, but do not apply
-        // task-assignment fencing when that note has no task metadata. Modern
-        // `taskNoteId` delegations and legacy forms that resolve to real task
-        // notes retain the full task fence.
-        let legacy_checkbox_note = input.task_note_id.is_none()
-            && input.note_id.is_some()
-            && task_text_msg.is_some()
-            && task_note
-                .as_ref()
-                .is_some_and(|note| note.metadata.task.is_none());
         if message.is_none() {
             if let Some(note) = task_note.as_ref() {
                 message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
@@ -7271,19 +6946,6 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
-        let assignment_repo = workspace_path
-            .as_deref()
-            .map(|path| assignment_repository_path(path, &assignment_scope))
-            .transpose()?;
-        let expected_head_sha = assignment_repo
-            .as_deref()
-            .and_then(|path| intent_git::refs::rev_parse(path, "HEAD").ok());
-        let scope_hash = digest_json(&json!(assignment_scope));
-        let revision = task_revision(
-            task_note.as_ref(),
-            &assignment_instructions,
-            &assignment_scope,
-        );
         // Specialist validation (monorepo#3497): reject an unknown specialist
         // id with `-32602` HERE, before provider/effort resolution — an
         // unknown id would otherwise surface as a confusing provider-
@@ -7380,22 +7042,6 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
-        extra_metadata.insert(TASK_REVISION_KEY.to_string(), json!(revision));
-        extra_metadata.insert(EXPECTED_HEAD_SHA_KEY.to_string(), json!(expected_head_sha));
-        extra_metadata.insert(SCOPE_HASH_KEY.to_string(), json!(scope_hash));
-        extra_metadata.insert(ASSIGNMENT_SCOPE_KEY.to_string(), json!(assignment_scope));
-        extra_metadata.insert(
-            ASSIGNMENT_INSTRUCTIONS_KEY.to_string(),
-            json!(assignment_instructions),
-        );
-        if !legacy_checkbox_note {
-            if let Some(task_note_id) = &session_task_note_id {
-                extra_metadata.insert(
-                    ASSIGNMENT_TASK_NOTE_ID_KEY.to_string(),
-                    json!(task_note_id.0),
-                );
-            }
-        }
         let extra = AgentCreateExtra {
             provider: delegate_provider,
             reasoning_effort,
@@ -7634,9 +7280,6 @@ impl Services {
             "ok": true,
             "agentId": agent_id,
             "name": name,
-            "taskRevision": revision,
-            "expectedHeadSha": expected_head_sha,
-            "scopeHash": scope_hash,
         });
         if let Some(provider) = provider {
             result
@@ -7801,13 +7444,6 @@ impl Services {
             classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
         };
         use intent_core::BatchTaskEntry;
-
-        if input.scope.is_some() {
-            return Err(Error::InvalidParams(
-                "agent.delegate: scope is supported only for single-task delegation; batch delegation remains semantic-only"
-                    .to_string(),
-            ));
-        }
 
         let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
         // Per-task option overrides, keyed by task-note id. Only OBJECT
@@ -7991,7 +7627,6 @@ impl Services {
                         wait_mode: input.wait_mode.clone(),
                         skip_auto_commit: input.skip_auto_commit,
                         isolation: input.isolation.clone(),
-                        scope: None,
                         ..Default::default()
                     };
                     match Box::pin(self.agent_delegate_op(
@@ -8005,14 +7640,6 @@ impl Services {
                             obj.insert("disposition".into(), json!("started"));
                             obj.insert("agentId".into(), res["agentId"].clone());
                             obj.insert("agentName".into(), res["name"].clone());
-                            obj.insert("taskRevision".into(), res["taskRevision"].clone());
-                            obj.insert("scopeHash".into(), res["scopeHash"].clone());
-                            if !res["expectedHeadSha"].is_null() {
-                                obj.insert(
-                                    "expectedHeadSha".into(),
-                                    res["expectedHeadSha"].clone(),
-                                );
-                            }
                             started_ids.push(id.clone());
                         }
                         Err(e) => {
