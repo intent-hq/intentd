@@ -1152,7 +1152,9 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
         "result echoes the marker: {dismissed}"
     );
 
-    // `agent:updated` carries the marker on the wire.
+    // `agent:updated` carries the marker on the wire — and the session's
+    // pending-questions marker alongside it, so the event is self-contained
+    // (monorepo#3180): clients re-derive the hold without an `agent.get`.
     let mut saw_updated = false;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
@@ -1161,6 +1163,11 @@ async fn question_hold_released_by_dismiss_questions_over_wss() {
             && ev["data"]["agentId"].as_str() == Some(asker_id.as_str())
             && ev["data"]["dismissedQuestionsMessageId"] == json!(question_mid)
         {
+            assert_eq!(
+                ev["data"]["pendingQuestionsMessageId"],
+                json!(question_mid),
+                "dismiss event carries the pending marker: {ev}"
+            );
             saw_updated = true;
             break;
         }
