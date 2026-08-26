@@ -2740,6 +2740,23 @@ impl Store {
     /// adjusted rank, then newest-first, one row per matching message.
     /// `limit` `None` → no cap.
     ///
+    /// Shape (monorepo#3529): ranking and result materialization split into
+    /// two phases inside one statement, and — critically — the ranking phase
+    /// never reads any `agent_message` column stored *after* `content`. In
+    /// the record layout `created_at` follows the multi-KB `content` blob,
+    /// so reading it walks the row's overflow-page chain; the single-pass
+    /// predecessor did that for every FTS candidate and took ~6.5s cold on a
+    /// 600MB dogfood DB (vs 0.04s for the FTS rank itself). The inner
+    /// subquery therefore ranks candidates using only cheap leading columns
+    /// (`agent_id` for the workspace boost, plus any filters) and tiebreaks
+    /// equal ranks by `rowid DESC` — the log is append-only, so rowid order
+    /// is insert order and `rowid DESC` is the same newest-first tiebreak —
+    /// then applies the LIMIT; the outer query joins `content`, `created_at`
+    /// and the session context back for just the returned rows and orders
+    /// the final page by the documented `rank/created_at/id` key. The optional
+    /// filters are spliced in only when present, so the common unfiltered
+    /// search never evaluates per-candidate `? IS NULL` guards.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -2752,37 +2769,55 @@ impl Store {
         prefer_workspace_id: Option<&WorkspaceId>,
         limit: Option<i64>,
     ) -> Result<Vec<MessageFtsMatch>> {
-        let rows = sqlx::query(
+        let mut filters = String::new();
+        if workspace_id.is_some() {
+            filters.push_str(" AND s.workspace_id = ?");
+        }
+        if agent_id.is_some() {
+            filters.push_str(" AND m.agent_id = ?");
+        }
+        if role.is_some() {
+            filters.push_str(" AND m.role = ?");
+        }
+        let sql = format!(
             "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
-                    s.workspace_id, s.name AS agent_name, \
-                    bm25(agent_message_fts) \
-                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) \
-                      + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
-             FROM agent_message_fts \
-             JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
+                    s.workspace_id, s.name AS agent_name, top.adjusted_rank \
+             FROM ( \
+                 SELECT agent_message_fts.rowid AS msg_rowid, \
+                        bm25(agent_message_fts) \
+                          - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) \
+                          + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
+                 FROM agent_message_fts \
+                 JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
+                 JOIN agent_session s ON s.id = m.agent_id \
+                 JOIN workspace w ON w.id = s.workspace_id \
+                 WHERE agent_message_fts MATCH ?{filters} \
+                 ORDER BY adjusted_rank ASC, msg_rowid DESC \
+                 LIMIT ? \
+             ) top \
+             JOIN agent_message m ON m.rowid = top.msg_rowid \
              JOIN agent_session s ON s.id = m.agent_id \
-             JOIN workspace w ON w.id = s.workspace_id \
-             WHERE agent_message_fts MATCH ? \
-               AND (? IS NULL OR s.workspace_id = ?) \
-               AND (? IS NULL OR m.agent_id = ?) \
-               AND (? IS NULL OR m.role = ?) \
-             ORDER BY adjusted_rank ASC, m.created_at DESC, m.id ASC \
-             LIMIT ?",
-        )
-        .bind(prefer_workspace_id.map(|w| w.0.as_str()))
-        .bind(PREFER_WORKSPACE_BOOST)
-        .bind(ARCHIVED_WORKSPACE_PENALTY)
-        .bind(match_expr)
-        .bind(workspace_id.map(|w| w.0.as_str()))
-        .bind(workspace_id.map(|w| w.0.as_str()))
-        .bind(agent_id)
-        .bind(agent_id)
-        .bind(role)
-        .bind(role)
-        .bind(limit.map_or(-1, |n| n.max(0)))
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("search agent messages failed: {e}")))?;
+             ORDER BY top.adjusted_rank ASC, m.created_at DESC, m.id ASC"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(prefer_workspace_id.map(|w| w.0.as_str()))
+            .bind(PREFER_WORKSPACE_BOOST)
+            .bind(ARCHIVED_WORKSPACE_PENALTY)
+            .bind(match_expr);
+        if let Some(ws) = workspace_id {
+            query = query.bind(ws.0.as_str());
+        }
+        if let Some(agent) = agent_id {
+            query = query.bind(agent);
+        }
+        if let Some(role) = role {
+            query = query.bind(role);
+        }
+        let rows = query
+            .bind(limit.map_or(-1, |n| n.max(0)))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("search agent messages failed: {e}")))?;
         rows.iter()
             .map(|row| {
                 let content: serde_json::Value =
@@ -9656,5 +9691,274 @@ mod tests {
             .insert_workspace(&workspace)
             .await
             .expect("insert workspace");
+    }
+
+    /// Seed a message-heavy fixture for the `search.messages` FTS benchmark:
+    /// `n_ws` workspaces (the last one archived), `agents_per_ws` sessions
+    /// each, `msgs_per_agent` user/assistant messages per session. Most
+    /// messages contain the broad token "deploy" (the pathological
+    /// common-term query from monorepo#3529); every message carries a few
+    /// hundred bytes of filler so the fixture approximates a real dogfood
+    /// transcript DB.
+    async fn seed_search_bench_fixture(
+        store: &Store,
+        n_ws: usize,
+        agents_per_ws: usize,
+        msgs_per_agent: usize,
+    ) -> Vec<WorkspaceId> {
+        let ts = "2026-01-01T00:00:00Z";
+        let filler = "component pipeline latency budget review checklist artifact \
+                      terminal session workspace daemon protocol channel release ";
+        let mut ws_ids = Vec::new();
+        for wi in 0..n_ws {
+            let ws_id = WorkspaceId(format!("ws-bench-{wi}"));
+            let mut ws = baseline_test_workspace(&ws_id, ts);
+            if wi == n_ws - 1 {
+                ws.archived = true;
+                ws.archived_at = Some(ts.to_string());
+            }
+            store.insert_workspace(&ws).await.expect("insert ws");
+            for ai in 0..agents_per_ws {
+                let agent_id = AgentId(format!("agent-bench-{wi}-{ai}"));
+                let session = baseline_test_session(&agent_id, &ws_id, ts, None);
+                let mut contents = Vec::with_capacity(msgs_per_agent);
+                let mut stamps = Vec::with_capacity(msgs_per_agent);
+                for mi in 0..msgs_per_agent {
+                    // ~90% of messages match the broad query token.
+                    let lead = if mi % 10 == 0 { "quiet" } else { "deploy" };
+                    let text = format!(
+                        "{lead} step {wi}-{ai}-{mi}: {}",
+                        filler.repeat(16 + (mi % 16))
+                    );
+                    contents.push(serde_json::json!([{ "type": "text", "text": text }]));
+                    // Globally unique, insertion-ordered stamps (day=ws,
+                    // hour=agent), mirroring the production append-only log
+                    // where created_at order == rowid order.
+                    stamps.push(format!(
+                        "2026-01-{:02}T{:02}:{:02}:{:02}Z",
+                        wi + 1,
+                        ai,
+                        mi / 60,
+                        mi % 60
+                    ));
+                }
+                let messages: Vec<ReplaceMessage<'_>> = contents
+                    .iter()
+                    .zip(&stamps)
+                    .enumerate()
+                    .map(|(mi, (content, created_at))| ReplaceMessage {
+                        role: if mi % 2 == 0 { "user" } else { "assistant" },
+                        content,
+                        metadata: None,
+                        created_at,
+                    })
+                    .collect();
+                store
+                    .insert_agent_session_with_messages(&session, &messages)
+                    .await
+                    .expect("insert session with messages");
+            }
+            ws_ids.push(ws_id);
+        }
+        ws_ids
+    }
+
+    /// The retired single-pass `search.messages` query (pre-monorepo#3529),
+    /// kept verbatim as the semantics reference for the equivalence test and
+    /// the manual benchmark: same boosts, filters, ordering, and limit
+    /// handling as the shipped two-phase shape, expressed the old way.
+    const SINGLE_PASS_SEARCH_SQL: &str =
+        "SELECT m.id AS message_id, m.agent_id, m.role, m.content, m.created_at, \
+                    s.workspace_id, s.name AS agent_name, \
+                    bm25(agent_message_fts) \
+                      - (CASE WHEN s.workspace_id = ? THEN ? ELSE 0.0 END) \
+                      + (CASE WHEN w.archived <> 0 THEN ? ELSE 0.0 END) AS adjusted_rank \
+             FROM agent_message_fts \
+             JOIN agent_message m ON m.rowid = agent_message_fts.rowid \
+             JOIN agent_session s ON s.id = m.agent_id \
+             JOIN workspace w ON w.id = s.workspace_id \
+             WHERE agent_message_fts MATCH ? \
+               AND (? IS NULL OR s.workspace_id = ?) \
+               AND (? IS NULL OR m.agent_id = ?) \
+               AND (? IS NULL OR m.role = ?) \
+             ORDER BY adjusted_rank ASC, m.created_at DESC, m.id ASC \
+             LIMIT ?";
+
+    /// Run [`SINGLE_PASS_SEARCH_SQL`] with the same parameter surface as
+    /// [`Store::search_agent_messages_fts`], returning `(message_id, rank)`
+    /// pairs in result order.
+    async fn single_pass_search(
+        store: &Store,
+        match_expr: &str,
+        workspace_id: Option<&WorkspaceId>,
+        agent_id: Option<&str>,
+        role: Option<&str>,
+        prefer_workspace_id: Option<&WorkspaceId>,
+        limit: Option<i64>,
+    ) -> Vec<(String, f64)> {
+        let rows = sqlx::query(SINGLE_PASS_SEARCH_SQL)
+            .bind(prefer_workspace_id.map(|w| w.0.as_str()))
+            .bind(PREFER_WORKSPACE_BOOST)
+            .bind(ARCHIVED_WORKSPACE_PENALTY)
+            .bind(match_expr)
+            .bind(workspace_id.map(|w| w.0.as_str()))
+            .bind(workspace_id.map(|w| w.0.as_str()))
+            .bind(agent_id)
+            .bind(agent_id)
+            .bind(role)
+            .bind(role)
+            .bind(limit.map_or(-1, |n| n.max(0)))
+            .fetch_all(store.read_pool())
+            .await
+            .expect("single-pass reference query");
+        rows.iter()
+            .map(|row| {
+                (
+                    col::<String>(row, "message_id").expect("message_id"),
+                    col::<f64>(row, "adjusted_rank").expect("adjusted_rank"),
+                )
+            })
+            .collect()
+    }
+
+    /// Equivalence guard for the two-phase `search_agent_messages_fts` shape
+    /// (monorepo#3529): across every filter/boost/limit combination, the
+    /// shipped query must return exactly the rows — same order, same
+    /// adjusted ranks — as the retired single-pass reference query.
+    #[tokio::test]
+    async fn search_messages_fts_two_phase_matches_single_pass() {
+        type Case<'a> = (
+            &'a str,
+            Option<&'a WorkspaceId>,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a WorkspaceId>,
+            Option<i64>,
+        );
+        let tmp = TempDb::new("test-fts-two-phase-equivalence");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_ids = seed_search_bench_fixture(&store, 3, 2, 40).await;
+        let ws0 = &ws_ids[0];
+        let archived = &ws_ids[2];
+        let agent = "agent-bench-0-1";
+
+        let cases: Vec<Case<'_>> = vec![
+            ("deploy", None, None, None, None, Some(10)),
+            ("deploy", None, None, None, Some(ws0), Some(10)),
+            ("deploy", None, None, None, Some(archived), Some(25)),
+            ("deploy", Some(ws0), None, None, None, Some(25)),
+            ("deploy", Some(archived), None, None, Some(ws0), Some(10)),
+            ("deploy", None, Some(agent), None, Some(ws0), Some(5)),
+            ("deploy", None, None, Some("assistant"), None, Some(10)),
+            (
+                "deploy",
+                Some(ws0),
+                Some(agent),
+                Some("user"),
+                Some(ws0),
+                Some(7),
+            ),
+            ("deploy", None, None, None, Some(ws0), None),
+            ("deploy", None, None, None, None, Some(0)),
+            ("quiet", None, None, None, Some(ws0), Some(10)),
+            ("nomatchterm", None, None, None, None, Some(10)),
+        ];
+        for (match_expr, ws, agent_id, role, prefer, limit) in cases {
+            let reference =
+                single_pass_search(&store, match_expr, ws, agent_id, role, prefer, limit).await;
+            let shipped = store
+                .search_agent_messages_fts(match_expr, ws, agent_id, role, prefer, limit)
+                .await
+                .expect("two-phase query")
+                .into_iter()
+                .map(|m| (m.message_id, m.rank))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shipped, reference,
+                "two-phase result diverged from single-pass reference for \
+                 match={match_expr:?} ws={ws:?} agent={agent_id:?} role={role:?} \
+                 prefer={prefer:?} limit={limit:?}"
+            );
+        }
+    }
+
+    /// Manual benchmark for the `search.messages` query shapes (monorepo#3529).
+    /// Compares the retired single-pass shape (full result rows — including
+    /// the message `content` blob — dragged through the ORDER BY sorter for
+    /// every FTS candidate) against the shipped two-phase shape (rank a
+    /// minimal projection, join content back for the LIMIT rows only) and an
+    /// FTS-only floor (no joins/boosts; not semantics-preserving — lower
+    /// bound reference). Run with:
+    /// `cargo test -p intent-store --release bench_search_messages_fts_query_shapes -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "manual benchmark (monorepo#3529); run with --ignored --nocapture, --release"]
+    async fn bench_search_messages_fts_query_shapes() {
+        use std::time::Instant;
+        let tmp = TempDb::new("bench-search-fts");
+        let store = Store::open(&tmp).await.expect("create bench store");
+        let ws_ids = seed_search_bench_fixture(&store, 10, 4, 2500).await;
+        let prefer = ws_ids[0].0.as_str();
+        let match_expr = r#"("deploy" OR "deploy"*)"#;
+
+        let old_shape = SINGLE_PASS_SEARCH_SQL;
+        let fts_only = "SELECT rowid, bm25(agent_message_fts) AS r \
+             FROM agent_message_fts WHERE agent_message_fts MATCH ? \
+             ORDER BY r ASC LIMIT ?";
+
+        for prefer_bind in [None, Some(prefer)] {
+            for (name, run) in [("old-single-pass", true), ("new-two-phase", false)] {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    let n = if run {
+                        sqlx::query(old_shape)
+                            .bind(prefer_bind)
+                            .bind(PREFER_WORKSPACE_BOOST)
+                            .bind(ARCHIVED_WORKSPACE_PENALTY)
+                            .bind(match_expr)
+                            .bind(Option::<&str>::None)
+                            .bind(Option::<&str>::None)
+                            .bind(Option::<&str>::None)
+                            .bind(Option::<&str>::None)
+                            .bind(Option::<&str>::None)
+                            .bind(Option::<&str>::None)
+                            .bind(10_i64)
+                            .fetch_all(store.read_pool())
+                            .await
+                            .expect("old shape")
+                            .len()
+                    } else {
+                        store
+                            .search_agent_messages_fts(
+                                match_expr,
+                                None,
+                                None,
+                                None,
+                                prefer_bind.map(WorkspaceId::from).as_ref(),
+                                Some(10),
+                            )
+                            .await
+                            .expect("new shape")
+                            .len()
+                    };
+                    assert_eq!(n, 10);
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                println!("prefer={:?} {name}: best {best:.3}s", prefer_bind.is_some());
+            }
+        }
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let rows = sqlx::query(fts_only)
+                .bind(match_expr)
+                .bind(10_i64)
+                .fetch_all(store.read_pool())
+                .await
+                .expect("fts only");
+            assert_eq!(rows.len(), 10);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("fts-only floor: best {best:.3}s");
     }
 }
