@@ -21,7 +21,7 @@ use intent_services::browser_ops;
 use serde_json::{Map, Value};
 
 use crate::events::{error_frame, success_frame};
-use crate::reverse::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
+use crate::reverse::{request_timeout, ReverseChannel};
 
 /// The `browser.*` methods, once classified. Kept as an enum for parity with
 /// `host::HostMethod` and to leave room for future additions without changing
@@ -143,8 +143,9 @@ pub(crate) async fn exec(
         BrowserExecError::InvalidParams(e.message)
     })?;
     let forwarded = browser_ops::build_forward_params(&args);
+    let timeout = request_timeout("browser.exec", &forwarded);
     let fe_response = reverse
-        .request("browser.exec", forwarded, DEFAULT_REVERSE_TIMEOUT)
+        .request("browser.exec", forwarded, timeout)
         .await
         .map_err(|e| BrowserExecError::Proxy(format!("browser.exec: {}", e.message)))?;
     browser_ops::shape_result(&fe_response).map_err(|e| BrowserExecError::Proxy(e.message))

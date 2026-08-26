@@ -2993,6 +2993,7 @@ impl SystemControl for DaemonControl {
             has_display: detect_has_display(),
             max_agents: self.manager.registry().cap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_commit: intent_transport::BUILD_COMMIT.map(str::to_string),
             uptime_seconds: self.start_time.elapsed().as_secs(),
             local_ips,
             hostname,

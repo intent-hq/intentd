@@ -32,6 +32,7 @@ impl FakeControl {
                 has_display: true,
                 max_agents: 20,
                 version: "0.1.0".to_string(),
+                build_commit: Some("0123456789abcdef".to_string()),
                 uptime_seconds: 123,
                 local_ips: vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()],
                 hostname: "studio.local".to_string(),
@@ -125,6 +126,7 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["agents"], 1);
     assert_eq!(local["maxAgents"], 20);
     assert_eq!(local["version"], "0.1.0");
+    assert_eq!(local["buildCommit"], "0123456789abcdef");
     assert_eq!(local["uptimeSeconds"], 123);
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
@@ -162,6 +164,7 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         has_display: false,
         max_agents: 8,
         version: "0.1.0".to_string(),
+        build_commit: None,
         uptime_seconds: 456,
         local_ips: Vec::new(),
         hostname: "intent".to_string(),
@@ -195,6 +198,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert_eq!(v["childMemoryPeakBytes"], Value::Null);
     // Budget off ⇒ the budget fields are ABSENT (presence-detected), not null.
     let obj = v.as_object().unwrap();
+    // Builds without source metadata omit the additive identity field.
+    assert!(!obj.contains_key("buildCommit"));
     assert!(!obj.contains_key("agentMemoryBudgetBytes"));
     assert!(!obj.contains_key("agentMemoryChargedBytes"));
     assert!(!obj.contains_key("queuedSpawns"));

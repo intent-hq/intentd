@@ -5143,6 +5143,11 @@ impl AgentManager {
                 )));
             }
         }
+        // Resolve the id before any queue gate so every delivery path carries
+        // the same durable identity. Internal completion wakes supply a stable
+        // id; restart retries then adopt the existing queue entry or transcript
+        // row instead of minting a second wake.
+        let message_id = message_id.unwrap_or_else(new_message_id);
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
@@ -5161,8 +5166,9 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message_with_origin(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
@@ -5212,14 +5218,16 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_message(
+                    let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                         &agent_id,
+                        Some(message_id.clone()),
                         content,
                         options.image_blocks.clone(),
                         options.file_blocks.clone(),
                         options.message_metadata.clone(),
                         options.queued_prepend(),
                         options.interrupt_priority,
+                        false,
                     );
                     let result = json!({
                         "success": true,
@@ -5265,14 +5273,16 @@ impl AgentManager {
         // row flips the hold false and kicks the drain. Checked BEFORE
         // `try_begin` so even an idle agent holds the delivery.
         if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
-            let (queued, position) = self.services.enqueue_message(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
+                false,
             );
             let result = json!({
                 "success": true,
@@ -5319,8 +5329,9 @@ impl AgentManager {
             && self.services.has_ready_to_send(&agent_id)
             && self.services.question_hold_active(&agent_id).await
         {
-            let (queued, position) = self.services.enqueue_message_with_origin(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
@@ -5342,8 +5353,9 @@ impl AgentManager {
             return Ok(result);
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let (queued, position) = self.services.enqueue_message_with_origin(
+            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                 &agent_id,
+                Some(message_id.clone()),
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
@@ -5361,7 +5373,6 @@ impl AgentManager {
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(result);
         }
-        let message_id = message_id.unwrap_or_else(new_message_id);
         // Delivery-time unblocked hints (monorepo#2044), direct-send arm: an
         // idle target delivers the wake immediately, so delivery time is NOW
         // — compute the section here so an unqueued completion wake carries
@@ -5448,8 +5459,9 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message_with_origin(
+                let (queued, position) = self.services.enqueue_message_with_id_and_origin(
                     &agent_id,
+                    Some(message_id.clone()),
                     content,
                     options.image_blocks.clone(),
                     options.file_blocks.clone(),

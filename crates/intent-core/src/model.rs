@@ -2456,7 +2456,7 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "1.1";
+pub const CURRENT_HARNESS_VERSION: &str = "2.0";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -2917,6 +2917,16 @@ pub struct AgentMetadata {
     /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_agent_id: Option<String>,
+    /// Semantic identity of the delegated task assignment. Unlike `Note.rev`,
+    /// this excludes progress-only task-note sections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_revision: Option<String>,
+    /// Repository HEAD recorded when the delegated assignment was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_head_sha: Option<String>,
+    /// Hash of the canonical repository-relative assignment scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_hash: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -3138,6 +3148,24 @@ impl AgentLite {
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
+        let task_revision = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("taskRevision"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let expected_head_sha = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("expectedHeadSha"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let scope_hash = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("scopeHash"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -3158,6 +3186,9 @@ impl AgentLite {
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
+            task_revision,
+            expected_head_sha,
+            scope_hash,
         };
         Self {
             id: session.id,
@@ -3377,6 +3408,10 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
+    /// Optional repository-relative file/directory scope for assignment
+    /// fencing. The service canonicalizes, sorts, and deduplicates entries
+    /// before hashing and persistence.
+    pub scope: Option<Vec<String>>,
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task

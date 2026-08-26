@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use intent_core::{AgentReverseDispatch, BoxFuture, ReverseDispatchError};
 use serde_json::Value;
 
-use super::{ReverseChannel, DEFAULT_REVERSE_TIMEOUT};
+use super::{request_timeout, ReverseChannel};
 
 /// Registry of live reverse channels ordered by arrival. Cheap to clone
 /// (`Arc` inside).
@@ -129,13 +129,13 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             let Some(channel) = channel else {
                 return Err(ReverseDispatchError::NoClient);
             };
-            channel
-                .request(method, params, DEFAULT_REVERSE_TIMEOUT)
-                .await
-                .map_err(|e| ReverseDispatchError::Transport {
+            let timeout = request_timeout(method, &params);
+            channel.request(method, params, timeout).await.map_err(|e| {
+                ReverseDispatchError::Transport {
                     code: e.code,
                     message: e.message,
-                })
+                }
+            })
         })
     }
 }

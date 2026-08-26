@@ -23,6 +23,9 @@ pub use server::{collect_bind_interfaces, collect_local_ips, PairingSnapshot, Se
 pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 
+/// Source commit embedded at build time, when the build environment can identify it.
+pub const BUILD_COMMIT: Option<&str> = option_env!("INTENTD_EMBEDDED_BUILD_COMMIT");
+
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children
 /// spawned by lib tests (e.g. real provider CLIs in host-ops probes) inherit

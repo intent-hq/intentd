@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -67,9 +67,192 @@ const WAIT_MODE_AFTER_ALL: &str = "after_all";
 const WAKE_OR_CREATE_SOURCE: &str = "wake_or_create_task_agent";
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::Services;
+
+const TASK_REVISION_KEY: &str = "taskRevision";
+const EXPECTED_HEAD_SHA_KEY: &str = "expectedHeadSha";
+const SCOPE_HASH_KEY: &str = "scopeHash";
+const ASSIGNMENT_SCOPE_KEY: &str = "assignmentScope";
+const ASSIGNMENT_INSTRUCTIONS_KEY: &str = "assignmentInstructions";
+const ASSIGNMENT_TASK_NOTE_ID_KEY: &str = "assignmentTaskNoteId";
+
+#[derive(Debug)]
+struct AssignmentFence {
+    task_revision: String,
+    expected_head_sha: Option<String>,
+    scope_hash: String,
+    scope: Vec<String>,
+    instructions: String,
+    task_note_id: Option<NoteId>,
+}
+
+fn digest_json(value: &Value) -> String {
+    let bytes = serde_json::to_vec(value).expect("JSON value serialization cannot fail");
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+fn canonical_assignment_scope(scope: Option<&[String]>) -> Result<Vec<String>> {
+    let mut canonical = Vec::new();
+    for raw in scope.unwrap_or_default() {
+        let normalized = raw.trim().replace('\\', "/");
+        if normalized.is_empty() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: scope entries cannot be empty".to_string(),
+            ));
+        }
+        if normalized.starts_with('/') {
+            return Err(Error::InvalidParams(format!(
+                "agent.delegate: scope entries must be repository-relative: {raw}"
+            )));
+        }
+        let mut parts = Vec::new();
+        for part in normalized.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.delegate: scope entries cannot contain '..': {raw}"
+                    )))
+                }
+                other => parts.push(other),
+            }
+        }
+        if parts.is_empty() {
+            return Err(Error::InvalidParams(format!(
+                "agent.delegate: scope entry has no repository-relative path: {raw}"
+            )));
+        }
+        canonical.push(parts.join("/"));
+    }
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn assignment_repository_path(workspace_path: &Path, scope: &[String]) -> Result<PathBuf> {
+    let workspace_root = workspace_path.canonicalize().map_err(|e| {
+        Error::Internal(format!(
+            "agent.delegate: resolve workspace repository path failed: {e}"
+        ))
+    })?;
+    let mut roots = Vec::new();
+    for entry in scope {
+        let mut candidate = workspace_root.join(entry);
+        while !candidate.exists() && candidate != workspace_root {
+            candidate.pop();
+        }
+        if candidate.is_file() {
+            candidate.pop();
+        }
+        let candidate = candidate.canonicalize().map_err(|e| {
+            Error::InvalidParams(format!(
+                "agent.delegate: resolve scope entry {entry} failed: {e}"
+            ))
+        })?;
+        if !candidate.starts_with(&workspace_root) {
+            return Err(Error::InvalidParams(format!(
+                "agent.delegate: scope entry resolves outside the workspace: {entry}"
+            )));
+        }
+        let mut probe = candidate;
+        let root = loop {
+            if probe.join(".git").exists() || intent_git::refs::rev_parse(&probe, "HEAD").is_ok() {
+                break probe;
+            }
+            if probe == workspace_root || !probe.pop() {
+                break workspace_root.clone();
+            }
+        };
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if roots.len() > 1 {
+        return Err(Error::InvalidParams(
+            "agent.delegate: scope spans multiple Git repositories; split it into one delegation per repository"
+                .to_string(),
+        ));
+    }
+    Ok(roots.pop().unwrap_or(workspace_root))
+}
+
+fn assignment_content(content: &str) -> String {
+    content
+        .replace("\r\n", "\n")
+        .lines()
+        .take_while(|line| !line.trim().to_ascii_lowercase().starts_with("## progress"))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn scope_overlaps_path(scope: &str, path: &str) -> bool {
+    scope.is_empty()
+        || scope == path
+        || path
+            .strip_prefix(scope)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || scope
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn task_revision(note: Option<&intent_core::Note>, instructions: &str, scope: &[String]) -> String {
+    let acceptance = note
+        .and_then(|n| n.metadata.task.as_ref())
+        .map(|t| t.acceptance_criteria.clone())
+        .unwrap_or_default();
+    digest_json(&json!({
+        "title": note.map_or("", |n| n.title.trim()),
+        "content": note.map_or_else(String::new, |n| assignment_content(&n.content)),
+        "acceptanceCriteria": acceptance,
+        "instructions": instructions.trim(),
+        "scope": scope,
+    }))
+}
+
+fn assignment_fence(session: &AgentSession) -> Option<AssignmentFence> {
+    let metadata = session.metadata.as_ref()?;
+    let task_revision = metadata.get(TASK_REVISION_KEY)?.as_str()?.to_string();
+    let scope_hash = metadata.get(SCOPE_HASH_KEY)?.as_str()?.to_string();
+    let scope = metadata
+        .get(ASSIGNMENT_SCOPE_KEY)
+        .and_then(Value::as_array)?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    Some(AssignmentFence {
+        task_revision,
+        expected_head_sha: metadata
+            .get(EXPECTED_HEAD_SHA_KEY)
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        scope_hash,
+        scope,
+        instructions: metadata
+            .get(ASSIGNMENT_INSTRUCTIONS_KEY)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        task_note_id: metadata
+            .get(ASSIGNMENT_TASK_NOTE_ID_KEY)
+            .and_then(Value::as_str)
+            .map(NoteId::from),
+    })
+}
 
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
@@ -117,9 +300,13 @@ pub(crate) struct AgentSnapshot {
     /// Active workspace event subscriptions owned by this agent.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) event_subscriptions: usize,
-    /// Delegated child agents genuinely in flight (pending/active/
-    /// Processing/Waiting status) — idle/restorable children do not count
-    /// (monorepo#3384).
+    /// Delegated children that are executing a live runtime turn now.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) active_sub_agents: usize,
+    /// Delegated children not yet settled, including idle/background waiters.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) unsettled_sub_agents: usize,
+    /// Legacy compatibility count for children in an in-flight status.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) running_sub_agents: usize,
     /// Structured questions still pending presentation/answer.
@@ -151,6 +338,8 @@ impl AgentSnapshot {
             && self.agent_watches == 0
             && self.queued_messages == 0
             && self.event_subscriptions == 0
+            && self.active_sub_agents == 0
+            && self.unsettled_sub_agents == 0
             && self.running_sub_agents == 0
             && self.num_questions_asked == 0
             && self.pr_monitors.is_empty()
@@ -6121,6 +6310,98 @@ impl Services {
         .await;
     }
 
+    /// Return a quarantine reason when a fenced delegated assignment is no
+    /// longer current. Legacy sessions without all fence fields fail open.
+    pub(crate) async fn assignment_quarantine_reason(
+        &self,
+        session: &AgentSession,
+    ) -> Option<String> {
+        let fence = assignment_fence(session)?;
+        if digest_json(&json!(fence.scope)) != fence.scope_hash {
+            return Some("scope-hash-invalid".to_string());
+        }
+        if !fence.scope.is_empty() {
+            let Some(expected_head) = fence.expected_head_sha.as_deref() else {
+                return Some("expected-head-missing".to_string());
+            };
+            let workspace_path = self
+                .store
+                .get_workspace(&session.workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w));
+            let assignment_repo = workspace_path.as_deref().and_then(|path| {
+                let workspace_root = path.canonicalize().ok()?;
+                assignment_repository_path(path, &fence.scope)
+                    .ok()
+                    .map(|repo| (workspace_root, repo))
+            });
+            if assignment_repo.as_ref().is_none_or(|path| {
+                !intent_git::refs::is_ancestor(&path.1, expected_head, "HEAD").unwrap_or(false)
+            }) {
+                return Some("expected-head-not-ancestor".to_string());
+            }
+            let (workspace_path, assignment_repo) = assignment_repo.expect("checked above");
+            let repo_relative_scopes = fence
+                .scope
+                .iter()
+                .filter_map(|scope| {
+                    workspace_path
+                        .join(scope)
+                        .strip_prefix(&assignment_repo)
+                        .ok()
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                })
+                .collect::<Vec<_>>();
+            let changed = intent_git::diff::diff_two_dot(&assignment_repo, expected_head, "HEAD")
+                .unwrap_or_default();
+            if changed.iter().any(|file| {
+                repo_relative_scopes
+                    .iter()
+                    .any(|scope| scope_overlaps_path(scope, &file.path))
+            }) {
+                return Some("scope-changed-since-delegation".to_string());
+            }
+        }
+        let task_note_id = fence.task_note_id.as_ref()?;
+        if session.task_note_id.as_ref() != Some(task_note_id) {
+            return Some("assignment-task-changed".to_string());
+        }
+        let Ok(note) = crate::fetch_note(&self.store, &session.workspace_id, task_note_id).await
+        else {
+            return Some("task-missing".to_string());
+        };
+        let current_revision = task_revision(Some(&note), &fence.instructions, &fence.scope);
+        if current_revision != fence.task_revision {
+            return Some("task-revision-mismatch".to_string());
+        }
+        let Some(task) = note.metadata.task.as_ref() else {
+            return Some("task-metadata-missing".to_string());
+        };
+        let mut newest_fence = None;
+        for agent_id in task.assigned_agent_ids.iter().rev() {
+            let Ok(assigned) = self.store.get_agent_session(agent_id).await else {
+                continue;
+            };
+            if assigned.task_note_id.as_ref() == Some(task_note_id) {
+                if let Some(assigned_fence) = assignment_fence(&assigned) {
+                    newest_fence = Some(assigned_fence);
+                    break;
+                }
+            }
+        }
+        let Some(newest) = newest_fence else {
+            return Some("assignment-no-longer-current".to_string());
+        };
+        if newest.scope_hash != fence.scope_hash {
+            return Some("scope-superseded".to_string());
+        }
+        if newest.task_revision != fence.task_revision {
+            return Some("task-revision-superseded".to_string());
+        }
+        None
+    }
+
     /// `agent.reportToParent`: a delegated child reports back to its parent
     /// (PROTOCOL §5.5). Caller identity comes only from the MCP front door; the
     /// RPC dispatch path passes `None`, so it always surfaces `-32603`. When the
@@ -6157,6 +6438,22 @@ impl Services {
             return Err(Error::NotFound(format!("agent session {caller}")));
         }
         let parent = session.parent_agent_id.clone().ok_or_else(not_delegated)?;
+        if let Some(reason) = self.assignment_quarantine_reason(&session).await {
+            let fence = assignment_fence(&session).expect("fenced session");
+            tracing::warn!(
+                agent = %caller.0,
+                task = ?session.task_note_id,
+                %reason,
+                "quarantined stale delegated-agent report"
+            );
+            return Ok(json!({
+                "ok": false,
+                "quarantined": true,
+                "reason": reason,
+                "taskRevision": fence.task_revision,
+                "scopeHash": fence.scope_hash,
+            }));
+        }
         // `report` is declared as a string on the MCP surface; coerce other
         // JSON shapes to their textual form for delivery.
         let report_text = match &report {
@@ -6193,12 +6490,10 @@ impl Services {
                 .await;
         }
 
-        // Immediate parent wake for non-grouped children: if this child is in an
-        // `after_all` delegation group, skip the immediate wake — the group's
-        // aggregated wake will fold this report in when all children settle. Otherwise,
-        // deliver the wake NOW unconditionally to the parent, then mark the parent's
-        // ungrouped watches to suppress their agent:idle delivery (report-time wake
-        // requirement).
+        // Immediate progress wake for non-grouped children. A report does not
+        // consume a terminal completion watch: idle/failure/deletion still owns
+        // the final wake and durable one-shot retirement. Grouped reports remain
+        // deferred to the single after_all aggregate.
         let grouped = self.child_in_undelivered_group(&parent, &caller);
         if !grouped {
             // Deliver the wake in the parent's HOME workspace: for a
@@ -6210,33 +6505,19 @@ impl Services {
                 .get_agent_session(&parent)
                 .await
                 .map_or_else(|_| workspace_id.clone(), |s| s.workspace_id);
-            // Mark any ungrouped watches whose parent matches this parent as
-            // report_delivered, so deliver_completion_to_watches will skip agent:idle
-            // for them (suppressing the duplicate wake). Do NOT mark watches for other
-            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
-            // completion wake and should not receive the report wake. The marking runs
-            // BEFORE the wake is built (issue intent-hq/monorepo#2528) so the wake's
-            // disarm disclosure — text suffix + metadata — reflects the actual flip.
             let watches = self.find_watches_for_child(&caller);
-            let mut marked = false;
-            for watch in watches.iter().filter(|w| {
-                w.group_id.is_none() && w.parent_agent_id == parent && !w.report_delivered
-            }) {
-                marked |= self.mark_watch_report_delivered(&watch.id);
-            }
+            let watch_still_armed = watches
+                .iter()
+                .any(|watch| watch.group_id.is_none() && watch.parent_agent_id == parent);
             // Deliver exactly ONE wake to the parent, regardless of watch count.
             // Format the wake message with the persisted report. "reported", not
-            // "completed" — a report is not necessarily a completion (monorepo#2528).
-            // `marked` = the flip disarmed the parent's one-shot watch for
-            // agent:idle — it never fires on the child's completion again
-            // (failure/deletion still deliver); the wake discloses it with the
-            // re-arm pointer, mirroring the #2051 retirement note in
-            // `format_completion_wake`. Wording owned by the harness (H6).
+            // "completed" — a report is not necessarily a completion. Passing
+            // false omits the terminal retirement/re-arm suffix.
             let wake_text = crate::harness::latest().report_to_parent_wake(
                 &session.name,
                 &caller.0,
                 &report_text,
-                marked,
+                false,
             );
             // Build event notification metadata (mirroring deliver_completion_to_watches).
             let mut metadata = json!({
@@ -6262,82 +6543,22 @@ impl Services {
                     }
                 }]
             });
-            // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
-            // the reporting child's linked task-note id plus its recorded
-            // flipped completions (consumed here — this report wake is the
-            // completion cycle's one wake, since it disarms the idle-time
-            // delivery) so the delivery path can compute the "tasks now
-            // unblocked" section fresh at render time. Only the triggering
-            // facts are stored here.
-            let mut trigger_tasks: Vec<(String, String)> = Vec::new();
-            if let Some(note_id) = &task_note_id {
-                trigger_tasks.push((workspace_id.0.clone(), note_id.0.clone()));
-            }
-            for pair in self.take_flipped_completion_triggers(&caller).await {
-                if !trigger_tasks.contains(&pair) {
-                    trigger_tasks.push(pair);
-                }
-            }
-            ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
-            // Machine-readable disarm flag (monorepo#2060 parity, the
-            // `hookStillActive` twin): present iff this call flipped a watch;
-            // omitted entirely when nothing was disarmed.
-            if marked {
-                metadata["watchStillArmed"] = json!(false);
+            // Progress does not consume completion trigger facts. They remain
+            // available for the terminal wake that retires the watch.
+            if watch_still_armed {
+                metadata["watchStillArmed"] = json!(true);
             }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
-            match self
+            if let Err(e) = self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
                 .await
             {
-                Ok(_) => {
-                    // monorepo#2889: the parent just heard THIS report cycle —
-                    // record its identity (the report timestamp, the same
-                    // #2842 identity) in the per-pair delivery marker so the
-                    // same cycle's completion wake cannot re-embed the report
-                    // body. The `report_delivered` watch flag alone does not
-                    // survive the cycle: every re-arm path (agent.watch
-                    // adoption, SUB-1 sender auto-subscribe, watch reuse)
-                    // clears it as fresh interest (monorepo#2532), and a
-                    // parent with NO watch at report time still receives this
-                    // wake. The marker skip in
-                    // `deliver_completion_to_watches` leaves the watch ARMED,
-                    // so a re-armed watch still fires on a FUTURE cycle (new
-                    // timestamp). Grouped children never reach here (their
-                    // report defers to the aggregated wake), and a failed
-                    // send records nothing (the parent never heard the
-                    // report, so the completion wake must still carry it).
-                    // Best-effort: a write failure only restores the pre-fix
-                    // duplicate for this cycle.
-                    if let Err(e) = self
-                        .store
-                        .record_completion_wake_delivery(&parent, &caller, &saved_at, &now_iso())
-                        .await
-                    {
-                        tracing::warn!(
-                            parent = %parent.0,
-                            child = %caller.0,
-                            error = %e,
-                            "completion wake dedup record failed at reportToParent delivery"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        parent = %parent.0,
-                        child = %caller.0,
-                        "failed to deliver reportToParent wake to parent"
-                    );
-                }
-            }
-            // Marking flips the parent's waiting projection (report_delivered
-            // watches are excluded), so publish the refreshed flags in the
-            // parent's HOME workspace — the watch anchor — to keep connected
-            // clients from serving a stale `isWaitingForOtherAgents: true`.
-            if marked {
-                self.publish_subscriptions_changed(&parent_home_ws, &parent)
-                    .await;
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver reportToParent progress wake to parent"
+                );
             }
         }
 
@@ -6511,6 +6732,22 @@ impl Services {
         // `NotFound` before any state changes.
         if session.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {caller}")));
+        }
+        if let Some(reason) = self.assignment_quarantine_reason(&session).await {
+            let fence = assignment_fence(&session).expect("fenced session");
+            tracing::warn!(
+                agent = %caller.0,
+                task = ?session.task_note_id,
+                %reason,
+                "quarantined stale delegated-agent attention request"
+            );
+            return Ok(json!({
+                "ok": false,
+                "quarantined": true,
+                "reason": reason,
+                "taskRevision": fence.task_revision,
+                "scopeHash": fence.scope_hash,
+            }));
         }
         // 1. Persist the pending attention request on the session via the
         // narrow attention writer (with `clear_attention_request` the only
@@ -6810,6 +7047,13 @@ impl Services {
         let skip_auto_commit = input.skip_auto_commit.unwrap_or(false)
             || !self.effective_auto_commit(&workspace_id).await;
         let task_text_msg = input.task_text.as_deref().and_then(first_nonempty);
+        let assignment_instructions = input
+            .agent_instructions
+            .as_deref()
+            .and_then(first_nonempty)
+            .or_else(|| task_text_msg.clone())
+            .unwrap_or_default();
+        let assignment_scope = canonical_assignment_scope(input.scope.as_deref())?;
         let mut message = input
             .agent_instructions
             .as_deref()
@@ -6825,6 +7069,17 @@ impl Services {
                 .ok(),
             None => None,
         };
+        // The legacy `noteId` + `taskText` form addresses a checkbox inside a
+        // regular containing note. Keep its session linkage, but do not apply
+        // task-assignment fencing when that note has no task metadata. Modern
+        // `taskNoteId` delegations and legacy forms that resolve to real task
+        // notes retain the full task fence.
+        let legacy_checkbox_note = input.task_note_id.is_none()
+            && input.note_id.is_some()
+            && task_text_msg.is_some()
+            && task_note
+                .as_ref()
+                .is_some_and(|note| note.metadata.task.is_none());
         if message.is_none() {
             if let Some(note) = task_note.as_ref() {
                 message = first_nonempty(&note.content).or_else(|| first_nonempty(&note.title));
@@ -6945,6 +7200,19 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
+        let assignment_repo = workspace_path
+            .as_deref()
+            .map(|path| assignment_repository_path(path, &assignment_scope))
+            .transpose()?;
+        let expected_head_sha = assignment_repo
+            .as_deref()
+            .and_then(|path| intent_git::refs::rev_parse(path, "HEAD").ok());
+        let scope_hash = digest_json(&json!(assignment_scope));
+        let revision = task_revision(
+            task_note.as_ref(),
+            &assignment_instructions,
+            &assignment_scope,
+        );
         let delegate_provider = if let Some(provider_param) = input.provider.as_deref() {
             ensure_known_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
@@ -7031,6 +7299,22 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
+        extra_metadata.insert(TASK_REVISION_KEY.to_string(), json!(revision));
+        extra_metadata.insert(EXPECTED_HEAD_SHA_KEY.to_string(), json!(expected_head_sha));
+        extra_metadata.insert(SCOPE_HASH_KEY.to_string(), json!(scope_hash));
+        extra_metadata.insert(ASSIGNMENT_SCOPE_KEY.to_string(), json!(assignment_scope));
+        extra_metadata.insert(
+            ASSIGNMENT_INSTRUCTIONS_KEY.to_string(),
+            json!(assignment_instructions),
+        );
+        if !legacy_checkbox_note {
+            if let Some(task_note_id) = &session_task_note_id {
+                extra_metadata.insert(
+                    ASSIGNMENT_TASK_NOTE_ID_KEY.to_string(),
+                    json!(task_note_id.0),
+                );
+            }
+        }
         let extra = AgentCreateExtra {
             provider: delegate_provider,
             reasoning_effort,
@@ -7265,7 +7549,14 @@ impl Services {
         }
 
         // Include effective isolation in the result when isolation was requested
-        let mut result = json!({ "ok": true, "agentId": agent_id, "name": name });
+        let mut result = json!({
+            "ok": true,
+            "agentId": agent_id,
+            "name": name,
+            "taskRevision": revision,
+            "expectedHeadSha": expected_head_sha,
+            "scopeHash": scope_hash,
+        });
         if let Some(provider) = provider {
             result
                 .as_object_mut()
@@ -7429,6 +7720,13 @@ impl Services {
             classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
         };
         use intent_core::BatchTaskEntry;
+
+        if input.scope.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: scope is supported only for single-task delegation; batch delegation remains semantic-only"
+                    .to_string(),
+            ));
+        }
 
         let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
         // Per-task option overrides, keyed by task-note id. Only OBJECT
@@ -7596,6 +7894,7 @@ impl Services {
                         wait_mode: input.wait_mode.clone(),
                         skip_auto_commit: input.skip_auto_commit,
                         isolation: input.isolation.clone(),
+                        scope: None,
                         ..Default::default()
                     };
                     match Box::pin(self.agent_delegate_op(
@@ -7609,6 +7908,14 @@ impl Services {
                             obj.insert("disposition".into(), json!("started"));
                             obj.insert("agentId".into(), res["agentId"].clone());
                             obj.insert("agentName".into(), res["name"].clone());
+                            obj.insert("taskRevision".into(), res["taskRevision"].clone());
+                            obj.insert("scopeHash".into(), res["scopeHash"].clone());
+                            if !res["expectedHeadSha"].is_null() {
+                                obj.insert(
+                                    "expectedHeadSha".into(),
+                                    res["expectedHeadSha"].clone(),
+                                );
+                            }
                             started_ids.push(id.clone());
                         }
                         Err(e) => {
@@ -8915,19 +9222,21 @@ impl Services {
             .get(agent_id)
             .map_or(0, std::vec::Vec::len);
         let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
-        // Delegated children genuinely in flight (pending/active/Processing/
-        // Waiting) — idle/restorable children are NOT "running"
-        // (monorepo#3384). One aggregate statement over the
-        // `parent_agent_id` index, unscoped by workspace so a Chief
-        // parent's cross-workspace delegates count too — O(this agent's
-        // children), never O(workspace sessions). Fails open to 0.
-        let running_sub_agents = usize::try_from(
-            self.store
-                .count_running_child_agents(agent_id)
-                .await
-                .unwrap_or(0),
-        )
-        .expect("value fits in usize");
+        // One aggregate statement over `idx_agent_parent`, unscoped by
+        // workspace so Chief cross-workspace delegates count too. Active is
+        // the live runtime-turn subset (`is_active`); unsettled also includes
+        // idle children waiting on hooks or other background work. The legacy
+        // running preserves the existing in-flight-status count. Fails open.
+        let child_counts = self
+            .store
+            .count_child_agents(agent_id)
+            .await
+            .unwrap_or_default();
+        let active_sub_agents = usize::try_from(child_counts.active).expect("value fits in usize");
+        let unsettled_sub_agents =
+            usize::try_from(child_counts.unsettled).expect("value fits in usize");
+        let running_sub_agents =
+            usize::try_from(child_counts.running).expect("value fits in usize");
         let num_questions_asked = self.pending_question_count(agent_id).await;
         // Per-agent indexed read over this agent's monitor rows; labels only,
         // no snapshot hydration. Fails open to empty.
@@ -8947,6 +9256,8 @@ impl Services {
             agent_watches,
             queued_messages,
             event_subscriptions,
+            active_sub_agents,
+            unsettled_sub_agents,
             running_sub_agents,
             num_questions_asked,
             pr_monitors,
@@ -11000,8 +11311,47 @@ impl Services {
         interrupt: bool,
         user_origin: bool,
     ) -> (QueuedMessage, usize) {
+        self.enqueue_message_with_id_and_origin(
+            agent_id,
+            None,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            user_origin,
+        )
+    }
+
+    /// Queue a message under a caller-selected durable id. Completion-watch
+    /// delivery uses this so a restart retry adopts the already-persisted queue
+    /// entry instead of creating a duplicate terminal wake.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_message_with_id_and_origin(
+        &self,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        user_origin: bool,
+    ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
-        let id = new_message_id();
+        let id = message_id.unwrap_or_else(new_message_id);
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.entry(agent_id.clone()).or_default();
+        if let Some((position, existing)) =
+            queue.iter().enumerate().find(|(_, queued)| queued.id == id)
+        {
+            return (existing.clone(), position);
+        }
         let queued = QueuedMessage {
             turn_id: id.clone(),
             id,
@@ -11019,11 +11369,6 @@ impl Services {
             interrupt_priority: interrupt,
             user_origin,
         };
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard.entry(agent_id.clone()).or_default();
         let position = if interrupt {
             // Behind earlier interrupts, ahead of every normal entry.
             let idx = queue.iter().take_while(|m| m.interrupt_priority).count();
