@@ -10507,19 +10507,7 @@ impl Services {
             return Ok(response);
         }
 
-        // Create branch: no live session. Purge stale (NotFound / soft-
-        // deleted) assignments first so the subsequent `assign_agent` starts
-        // from a clean list, then build the rich create payload. Poisoned ids
-        // are deliberately NOT purged yet: their assignment must survive a
-        // failed queue migration below so the next wakeOrCreate can retry it;
-        // they are purged after a successful migration instead.
-        let stale_now: Vec<AgentId> = cleaned_up
-            .iter()
-            .filter(|id| !poisoned.contains(id))
-            .cloned()
-            .collect();
-        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &stale_now)
-            .await?;
+        // Create branch: no live session.
         let create_opts = input.create.clone().unwrap_or_default();
 
         // SECURITY: the project tier comes from the stored workspace record.
@@ -10529,6 +10517,29 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
+        // Strict validation (monorepo#3497): the client-supplied
+        // `create.specialist` is validated even when an inherited specialist
+        // wins the B4 precedence below (client input never bypasses the
+        // `-32602`), and BEFORE the stale-assignment purge so a rejected
+        // wake leaves task state untouched.
+        if let Some(spec_id) = create_opts.specialist.as_deref() {
+            self.specialists_service()
+                .canonical_id_or_err(spec_id, workspace_path.as_deref())?;
+        }
+
+        // Purge stale (NotFound / soft-deleted) assignments first so the
+        // subsequent `assign_agent` starts from a clean list, then build the
+        // rich create payload. Poisoned ids are deliberately NOT purged yet:
+        // their assignment must survive a failed queue migration below so the
+        // next wakeOrCreate can retry it; they are purged after a successful
+        // migration instead.
+        let stale_now: Vec<AgentId> = cleaned_up
+            .iter()
+            .filter(|id| !poisoned.contains(id))
+            .cloned()
+            .collect();
+        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &stale_now)
+            .await?;
         // B4: specialist/model inheritance — the previous session's specialist
         // wins; the wake-level `model` override wins over both the previous
         // session's model and the `create.model` fallback. An INHERITED

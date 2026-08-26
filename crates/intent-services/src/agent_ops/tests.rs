@@ -20787,6 +20787,90 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
     );
 }
 
+/// monorepo#3497: an unknown client-supplied `create.specialist` rejects the
+/// wakeOrCreate create branch with `-32602` even when a VALID inherited
+/// specialist would win the B4 precedence (client input never bypasses the
+/// validation), and the rejection is side-effect free — the stale-assignment
+/// purge must not have run, so the previous (deleted) agent's task assignment
+/// survives and no new session is persisted.
+#[tokio::test]
+async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Strict").await;
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            None,
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            AgentCreateExtra::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone(), None)
+        .await
+        .expect("assign prev");
+    // Mark the session deleted: the wake falls through to the create branch
+    // with this row as both the inheritance source AND a stale assignment
+    // the purge would remove.
+    let mut prev_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .await
+        .expect("load prev");
+    prev_session.status = intent_core::AgentStatus::Deleted;
+    prev_session.updated_at = intent_core::now_iso();
+    svc.store()
+        .update_agent_session(&prev_session.workspace_id.clone(), &prev_session)
+        .await
+        .expect("mark prev deleted");
+    let sessions_before = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list before")
+        .len();
+
+    let input = AgentWakeOrCreateInput {
+        create: Some(intent_core::AgentWakeCreateOptions {
+            specialist: Some("no-such-specialist".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "go".into(), input)
+        .await
+        .expect_err("unknown create.specialist must reject despite a valid inherited one");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("unknown specialist: no-such-specialist"),
+        "error names the id: {err}"
+    );
+
+    let sessions_after = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list after")
+        .len();
+    assert_eq!(sessions_after, sessions_before, "no new session persisted");
+    let task = svc
+        .get_my_task(ws.clone(), note_id)
+        .await
+        .expect("task read-back");
+    assert!(
+        task.assigned_agents.iter().any(|a| a.0 == prev_id),
+        "stale-assignment purge must not run before the rejection: {:?}",
+        task.assigned_agents
+    );
+}
+
 /// B7: `messageMetadata` is folded onto the delivered content block on the
 /// create branch (and by construction the wake branch shares the same helper).
 #[tokio::test]
