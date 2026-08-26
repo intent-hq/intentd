@@ -1,13 +1,78 @@
 //! Agent queue repository: durable write-through snapshots of the per-agent
-//! in-memory send queue (migration 0046). Queues are small, so each mutation
-//! replaces the agent's whole persisted queue in one transaction — simple and
-//! race-safe under the single-connection write pool. Rows cascade with their
-//! `agent_session` row (workspace/agent delete needs no explicit cleanup).
+//! in-memory send queue (migration 0046). Each mutation replaces the agent's
+//! whole persisted queue in one transaction — simple and race-safe under the
+//! single-connection write pool. Inserts are chunked multi-row statements
+//! (intent-hq/monorepo#3540 — the write-through used to insert one row per
+//! statement, so every send against an N-entry queue cost O(N) statements),
+//! keeping a replace at O(1) statements for any plausible queue size. Rows
+//! cascade with their `agent_session` row (workspace/agent delete needs no
+//! explicit cleanup).
 
 use intent_core::{AgentId, Error, Result};
-use sqlx::Row;
+use sqlx::{Row, Sqlite, Transaction};
 
 use crate::Store;
+
+/// Columns inserted by the bulk queue writes, in bind order.
+const QUEUE_COLUMNS: &str = "id, agent_id, position, payload, created_at, turn_id";
+
+/// Rows per bulk INSERT chunk. 4096 rows × 6 binds = 24576, well under the
+/// bundled `SQLite`'s `SQLITE_MAX_VARIABLE_NUMBER` (32766 since 3.32); one
+/// chunk covers any plausible queue, so the statement count stays flat.
+const ROWS_PER_STATEMENT: usize = 4096;
+
+/// One encoded queue row ready to bind: `(id, position, payload_json,
+/// created_at, turn_id)` — the owning `agent_id` is bound by the caller.
+type EncodedRow = (String, i64, String, String, String);
+
+/// JSON-encode queue rows for binding, failing fast on an unencodable payload.
+fn encode_rows(rows: &[AgentQueueRow]) -> Result<Vec<EncodedRow>> {
+    rows.iter()
+        .map(|r| {
+            serde_json::to_string(&r.payload)
+                .map(|payload| {
+                    (
+                        r.id.clone(),
+                        r.position,
+                        payload,
+                        r.created_at.clone(),
+                        r.turn_id.clone(),
+                    )
+                })
+                .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
+        })
+        .collect()
+}
+
+/// Insert the encoded rows under `agent_id` in chunked multi-row statements
+/// within the caller's transaction.
+async fn insert_rows(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_id: &AgentId,
+    rows: &[EncodedRow],
+) -> Result<()> {
+    let binds_per_row = QUEUE_COLUMNS.split(',').count();
+    let row_placeholders = format!("({})", vec!["?"; binds_per_row].join(","));
+    for chunk in rows.chunks(ROWS_PER_STATEMENT) {
+        let placeholders = vec![row_placeholders.as_str(); chunk.len()].join(",");
+        let sql = format!("INSERT INTO agent_queue ({QUEUE_COLUMNS}) VALUES {placeholders}");
+        let mut query = sqlx::query(&sql);
+        for (id, position, payload, created_at, turn_id) in chunk {
+            query = query
+                .bind(id)
+                .bind(&agent_id.0)
+                .bind(position)
+                .bind(payload)
+                .bind(created_at)
+                .bind(turn_id);
+        }
+        query
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| Error::Internal(format!("bulk insert agent queue failed: {e}")))?;
+    }
+    Ok(())
+}
 
 /// One persisted queue entry. `payload` is the full internal `QueuedMessage`
 /// JSON (owned by `intent-services`); the store treats it as opaque.
@@ -26,10 +91,10 @@ pub struct AgentQueueRow {
 
 impl Store {
     /// Replace the persisted queue for one agent with the given snapshot
-    /// (delete-then-insert in a single transaction). An empty `rows` slice
-    /// clears the agent's persisted queue. Every row must belong to
-    /// `agent_id` — a mismatch fails fast instead of silently persisting
-    /// rows under the wrong agent.
+    /// (delete-then-bulk-insert in a single transaction, O(1) statements).
+    /// An empty `rows` slice clears the agent's persisted queue. Every row
+    /// must belong to `agent_id` — a mismatch fails fast instead of silently
+    /// persisting rows under the wrong agent.
     ///
     /// # Errors
     ///
@@ -47,22 +112,7 @@ impl Store {
         }
         let pool = self.write_pool();
         let agent_id = agent_id.clone();
-        let owned: Vec<(String, i64, String, String, String)> = rows
-            .iter()
-            .map(|r| {
-                serde_json::to_string(&r.payload)
-                    .map(|payload| {
-                        (
-                            r.id.clone(),
-                            r.position,
-                            payload,
-                            r.created_at.clone(),
-                            r.turn_id.clone(),
-                        )
-                    })
-                    .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
-            })
-            .collect::<Result<_>>()?;
+        let owned = encode_rows(rows)?;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool
@@ -74,21 +124,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("replace agent queue clear failed: {e}")))?;
-            for (id, position, payload, created_at, turn_id) in &owned {
-                sqlx::query(
-                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at, turn_id) \
-                     VALUES (?,?,?,?,?,?)",
-                )
-                .bind(id)
-                .bind(&agent_id.0)
-                .bind(position)
-                .bind(payload)
-                .bind(created_at)
-                .bind(turn_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("replace agent queue insert failed: {e}")))?;
-            }
+            insert_rows(&mut tx, &agent_id, &owned).await?;
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("replace agent queue commit failed: {e}")))?;
@@ -125,22 +161,7 @@ impl Store {
         let pool = self.write_pool();
         let from = from.clone();
         let to = to.clone();
-        let owned: Vec<(String, i64, String, String, String)> = rows
-            .iter()
-            .map(|r| {
-                serde_json::to_string(&r.payload)
-                    .map(|payload| {
-                        (
-                            r.id.clone(),
-                            r.position,
-                            payload,
-                            r.created_at.clone(),
-                            r.turn_id.clone(),
-                        )
-                    })
-                    .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
-            })
-            .collect::<Result<_>>()?;
+        let owned = encode_rows(rows)?;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool
@@ -153,21 +174,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("move agent queue clear failed: {e}")))?;
-            for (id, position, payload, created_at, turn_id) in &owned {
-                sqlx::query(
-                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at, turn_id) \
-                     VALUES (?,?,?,?,?,?)",
-                )
-                .bind(id)
-                .bind(&to.0)
-                .bind(position)
-                .bind(payload)
-                .bind(created_at)
-                .bind(turn_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("move agent queue insert failed: {e}")))?;
-            }
+            insert_rows(&mut tx, &to, &owned).await?;
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("move agent queue commit failed: {e}")))?;
