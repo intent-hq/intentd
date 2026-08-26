@@ -515,7 +515,6 @@ async fn delegate(
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
         force: opt_bool(args, "force"),
-        scope: opt_scope(args)?,
         tasks,
         // Presence-sensitive: `greedy` is REMOVED and any supplied value
         // (even `null`) must reach the service layer for its rejection.
@@ -526,27 +525,6 @@ async fn delegate(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
-}
-
-fn opt_scope(args: &Value) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = args.get("scope") else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
-    let entries = value
-        .as_array()
-        .ok_or_else(|| "scope must be an array of repository-relative path strings".to_string())?;
-    entries
-        .iter()
-        .map(|entry| {
-            entry.as_str().map(str::to_string).ok_or_else(|| {
-                "scope must contain only repository-relative path strings".to_string()
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
 }
 
 /// Resolve the effective delivery priority for `ws.agent.send` /
@@ -1509,16 +1487,6 @@ fn merge_ok(mut v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn assignment_scope_binding_is_strict() {
-        assert_eq!(
-            opt_scope(&json!({ "scope": ["crates/a", "crates/b"] })).unwrap(),
-            Some(vec!["crates/a".to_string(), "crates/b".to_string()])
-        );
-        assert!(opt_scope(&json!({ "scope": "crates/a" })).is_err());
-        assert!(opt_scope(&json!({ "scope": ["crates/a", 7] })).is_err());
-    }
 
     fn entry(id: &str, extra: &Value) -> Value {
         let mut v = json!({
