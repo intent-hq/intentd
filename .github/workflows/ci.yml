@@ -1,10 +1,11 @@
 name: CI
 on:
   # Push-to-main runs only the release build matrix (+ deb-packaging + gate).
-  # The main ruleset enforces strict up-to-date required checks and blocks
-  # direct pushes, so every main commit's tree is identical to one the PR CI
-  # just tested — the test jobs (route/check/coverage-e2e/coverage-all) are
-  # push-skipped via their `if`s (CI audit, 2026-08).
+  # The main ruleset routes every merge through the merge queue (see
+  # `merge_group` below) and blocks direct pushes, so every main commit's
+  # tree is identical to one a merge-queue (or, pre-queue, strict-up-to-date
+  # PR) run just tested — the test jobs (route/check/coverage-e2e/
+  # coverage-all) are push-skipped via their `if`s (CI audit, 2026-08).
   push:
     branches: [main]
   # Fork PRs get no CI: external PRs are not accepted (intent-hq/monorepo#417).
@@ -14,6 +15,13 @@ on:
   # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
   # are completely unaffected.
   pull_request:
+  # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
+  # merged tree before it lands on main, so merge_group runs the same test
+  # jobs as pull_request CI. Merge groups are created by the repo's own
+  # ruleset from already-filed PRs, so they need no same-repo fork guard.
+  # pr-title / conflict-markers are PR-metadata checks that stay
+  # pull_request-only — the gate accepts their skip.
+  merge_group:
 
 permissions:
   contents: read
@@ -57,7 +65,9 @@ jobs:
     # Also skipped on fork PRs (see the `pull_request` trigger comment):
     # route's skip cascades over the needs chain, skipping check /
     # coverage-e2e / coverage-all, so fork PRs can never reach tinybox.
-    if: github.event_name != 'push' && github.event.pull_request.head.repo.full_name == github.repository
+    # Runs on merge_group (see the trigger comment) — merge groups come from
+    # the repo's own ruleset, so no same-repo guard applies there.
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -464,12 +474,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-build-${{ matrix.target }}
-      # On PRs a cheap `cargo check` proves per-target compilation; the full
-      # `--release` build (the expensive part, esp. on Windows) only runs on
-      # push to main. The "Warm PR check cache" step keeps the persistent
-      # target dir warm for PR checks after main builds.
+      # On PRs and merge-queue runs a cheap `cargo check` proves per-target
+      # compilation; the full `--release` build (the expensive part, esp. on
+      # Windows) only runs on push to main. The "Warm PR check cache" step
+      # keeps the persistent target dir warm for PR checks after main builds.
       - name: Check (PR compilation proof)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
       # Clippy over macOS-gated code (intent-hq/monorepo#3285): the `check`
       # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
@@ -486,7 +496,7 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'pull_request' && runner.os == 'macOS'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Build (release)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'pull_request'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
       - name: Warm PR check cache
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
@@ -504,9 +514,11 @@ jobs:
     # The same-repo clause is belt-and-suspenders for the fork-PR policy
     # (see the `pull_request` trigger comment): the route.result guard
     # already skips this job on fork PRs (route is fork-skipped), but this
-    # job can land on tinybox, so it carries the guard explicitly.
+    # job can land on tinybox, so it carries the guard explicitly (merge
+    # groups come from the repo's own ruleset, so the guard passes there
+    # via the event check).
     needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && github.event.pull_request.head.repo.full_name == github.repository && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && (github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -698,9 +710,11 @@ jobs:
     # The same-repo clause is belt-and-suspenders for the fork-PR policy
     # (see the `pull_request` trigger comment): the route.result guard
     # already skips this job on fork PRs (route is fork-skipped), but this
-    # job can land on tinybox, so it carries the guard explicitly.
+    # job can land on tinybox, so it carries the guard explicitly (merge
+    # groups come from the repo's own ruleset, so the guard passes there
+    # via the event check).
     needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name != 'push' && github.event.pull_request.head.repo.full_name == github.repository && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && (github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -1041,8 +1055,11 @@ jobs:
   # a route failure (see release-fast-path above), and on push to main, all
   # legitimate. pr-title / conflict-markers accept success OR skipped since
   # both carry `if: github.event_name == 'pull_request'` and are legitimately
-  # skipped on push runs — requiring strict success there would fail the
-  # gate outside pull_request events.
+  # skipped on push and merge_group runs (PR-metadata checks, already
+  # validated on the PR) — requiring strict success there would fail the
+  # gate outside pull_request events. On merge_group everything else keeps
+  # the pull_request semantics: check / coverage-e2e / coverage-all run
+  # against the queue's merged tree and must pass.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
