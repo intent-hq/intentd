@@ -1204,10 +1204,7 @@ async fn golden_report_to_parent_wake_bytes() {
     assert_eq!(
         texts,
         vec![format!(
-            "[WORKSPACE EVENTS] Child agent {child_name} ({id}) reported. Report: Task \
-             finished. NOTE: this report consumed your one-shot watch on this agent — it \
-             will NOT fire again on completion (failure/deletion still deliver). Call \
-             ws.agent.watch(\"{id}\") again to be woken at its next completion.",
+            "[WORKSPACE EVENTS] Child agent {child_name} ({id}) reported. Report: Task finished.",
             id = child.0
         )]
     );
@@ -1924,8 +1921,10 @@ fn golden_snapshot_full_field_serialization() {
         agent_watches: 2,
         queued_messages: 3,
         event_subscriptions: 4,
-        running_sub_agents: 5,
-        num_questions_asked: 6,
+        active_sub_agents: 5,
+        unsettled_sub_agents: 6,
+        running_sub_agents: 6,
+        num_questions_asked: 7,
         pr_monitors: vec![
             "intent-hq/intentd#7".to_string(),
             "intent-hq/monorepo#8 (changes pending)".to_string(),
@@ -1935,8 +1934,9 @@ fn golden_snapshot_full_field_serialization() {
     assert_eq!(
         serde_json::to_string(&snap).unwrap(),
         "{\"time\":\"2026-01-02T03:04:05Z\",\"hooks\":1,\"agentWatches\":2,\
-         \"queuedMessages\":3,\"eventSubscriptions\":4,\"runningSubAgents\":5,\
-         \"numQuestionsAsked\":6,\"prMonitors\":[\"intent-hq/intentd#7\",\
+         \"queuedMessages\":3,\"eventSubscriptions\":4,\"activeSubAgents\":5,\
+         \"unsettledSubAgents\":6,\"runningSubAgents\":6,\"numQuestionsAsked\":7,\
+         \"prMonitors\":[\"intent-hq/intentd#7\",\
          \"intent-hq/monorepo#8 (changes pending)\"],\"pendingAttention\":\"blocker\"}"
     );
 }

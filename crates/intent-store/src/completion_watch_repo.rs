@@ -31,6 +31,141 @@ pub struct PersistedCompletionWatch {
 }
 
 impl Store {
+    /// Atomically retire one fired completion watch and record the delivered
+    /// completion identity when one exists. The caller invokes this only after
+    /// the parent wake is durable, so a failed transaction leaves the watch as
+    /// the restart-recovery record and a successful transaction cannot leave a
+    /// stale watch behind its dedup marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if the transaction cannot begin, update the
+    /// delivery marker, retire the watch, or commit.
+    pub async fn retire_completion_watch_after_delivery(
+        &self,
+        watch_id: &str,
+        parent_agent_id: &AgentId,
+        child_agent_id: &AgentId,
+        completion_identity: Option<&str>,
+        delivered_at: &str,
+    ) -> Result<()> {
+        let pool = self.write_pool().clone();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("retire completion_watch begin failed: {e}"))
+            })?;
+            if let Some(identity) = completion_identity {
+                sqlx::query(
+                    "INSERT INTO completion_wake_delivery (
+                        parent_agent_id, child_agent_id, completion_identity, delivered_at
+                     ) VALUES (?,?,?,?)
+                     ON CONFLICT(parent_agent_id, child_agent_id) DO UPDATE SET
+                        completion_identity = excluded.completion_identity,
+                        delivered_at = excluded.delivered_at",
+                )
+                .bind(&parent_agent_id.0)
+                .bind(&child_agent_id.0)
+                .bind(identity)
+                .bind(delivered_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "retire completion_watch delivery marker failed: {e}"
+                    ))
+                })?;
+            }
+            sqlx::query("DELETE FROM completion_watch WHERE id = ?")
+                .bind(watch_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("retire completion_watch delete failed: {e}"))
+                })?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("retire completion_watch commit failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Atomically settle a delivered delegation group: failed children that
+    /// can still complete become ungrouped watches, all other group watches are
+    /// retired, and the group row is deleted. A failure leaves the complete
+    /// group and all watches restart-recoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if any settlement statement or the final
+    /// transaction commit fails.
+    pub async fn settle_delegation_group_after_delivery(
+        &self,
+        group_id: &str,
+        retain_children: &[AgentId],
+    ) -> Result<()> {
+        let pool = self.write_pool().clone();
+        let retained: Vec<String> = retain_children.iter().map(|id| id.0.clone()).collect();
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("settle delegation_group begin failed: {e}"))
+            })?;
+            for child_id in &retained {
+                sqlx::query(
+                    "UPDATE completion_watch SET group_id = NULL \
+                     WHERE group_id = ? AND child_agent_id = ?",
+                )
+                .bind(group_id)
+                .bind(child_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("settle delegation_group retain watch failed: {e}"))
+                })?;
+            }
+            if retained.is_empty() {
+                sqlx::query("DELETE FROM completion_watch WHERE group_id = ?")
+                    .bind(group_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "settle delegation_group delete watches failed: {e}"
+                        ))
+                    })?;
+            } else {
+                let placeholders = std::iter::repeat_n("?", retained.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "DELETE FROM completion_watch WHERE group_id = ? \
+                     AND child_agent_id NOT IN ({placeholders})"
+                );
+                let mut query = sqlx::query(&sql).bind(group_id);
+                for child_id in &retained {
+                    query = query.bind(child_id);
+                }
+                query.execute(&mut *tx).await.map_err(|e| {
+                    Error::Internal(format!(
+                        "settle delegation_group delete watches failed: {e}"
+                    ))
+                })?;
+            }
+            sqlx::query("DELETE FROM delegation_group WHERE group_id = ?")
+                .bind(group_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("settle delegation_group delete failed: {e}"))
+                })?;
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("settle delegation_group commit failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Insert a `completion_watch` row, or update its mutable columns on id
     /// conflict (parent anchor/name, `group_id`, `report_delivered`). The
     /// identity columns — child ids/workspace and `created_at` — are fixed at

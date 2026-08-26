@@ -3472,7 +3472,8 @@ mod _dead_dispatch_unit_tests {
                 "delegate_task",
                 json!({ "taskNoteId": "tn", "noteId": "n", "taskText": "t", "agentInstructions": "i",
                         "specialist": "implementor", "model": "opus", "behaviorPrompt": "b",
-                        "waitMode": "after_all", "skipAutoCommit": true }),
+                        "waitMode": "after_all", "skipAutoCommit": true,
+                        "scope": ["crates/intent-core", "crates/intent-services"] }),
             ),
             ("report_to_parent", json!({ "report": "all done" })),
             // `send_message_to_agent` is absent here: `MockApi`
@@ -8584,6 +8585,9 @@ mod wsapi4_bindings_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                task_revision: None,
+                expected_head_sha: None,
+                scope_hash: None,
             },
         }
     }

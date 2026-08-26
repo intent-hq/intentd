@@ -57,6 +57,7 @@ const SNAPSHOT_PREFIX: &str = "current ws.agent.snapshot() => ";
 /// Turn-1 trigger marker: the mock's `rules` entry matches on this, so the
 /// subscription-registering tool call fires ONLY on the first user turn.
 const SUBSCRIBE_MARKER: &str = "SUBSCRIBE_NOW_E2E";
+const CHILD_COUNTER_MARKER: &str = "KEEP_CHILD_ACTIVE_FOR_SNAPSHOT_E2E";
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
@@ -430,6 +431,10 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
                 },
             }],
             "response": "subscribed",
+        }, {
+            "ifPromptContains": CHILD_COUNTER_MARKER,
+            "delayMs": 5000,
+            "response": "child done",
         }],
         "response": "done",
     })
@@ -724,6 +729,34 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         v2["eventSubscriptions"],
         json!(1),
         "gated session's tool still reports its subscription: {v2}"
+    );
+
+    // Create a real delegated child through the MCP bridge, keep its provider
+    // turn in flight, then verify all three child counters over WSS. The legacy
+    // field remains the unsettled alias.
+    let create_code = format!(
+        "return await ws.agent.create('Snapshot Child', '{CHILD_COUNTER_MARKER}', {{ model: 'mock:default' }})"
+    );
+    let (create_err, create_text) = bridge.call_js(&create_code).await;
+    assert!(!create_err, "child creation must succeed: {create_text}");
+    let (child_err, child_text) = bridge.call_js("return await ws.agent.snapshot()").await;
+    assert!(!child_err, "child snapshot must succeed: {child_text}");
+    let child_snapshot: Value =
+        serde_json::from_str(&child_text).expect("child snapshot returns JSON");
+    assert_eq!(
+        child_snapshot["activeSubAgents"],
+        json!(1),
+        "{child_snapshot}"
+    );
+    assert_eq!(
+        child_snapshot["unsettledSubAgents"],
+        json!(1),
+        "{child_snapshot}"
+    );
+    assert_eq!(
+        child_snapshot["runningSubAgents"],
+        json!(1),
+        "legacy running count preserves in-flight status semantics: {child_snapshot}"
     );
 }
 

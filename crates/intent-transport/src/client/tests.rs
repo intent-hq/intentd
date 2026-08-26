@@ -56,6 +56,10 @@ async fn mints_client_id_when_omitted() {
     let server = &resp["result"]["server"];
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(server["version"], json!(env!("CARGO_PKG_VERSION")));
+    match crate::BUILD_COMMIT {
+        Some(build_commit) => assert_eq!(server["buildCommit"], json!(build_commit)),
+        None => assert!(server.get("buildCommit").is_none()),
+    }
     assert_eq!(
         server["protocolVersion"],
         json!(crate::protocol::PROTOCOL_VERSION)
@@ -70,6 +74,13 @@ async fn mints_client_id_when_omitted() {
         json!(true),
         "server advertises the liveState capability (§5.17)"
     );
+}
+
+#[test]
+fn server_identity_omits_an_unknown_build_commit() {
+    let server = server_json(true, "linux", "x86_64", "1.2.3", None, true);
+    assert_eq!(server["version"], "1.2.3");
+    assert!(server.get("buildCommit").is_none());
 }
 
 #[tokio::test]

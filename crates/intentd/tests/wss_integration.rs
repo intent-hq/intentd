@@ -442,6 +442,21 @@ async fn wss_client_hello_and_drafts_round_trip() {
         sess[0]["result"]["server"]["locality"], "remote",
         "WSS ⇒ remote in the client.hello server block (§5.14/§5.17)"
     );
+    assert_eq!(
+        sess[0]["result"]["server"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "client.hello exposes the daemon package version"
+    );
+    match intent_transport::BUILD_COMMIT {
+        Some(build_commit) => assert_eq!(
+            sess[0]["result"]["server"]["buildCommit"], build_commit,
+            "client.hello exposes the daemon build commit when available"
+        ),
+        None => assert!(
+            sess[0]["result"]["server"].get("buildCommit").is_none(),
+            "client.hello omits unavailable build metadata"
+        ),
+    }
     assert_eq!(sess[1]["result"]["ok"], true);
     assert!(sess[1]["result"]["updatedAt"].is_string());
     assert_eq!(sess[2]["result"]["text"], "wss draft");
