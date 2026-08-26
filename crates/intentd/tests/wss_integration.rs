@@ -7729,6 +7729,85 @@ async fn wss_note_version_history_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#3573 over the real WSS wire: a workspace whose
+/// notes carry >1 MiB of content used to serialize a full-content
+/// `note.list` frame past the 1 MiB outbound warn threshold.
+/// `projection: "slim"` (§5.2, v8.1) serves bounded rows — `content`
+/// replaced by `contentPreview` (500 chars) + `contentLength` — so the slim
+/// frame stays far under the threshold, while the default (absent
+/// projection) still round-trips the complete content for existing clients.
+#[tokio::test]
+async fn wss_note_list_slim_projection_bounds_large_frames() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Slim Notes"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // One giant note (~1.1 MiB) reproduces the oversized-list-frame report.
+    let big = "x".repeat(1_100_000);
+    let create_req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "note.create",
+        "params": { "workspaceId": ws_id, "title": "Giant", "content": big },
+    });
+    let sess = wss_session(srv.port, srv.cfg.clone(), vec![create_req.to_string()]).await;
+    assert!(sess[0]["result"]["note"]["id"].is_string(), "{}", sess[0]);
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"note.list","params":{{"workspaceId":"{ws_id}","projection":"slim"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"note.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+
+    // Slim: every row bounded, the giant note's content omitted, and the
+    // whole response well under the 1 MiB warn threshold (< 256 KiB).
+    let slim = &sess[0];
+    let rows = slim["result"]["notes"].as_array().expect("notes array");
+    let giant = rows
+        .iter()
+        .find(|n| n["title"] == "Giant")
+        .expect("giant note listed");
+    assert!(giant.get("content").is_none(), "slim omits content");
+    assert_eq!(
+        giant["contentPreview"].as_str().map(str::len),
+        Some(500),
+        "preview bounded"
+    );
+    assert_eq!(giant["contentLength"].as_i64(), Some(1_100_000));
+    let frame = serde_json::to_string(slim).expect("serialize");
+    assert!(
+        frame.len() < 256 * 1024,
+        "slim frame stays bounded: {} bytes",
+        frame.len()
+    );
+
+    // Default (absent projection): full rows, complete content intact.
+    let full = &sess[1];
+    let rows = full["result"]["notes"].as_array().expect("notes array");
+    let giant = rows
+        .iter()
+        .find(|n| n["title"] == "Giant")
+        .expect("giant note listed");
+    assert_eq!(giant["content"].as_str().map(str::len), Some(1_100_000));
+    assert!(giant.get("contentPreview").is_none());
+
+    srv.ws.stop().await;
+}
+
 /// Regression for monorepo#721 over the real WSS wire: full-content note
 /// writes (`note.setContent`) with non-ASCII content (emoji/CJK) must not
 /// corrupt content or panic the daemon. The CRDT merge engine computes
