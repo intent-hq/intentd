@@ -2759,14 +2759,27 @@ impl Store {
     /// predecessor did that for every FTS candidate and took ~6.5s cold on a
     /// 600MB dogfood DB (vs 0.04s for the FTS rank itself). The inner
     /// subquery therefore ranks candidates using only cheap leading columns
-    /// (`agent_id` for the workspace boost, plus any filters) and tiebreaks
-    /// equal ranks by `rowid DESC` — the log is append-only, so rowid order
-    /// is insert order and `rowid DESC` is the same newest-first tiebreak —
-    /// then applies the LIMIT; the outer query joins `content`, `created_at`
-    /// and the session context back for just the returned rows and orders
-    /// the final page by the documented `rank/created_at/id` key. The optional
-    /// filters are spliced in only when present, so the common unfiltered
-    /// search never evaluates per-candidate `? IS NULL` guards.
+    /// (`agent_id` for the workspace boost, plus any filters), tiebreaks
+    /// equal ranks by `rowid DESC` (insertion-order-newest), and applies the
+    /// LIMIT; the outer query joins `content`, `created_at` and the session
+    /// context back for just the returned rows and orders the final page by
+    /// the documented `rank/created_at/id` key. The optional filters are
+    /// spliced in only when present, so the common unfiltered search never
+    /// evaluates per-candidate `? IS NULL` guards.
+    ///
+    /// Accepted trade-off: the selection-phase tiebreak is
+    /// insertion-order-newest, which equals timestamp-newest only while
+    /// rowid order matches `created_at` order. Two write paths break that
+    /// alignment — [`Store::replace_agent_messages`] (delete + re-insert
+    /// gives the transcript fresh rowids with preserved timestamps) and
+    /// session import via [`Store::insert_agent_session_with_messages`]
+    /// (historical timestamps land at fresh rowids). For such rows, an
+    /// exact-rank tie straddling the LIMIT cutoff may select a different —
+    /// equally-ranked — row than the timestamp tiebreak would (the final
+    /// page's internal ordering is unaffected). Restoring exact timestamp
+    /// selection would mean reading `created_at` during ranking, which is
+    /// precisely the overflow-page cost this shape removes; see
+    /// `search_messages_fts_rowid_tiebreak_divergence_after_import`.
     ///
     /// # Errors
     ///
@@ -9841,7 +9854,10 @@ mod tests {
                     contents.push(serde_json::json!([{ "type": "text", "text": text }]));
                     // Globally unique, insertion-ordered stamps (day=ws,
                     // hour=agent), mirroring the production append-only log
-                    // where created_at order == rowid order.
+                    // where created_at order == rowid order. This alignment
+                    // is what makes the two-phase/single-pass equivalence
+                    // test exact; the rowid-tiebreak divergence test below
+                    // covers the misaligned (import) case.
                     stamps.push(format!(
                         "2026-01-{:02}T{:02}:{:02}:{:02}Z",
                         wi + 1,
@@ -9988,6 +10004,109 @@ mod tests {
                  prefer={prefer:?} limit={limit:?}"
             );
         }
+    }
+
+    /// Documents the accepted rowid-tiebreak trade-off (monorepo#3529, PR
+    /// review): once a write path lands historical `created_at` at fresh
+    /// rowids (session import via `insert_agent_session_with_messages`, or
+    /// `replace_agent_messages`), an exact-rank tie straddling the LIMIT
+    /// cutoff may select a different — equally-ranked — row than the
+    /// retired single-pass query's timestamp tiebreak. This test imports a
+    /// message tying byte-identically in bm25 with the fixture's shortest
+    /// "deploy" docs but carrying the oldest timestamp, then asserts the
+    /// invariants that DO hold: identical rank sequences at the cutoff,
+    /// selections drawn from the same unlimited result set, divergence
+    /// confined to exactly-tied ranks, and full equivalence when no LIMIT
+    /// splits the tie group.
+    #[tokio::test]
+    #[allow(clippy::float_cmp)] // rank ties are byte-identical bm25 values by construction
+    async fn search_messages_fts_rowid_tiebreak_divergence_after_import() {
+        let tmp = TempDb::new("test-fts-rowid-tiebreak-divergence");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_ids = seed_search_bench_fixture(&store, 3, 2, 40).await;
+        let ws0 = &ws_ids[0];
+
+        // Import a session whose message is shaped exactly like the
+        // fixture's shortest "deploy" docs (same token count, tf(deploy)=1
+        // → identical bm25 rank) but with a created_at OLDER than every
+        // fixture message, landing at the newest rowid.
+        let filler = "component pipeline latency budget review checklist artifact \
+                      terminal session workspace daemon protocol channel release ";
+        let agent_id = AgentId("agent-imported-9-9".to_string());
+        let session = baseline_test_session(&agent_id, ws0, "2025-06-01T00:00:00Z", None);
+        let text = format!("deploy step 9-9-16: {}", filler.repeat(16));
+        let content = serde_json::json!([{ "type": "text", "text": text }]);
+        store
+            .insert_agent_session_with_messages(
+                &session,
+                &[ReplaceMessage {
+                    role: "user",
+                    content: &content,
+                    metadata: None,
+                    created_at: "2025-06-01T00:00:00Z",
+                }],
+            )
+            .await
+            .expect("import session");
+
+        // Unlimited: both shapes return the same full row set, and the
+        // outer rank/created_at/id ordering makes them identical.
+        let reference_all =
+            single_pass_search(&store, "deploy", None, None, None, None, None).await;
+        let shipped_all = store
+            .search_agent_messages_fts("deploy", None, None, None, None, None)
+            .await
+            .expect("two-phase query, no limit")
+            .into_iter()
+            .map(|m| (m.message_id, m.rank))
+            .collect::<Vec<_>>();
+        assert_eq!(shipped_all, reference_all, "unlimited results must agree");
+
+        // limit=5 splits the top tie group: rank sequences must still be
+        // identical, every selected row must come from the unlimited set
+        // with its same rank, and any selection difference must be confined
+        // to rows whose adjusted ranks are exactly equal.
+        let reference = single_pass_search(&store, "deploy", None, None, None, None, Some(5)).await;
+        let shipped = store
+            .search_agent_messages_fts("deploy", None, None, None, None, Some(5))
+            .await
+            .expect("two-phase query, limit 5")
+            .into_iter()
+            .map(|m| (m.message_id, m.rank))
+            .collect::<Vec<_>>();
+        assert_eq!(shipped.len(), reference.len());
+        let shipped_ranks: Vec<f64> = shipped.iter().map(|(_, r)| *r).collect();
+        let reference_ranks: Vec<f64> = reference.iter().map(|(_, r)| *r).collect();
+        assert_eq!(
+            shipped_ranks, reference_ranks,
+            "rank sequences at the cutoff must be identical"
+        );
+        for (id, rank) in &shipped {
+            assert!(
+                reference_all
+                    .iter()
+                    .any(|(rid, rr)| rid == id && rr == rank),
+                "shipped row {id} must appear in the unlimited reference set"
+            );
+        }
+        let mut diverged = false;
+        for ((sid, srank), (rid, rrank)) in shipped.iter().zip(&reference) {
+            if sid != rid {
+                diverged = true;
+                assert_eq!(
+                    srank, rrank,
+                    "selection may differ only between exactly-tied ranks \
+                     (shipped {sid} vs reference {rid})"
+                );
+            }
+        }
+        // The imported row does displace a same-rank fixture row at this
+        // cutoff — the trade-off is real, not hypothetical. If this stops
+        // holding, the fixture no longer exercises the misaligned case.
+        assert!(
+            diverged,
+            "expected the rowid tiebreak to select differently at the cutoff"
+        );
     }
 
     /// Manual benchmark for the `search.messages` query shapes (monorepo#3529).
