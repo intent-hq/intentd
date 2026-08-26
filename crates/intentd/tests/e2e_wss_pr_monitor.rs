@@ -337,6 +337,7 @@ impl SourceControl for StubForge {
                     .map(|(name, _, _)| name.clone())
                     .collect(),
             }),
+            is_in_merge_queue: None,
         })
     }
     async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {

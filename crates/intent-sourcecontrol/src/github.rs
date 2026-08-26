@@ -746,6 +746,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
       mergeStateStatus
+      isInMergeQueue
       reviewDecision
       baseRefName
       commits(last: 1) {
@@ -1308,6 +1309,10 @@ impl SourceControl for GitHubSourceControl {
             .and_then(|p| p.get("mergeStateStatus"))
             .and_then(Value::as_str)
             .map(String::from);
+        // Absent on hosts that do not report it: degrades to `None`.
+        let is_in_merge_queue = pr
+            .and_then(|p| p.get("isInMergeQueue"))
+            .and_then(Value::as_bool);
         let rollup = data
             .pointer(ROLLUP_CONTEXTS_POINTER)
             .and_then(Value::as_array);
@@ -1349,6 +1354,7 @@ impl SourceControl for GitHubSourceControl {
             checks,
             checks_known: rollup.is_some(),
             branch_rules,
+            is_in_merge_queue,
         })
     }
 
@@ -1930,9 +1936,11 @@ mod tests {
                 required_conversation_resolution: Some(true),
                 required_status_checks: vec!["build".into()],
             }),
+            is_in_merge_queue: Some(true),
         };
         let wire = serde_json::to_value(&signals).unwrap();
         assert_eq!(wire["mergeStateStatus"], "BLOCKED");
+        assert_eq!(wire["isInMergeQueue"], true);
         assert_eq!(wire["reviewDecision"], "review_required");
         assert_eq!(wire["checksKnown"], true);
         assert_eq!(wire["checks"][0]["isRequired"], true);
@@ -1948,6 +1956,10 @@ mod tests {
             wire["branchRules"]["requiredStatusChecks"],
             json!(["build"])
         );
+
+        // A host that does not report the merge-queue flag omits the key.
+        let wire = serde_json::to_value(MergeRequirementSignals::default()).unwrap();
+        assert!(wire.get("isInMergeQueue").is_none());
     }
 
     #[test]

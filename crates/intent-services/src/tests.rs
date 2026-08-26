@@ -11151,6 +11151,7 @@ mod pr {
                     required_conversation_resolution: Some(true),
                     required_status_checks: vec!["build".into(), "test".into()],
                 }),
+                is_in_merge_queue: None,
             }),
             ..Default::default()
         })
