@@ -684,8 +684,10 @@ async fn dispatch(
             let notes = api.list_notes(&ws_id).await.map_err(domain_to_rpc)?;
             match projection {
                 Some(intent_core::NoteListProjection::Slim) => {
-                    let rows: Vec<Value> =
-                        notes.iter().map(intent_core::note_list_slim_row).collect();
+                    let rows: Vec<Value> = notes
+                        .into_iter()
+                        .map(intent_core::note_list_slim_row)
+                        .collect();
                     Ok(json!({ "notes": rows }))
                 }
                 None => Ok(json!({ "notes": notes })),

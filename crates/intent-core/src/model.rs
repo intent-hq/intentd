@@ -2436,22 +2436,30 @@ pub const NOTE_LIST_PREVIEW_CHARS: usize = 500;
 /// One slim `note.list` row ([`NoteListProjection::Slim`]): the note's full
 /// wire object with `content` removed and replaced by `contentPreview`
 /// (first [`NOTE_LIST_PREVIEW_CHARS`] chars, char-boundary safe by
-/// construction) and `contentLength` (total chars — the same unit as the
-/// `note.listVersions` summaries' SQL `LENGTH(content)`). All other fields
-/// serialize exactly as the full row does.
+/// construction) and `contentLength` (total chars — Unicode scalar values,
+/// the same unit as the `note.listVersions` summaries' SQL `LENGTH(content)`
+/// for the NUL-free content the daemon writes; on content containing U+0000
+/// this counts every scalar while the SQL `LENGTH` stops at the NUL). All
+/// other fields serialize exactly as the full row does.
+///
+/// Consumes the note and takes `content` out BEFORE serializing, so the
+/// full body is never copied into the JSON value — the transform allocates
+/// only the bounded preview, keeping the hot `note.list` path free of
+/// content-sized work beyond the row fetch itself.
 #[must_use]
-pub fn note_list_slim_row(note: &Note) -> serde_json::Value {
-    let mut value = serde_json::to_value(note).unwrap_or(serde_json::Value::Null);
+pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
+    let content = std::mem::take(&mut note.content);
+    let mut value = serde_json::to_value(&note).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut value {
         map.remove("content");
-        let preview: String = note.content.chars().take(NOTE_LIST_PREVIEW_CHARS).collect();
+        let preview: String = content.chars().take(NOTE_LIST_PREVIEW_CHARS).collect();
         map.insert(
             "contentPreview".to_string(),
             serde_json::Value::String(preview),
         );
         map.insert(
             "contentLength".to_string(),
-            serde_json::json!(note.content.chars().count()),
+            serde_json::json!(content.chars().count()),
         );
     }
     value
@@ -4097,11 +4105,11 @@ mod tests {
         };
 
         // Short content: whole preview, exact char count.
-        let row = note_list_slim_row(&note);
+        let full = serde_json::to_value(&note).unwrap();
+        let row = note_list_slim_row(note.clone());
         assert!(row.get("content").is_none());
         assert_eq!(row["contentPreview"], "# Hi");
         assert_eq!(row["contentLength"], 4);
-        let full = serde_json::to_value(&note).unwrap();
         for (k, v) in full.as_object().unwrap() {
             if k != "content" {
                 assert_eq!(&row[k], v, "field {k} unchanged");
@@ -4111,7 +4119,7 @@ mod tests {
         // Long multibyte content: truncated at the char budget, never a
         // byte split; contentLength counts chars, not bytes.
         note.content = "é".repeat(NOTE_LIST_PREVIEW_CHARS * 3);
-        let row = note_list_slim_row(&note);
+        let row = note_list_slim_row(note);
         let preview = row["contentPreview"].as_str().unwrap();
         assert_eq!(preview.chars().count(), NOTE_LIST_PREVIEW_CHARS);
         assert_eq!(preview, "é".repeat(NOTE_LIST_PREVIEW_CHARS));
