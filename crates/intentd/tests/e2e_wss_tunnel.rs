@@ -26,7 +26,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio_tungstenite::tungstenite::Message;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
@@ -231,15 +231,16 @@ async fn spawn_echo_listener() -> u16 {
     port
 }
 
-/// Reserve a loopback port with nothing listening on it (bind, read the port,
-/// drop the listener). Connects to it are refused.
-async fn closed_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
+/// Reserve a loopback port that refuses connects for as long as the returned
+/// socket is held: bound but never listening, so the kernel answers connects
+/// with RST while the live bind keeps concurrent processes from reusing the
+/// port (the bind-and-drop pattern raced under parallel test load,
+/// intent-hq/monorepo#3499).
+fn closed_port() -> (TcpSocket, u16) {
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
+    let port = socket.local_addr().expect("local addr").port();
+    (socket, port)
 }
 
 /// OPEN a live echo port, push data both ways, then tear down with EOF: the
@@ -332,7 +333,7 @@ async fn tunnel_close_tears_down_and_frees_stream_id() {
 #[tokio::test]
 async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
     let srv = start().await;
-    let dead_port = closed_port().await;
+    let (_port_reservation, dead_port) = closed_port();
     let echo_port = spawn_echo_listener().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
