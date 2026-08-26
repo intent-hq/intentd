@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.61] - 2026-08-26
+
+### 🚀 Features
+
+- *(specialists)* Alias support in the specialist schema (coordinator → spec-writer) ([#1488](https://github.com/intent-hq/intentd/pull/1488))
+
+### 🐛 Bug Fixes
+
+- *(services)* Schedule lastActivity only at turn boundaries ([#1489](https://github.com/intent-hq/intentd/pull/1489))
+
+
 ## [0.7.60] - 2026-08-26
 
 ### 🚀 Features
