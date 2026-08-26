@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1] - 2026-08-26
+
+### 🐛 Bug Fixes
+
+- Raise default stream-stall threshold to 5 minutes ([#1505](https://github.com/intent-hq/intentd/pull/1505))
+
+
 ## [0.8.0] - 2026-08-26
 
 ### 🚀 Features
